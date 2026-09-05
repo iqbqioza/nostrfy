@@ -163,8 +163,6 @@ mod tests {
 
         // A token signed over the delegator's own pubkey (the previous,
         // incorrect behavior) must fail.
-        let bad_payload = format!("nostr:delegation:{}{conditions}", "8e0d3d3e".repeat(0));
-        let _ = bad_payload;
         let bad_token = {
             let payload = format!("nostr:delegation:{}:{conditions}", ev.tags[0][1]);
             let mut hasher = Sha256::new();
