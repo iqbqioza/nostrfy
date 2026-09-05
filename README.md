@@ -197,6 +197,10 @@ specialized deployments — copy one, adjust it and `nostrd check` it:
 | `private-relay.toml` | Invite-only / authenticated relay (NIP-42 + allow list) |
 | `search-focused.toml` | NIP-50 full-text search archive relay |
 | `tiny-vps.toml` | Smallest footprint for a 512 MB VPS |
+| `caddy/Caddyfile` | Automatic-HTTPS reverse proxy for one relay |
+| `caddy/Caddyfile.multi` | Several relays + Blossom on one server (one Caddyfile) |
+| `caddy/relay-1.toml` / `relay-2.toml` | Configs for the multi-relay setup (distinct ports and databases) |
+| `caddy/README.md` | Step-by-step Caddy + nostrd setup and troubleshooting |
 
 ## REST API
 

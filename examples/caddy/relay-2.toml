@@ -1,0 +1,45 @@
+# nostrd.toml — relay 2 of the multi-relay Caddy setup
+#
+# A groups-focused relay on its own hostname and port, with its own
+# database — see examples/caddy/Caddyfile.multi. Start it alongside
+# relay-1.toml on the same machine:
+#
+#   nostrd --config relay-2.toml start
+#
+# Every port and path must differ from relay 1's.
+
+[relay]
+name = "groups.example.com"
+description = "Nostr groups relay (NIP-29 + NIP-43)"
+pubkey = ""
+private_key = ""            # `nostrd genkey` — REQUIRED for NIP-29 metadata
+public_url = "wss://groups.example.com"
+enabled_nips = [1, 9, 11, 29, 40, 42, 43, 45, 46, 50, 57, 59, 65, 70, 77, 86, 94]
+max_groups = 5000
+
+[server]
+host = "127.0.0.1"          # only reachable through Caddy
+port = 8081                 # distinct from relay 1's 8080
+
+[rpc]
+management_port = 8083     # 8080 relay1, 8081 relay2, 8082 relay1 mgmt
+management_host = "127.0.0.1"
+management_token = ""
+
+[limits]
+ws_idle_timeout_secs = 900
+live_batch_interval_ms = 10
+live_batch_size = 64
+max_out_queue_bytes = 524288
+
+[database]
+path = "./data2"            # distinct from relay 1's data1
+search_index = true
+meta_index = true
+
+[daemon]
+pid_file = "./nostrd2.pid"
+log_file = "./nostrd2.log"
+
+[blossom]
+host = ""                   # this process is relay-only

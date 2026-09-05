@@ -1,0 +1,26 @@
+# Caddyfile — single nostrd relay behind automatic HTTPS
+#
+# Copy to /etc/caddy/Caddyfile (Caddy serves on :80/:443 automatically
+# and obtains/renews the TLS certificate via Let's Encrypt).
+#
+# The relay runs on 127.0.0.1:8080 (see examples/relay-basic.toml):
+#   nostrd --config nostrd.toml start
+#
+# Then point your clients at wss://relay.example.com. Caddy terminates
+# TLS, handles the WebSocket upgrade transparently and forwards
+# X-Forwarded-Proto, which nostrd uses to build correct wss:// URLs
+# in its NIP-11 document and Blossom auth checks.
+
+relay.example.com {
+	# Static compression for HTTP responses (WebSocket frames are
+	# never compressed by this directive).
+	encode zstd gzip
+
+	# Optional: a sane maximum for the whole request body.
+	# (nostrd enforces its own per-message limits anyway.)
+	request_body {
+		max_size 8MB
+	}
+
+	reverse_proxy 127.0.0.1:8080
+}

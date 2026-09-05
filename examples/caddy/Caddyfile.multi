@@ -1,0 +1,48 @@
+# Caddyfile — several relays on ONE server, each on its own hostname
+#
+# Scenario (three services, two nostrd processes, one Caddy):
+#
+#   relay.example.com   -> 127.0.0.1:8080   general-purpose relay
+#                              (examples/caddy/relay-1.toml, which also
+#                               serves the Blossom media server for
+#                               media.example.com)
+#   groups.example.com  -> 127.0.0.1:8081   groups-focused relay
+#                              (examples/caddy/relay-2.toml)
+#   media.example.com   -> 127.0.0.1:8080   Blossom routes only
+#                              (routed by the relay-1 process via its
+#                               [blossom] host setting)
+#
+# Start the relays with their own configs and databases:
+#   nostrd --config relay-1.toml start
+#   nostrd --config relay-2.toml start
+#
+# Every hostname gets its own Let's Encrypt certificate automatically.
+# All three services share port 80/443 on the public interface.
+
+relay.example.com {
+	encode zstd gzip
+	reverse_proxy 127.0.0.1:8080
+}
+
+groups.example.com {
+	encode zstd gzip
+	reverse_proxy 127.0.0.1:8081
+}
+
+# Blossom media server: same process as relay.example.com, but Caddy
+# routes this hostname there too; nostrd serves only the Blossom
+# routes for requests whose Host header matches [blossom] host.
+media.example.com {
+	# Media is big: cap uploads below the Caddy default of 0 (unlimited)
+	# is a good idea; nostrd enforces blossom.max_upload_bytes itself.
+	request_body {
+		max_size 25MB
+	}
+	encode zstd gzip
+	reverse_proxy 127.0.0.1:8080
+}
+
+# Optional: redirect the bare domain to the relay (or your own site).
+# example.com {
+#     redir https://relay.example.com
+# }

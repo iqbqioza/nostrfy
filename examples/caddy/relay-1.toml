@@ -1,0 +1,45 @@
+# nostrd.toml — relay 1 of the multi-relay Caddy setup
+#
+# Serves:
+#   wss://relay.example.com   the general-purpose relay
+#   media.example.com         the Blossom file server (same process,
+#                             routed by the Host header, see
+#                             examples/caddy/Caddyfile.multi)
+#
+# The two relays on this server must use DIFFERENT database paths and
+# DIFFERENT ports (relay-2.toml uses 8081 and ./data2).
+
+[relay]
+name = "relay.example.com"
+description = "General-purpose relay"
+pubkey = ""
+private_key = ""            # `nostrd genkey`
+# The public endpoint clients connect to (Caddy terminates TLS).
+public_url = "wss://relay.example.com"
+
+[server]
+host = "127.0.0.1"          # only reachable through Caddy
+port = 8080
+
+[rpc]
+# Management API on a separate port, reachable only from localhost.
+# Port allocation on this box: 8080 = relay 1, 8081 = relay 2,
+# 8082 = relay 1 management, 8083 = relay 2 management.
+management_port = 8082
+management_host = "127.0.0.1"
+management_token = ""       # set a strong token to enable NIP-86
+
+[database]
+path = "./data1"            # distinct from relay 2's data2
+
+[daemon]
+pid_file = "./nostrd1.pid"
+log_file = "./nostrd1.log"
+
+[blossom]
+# This process also serves the media server for its own hostname.
+host = "media.example.com"
+storage = "local"
+local_path = "/var/lib/nostrd1/images"
+max_upload_bytes = 20971520
+restrict_uploads = false
