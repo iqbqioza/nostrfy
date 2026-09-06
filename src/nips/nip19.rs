@@ -265,12 +265,14 @@ fn parse_tlv(data: &[u8]) -> Result<Vec<(u8, Vec<u8>)>, Bech32Error> {
     let mut items = Vec::new();
     let mut pos = 0;
     while pos < data.len() {
-        if pos + 3 > data.len() {
+        if pos + 2 > data.len() {
             return Err(Bech32Error::InvalidTlv);
         }
         let tlv_type = data[pos];
-        let len = u16::from_be_bytes([data[pos + 1], data[pos + 2]]) as usize;
-        pos += 3;
+        // NIP-19: `T` and `L` are one byte each. A two-byte length made
+        // every standard `nevent1`/`naddr1` string undecodable.
+        let len = data[pos + 1] as usize;
+        pos += 2;
         if pos + len > data.len() {
             return Err(Bech32Error::InvalidTlv);
         }
@@ -509,6 +511,28 @@ mod tests {
     }
 
     #[test]
+    fn tlv_lengths_are_one_byte() {
+        // The TLV payload of the `nprofile` vector in the NIP-19 spec
+        // (pubkey 3bf0c63f..., relays wss://r.x.com and
+        // wss://djbas.sadkb.com). `T` and `L` are one byte each.
+        let data = hex::decode(
+            "00203bf0c63fcb93463407af97a5e5ee64fa883d107ef9e558472c4eb9aaaefa459d\
+             010d7773733a2f2f722e782e636f6d\
+             01157773733a2f2f646a6261732e7361646b622e636f6d",
+        )
+        .unwrap();
+        let items = parse_tlv(&data).unwrap();
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].0, TLV_SPECIAL);
+        assert_eq!(
+            hex::encode(&items[0].1),
+            "3bf0c63fcb93463407af97a5e5ee64fa883d107ef9e558472c4eb9aaaefa459d"
+        );
+        assert_eq!(items[1], (TLV_RELAY, b"wss://r.x.com".to_vec()));
+        assert_eq!(items[2], (TLV_RELAY, b"wss://djbas.sadkb.com".to_vec()));
+    }
+
+    #[test]
     fn nevent_roundtrip() {
         let id = [0x42u8; 32];
         let entity = Nip19Entity::Event {
@@ -521,11 +545,11 @@ mod tests {
         // 1 = relay.
         let mut data = Vec::new();
         data.push(TLV_SPECIAL);
-        data.extend_from_slice(&(32u16).to_be_bytes());
+        data.push(32);
         data.extend_from_slice(&id);
         let relay = b"wss://relay.example.com";
         data.push(TLV_RELAY);
-        data.extend_from_slice(&(relay.len() as u16).to_be_bytes());
+        data.push(relay.len() as u8);
         data.extend_from_slice(relay);
 
         let encoded = bech32m_encode("nevent", &data).unwrap();
@@ -540,17 +564,17 @@ mod tests {
         let mut data = Vec::new();
         let d = b"post-1";
         data.push(TLV_SPECIAL);
-        data.extend_from_slice(&(d.len() as u16).to_be_bytes());
+        data.push(d.len() as u8);
         data.extend_from_slice(d);
         let relay = b"wss://relay.example.com";
         data.push(TLV_RELAY);
-        data.extend_from_slice(&(relay.len() as u16).to_be_bytes());
+        data.push(relay.len() as u8);
         data.extend_from_slice(relay);
         data.push(TLV_AUTHOR);
-        data.extend_from_slice(&(32u16).to_be_bytes());
+        data.push(32);
         data.extend_from_slice(&[0x11u8; 32]);
         data.push(TLV_KIND);
-        data.extend_from_slice(&(4u16).to_be_bytes());
+        data.push(4);
         data.extend_from_slice(&30023u32.to_be_bytes());
 
         let encoded = bech32m_encode("naddr", &data).unwrap();
@@ -574,13 +598,13 @@ mod tests {
         let author = [0x77u8; 32];
         let mut data = Vec::new();
         data.push(TLV_SPECIAL);
-        data.extend_from_slice(&(32u16).to_be_bytes());
+        data.push(32);
         data.extend_from_slice(&id);
         data.push(TLV_AUTHOR);
-        data.extend_from_slice(&(32u16).to_be_bytes());
+        data.push(32);
         data.extend_from_slice(&author);
         data.push(TLV_KIND);
-        data.extend_from_slice(&(4u16).to_be_bytes());
+        data.push(4);
         data.extend_from_slice(&7u32.to_be_bytes());
 
         let encoded = bech32m_encode("nevent", &data).unwrap();
@@ -621,10 +645,10 @@ mod tests {
         // old code expected the id at type 2.
         let mut data = Vec::new();
         data.push(TLV_SPECIAL);
-        data.extend_from_slice(&(32u16).to_be_bytes());
+        data.push(32);
         data.extend_from_slice(&[0x42u8; 32]);
         data.push(TLV_KIND);
-        data.extend_from_slice(&(4u16).to_be_bytes());
+        data.push(4);
         data.extend_from_slice(&1u32.to_be_bytes());
         let encoded = bech32m_encode("nevent", &data).unwrap();
         match parse_nip19(&encoded).unwrap() {
@@ -638,13 +662,13 @@ mod tests {
         let mut data = Vec::new();
         let d = b"";
         data.push(TLV_SPECIAL);
-        data.extend_from_slice(&(d.len() as u16).to_be_bytes());
+        data.push(d.len() as u8);
         data.extend_from_slice(d);
         data.push(TLV_AUTHOR);
-        data.extend_from_slice(&(32u16).to_be_bytes());
+        data.push(32);
         data.extend_from_slice(&[0x22u8; 32]);
         data.push(TLV_KIND);
-        data.extend_from_slice(&(4u16).to_be_bytes());
+        data.push(4);
         data.extend_from_slice(&0u32.to_be_bytes());
         let encoded = bech32m_encode("naddr", &data).unwrap();
         match parse_nip19(&encoded).unwrap() {
