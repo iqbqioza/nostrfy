@@ -216,18 +216,22 @@ impl S3Client {
         // Canonical query: sort the key=value pairs (SigV4 requires sorted).
         let canonical_query = sorted_query(query);
         // SigV4 canonical headers must be sorted by name and lowercased.
-        let mut headers: Vec<(&str, String)> = vec![
-            ("host", host),
-            ("x-amz-content-sha256", payload_hash.to_string()),
-            ("x-amz-date", amz_date.to_string()),
+        let mut headers: Vec<(String, String)> = vec![
+            ("host".to_string(), host),
+            ("x-amz-content-sha256".to_string(), payload_hash.to_string()),
+            ("x-amz-date".to_string(), amz_date.to_string()),
         ];
         if let Some(ct) = content_type {
-            headers.push(("content-type", ct.trim().to_ascii_lowercase()));
+            headers.push(("content-type".to_string(), ct.trim().to_ascii_lowercase()));
         }
         for (name, value) in extra_headers {
-            headers.push((name, value.trim().to_ascii_lowercase()));
+            // The name must be lowercased too: S3 canonicalizes the
+            // received headers (HTTP names are case-insensitive and the
+            // client sends them lowercase), so a signed "Range" would
+            // never match the sent "range" — every ranged GET would 403.
+            headers.push((name.to_ascii_lowercase(), value.trim().to_ascii_lowercase()));
         }
-        headers.sort_by(|a, b| a.0.cmp(b.0));
+        headers.sort_by(|a, b| a.0.cmp(&b.0));
         let mut canonical_headers = String::new();
         let mut signed_headers = String::new();
         for (i, (name, value)) in headers.iter().enumerate() {
@@ -486,6 +490,10 @@ mod tests {
             "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
         );
         let empty_hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        // The production call passes "Range" (capital R); the signer must
+        // lowercase the name so the signed canonical headers match the
+        // headers S3 actually receives (a "Range" canonical header would
+        // never match the sent "range" and every ranged GET would 403).
         let authorization = client.sign(
             "GET",
             "test.txt",
@@ -494,7 +502,7 @@ mod tests {
             "20130524T000000Z",
             "20130524",
             None,
-            &[("range", "bytes=0-9")],
+            &[("Range", "bytes=0-9")],
         );
         // The signing chain is validated against the AWS documentation's
         // worked example; this expectation is the same request expressed
