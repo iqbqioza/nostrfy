@@ -847,12 +847,26 @@ impl GroupStore {
                 break;
             }
             let min_created = page.iter().map(|e| e.created_at).min().unwrap_or(0);
-            meta_events.extend(page);
-            if more && min_created > 0 {
-                until = Some(min_created - 1);
-                continue;
+            let full = page.len() >= PAGE;
+            if !full && more {
+                // The scan budget was exhausted mid-timestamp: the page is
+                // partial and stepping the cursor would silently skip the
+                // unexamined events of the same timestamp, leaving their
+                // groups out of the ghost detection (fail-open). Stop and
+                // warn, like the moderation walk above.
+                log::warn!(
+                    "group metadata scan ended early (scan budget exhausted with {} events in \
+                     the page): the ghost detection may be incomplete after this restart",
+                    page.len()
+                );
+                meta_events.extend(page);
+                break;
             }
-            break;
+            meta_events.extend(page);
+            if !full || min_created == 0 {
+                break;
+            }
+            until = Some(min_created - 1);
         }
         for event in &meta_events {
             if let Some(gid) = crate::nips::nip29::group_id_d(event) {

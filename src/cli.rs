@@ -481,13 +481,13 @@ impl Cli {
                 flush_stdout();
                 return Ok(());
             }
-        } else if version.is_none() && version_gt(current, &target) {
-            // No explicit version: never downgrade a newer local build to
-            // the latest release (e.g. a dev build newer than the newest
-            // published tag).
+        } else if version.is_none() && !force && version_gt(current, &target) {
+            // No explicit version and no --force: never downgrade a newer
+            // local build to the latest release (e.g. a dev build newer
+            // than the newest published tag). --force bypasses the guard.
             print_line(&format!(
                 "the installed binary ({current}) is newer than the latest release ({target}); \
-                 nothing to upgrade"
+                 nothing to upgrade (use --force to downgrade)"
             ));
             flush_stdout();
             return Ok(());
@@ -601,34 +601,35 @@ impl Cli {
                 perms.set_mode(0o755);
             }
             std::fs::set_permissions(&tmp, perms).map_err(Error::Io)?;
-            // The probe runs in a thread with a hard deadline: a downloaded
-            // binary that hangs must not hang the CLI.
-            let (tx, rx) = std::sync::mpsc::channel();
-            let probe_tmp = tmp.clone();
-            let probe_thread = std::thread::spawn(move || {
-                let out = std::process::Command::new(&probe_tmp)
-                    .arg("--version")
-                    .output();
-                let _ = tx.send(out);
-            });
-            match rx.recv_timeout(Duration::from_secs(30)) {
-                Ok(Ok(out)) if out.status.success() => {
-                    let _ = probe_thread.join();
+            // The probe runs with a hard deadline: a downloaded binary that hangs
+            // must not hang the CLI, and the child process is killed on
+            // timeout instead of being left orphaned.
+            let mut child = std::process::Command::new(&tmp)
+                .arg("--version")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .map_err(|e| Error::Other(format!("downloaded binary does not run: {e}")))?;
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            let probe_ok = loop {
+                match child.try_wait().map_err(Error::Io)? {
+                    Some(status) => break status.success(),
+                    None => {
+                        if std::time::Instant::now() >= deadline {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            break false;
+                        }
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
                 }
-                Ok(Ok(_)) => {
-                    return Err(Error::Other(
-                        "downloaded binary failed its version check; keeping the current binary"
-                            .into(),
-                    ));
-                }
-                Ok(Err(e)) => {
-                    return Err(Error::Other(format!("downloaded binary does not run: {e}")));
-                }
-                Err(_) => {
-                    return Err(Error::Other(
-                        "the downloaded binary did not answer --version within 30 seconds".into(),
-                    ));
-                }
+            };
+            if !probe_ok {
+                return Err(Error::Other(
+                    "downloaded binary failed or timed out in its version check; \
+                     keeping the current binary"
+                        .into(),
+                ));
             };
             std::fs::rename(&tmp, &exe).map_err(Error::Io)?;
             // fsync the directory so the rename survives a power loss, not
