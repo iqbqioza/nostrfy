@@ -506,9 +506,18 @@ async fn blossom_root_info(
     if is_websocket {
         return Some(StatusCode::NOT_FOUND.into_response());
     }
+    let relay_name = cfg.relay.name.trim();
+    let name = if relay_name.is_empty() {
+        "nostrfy".to_string()
+    } else {
+        relay_name.to_string()
+    };
     let info = json!({
-        "name": format!("nostrfy Blossom ({})", cfg.blossom.host.trim()),
-        "supported_nips": [],
+        "name": format!("{name} (media)"),
+        // File-related NIPs this server implements: 94 (file-metadata
+        // events are stored and served), 96 (HTTP file storage) and
+        // 98 (HTTP auth, used for the uploads).
+        "supported_nips": [94, 96, 98],
         "supported_file_hashes": ["sha256"],
         "tos_url": null,
         "payment_required": false,
@@ -1257,6 +1266,71 @@ mod tests {
     use std::time::Duration;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio::net::TcpStream;
+
+    /// A relay with a configured Blossom host, for the info-document tests.
+    async fn blossom_relay() -> Arc<Relay> {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut cfg = crate::config::Config::default();
+        cfg.relay.name = "example relay".into();
+        cfg.blossom.host = "media.example.com".into();
+        cfg.database.map_size = 16 * 1024 * 1024;
+        cfg.database.max_map_size = 256 * 1024 * 1024;
+        cfg.database.path = std::env::temp_dir()
+            .join("nostrfy-server-test")
+            .join(format!("{:x}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&cfg.database.path);
+        let db = crate::db::DbClient::open(
+            &cfg.database,
+            true,
+            Arc::new(Default::default()),
+            0,
+            128,
+            4096,
+            262144,
+        )
+        .unwrap();
+        let config = Arc::new(tokio::sync::RwLock::new(cfg));
+        Arc::new(
+            Relay::new(
+                config,
+                db,
+                crate::stats::Stats::new(),
+                "",
+                crate::relay::LiveBusConfig {
+                    buffer: 1024,
+                    batch_interval_ms: 10,
+                    batch_size: 64,
+                },
+            )
+            .await,
+        )
+    }
+
+    #[tokio::test]
+    async fn blossom_server_info_carries_name_and_file_nips() {
+        let relay = blossom_relay().await;
+        let resp = blossom_root_info(relay.clone(), Some("media.example.com"), false)
+            .await
+            .expect("the Blossom host is answered");
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["name"], "example relay (media)");
+        assert_eq!(
+            json["supported_nips"],
+            serde_json::json!([94, 96, 98]),
+            "file-related NIPs are advertised"
+        );
+        assert_eq!(json["upload_url"], "https://media.example.com/upload");
+        assert_eq!(json["supported_file_hashes"], serde_json::json!(["sha256"]));
+        // Any other host is not answered.
+        assert!(
+            blossom_root_info(relay.clone(), Some("relay.example.com"), false)
+                .await
+                .is_none()
+        );
+        relay.db.shutdown();
+    }
 
     fn test_app() -> axum::Router {
         axum::Router::new().route("/", axum::routing::get(|| async { "ok" }))
