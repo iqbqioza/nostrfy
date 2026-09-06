@@ -31,6 +31,24 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # The release version is the tag name (e.g. tag v0.1.4 -> 0.1.4):
+      # temporarily overwrite the Cargo.toml package version so the built
+      # binary reports it via --version / CARGO_PKG_VERSION (and the
+      # upgrade command compares against it). Only the first `version =`
+      # line inside [package] is replaced.
+      - name: Set the release version from the tag
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          awk -v v="$VERSION" '
+            /^\[package\]/ { in_pkg = 1 }
+            in_pkg && /^version = / {
+              sub(/version = ".*"/, "version = \"" v "\"")
+              in_pkg = 0
+            }
+            { print }
+          ' Cargo.toml > Cargo.toml.new && mv Cargo.toml.new Cargo.toml
+          grep -m1 '^version' Cargo.toml
+
       - name: Build release binary
         run: cargo build --release
 
@@ -68,7 +86,19 @@ jobs:
           prepare: |
             env IGNORE_OSVERSION=yes pkg update -f
             env IGNORE_OSVERSION=yes pkg install -y rust
+          # The release version is the tag name: same temporary Cargo.toml
+          # override as the build job (POSIX awk, no GNU extensions, so it
+          # works on FreeBSD's sed-awk).
           run: |
+            VERSION="${GITHUB_REF_NAME#v}"
+            awk -v v="$VERSION" '
+              /^\[package\]/ { in_pkg = 1 }
+              in_pkg && /^version = / {
+                sub(/version = ".*"/, "version = \"" v "\"")
+                in_pkg = 0
+              }
+              { print }
+            ' Cargo.toml > Cargo.toml.new && mv Cargo.toml.new Cargo.toml
             cargo build --release
             mkdir -p dist
             cp target/release/nostrfy "dist/nostrfy-freebsd-x86_64"
