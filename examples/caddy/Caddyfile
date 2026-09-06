@@ -19,7 +19,10 @@ relay.example.com {
 	# Optional: a sane maximum for the whole request body.
 	# (nostrfy enforces its own per-message limits anyway.)
 	request_body {
-		max_size 8MB
+		# Blossom uploads share this host's port: keep the cap above the
+		# default max_upload_bytes (20 MiB), or Caddy silently rejects
+		# uploads the relay would accept.
+		max_size 25MB
 	}
 
 	reverse_proxy 127.0.0.1:8080

@@ -35,5 +35,7 @@ primary_region = "nrt"   # change to your preferred region
       grace_period = "15s"
 
 [metrics]
-  port = 9091
+  # Scraped by Fly from the same listener that serves /metrics (8080):
+  # a separate port (9091) is never bound by the container.
+  port = 8080
   path = "/metrics"

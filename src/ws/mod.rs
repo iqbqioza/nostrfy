@@ -1594,6 +1594,105 @@ mod tests {
     }
 
     #[test]
+    fn group_join_requires_a_stored_invite() {
+        // A JOIN with an invite code is only admitted while a stored,
+        // undeleted 9009 backs the code: revoking the 9009 (NIP-09) must
+        // take effect immediately, even though the in-memory invite set
+        // still holds the code.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_relay_with("").await;
+            let mut conn = build_conn_on(relay.clone()).await;
+            let now = unix_now();
+            let code = "abc123";
+
+            // Create the group, issue the invite, and join with the code.
+            let create = signed_kind_note_seeded(
+                relay.secp(),
+                1,
+                crate::nips::nip29::CREATE_GROUP,
+                "",
+                now,
+                vec![vec!["h".into(), "g1".into()]],
+            );
+            let invite = signed_kind_note_seeded(
+                relay.secp(),
+                1,
+                9009,
+                "",
+                now,
+                vec![
+                    vec!["h".into(), "g1".into()],
+                    vec!["code".into(), code.into()],
+                ],
+            );
+            let join = signed_kind_note_seeded(
+                relay.secp(),
+                2,
+                crate::nips::nip29::JOIN,
+                "",
+                now,
+                vec![
+                    vec!["h".into(), "g1".into()],
+                    vec!["code".into(), code.into()],
+                ],
+            );
+            for ev in [&create, &invite, &join] {
+                conn.queue_event_value(ev.clone()).await;
+                conn.flush_pending_events().await;
+                assert!(
+                    outgoing_json(&conn)
+                        .iter()
+                        .any(|m| m[0] == "OK" && m[1] == ev.id && m[2] == true),
+                    "the group/invite/join sequence is accepted"
+                );
+            }
+
+            // Revoke the invite by deleting its 9009.
+            let deletion = signed_kind_note_seeded(
+                relay.secp(),
+                1,
+                crate::nips::nip09::DELETION_KIND,
+                "",
+                now + 1,
+                vec![vec!["e".into(), invite.id.clone()]],
+            );
+            conn.queue_event_value(deletion.clone()).await;
+            conn.flush_pending_events().await;
+            assert!(
+                outgoing_json(&conn)
+                    .iter()
+                    .any(|m| m[0] == "OK" && m[1] == deletion.id && m[2] == true),
+                "the deletion is accepted"
+            );
+
+            // A different pubkey joining with the revoked code is refused,
+            // even though the in-memory invite set still holds the code.
+            let join2 = signed_kind_note_seeded(
+                relay.secp(),
+                3,
+                crate::nips::nip29::JOIN,
+                "",
+                now,
+                vec![
+                    vec!["h".into(), "g1".into()],
+                    vec!["code".into(), code.into()],
+                ],
+            );
+            conn.queue_event_value(join2.clone()).await;
+            conn.flush_pending_events().await;
+            assert!(
+                outgoing_json(&conn)
+                    .iter()
+                    .any(|m| m[0] == "OK" && m[1] == join2.id && m[2] == false),
+                "a revoked invite code must not admit a join"
+            );
+
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
     fn command_events_edit_lists_and_reply_with_1111() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {

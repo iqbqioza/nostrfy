@@ -112,9 +112,16 @@ impl BlobStore {
             ));
         }
         let npub = npub_of(pubkey);
-        match &self.storage {
-            Storage::Local(s) => s.put(&npub, sha256, bytes, mime, uploaded).await?,
-            Storage::S3(s) => s.put(&npub, sha256, bytes, mime, uploaded).await?,
+        let stored = match &self.storage {
+            Storage::Local(s) => s.put(&npub, sha256, bytes, mime, uploaded).await,
+            Storage::S3(s) => s.put(&npub, sha256, bytes, mime, uploaded).await,
+        };
+        if let Err(e) = stored {
+            // Roll the owner mapping back: a failed PUT must not leave a
+            // mapping pointing at an object that was never stored (an
+            // unreachable, billed orphan).
+            self.db.blossom_remove_owner(sha256, pubkey).await;
+            return Err(e);
         }
         Ok(Descriptor {
             sha256: sha256.to_string(),

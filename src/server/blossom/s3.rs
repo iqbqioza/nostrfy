@@ -32,9 +32,13 @@ impl S3Client {
             bucket: bucket.to_string(),
             access_key: access_key.to_string(),
             secret_key: secret_key.to_string(),
-            // A hung S3 endpoint must not hold a request handler forever.
+            // A hung S3 endpoint must not hold a request handler forever. The
+            // connect phase is bounded; the body is streamed 1:1 to the
+            // client, so a total request timeout would truncate large blobs
+            // under slow clients (the client connection itself bounds the
+            // stream lifetime).
             http: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(60))
+                .connect_timeout(std::time::Duration::from_secs(30))
                 .build()
                 .expect("reqwest client"),
         }
@@ -42,12 +46,7 @@ impl S3Client {
 
     /// `https://<endpoint>/<bucket>/<key>`
     fn url(&self, key: &str) -> String {
-        let key = key
-            .split('/')
-            .map(percent_encode)
-            .collect::<Vec<_>>()
-            .join("/");
-        format!("{}/{}/{}", self.endpoint, self.bucket, key)
+        format!("{}/{}/{}", self.endpoint, self.bucket, encoded_key(key))
     }
 
     /// Sends a signed request and returns the raw response (the caller
@@ -147,7 +146,10 @@ impl S3Client {
         extra_headers: &[(&str, &str)],
     ) -> String {
         let host = host_of(&self.endpoint);
-        let canonical_uri = format!("/{}/{}", self.bucket, key);
+        // The canonical URI must match the request URL exactly: the object
+        // key is percent-encoded segment-wise in both (a raw key in the
+        // signature would mismatch the encoded URL and yield a 403).
+        let canonical_uri = format!("/{}/{}", self.bucket, encoded_key(key));
         // Canonical query: sort the key=value pairs (SigV4 requires sorted).
         let canonical_query = sorted_query(query);
         // SigV4 canonical headers must be sorted by name and lowercased.
@@ -255,7 +257,18 @@ impl S3Client {
 
     pub(crate) async fn delete_object(&self, key: &str) -> Result<bool> {
         let (status, _) = self.send("DELETE", key, "", None, None, &[]).await?;
-        Ok(status.is_success() || status == reqwest::StatusCode::NOT_FOUND)
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+        if !status.is_success() {
+            // Propagate the failure: the caller must not drop the owner
+            // mapping for an object that is still in the bucket (that
+            // would orphan a billed object with no way to delete it).
+            return Err(crate::error::Error::Other(format!(
+                "s3 delete failed: {status}"
+            )));
+        }
+        Ok(true)
     }
 
     /// `ListObjectsV2` for a prefix; returns (key, size). Used by the
@@ -347,6 +360,15 @@ fn percent_encode(input: &str) -> String {
         }
     }
     out
+}
+
+/// The percent-encoded object key (each path segment encoded), shared by
+/// the request URL and the SigV4 canonical URI.
+fn encoded_key(key: &str) -> String {
+    key.split('/')
+        .map(percent_encode)
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 fn sorted_query(query: &str) -> String {

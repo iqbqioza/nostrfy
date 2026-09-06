@@ -152,7 +152,8 @@ sudo systemctl start nostrfy
 ## Updates
 
 ```sh
-# the one-liner overwrites the existing binary (it asks for confirmation)
-curl -fsSL https://raw.githubusercontent.com/iqbqioza/nostrfy/main/install.sh | sh
+# piped installs never ask for confirmation: use --force to overwrite an
+# existing binary (or run the script from a terminal and answer y/N)
+curl -fsSL https://raw.githubusercontent.com/iqbqioza/nostrfy/main/install.sh | sh -s -- --force
 sudo systemctl restart nostrfy
 ```
