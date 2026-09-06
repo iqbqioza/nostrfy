@@ -127,14 +127,16 @@ impl StampClock {
     }
 
     /// Returns a timestamp strictly greater than every previously issued
-    /// stamp and at least `floor`. Stamps saturate at `u64::MAX - 1` so
-    /// the issued value can never collide with a previous one.
+    /// stamp and at least `floor`. Issued stamps cap at `u64::MAX - 1`
+    /// (the last unique value: `min(u64::MAX - 2)` before the increment),
+    /// so the issued value can never collide with a previous one within
+    /// the reachable range.
     pub(crate) fn stamp(&self, floor: u64) -> u64 {
         let mut cur = self.last.load(Ordering::Relaxed);
         loop {
             let next = cur
                 .max(floor.saturating_sub(1))
-                .min(u64::MAX - 1)
+                .min(u64::MAX - 2)
                 .saturating_add(1);
             match self
                 .last

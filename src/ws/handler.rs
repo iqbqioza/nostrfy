@@ -692,14 +692,19 @@ impl super::Conn {
     /// refused too. The list is read fresh on every message, so changes
     /// made by command events or NIP-86 apply to live connections without
     /// a reconnect.
-    pub(crate) async fn access_allows_read(&self) -> bool {
+    pub(crate) async fn access_allows_read(&mut self) -> bool {
         // Lock order: config before access — the same order as the accept
         // path (`config.read` held across `access.read`). Acquiring access
         // first and then awaiting config would set up a lock cycle with an
         // access writer and a config writer (tokio RwLocks are fair).
         let admin = self.relay.config.read().await.relay.pubkey.clone();
         let access = self.relay.access.read().await;
-        self.read_verdict(&access, &admin)
+        let verdict = self.read_verdict(&access, &admin);
+        // The verdict seeds `access_allowed_cache` (also computed once at
+        // connect), so the non-blocking hot path always falls back to a
+        // genuinely computed verdict — never to an uninitialized value.
+        self.access_allowed_cache = verdict;
+        verdict
     }
 
     /// Non-blocking variant for the hot live-delivery path: recomputes the

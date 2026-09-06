@@ -447,10 +447,14 @@ impl Cli {
     /// `nostrfy upgrade`: replaces the relay binary with a GitHub release
     /// asset (the version given on the command line, or the latest release).
     /// The download is written to a temp file next to the current
-    /// executable, verified by running `--version` on it, and atomically
-    /// renamed over the binary — a crash mid-upgrade leaves the old binary
-    /// intact. A running daemon keeps using the old file (already mapped);
-    /// the operator is reminded to `restart` to apply the update.
+    /// executable (created with O_EXCL, so a planted symlink is never
+    /// followed), its sha256 is verified against the published checksum,
+    /// the binary is proven to run (`--version` probe with a deadline),
+    /// and it is atomically renamed over the binary with an fsync of both
+    /// the file and the directory — a crash or power loss mid-upgrade
+    /// leaves the old binary intact. A running daemon keeps using the old
+    /// file (already mapped); the operator is reminded to `restart` to
+    /// apply the update.
     fn upgrade(&self, version: Option<&str>, force: bool) -> Result<()> {
         const REPO: &str = "iqbqioza/nostrfy";
         const MAX_ASSET_BYTES: u64 = 256 * 1024 * 1024;
@@ -497,12 +501,31 @@ impl Cli {
         let dir = exe
             .parent()
             .ok_or_else(|| Error::Other("cannot locate the binary's directory".into()))?;
+        // Best-effort cleanup of temp files left behind by a hard-killed
+        // previous upgrade (same pattern, any pid).
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name.starts_with(".nostrfy-upgrade-") && name.ends_with("-tmp") {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
         let tmp = dir.join(format!(".nostrfy-upgrade-{}-tmp", std::process::id()));
         let url = format!("https://github.com/{REPO}/releases/download/{tag}/{asset}");
         print_line(&format!("downloading {url} ..."));
         flush_stdout();
+        // Timeouts for every network step: a blackholed connection must not
+        // hang the CLI forever (ureq's default agent has no read timeout).
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_secs(30))
+            .timeout_read(Duration::from_secs(120))
+            .timeout_write(Duration::from_secs(120))
+            .build();
         let result = (|| -> Result<()> {
-            let response = ureq::get(&url)
+            let response = agent
+                .get(&url)
                 .set("User-Agent", "nostrfy-upgrade")
                 .call()
                 .map_err(|e| Error::Other(format!("download failed: {e}")))?;
@@ -513,7 +536,13 @@ impl Cli {
                 )));
             }
             let mut reader = response.into_reader();
-            let mut out = std::fs::File::create(&tmp).map_err(Error::Io)?;
+            // create_new (O_EXCL): never follow a pre-planted symlink or
+            // truncate an existing file.
+            let mut out = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)
+                .map_err(|e| Error::Other(format!("cannot create {}: {e}", tmp.display())))?;
             // Stream with a hard byte cap: the trait-object reader cannot
             // be `take()`d, and a huge (or hostile) response must not be
             // buffered or written out unbounded.
@@ -531,27 +560,82 @@ impl Cli {
                 }
                 out.write_all(&buf[..n]).map_err(Error::Io)?;
             }
+            // The release pipeline publishes <asset>.sha256 next to the
+            // binary (install.sh verifies it the same way): verify the
+            // digest BEFORE executing anything downloaded.
+            let checksum = agent
+                .get(&format!("{url}.sha256"))
+                .set("User-Agent", "nostrfy-upgrade")
+                .call()
+                .map_err(|e| Error::Other(format!("cannot fetch the checksum: {e}")))?
+                .into_string()
+                .map_err(|e| Error::Other(format!("invalid checksum response: {e}")))?;
+            let expected = checksum
+                .split_whitespace()
+                .next()
+                .and_then(|h| hex::decode(h).ok())
+                .filter(|b| b.len() == 32)
+                .ok_or_else(|| Error::Other("the published checksum is not a sha256".into()))?;
+            out.sync_all().map_err(Error::Io)?;
+            drop(out);
+            let actual = {
+                use sha2::Digest;
+                let mut hasher = sha2::Sha256::new();
+                let mut f = std::fs::File::open(&tmp).map_err(Error::Io)?;
+                std::io::copy(&mut f, &mut hasher).map_err(Error::Io)?;
+                hasher.finalize().to_vec()
+            };
+            if actual != expected {
+                return Err(Error::Other(
+                    "sha256 of the downloaded binary does not match the published checksum; \
+                     keeping the current binary"
+                        .into(),
+                ));
+            }
             // Make it executable and prove it runs before replacing the
-            // live binary: a corrupt or truncated download must not clobber
-            // a working relay.
-            let mut perms = out.metadata().map_err(Error::Io)?.permissions();
+            // live binary.
+            let mut perms = std::fs::metadata(&tmp).map_err(Error::Io)?.permissions();
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
                 perms.set_mode(0o755);
             }
-            out.set_permissions(perms).map_err(Error::Io)?;
-            drop(out);
-            let probe = std::process::Command::new(&tmp)
-                .arg("--version")
-                .output()
-                .map_err(|e| Error::Other(format!("downloaded binary does not run: {e}")))?;
-            if !probe.status.success() {
-                return Err(Error::Other(
-                    "downloaded binary failed its version check; keeping the current binary".into(),
-                ));
-            }
+            std::fs::set_permissions(&tmp, perms).map_err(Error::Io)?;
+            // The probe runs in a thread with a hard deadline: a downloaded
+            // binary that hangs must not hang the CLI.
+            let (tx, rx) = std::sync::mpsc::channel();
+            let probe_tmp = tmp.clone();
+            let probe_thread = std::thread::spawn(move || {
+                let out = std::process::Command::new(&probe_tmp)
+                    .arg("--version")
+                    .output();
+                let _ = tx.send(out);
+            });
+            match rx.recv_timeout(Duration::from_secs(30)) {
+                Ok(Ok(out)) if out.status.success() => {
+                    let _ = probe_thread.join();
+                }
+                Ok(Ok(_)) => {
+                    return Err(Error::Other(
+                        "downloaded binary failed its version check; keeping the current binary"
+                            .into(),
+                    ));
+                }
+                Ok(Err(e)) => {
+                    return Err(Error::Other(format!("downloaded binary does not run: {e}")));
+                }
+                Err(_) => {
+                    return Err(Error::Other(
+                        "the downloaded binary did not answer --version within 30 seconds".into(),
+                    ));
+                }
+            };
             std::fs::rename(&tmp, &exe).map_err(Error::Io)?;
+            // fsync the directory so the rename survives a power loss, not
+            // just a process crash.
+            if let Ok(d) = std::fs::File::open(dir) {
+                let _ = d.sync_all();
+            }
             Ok(())
         })();
         if result.is_err() {
@@ -725,7 +809,13 @@ fn upgrade_asset_name(os: &str, arch: &str) -> Option<String> {
 /// The tag of the latest GitHub release (without the leading "v").
 fn latest_release_version(repo: &str) -> Result<String> {
     let url = format!("https://api.github.com/repos/{repo}/releases/latest");
-    let response = ureq::get(&url)
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(30))
+        .timeout_read(Duration::from_secs(60))
+        .timeout_write(Duration::from_secs(60))
+        .build();
+    let response = agent
+        .get(&url)
         .set("User-Agent", "nostrfy-upgrade")
         .call()
         .map_err(|e| Error::Other(format!("cannot query the latest release: {e}")))?;

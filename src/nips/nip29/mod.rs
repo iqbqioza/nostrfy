@@ -831,11 +831,29 @@ impl GroupStore {
         // not part of the moderation walk above. Include its group ids in
         // the ghost detection, so a private group whose only surviving
         // events are its metadata cannot become world-readable after a
-        // restart.
+        // restart. Walk it in pages like the moderation walk: a relay
+        // hosting many groups can hold far more than one page of metadata,
+        // and a truncated walk would silently fail the ghost detection
+        // open (private metadata world-readable).
         let meta_kinds: Vec<u64> = (GROUP_META..=GROUP_PINS).collect();
-        let meta_filter: Filter =
-            serde_json::from_value(json!({ "kinds": meta_kinds })).expect("static filter");
-        let (meta_events, _) = db.query_full(vec![meta_filter], PAGE, unix_now()).await;
+        let mut meta_events: Vec<Event> = Vec::new();
+        let mut until: Option<u64> = None;
+        loop {
+            let mut filter: Filter =
+                serde_json::from_value(json!({ "kinds": meta_kinds })).expect("static filter");
+            filter.until = until;
+            let (page, more) = db.query_full(vec![filter], PAGE, unix_now()).await;
+            if page.is_empty() {
+                break;
+            }
+            let min_created = page.iter().map(|e| e.created_at).min().unwrap_or(0);
+            meta_events.extend(page);
+            if more && min_created > 0 {
+                until = Some(min_created - 1);
+                continue;
+            }
+            break;
+        }
         for event in &meta_events {
             if let Some(gid) = crate::nips::nip29::group_id_d(event) {
                 seen_gids.insert(gid.to_string());

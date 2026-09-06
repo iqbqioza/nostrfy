@@ -612,6 +612,10 @@ pub async fn handle_connection(
         pending_reqs: std::collections::VecDeque::new(),
     };
     conn.send_auth_challenge().await;
+    // Seed the access-read verdict cache with a genuinely computed value,
+    // so the non-blocking live/pump checks never fall back to an
+    // uninitialized (sentinel) verdict during the first contention window.
+    conn.access_allows_read().await;
 
     // A single task per connection: incoming messages and live batches are
     // processed in the same loop, and outgoing messages are flushed to the
