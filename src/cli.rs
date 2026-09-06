@@ -14,7 +14,7 @@ use crate::server::run_server;
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "nostrd",
+    name = "nostrfy",
     version,
     about = "A minimal and stable Nostr relay server"
 )]
@@ -30,9 +30,9 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Write a default nostrd.toml and exit.
+    /// Write a default nostrfy.toml and exit.
     Init,
-    /// Generate a relay secret key for NIP-29 and write it into nostrd.toml
+    /// Generate a relay secret key for NIP-29 and write it into nostrfy.toml
     /// (asks for confirmation when relay.private_key is already set).
     #[command(name = "genkey")]
     GenKey,
@@ -43,11 +43,11 @@ pub enum Command {
     },
     /// Stop the running daemon.
     Stop,
-    /// Stop the daemon and start it again (reloads nostrd.toml).
+    /// Stop the daemon and start it again (reloads nostrfy.toml).
     Restart,
     /// Show live statistics of the running daemon.
     Stats,
-    /// Validate nostrd.toml and exit.
+    /// Validate nostrfy.toml and exit.
     Check,
     /// Manage the Blossom upload allowlist (npub1... or hex pubkeys).
     #[command(name = "blossom")]
@@ -111,7 +111,7 @@ impl Cli {
                 cfg.validate()?;
                 if let Some(pid) = running_pid(&cfg.daemon.pid_file) {
                     return Err(Error::Config(format!(
-                        "already running (pid {pid}); use 'nostrd stop' or 'nostrd restart'"
+                        "already running (pid {pid}); use 'nostrfy stop' or 'nostrfy restart'"
                     )));
                 }
                 return Ok(());
@@ -133,7 +133,7 @@ impl Cli {
         cfg.validate()?;
         if let Some(pid) = running_pid(&cfg.daemon.pid_file) {
             return Err(Error::Config(format!(
-                "already running (pid {pid}); use 'nostrd stop' or 'nostrd restart'"
+                "already running (pid {pid}); use 'nostrfy stop' or 'nostrfy restart'"
             )));
         }
         self.daemonize(&cfg)?;
@@ -203,13 +203,13 @@ impl Cli {
             // Parent: the daemon has forked and the first child exited.
             // Report the pid (read from the pid file, which the daemon
             // writes just after the first child exits) and terminate, so the
-            // foreground `nostrd start`/`restart` returns with a clear
+            // foreground `nostrfy start`/`restart` returns with a clear
             // message instead of silently.
             daemonize::Outcome::Parent(result) => {
                 result.map_err(|e| Error::Config(format!("failed to daemonize: {e}")))?;
                 match wait_for_pid_file(&cfg.daemon.pid_file) {
-                    Some(pid) => print_line(&format!("nostrd started (pid {pid})")),
-                    None => print_line("nostrd started"),
+                    Some(pid) => print_line(&format!("nostrfy started (pid {pid})")),
+                    None => print_line("nostrfy started"),
                 }
                 flush_stdout();
                 std::process::exit(0);
@@ -232,11 +232,11 @@ impl Cli {
         let pid = match running_pid(&self.load_config()?.daemon.pid_file) {
             Some(pid) => pid,
             None => {
-                print_line("nostrd is not running");
+                print_line("nostrfy is not running");
                 return Ok(());
             }
         };
-        print_line(&format!("stopping nostrd (pid {pid})"));
+        print_line(&format!("stopping nostrfy (pid {pid})"));
         // SAFETY: `kill` only touches the targeted process id.
         let ret = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
         if ret != 0 {
@@ -250,7 +250,7 @@ impl Cli {
                 "daemon (pid {pid}) did not stop in time"
             )));
         }
-        print_line("nostrd stopped");
+        print_line("nostrfy stopped");
         Ok(())
     }
 
@@ -258,7 +258,7 @@ impl Cli {
         let cfg = self.load_config()?;
         if !cfg.daemon.stats_file.exists() {
             return Err(Error::Config(
-                "nostrd is not running (no stats file)".into(),
+                "nostrfy is not running (no stats file)".into(),
             ));
         }
         let raw = std::fs::read_to_string(&cfg.daemon.stats_file)?;
@@ -267,14 +267,14 @@ impl Cli {
         Ok(())
     }
 
-    /// `nostrd blossom allow/deny/list`: manages the Blossom upload allowlist.
+    /// `nostrfy blossom allow/deny/list`: manages the Blossom upload allowlist.
     /// The list lives in the relay database (LMDB) — never the config file —
     /// so it survives restarts and is shared with the running daemon. The
     /// daemon is reloaded via SIGHUP so changes apply without a restart.
     fn blossom_allowlist(&self, action: &BlossomAction) -> Result<()> {
         if !self.config.exists() {
             return Err(Error::Config(format!(
-                "{} not found; run 'nostrd init' first",
+                "{} not found; run 'nostrfy init' first",
                 self.config.display()
             )));
         }
@@ -332,7 +332,7 @@ impl Cli {
                     print_line(&format!("the running daemon (pid {pid}) was reloaded"));
                 } else {
                     print_line(
-                        "warning: could not signal the running daemon; run 'nostrd restart' to apply",
+                        "warning: could not signal the running daemon; run 'nostrfy restart' to apply",
                     );
                 }
             }
@@ -343,14 +343,14 @@ impl Cli {
         Ok(())
     }
 
-    /// `nostrd relay allow/deny/list`: manages the relay pubkey allow/deny
+    /// `nostrfy relay allow/deny/list`: manages the relay pubkey allow/deny
     /// lists. They live in the relay database (LMDB) — never the config
     /// file — and the daemon is reloaded via SIGHUP so changes apply
     /// immediately.
     fn relay_access(&self, action: &RelayAction) -> Result<()> {
         if !self.config.exists() {
             return Err(Error::Config(format!(
-                "{} not found; run 'nostrd init' first",
+                "{} not found; run 'nostrfy init' first",
                 self.config.display()
             )));
         }
@@ -419,7 +419,7 @@ impl Cli {
                     print_line(&format!("the running daemon (pid {pid}) was reloaded"));
                 } else {
                     print_line(
-                        "warning: could not signal the running daemon; run 'nostrd restart' to apply",
+                        "warning: could not signal the running daemon; run 'nostrfy restart' to apply",
                     );
                 }
             }
@@ -430,7 +430,7 @@ impl Cli {
         Ok(())
     }
 
-    /// `nostrd genkey`: generates a relay secret key (for NIP-29 group
+    /// `nostrfy genkey`: generates a relay secret key (for NIP-29 group
     /// metadata and NIP-43 membership events) and writes it into
     /// `relay.private_key` of the config file, preserving the rest of the
     /// file. When `relay.private_key` is already set, the operator is asked
@@ -438,7 +438,7 @@ impl Cli {
     fn genkey(&self) -> Result<()> {
         if !self.config.exists() {
             return Err(Error::Config(format!(
-                "{} not found; run 'nostrd init' first",
+                "{} not found; run 'nostrfy init' first",
                 self.config.display()
             )));
         }
@@ -503,7 +503,7 @@ fn open_db(cfg: &Config) -> Result<crate::db::DbClient> {
     )
 }
 
-/// Prints a line to stdout, ignoring broken-pipe errors (e.g. `nostrd stats
+/// Prints a line to stdout, ignoring broken-pipe errors (e.g. `nostrfy stats
 /// | head`): a closed pipe must not panic the process like `println!` does.
 fn print_line(text: &str) {
     use std::io::Write;
@@ -726,7 +726,7 @@ fn process_alive(pid: u32) -> bool {
     // Best-effort name check: a reused pid running a different program is
     // not our daemon.
     match process_name(pid) {
-        Some(name) => name == "nostrd",
+        Some(name) => name == "nostrfy",
         None => true,
     }
 }
@@ -807,15 +807,15 @@ mod tests {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = std::env::temp_dir()
-            .join("nostrd-genkey-test")
+            .join("nostrfy-genkey-test")
             .join(format!("{:x}-{id}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let config_path = dir.join("nostrd.toml");
+        let config_path = dir.join("nostrfy.toml");
         std::fs::write(
             &config_path,
             "[relay]
-name = \"nostrd\"\n",
+name = \"nostrfy\"\n",
         )
         .unwrap();
         let mut cli = Cli {
@@ -843,23 +843,23 @@ name = \"nostrd\"\n",
 
     #[test]
     fn replaces_existing_private_key_preserving_comments() {
-        let text = "# comment\n[relay]\nname = \"nostrd\"\n# my key\nprivate_key = \"\"\npublic_url = \"wss://x\"\n";
+        let text = "# comment\n[relay]\nname = \"nostrfy\"\n# my key\nprivate_key = \"\"\npublic_url = \"wss://x\"\n";
         let out = set_private_key_in_text(text, KEY);
         assert!(out.contains(&format!("private_key = \"{KEY}\"")));
         assert!(!out.contains("private_key = \"\""));
         // Comments and unrelated lines survive.
         assert!(out.contains("# comment"));
         assert!(out.contains("# my key"));
-        assert!(out.contains("name = \"nostrd\""));
+        assert!(out.contains("name = \"nostrfy\""));
         assert!(out.contains("public_url = \"wss://x\""));
     }
 
     #[test]
     fn inserts_private_key_after_relay_header() {
-        let text = "[relay]\nname = \"nostrd\"\n\n[server]\nport = 8080\n";
+        let text = "[relay]\nname = \"nostrfy\"\n\n[server]\nport = 8080\n";
         let out = set_private_key_in_text(text, KEY);
         assert!(out.contains(&format!(
-            "[relay]\nprivate_key = \"{KEY}\"\nname = \"nostrd\""
+            "[relay]\nprivate_key = \"{KEY}\"\nname = \"nostrfy\""
         )));
         assert!(out.contains("[server]\nport = 8080"));
     }
@@ -901,7 +901,7 @@ name = \"nostrd\"\n",
         // recognized as the `[relay]` section; before the fix the key was
         // appended as a *second* `[relay]` section, breaking the file with
         // a duplicate key.
-        let text = "[relay]# my relay\nname = \"nostrd\"\n[server]\nport = 8080\n";
+        let text = "[relay]# my relay\nname = \"nostrfy\"\n[server]\nport = 8080\n";
         let out = set_private_key_in_text(text, KEY);
         assert!(out.contains(&format!("[relay]# my relay\nprivate_key = \"{KEY}\"")));
         assert!(out.contains("[server]\nport = 8080"));

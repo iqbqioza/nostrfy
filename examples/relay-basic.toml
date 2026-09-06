@@ -1,22 +1,22 @@
-# nostrd.toml — basic relay (minimal setup)
+# nostrfy.toml — basic relay (minimal setup)
 #
 # A plain general-purpose relay: every NIP is enabled with the built-in
 # defaults, suitable for a personal or small community relay on a regular
-# VPS. Copy this file to nostrd.toml, adjust the values, then:
+# VPS. Copy this file to nostrfy.toml, adjust the values, then:
 #
-#   nostrd check          # validate the configuration
-#   nostrd start          # run it (daemonizes; use --foreground to test)
+#   nostrfy check          # validate the configuration
+#   nostrfy start          # run it (daemonizes; use --foreground to test)
 #
 # See docs/MANUAL.md for the full reference.
 
 [relay]
-name = "nostrd"
+name = "nostrfy"
 description = "A minimal and stable Nostr relay"
 pubkey = ""                 # your public key (npub or hex), shown in NIP-11
 contact = ""                # admin contact, shown in NIP-11
 icon = ""                   # relay icon URL, shown in NIP-11
 post_policy = ""            # a NIP-01 filter to accept only matching events
-private_key = ""            # run `nostrd genkey` to generate one
+private_key = ""            # run `nostrfy genkey` to generate one
 public_url = ""             # e.g. "wss://relay.example.com" behind a proxy
 enabled_nips = []           # empty = all supported NIPs are enabled
 disabled_nips = []          # disable specific NIPs, e.g. [50]
@@ -37,8 +37,8 @@ search_index = true         # NIP-50 word index (search works without it too)
 reader_threads = 2
 
 [daemon]
-pid_file = "./nostrd.pid"
-log_file = "./nostrd.log"
+pid_file = "./nostrfy.pid"
+log_file = "./nostrfy.log"
 
 [blossom]
 host = ""                   # empty = the Blossom file server is disabled

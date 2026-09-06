@@ -1,12 +1,12 @@
-# nostrd Manual
+# nostrfy Manual
 
-This manual explains every feature of **nostrd**, a Nostr relay server, step by step — from installation to everyday operation.
+This manual explains every feature of **nostrfy**, a Nostr relay server, step by step — from installation to everyday operation.
 
 ## Table of Contents
 
-1. [What is nostrd](#1-what-is-nostrd)
+1. [What is nostrfy](#1-what-is-nostrfy)
 2. [Installation](#2-installation)
-3. [The Config File (nostrd.toml)](#3-the-config-file-nostrdtoml)
+3. [The Config File (nostrfy.toml)](#3-the-config-file-nostrfytoml)
 4. [Starting and Stopping](#4-starting-and-stopping)
 5. [Command Reference](#5-command-reference)
 6. [REST API](#6-rest-api)
@@ -23,9 +23,9 @@ This manual explains every feature of **nostrd**, a Nostr relay server, step by 
 
 ---
 
-## 1. What is nostrd
+## 1. What is nostrfy
 
-nostrd is a **relay server** for the [Nostr](https://nostr.com/) protocol. It stores events (posts, reactions, profiles, ...) sent by clients (nos2x, Amethyst, Damus, Iris, and others) and delivers them in response to subscription requests.
+nostrfy is a **relay server** for the [Nostr](https://nostr.com/) protocol. It stores events (posts, reactions, profiles, ...) sent by clients (nos2x, Amethyst, Damus, Iris, and others) and delivers them in response to subscription requests.
 
 Key features:
 
@@ -45,7 +45,7 @@ Key features:
 
 ### Low-spec VPS (0.25 vCPU / 512 MB)
 
-nostrd is verified to run stably even when the database exceeds RAM. The LMDB map is a **sparse 1 TiB virtual reservation** — physical disk grows only with the data written — and the process memory stays flat: a relay with a 252 MB database held **7.9 MB of private RSS** (the rest is reclaimable file cache the kernel evicts under pressure).
+nostrfy is verified to run stably even when the database exceeds RAM. The LMDB map is a **sparse 1 TiB virtual reservation** — physical disk grows only with the data written — and the process memory stays flat: a relay with a 252 MB database held **7.9 MB of private RSS** (the rest is reclaimable file cache the kernel evicts under pressure).
 
 For a tiny VPS, one setting makes the biggest difference:
 
@@ -64,12 +64,12 @@ If you need search on a tiny VPS, keep `search_index = true` and lower `max_inde
 ### Building
 
 ```bash
-git clone https://github.com/iqbqioza/nostrd.git
-cd nostrd
+git clone https://github.com/iqbqioza/nostrfy.git
+cd nostrfy
 cargo build --release
 ```
 
-When the build finishes, the binary is at `target/release/nostrd`.
+When the build finishes, the binary is at `target/release/nostrfy`.
 
 ### Installing a pre-built binary
 
@@ -79,12 +79,12 @@ both OSes — it detects the platform, downloads the matching binary and
 verifies its checksum:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/iqbqioza/nostrd/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/iqbqioza/nostrfy/main/install.sh | sh
 ```
 
 #### FreeBSD
 
-nostrd builds and runs on FreeBSD (13.x and 14.x, amd64). Install Rust
+nostrfy builds and runs on FreeBSD (13.x and 14.x, amd64). Install Rust
 and build with:
 
 ```sh
@@ -99,13 +99,13 @@ Platform notes:
   uses `/proc/<pid>/comm` on Linux), so a stale pid file whose pid was
   reused by another program is detected on both platforms.
 - `daemon.mode` forks like on Linux; the standard double-fork daemon
-  works with the default `rc` integration (`service nostrd start`).
+  works with the default `rc` integration (`service nostrfy start`).
 - Blossom's `min_free_bytes` check uses `statvfs`, which both systems
   provide; no other platform-specific code is used (the relay itself is
   plain async Rust on top of tokio).
 
 ```bash
-./target/release/nostrd --version
+./target/release/nostrfy --version
 ```
 
 ### Running on port 80
@@ -114,29 +114,29 @@ Regular users cannot bind port 80. Either run with `sudo`, or use a higher port 
 
 ```bash
 # Example: run on port 8080 (works for regular users)
-./target/release/nostrd --config nostrd.toml start
+./target/release/nostrfy --config nostrfy.toml start
 ```
 
 ---
 
-## 3. The Config File (nostrd.toml)
+## 3. The Config File (nostrfy.toml)
 
-Configuration lives in a **TOML** file called `nostrd.toml`.
+Configuration lives in a **TOML** file called `nostrfy.toml`.
 
 ### Creating the initial config file
 
 ```bash
-./target/release/nostrd --config nostrd.toml init
+./target/release/nostrfy --config nostrfy.toml init
 ```
 
-This generates `nostrd.toml`. Open it in a text editor and adjust it — every option is commented.
+This generates `nostrfy.toml`. Open it in a text editor and adjust it — every option is commented.
 
 > For the complete option-by-option reference, see [Configuration Reference (CONFIGURATION.md)](CONFIGURATION.md).
 
 ### Validating the config
 
 ```bash
-./target/release/nostrd --config nostrd.toml check
+./target/release/nostrfy --config nostrfy.toml check
 ```
 
 If anything is wrong, it tells you exactly what. It is strongly recommended to run this before starting.
@@ -147,7 +147,7 @@ If anything is wrong, it tells you exactly what. It is strongly recommended to r
 
 | Option | Description | Default |
 | --- | --- | --- |
-| `name` | Relay name (shown to clients via NIP-11) | `nostrd` |
+| `name` | Relay name (shown to clients via NIP-11) | `nostrfy` |
 | `description` | Relay description | A fixed description |
 | `pubkey` | Administrator public key (64 hex chars) | empty |
 | `contact` | Administrator contact (URL or email) | empty |
@@ -170,7 +170,7 @@ If anything is wrong, it tells you exactly what. It is strongly recommended to r
 | `enabled_nip78_auth` | Require NIP-42 AUTH before accepting kind 78/30078 events and serve them only to the authenticated owner | `true` |
 | `enabled_command_events` | Execute kind:1 operator commands (authored by `relay.private_key`) that edit the relay/blossom allow lists, answered with kind:1111 events | `false` |
 
-To generate a secret key, use the `nostrd genkey` command (see [5. Command Reference](#5-command-reference)).
+To generate a secret key, use the `nostrfy genkey` command (see [5. Command Reference](#5-command-reference)).
 
 #### `[server]` — Server settings
 
@@ -188,7 +188,7 @@ To generate a secret key, use the `nostrd genkey` command (see [5. Command Refer
 
 > **Note**: `enabled_nip78_auth = true` (the default) makes kind 78/30078 events private: they require NIP-42 AUTH to publish, and are served only to the authenticated owner (the event author). Unauthenticated subscribers, negentropy syncs and the REST API do not see them. Requires NIP-42 to be enabled; set `enabled_nip78_auth = false` for the legacy public behavior.
 
-> **Note**: `enabled_command_events = true` lets the admin manage the relay/blossom access lists by publishing a kind:1 event signed with the admin pubkey (`relay.pubkey`), e.g. content `/relay deny npub1...` or `/blossom allow npub1...` (the pubkey may carry the `nostr:` URI prefix). The relay executes the command immediately (persisted like `nostrd relay allow/deny`), and answers with a kind:1111 event signed with `relay.private_key`, tagged `e` to the command and `p` to the admin — served publicly, so the result is visible even when NIP-42 is enabled. Only the admin can issue commands. Off by default.
+> **Note**: `enabled_command_events = true` lets the admin manage the relay/blossom access lists by publishing a kind:1 event signed with the admin pubkey (`relay.pubkey`), e.g. content `/relay deny npub1...` or `/blossom allow npub1...` (the pubkey may carry the `nostr:` URI prefix). The relay executes the command immediately (persisted like `nostrfy relay allow/deny`), and answers with a kind:1111 event signed with `relay.private_key`, tagged `e` to the command and `p` to the admin — served publicly, so the result is visible even when NIP-42 is enabled. Only the admin can issue commands. Off by default.
 
 #### `[rpc]` — NIP-86 management RPC
 
@@ -251,9 +251,9 @@ To generate a secret key, use the `nostrd genkey` command (see [5. Command Refer
 
 | Option | Description | Default |
 | --- | --- | --- |
-| `pid_file` | PID file path | `./nostrd.pid` |
-| `log_file` | Log file path | `./nostrd.log` |
-| `stats_file` | Statistics file path | `./nostrd.stats.json` |
+| `pid_file` | PID file path | `./nostrfy.pid` |
+| `log_file` | Log file path | `./nostrfy.log` |
+| `stats_file` | Statistics file path | `./nostrfy.stats.json` |
 | `stats_interval_secs` | Statistics write interval | `5` |
 | `max_log_size_bytes` | Log rotation size (0 = no rotation) | 50 MB |
 | `max_log_files` | Number of rotated log files to keep | `5` |
@@ -267,7 +267,7 @@ To generate a secret key, use the `nostrd genkey` command (see [5. Command Refer
 | `allowed_kinds` | Kind allowlist. When non-empty, only these kinds are accepted |
 | `blocked_ips` | IP addresses to refuse connections from |
 
-> **Note**: The pubkey allow/deny lists are **not** config keys — they live in the relay database and are managed with `nostrd relay allow/deny` (see [Section 7](#7-nip-86-management-api) / the blossom-style CLI), or at runtime via command events (`/relay allow|deny`, `/blossom allow|deny`). A denied pubkey is always rejected when **publishing**, even with `restrict_relay = false`, and is **never served either**: subscriptions (REQ), COUNT and negentropy syncs are refused with `restricted:`, and live events stop being delivered to its connections — immediately, without disconnecting them. With `restrict_relay = true`, reading is narrowed to allow-listed pubkeys too (anonymous connections are refused as well). The admin pubkey (`relay.pubkey`) and the relay's own pubkey (`relay.private_key`) are exempt from the lists, so the operator can always publish command events and read the replies.
+> **Note**: The pubkey allow/deny lists are **not** config keys — they live in the relay database and are managed with `nostrfy relay allow/deny` (see [Section 7](#7-nip-86-management-api) / the blossom-style CLI), or at runtime via command events (`/relay allow|deny`, `/blossom allow|deny`). A denied pubkey is always rejected when **publishing**, even with `restrict_relay = false`, and is **never served either**: subscriptions (REQ), COUNT and negentropy syncs are refused with `restricted:`, and live events stop being delivered to its connections — immediately, without disconnecting them. With `restrict_relay = true`, reading is narrowed to allow-listed pubkeys too (anonymous connections are refused as well). The admin pubkey (`relay.pubkey`) and the relay's own pubkey (`relay.private_key`) are exempt from the lists, so the operator can always publish command events and read the replies.
 
 ---
 
@@ -276,28 +276,28 @@ To generate a secret key, use the `nostrd genkey` command (see [5. Command Refer
 ### Start (as a daemon)
 
 ```bash
-./target/release/nostrd --config nostrd.toml start
-# => nostrd started (pid 12345)
+./target/release/nostrfy --config nostrfy.toml start
+# => nostrfy started (pid 12345)
 ```
 
 ### Start (foreground, in the terminal)
 
 ```bash
-./target/release/nostrd --config nostrd.toml start --foreground
+./target/release/nostrfy --config nostrfy.toml start --foreground
 ```
 
 ### Stop
 
 ```bash
-./target/release/nostrd --config nostrd.toml stop
-# => stopping nostrd (pid 12345)
-# => nostrd stopped
+./target/release/nostrfy --config nostrfy.toml stop
+# => stopping nostrfy (pid 12345)
+# => nostrfy stopped
 ```
 
 ### Restart (re-reads the config)
 
 ```bash
-./target/release/nostrd --config nostrd.toml restart
+./target/release/nostrfy --config nostrfy.toml restart
 ```
 
 ### Health check
@@ -320,8 +320,8 @@ Returns the relay name, supported NIPs, limits, and more as JSON. The `supported
 After editing the config file, a **SIGHUP** reloads it without a full restart:
 
 ```bash
-# The PID is written to nostrd.pid
-kill -HUP $(cat nostrd.pid)
+# The PID is written to nostrfy.pid
+kill -HUP $(cat nostrfy.pid)
 ```
 
 > Some settings are fixed at startup and are **not** changed by a reload (`api_host`, `ws_paths`, `metrics_enabled`, LiveKit settings, `private_key`, ...). Use `restart` for those; the log warns you when this applies.
@@ -330,24 +330,24 @@ kill -HUP $(cat nostrd.pid)
 
 ## 5. Command Reference
 
-All commands accept `--config <path>` (default: `nostrd.toml`).
+All commands accept `--config <path>` (default: `nostrfy.toml`).
 
 | Command | Description |
 | --- | --- |
-| `nostrd init` | Write a default config file (refuses to overwrite an existing one) |
-| `nostrd genkey` | Generate a secret key for NIP-29 groups and write it into `relay.private_key`. Asks for confirmation (y/N) if a key already exists. Also prints the public key (the NIP-11 `self`). The config file is restricted to `0600` after the write (it now contains a secret) |
-| `nostrd init` | Write a default `nostrd.toml` and exit. The file is created `0600` — it will hold secrets later (the private key, S3 keys, the management token) |
-| `nostrd check` | Validate the config file (run before starting) |
-| `nostrd start` | Start as a daemon (`--foreground` to run in the terminal) |
-| `nostrd stop` | Stop the running daemon |
-| `nostrd restart` | Stop and start again (re-reads the config) |
-| `nostrd stats` | Show live statistics |
-| `nostrd blossom allow <pubkey>` / `deny <pubkey>` / `list` | Manage the Blossom upload allowlist (persisted in LMDB; the running relay applies it on SIGHUP) |
-| `nostrd relay allow <pubkey>` / `deny <pubkey>` / `list` | Manage the relay pubkey allow/deny lists (persisted in LMDB; a denied pubkey is always rejected when publishing and never served when reading; the running relay applies changes on SIGHUP) |
+| `nostrfy init` | Write a default config file (refuses to overwrite an existing one) |
+| `nostrfy genkey` | Generate a secret key for NIP-29 groups and write it into `relay.private_key`. Asks for confirmation (y/N) if a key already exists. Also prints the public key (the NIP-11 `self`). The config file is restricted to `0600` after the write (it now contains a secret) |
+| `nostrfy init` | Write a default `nostrfy.toml` and exit. The file is created `0600` — it will hold secrets later (the private key, S3 keys, the management token) |
+| `nostrfy check` | Validate the config file (run before starting) |
+| `nostrfy start` | Start as a daemon (`--foreground` to run in the terminal) |
+| `nostrfy stop` | Stop the running daemon |
+| `nostrfy restart` | Stop and start again (re-reads the config) |
+| `nostrfy stats` | Show live statistics |
+| `nostrfy blossom allow <pubkey>` / `deny <pubkey>` / `list` | Manage the Blossom upload allowlist (persisted in LMDB; the running relay applies it on SIGHUP) |
+| `nostrfy relay allow <pubkey>` / `deny <pubkey>` / `list` | Manage the relay pubkey allow/deny lists (persisted in LMDB; a denied pubkey is always rejected when publishing and never served when reading; the running relay applies changes on SIGHUP) |
 
 ### Inbox/outbox subscription filters
 
-nostrd extends the REQ filter syntax with two convenience keys for the inbox/outbox routing model (a nostrd extension — not part of any NIP):
+nostrfy extends the REQ filter syntax with two convenience keys for the inbox/outbox routing model (a nostrfy extension — not part of any NIP):
 
 - `"outbox": "<pubkey>"` — expands to `"authors": ["<pubkey>"]`: only events **authored by** the pubkey (stored and live).
 - `"inbox": "<pubkey>"` — expands to `"#p": ["<pubkey>"]`: only events **addressed to** the pubkey (mentions, replies, zaps and DMs that `p`-tag it).
@@ -365,7 +365,7 @@ The inbox/outbox endpoints are also write-restricted: `/outbox` accepts only eve
 
 ## 6. REST API
 
-nostrd provides a read-only REST API at `GET /api/v1/...`.
+nostrfy provides a read-only REST API at `GET /api/v1/...`.
 
 > If `server.api_host` is set, only requests with that Host header can use the API (e.g. `curl -H "Host: api.example.com" ...`).
 
@@ -536,11 +536,11 @@ Changes made at runtime — NIP-86 `allowkind`/`disallowkind`, or a `SIGHUP` rel
 
 ## 9. NIP-29 Groups
 
-nostrd supports NIP-29 (relay-based groups): closed chat spaces where only members can write.
+nostrfy supports NIP-29 (relay-based groups): closed chat spaces where only members can write.
 
 ### Enabling groups
 
-1. Run `nostrd genkey` to set `relay.private_key` (**required** — group metadata is not generated without it)
+1. Run `nostrfy genkey` to set `relay.private_key` (**required** — group metadata is not generated without it)
 2. `restart` the relay
 
 ### How groups work (overview)
@@ -596,7 +596,7 @@ curl -i http://127.0.0.1:8080/.well-known/nip29/livekit
 
 ## 11. Blossom File Server (Media Hosting)
 
-nostrd can act as a [Blossom](https://github.com/hzrd149/blossom) blob server: clients upload files addressed by their SHA-256 hash, and the relay serves them back. Like the REST API, the Blossom server lives on a dedicated hostname on the same port.
+nostrfy can act as a [Blossom](https://github.com/hzrd149/blossom) blob server: clients upload files addressed by their SHA-256 hash, and the relay serves them back. Like the REST API, the Blossom server lives on a dedicated hostname on the same port.
 
 ### 11.1 Configuration
 
@@ -618,7 +618,7 @@ s3_access_key = "..."
 s3_secret_key = "..."
 ```
 
-Point `media.example.com` (and only that hostname) at the same port in your reverse proxy, then restart (`nostrd restart`). `GET /` on that host answers with the Blossom server info document.
+Point `media.example.com` (and only that hostname) at the same port in your reverse proxy, then restart (`nostrfy restart`). `GET /` on that host answers with the Blossom server info document.
 
 ### 11.2 Storage layout
 
@@ -681,9 +681,9 @@ restrict_uploads = true
 The allowlist itself is **not** stored in the config file — it lives in the relay database (LMDB) and is managed with dedicated commands (no restart needed; the running daemon is reloaded automatically):
 
 ```sh
-nostrd blossom allow npub1...          # allow a pubkey (npub1... or hex)
-nostrd blossom deny npub1...          # revoke a pubkey
-nostrd blossom list                  # show the list and restrict_uploads
+nostrfy blossom allow npub1...          # allow a pubkey (npub1... or hex)
+nostrfy blossom deny npub1...          # revoke a pubkey
+nostrfy blossom list                  # show the list and restrict_uploads
 ```
 
 Uploads from unlisted pubkeys are rejected with `403`. The list survives restarts and is shared with the running daemon via a database reload (SIGHUP). It is stored under a fixed key of the existing `access` table — no new LMDB table is created, so databases from older versions remain compatible.
@@ -700,7 +700,7 @@ Uploads from unlisted pubkeys are rejected with `403`. The list survives restart
 
 ## 11b. Running Multiple Instances
 
-nostrd supports several independent relays on one server (different ports). Each instance needs its **own**:
+nostrfy supports several independent relays on one server (different ports). Each instance needs its **own**:
 
 - `server.port` — the listen port
 - `[daemon] pid_file` / `log_file` / `stats_file` — **shared values make the second instance refuse to start with `already running`**
@@ -710,44 +710,44 @@ nostrd supports several independent relays on one server (different ports). Each
 Example:
 
 ```toml
-# /etc/nostrd/a.toml — instance A
+# /etc/nostrfy/a.toml — instance A
 [server]
 port = 8080
 
 [database]
-path = "/var/lib/nostrd-a"
+path = "/var/lib/nostrfy-a"
 
 [daemon]
-pid_file = "/var/run/nostrd-a.pid"
-log_file = "/var/log/nostrd-a.log"
-stats_file = "/var/lib/nostrd-a/stats.json"
+pid_file = "/var/run/nostrfy-a.pid"
+log_file = "/var/log/nostrfy-a.log"
+stats_file = "/var/lib/nostrfy-a/stats.json"
 ```
 
 ```toml
-# /etc/nostrd/b.toml — instance B
+# /etc/nostrfy/b.toml — instance B
 [server]
 port = 8081
 
 [database]
-path = "/var/lib/nostrd-b"
+path = "/var/lib/nostrfy-b"
 
 [daemon]
-pid_file = "/var/run/nostrd-b.pid"
-log_file = "/var/log/nostrd-b.log"
-stats_file = "/var/lib/nostrd-b/stats.json"
+pid_file = "/var/run/nostrfy-b.pid"
+log_file = "/var/log/nostrfy-b.log"
+stats_file = "/var/lib/nostrfy-b/stats.json"
 ```
 
-Each instance is managed with its own config: `nostrd --config /etc/nostrd/a.toml start` etc.
+Each instance is managed with its own config: `nostrfy --config /etc/nostrfy/a.toml start` etc.
 
 ## 12. Logs and Statistics
 
 ### Logs
 
-The daemon writes to `daemon.log_file`. When the file grows past `max_log_size_bytes`, it rotates automatically (`nostrd.log.1`, `nostrd.log.2`, ... up to `max_log_files` generations).
+The daemon writes to `daemon.log_file`. When the file grows past `max_log_size_bytes`, it rotates automatically (`nostrfy.log.1`, `nostrfy.log.2`, ... up to `max_log_files` generations).
 
 ```bash
 # Follow the log
-tail -f nostrd.log
+tail -f nostrfy.log
 ```
 
 The log level is controlled by the `RUST_LOG` environment variable (e.g. `RUST_LOG=debug`).
@@ -755,7 +755,7 @@ The log level is controlled by the `RUST_LOG` environment variable (e.g. `RUST_L
 ### Statistics
 
 ```bash
-./target/release/nostrd stats
+./target/release/nostrfy stats
 ```
 
 Or over HTTP:
@@ -781,7 +781,7 @@ Available when `metrics_enabled = true`.
 After editing the config file, reload it without a restart:
 
 ```bash
-kill -HUP $(cat nostrd.pid)
+kill -HUP $(cat nostrfy.pid)
 ```
 
 Settings that take effect on reload: relay name/description, limits (except the HTTP-layer ones below), NIP toggles (partially), NIP-40 on/off, API concurrency, ...
@@ -823,14 +823,14 @@ has two threads; a single heavy REQ no longer stalls every query.
 Event ingestion is bound by two costs: the Schnorr signature check
 (about 30-50 µs per event) and the synchronous disk flush the LMDB
 writer performs after every commit batch. Both are tunable in
-`nostrd.toml`:
+`nostrfy.toml`:
 
 | Setting | Value | Why |
 | --- | --- | --- |
 | `database.disabled_fsync = true` | `false` | The dominant ingest cost is the fsync after each commit batch. With `disabled_fsync` the writer commits into the OS page cache (microseconds) and the kernel flushes shortly after; a power loss loses only the writes since the last flush. Start here. |
 | CPU cores | ≥ 8 vCPU | The batch `EVENT` path verifies every signature in parallel across the cores (see below) before the cheap checks run |
 
-Starting the relay with `RUST_LOG=nostrd=debug` shows the config the
+Starting the relay with `RUST_LOG=nostrfy=debug` shows the config the
 instance is actually using, and real-world tuning should be measured,
 not guessed; the per-connection drop pattern (many clients posting
 events) is what a relay sees in production.

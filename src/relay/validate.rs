@@ -482,7 +482,7 @@ mod tests {
             let mut cfg = Config::default();
             cfg.database.map_size = 16 * 1024 * 1024;
             cfg.database.max_map_size = 256 * 1024 * 1024;
-            cfg.database.path = std::env::temp_dir().join("nostrd-vanish-test");
+            cfg.database.path = std::env::temp_dir().join("nostrfy-vanish-test");
             let _ = std::fs::remove_dir_all(&cfg.database.path);
             let db = crate::db::DbClient::open(
                 &cfg.database,
@@ -528,7 +528,7 @@ mod tests {
             cfg.relay.max_events_per_min_per_pubkey = 3;
             cfg.database.map_size = 16 * 1024 * 1024;
             cfg.database.max_map_size = 256 * 1024 * 1024;
-            cfg.database.path = std::env::temp_dir().join("nostrd-rate-test");
+            cfg.database.path = std::env::temp_dir().join("nostrfy-rate-test");
             let _ = std::fs::remove_dir_all(&cfg.database.path);
             let db = crate::db::DbClient::open(
                 &cfg.database,
@@ -608,7 +608,7 @@ mod tests {
             let mut cfg = Config::default();
             cfg.database.map_size = 16 * 1024 * 1024;
             cfg.database.max_map_size = 256 * 1024 * 1024;
-            cfg.database.path = std::env::temp_dir().join("nostrd-rate-map-test");
+            cfg.database.path = std::env::temp_dir().join("nostrfy-rate-map-test");
             let _ = std::fs::remove_dir_all(&cfg.database.path);
             let db = crate::db::DbClient::open(
                 &cfg.database,
@@ -686,7 +686,7 @@ mod tests {
             let mut cfg = Config::default();
             cfg.database.map_size = 16 * 1024 * 1024;
             cfg.database.max_map_size = 256 * 1024 * 1024;
-            cfg.database.path = std::env::temp_dir().join("nostrd-git-test-disabled");
+            cfg.database.path = std::env::temp_dir().join("nostrfy-git-test-disabled");
             let _ = std::fs::remove_dir_all(&cfg.database.path);
             let db = crate::db::DbClient::open(
                 &cfg.database,
@@ -742,7 +742,7 @@ mod tests {
             // enable_git = true: the kinds are accepted.
             let mut cfg2 = Config::default();
             cfg2.relay.enabled_git = true;
-            cfg2.database.path = std::env::temp_dir().join("nostrd-git-test-enabled");
+            cfg2.database.path = std::env::temp_dir().join("nostrfy-git-test-enabled");
             let _ = std::fs::remove_dir_all(&cfg2.database.path);
             let db2 = crate::db::DbClient::open(
                 &cfg2.database,
@@ -794,7 +794,7 @@ mod tests {
             let mut cfg = Config::default();
             cfg.database.map_size = 16 * 1024 * 1024;
             cfg.database.max_map_size = 256 * 1024 * 1024;
-            cfg.database.path = std::env::temp_dir().join("nostrd-ephemeral-test-allow");
+            cfg.database.path = std::env::temp_dir().join("nostrfy-ephemeral-test-allow");
             let _ = std::fs::remove_dir_all(&cfg.database.path);
             let db = crate::db::DbClient::open(
                 &cfg.database,
@@ -851,7 +851,7 @@ mod tests {
             // With reject_ephemeral = true: ephemeral range is blocked.
             let mut cfg2 = Config::default();
             cfg2.relay.reject_ephemeral = true;
-            cfg2.database.path = std::env::temp_dir().join("nostrd-ephemeral-test-reject");
+            cfg2.database.path = std::env::temp_dir().join("nostrfy-ephemeral-test-reject");
             let _ = std::fs::remove_dir_all(&cfg2.database.path);
             let db2 = crate::db::DbClient::open(
                 &cfg2.database,
@@ -952,7 +952,7 @@ mod tests {
             cfg.relay.reject_ephemeral = true;
             cfg.database.map_size = 16 * 1024 * 1024;
             cfg.database.max_map_size = 256 * 1024 * 1024;
-            cfg.database.path = std::env::temp_dir().join("nostrd-ephemeral-validate-base");
+            cfg.database.path = std::env::temp_dir().join("nostrfy-ephemeral-validate-base");
             let _ = std::fs::remove_dir_all(&cfg.database.path);
             let db = crate::db::DbClient::open(
                 &cfg.database,
@@ -1007,7 +1007,7 @@ mod tests {
             let mut cfg = Config::default();
             cfg.database.map_size = 16 * 1024 * 1024;
             cfg.database.max_map_size = 256 * 1024 * 1024;
-            cfg.database.path = std::env::temp_dir().join("nostrd-vanish-test");
+            cfg.database.path = std::env::temp_dir().join("nostrfy-vanish-test");
             let _ = std::fs::remove_dir_all(&cfg.database.path);
             let db = crate::db::DbClient::open(
                 &cfg.database,

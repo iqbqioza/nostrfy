@@ -1,19 +1,19 @@
 # =============================================================================
-# nostrd configuration template
+# nostrfy configuration template
 #
-# Copy this file to `nostrd.toml` (or pass `--config <path>` to the CLI) and
+# Copy this file to `nostrfy.toml` (or pass `--config <path>` to the CLI) and
 # adjust the values. Every setting is optional: missing entries fall back to
 # the defaults shown here, so a minimal file with a handful of overrides is
 # enough to run the relay.
 #
 # Commands:
-#   nostrd start    start as a daemon (add --foreground to run in the shell)
-#   nostrd restart  stop and start again (reloads nostrd.toml)
-#   nostrd stop     stop the running daemon
-#   nostrd stats    show live statistics of the running daemon
-#   nostrd check    validate this file and exit
-#   nostrd init     write a default configuration and exit
-#   nostrd genkey   generate a relay secret key (NIP-29) and write it into
+#   nostrfy start    start as a daemon (add --foreground to run in the shell)
+#   nostrfy restart  stop and start again (reloads nostrfy.toml)
+#   nostrfy stop     stop the running daemon
+#   nostrfy stats    show live statistics of the running daemon
+#   nostrfy check    validate this file and exit
+#   nostrfy init     write a default configuration and exit
+#   nostrfy genkey   generate a relay secret key (NIP-29) and write it into
 #                   relay.private_key of this file (confirms overwrite if set)
 #
 # Sending SIGHUP to the daemon reloads this file at runtime: most limits,
@@ -33,7 +33,7 @@
 # -----------------------------------------------------------------------------
 [relay]
 # Human-readable relay name.
-name = "nostrd"
+name = "nostrfy"
 
 # Short description of the relay.
 description = "A minimal and stable Nostr relay"
@@ -56,7 +56,7 @@ post_policy = ""
 # 39001 admins / 39002 members snapshots) and NIP-43 role/membership events,
 # and its pubkey is advertised as the NIP-11 `self` field. Without a key,
 # NIP-29 groups still work but the relay cannot generate the 39000-39005
-# snapshots at group creation. Generate one with `nostrd genkey`.
+# snapshots at group creation. Generate one with `nostrfy genkey`.
 private_key = ""
 
 # Public URL of this relay as seen by clients (e.g. "wss://relay.example.com").
@@ -113,7 +113,7 @@ require_auth = false
 
 # Send the NIP-42 AUTH challenge to every new connection. The challenge is
 # only ever sent at connect time, so `require_auth = true` with this set to
-# false is a total lockout (no client can authenticate); `nostrd check`
+# false is a total lockout (no client can authenticate); `nostrfy check`
 # warns about the combination.
 send_auth_challenge = true
 
@@ -373,14 +373,14 @@ max_db_queue_events = 262144
 # Daemon
 # -----------------------------------------------------------------------------
 [daemon]
-# PID file used by `nostrd start/stop/restart`.
-pid_file = "./nostrd.pid"
+# PID file used by `nostrfy start/stop/restart`.
+pid_file = "./nostrfy.pid"
 
 # Log file (stdout/stderr of the daemon).
-log_file = "./nostrd.log"
+log_file = "./nostrfy.log"
 
-# File written periodically with the relay statistics (read by `nostrd stats`).
-stats_file = "./nostrd.stats.json"
+# File written periodically with the relay statistics (read by `nostrfy stats`).
+stats_file = "./nostrfy.stats.json"
 
 # Interval in seconds between statistics file writes.
 stats_interval_secs = 5
@@ -412,7 +412,7 @@ max_upload_bytes = 20971520        # 20 MiB max upload size
 min_free_bytes = 33554432         # refuse uploads (507) while the local disk has
                                     # less than this many free bytes; 0 disables
 restrict_uploads = false            # only allowlisted pubkeys may upload
-                                    # (list managed via 'nostrd blossom allow/deny')
+                                    # (list managed via 'nostrfy blossom allow/deny')
 s3_endpoint = ""                   # e.g. "https://<account>.r2.cloudflarestorage.com"
 s3_region = "auto"                 # R2 uses "auto"; AWS uses e.g. "us-east-1"
 s3_bucket = ""                     # the "bucket" of bucket/{npub1}/{file}
@@ -421,7 +421,7 @@ s3_secret_key = ""
 [access]
 # true = only allow-listed pubkeys may publish. The allow/deny lists are
 # NOT config keys: they live in the relay database (LMDB) and are managed
-# with `nostrd relay allow/deny`. A denied pubkey is always rejected, even
+# with `nostrfy relay allow/deny`. A denied pubkey is always rejected, even
 # with restrict_relay = false.
 restrict_relay = false
 

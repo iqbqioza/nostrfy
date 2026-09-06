@@ -500,7 +500,7 @@ fn rebuild_keeps_join_membership() {
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let path = std::env::temp_dir()
-        .join("nostrd-nip29-rebuild")
+        .join("nostrfy-nip29-rebuild")
         .join(format!("{:x}-{id}", std::process::id()));
     let _ = std::fs::remove_dir_all(&path);
     let cfg = crate::config::DatabaseConfig {
@@ -556,7 +556,7 @@ fn rebuild_ghosts_group_whose_only_surviving_events_are_relay_metadata() {
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let path = std::env::temp_dir()
-        .join("nostrd-nip29-ghost-meta")
+        .join("nostrfy-nip29-ghost-meta")
         .join(format!("{:x}-{id}", std::process::id()));
     let _ = std::fs::remove_dir_all(&path);
     let cfg = crate::config::DatabaseConfig {

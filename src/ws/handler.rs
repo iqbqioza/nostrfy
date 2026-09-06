@@ -102,7 +102,7 @@ impl super::Conn {
     /// Queues an already-parsed event for batched acceptance.
     pub(crate) async fn queue_event_value(&mut self, event: Event) {
         self.events_received_local += 1;
-        // Path-specific write policy (nostrd): `/inbox` and `/outbox` are
+        // Path-specific write policy (nostrfy): `/inbox` and `/outbox` are
         // restricted endpoints — see `write_policy_reason`.
         if let Some(reason) = self.write_policy_reason(&event).await {
             self.relay.stats.bump(&self.relay.stats.events_rejected, 1);
@@ -304,7 +304,7 @@ impl super::Conn {
         let mut filters = Vec::new();
         for f in &rest[1..] {
             let mut f = f.clone();
-            // nostrd inbox/outbox keys expand into `#p`/`authors`; an invalid
+            // nostrfy inbox/outbox keys expand into `#p`/`authors`; an invalid
             // value makes the whole subscription invalid like any other
             // malformed filter field.
             if crate::filter::rewrite_inbox_outbox(&mut f).is_err() {

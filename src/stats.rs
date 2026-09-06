@@ -1,4 +1,4 @@
-//! Shared counters reported by `nostrd stats` and the NIP-11
+//! Shared counters reported by `nostrfy stats` and the NIP-11
 //! information document.
 
 use serde_json::{Value, json};
@@ -84,103 +84,103 @@ impl Stats {
             out.push_str(&format!("{name} {value}\n"));
         };
         metric(
-            "nostrd_uptime_seconds",
+            "nostrfy_uptime_seconds",
             "Seconds since the relay started.",
             "gauge",
             unix_now().saturating_sub(self.started_at.load(Ordering::Relaxed)),
         );
         metric(
-            "nostrd_connections_active",
+            "nostrfy_connections_active",
             "Currently open WebSocket connections.",
             "gauge",
             self.connections_active.load(Ordering::Relaxed),
         );
         metric(
-            "nostrd_connections_total",
+            "nostrfy_connections_total",
             "WebSocket connections accepted since start.",
             "counter",
             self.connections_total.load(Ordering::Relaxed),
         );
         metric(
-            "nostrd_subscriptions_active",
+            "nostrfy_subscriptions_active",
             "Active subscription filters.",
             "gauge",
             self.subscriptions_active.load(Ordering::Relaxed),
         );
         metric(
-            "nostrd_subscriptions_total",
+            "nostrfy_subscriptions_total",
             "Subscriptions created since start.",
             "counter",
             self.subscriptions_total.load(Ordering::Relaxed),
         );
         metric(
-            "nostrd_events_received",
+            "nostrfy_events_received",
             "EVENT messages received since start.",
             "counter",
             self.events_received.load(Ordering::Relaxed),
         );
         metric(
-            "nostrd_events_accepted",
+            "nostrfy_events_accepted",
             "Events accepted and stored since start.",
             "counter",
             self.events_accepted.load(Ordering::Relaxed),
         );
         metric(
-            "nostrd_events_rejected",
+            "nostrfy_events_rejected",
             "Events rejected since start.",
             "counter",
             self.events_rejected.load(Ordering::Relaxed),
         );
         metric(
-            "nostrd_events_duplicate",
+            "nostrfy_events_duplicate",
             "Duplicate events dropped since start.",
             "counter",
             self.events_duplicate.load(Ordering::Relaxed),
         );
         metric(
-            "nostrd_events_deleted",
+            "nostrfy_events_deleted",
             "Events deleted (NIP-09) since start.",
             "counter",
             self.events_deleted.load(Ordering::Relaxed),
         );
         metric(
-            "nostrd_messages_in",
+            "nostrfy_messages_in",
             "WebSocket messages received since start.",
             "counter",
             self.messages_in.load(Ordering::Relaxed),
         );
         metric(
-            "nostrd_messages_out",
+            "nostrfy_messages_out",
             "WebSocket messages sent since start.",
             "counter",
             self.messages_out.load(Ordering::Relaxed),
         );
         metric(
-            "nostrd_bytes_in",
+            "nostrfy_bytes_in",
             "WebSocket bytes received since start.",
             "counter",
             self.bytes_in.load(Ordering::Relaxed),
         );
         metric(
-            "nostrd_bytes_out",
+            "nostrfy_bytes_out",
             "WebSocket bytes sent since start.",
             "counter",
             self.bytes_out.load(Ordering::Relaxed),
         );
         metric(
-            "nostrd_buffers_dropped",
+            "nostrfy_buffers_dropped",
             "Outgoing messages dropped for slow readers since start.",
             "counter",
             self.buffers_dropped.load(Ordering::Relaxed),
         );
         metric(
-            "nostrd_db_errors",
+            "nostrfy_db_errors",
             "Database errors since start.",
             "counter",
             self.db_errors.load(Ordering::Relaxed),
         );
         metric(
-            "nostrd_db_size_bytes",
+            "nostrfy_db_size_bytes",
             "Database size on disk in bytes.",
             "gauge",
             self.db_size_bytes.load(Ordering::Relaxed),
@@ -198,9 +198,9 @@ mod tests {
         let stats = Stats::new();
         stats.bump(&stats.events_accepted, 3);
         let text = stats.as_prometheus();
-        assert!(text.contains("nostrd_events_accepted 3\n"));
-        assert!(text.contains("# TYPE nostrd_events_accepted counter\n"));
-        assert!(text.contains("# TYPE nostrd_uptime_seconds gauge\n"));
+        assert!(text.contains("nostrfy_events_accepted 3\n"));
+        assert!(text.contains("# TYPE nostrfy_events_accepted counter\n"));
+        assert!(text.contains("# TYPE nostrfy_uptime_seconds gauge\n"));
         // Every line is either a comment, a blank, or `name value`.
         for line in text.lines() {
             if line.is_empty() || line.starts_with('#') {

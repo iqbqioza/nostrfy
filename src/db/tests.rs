@@ -11,7 +11,7 @@ fn config() -> DatabaseConfig {
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let path = std::env::temp_dir()
-        .join("nostrd-db-test")
+        .join("nostrfy-db-test")
         .join(format!("{:x}-{id}", std::process::id()));
     let _ = std::fs::remove_dir_all(&path);
     DatabaseConfig {
@@ -593,7 +593,7 @@ fn nip28_channel_queries_use_e_tag_index() {
             40,
             "channel about",
             now,
-            vec![vec!["name".into(), "nostrd".into()]],
+            vec![vec!["name".into(), "nostrfy".into()]],
         );
         assert_eq!(db.put(channel.clone(), now).await, PutOutcome::Stored);
         for i in 0..3 {

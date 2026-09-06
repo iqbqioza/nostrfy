@@ -1,12 +1,12 @@
-# nostrd Troubleshooting
+# nostrfy Troubleshooting
 
-This page collects the errors you are most likely to meet while running nostrd, together with step-by-step fixes.
+This page collects the errors you are most likely to meet while running nostrfy, together with step-by-step fixes.
 
 **Three things to check first**:
 
-1. `nostrd check` validates your config (9 out of 10 errors are config mistakes)
-2. `tail -f nostrd.log` shows the log (the cause of the error is almost always there)
-3. `nostrd restart` restarts the daemon cleanly
+1. `nostrfy check` validates your config (9 out of 10 errors are config mistakes)
+2. `tail -f nostrfy.log` shows the log (the cause of the error is almost always there)
+3. `nostrfy restart` restarts the daemon cleanly
 
 ---
 
@@ -33,12 +33,12 @@ This page collects the errors you are most likely to meet while running nostrd, 
 
 ```bash
 # Change port = 8080 in the config file, then:
-./target/release/nostrd --config nostrd.toml start
+./target/release/nostrfy --config nostrfy.toml start
 ```
 
 ### 1-2. `error: cannot bind to ...: Address already in use`
 
-**Cause**: Another process (an old nostrd or a different server) is already using the port.
+**Cause**: Another process (an old nostrfy or a different server) is already using the port.
 
 **Fix**:
 
@@ -46,19 +46,19 @@ This page collects the errors you are most likely to meet while running nostrd, 
 # See what is using the port
 ss -tlnp | grep :8080
 
-# If nostrd is running, restart it
-./target/release/nostrd --config nostrd.toml restart
+# If nostrfy is running, restart it
+./target/release/nostrfy --config nostrfy.toml restart
 
 # If it is another process, stop it and retry
 ```
 
-### 1-3. `already running (pid 1234); use 'nostrd stop' or 'nostrd restart'`
+### 1-3. `already running (pid 1234); use 'nostrfy stop' or 'nostrfy restart'`
 
-**Cause**: nostrd is already running; `start` refuses to start a second instance.
+**Cause**: nostrfy is already running; `start` refuses to start a second instance.
 
-**Fix**: Use `nostrd restart`, or just use the running instance.
+**Fix**: Use `nostrfy restart`, or just use the running instance.
 
-### 1-4. `nostrd stop` hangs / `did not stop in time`
+### 1-4. `nostrfy stop` hangs / `did not stop in time`
 
 **Cause**: The daemon is stuck or not responding.
 
@@ -66,15 +66,15 @@ ss -tlnp | grep :8080
 
 ```bash
 # Check the process
-ps aux | grep nostrd
+ps aux | grep nostrfy
 
 # If it really will not stop, force-kill it
 kill -9 <PID>
 # Remove a stale pid file if present
-rm -f nostrd.pid
+rm -f nostrfy.pid
 ```
 
-### 1-5. `error: invalid nostrd.toml: TOML parse error`
+### 1-5. `error: invalid nostrfy.toml: TOML parse error`
 
 **Cause**: The config file is not valid TOML. Common mistakes: forgetting quotes around a string, or writing the same key twice.
 
@@ -87,21 +87,21 @@ port = 8080              # numbers are plain
 enabled_nips = [1, 50]   # lists are wrapped in [ ]
 ```
 
-### 1-6. `error: cannot read nostrd.toml: No such file or directory`
+### 1-6. `error: cannot read nostrfy.toml: No such file or directory`
 
 **Cause**: The config file does not exist.
 
 **Fix**:
 
 ```bash
-./target/release/nostrd --config nostrd.toml init
+./target/release/nostrfy --config nostrfy.toml init
 ```
 
 ### 1-7. `error: relay.private_key is not a valid secp256k1 secret key`
 
 **Cause**: `relay.private_key` is not a valid 64-character hex key.
 
-**Fix**: Run `nostrd genkey` to generate a correct key (or set `private_key = ""`).
+**Fix**: Run `nostrfy genkey` to generate a correct key (or set `private_key = ""`).
 
 ### 1-8. Lots of warnings in the log at startup
 
@@ -110,7 +110,7 @@ enabled_nips = [1, 50]   # lists are wrapped in [ ]
 | Warning | Meaning and fix |
 | --- | --- |
 | `relay.public_url is empty and server.host is "0.0.0.0"...` | `public_url` is not set. **NIP-42 auth, NIP-62 vanish and NIP-98 admin auth will not work.** Set `wss://your-public-url` |
-| `relay.private_key is empty while NIP-29 is enabled...` | Groups need a secret key. Run `nostrd genkey` |
+| `relay.private_key is empty while NIP-29 is enabled...` | Groups need a secret key. Run `nostrfy genkey` |
 | `unknown config key [relay].software is ignored` | An unused legacy key (or a typo) in the config. Check the key name |
 | `unknown config section [serve] is ignored` | A typo in a section name (e.g. `[serve]` instead of `[server]`). Fix it |
 | `relay.require_auth is true but relay.send_auth_challenge is false...` | This combination locks everyone out. Change one of the two |
@@ -151,7 +151,7 @@ sudo ufw allow 8080
 When using Cloudflare Tunnel:
 
 - The relay runs plain HTTP; Cloudflare terminates TLS, so clients use `wss://`. Set `public_url = "wss://..."` on the relay (this makes NIP-42 auth work)
-- Cloudflare adds an `X-Forwarded-Proto` header. nostrd treats `ws`/`wss`/`http`/`https` values the same, so no extra configuration is normally needed
+- Cloudflare adds an `X-Forwarded-Proto` header. nostrfy treats `ws`/`wss`/`http`/`https` values the same, so no extra configuration is normally needed
 
 ### 2-4. `error: message too large` and the connection closes
 
@@ -252,7 +252,7 @@ The upload authorization event (kind 24242) was rejected. Check that:
 
 ### 3b-2. Upload fails with `403`
 
-`blossom.restrict_uploads = true` is set and the pubkey is not on the allowlist — add it with `nostrd blossom allow npub1...` (the daemon reloads automatically). If the list looks wrong, `nostrd blossom list` shows it.
+`blossom.restrict_uploads = true` is set and the pubkey is not on the allowlist — add it with `nostrfy blossom allow npub1...` (the daemon reloads automatically). If the list looks wrong, `nostrfy blossom list` shows it.
 
 ### 3b-2a. Upload fails with `409`
 
@@ -260,7 +260,7 @@ The client sent an `X-SHA-256` header that does not match the actual request bod
 
 ### 3b-3. `GET /` on the media host serves the NIP-11 document instead of the Blossom server info
 
-The request did not reach the relay with the Blossom Host header. Point `media.example.com` (or whatever `blossom.host` is set to) at the same port in the reverse proxy, then `nostrd restart`.
+The request did not reach the relay with the Blossom Host header. Point `media.example.com` (or whatever `blossom.host` is set to) at the same port in the reverse proxy, then `nostrfy restart`.
 
 ### 3b-4. A blob 404s right after upload
 
@@ -270,7 +270,7 @@ The file is content-addressed by its SHA-256: fetch it via the exact hash return
 
 ### 4-1. Search returns 0 results / unexpected results
 
-nostrd search matches **whole words**. Note that:
+nostrfy search matches **whole words**. Note that:
 
 - `search = "rust"` matches events containing the word "rust", but `"ru"` does NOT match "rust" as a substring
 - Only words in the event content are searched
@@ -284,8 +284,8 @@ nostrd search matches **whole words**. Note that:
 **Fix**:
 
 ```bash
-./target/release/nostrd --config nostrd.toml genkey
-./target/release/nostrd --config nostrd.toml restart
+./target/release/nostrfy --config nostrfy.toml genkey
+./target/release/nostrfy --config nostrfy.toml restart
 ```
 
 ### 4-3. `restricted: unknown group` rejects group events
@@ -335,7 +335,7 @@ Common causes:
 
 ### 4-9. NIP-98 auth events are accepted with a different scheme or port
 
-The NIP-98 spec says the `u` tag must be *exactly* the same as the absolute request URL. nostrd deliberately tolerates two differences:
+The NIP-98 spec says the `u` tag must be *exactly* the same as the absolute request URL. nostrfy deliberately tolerates two differences:
 
 - **scheme**: `wss://` / `https://` (and `ws://` / `http://`, including the `nostr+` variants) are treated as equivalent — this keeps NIP-98 auth working behind TLS-terminating proxies, which see `http` on their side while the client signs `https`
 - **default ports**: a `u` tag without a port is accepted when the relay listens on port 80 or 443
@@ -362,7 +362,7 @@ The host, path and query must still match exactly, so the tolerance cannot be us
 df -h /path/to/data
 ```
 
-### 5-3. `nostrd check` reports `map_size must not exceed max_map_size`
+### 5-3. `nostrfy check` reports `map_size must not exceed max_map_size`
 
 **Cause**: `database.map_size` is larger than `max_map_size`.
 
@@ -380,20 +380,20 @@ curl http://127.0.0.1:8080/relay/stats
 All data lives in the `database.path` directory. **Stop the relay before copying** (copying a live database can corrupt it).
 
 ```bash
-./target/release/nostrd --config nostrd.toml stop
+./target/release/nostrfy --config nostrfy.toml stop
 cp -a ./data ./data-backup
-./target/release/nostrd --config nostrd.toml start
+./target/release/nostrfy --config nostrfy.toml start
 ```
 
 ---
 
 ## 6. Daemon Operation
 
-### 6-1. `nostrd stats` says `nostrd is not running (no stats file)`
+### 6-1. `nostrfy stats` says `nostrfy is not running (no stats file)`
 
 **Cause**: The stats file does not exist — the daemon is not running, or it started less than a few seconds ago.
 
-**Fix**: Run `nostrd start`, wait a few seconds, and try again.
+**Fix**: Run `nostrfy start`, wait a few seconds, and try again.
 
 ### 6-2. The log grows without bound
 
@@ -405,7 +405,7 @@ cp -a ./data ./data-backup
 
 **Cause**: You reloaded (SIGHUP) settings that are fixed at startup: `private_key`, `api_host`, `metrics_enabled`, LiveKit settings, and the NIP enable/disable lists.
 
-**Fix**: Use `nostrd restart`. The log contains a "a restart is required" warning in this case.
+**Fix**: Use `nostrfy restart`. The log contains a "a restart is required" warning in this case.
 
 ### 6-4. The relay keeps dying by itself
 
@@ -413,12 +413,12 @@ cp -a ./data ./data-backup
 
 **Fix**:
 
-1. Check the end of the log: `tail -50 nostrd.log`
+1. Check the end of the log: `tail -50 nostrfy.log`
 2. Check if the machine rebooted: `uptime` (a very short uptime means a reboot)
 3. Check memory: `free -h`
-4. Start the relay again: `nostrd start`
+4. Start the relay again: `nostrfy start`
 
-> **Tip**: To start nostrd automatically on boot, register it as a systemd service with the relay's start command as `ExecStart`.
+> **Tip**: To start nostrfy automatically on boot, register it as a systemd service with the relay's start command as `ExecStart`.
 
 ### 6-5. systemd cannot start the relay on port 80
 
@@ -428,10 +428,10 @@ A systemd service running as root can bind port 80. If you set `User=` to a regu
 
 ## 7. Still Not Solved?
 
-1. **Check the log**: `tail -100 nostrd.log` — it usually names the direct cause
-2. **Re-validate the config**: `nostrd check` — shows warnings and errors
+1. **Check the log**: `tail -100 nostrfy.log` — it usually names the direct cause
+2. **Re-validate the config**: `nostrfy check` — shows warnings and errors
 3. **Gather reproduction details**: what were you doing, which client, what exact error
-4. **Ask in the project repository**: https://github.com/iqbqioza/nostrd (when filing an issue, include the reproduction steps and the log)
+4. **Ask in the project repository**: https://github.com/iqbqioza/nostrfy (when filing an issue, include the reproduction steps and the log)
 
 ---
 

@@ -250,7 +250,7 @@ impl Relay {
         // bans/allowlists survive restarts; the config `access` section seeds
         // the very first run only (when no runtime state exists yet). The
         // pubkey allow/deny lists live in the relay database (LMDB),
-        // managed with `nostrd relay allow/deny` — never in the config.
+        // managed with `nostrfy relay allow/deny` — never in the config.
         let mut access = match db.load_access().await {
             Some(access) => access,
             None => config.read().await.access.clone(),
@@ -1156,7 +1156,7 @@ mod tests {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let path = std::env::temp_dir()
-            .join("nostrd-relay-dbstate")
+            .join("nostrfy-relay-dbstate")
             .join(format!("{:x}-{id}", std::process::id()));
         let _ = std::fs::remove_dir_all(&path);
         let mut cfg = crate::config::Config::default();

@@ -1,18 +1,18 @@
-# nostrd.toml — groups-focused relay (NIP-29 / NIP-43)
+# nostrfy.toml — groups-focused relay (NIP-29 / NIP-43)
 #
 # A relay optimized for NIP-29 group-chat communities: more groups,
 # fast live delivery of group messages, and the NIP-43 role system on
 # top of the built-in admin roles (admin/mod) of NIP-29.
 #
 # Group metadata (kinds 39000-39005) is relay-generated and signed with
-# relay.private_key — generate one with `nostrd genkey` or group
+# relay.private_key — generate one with `nostrfy genkey` or group
 # membership edits will be rejected with "relay key not set".
 
 [relay]
-name = "nostrd groups"
+name = "nostrfy groups"
 description = "Nostr groups relay (NIP-29 + NIP-43)"
 pubkey = ""
-private_key = ""            # REQUIRED: `nostrd genkey` — signs group metadata
+private_key = ""            # REQUIRED: `nostrfy genkey` — signs group metadata
 public_url = "wss://groups.example.com"
 enabled_nips = [1, 9, 11, 29, 40, 42, 43, 45, 46, 50, 57, 59, 65, 70, 77, 86, 94]
 # NIP-29 group events can be a significant share of the write load:

@@ -480,7 +480,7 @@ impl Store {
     }
 
     /// Loads the persisted Blossom upload allowlist (empty when none).
-    /// The list is written by the CLI commands (`nostrd blossom allow/deny`),
+    /// The list is written by the CLI commands (`nostrfy blossom allow/deny`),
     /// which open the same environment from their own process.
     pub(crate) fn load_blossom_allow(&self) -> Result<Vec<String>> {
         let rtxn = self.env.read_txn()?;
@@ -639,7 +639,7 @@ impl Store {
 
     /// Persists the relay pubkey access lists ((pubkey, reason) pairs for
     /// the deny and allow lists) under a single fixed key, so the CLI
-    /// commands (`nostrd relay allow/deny`) and the running server share
+    /// commands (`nostrfy relay allow/deny`) and the running server share
     /// one source of truth without touching the config file.
     pub(crate) fn save_relay_pubkeys(
         &self,
@@ -654,7 +654,7 @@ impl Store {
     }
 
     /// Persists the Blossom upload allowlist under a single fixed key, so
-    /// the CLI command (`nostrd blossom allow/deny`) and the running
+    /// the CLI command (`nostrfy blossom allow/deny`) and the running
     /// server share one source of truth without touching the config file.
     pub(crate) fn save_blossom_allow(&self, entries: &[String]) -> Result<()> {
         let data = serde_json::to_vec(entries)?;
@@ -687,7 +687,7 @@ impl Store {
 }
 
 /// Shared migration used by both the relay server (`Store`) and the CLI
-/// commands (`nostrd relay allow/deny`), which open the environment from
+/// commands (`nostrfy relay allow/deny`), which open the environment from
 /// their own process: without it, a CLI write before the first post-upgrade
 /// server start would silently skip the legacy entries.
 pub(crate) fn migrate_access_pubkeys(env: &Env, access: &Database<Bytes, Bytes>) -> Result<()> {

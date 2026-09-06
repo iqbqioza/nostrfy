@@ -150,7 +150,7 @@ mod tests {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let path = std::env::temp_dir()
-            .join("nostrd-livekit-test")
+            .join("nostrfy-livekit-test")
             .join(format!("{:x}-{id}", std::process::id()));
         let _ = std::fs::remove_dir_all(&path);
         let mut cfg = Config::default();

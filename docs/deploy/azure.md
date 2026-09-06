@@ -1,4 +1,4 @@
-# Deploying nostrd on Microsoft Azure
+# Deploying nostrfy on Microsoft Azure
 
 Options: **VM** (recommended), or **Container Apps**.
 
@@ -10,15 +10,15 @@ Options: **VM** (recommended), or **Container Apps**.
 
 ```sh
 ssh <user>@<public-ip>
-curl -fsSL https://raw.githubusercontent.com/iqbqioza/nostrd/main/install.sh | sh
-sudo mkdir -p /etc/nostrd
-sudo curl -fsSL -o /etc/nostrd/nostrd.toml \
-  https://raw.githubusercontent.com/iqbqioza/nostrd/main/deploy/nostrd.toml
-sudo nano /etc/nostrd/nostrd.toml                 # set name, public_url, private_key
-sudo curl -fsSL -o /etc/systemd/system/nostrd.service \
-  https://raw.githubusercontent.com/iqbqioza/nostrd/main/deploy/nostrd.service
+curl -fsSL https://raw.githubusercontent.com/iqbqioza/nostrfy/main/install.sh | sh
+sudo mkdir -p /etc/nostrfy
+sudo curl -fsSL -o /etc/nostrfy/nostrfy.toml \
+  https://raw.githubusercontent.com/iqbqioza/nostrfy/main/deploy/nostrfy.toml
+sudo nano /etc/nostrfy/nostrfy.toml                 # set name, public_url, private_key
+sudo curl -fsSL -o /etc/systemd/system/nostrfy.service \
+  https://raw.githubusercontent.com/iqbqioza/nostrfy/main/deploy/nostrfy.service
 sudo systemctl daemon-reload
-sudo systemctl enable --now nostrd
+sudo systemctl enable --now nostrfy
 ```
 
 4. **Verify**:
@@ -41,4 +41,4 @@ Container Apps builds from the repository `Dockerfile` (which downloads the pre-
 4. **Persistent storage**: mount an **Azure Storage file share** at `/data` for the LMDB data.
 5. **TLS**: Container Apps provides `https://` on the app URL — set `relay.public_url = "wss://<app>.<region>.azurecontainerapps.io"` (or a custom domain).
 
-> **Note**: set **min replicas = 1** — a relay must never scale to zero. The baked `deploy/nostrd.container.toml` can be replaced by mounting your own `nostrd.toml` at `/etc/nostrd/nostrd.toml`.
+> **Note**: set **min replicas = 1** — a relay must never scale to zero. The baked `deploy/nostrfy.container.toml` can be replaced by mounting your own `nostrfy.toml` at `/etc/nostrfy/nostrfy.toml`.

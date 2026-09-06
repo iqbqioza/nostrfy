@@ -1,4 +1,4 @@
-# Deploying nostrd on Digital Ocean
+# Deploying nostrfy on Digital Ocean
 
 Two options: a **Droplet** (VM, simplest) or the **App Platform** (containers).
 
@@ -9,15 +9,15 @@ Two options: a **Droplet** (VM, simplest) or the **App Platform** (containers).
 
 ```sh
 ssh root@<droplet-ip>
-curl -fsSL https://raw.githubusercontent.com/iqbqioza/nostrd/main/install.sh | sh
-sudo mkdir -p /etc/nostrd
-sudo curl -fsSL -o /etc/nostrd/nostrd.toml \
-  https://raw.githubusercontent.com/iqbqioza/nostrd/main/deploy/nostrd.toml
-sudo nano /etc/nostrd/nostrd.toml                 # set name, public_url, private_key
-sudo curl -fsSL -o /etc/systemd/system/nostrd.service \
-  https://raw.githubusercontent.com/iqbqioza/nostrd/main/deploy/nostrd.service
+curl -fsSL https://raw.githubusercontent.com/iqbqioza/nostrfy/main/install.sh | sh
+sudo mkdir -p /etc/nostrfy
+sudo curl -fsSL -o /etc/nostrfy/nostrfy.toml \
+  https://raw.githubusercontent.com/iqbqioza/nostrfy/main/deploy/nostrfy.toml
+sudo nano /etc/nostrfy/nostrfy.toml                 # set name, public_url, private_key
+sudo curl -fsSL -o /etc/systemd/system/nostrfy.service \
+  https://raw.githubusercontent.com/iqbqioza/nostrfy/main/deploy/nostrfy.service
 sudo systemctl daemon-reload
-sudo systemctl enable --now nostrd
+sudo systemctl enable --now nostrfy
 ```
 
 3. **Open the port** in the Droplet firewall (the [Digital Ocean Cloud Firewall](https://www.digitalocean.com/community/tutorials/how-to-configure-a-digitalocean-cloud-firewall) is recommended): allow inbound TCP `8080` (and `443` if you add TLS).
@@ -36,10 +36,10 @@ The App Platform builds from the repository `Dockerfile` (which downloads the pr
 1. **Connect your GitHub repo** and create an app from it.
 2. **Port**: set the HTTP port to `8080` (the relay listens there).
 3. **Persistent disk**: mount a volume at `/data` (LMDB data lives there — without it, data is lost on every deploy).
-4. **Env**: the `deploy/nostrd.container.toml` baked into the image can be replaced by mounting your own config at `/etc/nostrd/nostrd.toml` (create a fork that copies it, or use a Dockerfile `COPY` in your own repo).
+4. **Env**: the `deploy/nostrfy.container.toml` baked into the image can be replaced by mounting your own config at `/etc/nostrfy/nostrfy.toml` (create a fork that copies it, or use a Dockerfile `COPY` in your own repo).
 5. **TLS**: App Platform provides `https://` automatically for the app domain — set `relay.public_url` accordingly.
 
 ## Both options
 
-- Updates: re-run `install.sh` + `systemctl restart nostrd` (Droplet), or push to the connected repo (App Platform).
+- Updates: re-run `install.sh` + `systemctl restart nostrfy` (Droplet), or push to the connected repo (App Platform).
 - All configuration is documented in the [Configuration reference](../CONFIGURATION.md).

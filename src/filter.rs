@@ -205,7 +205,7 @@ pub(crate) fn tag_values(value: &Value) -> impl Iterator<Item = &str> {
     )
 }
 
-/// nostrd extension: the `inbox` and `outbox` filter keys expand into the
+/// nostrfy extension: the `inbox` and `outbox` filter keys expand into the
 /// standard constraints before the filter is parsed — `inbox` to `#p`
 /// (events addressed to the pubkey: mentions, replies, zaps, DMs) and
 /// `outbox` to `authors` (events authored by the pubkey). Each value is a

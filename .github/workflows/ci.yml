@@ -90,6 +90,6 @@ jobs:
 
       - name: Smoke test
         run: |
-          ./target/release/nostrd --version
-          ./target/release/nostrd --config /tmp/nostrd-test.toml init
-          ./target/release/nostrd --config /tmp/nostrd-test.toml check
+          ./target/release/nostrfy --version
+          ./target/release/nostrfy --config /tmp/nostrfy-test.toml init
+          ./target/release/nostrfy --config /tmp/nostrfy-test.toml check

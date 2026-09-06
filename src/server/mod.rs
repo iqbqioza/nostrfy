@@ -507,7 +507,7 @@ async fn blossom_root_info(
         return Some(StatusCode::NOT_FOUND.into_response());
     }
     let info = json!({
-        "name": format!("nostrd Blossom ({})", cfg.blossom.host.trim()),
+        "name": format!("nostrfy Blossom ({})", cfg.blossom.host.trim()),
         "supported_nips": [],
         "supported_file_hashes": ["sha256"],
         "tos_url": null,

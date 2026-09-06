@@ -1,4 +1,4 @@
-# Deploying nostrd on AWS
+# Deploying nostrfy on AWS
 
 Options: **EC2** (VM, recommended), **Lightsail** (simpler VM), or **ECS/Fargate** (containers).
 
@@ -10,15 +10,15 @@ Options: **EC2** (VM, recommended), **Lightsail** (simpler VM), or **ECS/Fargate
 
 ```sh
 ssh -i your-key.pem ec2-user@<public-ip>        # Ubuntu: ubuntu@<public-ip>
-curl -fsSL https://raw.githubusercontent.com/iqbqioza/nostrd/main/install.sh | sh
-sudo mkdir -p /etc/nostrd
-sudo curl -fsSL -o /etc/nostrd/nostrd.toml \
-  https://raw.githubusercontent.com/iqbqioza/nostrd/main/deploy/nostrd.toml
-sudo nano /etc/nostrd/nostrd.toml                 # set name, public_url, private_key
-sudo curl -fsSL -o /etc/systemd/system/nostrd.service \
-  https://raw.githubusercontent.com/iqbqioza/nostrd/main/deploy/nostrd.service
+curl -fsSL https://raw.githubusercontent.com/iqbqioza/nostrfy/main/install.sh | sh
+sudo mkdir -p /etc/nostrfy
+sudo curl -fsSL -o /etc/nostrfy/nostrfy.toml \
+  https://raw.githubusercontent.com/iqbqioza/nostrfy/main/deploy/nostrfy.toml
+sudo nano /etc/nostrfy/nostrfy.toml                 # set name, public_url, private_key
+sudo curl -fsSL -o /etc/systemd/system/nostrfy.service \
+  https://raw.githubusercontent.com/iqbqioza/nostrfy/main/deploy/nostrfy.service
 sudo systemctl daemon-reload
-sudo systemctl enable --now nostrd
+sudo systemctl enable --now nostrfy
 ```
 
 4. **Verify**:
@@ -37,10 +37,10 @@ Lightsail instances work exactly like the EC2 guide — the **networking tab** h
 
 The repository `Dockerfile` downloads the pre-built release binary at build time:
 
-1. Push the image to ECR: `docker buildx build --platform linux/amd64,linux/arm64 -t <account>.dkr.ecr.<region>.amazonaws.com/nostrd .`
+1. Push the image to ECR: `docker buildx build --platform linux/amd64,linux/arm64 -t <account>.dkr.ecr.<region>.amazonaws.com/nostrfy .`
 2. Create an ECS service (Fargate, 1 task) with a **mounted EFS volume at `/data`** (LMDB persistence — without it, data is lost on redeploys).
 3. Expose port `8080`; front it with an ALB + ACM certificate for TLS.
-4. The baked `deploy/nostrd.container.toml` config can be overridden by mounting your own `nostrd.toml` at `/etc/nostrd/nostrd.toml` (e.g. a fork that copies it into the image).
+4. The baked `deploy/nostrfy.container.toml` config can be overridden by mounting your own `nostrfy.toml` at `/etc/nostrfy/nostrfy.toml` (e.g. a fork that copies it into the image).
 
 ## Elastic IP
 

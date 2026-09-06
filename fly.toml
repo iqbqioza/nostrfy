@@ -1,15 +1,15 @@
-# fly.toml — template for deploying nostrd to Fly.io.
+# fly.toml — template for deploying nostrfy to Fly.io.
 #
 # Quick start (see docs/DEPLOYMENT.md for the full guide):
 #   1. fly launch --no-deploy --name <app-name>
 #   2. fly volumes create data --size 1 --region <region>
 #   3. set the relay name / public_url / private_key in
-#      deploy/nostrd.container.toml (baked into the image)
+#      deploy/nostrfy.container.toml (baked into the image)
 #   4. fly deploy
 #
 # app = the app name (required, must be unique on Fly). Set it with
 #       `fly launch --name <name>` or edit this line.
-app = "nostrd"
+app = "nostrfy"
 primary_region = "nrt"   # change to your preferred region
 
 [build]

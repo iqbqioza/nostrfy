@@ -20,10 +20,10 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            asset: nostrd-linux-x86_64
+            asset: nostrfy-linux-x86_64
           # Native ARM64 runner (GitHub-hosted, public repos).
           - os: ubuntu-24.04-arm
-            asset: nostrd-linux-aarch64
+            asset: nostrfy-linux-aarch64
     steps:
       - uses: actions/checkout@v4
 
@@ -37,7 +37,7 @@ jobs:
       - name: Prepare release assets
         run: |
           mkdir -p dist
-          cp target/release/nostrd "dist/${{ matrix.asset }}"
+          cp target/release/nostrfy "dist/${{ matrix.asset }}"
           chmod +x "dist/${{ matrix.asset }}"
           (cd dist && tar -czf "${{ matrix.asset }}.tar.gz" "${{ matrix.asset }}")
           (cd dist && sha256sum "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256")
@@ -49,7 +49,7 @@ jobs:
           if-no-files-found: error
 
   freebsd:
-    name: Build (nostrd-freebsd-x86_64)
+    name: Build (nostrfy-freebsd-x86_64)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -71,14 +71,14 @@ jobs:
           run: |
             cargo build --release
             mkdir -p dist
-            cp target/release/nostrd "dist/nostrd-freebsd-x86_64"
-            chmod +x "dist/nostrd-freebsd-x86_64"
-            (cd dist && tar -czf "nostrd-freebsd-x86_64.tar.gz" "nostrd-freebsd-x86_64")
-            (cd dist && sha256 -r "nostrd-freebsd-x86_64" > "nostrd-freebsd-x86_64.sha256")
+            cp target/release/nostrfy "dist/nostrfy-freebsd-x86_64"
+            chmod +x "dist/nostrfy-freebsd-x86_64"
+            (cd dist && tar -czf "nostrfy-freebsd-x86_64.tar.gz" "nostrfy-freebsd-x86_64")
+            (cd dist && sha256 -r "nostrfy-freebsd-x86_64" > "nostrfy-freebsd-x86_64.sha256")
 
       - uses: actions/upload-artifact@v4
         with:
-          name: nostrd-freebsd-x86_64
+          name: nostrfy-freebsd-x86_64
           path: dist/*
           if-no-files-found: error
 
@@ -97,15 +97,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "$GITHUB_REF_NAME" \
-            dist/nostrd-linux-x86_64 \
-            dist/nostrd-linux-x86_64.tar.gz \
-            dist/nostrd-linux-x86_64.sha256 \
-            dist/nostrd-linux-aarch64 \
-            dist/nostrd-linux-aarch64.tar.gz \
-            dist/nostrd-linux-aarch64.sha256 \
-            dist/nostrd-freebsd-x86_64 \
-            dist/nostrd-freebsd-x86_64.tar.gz \
-            dist/nostrd-freebsd-x86_64.sha256 \
+            dist/nostrfy-linux-x86_64 \
+            dist/nostrfy-linux-x86_64.tar.gz \
+            dist/nostrfy-linux-x86_64.sha256 \
+            dist/nostrfy-linux-aarch64 \
+            dist/nostrfy-linux-aarch64.tar.gz \
+            dist/nostrfy-linux-aarch64.sha256 \
+            dist/nostrfy-freebsd-x86_64 \
+            dist/nostrfy-freebsd-x86_64.tar.gz \
+            dist/nostrfy-freebsd-x86_64.sha256 \
             --repo "$GITHUB_REPOSITORY" \
             --title "$GITHUB_REF_NAME" \
             --notes "See the commit history for changes in this release." \

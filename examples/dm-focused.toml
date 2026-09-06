@@ -1,4 +1,4 @@
-# nostrd.toml — DM-focused relay
+# nostrfy.toml — DM-focused relay
 #
 # A relay for private direct messages (NIP-04 legacy kind 4, NIP-17
 # kind 14, NIP-59 gift-wrapped kind 1059). Encrypted content is
@@ -8,7 +8,7 @@
 # envelope store.
 
 [relay]
-name = "nostrd dm"
+name = "nostrfy dm"
 description = "Private direct-message relay"
 pubkey = ""
 private_key = ""            # optional; only needed for NIP-29 metadata

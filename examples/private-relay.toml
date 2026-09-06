@@ -1,4 +1,4 @@
-# nostrd.toml — private (invite-only / authenticated) relay
+# nostrfy.toml — private (invite-only / authenticated) relay
 #
 # For a closed community: only authenticated clients (NIP-42) may
 # publish, only allow-listed pubkeys are served, and the relay is
@@ -7,10 +7,10 @@
 # pubkeys are served at all) for a truly private relay.
 
 [relay]
-name = "nostrd private"
+name = "nostrfy private"
 description = "Private relay for a closed group of friends"
 pubkey = ""
-private_key = ""            # `nostrd genkey`
+private_key = ""            # `nostrfy genkey`
 public_url = "wss://private.example.com"
 # Only authenticated clients (NIP-42 AUTH before EVENT) may publish.
 require_auth = true

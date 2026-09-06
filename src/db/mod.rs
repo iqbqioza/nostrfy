@@ -63,7 +63,7 @@ pub(crate) fn db_error(errors: &Arc<std::sync::atomic::AtomicU64>, e: &crate::er
         e,
         crate::error::Error::Heed(heed::Error::Mdb(heed::MdbError::MapFull))
     ) {
-        log::error!("database map is full: increase database.max_map_size in nostrd.toml");
+        log::error!("database map is full: increase database.max_map_size in nostrfy.toml");
     } else {
         log::error!("database error: {e}");
     }
@@ -854,7 +854,7 @@ impl DbClient {
     }
 
     /// Persists the Blossom upload allowlist under its dedicated LMDB key
-    /// (the same key `nostrd blossom allow/deny` writes).
+    /// (the same key `nostrfy blossom allow/deny` writes).
     pub async fn save_blossom_allow(&self, entries: &[String]) {
         let entries = entries.to_vec();
         let _ = self

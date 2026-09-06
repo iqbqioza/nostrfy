@@ -1,6 +1,6 @@
-# nostrd Configuration Reference
+# nostrfy Configuration Reference
 
-This page is the complete reference for the `nostrd.toml` configuration file: every key, its type, its default, and exactly what it does.
+This page is the complete reference for the `nostrfy.toml` configuration file: every key, its type, its default, and exactly what it does.
 
 ## Table of Contents
 
@@ -21,21 +21,21 @@ This page is the complete reference for the `nostrd.toml` configuration file: ev
 
 ## 1. Basics
 
-The configuration is a [TOML](https://toml.io/) file, by default named `nostrd.toml`.
+The configuration is a [TOML](https://toml.io/) file, by default named `nostrfy.toml`.
 
 **Create** it with:
 
 ```bash
-./target/release/nostrd --config nostrd.toml init
+./target/release/nostrfy --config nostrfy.toml init
 ```
 
 **Validate** it (recommended before every start):
 
 ```bash
-./target/release/nostrd --config nostrd.toml check
+./target/release/nostrfy --config nostrfy.toml check
 ```
 
-Every command takes `--config <path>` (default `nostrd.toml`).
+Every command takes `--config <path>` (default `nostrfy.toml`).
 
 ### General syntax
 
@@ -71,7 +71,7 @@ Every key is optional; a missing key uses the default shown below.
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
-| `name` | string | `"nostrd"` | Relay name (shown to clients via NIP-11) |
+| `name` | string | `"nostrfy"` | Relay name (shown to clients via NIP-11) |
 | `description` | string | `"A minimal and stable Nostr relay"` | Relay description (NIP-11) |
 | `pubkey` | string (64 hex) | `""` | Administrator public key (NIP-11 `pubkey` field) |
 | `contact` | string | `""` | Administrator contact (URI, e.g. `mailto:` or `https://`) |
@@ -106,7 +106,7 @@ Every key is optional; a missing key uses the default shown below.
 
 **`post_policy`** — A URL where you describe your posting policy. Omitted when empty.
 
-**`private_key`** — The relay's own secret key (64 hex chars). It signs **relay-generated events**: NIP-29 group metadata (39000-39005), NIP-43 role/membership events. Without it, NIP-29 groups still accept moderation events but produce **no 39001/39002 snapshots**, and NIP-43 is unavailable (a warning is logged). Generate with `nostrd genkey`; keep it secret. Read once at startup — changing it requires a `restart`. The config file is created and kept at `0600` (`nostrd init` creates it that way; `nostrd genkey` enforces it after writing the key), so a loosely defaulted umask cannot leave secrets readable by other users.
+**`private_key`** — The relay's own secret key (64 hex chars). It signs **relay-generated events**: NIP-29 group metadata (39000-39005), NIP-43 role/membership events. Without it, NIP-29 groups still accept moderation events but produce **no 39001/39002 snapshots**, and NIP-43 is unavailable (a warning is logged). Generate with `nostrfy genkey`; keep it secret. Read once at startup — changing it requires a `restart`. The config file is created and kept at `0600` (`nostrfy init` creates it that way; `nostrfy genkey` enforces it after writing the key), so a loosely defaulted umask cannot leave secrets readable by other users.
 
 **`public_url`** — The relay's public address, e.g. `wss://relay.example.com`. Used to validate URL-bearing tags from clients: NIP-42 AUTH (`relay` tag), NIP-62 vanish (`relay` tag), NIP-98 admin auth (`u` tag). When empty, the relay falls back to `host:port`, which never matches a real client URL when binding `0.0.0.0`/`127.0.0.1` (a warning is logged). **Always set this.**
 
@@ -144,12 +144,12 @@ Every key is optional; a missing key uses the default shown below.
 - `/blossom allow <pubkey>` — add a pubkey to the Blossom upload allowlist
 - `/blossom deny <pubkey>` — remove a pubkey from the Blossom upload allowlist
 
-The changes take effect immediately and are persisted (same lists as `nostrd relay allow/deny` and `nostrd blossom allow/deny`). The relay answers every recognized command with a kind:1111 event signed with `relay.private_key`, tagged `e` to the command event and `p` to the admin pubkey (a mention, so clients show it as addressed to the admin); the reply is served publicly, so the result is visible even when NIP-42 is enabled. `error: ...` replies report unknown commands or invalid pubkeys. Only the admin (`relay.pubkey`) can issue commands — the author check runs on the event's verified signature. The admin and the relay's own pubkey are exempt from the pubkey allow/deny lists (publish and read), so commands keep working on `restrict_relay` relays. Requires both `relay.pubkey` (admin) and `relay.private_key` (reply signing); warnings are logged when the flag is on without them. Default `false`.
+The changes take effect immediately and are persisted (same lists as `nostrfy relay allow/deny` and `nostrfy blossom allow/deny`). The relay answers every recognized command with a kind:1111 event signed with `relay.private_key`, tagged `e` to the command event and `p` to the admin pubkey (a mention, so clients show it as addressed to the admin); the reply is served publicly, so the result is visible even when NIP-42 is enabled. `error: ...` replies report unknown commands or invalid pubkeys. Only the admin (`relay.pubkey`) can issue commands — the author check runs on the event's verified signature. The admin and the relay's own pubkey are exempt from the pubkey allow/deny lists (publish and read), so commands keep working on `restrict_relay` relays. Requires both `relay.pubkey` (admin) and `relay.private_key` (reply signing); warnings are logged when the flag is on without them. Default `false`.
 
 ### Behavior notes
 
 - **`name` / `description` / `icon` / `pubkey` / `contact`** are served to every client in the NIP-11 document (`GET /`). Empty string fields are omitted from the document. Runtime changes via NIP-86 are **persisted into this config file**, so a later SIGHUP reload keeps them.
-- **`private_key`**: without it, no 39001/39002 group snapshots are generated. Generate with `nostrd genkey`; changing requires `restart`.
+- **`private_key`**: without it, no 39001/39002 group snapshots are generated. Generate with `nostrfy genkey`; changing requires `restart`.
 - **`public_url`**: matching tolerates different schemes (`wss`/`ws`/`https`/`http`) and paths, and is case-insensitive. When the relay binds `0.0.0.0` or `127.0.0.1` and `public_url` is empty, a loud warning explains that NIP-42/62/98 URL checks will fail.
 - **`livekit_url` + `livekit_api_key` + `livekit_api_secret`**: all three are needed together; a URL without credentials logs a warning (tokens would be signed with an empty secret).
 - **`enabled_nips` / `disabled_nips`**: `enabled_nips` wins over `disabled_nips`. Both affect the NIP-11 `supported_nips` list and the relay's behavior gates (NIP-29 groups, NIP-50 search, NIP-40 expiry, ...).
@@ -179,7 +179,7 @@ The changes take effect immediately and are persisted (same lists as `nostrd rel
 | --- | --- | --- | --- |
 | `host` | string | `"127.0.0.1"` | Bind address. `0.0.0.0` (or `::`) accepts connections from anywhere |
 | `port` | integer | `8080` | Port (1–65535). Port 80 requires root |
-| `api_host` | string | `""` | Hostname dedicated to the REST API (must be a bare hostname — no scheme, port, path or whitespace; validated at `nostrd check`/startup) |
+| `api_host` | string | `""` | Hostname dedicated to the REST API (must be a bare hostname — no scheme, port, path or whitespace; validated at `nostrfy check`/startup) |
 | `metrics_enabled` | boolean | `true` | Serve Prometheus metrics at `/metrics` |
 | `ws_paths` | string | `"root"` | WebSocket endpoint paths: `root` (`/` only), `inbox-outbox`, or `all` |
 | `inbox_write_policy` | string | `"any"` | Write policy for `/inbox`: `any` or `relay` |
@@ -396,7 +396,7 @@ The changes take effect immediately and are persisted (same lists as `nostrd rel
 ### Behavior notes
 
 - The memory map is never resized at runtime: raising `max_map_size` requires a `restart`.
-- `map_size` must not exceed `max_map_size` (`nostrd check` rejects the combination).
+- `map_size` must not exceed `max_map_size` (`nostrfy check` rejects the combination).
 - Search semantics are the same with or without the index: whole-word matching (see the troubleshooting guide).
 
 ### Upgrades are automatic and instant
@@ -414,9 +414,9 @@ The changes take effect immediately and are persisted (same lists as `nostrd rel
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
-| `pid_file` | string | `"./nostrd.pid"` | PID file path |
-| `log_file` | string | `"./nostrd.log"` | Log file path |
-| `stats_file` | string | `"./nostrd.stats.json"` | Statistics file path |
+| `pid_file` | string | `"./nostrfy.pid"` | PID file path |
+| `log_file` | string | `"./nostrfy.log"` | Log file path |
+| `stats_file` | string | `"./nostrfy.stats.json"` | Statistics file path |
 | `stats_interval_secs` | integer | `5` | Statistics write interval (seconds) |
 | `max_log_size_bytes` | integer | `52428800` (50 MB) | Log rotation size (`0` = no rotation) |
 | `max_log_files` | integer | `5` | Rotated log generations to keep |
@@ -427,7 +427,7 @@ The changes take effect immediately and are persisted (same lists as `nostrd rel
 
 **`log_file`** — Where the daemon writes its log. Rotated when it grows past `max_log_size_bytes`.
 
-**`stats_file`** — Where live statistics are written (atomically, via temp-file + rename) every `stats_interval_secs` seconds. Read by `nostrd stats`; the same data is served at `/relay/stats`.
+**`stats_file`** — Where live statistics are written (atomically, via temp-file + rename) every `stats_interval_secs` seconds. Read by `nostrfy stats`; the same data is served at `/relay/stats`.
 
 **`stats_interval_secs`** — How often the statistics file is refreshed (≥ 1).
 
@@ -456,9 +456,9 @@ The changes take effect immediately and are persisted (same lists as `nostrd rel
 **`restrict_relay`** — The pubkey **allow/deny lists are not config state**: they live in the relay database (LMDB) and are managed at runtime with:
 
 ```sh
-nostrd relay allow npub1...      # allow a pubkey to publish (npub1... or hex)
-nostrd relay deny npub1...       # deny a pubkey — its events are always rejected
-nostrd relay list                # show both lists and restrict_relay
+nostrfy relay allow npub1...      # allow a pubkey to publish (npub1... or hex)
+nostrfy relay deny npub1...       # deny a pubkey — its events are always rejected
+nostrfy relay list                # show both lists and restrict_relay
 ```
 
 - `restrict_relay = true`: **only** the pubkeys on the allow list may publish (everyone else is rejected with `blocked: pubkey not allowed`).
@@ -477,7 +477,7 @@ nostrd relay list                # show both lists and restrict_relay
 
 - The kinds/IP lists are seeded at startup and then **managed at runtime** through NIP-86. Runtime changes are persisted in the database and survive restarts; once runtime state exists, it takes precedence over the config section.
 - The reason is reported by the NIP-86 list methods (`listbannedpubkeys`, `listblockedips`, ...).
-- `blocked_ips` entries must parse as IP addresses (`nostrd check` validates them).
+- `blocked_ips` entries must parse as IP addresses (`nostrfy check` validates them).
 
 ---
 
@@ -485,7 +485,7 @@ nostrd relay list                # show both lists and restrict_relay
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
-| `host` | string | `""` | Hostname dedicated to the Blossom server, e.g. `media.example.com` (must be a bare hostname — no scheme, port, path or whitespace; validated at `nostrd check`/startup). Empty = the feature is disabled |
+| `host` | string | `""` | Hostname dedicated to the Blossom server, e.g. `media.example.com` (must be a bare hostname — no scheme, port, path or whitespace; validated at `nostrfy check`/startup). Empty = the feature is disabled |
 | `storage` | string | `"local"` | Storage backend: `"local"` or `"s3"` (any S3-compatible service, including Cloudflare R2) |
 | `local_path` | string | `"./data/images"` | Local storage directory: `<local_path>/<npub1...>/<sha256>` |
 | `max_upload_bytes` | integer | `20971520` | Maximum accepted upload size (the `PUT /upload` body limit) |
@@ -515,9 +515,9 @@ nostrd relay list                # show both lists and restrict_relay
 **`restrict_uploads`** — When `true`, `PUT /upload` accepts only the pubkeys on the Blossom upload allowlist (everyone else gets `403`). The allowlist itself is **not** part of the config file: it lives in the relay database (LMDB), is loaded at startup and managed at runtime with:
 
 ```sh
-nostrd blossom allow npub1...     # add a pubkey (npub1... or hex)
-nostrd blossom deny npub1...     # remove a pubkey
-nostrd blossom list             # show the list and the restrict flag
+nostrfy blossom allow npub1...     # add a pubkey (npub1... or hex)
+nostrfy blossom deny npub1...     # remove a pubkey
+nostrfy blossom list             # show the list and the restrict flag
 ```
 
 Each `allow`/`deny` writes the database and reloads the running daemon (SIGHUP), so the change applies immediately.
@@ -537,7 +537,7 @@ Each `allow`/`deny` writes the database and reloads the running daemon (SIGHUP),
 
 ## 10. Validation rules
 
-`nostrd check` (and startup) rejects invalid configurations with a clear message:
+`nostrfy check` (and startup) rejects invalid configurations with a clear message:
 
 | Rule | Error example |
 | --- | --- |
@@ -563,9 +563,9 @@ Unknown keys or sections produce **warnings** (not errors), so typos are visible
 
 ## 10. Reloading at runtime (SIGHUP)
 
-Editing the file and sending `kill -HUP $(cat nostrd.pid)` reloads it **without a restart**. Most settings take effect immediately; a few are fixed at startup:
+Editing the file and sending `kill -HUP $(cat nostrfy.pid)` reloads it **without a restart**. Most settings take effect immediately; a few are fixed at startup:
 
-| Applies on SIGHUP | Requires `nostrd restart` |
+| Applies on SIGHUP | Requires `nostrfy restart` |
 | --- | --- |
 | `relay.name`, `description`, `pubkey`, `contact`, `icon`, `post_policy`, `public_url`, `relay.reject_ephemeral`, `relay.enabled_git`, `relay.enabled_nip78_auth` | `relay.private_key` |
 | most of `[limits]` (the restart-column entries below apply on restart only) | `relay.livekit_*`, `relay.enabled_nips` / `disabled_nips` |
@@ -659,9 +659,9 @@ search_index = true
 disabled_fsync = false
 
 [daemon]
-pid_file = "./nostrd.pid"
-log_file = "./nostrd.log"
-stats_file = "./nostrd.stats.json"
+pid_file = "./nostrfy.pid"
+log_file = "./nostrfy.log"
+stats_file = "./nostrfy.stats.json"
 stats_interval_secs = 5
 max_log_size_bytes = 52428800
 max_log_files = 5
@@ -681,10 +681,10 @@ blocked_ips = []
 | --- | --- | --- |
 | `public_url` unset | NIP-42 auth fails, warning at startup | Set `public_url = "wss://..."` |
 | `host = "127.0.0.1"` left as-is | External clients cannot connect | `host = "0.0.0.0"` |
-| `private_key` unset with NIP-29 enabled | No group metadata (39000-39005) | `nostrd genkey` + `restart` |
+| `private_key` unset with NIP-29 enabled | No group metadata (39000-39005) | `nostrfy genkey` + `restart` |
 | String without quotes | TOML parse error | `name = "my relay"` |
-| `restrict_relay = true` with an empty allow list | Everyone is locked out | `nostrd relay allow <npub>` the intended pubkeys |
-| Changing `private_key`/`api_host` and only SIGHUPing | Change does not apply | Use `nostrd restart` |
+| `restrict_relay = true` with an empty allow list | Everyone is locked out | `nostrfy relay allow <npub>` the intended pubkeys |
+| Changing `private_key`/`api_host` and only SIGHUPing | Change does not apply | Use `nostrfy restart` |
 | Values written as floats (`1.5`) or strings (`"8080"`) | Config/parse errors | Use plain integers |
 
 ---

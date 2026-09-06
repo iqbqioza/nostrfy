@@ -1,6 +1,6 @@
-# nostrd HTTP REST API Reference
+# nostrfy HTTP REST API Reference
 
-nostrd provides a **read-only** HTTP REST API for querying stored events. It is served on `GET /api/v1/...`.
+nostrfy provides a **read-only** HTTP REST API for querying stored events. It is served on `GET /api/v1/...`.
 
 > **Media uploads** (images, files) are **not** part of this API: they go through the Blossom file server on the `[blossom]` hostname (`PUT /upload`, kind-24242 auth) — see the [Blossom chapter of the manual](MANUAL.md#11-blossom-file-server-media-hosting).
 

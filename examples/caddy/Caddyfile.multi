@@ -1,6 +1,6 @@
 # Caddyfile — several relays on ONE server, each on its own hostname
 #
-# Scenario (three services, two nostrd processes, one Caddy):
+# Scenario (three services, two nostrfy processes, one Caddy):
 #
 #   relay.example.com   -> 127.0.0.1:8080   general-purpose relay
 #                              (examples/caddy/relay-1.toml, which also
@@ -13,8 +13,8 @@
 #                               [blossom] host setting)
 #
 # Start the relays with their own configs and databases:
-#   nostrd --config relay-1.toml start
-#   nostrd --config relay-2.toml start
+#   nostrfy --config relay-1.toml start
+#   nostrfy --config relay-2.toml start
 #
 # Every hostname gets its own Let's Encrypt certificate automatically.
 # All three services share port 80/443 on the public interface.
@@ -30,11 +30,11 @@ groups.example.com {
 }
 
 # Blossom media server: same process as relay.example.com, but Caddy
-# routes this hostname there too; nostrd serves only the Blossom
+# routes this hostname there too; nostrfy serves only the Blossom
 # routes for requests whose Host header matches [blossom] host.
 media.example.com {
 	# Media is big: cap uploads below the Caddy default of 0 (unlimited)
-	# is a good idea; nostrd enforces blossom.max_upload_bytes itself.
+	# is a good idea; nostrfy enforces blossom.max_upload_bytes itself.
 	request_body {
 		max_size 25MB
 	}

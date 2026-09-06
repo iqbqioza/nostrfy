@@ -1,4 +1,4 @@
-//! nostrd: a minimal, stable Nostr relay server.
+//! nostrfy: a minimal, stable Nostr relay server.
 //!
 //! See the `cli` module for the subcommands (`start`/`stop`/`restart`/
 //! `stats`/`check`/`init`) and `server` for the HTTP/WebSocket front.
