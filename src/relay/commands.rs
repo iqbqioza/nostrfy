@@ -1,7 +1,8 @@
 //! Command events: with `relay.enabled_command_events = true`, kind:1
-//! events authored by the relay's own pubkey are executed as operator
-//! commands without the CLI. The content is a slash-prefixed command; the
-//! pubkey operand accepts `npub1...`, `nostr:npub1...` or 64-hex:
+//! events authored by the admin pubkey (`relay.pubkey`) are executed as
+//! operator commands without the CLI. The content is a slash-prefixed
+//! command; the pubkey operand accepts `npub1...`, `nostr:npub1...` or
+//! 64-hex:
 //!
 //! - `/relay allow <npub1...|nostr:npub1...|64-hex>` — add a pubkey to the relay allow list
 //! - `/relay add <npub1...|nostr:npub1...|64-hex>` — alias of `/relay allow`
@@ -9,11 +10,11 @@
 //! - `/blossom allow <npub1...|nostr:npub1...|64-hex>` — add a pubkey to the Blossom upload allowlist
 //! - `/blossom deny <npub1...|nostr:npub1...|64-hex>` — remove a pubkey from the Blossom upload allowlist
 //!
-//! The relay answers every recognized command with a relay-signed kind:1111
-//! event (tagged with `e` to the command event; served publicly, so the
-//! result is visible even without NIP-42). Only the holder of
-//! `relay.private_key` can issue commands: the author check runs on the
-//! event's verified signature.
+//! The relay answers every recognized command with a kind:1111 event
+//! signed with `relay.private_key` (tagged `e` to the command event and
+//! `p` to the admin pubkey; served publicly, so the result is visible
+//! even without NIP-42). Only the admin (`relay.pubkey`) can issue
+//! commands: the author check runs on the event's verified signature.
 
 use crate::config;
 use crate::event::Event;
@@ -107,18 +108,29 @@ fn normalize_pubkey(value: &str) -> Option<String> {
 
 impl Relay {
     /// Runs the command-event side effect for a stored kind:1 event:
-    /// recognizes the relay's own pubkey and `relay.enabled_command_events`,
-    /// parses the content and executes the command, then answers with a
-    /// kind:1111 event carrying the result. Non-command events are ignored.
+    /// recognizes the admin pubkey (`relay.pubkey`) and
+    /// `relay.enabled_command_events`, parses the content and executes
+    /// the command, then answers with a kind:1111 event carrying the
+    /// result (signed with `relay.private_key`). Non-command events are
+    /// ignored.
     pub(crate) async fn handle_command_event(&self, event: &Event) {
-        let enabled = self.config.read().await.relay.enabled_command_events;
+        let cfg = self.config.read().await;
+        let enabled = cfg.relay.enabled_command_events;
+        let admin = cfg.relay.pubkey.clone();
+        drop(cfg);
         if !enabled {
             return;
         }
-        let Some(relay_pubkey) = self.relay_pubkey() else {
+        if admin.is_empty() {
             return;
-        };
-        if event.pubkey != relay_pubkey {
+        }
+        // The reply needs a key to be signed with.
+        if self.relay_pubkey().is_none() {
+            return;
+        }
+        // Only the admin (`relay.pubkey`) can issue commands: the author
+        // check runs on the event's verified signature.
+        if !admin.eq_ignore_ascii_case(&event.pubkey) {
             return;
         }
         let Some(outcome) = parse(&event.content) else {
@@ -197,13 +209,16 @@ impl Relay {
         }
     }
 
-    /// Signs, stores and broadcasts the kind:1111 reply to a command event.
-    /// The reply carries `e` = the command's id and is served publicly, so
-    /// the result stays visible even when NIP-42 is enabled.
+    /// Signs (with `relay.private_key`), stores and broadcasts the kind:1111
+    /// reply to a command event. The reply carries `e` = the command's id
+    /// and `p` = the admin pubkey (`relay.pubkey`), so clients show it as
+    /// addressed to the admin; it is served publicly, so the result stays
+    /// visible even when NIP-42 is enabled.
     pub(crate) async fn reply_to_command(&self, command: &Event, text: String) {
         let Some(pubkey) = self.relay_pubkey() else {
             return;
         };
+        let admin = self.config.read().await.relay.pubkey.clone();
         let stamp = self.stamp_floor(unix_now());
         let mut event = Event {
             id: String::new(),
@@ -214,6 +229,11 @@ impl Relay {
             content: text,
             sig: String::new(),
         };
+        if !admin.is_empty() {
+            event
+                .tags
+                .push(vec!["p".into(), admin.to_ascii_lowercase()]);
+        }
         let _ = self.store_relay_event(&mut event).await;
     }
 }

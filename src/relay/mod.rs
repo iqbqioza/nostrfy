@@ -83,6 +83,10 @@ pub struct Relay {
     /// The relay's own keypair (from `relay.private_key`), used to sign
     /// NIP-29 and NIP-43 relay-generated events.
     key: Option<Keypair>,
+    /// Cached hex pubkey of the relay's own key (fixed at startup, like
+    /// `key`). The access-control checks exempt it, so the operator can
+    /// always publish command events and read on restricted relays.
+    pub(crate) relay_pubkey: Option<String>,
     secp: Secp256k1<secp256k1::All>,
     /// Path of the config file, set at startup so NIP-86 runtime changes
     /// (relay name/description/icon) can be persisted to disk; without
@@ -234,6 +238,9 @@ impl Relay {
                 }
             }
         };
+        let relay_pubkey = key
+            .as_ref()
+            .map(|keypair| XOnlyPublicKey::from_keypair(keypair).0.to_string());
         let api_max_concurrent = config.read().await.limits.max_api_concurrent;
         // Seed the access control: the persisted runtime state wins, so NIP-86
         // bans/allowlists survive restarts; the config `access` section seeds
@@ -278,6 +285,7 @@ impl Relay {
             ip_blocks_version: AtomicU64::new(0),
             config_version: AtomicU64::new(0),
             key,
+            relay_pubkey,
             secp,
             config_path: Arc::new(tokio::sync::RwLock::new(None)),
             stamps: StampClock::new(),
@@ -404,9 +412,7 @@ impl Relay {
 
     /// Hex pubkey of the relay's own key, if configured.
     pub fn relay_pubkey(&self) -> Option<String> {
-        self.key
-            .as_ref()
-            .map(|keypair| XOnlyPublicKey::from_keypair(keypair).0.to_string())
+        self.relay_pubkey.clone()
     }
 
     pub fn secp(&self) -> &Secp256k1<secp256k1::All> {

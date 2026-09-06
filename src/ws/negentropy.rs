@@ -107,6 +107,14 @@ impl super::Conn {
             self.send_neg_err(&sub_id, "auth-required: please authenticate before syncing");
             return;
         }
+        // The access lists gate syncing like the REQ path: denied pubkeys
+        // are never served, and `restrict_relay` narrows syncs to the
+        // allow list. Read fresh per message, so command-event changes
+        // apply immediately without a reconnect.
+        if !self.access_allows_read().await {
+            self.send_neg_err(&sub_id, "restricted: you are not allowed to sync");
+            return;
+        }
 
         let max_items = self.relay.config.read().await.limits.max_neg_items;
         let max_subs = self.relay.config.read().await.limits.max_subscriptions;
@@ -295,6 +303,18 @@ impl super::Conn {
             self.send_notice("error: NEG-MSG message must be hex");
             return;
         };
+        // The access lists gate in-flight syncs too: a pubkey that was
+        // denied mid-reconciliation gets its sync stopped immediately
+        // (per NIP-77 a NEG-ERR closes the subscription) — no reconnect
+        // needed.
+        if !self.access_allows_read().await {
+            if let Some(state) = self.neg.remove(&sub_id) {
+                self.neg_total = self.neg_total.saturating_sub(state.items.len());
+                self.release_neg_stats_subscription();
+            }
+            self.send_neg_err(&sub_id, "restricted: you are not allowed to sync");
+            return;
+        }
         let Some(state) = self.neg.get_mut(&sub_id) else {
             self.send_neg_err(&sub_id, "closed: unknown subscription");
             return;

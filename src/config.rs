@@ -1200,13 +1200,22 @@ impl Config {
             );
         }
 
-        // Command events: the relay can only execute its own commands
-        // when it has a key to be identified by.
-        if self.relay.enabled_command_events && self.relay.private_key.trim().is_empty() {
-            log::warn!(
-                "relay.enabled_command_events is true but relay.private_key is empty: no \
-                 kind:1 command events can be recognized; run 'nostrd genkey' to set a key"
-            );
+        // Command events: the admin pubkey (`relay.pubkey`) issues them and
+        // `relay.private_key` signs the replies; warn when either is missing.
+        if self.relay.enabled_command_events {
+            if self.relay.pubkey.trim().is_empty() {
+                log::warn!(
+                    "relay.enabled_command_events is true but relay.pubkey is empty: no \
+                     kind:1 command events can be recognized; set relay.pubkey to the \
+                     admin pubkey"
+                );
+            }
+            if self.relay.private_key.trim().is_empty() {
+                log::warn!(
+                    "relay.enabled_command_events is true but relay.private_key is empty: \
+                     the kind:1111 replies cannot be signed; run 'nostrd genkey' to set a key"
+                );
+            }
         }
 
         // Blossom file server: the storage backend must be known, and S3
