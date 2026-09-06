@@ -419,10 +419,22 @@ impl super::Conn {
             .sum();
         let (events, more) = self.relay.db.query_req(stored, max_limit, now).await;
         let mut to_send = Vec::new();
+        // NIP-67: whether any withheld event could be revealed by AUTH, in
+        // which case the `EOSE` carries the `"auth"` hint (challenges must
+        // be enabled for the hint to make sense, mirroring
+        // `send_auth_challenge`).
+        let hint_eligible = {
+            let cfg = self.relay.config.read().await;
+            cfg.nip_enabled(42) && cfg.relay.send_auth_challenge
+        };
+        let mut auth_hidden = false;
         {
             let groups = self.relay.groups.read().await;
             for event in events {
                 if !self.visible_to(&groups, &event) {
+                    if hint_eligible && self.auth_hidden_behind(&groups, &event) {
+                        auth_hidden = true;
+                    }
                     continue;
                 }
                 to_send.push(event);
@@ -440,6 +452,7 @@ impl super::Conn {
             events: to_send.into(),
             eose_hint,
             truncated_or_more: truncated || more,
+            auth_hint: auth_hidden,
             sent_bytes: 0,
         });
     }
@@ -648,6 +661,27 @@ impl super::Conn {
                 .collect()
         };
         self.send_control(nip45::count_response(sub_id, &filters, &events, more));
+    }
+
+    /// Whether an event withheld from this connection could be served to an
+    /// authenticated pubkey (NIP-70 protected, NIP-59 gift-wrap recipient,
+    /// NIP-78 owner, NIP-29 privacy-gated group member). Drives the NIP-67
+    /// `"auth"` EOSE hint.
+    pub(crate) fn auth_hidden_behind(&self, groups: &nip29::GroupStore, event: &Event) -> bool {
+        // NIP-70: protected events are served to any authenticated client.
+        if !self.is_authed() && nip70::is_protected(event) {
+            return true;
+        }
+        // NIP-59 gift wraps are served to the authenticated recipient and
+        // NIP-78 application-specific events to the authenticated owner, so
+        // both are AUTH-revealable.
+        if !self.gift_wrap_visible(event) || !self.nip78_visible(event) {
+            return true;
+        }
+        // NIP-29: content of a `private` group (or `hidden` metadata) is
+        // served to authenticated members. Deleted/ghost/unknown groups are
+        // not AUTH-revealable — their content stays gone for everyone.
+        groups.privacy_gated(event)
     }
 
     /// NIP-59 / NIP-17: gift wraps are signed by random keys, so they may

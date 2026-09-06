@@ -503,7 +503,7 @@ If `rpc.management_port` is set, the legacy REST endpoints are available at `htt
 | 62 | Request to vanish |
 | 65 | Relay list metadata (kind 10002, `#r` indexed) |
 | 66 | Relay discovery & liveness (self-publishes kind 30166 when `relay.private_key` is set, refreshed every 12 h) |
-| 67 | EOSE completeness hint |
+| 67 | EOSE completeness hint (incl. the `"auth"` hint with a challenge when AUTH-gated events were withheld) |
 | 70 | Protected events |
 | 77 | Negentropy syncing |
 | 78 | Application-specific data (kind 30078, addressable; **AUTH-gated** — see `relay.nip78_auth`) |

@@ -35,6 +35,9 @@ pub(crate) struct PendingReq {
     pub(crate) events: std::collections::VecDeque<Event>,
     pub(crate) eose_hint: bool,
     pub(crate) truncated_or_more: bool,
+    /// NIP-67 `"auth"` hint: more stored events match the filters if the
+    /// client performs AUTH; the challenge is queued ahead of the EOSE.
+    pub(crate) auth_hint: bool,
     /// Serialized bytes of the EVENT messages queued so far (against
     /// `limits.max_req_response_bytes`).
     pub(crate) sent_bytes: u64,
@@ -218,12 +221,27 @@ impl Conn {
     /// leave the client hanging on a completed subscription.
     fn finish_pending_req(&mut self, pending: PendingReq) {
         let eose = if pending.eose_hint {
-            let hint = if pending.truncated_or_more {
+            // NIP-67: `"auth"` advertises stored events that match the
+            // filters but are withheld pending AUTH (protected events,
+            // gift wraps, NIP-78 owner data, private groups). The spec
+            // requires an AUTH challenge to be sent *before* the EOSE
+            // that carries the hint, so it is queued ahead of it.
+            if pending.auth_hint {
+                self.send_control(nip42::auth_message(&self.challenge));
+            }
+            // `"finish"`/`"more"` describe the events servable without
+            // AUTH; `"auth"` and either hint may coexist (e.g. the spec's
+            // `["EOSE", sub, ["auth", "finish"]]`).
+            let mut hints = Vec::with_capacity(2);
+            if pending.auth_hint {
+                hints.push("auth");
+            }
+            hints.push(if pending.truncated_or_more {
                 "more"
             } else {
                 "finish"
-            };
-            json!(["EOSE", pending.sub_id, [hint]])
+            });
+            json!(["EOSE", pending.sub_id, hints])
         } else {
             json!(["EOSE", pending.sub_id])
         };
@@ -2365,6 +2383,7 @@ mod tests {
                 events,
                 eose_hint: false,
                 truncated_or_more: false,
+                auth_hint: false,
                 sent_bytes: 0,
             });
             conn.pump_pending_reqs();
@@ -2403,6 +2422,7 @@ mod tests {
                 events,
                 eose_hint: false,
                 truncated_or_more: false,
+                auth_hint: false,
                 sent_bytes: 0,
             });
             conn.pump_pending_reqs();
@@ -2440,6 +2460,7 @@ mod tests {
                     events,
                     eose_hint: true,
                     truncated_or_more: false,
+                    auth_hint: false,
                     sent_bytes: 0,
                 });
             }
@@ -2486,6 +2507,117 @@ mod tests {
     }
 
     #[test]
+    fn eose_auth_hint_is_preceded_by_a_challenge() {
+        // NIP-67 `"auth"` hint: the hint array carries `"auth"`, and the
+        // spec's MUST — an AUTH message before the EOSE — is honored by
+        // queueing the challenge ahead of the EOSE.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            conn.subs
+                .insert("s".into(), (Vec::new(), 0, "\"s\"".into()));
+            conn.enqueue_pending_req(PendingReq {
+                sub_id: "s".into(),
+                events: std::collections::VecDeque::new(),
+                eose_hint: true,
+                truncated_or_more: false,
+                auth_hint: true,
+                sent_bytes: 0,
+            });
+            conn.pump_pending_reqs();
+            let msgs = outgoing_json(&conn);
+            let eose = msgs
+                .iter()
+                .position(|m| m[0] == "EOSE")
+                .expect("an EOSE is sent");
+            let auth = msgs
+                .iter()
+                .position(|m| m[0] == "AUTH")
+                .expect("the AUTH challenge must precede the hint EOSE");
+            assert!(
+                auth < eose,
+                "the AUTH challenge must be queued before the EOSE containing the hint"
+            );
+            assert_eq!(
+                msgs[eose][2],
+                json!(["auth", "finish"]),
+                "the hint array carries auth and finish"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn req_emits_auth_hint_when_protected_events_are_withheld() {
+        // An anonymous REQ over a subscription that also matches NIP-70
+        // protected events gets `["EOSE", sub, ["auth", "finish"]]` with a
+        // challenge first; the authenticated owner instead receives the
+        // protected event and a plain `["finish"]`.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_relay_with("").await;
+            let mut conn = build_conn_on(relay.clone()).await;
+            let now = unix_now();
+            let normal = signed_note(relay.secp(), "public", now, vec![]);
+            let protected = signed_note(relay.secp(), "secret", now, vec![vec!["-".into()]]);
+            relay.db.put(normal.clone(), now).await;
+            relay.db.put(protected.clone(), now).await;
+
+            conn.handle_req(&[json!("sub"), json!({"kinds": [1]})])
+                .await;
+            conn.pump_pending_reqs();
+            let msgs = outgoing_json(&conn);
+            assert!(
+                !msgs
+                    .iter()
+                    .any(|m| m[0] == "EVENT" && m[2]["id"] == protected.id),
+                "the protected event stays hidden from anonymous"
+            );
+            let eose = msgs
+                .iter()
+                .position(|m| m[0] == "EOSE")
+                .expect("an EOSE is sent");
+            assert_eq!(
+                msgs[eose][2],
+                json!(["auth", "finish"]),
+                "withheld auth-gated events must carry the auth hint"
+            );
+            assert!(
+                msgs.iter().take(eose).any(|m| m[0] == "AUTH"),
+                "the challenge must be queued before the auth-hinted EOSE"
+            );
+
+            // The authenticated owner fetches the whole subscription: no
+            // auth hint, no extra challenge.
+            let mut owner = build_conn_on(relay).await;
+            let auth = signed_auth(owner.relay.secp(), "test-challenge", now);
+            owner
+                .handle_auth(&[serde_json::to_value(&auth).unwrap()])
+                .await;
+            owner
+                .handle_req(&[json!("sub"), json!({"kinds": [1]})])
+                .await;
+            owner.pump_pending_reqs();
+            let msgs = outgoing_json(&owner);
+            assert!(
+                !msgs.iter().any(|m| m[0] == "AUTH"),
+                "an authed owner needs no extra challenge"
+            );
+            let eose = msgs
+                .iter()
+                .position(|m| m[0] == "EOSE")
+                .expect("an EOSE is sent");
+            assert_eq!(
+                msgs[eose][2],
+                json!(["finish"]),
+                "the authed owner gets a plain finish"
+            );
+
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
     fn pump_skips_closed_subscriptions_and_replaced_ids() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -2500,6 +2632,7 @@ mod tests {
                 events,
                 eose_hint: true,
                 truncated_or_more: false,
+                auth_hint: false,
                 sent_bytes: 0,
             });
             conn.pump_pending_reqs();
@@ -2522,6 +2655,7 @@ mod tests {
                 events: first,
                 eose_hint: false,
                 truncated_or_more: false,
+                auth_hint: false,
                 sent_bytes: 0,
             });
             let mut second = std::collections::VecDeque::new();
@@ -2531,6 +2665,7 @@ mod tests {
                 events: second,
                 eose_hint: false,
                 truncated_or_more: false,
+                auth_hint: false,
                 sent_bytes: 0,
             });
             assert_eq!(conn.pending_reqs.len(), 1, "the stale response is dropped");
@@ -2580,6 +2715,7 @@ mod tests {
                 events,
                 eose_hint: false,
                 truncated_or_more: false,
+                auth_hint: false,
                 sent_bytes: 0,
             });
             conn.pump_pending_reqs();
