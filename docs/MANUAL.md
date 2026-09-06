@@ -168,7 +168,7 @@ If anything is wrong, it tells you exactly what. It is strongly recommended to r
 | `require_auth` | Require NIP-42 auth for everything (subscriptions and publishing) | `false` |
 | `send_auth_challenge` | Send an AUTH challenge on connect | `true` |
 | `enabled_nip78_auth` | Require NIP-42 AUTH before accepting kind 78/30078 events and serve them only to the authenticated owner | `true` |
-| `enabled_command_events` | Execute kind:1 operator commands (authored by `relay.private_key`) that edit the relay/blossom allow lists, answered with kind:1111 events | `false` |
+| `enabled_command_events` | Execute kind:1 operator commands (authored by the admin pubkey `relay.pubkey`) that edit the relay/blossom allow lists, answered with kind:1111 events | `false` |
 
 To generate a secret key, use the `nostrfy genkey` command (see [5. Command Reference](#5-command-reference)).
 

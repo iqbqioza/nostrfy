@@ -292,6 +292,14 @@ impl super::Relay {
             None => nip01::verify(event, self.secp())
                 .map_err(|_| "invalid: signature verification failed".to_string())?,
         }
+        // NIP-01: hex fields are lowercase by convention. An uppercase-hex
+        // pubkey would be stored verbatim and then never match the
+        // case-sensitive author/tag filters (the event becomes invisible
+        // to clients), while normalizing it would break the id/signature
+        // that were computed over the original string — so reject it.
+        if event.pubkey != event.pubkey.to_ascii_lowercase() {
+            return Err("invalid: pubkey must be lowercase hex".into());
+        }
 
         if cfg.nip_enabled(26) && !nip26::verify(event, self.secp()) {
             return Err("invalid: delegation failed".into());

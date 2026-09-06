@@ -157,12 +157,13 @@ pub struct RelayConfig {
     /// require the NIP-42 AUTH flow before they are accepted, and are only
     /// served to the authenticated owner (the event author's pubkey).
     pub enabled_nip78_auth: bool,
-    /// When true, kind:1 events authored by the relay's own pubkey
-    /// (`relay.private_key`) are executed as operator commands: content
-    /// "relay allow/deny <npub1...|hex>" edits the relay access lists and
-    /// "blossom allow/deny <npub1...|hex>" edits the Blossom upload
+    /// When true, kind:1 events authored by the admin pubkey (`relay.pubkey`)
+    /// are executed as operator commands: content
+    /// "/relay allow/deny <npub1...|hex>" edits the relay access lists and
+    /// "/blossom allow/deny <npub1...|hex>" edits the Blossom upload
     /// allowlist, without the CLI. The relay answers each command with a
-    /// relay-signed kind:1111 event (tagged to the command).
+    /// kind:1111 event signed with `relay.private_key` (tagged to the
+    /// command).
     pub enabled_command_events: bool,
 }
 

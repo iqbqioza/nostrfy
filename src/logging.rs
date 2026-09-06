@@ -122,9 +122,10 @@ impl FileLogger {
         // rename is logged (the old log content between the rotation size
         // and the failure would otherwise be silently lost).
         let first = backup_path(&self.path, 1);
-        if let Err(e) = std::fs::rename(&self.path, &first) {
+        let rotated = std::fs::rename(&self.path, &first).is_ok();
+        if !rotated {
             eprintln!(
-                "cannot rotate log {} -> {}: {e}",
+                "cannot rotate log {} -> {}",
                 self.path.display(),
                 first.display()
             );
@@ -136,7 +137,13 @@ impl FileLogger {
         {
             Ok(file) => {
                 state.file = file;
-                state.size = 0;
+                // Only a successful rotation may reset the size counter: a
+                // failed rename leaves the (still oversized) current file
+                // in place, and resetting to 0 would stop rotation attempts
+                // while the log grows unbounded.
+                if rotated {
+                    state.size = 0;
+                }
             }
             Err(e) => eprintln!("cannot reopen log file: {e}"),
         }

@@ -716,13 +716,14 @@ impl super::Conn {
         let Ok(access) = self.relay.access.try_read() else {
             return self.access_allowed_cache;
         };
-        let admin = self
-            .relay
-            .config
-            .try_read()
-            .map(|cfg| cfg.relay.pubkey.clone())
-            .unwrap_or_default();
-        let verdict = self.read_verdict(&access, &admin);
+        let Ok(cfg) = self.relay.config.try_read() else {
+            // The config write lock is held (a SIGHUP reload): keep the
+            // previous verdict instead of recomputing without the admin
+            // pubkey, which would drop the operator exemption for the
+            // duration of the reload.
+            return self.access_allowed_cache;
+        };
+        let verdict = self.read_verdict(&access, &cfg.relay.pubkey);
         self.access_allowed_cache = verdict;
         verdict
     }

@@ -105,14 +105,18 @@ impl Filter {
                 return false;
             }
         }
-        // NIP-26: events published under a delegation tag match filters on
-        // the delegator's pubkey as well as on the event's own author.
+        // NIP-26: events published under a valid delegation tag match filters
+        // on the delegator's pubkey as well as on the event's own author.
+        // Only a well-formed delegation (`delegation` tags have exactly 4
+        // elements, see `nip26::delegation`) counts: a malformed tag of
+        // any other length must not let an attacker's event match filters
+        // on somebody else's pubkey.
         if let Some(authors) = &self.authors
             && !authors.iter().any(|a| a == ev.pubkey())
             && !ev
                 .tags()
                 .iter()
-                .any(|t| t.len() >= 2 && t[0] == "delegation" && authors.iter().any(|a| a == &t[1]))
+                .any(|t| t.len() == 4 && t[0] == "delegation" && authors.iter().any(|a| a == &t[1]))
         {
             return false;
         }

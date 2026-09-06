@@ -265,9 +265,16 @@ impl Conn {
         loop {
             // The access lists gate the pump too: results queued before a
             // deny are dropped, so the restriction applies immediately
-            // without disconnecting the connection.
+            // without disconnecting the connection. The subscriptions are
+            // closed (CLOSED + unregistered), so the client does not hang
+            // waiting for an EOSE that will never come.
             if !self.access_allows_read_sync() {
+                let ids: Vec<String> = self.pending_reqs.iter().map(|p| p.sub_id.clone()).collect();
                 self.pending_reqs.clear();
+                for id in ids {
+                    self.send_closed(&id, "restricted: you are not allowed to subscribe");
+                    self.remove_subscription(&id);
+                }
                 break;
             }
             // A subscription closed while its response was still pumping

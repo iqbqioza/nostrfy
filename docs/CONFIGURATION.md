@@ -90,7 +90,7 @@ Every key is optional; a missing key uses the default shown below.
 | `require_auth` | boolean | `false` | Require NIP-42 authentication for all REQ/EVENT/COUNT/NEG |
 | `send_auth_challenge` | boolean | `true` | Send the AUTH challenge on connect |
 | `enabled_nip78_auth` | boolean | `true` | Require NIP-42 AUTH before accepting kind 78/30078 events and serve them only to the authenticated owner |
-| `enabled_command_events` | boolean | `false` | Execute kind:1 operator commands authored by `relay.private_key` (see below) |
+| `enabled_command_events` | boolean | `false` | Execute kind:1 operator commands authored by the admin pubkey `relay.pubkey` (see below) |
 
 ### Key details
 

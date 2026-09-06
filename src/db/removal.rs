@@ -405,7 +405,11 @@ impl Store {
         }
         let mut wtxn = self.env.write_txn()?;
         let since_key = created_key(0, &[0u8; ID_LEN]);
-        let until_key = created_key(now, &[0xffu8; ID_LEN]);
+        // NIP-40 semantics are `expiration < now` (every other path checks
+        // `exp < now`): the purge must not delete events whose expiration
+        // equals the current second, so the upper bound steps one second
+        // below `now`.
+        let until_key = created_key(now.saturating_sub(1), &[0xffu8; ID_LEN]);
         let mut last_key: Option<Vec<u8>> = None;
         let mut removed = 0usize;
         loop {
