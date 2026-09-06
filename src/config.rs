@@ -152,6 +152,10 @@ pub struct RelayConfig {
     /// Send a NIP-42 auth-request challenge when a connection arrives
     /// without authentication.
     pub send_auth_challenge: bool,
+    /// When true, NIP-78 application-specific events (kinds 78 and 30078)
+    /// require the NIP-42 AUTH flow before they are accepted, and are only
+    /// served to the authenticated owner (the event author's pubkey).
+    pub nip78_auth: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -382,6 +386,7 @@ impl Default for RelayConfig {
             max_groups: 1_000,
             require_auth: false,
             send_auth_challenge: true,
+            nip78_auth: true,
         }
     }
 }
@@ -1041,6 +1046,19 @@ impl Config {
                 "relay.require_auth requires NIP-42 to be enabled (add 42 to relay.enabled_nips or remove 42 from relay.disabled_nips)".into(),
             ));
         }
+        // `nip78_auth` has the same footgun: with NIP-42 disabled nobody
+        // can authenticate, so every kind 78/30078 event would be rejected
+        // at publish and never served.
+        if self.relay.nip78_auth && !self.nip_enabled(42) {
+            return Err(Error::Config(
+                "relay.nip78_auth requires NIP-42 to be enabled (add 42 to relay.enabled_nips or remove 42 from relay.disabled_nips)".into(),
+            ));
+        }
+        if self.relay.nip78_auth && !self.nip_enabled(78) {
+            log::warn!(
+                "relay.nip78_auth is set but NIP-78 is not enabled; the AUTH gate is inactive"
+            );
+        }
         // Limits must be usable (zero would disable core functionality or
         // make the queue fail fast on the first request).
         let l = &self.limits;
@@ -1508,6 +1526,7 @@ fn known_config_keys() -> &'static [(&'static str, &'static [&'static str])] {
                 "max_groups",
                 "require_auth",
                 "send_auth_challenge",
+                "nip78_auth",
                 "enable_git",
                 "software",
                 "version",
@@ -2428,6 +2447,32 @@ log_max_files = 2
         let mut cfg = Config::default();
         cfg.access.blocked_ips = vec![("not-an-ip".into(), String::new())];
         assert!(cfg.validate().is_err(), "blocked IPs must parse");
+    }
+
+    #[test]
+    fn nip78_auth_defaults_parses_and_requires_nip42() {
+        let cfg = Config::default();
+        assert!(
+            cfg.relay.nip78_auth,
+            "default must be true (spec-conformant private NIP-78)"
+        );
+        assert!(cfg.validate().is_ok());
+
+        let parsed: Config =
+            toml::from_str("[relay]\nnip78_auth = false\n").expect("must parse false");
+        assert!(!parsed.relay.nip78_auth);
+
+        // Missing key defaults to true via #[serde(default)]
+        let parsed: Config = toml::from_str("").expect("empty must parse");
+        assert!(parsed.relay.nip78_auth);
+
+        // The gate needs NIP-42, otherwise nobody can authenticate.
+        let mut cfg = Config::default();
+        cfg.relay.disabled_nips = vec![42];
+        assert!(
+            cfg.validate().is_err(),
+            "nip78_auth requires NIP-42 to be enabled"
+        );
     }
 
     #[test]

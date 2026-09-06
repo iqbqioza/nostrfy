@@ -634,6 +634,7 @@ impl super::Conn {
                 .filter(|e| {
                     (self.is_authed() || !nip70::is_protected(e))
                         && self.gift_wrap_visible(e)
+                        && self.nip78_visible(e)
                         && groups.as_deref().is_none_or(|g| {
                             if self.authed_pubkeys.is_empty() {
                                 g.visible_to(e, None)
@@ -661,6 +662,14 @@ impl super::Conn {
                 .iter()
                 .any(|t| t.len() >= 2 && t[0] == "p" && self.authed_pubkeys.contains(&t[1]))
     }
+    /// Whether a NIP-78 application-specific event may be served on this
+    /// connection: only to the authenticated owner (the event author's
+    /// pubkey), when the AUTH gate is on.
+    pub(crate) fn nip78_visible(&self, event: &Event) -> bool {
+        !self.nip78_restricted
+            || !crate::nips::nip78::is_app_specific(event)
+            || self.authed_pubkeys.iter().any(|pk| pk == &event.pubkey)
+    }
     /// Whether a stored or live event may be served on this connection
     /// (NIP-70 protected, NIP-59 gift-wrap recipient and NIP-29 group
     /// access checks).
@@ -673,6 +682,9 @@ impl super::Conn {
             return false;
         }
         if !self.gift_wrap_visible(event) {
+            return false;
+        }
+        if !self.nip78_visible(event) {
             return false;
         }
         if self.authed_pubkeys.is_empty() {
@@ -708,6 +720,11 @@ impl super::Conn {
         // when the batch contains no group events (visible_to is only
         // reached when the groups lock was taken).
         if !self.gift_wrap_visible(event) {
+            return;
+        }
+        // NIP-78: application-specific events are only delivered to the
+        // authenticated owner.
+        if !self.nip78_visible(event) {
             return;
         }
         if let Some(groups) = groups

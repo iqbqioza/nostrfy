@@ -15,7 +15,7 @@ use crate::config::Config;
 use crate::event::Event;
 use crate::filter::Filter;
 use crate::nips::nip19::{self, Nip19Entity};
-use crate::nips::{nip29, nip62, nip70};
+use crate::nips::{nip29, nip62, nip70, nip78};
 use crate::relay::Relay;
 use crate::util::unix_now;
 
@@ -162,6 +162,32 @@ fn excluded_tags(params: &ApiParams) -> Vec<&'static str> {
         out.push("d");
     }
     out
+}
+
+/// Whether a stored event is visible to this unauthenticated REST API,
+/// mirroring an anonymous WebSocket connection: NIP-70 protected events,
+/// NIP-59 gift wraps, NIP-29 private/hidden group content and (when the
+/// NIP-78 AUTH gate is active) NIP-78 application-specific events are
+/// withheld.
+fn api_visible(
+    event: &Event,
+    groups: Option<&nip29::GroupStore>,
+    excluded: &[&str],
+    nip78: bool,
+) -> bool {
+    !nip70::is_protected(event)
+        && event.kind != nip62::GIFT_WRAP_KIND
+        && !(nip78 && nip78::is_app_specific(event))
+        && groups.is_none_or(|g| g.visible_to(event, None))
+        && !excluded
+            .iter()
+            .any(|name| event.tags.iter().any(|t| t.len() >= 2 && t[0] == *name))
+}
+
+/// Whether the NIP-78 AUTH gate is active in the current config.
+async fn nip78_auth_active(relay: &Arc<Relay>) -> bool {
+    let cfg = relay.config.read().await;
+    cfg.nip_enabled(78) && cfg.relay.nip78_auth
 }
 
 fn apply_params(mut filter: Filter, params: &ApiParams) -> Filter {
@@ -470,6 +496,7 @@ pub async fn api_monthly_handler(
     };
     let count_limit = relay.config.read().await.limits.max_count;
     let no_tags = excluded_tags(&params);
+    let nip78 = nip78_auth_active(&relay).await;
 
     let mut month_counts = Vec::with_capacity(months.len());
     let mut total = 0u64;
@@ -494,14 +521,7 @@ pub async fn api_monthly_handler(
         };
         let count = events
             .iter()
-            .filter(|e| {
-                !nip70::is_protected(e)
-                    && (e.kind != nip62::GIFT_WRAP_KIND)
-                    && groups.as_deref().is_none_or(|g| g.visible_to(e, None))
-                    && !no_tags
-                        .iter()
-                        .any(|name| e.tags.iter().any(|t| t.len() >= 2 && t[0] == *name))
-            })
+            .filter(|e| api_visible(e, groups.as_deref(), &no_tags, nip78))
             .count();
         drop(groups);
         total += count as u64;
@@ -578,6 +598,7 @@ pub async fn api_count_handler(
     // The absence filters apply like the /query path (a `no_p` count must
     // agree with the visible rows of a `no_p` query).
     let no_tags = excluded_tags(&params);
+    let nip78 = nip78_auth_active(&relay).await;
     let (events, more) = relay.db.api_count(vec![filter], count_limit, now).await;
     let has_group_events = events.iter().any(nip29::is_group_event);
     let groups = if has_group_events {
@@ -587,14 +608,7 @@ pub async fn api_count_handler(
     };
     let count = events
         .iter()
-        .filter(|e| {
-            !nip70::is_protected(e)
-                && (e.kind != nip62::GIFT_WRAP_KIND)
-                && groups.as_deref().is_none_or(|g| g.visible_to(e, None))
-                && !no_tags
-                    .iter()
-                    .any(|name| e.tags.iter().any(|t| t.len() >= 2 && t[0] == *name))
-        })
+        .filter(|e| api_visible(e, groups.as_deref(), &no_tags, nip78))
         .count();
     drop(groups);
     drop(_permit);
@@ -635,15 +649,12 @@ pub async fn api_kinds_handler(
         None
     };
     let no_tags = excluded_tags(&params);
+    let nip78 = nip78_auth_active(&relay).await;
     let mut by_kind: std::collections::BTreeMap<u64, usize> = std::collections::BTreeMap::new();
-    for e in events.iter().filter(|e| {
-        !nip70::is_protected(e)
-            && (e.kind != nip62::GIFT_WRAP_KIND)
-            && groups.as_deref().is_none_or(|g| g.visible_to(e, None))
-            && !no_tags
-                .iter()
-                .any(|name| e.tags.iter().any(|t| t.len() >= 2 && t[0] == *name))
-    }) {
+    for e in events
+        .iter()
+        .filter(|e| api_visible(e, groups.as_deref(), &no_tags, nip78))
+    {
         *by_kind.entry(e.kind).or_default() += 1;
     }
     drop(groups);
@@ -710,6 +721,7 @@ pub async fn api_daily_handler(
     };
     let count_limit = relay.config.read().await.limits.max_count;
     let no_tags = excluded_tags(&params);
+    let nip78 = nip78_auth_active(&relay).await;
 
     let mut day_counts = Vec::with_capacity(days_in_month as usize);
     let mut total = 0u64;
@@ -731,14 +743,7 @@ pub async fn api_daily_handler(
         };
         let count = events
             .iter()
-            .filter(|e| {
-                !nip70::is_protected(e)
-                    && (e.kind != nip62::GIFT_WRAP_KIND)
-                    && groups.as_deref().is_none_or(|g| g.visible_to(e, None))
-                    && !no_tags
-                        .iter()
-                        .any(|name| e.tags.iter().any(|t| t.len() >= 2 && t[0] == *name))
-            })
+            .filter(|e| api_visible(e, groups.as_deref(), &no_tags, nip78))
             .count();
         drop(groups);
         total += count as u64;
@@ -819,6 +824,7 @@ pub async fn api_stats_handler(
     let now = unix_now();
     let filter: Filter = serde_json::from_value(json!({ "authors": [hex_pk] })).expect("static");
     let no_tags = excluded_tags(&params);
+    let nip78 = nip78_auth_active(&relay).await;
 
     let (events, more) = relay
         .db
@@ -832,14 +838,10 @@ pub async fn api_stats_handler(
     };
     let mut by_kind: std::collections::BTreeMap<u64, usize> = std::collections::BTreeMap::new();
     let mut total = 0usize;
-    for e in events.iter().filter(|e| {
-        !nip70::is_protected(e)
-            && (e.kind != nip62::GIFT_WRAP_KIND)
-            && groups.as_deref().is_none_or(|g| g.visible_to(e, None))
-            && !no_tags
-                .iter()
-                .any(|name| e.tags.iter().any(|t| t.len() >= 2 && t[0] == *name))
-    }) {
+    for e in events
+        .iter()
+        .filter(|e| api_visible(e, groups.as_deref(), &no_tags, nip78))
+    {
         *by_kind.entry(e.kind).or_default() += 1;
         total += 1;
     }
@@ -857,22 +859,12 @@ pub async fn api_stats_handler(
     let (last, _) = relay.db.api_query(vec![filter], 64, now, false).await;
     drop(_permit);
     let stats_groups = relay.groups.read().await;
-    let visible_first = first.into_iter().find(|e| {
-        !nip70::is_protected(e)
-            && e.kind != nip62::GIFT_WRAP_KIND
-            && stats_groups.visible_to(e, None)
-            && !no_tags
-                .iter()
-                .any(|name| e.tags.iter().any(|t| t.len() >= 2 && t[0] == *name))
-    });
-    let visible_last = last.into_iter().find(|e| {
-        !nip70::is_protected(e)
-            && e.kind != nip62::GIFT_WRAP_KIND
-            && stats_groups.visible_to(e, None)
-            && !no_tags
-                .iter()
-                .any(|name| e.tags.iter().any(|t| t.len() >= 2 && t[0] == *name))
-    });
+    let visible_first = first
+        .into_iter()
+        .find(|e| api_visible(e, Some(&stats_groups), &no_tags, nip78));
+    let visible_last = last
+        .into_iter()
+        .find(|e| api_visible(e, Some(&stats_groups), &no_tags, nip78));
     drop(stats_groups);
     let first_seen = visible_first.map(|e| e.created_at);
     let last_seen = visible_last.map(|e| e.created_at);
@@ -956,6 +948,7 @@ pub async fn api_hourly_handler(
     };
     let count_limit = relay.config.read().await.limits.max_count;
     let no_tags = excluded_tags(&params);
+    let nip78 = nip78_auth_active(&relay).await;
 
     let mut hour_counts = Vec::with_capacity(24);
     let mut total = 0u64;
@@ -977,14 +970,7 @@ pub async fn api_hourly_handler(
         };
         let count = events
             .iter()
-            .filter(|e| {
-                !nip70::is_protected(e)
-                    && (e.kind != nip62::GIFT_WRAP_KIND)
-                    && groups.as_deref().is_none_or(|g| g.visible_to(e, None))
-                    && !no_tags
-                        .iter()
-                        .any(|name| e.tags.iter().any(|t| t.len() >= 2 && t[0] == *name))
-            })
+            .filter(|e| api_visible(e, groups.as_deref(), &no_tags, nip78))
             .count();
         drop(groups);
         total += count as u64;
@@ -1323,6 +1309,7 @@ async fn query_and_respond(
             f.search = None;
         }
     }
+    let nip78 = nip78_auth_active(relay).await;
     // Pagination: fetch `limit + offset + 1` so `more` can be decided from
     // the *visible* sequence (events hidden between pages — protected, gift
     // wraps, private groups — must not make a client skip a page or stop
@@ -1352,14 +1339,7 @@ async fn query_and_respond(
     };
     let visible: Vec<Event> = events
         .into_iter()
-        .filter(|e| {
-            !nip70::is_protected(e)
-                && (e.kind != nip62::GIFT_WRAP_KIND)
-                && groups.as_deref().is_none_or(|g| g.visible_to(e, None))
-                && !no_tags
-                    .iter()
-                    .any(|name| e.tags.iter().any(|t| t.len() >= 2 && t[0] == *name))
-        })
+        .filter(|e| api_visible(e, groups.as_deref(), no_tags, nip78))
         .collect();
     drop(groups);
 
@@ -2230,6 +2210,49 @@ mod tests {
                 .collect();
             assert_eq!(contents, vec!["top-level".to_string()]);
 
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn api_hides_nip78_events() {
+        // The unauthenticated REST API must not leak kind 78/30078 events
+        // while relay.nip78_auth is on (the default).
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_relay().await;
+            let now = unix_now();
+            relay
+                .db
+                .put(signed_note(relay.secp(), "public", now, vec![]), now)
+                .await;
+            relay
+                .db
+                .put(
+                    signed_kind_note(
+                        relay.secp(),
+                        30078,
+                        "app",
+                        now,
+                        vec![vec!["d".into(), "profile".into()]],
+                    ),
+                    now,
+                )
+                .await;
+            let filters: Vec<Filter> =
+                serde_json::from_value(serde_json::json!([{"kinds": [1, 30078]}])).unwrap();
+            let (_, Json(resp)) = query_and_respond(&relay, filters, 10, Some(0), false, &[]).await;
+            let contents: Vec<String> = resp["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|e| e["content"].as_str().unwrap().to_string())
+                .collect();
+            assert_eq!(
+                contents,
+                vec!["public".to_string()],
+                "NIP-78 events must be withheld from the API"
+            );
             relay.db.shutdown();
         });
     }

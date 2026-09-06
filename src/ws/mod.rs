@@ -114,6 +114,10 @@ pub struct Conn {
     /// Whether NIP-59 gift wraps are only served to their recipients
     /// (enforced with NIP-42 auth; false when NIP-42 is disabled).
     pub(crate) giftwrap_restricted: bool,
+    /// Whether NIP-78 application-specific events (kinds 78/30078) are only
+    /// served to the authenticated owner when the AUTH gate is on (cached
+    /// from the config on connect and refreshed after a SIGHUP reload).
+    pub(crate) nip78_restricted: bool,
     pub(crate) dropped: u64,
     /// Per-connection message/byte counters, flushed into the shared stats
     /// once on disconnect so that a million connections do not hammer the
@@ -479,6 +483,7 @@ pub async fn handle_connection(
         req_response_bytes,
         expiry_enabled,
         giftwrap_restricted,
+        nip78_restricted,
         idle_timeout,
     ) = {
         let cfg = relay.config.read().await;
@@ -488,6 +493,7 @@ pub async fn handle_connection(
             cfg.limits.max_req_response_bytes,
             cfg.nip_enabled(40),
             cfg.nip_enabled(42),
+            cfg.nip_enabled(78) && cfg.relay.nip78_auth,
             cfg.limits.ws_idle_timeout_secs,
         )
     };
@@ -561,6 +567,7 @@ pub async fn handle_connection(
         pending_events: Vec::new(),
         expiry_enabled,
         giftwrap_restricted,
+        nip78_restricted,
         config_version: 0,
         dropped: 0,
         in_msgs: 0,
@@ -708,6 +715,7 @@ pub async fn handle_connection(
                             let cfg = conn.relay.config.read().await;
                             conn.expiry_enabled = cfg.nip_enabled(40);
                             conn.giftwrap_restricted = cfg.nip_enabled(42);
+                            conn.nip78_restricted = cfg.nip_enabled(78) && cfg.relay.nip78_auth;
                         }
                     }
                 }
@@ -801,6 +809,7 @@ pub async fn handle_connection(
                             let cfg = conn.relay.config.read().await;
                             conn.expiry_enabled = cfg.nip_enabled(40);
                             conn.giftwrap_restricted = cfg.nip_enabled(42);
+                            conn.nip78_restricted = cfg.nip_enabled(78) && cfg.relay.nip78_auth;
                         }
                         // The group store lock and its Arc clone are only
                         // taken when the batch actually contains group
@@ -977,6 +986,59 @@ mod tests {
         ev
     }
 
+    /// Like [`signed_note_seeded`] but with an arbitrary kind and a valid
+    /// signature over that kind (kind mutations after signing break the sig).
+    fn signed_kind_note_seeded(
+        secp: &Secp256k1<secp256k1::All>,
+        seed: u8,
+        kind: u64,
+        content: &str,
+        created: u64,
+        tags: Vec<Vec<String>>,
+    ) -> Event {
+        let keypair = Keypair::from_seckey_slice(secp, &[seed; 32]).unwrap();
+        let pubkey = XOnlyPublicKey::from_keypair(&keypair).0.to_string();
+        let mut ev = Event {
+            id: String::new(),
+            pubkey,
+            created_at: created,
+            kind,
+            tags,
+            content: content.into(),
+            sig: String::new(),
+        };
+        sign(&mut ev, &keypair, secp).unwrap();
+        ev
+    }
+
+    /// AUTH event signed with a specific key seed (owner of the events it
+    /// must reveal). Seed 2 matches [`signed_auth`]/[`signed_note_seeded`].
+    fn signed_auth_seeded(
+        secp: &Secp256k1<secp256k1::All>,
+        seed: u8,
+        challenge: &str,
+        created: u64,
+    ) -> Event {
+        let keypair = Keypair::from_seckey_slice(secp, &[seed; 32]).unwrap();
+        let pubkey = XOnlyPublicKey::from_keypair(&keypair).0.to_string();
+        let mut ev = Event {
+            id: String::new(),
+            pubkey,
+            created_at: created,
+            kind: 22242,
+            tags: vec![
+                vec!["challenge".into(), challenge.into()],
+                vec!["relay".into(), "127.0.0.1:8080".into()],
+            ],
+            content: String::new(),
+            sig: String::new(),
+        };
+        ev.id = compute_id(&ev);
+        let id = ev.id_bytes().unwrap();
+        ev.sig = secp.sign_schnorr_no_aux_rand(&id, &keypair).to_string();
+        ev
+    }
+
     async fn build_conn() -> Conn {
         build_conn_with("").await
     }
@@ -984,12 +1046,13 @@ mod tests {
     /// Builds a connection on a pre-built relay (for tests that need
     /// several connections sharing one relay + subscription index).
     async fn build_conn_on(relay: Arc<Relay>) -> Conn {
-        let (out_queue_bytes, expiry_enabled, giftwrap_restricted) = {
+        let (out_queue_bytes, expiry_enabled, giftwrap_restricted, nip78_restricted) = {
             let cfg = relay.config.read().await;
             (
                 cfg.limits.max_out_queue_bytes,
                 cfg.nip_enabled(40),
                 cfg.nip_enabled(42),
+                cfg.nip_enabled(78) && cfg.relay.nip78_auth,
             )
         };
         let conn_id = relay
@@ -1022,6 +1085,7 @@ mod tests {
             pending_events: Vec::new(),
             expiry_enabled,
             giftwrap_restricted,
+            nip78_restricted,
             config_version: 0,
             dropped: 0,
             in_msgs: 0,
@@ -1033,6 +1097,12 @@ mod tests {
     }
 
     async fn build_conn_with(private_key: &str) -> Conn {
+        build_conn_on(build_relay_with(private_key).await).await
+    }
+
+    /// Builds a relay with the test memory-mapped database and its live bus
+    /// running, for tests that need several connections sharing one relay.
+    async fn build_relay_with(private_key: &str) -> Arc<Relay> {
         let mut cfg = Config::default();
         cfg.database.path = temp_db_path();
         // Small memory map: the parallel tests each open a DB, and the
@@ -1066,53 +1136,7 @@ mod tests {
         )
         .await;
         relay.start_live_bus();
-        let relay = Arc::new(relay);
-        let (out_queue_bytes, expiry_enabled, giftwrap_restricted) = {
-            let cfg = relay.config.read().await;
-            (
-                cfg.limits.max_out_queue_bytes,
-                cfg.nip_enabled(40),
-                cfg.nip_enabled(42),
-            )
-        };
-        let conn_id = relay
-            .next_conn_id
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let (live_tx, live_rx) = tokio::sync::mpsc::channel(crate::relay::LIVE_QUEUE_CAPACITY);
-        relay
-            .conn_queues
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(conn_id, live_tx);
-        Conn {
-            relay,
-            conn_id,
-            subscriptions_held: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            path: "/".into(),
-            outgoing: std::collections::VecDeque::new(),
-            out_bytes: 0,
-            out_queue_bytes,
-            req_response_bytes: 0,
-            pending_reqs: std::collections::VecDeque::new(),
-            subs: HashMap::new(),
-            sub_bytes: 0,
-            neg: HashMap::new(),
-            neg_total: 0,
-            neg_opens_total: 0,
-            challenge: "test-challenge".into(),
-            authed_pubkeys: Vec::new(),
-            pending_events: Vec::new(),
-            live: Some(live_rx),
-            expiry_enabled,
-            giftwrap_restricted,
-            config_version: 0,
-            dropped: 0,
-            in_msgs: 0,
-            in_bytes: 0,
-            out_msgs: 0,
-            out_bytes_total: 0,
-            events_received_local: 0,
-        }
+        Arc::new(relay)
     }
 
     /// Every queued outgoing text message parsed as JSON.
@@ -1324,6 +1348,223 @@ mod tests {
                 Some(1),
                 "protected events are not counted for anonymous"
             );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn req_hides_nip78_events_from_anonymous_and_nonowners() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_relay_with("").await;
+            let mut conn = build_conn_on(relay.clone()).await;
+            let now = unix_now();
+            let normal = signed_note(relay.secp(), "public", now, vec![]);
+            // NIP-78 app-specific event authored by the seed-2 key (the key
+            // that `signed_auth` authenticates as).
+            let mut app = signed_note_seeded(
+                relay.secp(),
+                2,
+                "app-specific",
+                now,
+                vec![vec!["d".into(), "profile".into()]],
+            );
+            app.kind = 30078;
+            app.id = crate::nips::nip01::compute_id(&app);
+            relay.db.put(normal.clone(), now).await;
+            relay.db.put(app.clone(), now).await;
+
+            conn.handle_req(&[json!("sub"), json!({"kinds": [1, 30078]})])
+                .await;
+            conn.pump_pending_reqs();
+            let ids: Vec<String> = outgoing_json(&conn)
+                .iter()
+                .filter(|m| m[0] == "EVENT")
+                .map(|m| m[2]["id"].as_str().unwrap().to_string())
+                .collect();
+            assert!(ids.contains(&normal.id));
+            assert!(
+                !ids.contains(&app.id),
+                "NIP-78 event must be hidden from an anonymous client"
+            );
+
+            // The owner sees its own app-specific event.
+            let mut owner = build_conn_on(relay.clone()).await;
+            let auth = signed_auth(relay.secp(), "test-challenge", now);
+            owner
+                .handle_auth(&[serde_json::to_value(&auth).unwrap()])
+                .await;
+            assert!(owner.is_authed());
+            owner
+                .handle_req(&[json!("sub"), json!({"kinds": [30078]})])
+                .await;
+            owner.pump_pending_reqs();
+            assert!(
+                outgoing_json(&owner)
+                    .iter()
+                    .any(|m| m[0] == "EVENT" && m[2]["id"] == app.id),
+                "the authenticated owner sees its own NIP-78 event"
+            );
+
+            // A third party authenticated with a different key does not.
+            let mut other = build_conn_on(relay).await;
+            let auth = signed_auth_seeded(other.relay.secp(), 3, "test-challenge", now);
+            other
+                .handle_auth(&[serde_json::to_value(&auth).unwrap()])
+                .await;
+            assert!(other.is_authed());
+            other
+                .handle_req(&[json!("sub"), json!({"kinds": [30078]})])
+                .await;
+            other.pump_pending_reqs();
+            assert!(
+                !outgoing_json(&other)
+                    .iter()
+                    .any(|m| m[0] == "EVENT" && m[2]["id"] == app.id),
+                "an authenticated non-owner must not see the NIP-78 event"
+            );
+
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn count_applies_visibility_to_nip78_events() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let now = unix_now();
+            conn.relay
+                .db
+                .put(signed_note(conn.relay.secp(), "public", now, vec![]), now)
+                .await;
+            let mut app = signed_note(conn.relay.secp(), "app", now, vec![]);
+            app.kind = 30078;
+            app.id = crate::nips::nip01::compute_id(&app);
+            conn.relay.db.put(app, now).await;
+            conn.handle_count(&[json!("c"), json!({"kinds": [1, 30078]})])
+                .await;
+            let msgs = outgoing_json(&conn);
+            let count = msgs
+                .iter()
+                .find(|m| m[0] == "COUNT")
+                .expect("a COUNT response is sent");
+            assert_eq!(
+                count[2]["count"].as_u64(),
+                Some(1),
+                "NIP-78 events are not counted for anonymous"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn publish_requires_auth_for_nip78_events() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_relay_with("").await;
+            let mut conn = build_conn_on(relay.clone()).await;
+            let now = unix_now();
+            for kind in [78, 30078] {
+                let mut ev = signed_note(relay.secp(), "app", now, vec![]);
+                ev.kind = kind;
+                ev.id = crate::nips::nip01::compute_id(&ev);
+                conn.queue_event_value(ev.clone()).await;
+                conn.flush_pending_events().await;
+                assert!(
+                    !outgoing_json(&conn)
+                        .iter()
+                        .any(|m| m[0] == "OK" && m[1] == ev.id && m[2] == true),
+                    "kind {kind} must be rejected on an anonymous connection"
+                );
+            }
+
+            // The AUTH'd author can publish its own app-specific event.
+            let mut owner = build_conn_on(relay).await;
+            let auth = signed_auth(owner.relay.secp(), "test-challenge", now);
+            owner
+                .handle_auth(&[serde_json::to_value(&auth).unwrap()])
+                .await;
+            let app = signed_kind_note_seeded(
+                owner.relay.secp(),
+                2,
+                78,
+                "owner-app",
+                now,
+                vec![vec!["d".into(), "profile".into()]],
+            );
+            owner.queue_event_value(app.clone()).await;
+            owner.flush_pending_events().await;
+            assert!(
+                outgoing_json(&owner)
+                    .iter()
+                    .any(|m| m[0] == "OK" && m[1] == app.id && m[2] == true),
+                "an authenticated client may publish kind 78"
+            );
+
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn live_delivery_hides_nip78_events() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_relay_with("").await;
+            let mut conn = build_conn_on(relay.clone()).await;
+            let now = unix_now();
+            conn.handle_req(&[json!("sub"), json!({"kinds": [30078]})])
+                .await;
+            assert!(conn.live.is_some(), "REQ must subscribe to live events");
+
+            let ev = signed_kind_note_seeded(relay.secp(), 2, 30078, "live-app", now, vec![]);
+            relay.broadcast(ev.clone());
+            let received = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                conn.live.as_mut().unwrap().recv(),
+            )
+            .await;
+            match received {
+                Ok(Some(_batch)) => {
+                    conn.deliver_live(&ev, &serde_json::to_string(&ev).unwrap_or_default(), None);
+                    assert!(
+                        !outgoing_json(&conn)
+                            .iter()
+                            .any(|m| m[0] == "EVENT" && m[2]["id"] == ev.id),
+                        "deliver_live must hide NIP-78 events from anonymous"
+                    );
+                }
+                other => panic!("live bus did not deliver: {other:?}"),
+            }
+
+            // The authenticated owner receives its own live app-specific event.
+            let mut owner = build_conn_on(relay.clone()).await;
+            let auth = signed_auth(owner.relay.secp(), "test-challenge", now);
+            owner
+                .handle_auth(&[serde_json::to_value(&auth).unwrap()])
+                .await;
+            owner
+                .handle_req(&[json!("sub"), json!({"kinds": [30078]})])
+                .await;
+            relay.broadcast(ev.clone());
+            let received = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                owner.live.as_mut().unwrap().recv(),
+            )
+            .await;
+            match received {
+                Ok(Some(_batch)) => {
+                    owner.deliver_live(&ev, &serde_json::to_string(&ev).unwrap_or_default(), None);
+                    assert!(
+                        outgoing_json(&owner)
+                            .iter()
+                            .any(|m| m[0] == "EVENT" && m[2]["id"] == ev.id),
+                        "the owner receives its own live NIP-78 event"
+                    );
+                }
+                other => panic!("live bus did not deliver: {other:?}"),
+            }
+
             conn.relay.db.shutdown();
         });
     }

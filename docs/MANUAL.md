@@ -167,6 +167,7 @@ If anything is wrong, it tells you exactly what. It is strongly recommended to r
 | `max_groups` | NIP-29 in-memory group store cap (active + deleted markers; `0` = unlimited) | `1000` |
 | `require_auth` | Require NIP-42 auth for everything (subscriptions and publishing) | `false` |
 | `send_auth_challenge` | Send an AUTH challenge on connect | `true` |
+| `nip78_auth` | Require NIP-42 AUTH before accepting kind 78/30078 events and serve them only to the authenticated owner | `true` |
 
 To generate a secret key, use the `nostrd genkey` command (see [5. Command Reference](#5-command-reference)).
 
@@ -183,6 +184,8 @@ To generate a secret key, use the `nostrd genkey` command (see [5. Command Refer
 | `metrics_enabled` | Serve `/metrics` (Prometheus format) | `true` |
 
 > **Note**: `require_auth = true` combined with `send_auth_challenge = false` locks everyone out — nobody can authenticate. Avoid this combination.
+
+> **Note**: `nip78_auth = true` (the default) makes kind 78/30078 events private: they require NIP-42 AUTH to publish, and are served only to the authenticated owner (the event author). Unauthenticated subscribers, negentropy syncs and the REST API do not see them. Requires NIP-42 to be enabled; set `nip78_auth = false` for the legacy public behavior.
 
 #### `[rpc]` — NIP-86 management RPC
 
@@ -503,7 +506,7 @@ If `rpc.management_port` is set, the legacy REST endpoints are available at `htt
 | 67 | EOSE completeness hint |
 | 70 | Protected events |
 | 77 | Negentropy syncing |
-| 78 | Application-specific data (kind 30078, addressable) |
+| 78 | Application-specific data (kind 30078, addressable; **AUTH-gated** — see `relay.nip78_auth`) |
 | 84 | Highlights (kind 9802) |
 | 85 | Trusted assertions (kinds 30382/30383/30384, addressable) |
 | 86 | Relay management API |
