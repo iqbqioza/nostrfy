@@ -329,6 +329,12 @@ pub struct DatabaseConfig {
     /// forever). A timeout keeps the relay responsive even when the storage
     /// is stuck: the request fails with a clear error instead of hanging.
     pub db_request_timeout_secs: u64,
+    /// Skip the synchronous disk flush after every write batch (LMDB
+    /// `MDB_NOSYNC`). Writes land in the OS page cache and are flushed by
+    /// the kernel later, which multiplies ingest throughput at the cost of
+    /// durability: on a power loss the most recent writes since the last
+    /// kernel flush may be lost. The default (false) flushes every batch.
+    pub disabled_fsync: bool,
     /// Overload protection: when the database thread's queue holds more than
     /// this many pending messages (or `max_db_queue_events` events), new
     /// database requests fail fast instead of accumulating in memory.
@@ -458,6 +464,7 @@ impl Default for DatabaseConfig {
             meta_index: true,
             db_buffer_size: 2_048,
             db_request_timeout_secs: 30,
+            disabled_fsync: false,
             max_db_queue_msgs: 4_096,
             max_db_queue_events: 262_144,
         }
@@ -1601,6 +1608,7 @@ fn known_config_keys() -> &'static [(&'static str, &'static [&'static str])] {
                 "meta_index",
                 "db_buffer_size",
                 "db_request_timeout_secs",
+                "disabled_fsync",
                 "max_db_queue_msgs",
                 "max_db_queue_events",
                 "map_max_size",

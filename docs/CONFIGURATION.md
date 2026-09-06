@@ -356,6 +356,7 @@ Every key is optional; a missing key uses the default shown below.
 | `reader_threads` | integer | `2` | Dedicated scan threads (1-64) |
 | `max_indexed_words` | integer | `32` | Words of each event's content indexed for search |
 | `meta_index` | boolean | `true` | Write the per-event metadata header used by the scan prefilter. Disabling it drops one random index write per event (ingest stays flat as the database grows) at the cost of scans falling back to the full parse |
+| `disabled_fsync` | boolean | `false` | Skip the synchronous disk flush after every write batch (`MDB_NOSYNC`). Multiplies ingest throughput at the cost of durability: a power loss may lose the most recent writes |
 
 ### Key details
 
@@ -375,6 +376,7 @@ Every key is optional; a missing key uses the default shown below.
 **`db_buffer_size`** — The LMDB environment's read/write buffer size in bytes (the `read_buffer_size`/`write_buffer_size` of the opened environment).
 **`max_indexed_words`** — How many words of each event's content are added to the NIP-50 search index. Higher values improve recall for long texts at a small storage cost.
 **`db_request_timeout_secs`** — How long a database request may wait before it fails (`0` = forever). Keeps the relay responsive when the storage is stuck. Write requests are not subject to the timeout (a false timeout would skip their side effects). The startup loads of the persisted access state (deny/allow lists, Blossom allowlist) wait without a timeout and never fail fast: an empty result would silently lift every ban (fail-open). Their SIGHUP reloads keep the previous lists when a load fails.
+**`disabled_fsync`** — Skip the synchronous disk flush after every write batch (LMDB `MDB_NOSYNC`). Writes are committed to the mapped pages and left in the OS page cache, so commits cost microseconds instead of an fsync; the kernel flushes them shortly after. A power loss or OS crash may lose the writes since the last kernel flush — a fine trade for a high-throughput relay with a replica/backup, a poor one for a single always-live instance. Takes effect at startup. The Manual's [Throughput tuning](MANUAL.md#throughput-events-per-second) section shows the settings that move ingest throughput.
 **`max_db_queue_msgs`** — When the database queue holds more than this many pending messages, new requests fail fast instead of piling up in memory.
 **`max_db_queue_events`** — Like `max_db_queue_msgs`, but counts the events inside queued batches (the memory-dominant part). Whichever limit is hit first applies.
 
@@ -641,6 +643,7 @@ map_size = 1073741824
 max_map_size = 1099511627776
 purge_interval_secs = 300
 search_index = true
+disabled_fsync = false
 
 [daemon]
 pid_file = "./nostrd.pid"

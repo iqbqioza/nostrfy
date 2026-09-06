@@ -19,6 +19,59 @@ pub(crate) enum Precheck {
     Vanish,
 }
 
+/// The smallest batch large enough for parallel signature verification to
+/// beat the per-thread spawn overhead (a flood from one connection yields
+/// batches far above this).
+const MIN_PARALLEL_VERIFY: usize = 16;
+/// Cap on the verification threads spawned for one batch, to keep
+/// concurrent floods from oversubscribing the machine.
+const MAX_PARALLEL_VERIFY_THREADS: usize = 8;
+
+/// Verifies the NIP-01 signatures of `events` across `available_parallelism`
+/// cores and returns one verdict per event, aligned with the input order.
+/// The Schnorr check is the dominant per-event CPU cost on the accept path
+/// (tens of microseconds each); a batch that handed it to a single connection
+/// worker would cap ingestion throughput at one core. Small batches fall back
+/// to the inline sequential verify (the same call, same verdicts).
+///
+/// `Secp256k1<All>` is `Send + Sync` (the precomputed context is immutable),
+/// so the shared context can verify on several threads at once.
+pub(crate) fn verify_signatures_parallel(
+    events: &[Event],
+    secp: &secp256k1::Secp256k1<secp256k1::All>,
+) -> Vec<bool> {
+    let cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let threads = cpus.min(MAX_PARALLEL_VERIFY_THREADS);
+    if events.len() < MIN_PARALLEL_VERIFY || threads < 2 {
+        return events
+            .iter()
+            .map(|e| nip01::verify(e, secp).is_ok())
+            .collect();
+    }
+    let per = events.len().div_ceil(threads);
+    std::thread::scope(|s| {
+        let mut handles = Vec::with_capacity(events.len().div_ceil(per));
+        for chunk in events.chunks(per) {
+            handles.push(s.spawn(move || {
+                chunk
+                    .iter()
+                    .map(|e| nip01::verify(e, secp).is_ok())
+                    .collect::<Vec<bool>>()
+            }));
+        }
+        let verdicts: Vec<bool> = handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap_or_default())
+            .collect();
+        // `div_ceil(per)` chunks never run empty, so the flattened length
+        // is exactly `events.len()`.
+        debug_assert_eq!(verdicts.len(), events.len());
+        verdicts
+    })
+}
+
 impl super::Relay {
     /// Runs the acceptance checks shared by the single and batched accept
     /// paths: base validation, NIP-62 vanish detection, NIP-43 join
@@ -26,6 +79,7 @@ impl super::Relay {
     /// metadata, late publication, membership and `previous` references).
     /// `known_prefixes` supplies the batch's pre-fetched `previous` tag
     /// references; `None` falls back to per-reference database lookups.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn precheck(
         &self,
         cfg: &Config,
@@ -34,12 +88,13 @@ impl super::Relay {
         now: u64,
         authed: &[String],
         known_prefixes: Option<&std::collections::HashSet<Vec<u8>>>,
+        verified: Option<bool>,
     ) -> Precheck {
         // Structural and signature validation first: the vanish detection
         // below must only ever run on a properly signed event authored by
         // the vanished pubkey (an unverified event claiming a foreign
         // pubkey must not trigger the deletion of that pubkey).
-        if let Err(reason) = self.validate_base(cfg, event, now, authed) {
+        if let Err(reason) = self.validate_base(cfg, event, now, authed, verified) {
             return Precheck::Reject(reason);
         }
         // NIP-62: request to vanish — delete everything by this pubkey.
@@ -136,12 +191,18 @@ impl super::Relay {
     /// checks — those run in [`super::Relay::precheck`] *after* the NIP-62
     /// vanish detection, so that a blocked or restricted pubkey can still
     /// request to vanish).
+    /// `verified` precomputes the NIP-01 signature check (the batch accept
+    /// path verifies a whole batch's signatures in parallel on other cores).
+    /// `None` performs the inline `nip01::verify`. All other base checks run
+    /// first in both paths, so the reported reject reason is identical
+    /// whether an event's signature was verified inline or in advance.
     pub(crate) fn validate_base(
         &self,
         cfg: &Config,
         event: &Event,
         now: u64,
         authed: &[String],
+        verified: Option<bool>,
     ) -> std::result::Result<(), String> {
         let limits = &cfg.limits;
 
@@ -216,8 +277,12 @@ impl super::Relay {
             return Err("mute: event contains secret key material".into());
         }
 
-        nip01::verify(event, self.secp())
-            .map_err(|_| "invalid: signature verification failed".to_string())?;
+        match verified {
+            Some(true) => {}
+            Some(false) => return Err("invalid: signature verification failed".to_string()),
+            None => nip01::verify(event, self.secp())
+                .map_err(|_| "invalid: signature verification failed".to_string())?,
+        }
 
         if cfg.nip_enabled(26) && !nip26::verify(event, self.secp()) {
             return Err("invalid: delegation failed".into());
@@ -476,7 +541,9 @@ mod tests {
             // The first three events of the minute are accepted.
             for i in 0..3 {
                 let ev = signed(1, vec![vec!["content".into(), format!("{i}")]]);
-                let out = relay.precheck(&cfg, &access, &ev, now, &[], None).await;
+                let out = relay
+                    .precheck(&cfg, &access, &ev, now, &[], None, None)
+                    .await;
                 assert!(
                     matches!(out, super::Precheck::Accept),
                     "event {i} must be accepted under the limit"
@@ -484,14 +551,18 @@ mod tests {
             }
             // The fourth is rate-limited.
             let ev = signed(1, vec![vec!["content".into(), "4".into()]]);
-            let out = relay.precheck(&cfg, &access, &ev, now, &[], None).await;
+            let out = relay
+                .precheck(&cfg, &access, &ev, now, &[], None, None)
+                .await;
             assert!(
                 matches!(out, super::Precheck::Reject(msg) if msg.contains("rate-limited")),
                 "the event over the limit must be rate-limited"
             );
             // A different pubkey has its own window.
             let ev = signed_other_key(1, vec![]);
-            let out = relay.precheck(&cfg, &access, &ev, now, &[], None).await;
+            let out = relay
+                .precheck(&cfg, &access, &ev, now, &[], None, None)
+                .await;
             assert!(
                 matches!(out, super::Precheck::Accept),
                 "another pubkey is not limited by the first window"
@@ -499,7 +570,7 @@ mod tests {
             // After the minute passes the window slides open again.
             let ev = signed(1, vec![vec!["content".into(), "5".into()]]);
             let out = relay
-                .precheck(&cfg, &access, &ev, now + 61, &[], None)
+                .precheck(&cfg, &access, &ev, now + 61, &[], None, None)
                 .await;
             assert!(
                 matches!(out, super::Precheck::Accept),
@@ -609,7 +680,7 @@ mod tests {
             for kind in [1617, 1618, 1619, 1621, 1622, 1630, 1633, 30617, 30618] {
                 let ev = signed(kind, vec![]);
                 let out = relay
-                    .precheck(&cfg, &access, &ev, unix_now(), &[], None)
+                    .precheck(&cfg, &access, &ev, unix_now(), &[], None, None)
                     .await;
                 assert!(
                     matches!(out, super::Precheck::Reject(msg) if msg.contains("NIP-34")),
@@ -620,7 +691,7 @@ mod tests {
             for kind in [1616, 1623, 1629, 1634, 30616, 30619] {
                 let ev = signed(kind, vec![]);
                 let out = relay
-                    .precheck(&cfg, &access, &ev, unix_now(), &[], None)
+                    .precheck(&cfg, &access, &ev, unix_now(), &[], None, None)
                     .await;
                 assert!(
                     matches!(out, super::Precheck::Accept),
@@ -665,7 +736,7 @@ mod tests {
             for kind in [1617, 1621, 1633, 30618] {
                 let ev = signed(kind, vec![]);
                 let out = relay2
-                    .precheck(&cfg2, &access2, &ev, unix_now(), &[], None)
+                    .precheck(&cfg2, &access2, &ev, unix_now(), &[], None, None)
                     .await;
                 assert!(
                     matches!(out, super::Precheck::Accept),
@@ -718,7 +789,7 @@ mod tests {
             for kind in [20000, 25000, 29999] {
                 let ev = signed(kind, vec![]);
                 let out = relay
-                    .precheck(&cfg, &access, &ev, unix_now(), &[], None)
+                    .precheck(&cfg, &access, &ev, unix_now(), &[], None, None)
                     .await;
                 assert!(
                     matches!(out, super::Precheck::Accept),
@@ -729,7 +800,7 @@ mod tests {
             for kind in [19999, 30000, 1, 0] {
                 let ev = signed(kind, vec![]);
                 let out = relay
-                    .precheck(&cfg, &access, &ev, unix_now(), &[], None)
+                    .precheck(&cfg, &access, &ev, unix_now(), &[], None, None)
                     .await;
                 assert!(
                     matches!(out, super::Precheck::Accept),
@@ -775,7 +846,7 @@ mod tests {
             for kind in [20000, 25000, 29999] {
                 let ev = signed(kind, vec![]);
                 let out = relay2
-                    .precheck(&cfg2, &access2, &ev, unix_now(), &[], None)
+                    .precheck(&cfg2, &access2, &ev, unix_now(), &[], None, None)
                     .await;
                 assert!(
                     matches!(out, super::Precheck::Reject(msg) if msg.contains("ephemeral")),
@@ -786,7 +857,7 @@ mod tests {
             for kind in [19999, 30000, 1, 0] {
                 let ev = signed(kind, vec![]);
                 let out = relay2
-                    .precheck(&cfg2, &access2, &ev, unix_now(), &[], None)
+                    .precheck(&cfg2, &access2, &ev, unix_now(), &[], None, None)
                     .await;
                 assert!(
                     matches!(out, super::Precheck::Accept),
@@ -808,7 +879,7 @@ mod tests {
             ] {
                 let ev = signed(kind, vec![]);
                 let out = relay2
-                    .precheck(&cfg2, &access2, &ev, unix_now(), &[], None)
+                    .precheck(&cfg2, &access2, &ev, unix_now(), &[], None, None)
                     .await;
                 assert!(
                     !matches!(out, super::Precheck::Reject(msg) if msg.contains("ephemeral")),
@@ -824,7 +895,7 @@ mod tests {
             let cfg2_reloaded = relay2.config.read().await;
             let ev = signed(20000, vec![]);
             let out = relay2
-                .precheck(&cfg2_reloaded, &access2, &ev, unix_now(), &[], None)
+                .precheck(&cfg2_reloaded, &access2, &ev, unix_now(), &[], None, None)
                 .await;
             assert!(
                 matches!(out, super::Precheck::Accept),
@@ -872,7 +943,7 @@ mod tests {
             let relay = Arc::new(relay);
             let cfg = relay.config.read().await;
             let ev = signed(20001, vec![]);
-            let res = relay.validate_base(&cfg, &ev, unix_now(), &[]);
+            let res = relay.validate_base(&cfg, &ev, unix_now(), &[], None);
             assert!(
                 res.is_err() && res.unwrap_err().contains("ephemeral"),
                 "validate_base must reject ephemeral when enabled"
@@ -880,7 +951,7 @@ mod tests {
             // NIP-42 AUTH (22242) must not be masked as ephemeral — it has
             // its own dedicated rejection below.
             let auth_ev = signed(22242, vec![]);
-            let auth_res = relay.validate_base(&cfg, &auth_ev, unix_now(), &[]);
+            let auth_res = relay.validate_base(&cfg, &auth_ev, unix_now(), &[], None);
             assert!(
                 auth_res.is_err() && !auth_res.unwrap_err().contains("ephemeral"),
                 "AUTH kind must not be rejected as ephemeral"
@@ -934,7 +1005,7 @@ mod tests {
                 .push((vanish.pubkey.clone(), String::new()));
             let cfg = relay.config.read().await;
             let out = relay
-                .precheck(&cfg, &access, &vanish, unix_now(), &[], None)
+                .precheck(&cfg, &access, &vanish, unix_now(), &[], None, None)
                 .await;
             assert!(
                 matches!(out, super::Precheck::Vanish),
@@ -944,7 +1015,7 @@ mod tests {
             // A blocked pubkey's *regular* event is still rejected.
             let note = signed(1, vec![]);
             let out = relay
-                .precheck(&cfg, &access, &note, unix_now(), &[], None)
+                .precheck(&cfg, &access, &note, unix_now(), &[], None, None)
                 .await;
             assert!(
                 matches!(out, super::Precheck::Reject(_)),

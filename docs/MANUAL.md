@@ -18,7 +18,8 @@ This manual explains every feature of **nostrd**, a Nostr relay server, step by 
 11b. [Running Multiple Instances](#11b-running-multiple-instances)
 12. [Logs and Statistics](#12-logs-and-statistics)
 13. [Reloading Configuration (SIGHUP)](#13-reloading-configuration-sighup)
-14. [When You Are Stuck](#14-when-you-are-stuck)
+14. [Large-Scale Deployments](#14-large-scale-deployments)
+15. [When You Are Stuck](#15-when-you-are-stuck)
 
 ---
 
@@ -810,6 +811,44 @@ the relay) and user space ~10 KiB (the task, the connection state, the
 WebSocket buffer), so a million connections need roughly 40 GiB of
 kernel + user memory on top of the database. The WebSocket reader pool
 has two threads; a single heavy REQ no longer stalls every query.
+
+### Throughput (events per second)
+
+Event ingestion is bound by two costs: the Schnorr signature check
+(about 30-50 µs per event) and the synchronous disk flush the LMDB
+writer performs after every commit batch. Both are tunable in
+`nostrd.toml`:
+
+| Setting | Value | Why |
+| --- | --- | --- |
+| `database.disabled_fsync = true` | `false` | The dominant ingest cost is the fsync after each commit batch. With `disabled_fsync` the writer commits into the OS page cache (microseconds) and the kernel flushes shortly after; a power loss loses only the writes since the last flush. Start here. |
+| CPU cores | ≥ 8 vCPU | The batch `EVENT` path verifies every signature in parallel across the cores (see below) before the cheap checks run |
+
+Starting the relay with `RUST_LOG=nostrd=debug` shows the config the
+instance is actually using, and real-world tuning should be measured,
+not guessed; the per-connection drop pattern (many clients posting
+events) is what a relay sees in production.
+
+**How the parallel signature check works.** When a WebSocket client's
+pending EVENTS are flushed, the batch is verified before the relay
+decides acceptance: every signature in the batch is checked at once on a
+pool of worker threads (`verify_signatures_parallel`, capped at 8
+threads; batches under 16 events verify inline). Each event's cheap
+checks (size, kind, PoW, tags, NIP-40) still run first, so the reject
+reason text is identical to the sequential path — only the Schnorr work,
+the only expensive per-event operation, is spread across cores. Under a
+multi-core build the ingest ceiling approximately multiplies by the
+worker count; a single-threaded build stays sequential and the setting
+changes nothing.
+
+The remaining ingest costs are cheap by design: the per-event metadata
+header (`database.meta_index`) is one small index write, the NIP-50 word
+index (`database.search_index`) is off by default per event and can be
+disabled entirely on write-heavy instances, and the writer merges every
+deferred EVENTS batch waiting in its queue into one commit (one fsync,
+or none with `disabled_fsync`). Event cloning for the writer and the
+broadcast are the only per-event allocations left; the live-delivery
+subscribers are matched by the reader pool without the writer's lock.
 
 ## 15. When You Are Stuck
 

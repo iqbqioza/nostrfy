@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use heed::types::Bytes;
-use heed::{Database, Env, EnvOpenOptions};
+use heed::{Database, Env, EnvFlags, EnvOpenOptions, FlagSetMode};
 use tokio::sync::oneshot;
 
 use super::{PutOutcome, db_error};
@@ -313,6 +313,19 @@ impl Store {
                 .map_size(map_size)
                 .open(&cfg.path)?
         };
+        if cfg.disabled_fsync {
+            // SAFETY: `NO_SYNC` is marked unsafe by heed because it trades
+            // durability for throughput (LMDB skips the fsync after each
+            // commit). The relay's semantics are unchanged: a write the
+            // process acknowledged has been committed to the map and may
+            // still be lost on OS crash / power loss — exactly what the
+            // option's documentation promises.
+            unsafe { env.set_flags(EnvFlags::NO_SYNC, FlagSetMode::Enable)? };
+            log::info!(
+                "database writes skip the fsync (disabled_fsync = true): commits land in the \
+                 OS page cache, so a power loss may lose the most recent writes"
+            );
+        }
 
         let mut wtxn = env.write_txn()?;
         let events = env.create_database::<Bytes, Bytes>(&mut wtxn, Some(EVENTS))?;
