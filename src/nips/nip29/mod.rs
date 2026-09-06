@@ -920,7 +920,7 @@ fn group_rank(kind: u64) -> u8 {
     }
 }
 
-fn event_code(event: &Event) -> Option<&str> {
+pub(crate) fn event_code(event: &Event) -> Option<&str> {
     tag_value(event, CODE)
 }
 

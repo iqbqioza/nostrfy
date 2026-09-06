@@ -23,15 +23,62 @@ pub(crate) const REFRESH_SECS: u64 = 12 * 3600;
 /// authority (the same convention as the NIP-42/62/98 relay identity).
 pub(crate) fn normalized_url(cfg: &Config) -> String {
     let url = cfg.relay.public_url.trim();
-    if !url.is_empty() {
-        return url.to_string();
-    }
-    let host = if cfg.server.host.contains(':') {
-        format!("[{}]", cfg.server.host)
+    let url = if url.is_empty() {
+        let host = if cfg.server.host.contains(':') {
+            format!("[{}]", cfg.server.host)
+        } else {
+            cfg.server.host.clone()
+        };
+        format!("wss://{host}:{}/", cfg.server.port)
     } else {
-        cfg.server.host.clone()
+        url.to_string()
     };
-    format!("wss://{host}:{}/", cfg.server.port)
+    normalize_url(&url)
+}
+
+/// RFC 3986 §6 normalization: the scheme and host are lowercased and a
+/// default port for the scheme is dropped, so `WSS://Relay.Example.Com:443/`
+/// and `wss://relay.example.com/` publish the same `d` tag.
+fn normalize_url(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    let scheme = scheme.to_ascii_lowercase();
+    // `find`+`split_at` keep the delimiter, so the path keeps its leading
+    // "/" ("host:8080/path" -> authority "host:8080", tail "/path").
+    let (authority, tail) = match rest.find(['/', '?', '#']) {
+        Some(i) => {
+            let (a, t) = rest.split_at(i);
+            (a, t)
+        }
+        None => (rest, ""),
+    };
+    // RFC 3986 §6.2.3: a hierarchical URI with an empty path is
+    // normalized to "/".
+    let tail = if tail.is_empty() && matches!(scheme.as_str(), "ws" | "wss" | "http" | "https") {
+        "/"
+    } else {
+        tail
+    };
+    // IPv6 literals keep their brackets: only a trailing `:<digits>` is a
+    // port ("[::1]:8080" -> host "[::1]", port "8080"; "[::1]" -> host).
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((h, p)) if p.chars().all(|c| c.is_ascii_digit()) => (h, Some(p)),
+        _ => (authority, None),
+    };
+    let host = host.to_ascii_lowercase();
+    let port = port.filter(|p| {
+        let default = match scheme.as_str() {
+            "wss" | "https" => Some("443"),
+            "ws" | "http" => Some("80"),
+            _ => None,
+        };
+        default.is_none_or(|d| d != *p)
+    });
+    match port {
+        Some(p) => format!("{scheme}://{host}:{p}{tail}"),
+        None => format!("{scheme}://{host}{tail}"),
+    }
 }
 
 /// Builds the relay's kind 30166 discovery event (unsigned — the publisher
@@ -133,5 +180,18 @@ mod tests {
         let mut cfg = Config::default();
         cfg.server.host = "::1".into();
         assert_eq!(normalized_url(&cfg), "wss://[::1]:8080/");
+    }
+
+    #[test]
+    fn normalized_url_lowercases_and_drops_default_ports() {
+        let mut cfg = Config::default();
+        cfg.relay.public_url = "WSS://Relay.Example.Com:443/".into();
+        assert_eq!(normalized_url(&cfg), "wss://relay.example.com/");
+        cfg.relay.public_url = "wss://relay.example.com:8443/".into();
+        assert_eq!(normalized_url(&cfg), "wss://relay.example.com:8443/");
+        cfg.relay.public_url = "ws://Relay.Example.Com:80/path".into();
+        assert_eq!(normalized_url(&cfg), "ws://relay.example.com/path");
+        cfg.relay.public_url = "wss://[::1]:443/".into();
+        assert_eq!(normalized_url(&cfg), "wss://[::1]/");
     }
 }

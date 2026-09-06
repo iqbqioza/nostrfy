@@ -168,6 +168,26 @@ impl super::Relay {
                 if let Some(reason) = reason {
                     return Precheck::Reject(reason);
                 }
+                // The in-memory invite set never forgets a code whose 9009
+                // was NIP-09-deleted or NIP-40-expired (revocation only
+                // takes effect after a restart). A JOIN with a code is
+                // therefore confirmed against the stored, unexpired 9009
+                // before admission — the same visibility the in-memory
+                // check has (a 9009 of the same batch is not committed
+                // yet either way).
+                if event.kind == nip29::JOIN
+                    && let Some(code) = nip29::event_code(event)
+                    && let Some(gid) = nip29::group_id(event)
+                {
+                    let f: Vec<crate::filter::Filter> = serde_json::from_value(serde_json::json!([
+                        { "kinds": [9009], "#h": [gid], "#code": [code] }
+                    ]))
+                    .expect("static filter");
+                    let (stored, _) = self.db.query_req(f, 1, now).await;
+                    if stored.is_empty() {
+                        return Precheck::Reject("restricted: invalid invite code".into());
+                    }
+                }
                 // NIP-29 `previous` timeline references must exist.
                 let mut unknown: Option<&str> = None;
                 for prefix in nip29::previous_tags(event) {
