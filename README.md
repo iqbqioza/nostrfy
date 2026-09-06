@@ -386,19 +386,29 @@ The advertised `supported_nips` list is **dynamic**: a NIP is dropped when all t
 
 ## Performance
 
-Measured on the release build (5 concurrent connections, fresh database, fsync per commit):
+Measured on the release build with a fresh database using the bundled load
+client [`examples/bench.rs`](examples/bench.rs) (an 8-thread laptop: Intel
+Core i5-8265U, 8 GB RAM). Publish rates are limited by the single LMDB
+writer thread and the fsync-free commit batching; readers run on their own
+threads and never block the writer.
 
-| Operation | Result |
-| --- | --- |
-| Event publish (signature verification + fsync commit) | ~1,100–1,400 events/s |
-| Query (limit 100, tag filter) | 50 queries in ~1.4 s |
-| Live notification delivery (publish → subscriber) | median ~6 ms, p95 ~12 ms |
-| COUNT (NIP-45) | 50 counts in ~0.9 s |
+| Scenario | Command | Result |
+| --- | --- | --- |
+| Event ingest (1 connection) | `bench ws://127.0.0.1:18999 ingest 10000` | **~21,000 events/s** (10,000 events in 0.48 s, all accepted) |
+| Parallel ingest (5 connections) | `bench ... parallel-ingest 5 5000` | **~22,000 events/s** (25,000 events in 1.14 s) |
+| Live fan-out (50 subscribers, 200 publishes) | `bench ... fanout 50 200` | **10,000/10,000 deliveries** (100% fan-out) |
+| Stored query (20,000 events) | `bench ... req 20000` | 20,000 events in **0.32 s** |
+| NIP-50 search (10,000 results) | `bench ... search <term>` | 10,000 events in **0.26 s** |
+| Concurrent search (20 parallel scans) | `bench ... parallel-req 20 <term>` | worst **1.7 s**, avg 0.94 s over a 35k-event store |
 
-Sustained-load stability test (10 connections × 30 s, ~20,000 published events):
-zero database errors, zero panics, zero rejected events. The memory map is a
-virtual address-space reservation: a freshly started relay uses only a few
-tens of MB of physical memory regardless of `map_size`.
+To reproduce: `cargo build --release --examples`, start a relay
+(`target/release/nostrfy --config ... start`, e.g. on port 18999) and run the
+scenarios above — raise `limits.max_limit` for the query/search scenarios
+(the default 500 caps the results). Keep subscriber counts under
+`limits.max_connections_per_ip` (default 64).
+
+The memory map is a virtual address-space reservation: a freshly started
+relay uses only a few tens of MB of physical memory regardless of `map_size`.
 
 ## Repository layout
 
