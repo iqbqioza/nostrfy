@@ -89,6 +89,7 @@ Every key is optional; a missing key uses the default shown below.
 | `max_events_per_min_per_pubkey` | integer | `0` | Publish rate limit per pubkey (events per minute; `0` = no limit) |
 | `require_auth` | boolean | `false` | Require NIP-42 authentication for all REQ/EVENT/COUNT/NEG |
 | `send_auth_challenge` | boolean | `true` | Send the AUTH challenge on connect |
+| `enabled_nip78_auth` | boolean | `true` | Require NIP-42 AUTH before accepting kind 78/30078 events and serve them only to the authenticated owner |
 
 ### Key details
 
@@ -133,6 +134,8 @@ Every key is optional; a missing key uses the default shown below.
 **`require_auth`** — When `true`, the relay refuses REQ/EVENT/COUNT/NEG messages with `auth-required:` unless the connection has completed NIP-42 AUTH. Useful for a private relay. Applied per connection.
 
 **`send_auth_challenge`** — When `true`, every new connection receives a NIP-42 auth-request challenge. `require_auth = true` with `send_auth_challenge = false` locks everyone out — the relay warns about the combination at startup.
+
+**`enabled_nip78_auth`** — NIP-78 application-specific events (kinds `78` and `30078`) are a private data store: when `true`, the relay requires the NIP-42 AUTH flow before accepting them (`auth-required: application-specific events require authentication`), and serves them only to the authenticated owner (the event author's pubkey) — REQ results, live events, COUNT and NIP-77 syncs withhold them from everyone else, and the unauthenticated REST API hides them. Set to `false` to restore the legacy behavior (public app-specific events). Requires NIP-42 to be enabled (the relay refuses to start otherwise) and is inactive when NIP-78 is disabled. Takes effect immediately on `SIGHUP` reload and on the next REQ/publish. Default `true`.
 
 ### Behavior notes
 
@@ -356,6 +359,7 @@ Every key is optional; a missing key uses the default shown below.
 | `reader_threads` | integer | `2` | Dedicated scan threads (1-64) |
 | `max_indexed_words` | integer | `32` | Words of each event's content indexed for search |
 | `meta_index` | boolean | `true` | Write the per-event metadata header used by the scan prefilter. Disabling it drops one random index write per event (ingest stays flat as the database grows) at the cost of scans falling back to the full parse |
+| `disabled_fsync` | boolean | `false` | Skip the synchronous disk flush after every write batch (`MDB_NOSYNC`). Multiplies ingest throughput at the cost of durability: a power loss may lose the most recent writes |
 
 ### Key details
 
@@ -375,6 +379,7 @@ Every key is optional; a missing key uses the default shown below.
 **`db_buffer_size`** — The LMDB environment's read/write buffer size in bytes (the `read_buffer_size`/`write_buffer_size` of the opened environment).
 **`max_indexed_words`** — How many words of each event's content are added to the NIP-50 search index. Higher values improve recall for long texts at a small storage cost.
 **`db_request_timeout_secs`** — How long a database request may wait before it fails (`0` = forever). Keeps the relay responsive when the storage is stuck. Write requests are not subject to the timeout (a false timeout would skip their side effects). The startup loads of the persisted access state (deny/allow lists, Blossom allowlist) wait without a timeout and never fail fast: an empty result would silently lift every ban (fail-open). Their SIGHUP reloads keep the previous lists when a load fails.
+**`disabled_fsync`** — Skip the synchronous disk flush after every write batch (LMDB `MDB_NOSYNC`). Writes are committed to the mapped pages and left in the OS page cache, so commits cost microseconds instead of an fsync; the kernel flushes them shortly after. A power loss or OS crash may lose the writes since the last kernel flush — a fine trade for a high-throughput relay with a replica/backup, a poor one for a single always-live instance. Takes effect at startup. The Manual's [Throughput tuning](MANUAL.md#throughput-events-per-second) section shows the settings that move ingest throughput.
 **`max_db_queue_msgs`** — When the database queue holds more than this many pending messages, new requests fail fast instead of piling up in memory.
 **`max_db_queue_events`** — Like `max_db_queue_msgs`, but counts the events inside queued batches (the memory-dominant part). Whichever limit is hit first applies.
 
@@ -553,7 +558,7 @@ Editing the file and sending `kill -HUP $(cat nostrd.pid)` reloads it **without 
 
 | Applies on SIGHUP | Requires `nostrd restart` |
 | --- | --- |
-| `relay.name`, `description`, `pubkey`, `contact`, `icon`, `post_policy`, `public_url`, `relay.reject_ephemeral`, `relay.enabled_git` | `relay.private_key` |
+| `relay.name`, `description`, `pubkey`, `contact`, `icon`, `post_policy`, `public_url`, `relay.reject_ephemeral`, `relay.enabled_git`, `relay.enabled_nip78_auth` | `relay.private_key` |
 | most of `[limits]` (the restart-column entries below apply on restart only) | `relay.livekit_*`, `relay.enabled_nips` / `disabled_nips` |
 | NIP-40 on/off, API concurrency | `server.host`, `server.port`, `server.api_host`, `server.ws_paths`, `rpc.management_port`, `rpc.management_host`, `server.metrics_enabled` |
 | — | `database.path`, `database.purge_interval_secs`, `daemon.max_log_size_bytes`, `max_log_files`, `stats_interval_secs`, `database.db_request_timeout_secs`, `max_db_queue_msgs`, `max_db_queue_events`, `max_indexed_words`, `live_buffer`, `live_batch_size`, `live_batch_interval_ms`, `max_connections`, `http_read_timeout_secs`, `max_connections_per_sec_per_ip`, `rpc.max_admin_body_bytes`, `relay.max_groups`, `blossom.host`, `blossom.storage`, `blossom.local_path`, `blossom.max_upload_bytes`, `blossom.min_free_bytes`, `blossom.s3_*` |
@@ -594,6 +599,7 @@ management_token = ""
 admin_pubkey = ""
 require_auth = false
 send_auth_challenge = true
+enabled_nip78_auth = true
 metrics_enabled = true
 
 [limits]
@@ -641,6 +647,7 @@ map_size = 1073741824
 max_map_size = 1099511627776
 purge_interval_secs = 300
 search_index = true
+disabled_fsync = false
 
 [daemon]
 pid_file = "./nostrd.pid"

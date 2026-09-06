@@ -117,6 +117,10 @@ require_auth = false
 # warns about the combination.
 send_auth_challenge = true
 
+# Require NIP-42 AUTH before accepting kind 78/30078 events and serve them
+# only to the authenticated owner. Default true; requires NIP-42 enabled.
+enabled_nip78_auth = true
+
 # -----------------------------------------------------------------------------
 # Network server
 # -----------------------------------------------------------------------------

@@ -141,6 +141,14 @@ impl super::Conn {
                     if item.protected && !self.is_authed() {
                         return false;
                     }
+                    // NIP-78: application-specific events are only synced
+                    // to the authenticated owner.
+                    if self.nip78_restricted
+                        && item.app_specific
+                        && !self.authed_pubkeys.iter().any(|pk| pk == &item.pubkey)
+                    {
+                        return false;
+                    }
                     // NIP-59/NIP-17: gift wraps are only served to their
                     // recipients when NIP-42 is enabled (the same gate as
                     // the REQ path's `gift_wrap_visible`): with NIP-42

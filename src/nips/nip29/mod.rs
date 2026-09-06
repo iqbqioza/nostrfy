@@ -674,6 +674,24 @@ impl GroupStore {
         self.visible_gid(gid, is_meta, authed)
     }
 
+    /// Whether `event` belongs to a membership-gated group (`private`
+    /// groups, or `hidden` groups' relay-generated metadata) — i.e. AUTH as
+    /// a member could reveal it. Deleted, ghost and unknown groups are not
+    /// AUTH-revealable: their content stays gone for everyone. Drives the
+    /// NIP-67 `"auth"` EOSE hint.
+    pub fn privacy_gated(&self, event: &Event) -> bool {
+        let Some(gid) = group_id_any(event) else {
+            return false;
+        };
+        if self.deleted.contains(gid) || self.ghost.contains(gid) {
+            return false;
+        }
+        let is_meta = (GROUP_META..=GROUP_PINS).contains(&event.kind);
+        self.groups
+            .get(gid)
+            .is_some_and(|g| g.settings.private || (g.settings.hidden && is_meta))
+    }
+
     /// Whether the content of a group may be served to `authed`. `is_meta`
     /// distinguishes relay-generated metadata events (kinds 39000-39005),
     /// which `hidden` groups additionally withhold from non-members.

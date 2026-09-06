@@ -477,10 +477,17 @@ impl Relay {
         }
         match self.db.try_load_relay_pubkeys().await {
             Some((deny, allow)) => {
+                // Read the config *before* taking the access write lock: the
+                // accept paths hold `config.read` while awaiting
+                // `access.read`, so acquiring `access.write` first and then
+                // awaiting `config.read` would set up a lock cycle (this
+                // method holding the write lock awaiting `config.read`,
+                // an accept holding `config.read` awaiting `access.read`).
+                let restrict_relay = self.config.read().await.access.restrict_relay;
                 let mut access = self.access.write().await;
                 access.blocked_pubkeys = deny;
                 access.allowed_pubkeys = allow;
-                access.restrict_relay = self.config.read().await.access.restrict_relay;
+                access.restrict_relay = restrict_relay;
                 log::info!("relay pubkey access lists reloaded from the database");
             }
             None => {
@@ -547,7 +554,7 @@ impl Relay {
         let access = self.access.read().await;
 
         match self
-            .precheck(&cfg, &access, &event, now, authed, known_prefixes)
+            .precheck(&cfg, &access, &event, now, authed, known_prefixes, None)
             .await
         {
             crate::relay::validate::Precheck::Reject(reason) => {
@@ -743,10 +750,19 @@ impl Relay {
         // containing group events (an `h` tag or a moderation/join/leave
         // kind) are routed to the sequential [`Self::accept_event`] path
         // above. The shared `precheck` still runs for every event.
+        //
+        // The Schnorr signature check dominates the per-event accept cost
+        // (tens of microseconds), so a large batch first verifies every
+        // signature in parallel across the machine's cores and the
+        // sequential loop below reuses the verdicts. `validate_base` runs
+        // its cheap checks before consulting a verdict, so the reject
+        // reasons are identical to the inline-verify path.
+        let verified = crate::relay::validate::verify_signatures_parallel(&events, self.secp());
         for event in events {
             let id = event.id.clone();
+            let verified = verified.get(results.len()).copied();
             match self
-                .precheck(&cfg, &access, &event, now, authed, None)
+                .precheck(&cfg, &access, &event, now, authed, None, verified)
                 .await
             {
                 crate::relay::validate::Precheck::Reject(reason) => {
@@ -1078,6 +1094,10 @@ mod tests {
 
     /// Builds a relay with an empty database.
     async fn build_relay() -> std::sync::Arc<Relay> {
+        build_relay_cfg(false).await
+    }
+
+    async fn build_relay_cfg(disable_fsync: bool) -> std::sync::Arc<Relay> {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let path = std::env::temp_dir()
@@ -1088,6 +1108,7 @@ mod tests {
         cfg.database.path = path;
         cfg.database.map_size = 16 * 1024 * 1024;
         cfg.database.max_map_size = 256 * 1024 * 1024;
+        cfg.database.disabled_fsync = disable_fsync;
         let db = crate::db::DbClient::open(
             &cfg.database,
             true,
@@ -1212,5 +1233,107 @@ mod tests {
         // A *mixed-case* string (uppercase prefix, lowercase data) is
         // invalid bech32 and must not be flagged.
         assert!(!contains_secret_key(&format!("NSEC1{}", &key[5..])));
+    }
+
+    /// Ingestion throughput benchmark through the real write path:
+    /// `accept_event[s]` → precheck (Schnorr verify) → batched LMDB commit →
+    /// first-seen / side effects → live broadcast. Reports the parallel vs
+    /// sequential signature-verify cost and the durable (fsync) vs
+    /// fsync-disabled end-to-end ingest. Run with:
+    /// `cargo test --release -- --ignored bench_ingest --nocapture`.
+    #[ignore]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn bench_ingest_events_per_sec() {
+        fn bench_signed(
+            secp: &secp256k1::Secp256k1<secp256k1::All>,
+            i: usize,
+            now: u64,
+        ) -> crate::event::Event {
+            // `i` spans the run counter, so no two runs reuse (pubkey, id)s.
+            // The low bytes vary so every seckey < the curve order n.
+            let mut seckey = [0u8; 32];
+            seckey[31] = ((i % 250) as u8) + 1;
+            seckey[30] = (i / 250) as u8;
+            let keypair = secp256k1::Keypair::from_seckey_slice(secp, &seckey).unwrap();
+            let pubkey = secp256k1::XOnlyPublicKey::from_keypair(&keypair)
+                .0
+                .to_string();
+            let mut ev = crate::event::Event {
+                id: String::new(),
+                pubkey,
+                created_at: now,
+                kind: 1,
+                tags: vec![vec!["t".into(), "bench".into()]],
+                content: format!("bench event {i}"),
+                sig: String::new(),
+            };
+            ev.id = crate::nips::nip01::compute_id(&ev);
+            let sig = secp.sign_schnorr_no_aux_rand(&ev.id_bytes().unwrap(), &keypair);
+            ev.sig = sig.to_string();
+            ev
+        }
+
+        let relay = build_relay().await;
+        let fsync_off_relay = build_relay_cfg(true).await;
+        let secp = relay.secp(); // shares the relay's precomputed context
+
+        // Signature-verify cost alone (the dominant per-event CPU work), one
+        // batch through the parallel path vs the sequential inline path. The
+        // end-to-end numbers below include DB commit time, which dominates on
+        // slow disks, so this section isolates the parallel verify gain.
+        {
+            const N: usize = 8000;
+            let now = crate::util::unix_now();
+            let big: Vec<crate::event::Event> =
+                (0..N).map(|i| bench_signed(secp, i, now)).collect();
+            let t0 = std::time::Instant::now();
+            for batch in big.chunks(1000) {
+                let v = crate::relay::validate::verify_signatures_parallel(batch, secp);
+                assert!(v.iter().all(|b| *b));
+            }
+            let par = t0.elapsed().as_secs_f64();
+            let t0 = std::time::Instant::now();
+            for batch in big.chunks(1000) {
+                let v: Vec<bool> = batch
+                    .iter()
+                    .map(|e| crate::nips::nip01::verify(e, secp).is_ok())
+                    .collect();
+                assert!(v.iter().all(|b| *b));
+            }
+            let seq = t0.elapsed().as_secs_f64();
+            println!(
+                "verify only: {N} sigs parallel {:>6.0}/s vs sequential {:>6.0}/s ({:.1}x)",
+                N as f64 / par,
+                N as f64 / seq,
+                seq / par
+            );
+        }
+
+        // End-to-end ingest through the full accept path, with the durable
+        // (fsync) DB and the fsync-disabled DB side by side.
+        let mut run = 0usize;
+        for (set, total) in [("flood batch", 1000usize), ("stream batch", 5000usize)] {
+            let now = crate::util::unix_now();
+            let pre: Vec<crate::event::Event> = (0..total)
+                .map(|i| bench_signed(secp, run + i, now))
+                .collect();
+            run += total;
+            for (name, target) in [("durable", &relay), ("fsync-off", &fsync_off_relay)] {
+                let t0 = std::time::Instant::now();
+                for chunk in pre.chunks(100) {
+                    let results = target.accept_events_batch(chunk.to_vec(), &[]).await;
+                    let accepted = results
+                        .iter()
+                        .filter(|(_, o)| matches!(o, crate::db::PutOutcome::Stored))
+                        .count();
+                    assert_eq!(accepted, chunk.len(), "every benchmark event must store");
+                }
+                let elapsed = t0.elapsed().as_secs_f64();
+                let eps = total as f64 / elapsed;
+                println!("{set} ({name}): {total} events in {elapsed:.3} s -> {eps:.0} events/sec");
+            }
+        }
+        relay.db.shutdown();
+        fsync_off_relay.db.shutdown();
     }
 }

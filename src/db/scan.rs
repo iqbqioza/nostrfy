@@ -27,7 +27,14 @@ use crate::nips::nip50;
 pub(crate) struct NegItem {
     pub created: u64,
     pub id: [u8; 32],
+    /// Author pubkey (hex), so the connection layer can serve NIP-78
+    /// application-specific events only to their authenticated owner.
+    pub pubkey: String,
     pub protected: bool,
+    /// Whether this record is a NIP-78 application-specific event (kinds
+    /// 78/30078), served only to the authenticated owner when the AUTH
+    /// gate is on.
+    pub app_specific: bool,
     pub gid: Option<String>,
     pub meta: bool,
     /// p-tag recipients of a NIP-59 gift wrap (kind 1059), `None` for every
@@ -297,7 +304,9 @@ impl ScanCollector for ItemCollector {
         self.items.push(NegItem {
             created: event.created_at,
             id,
+            pubkey: event.pubkey.clone(),
             protected,
+            app_specific: crate::nips::nip78::is_app_specific(&event),
             gid,
             meta,
             wrap_recipients,
@@ -340,7 +349,9 @@ impl ScanCollector for ItemCollector {
         self.items.push(NegItem {
             created: event.created_at(),
             id,
+            pubkey: event.pubkey().to_string(),
             protected,
+            app_specific: crate::nips::nip78::is_app_specific_kind(event.kind()),
             gid,
             meta,
             wrap_recipients,

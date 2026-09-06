@@ -33,6 +33,8 @@ management_token = ""
 admin_pubkey = ""
 require_auth = false
 send_auth_challenge = true
+# NIP-78 app-specific events: AUTH to publish, owner-only to serve (default).
+enabled_nip78_auth = true
 metrics_enabled = true
 
 [limits]

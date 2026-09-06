@@ -19,6 +19,7 @@ pub mod nip66;
 pub mod nip67;
 pub mod nip70;
 pub mod nip77;
+pub mod nip78;
 pub mod nip86;
 pub mod nip98;
 

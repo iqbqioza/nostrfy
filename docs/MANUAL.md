@@ -18,7 +18,8 @@ This manual explains every feature of **nostrd**, a Nostr relay server, step by 
 11b. [Running Multiple Instances](#11b-running-multiple-instances)
 12. [Logs and Statistics](#12-logs-and-statistics)
 13. [Reloading Configuration (SIGHUP)](#13-reloading-configuration-sighup)
-14. [When You Are Stuck](#14-when-you-are-stuck)
+14. [Large-Scale Deployments](#14-large-scale-deployments)
+15. [When You Are Stuck](#15-when-you-are-stuck)
 
 ---
 
@@ -166,6 +167,7 @@ If anything is wrong, it tells you exactly what. It is strongly recommended to r
 | `max_groups` | NIP-29 in-memory group store cap (active + deleted markers; `0` = unlimited) | `1000` |
 | `require_auth` | Require NIP-42 auth for everything (subscriptions and publishing) | `false` |
 | `send_auth_challenge` | Send an AUTH challenge on connect | `true` |
+| `enabled_nip78_auth` | Require NIP-42 AUTH before accepting kind 78/30078 events and serve them only to the authenticated owner | `true` |
 
 To generate a secret key, use the `nostrd genkey` command (see [5. Command Reference](#5-command-reference)).
 
@@ -182,6 +184,8 @@ To generate a secret key, use the `nostrd genkey` command (see [5. Command Refer
 | `metrics_enabled` | Serve `/metrics` (Prometheus format) | `true` |
 
 > **Note**: `require_auth = true` combined with `send_auth_challenge = false` locks everyone out — nobody can authenticate. Avoid this combination.
+
+> **Note**: `enabled_nip78_auth = true` (the default) makes kind 78/30078 events private: they require NIP-42 AUTH to publish, and are served only to the authenticated owner (the event author). Unauthenticated subscribers, negentropy syncs and the REST API do not see them. Requires NIP-42 to be enabled; set `enabled_nip78_auth = false` for the legacy public behavior.
 
 #### `[rpc]` — NIP-86 management RPC
 
@@ -499,10 +503,10 @@ If `rpc.management_port` is set, the legacy REST endpoints are available at `htt
 | 62 | Request to vanish |
 | 65 | Relay list metadata (kind 10002, `#r` indexed) |
 | 66 | Relay discovery & liveness (self-publishes kind 30166 when `relay.private_key` is set, refreshed every 12 h) |
-| 67 | EOSE completeness hint |
+| 67 | EOSE completeness hint (incl. the `"auth"` hint with a challenge when AUTH-gated events were withheld) |
 | 70 | Protected events |
 | 77 | Negentropy syncing |
-| 78 | Application-specific data (kind 30078, addressable) |
+| 78 | Application-specific data (kind 30078, addressable; **AUTH-gated** — see `relay.enabled_nip78_auth`) |
 | 84 | Highlights (kind 9802) |
 | 85 | Trusted assertions (kinds 30382/30383/30384, addressable) |
 | 86 | Relay management API |
@@ -810,6 +814,44 @@ the relay) and user space ~10 KiB (the task, the connection state, the
 WebSocket buffer), so a million connections need roughly 40 GiB of
 kernel + user memory on top of the database. The WebSocket reader pool
 has two threads; a single heavy REQ no longer stalls every query.
+
+### Throughput (events per second)
+
+Event ingestion is bound by two costs: the Schnorr signature check
+(about 30-50 µs per event) and the synchronous disk flush the LMDB
+writer performs after every commit batch. Both are tunable in
+`nostrd.toml`:
+
+| Setting | Value | Why |
+| --- | --- | --- |
+| `database.disabled_fsync = true` | `false` | The dominant ingest cost is the fsync after each commit batch. With `disabled_fsync` the writer commits into the OS page cache (microseconds) and the kernel flushes shortly after; a power loss loses only the writes since the last flush. Start here. |
+| CPU cores | ≥ 8 vCPU | The batch `EVENT` path verifies every signature in parallel across the cores (see below) before the cheap checks run |
+
+Starting the relay with `RUST_LOG=nostrd=debug` shows the config the
+instance is actually using, and real-world tuning should be measured,
+not guessed; the per-connection drop pattern (many clients posting
+events) is what a relay sees in production.
+
+**How the parallel signature check works.** When a WebSocket client's
+pending EVENTS are flushed, the batch is verified before the relay
+decides acceptance: every signature in the batch is checked at once on a
+pool of worker threads (`verify_signatures_parallel`, capped at 8
+threads; batches under 16 events verify inline). Each event's cheap
+checks (size, kind, PoW, tags, NIP-40) still run first, so the reject
+reason text is identical to the sequential path — only the Schnorr work,
+the only expensive per-event operation, is spread across cores. Under a
+multi-core build the ingest ceiling approximately multiplies by the
+worker count; a single-threaded build stays sequential and the setting
+changes nothing.
+
+The remaining ingest costs are cheap by design: the per-event metadata
+header (`database.meta_index`) is one small index write, the NIP-50 word
+index (`database.search_index`) is off by default per event and can be
+disabled entirely on write-heavy instances, and the writer merges every
+deferred EVENTS batch waiting in its queue into one commit (one fsync,
+or none with `disabled_fsync`). Event cloning for the writer and the
+broadcast are the only per-event allocations left; the live-delivery
+subscribers are matched by the reader pool without the writer's lock.
 
 ## 15. When You Are Stuck
 

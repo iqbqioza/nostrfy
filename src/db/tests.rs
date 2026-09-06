@@ -1611,6 +1611,45 @@ fn neg_items_carry_visibility_flags() {
 }
 
 #[test]
+fn neg_items_carry_nip78_flag() {
+    // NIP-78: the negentropy items carry the publisher pubkey and an
+    // app-specific flag so a gated relay can withhold them from
+    // unauthenticated peers during sync.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let app = event(30078, "app", now, vec![vec!["d".into(), "profile".into()]]);
+        let plain = event(1, "plain", now - 1, vec![]);
+        for e in [&app, &plain] {
+            assert_eq!(db.put(e.clone(), now).await, PutOutcome::Stored);
+        }
+        let f: Filter = serde_json::from_value(serde_json::json!({"kinds": [1, 30078]})).unwrap();
+        let (items, _) = db.neg_items(f, 100, now).await;
+        let by_id = |id: &str| items.iter().find(|i| hex::encode(i.id) == id).unwrap();
+        assert!(by_id(&app.id).app_specific, "app-specific flag set");
+        assert_eq!(
+            by_id(&app.id).pubkey,
+            app.pubkey,
+            "publisher pubkey captured"
+        );
+        assert!(
+            !by_id(&plain.id).app_specific,
+            "plain events are not app-specific"
+        );
+    });
+}
+
+#[test]
 fn count_stops_exactly_at_the_cap() {
     // NIP-45: the relay's count limit cuts exactly — the created_at
     // boundary continuation of the REQ path (NIP-67) must not inflate
