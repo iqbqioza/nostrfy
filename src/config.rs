@@ -19,9 +19,10 @@ pub const DEFAULT_CONFIG: &str = "nostrfy.toml";
 /// `relay.enabled_git` is set (the kinds are rejected otherwise). NIP-A3
 /// (kind 10133) is served but cannot be advertised: it is a `draft` with no
 /// integer identifier and NIP-11's `supported_nips` is an array of integer
-/// identifiers. The remaining file-storage NIPs (95/96 HTTP file storage)
-/// are excluded per the project rules (Blossom is provided separately by
-/// the `[blossom]` file server). NIP-33 was merged into NIP-01 but remains
+/// identifiers. File storage is covered too: NIP-94 (file metadata) is
+/// stored and served like any other event, and NIP-96 (Blossom) is served
+/// by the dedicated `[blossom]` file server; only NIP-95 (plain HTTP file
+/// storage) is not implemented. NIP-33 was merged into NIP-01 but remains
 /// advertised for clients that check it.
 pub const RELAY_NIPS: &[u16] = &[
     1, 9, 11, 13, 17, 22, 26, 29, 32, 33, 34, 40, 42, 43, 45, 46, 47, 50, 57, 59, 62, 65, 66, 67,

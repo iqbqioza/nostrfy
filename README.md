@@ -21,12 +21,12 @@
 > [!TIP]
 > This project's relay is running live at **wss://relay.damustr.com**.
 
-**All in one Nostr relay server written in Rust. Blazing fast by Design. Lean by Nature. Powerful by Default.**
+**All in one Nostr relay server engine written in Rust. Blazing fast by Design. Lean by Nature. Powerful by Default.**
 
 nostrfy is designed around two goals:
 
 - **Never go down.** Overload protection, a dedicated reader thread, panic containment and strict resource bounds keep the relay serving even under sustained abuse, a stalled disk or a memory-constrained host. The HTTP layer is hardened too: a connection cap that also covers plain HTTP, a header-read timeout that closes slow-loris sockets, per-IP connection-rate limiting, and optional per-pubkey publish rate limits.
-- **Spec-complete.** All relay-side NIPs are implemented and verified against the official specifications (file-storage NIPs excluded by design, except Blossom via the dedicated file server).
+- **Spec-complete.** All relay-side NIPs are implemented and verified against the official specifications — file-storage is covered too: NIP-94 (file metadata) events are stored and served like any other event, and NIP-96 (Blossom) is served by the dedicated file server.
 
 ## Table of contents
 
@@ -330,7 +330,7 @@ With `server.ws_paths = "inbox-outbox"` the relay's WebSocket endpoint is served
 
 ## NIP support
 
-All relay-side NIPs are implemented; client-side NIPs are stored and served as plain events. A subset of client-side NIPs that clients rely on (17, 22, 32, 46, 47, 57, 59, 65, 78, 84, 85, 87, 88, 94) is **deliberately** advertised in the NIP-11 document; the rest are not (per the spec: "Client-side NIPs SHOULD NOT be advertised"). NIP-34 (git) is opt-in via `relay.enabled_git` — off by default, since patch payloads can be large. NIP-A3 (kind 10133) is served but cannot be advertised: it is a `draft` with no integer identifier, and NIP-11's `supported_nips` is an array of integer identifiers. The remaining file-storage NIPs (95/96 HTTP file storage) are excluded by design — NIP-94 file-metadata events are stored and served like any other event, and Blossom is provided by the dedicated [Blossom file server](#features).
+All relay-side NIPs are implemented; client-side NIPs are stored and served as plain events. A subset of client-side NIPs that clients rely on (17, 22, 32, 46, 47, 57, 59, 65, 78, 84, 85, 87, 88, 94) is **deliberately** advertised in the NIP-11 document; the rest are not (per the spec: "Client-side NIPs SHOULD NOT be advertised"). NIP-34 (git) is opt-in via `relay.enabled_git` — off by default, since patch payloads can be large. NIP-A3 (kind 10133) is served but cannot be advertised: it is a `draft` with no integer identifier, and NIP-11's `supported_nips` is an array of integer identifiers. The remaining file-storage NIPs are covered: NIP-94 file-metadata events are stored and served like any other event, and Blossom (NIP-96) is provided by the dedicated [Blossom file server](#features) — only NIP-95 (plain HTTP file storage) is not implemented.
 
 The advertised `supported_nips` list is **dynamic**: a NIP is dropped when all the kinds it defines are blocked by `blocked_kinds`/`allowed_kinds` (e.g. blocking kind 5 hides NIP-09), when `reject_ephemeral` rejects every kind it relies on, or when it is disabled via `enabled_nips`/`disabled_nips`. Runtime changes (NIP-86 `allowkind`/`disallowkind`, `SIGHUP` reloads) are reflected in the next NIP-11 fetch.
 
