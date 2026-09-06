@@ -209,7 +209,7 @@ nostrfy exposes a **read-only HTTP API** on the same port under `/api/v1`, serve
 | Endpoint | Description |
 | --- | --- |
 | `GET /api/v1/{npub1...}/{kind}` | Events by author pubkey and kind (for `npub1` the `{kind}` path is mandatory — the kind-less `GET /api/v1/{npub1...}` returns the latest kind-0 profile) |
-| `GET /api/v1/{npub1...}/{kind}/monthly` | Per-month event counts for a pubkey + kind (`{"months": [{"month": "2026-08", "count": 4}], "total": 4}` — zero-filled; the whole period by default, bounded by `since`/`until`, at most 1200 months; `approximate: true` when a month hit the collection limit) |
+| `GET /api/v1/{npub1...}/{kind}/monthly` | Per-month event counts for a pubkey + kind (`{"months": [{"month": "2026-08", "count": 4}], "total": 4}` — zero-filled; the whole period by default, bounded by `since`/`until`, at most 120 months; `approximate: true` when a month hit the collection limit) |
 | `GET /api/v1/{nevent1...}` / `GET /api/v1/{note1...}` | A single event by its NIP-19 id |
 | `GET /api/v1/{npub1...}` | The author's latest kind-0 profile event |
 | `GET /api/v1/{npub1...}/kinds` | Per-kind event counts for an author, most used first |
@@ -284,20 +284,22 @@ nostrfy blossom list
 
 All commands accept `--config <path>` (default `./nostrfy.toml`).
 
-Sending `SIGHUP` to the daemon reloads the configuration at runtime: most limits, server auth settings, the NIP toggles (including the NIP-40 toggle, applied live) and the REST API concurrency ceiling apply immediately. A few settings are captured at startup and require a full restart — the log warns when one of them changed: `server.host`, `server.port`, `server.api_host`, `server.ws_paths`, `rpc.management_port`, `rpc.management_host`, `server.metrics_enabled`, `database.path`, `database.purge_interval_secs`, `relay.private_key` (a reload warns that it is ignored), `relay.enabled_nips`/`disabled_nips`, `relay.livekit_*`, `blossom.host`/`storage`/`local_path`/`max_upload_bytes`/`s3_*`, `daemon.max_log_size_bytes`/`max_log_files`/`stats_interval_secs`, the database request timeouts/queue caps, `live_buffer`/`live_batch_size`/`live_batch_interval_ms`, `max_indexed_words`, and the HTTP-layer limits `max_connections`/`http_read_timeout_secs`/`max_connections_per_sec_per_ip` (they shape the accept loop built at startup). An invalid reloaded file is rejected (the old configuration stays in force). The access control lists are runtime-managed (NIP-86) and are **not** overwritten by a reload.
+Sending `SIGHUP` to the daemon reloads the configuration at runtime: most limits, server auth settings, the NIP toggles (including the NIP-40 toggle, applied live) and the REST API concurrency ceiling apply immediately. A few settings are captured at startup and require a full restart — the log warns when one of them changed: `server.host`, `server.port`, `server.api_host`, `server.ws_paths`, `rpc.management_port`, `rpc.management_host`, `rpc.max_admin_body_bytes`, `server.metrics_enabled`, `database.path`, `database.purge_interval_secs`, `database.map_size`/`max_map_size`/`search_index`/`meta_index`/`reader_threads`/`disabled_fsync`, the database request timeouts/queue caps, `max_indexed_words`, `relay.private_key` (a reload warns that it is ignored), `relay.enabled_nips`/`disabled_nips`, `relay.livekit_*`, `blossom.host`/`storage`/`local_path`/`max_upload_bytes`/`min_free_bytes`/`s3_*`, `daemon.max_log_size_bytes`/`max_log_files`/`stats_interval_secs`, `live_buffer`/`live_batch_size`/`live_batch_interval_ms`, `socket_recv_buffer_kb`, and the HTTP-layer limits `max_connections`/`http_read_timeout_secs`/`max_connections_per_sec_per_ip` (they shape the accept loop built at startup). An invalid reloaded file is rejected (the old configuration stays in force). The access control lists are runtime-managed (NIP-86) and are **not** overwritten by a reload.
 
 ## Configuration
 
-Every setting is optional — missing entries fall back to the defaults, and `nostrfy.toml.example` documents every option with comments. The configuration has six sections:
+Every setting is optional — missing entries fall back to the defaults, and `nostrfy.toml.example` documents every option with comments. The configuration has eight sections:
 
 | Section | Purpose |
 | --- | --- |
 | `[relay]` | Identity, URLs (incl. `public_url` for NIP-42/62/98), `private_key`, LiveKit, NIP toggles |
-| `[server]` | Binding, `api_host` split, management API, authentication |
+| `[server]` | Binding, `api_host` split, metrics, WebSocket paths and inbox/outbox write policies |
+| `[rpc]` | Management API (NIP-86): port, token, admin pubkey, body limit |
 | `[limits]` | All limits and overload protections (connections incl. the HTTP layer, per-IP and per-pubkey rate limits, events, search, API bounds) |
 | `[database]` | LMDB storage (paths, memory-map sizes, search index) |
 | `[daemon]` | PID/log/stats files and log rotation |
 | `[access]` | Initial access control lists (NIP-86 manages them at runtime) |
+| `[blossom]` | The Blossom file server (host, local/S3 storage, upload limits) |
 
 `nostrfy check` (and startup) validate the file and warn about common misconfigurations — e.g. an empty `relay.public_url` with a wildcard/loopback bind (which would break NIP-42 AUTH, NIP-62 vanish and NIP-86 NIP-98 auth), a `require_pow` high enough to make mining infeasible, incomplete LiveKit settings, or the `require_auth` + `send_auth_challenge = false` lockout.
 

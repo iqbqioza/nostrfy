@@ -222,13 +222,13 @@ To generate a secret key, use the `nostrfy genkey` command (see [5. Command Refe
 | `http_read_timeout_secs` | Seconds to complete an HTTP request head (0 = disabled; slow-loris defense, applies to WS upgrades too) | `30` |
 | `max_connections_per_sec_per_ip` | Max new connections per second per source IP (0 = unlimited) | `0` |
 | `max_req_response_bytes` | Byte budget for one REQ response (0 = unlimited; over it the subscription is closed with `CLOSED`) | `33554432` (32 MiB) |
-| `max_sub_bytes` | Total subscription filter bytes per connection | `524288` |
-| `group_late_publish_secs` | Reject NIP-29 group events older than this (0 = off) | `604800` (7 days) |
-| `max_api_concurrent` | Max concurrent REST API requests | `32` |
-| `max_api_limit` | Ceiling for the API `limit` parameter (0 = unlimited) | `500` |
-| `max_api_offset` | Ceiling for the API `offset` parameter (0 = unlimited) | `10000` |
-| `max_api_search_bytes` | Max `search` bytes for the API (0 = unlimited) | `1024` |
-| `live_batch_interval_ms` / `live_batch_size` | Live fan-out batching (ms / events) | `10` / `64` |
+| `max_sub_bytes` | Total subscription filter bytes per connection | `1048576` |
+| `group_late_publish_secs` | Reject NIP-29 group events older than this (0 = off) | `3600` (1 hour) |
+| `max_api_concurrent` | Max concurrent REST API requests | `8` |
+| `max_api_limit` | Ceiling for the API `limit` parameter (0 = unlimited) | `5000` |
+| `max_api_offset` | Ceiling for the API `offset` parameter (0 = unlimited) | `50000` |
+| `max_api_search_bytes` | Max `search` bytes for the API (0 = unlimited) | `2048` |
+| `live_batch_interval_ms` / `live_batch_size` | Live fan-out batching (ms / events) | `20` / `32` |
 | `live_buffer` | Live fan-out queue size | `65536` |
 
 #### `[database]` — Database
@@ -409,7 +409,7 @@ curl "http://127.0.0.1:8080/api/v1/npub180cvv07tjdrrgpa0j7j7tmnyl2yr6yr7l8j4s3ev
 
 ### Monthly counts
 
-`GET /api/v1/{npub1...}/{kind}/monthly` returns per-month event counts (`{"months": [{"month": "2026-08", "count": 4, "approximate": false}], "total": 4}`) for a pubkey + kind, zero-filled over the `since`/`until` range (default: the whole period, from the earliest stored event to now; at most 1200 months).
+`GET /api/v1/{npub1...}/{kind}/monthly` returns per-month event counts (`{"months": [{"month": "2026-08", "count": 4, "approximate": false}], "total": 4}`) for a pubkey + kind, zero-filled over the `since`/`until` range (default: the whole period, from the earliest stored event to now; at most 120 months).
 
 ### Query parameters
 
@@ -624,7 +624,7 @@ Point `media.example.com` (and only that hostname) at the same port in your reve
 
 Both backends use the `bucket/{npub1xxx}/{file}` hierarchy: every upload is stored under the uploader's npub directory, keyed by the file's SHA-256.
 
-- **local**: `<local_path>/<npub1...>/<sha256>` (plus a `<sha256>.meta.json` descriptor)
+- **local**: `<local_path>/<npub1...>/<sha256>` (the sha→owner descriptor lives in LMDB; legacy `<sha256>.meta.json` sidecars are only read by the one-time migration)
 - **s3 / R2**: objects `<npub1...>/<sha256>` in the configured bucket
 
 ### 11.3 Endpoints
@@ -784,9 +784,9 @@ After editing the config file, reload it without a restart:
 kill -HUP $(cat nostrfy.pid)
 ```
 
-Settings that take effect on reload: relay name/description, limits (except the HTTP-layer ones below), NIP toggles (partially), NIP-40 on/off, API concurrency, ...
+Settings that take effect on reload: the relay name/description/pubkey/contact/icon/post-policy, `public_url`, most `[limits]` entries (the restart-only ones are listed below), the NIP toggles (`reject_ephemeral`, `enabled_git`, `enabled_nip78_auth`), NIP-40 on/off and the REST API concurrency ceiling.
 
-Settings that require a **restart**: `private_key`, `api_host`, `metrics_enabled`, LiveKit settings, `enabled_nips`/`disabled_nips`, and the HTTP-layer limits (`max_connections`, `http_read_timeout_secs`, `max_connections_per_sec_per_ip` — they shape the accept loop built at startup). The log warns when a change needs a restart.
+Settings that require a **restart** (the log warns when one of them changed): `private_key`, `api_host`, `metrics_enabled`, LiveKit settings, `enabled_nips`/`disabled_nips`, `server.host`/`port`/`ws_paths`, `rpc.management_port`/`management_host`/`max_admin_body_bytes`, `database.path`/`purge_interval_secs`/`map_size`/`max_map_size`/`search_index`/`meta_index`/`reader_threads`/`disabled_fsync`/`db_request_timeout_secs`/`max_db_queue_msgs`/`max_db_queue_events`/`max_indexed_words`, `daemon.max_log_size_bytes`/`max_log_files`/`stats_interval_secs`, `limits.live_buffer`/`live_batch_size`/`live_batch_interval_ms`/`socket_recv_buffer_kb`/`max_connections`/`http_read_timeout_secs`/`max_connections_per_sec_per_ip`, all `blossom.*`, and `relay.max_groups` (captured at startup; not covered by the reload warning). See the CONFIGURATION.md SIGHUP table for the full matrix.
 
 ---
 
@@ -801,7 +801,7 @@ into the millions requires host-level tuning:
 | --- | --- | --- |
 | `ulimit -n` / systemd `LimitNOFILE` | ≥ 2× the target connections (+1000) | Every connection holds an fd |
 | `net.core.somaxconn` | ≥ 1024 | Pending accept queue for connection bursts |
-| `net.ipv4.tcp_mem` / `net.ipv4.tcp_rmem` / `tcp_wmem` | tuned to the host RAM | The relay sets 16 KiB per socket direction; the kernel defaults must still cover the aggregate |
+| `net.ipv4.tcp_mem` / `net.ipv4.tcp_rmem` / `tcp_wmem` | tuned to the host RAM | The relay sets the send buffer to 16 KiB and the receive buffer to `limits.socket_recv_buffer_kb` (64 KiB default); the kernel defaults must still cover the aggregate |
 | `net.ipv4.tcp_fin_timeout` | low (e.g. 10) | Reclaims TIME_WAIT sockets faster |
 | `vm.overcommit_memory` | 1 or 2 | The LMDB map is a large sparse virtual reservation (see `database.max_map_size`) |
 
@@ -812,9 +812,9 @@ any serious connection count), and `kern.ipc.somaxconn` replaces
 Linux; note that FreeBSD does not double the requested `SO_RCVBUF`
 value, so the actual receive buffer equals the configured size.
 
-Per-connection kernel memory is ~32 KiB (16 KiB per direction, set by
-the relay) and user space ~10 KiB (the task, the connection state, the
-WebSocket buffer), so a million connections need roughly 40 GiB of
+Per-connection kernel memory is ~80 KiB (16 KiB send + 64 KiB receive,
+set by the relay) and user space ~10 KiB (the task, the connection state,
+the WebSocket buffer), so a million connections need roughly 90 GiB of
 kernel + user memory on top of the database. The WebSocket reader pool
 has two threads; a single heavy REQ no longer stalls every query.
 
@@ -849,8 +849,8 @@ changes nothing.
 
 The remaining ingest costs are cheap by design: the per-event metadata
 header (`database.meta_index`) is one small index write, the NIP-50 word
-index (`database.search_index`) is off by default per event and can be
-disabled entirely on write-heavy instances, and the writer merges every
+index (`database.search_index`, on by default) adds a word-index write per
+event and can be disabled entirely on write-heavy instances, and the writer merges every
 deferred EVENTS batch waiting in its queue into one commit (one fsync,
 or none with `disabled_fsync`). Event cloning for the writer and the
 broadcast are the only per-event allocations left; the live-delivery
