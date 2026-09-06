@@ -4,6 +4,7 @@
 //! relay-generated event publishing. Event validation lives in
 //! [`validate`].
 
+mod commands;
 mod index;
 pub(crate) use index::{FilterComponents, SubscriptionIndex};
 mod roles;
@@ -898,6 +899,13 @@ impl Relay {
                 || event.kind == nip29::LEAVE);
         if is_group_event {
             self.apply_group_event(&event, now).await;
+        }
+        // Command events: with `relay.enabled_command_events` a kind:1
+        // event authored by the relay's own pubkey carries an operator
+        // command; it is executed here (after storage, like the other
+        // side effects) and answered with a relay-signed kind:1111 event.
+        if event.kind == 1 {
+            self.handle_command_event(&event).await;
         }
         self.broadcast(event);
     }

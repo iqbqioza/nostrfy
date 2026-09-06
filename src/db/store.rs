@@ -653,6 +653,17 @@ impl Store {
         Ok(())
     }
 
+    /// Persists the Blossom upload allowlist under a single fixed key, so
+    /// the CLI command (`nostrd blossom allow/deny`) and the running
+    /// server share one source of truth without touching the config file.
+    pub(crate) fn save_blossom_allow(&self, entries: &[String]) -> Result<()> {
+        let data = serde_json::to_vec(entries)?;
+        let mut wtxn = self.env.write_txn()?;
+        self.access.put(&mut wtxn, b"blossom_allow", &data)?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
     /// Loads the persisted relay pubkey access lists ((deny, allow)).
     pub(crate) fn load_relay_pubkeys(&self) -> Result<RelayPubkeyLists> {
         let rtxn = self.env.read_txn()?;

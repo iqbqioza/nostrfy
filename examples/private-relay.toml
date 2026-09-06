@@ -17,6 +17,8 @@ require_auth = true
 send_auth_challenge = true
 # NIP-78 app-specific events: AUTH to publish, owner-only to serve (default).
 enabled_nip78_auth = true
+# Command events: kind:1 operator commands from relay.private_key (default off).
+enabled_command_events = false
 # Keep it small: no search, no groups, no negentropy, no NIP-50.
 enabled_nips = [1, 9, 11, 40, 42, 45, 46, 59, 65, 70, 78, 84]
 disabled_nips = [29, 43, 50, 77, 86, 98]

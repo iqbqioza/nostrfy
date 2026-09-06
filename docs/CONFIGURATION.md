@@ -90,6 +90,7 @@ Every key is optional; a missing key uses the default shown below.
 | `require_auth` | boolean | `false` | Require NIP-42 authentication for all REQ/EVENT/COUNT/NEG |
 | `send_auth_challenge` | boolean | `true` | Send the AUTH challenge on connect |
 | `enabled_nip78_auth` | boolean | `true` | Require NIP-42 AUTH before accepting kind 78/30078 events and serve them only to the authenticated owner |
+| `enabled_command_events` | boolean | `false` | Execute kind:1 operator commands authored by `relay.private_key` (see below) |
 
 ### Key details
 
@@ -136,6 +137,14 @@ Every key is optional; a missing key uses the default shown below.
 **`send_auth_challenge`** — When `true`, every new connection receives a NIP-42 auth-request challenge. `require_auth = true` with `send_auth_challenge = false` locks everyone out — the relay warns about the combination at startup.
 
 **`enabled_nip78_auth`** — NIP-78 application-specific events (kinds `78` and `30078`) are a private data store: when `true`, the relay requires the NIP-42 AUTH flow before accepting them (`auth-required: application-specific events require authentication`), and serves them only to the authenticated owner (the event author's pubkey) — REQ results, live events, COUNT and NIP-77 syncs withhold them from everyone else, and the unauthenticated REST API hides them. Set to `false` to restore the legacy behavior (public app-specific events). Requires NIP-42 to be enabled (the relay refuses to start otherwise) and is inactive when NIP-78 is disabled. Takes effect immediately on `SIGHUP` reload and on the next REQ/publish. Default `true`.
+
+**`enabled_command_events`** — When `true`, kind:1 events authored by the relay's own pubkey (`relay.private_key`) are executed as operator commands, so the allow/deny lists can be managed by publishing an event instead of running the CLI. The content must be exactly one of (the pubkey operand accepts `npub1...`, `nostr:npub1...` or 64-hex):
+- `/relay allow <pubkey>` (alias: `/relay add`) — add a pubkey to the relay allow list
+- `/relay deny <pubkey>` — add a pubkey to the relay deny list (removes it from allow)
+- `/blossom allow <pubkey>` — add a pubkey to the Blossom upload allowlist
+- `/blossom deny <pubkey>` — remove a pubkey from the Blossom upload allowlist
+
+The changes take effect immediately and are persisted (same lists as `nostrd relay allow/deny` and `nostrd blossom allow/deny`). The relay answers every recognized command with a relay-signed kind:1111 event tagged `e` to the command event; the reply is served publicly, so the result is visible even when NIP-42 is enabled. `error: ...` replies report unknown commands or invalid pubkeys. Only the holder of `relay.private_key` can issue commands — the author check runs on the event's verified signature. Requires `relay.private_key`; a warning is logged when the flag is on without a key. Default `false`.
 
 ### Behavior notes
 

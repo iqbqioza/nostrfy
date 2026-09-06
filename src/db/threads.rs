@@ -719,6 +719,12 @@ pub(crate) fn spawn(
                                     }
                                     let _ = reply.send(());
                                 }
+                                Msg::SaveBlossomAllow { entries, reply } => {
+                                    if let Err(e) = store.save_blossom_allow(&entries) {
+                                        db_error(&thread_errors, &e);
+                                    }
+                                    let _ = reply.send(());
+                                }
                                 Msg::BlossomAddOwner {
                                     sha256,
                                     mime,

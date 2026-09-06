@@ -201,6 +201,11 @@ enum Msg {
         allow: Vec<(String, String)>,
         reply: oneshot::Sender<()>,
     },
+    /// Persists the Blossom upload allowlist.
+    SaveBlossomAllow {
+        entries: Vec<String>,
+        reply: oneshot::Sender<()>,
+    },
     /// Adds an owner to a Blossom blob's persisted metadata (atomic);
     /// the reply carries whether the commit succeeded.
     BlossomAddOwner {
@@ -853,6 +858,15 @@ impl DbClient {
         let allow = allow.to_vec();
         let _ = self
             .request_write(|reply| Msg::SaveRelayPubkeys { deny, allow, reply })
+            .await;
+    }
+
+    /// Persists the Blossom upload allowlist under its dedicated LMDB key
+    /// (the same key `nostrd blossom allow/deny` writes).
+    pub async fn save_blossom_allow(&self, entries: &[String]) {
+        let entries = entries.to_vec();
+        let _ = self
+            .request_write(|reply| Msg::SaveBlossomAllow { entries, reply })
             .await;
     }
 

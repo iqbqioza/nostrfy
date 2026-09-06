@@ -168,6 +168,7 @@ If anything is wrong, it tells you exactly what. It is strongly recommended to r
 | `require_auth` | Require NIP-42 auth for everything (subscriptions and publishing) | `false` |
 | `send_auth_challenge` | Send an AUTH challenge on connect | `true` |
 | `enabled_nip78_auth` | Require NIP-42 AUTH before accepting kind 78/30078 events and serve them only to the authenticated owner | `true` |
+| `enabled_command_events` | Execute kind:1 operator commands (authored by `relay.private_key`) that edit the relay/blossom allow lists, answered with kind:1111 events | `false` |
 
 To generate a secret key, use the `nostrd genkey` command (see [5. Command Reference](#5-command-reference)).
 
@@ -186,6 +187,8 @@ To generate a secret key, use the `nostrd genkey` command (see [5. Command Refer
 > **Note**: `require_auth = true` combined with `send_auth_challenge = false` locks everyone out — nobody can authenticate. Avoid this combination.
 
 > **Note**: `enabled_nip78_auth = true` (the default) makes kind 78/30078 events private: they require NIP-42 AUTH to publish, and are served only to the authenticated owner (the event author). Unauthenticated subscribers, negentropy syncs and the REST API do not see them. Requires NIP-42 to be enabled; set `enabled_nip78_auth = false` for the legacy public behavior.
+
+> **Note**: `enabled_command_events = true` lets the operator manage the relay/blossom access lists by publishing a kind:1 event signed with `relay.private_key`, e.g. content `/relay deny npub1...` or `/blossom allow npub1...` (the pubkey may carry the `nostr:` URI prefix). The relay executes the command immediately (persisted like `nostrd relay allow/deny`), and answers with a relay-signed kind:1111 event tagged to the command — served publicly, so the result is visible even when NIP-42 is enabled. Only the key holder can issue commands. Off by default.
 
 #### `[rpc]` — NIP-86 management RPC
 

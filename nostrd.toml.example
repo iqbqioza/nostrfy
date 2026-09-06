@@ -121,6 +121,12 @@ send_auth_challenge = true
 # only to the authenticated owner. Default true; requires NIP-42 enabled.
 enabled_nip78_auth = true
 
+# Execute kind:1 events authored by relay.private_key as operator commands
+# ("/relay allow|deny <npub|hex>", "/blossom allow|deny <npub|hex>"; the
+# operand may carry the nostr: URI prefix), answered with relay-signed
+# kind:1111 events. Default false.
+enabled_command_events = false
+
 # -----------------------------------------------------------------------------
 # Network server
 # -----------------------------------------------------------------------------

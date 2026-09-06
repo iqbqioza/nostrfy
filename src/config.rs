@@ -156,6 +156,13 @@ pub struct RelayConfig {
     /// require the NIP-42 AUTH flow before they are accepted, and are only
     /// served to the authenticated owner (the event author's pubkey).
     pub enabled_nip78_auth: bool,
+    /// When true, kind:1 events authored by the relay's own pubkey
+    /// (`relay.private_key`) are executed as operator commands: content
+    /// "relay allow/deny <npub1...|hex>" edits the relay access lists and
+    /// "blossom allow/deny <npub1...|hex>" edits the Blossom upload
+    /// allowlist, without the CLI. The relay answers each command with a
+    /// relay-signed kind:1111 event (tagged to the command).
+    pub enabled_command_events: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -387,6 +394,7 @@ impl Default for RelayConfig {
             require_auth: false,
             send_auth_challenge: true,
             enabled_nip78_auth: true,
+            enabled_command_events: false,
         }
     }
 }
@@ -1192,6 +1200,15 @@ impl Config {
             );
         }
 
+        // Command events: the relay can only execute its own commands
+        // when it has a key to be identified by.
+        if self.relay.enabled_command_events && self.relay.private_key.trim().is_empty() {
+            log::warn!(
+                "relay.enabled_command_events is true but relay.private_key is empty: no \
+                 kind:1 command events can be recognized; run 'nostrd genkey' to set a key"
+            );
+        }
+
         // Blossom file server: the storage backend must be known, and S3
         // storage needs its credentials. The feature is opt-in via `host`.
         let b = &self.blossom;
@@ -1527,6 +1544,7 @@ fn known_config_keys() -> &'static [(&'static str, &'static [&'static str])] {
                 "require_auth",
                 "send_auth_challenge",
                 "enabled_nip78_auth",
+                "enabled_command_events",
                 "enable_git",
                 "software",
                 "version",
