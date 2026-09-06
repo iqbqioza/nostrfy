@@ -222,7 +222,7 @@ The changes take effect immediately and are persisted (same lists as `nostrfy re
 | `max_connections` | integer | `10000` | Maximum concurrent connections (must be ≥ 1) |
 | `max_connections_per_ip` | integer | `64` | Max connections per source IP (`0` = no per-IP cap) |
 | `max_ws_message_bytes` | integer | `1048576` | Max bytes per WebSocket message/frame |
-| `db_buffer_size` | integer | `2048` | Initial per-connection buffer size (bytes) |
+| `buffer_size` | integer | `2048` | Initial per-connection WebSocket buffer (bytes; legacy location of `database.db_buffer_size`) |
 | `socket_recv_buffer_kb` | integer | `64` | Per-connection kernel receive buffer (KiB, `0` = kernel default; the kernel may double it). Larger values let a fast publisher's burst absorb into one batch while the relay commits; the buffer uses real memory only while data is queued |
 | `max_out_queue_bytes` | integer | `262144` | Per-connection outgoing queue cap (bytes; `0` = unlimited) |
 | `ws_idle_timeout_secs` | integer | `300` | Close idle connections after this long (`0` = never) |
@@ -240,7 +240,7 @@ The changes take effect immediately and are persisted (same lists as `nostrfy re
 | `max_limit` | integer | `500` | Ceiling for the REQ `limit` |
 | `max_count` | integer | `2000` | Ceiling for COUNT results |
 | `max_sub_id_len` | integer | `64` | Max subscription id length |
-| `max_sub_bytes` | integer | `524288` | Total subscription filter bytes per connection |
+| `max_sub_bytes` | integer | `1048576` | Total subscription filter bytes per connection |
 
 ### Events
 
@@ -258,8 +258,8 @@ The changes take effect immediately and are persisted (same lists as `nostrfy re
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
-| `max_db_queue_msgs` | integer | `4096` | Max queued messages before failing fast |
-| `max_db_queue_events` | integer | `262144` | Max queued events before failing fast |
+| `db_queue_msgs` | integer | `4096` | Max queued messages before failing fast (legacy location of `database.max_db_queue_msgs`) |
+| `db_queue_events` | integer | `262144` | Max queued events before failing fast (legacy location of `database.max_db_queue_events`) |
 | `max_neg_items` | integer | `100000` | Max records per NIP-77 negentropy sync |
 | `live_buffer` | integer | `65536` | Live fan-out queue size |
 
@@ -268,23 +268,23 @@ The changes take effect immediately and are persisted (same lists as `nostrfy re
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
 | `new_pubkey_min_age_secs` | integer | `0` | Reject events from pubkeys younger than this (seconds) |
-| `group_late_publish_secs` | integer | `604800` | NIP-29: reject group events older than this (seconds) |
+| `group_late_publish_secs` | integer | `3600` | NIP-29: reject group events older than this (seconds) |
 
 ### REST API
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
-| `max_api_concurrent` | integer | `32` | Max concurrent `/api/v1` requests (503 beyond this) |
-| `max_api_limit` | integer | `500` | Ceiling for the API `limit` parameter (`0` = no bound) |
-| `max_api_offset` | integer | `10000` | Ceiling for the API `offset` parameter (`0` = no bound) |
-| `max_api_search_bytes` | integer | `1024` | Max bytes of the API `search` parameter (`0` = no bound) |
+| `max_api_concurrent` | integer | `8` | Max concurrent `/api/v1` requests (503 beyond this) |
+| `max_api_limit` | integer | `5000` | Ceiling for the API `limit` parameter (`0` = no bound) |
+| `max_api_offset` | integer | `50000` | Ceiling for the API `offset` parameter (`0` = no bound) |
+| `max_api_search_bytes` | integer | `2048` | Max bytes of the API `search` parameter (`0` = no bound) |
 
 ### Live fan-out
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
-| `live_batch_interval_ms` | integer | `10` | How often live events are flushed (ms) |
-| `live_batch_size` | integer | `64` | Max events per live batch |
+| `live_batch_interval_ms` | integer | `20` | How often live events are flushed (ms) |
+| `live_batch_size` | integer | `32` | Max events per live batch |
 
 ### Key details
 
@@ -385,7 +385,7 @@ The changes take effect immediately and are persisted (same lists as `nostrfy re
 **`purge_interval_secs`** — How often (seconds) NIP-40 expired events are physically removed from the database. Expired events are hidden from queries even between purges.
 
 **`search_index`** — When `true`, event content is word-indexed for fast NIP-50 search. When `false`, search still works (whole-word matching against content) but scans are slower. Toggling takes effect at startup. For a tiny VPS (0.25 vCPU / 512 MB) set `search_index = false` — it **halves the database** (41.8 MB → 20.5 MB per 10,000 events with 3 tags and 21 words in testing) and saves CPU/IO; see the Manual's [Low-spec Tuning](MANUAL.md#low-spec-vps-025-vcpu--512-mb).
-**`db_buffer_size`** — The LMDB environment's read/write buffer size in bytes (the `read_buffer_size`/`write_buffer_size` of the opened environment).
+**`db_buffer_size`** — The initial per-connection WebSocket buffer in bytes (grows on demand); the kernel receive buffer is tuned separately with `limits.socket_recv_buffer_kb`.
 **`max_indexed_words`** — How many words of each event's content are added to the NIP-50 search index. Higher values improve recall for long texts at a small storage cost.
 **`db_request_timeout_secs`** — How long a database request may wait before it fails (`0` = forever). Keeps the relay responsive when the storage is stuck. Write requests are not subject to the timeout (a false timeout would skip their side effects). The startup loads of the persisted access state (deny/allow lists, Blossom allowlist) wait without a timeout and never fail fast: an empty result would silently lift every ban (fail-open). Their SIGHUP reloads keep the previous lists when a load fails.
 **`disabled_fsync`** — Skip the synchronous disk flush after every write batch (LMDB `MDB_NOSYNC`). Writes are committed to the mapped pages and left in the OS page cache, so commits cost microseconds instead of an fsync; the kernel flushes them shortly after. A power loss or OS crash may lose the writes since the last kernel flush — a fine trade for a high-throughput relay with a replica/backup, a poor one for a single always-live instance. Takes effect at startup. The Manual's [Throughput tuning](MANUAL.md#throughput-events-per-second) section shows the settings that move ingest throughput.
@@ -570,11 +570,11 @@ Editing the file and sending `kill -HUP $(cat nostrfy.pid)` reloads it **without
 | `relay.name`, `description`, `pubkey`, `contact`, `icon`, `post_policy`, `public_url`, `relay.reject_ephemeral`, `relay.enabled_git`, `relay.enabled_nip78_auth` | `relay.private_key` |
 | most of `[limits]` (the restart-column entries below apply on restart only) | `relay.livekit_*`, `relay.enabled_nips` / `disabled_nips` |
 | NIP-40 on/off, API concurrency | `server.host`, `server.port`, `server.api_host`, `server.ws_paths`, `rpc.management_port`, `rpc.management_host`, `server.metrics_enabled` |
-| — | `database.path`, `database.purge_interval_secs`, `daemon.max_log_size_bytes`, `max_log_files`, `stats_interval_secs`, `database.db_request_timeout_secs`, `max_db_queue_msgs`, `max_db_queue_events`, `max_indexed_words`, `live_buffer`, `live_batch_size`, `live_batch_interval_ms`, `max_connections`, `http_read_timeout_secs`, `max_connections_per_sec_per_ip`, `rpc.max_admin_body_bytes`, `relay.max_groups`, `blossom.host`, `blossom.storage`, `blossom.local_path`, `blossom.max_upload_bytes`, `blossom.min_free_bytes`, `blossom.s3_*` |
+| — | `database.path`, `database.purge_interval_secs`, `database.map_size`, `database.max_map_size`, `database.search_index`, `database.meta_index`, `database.reader_threads`, `database.disabled_fsync`, `database.db_request_timeout_secs`, `database.max_db_queue_msgs`, `database.max_db_queue_events`, `database.max_indexed_words`, `daemon.max_log_size_bytes`, `max_log_files`, `stats_interval_secs`, `limits.live_buffer`, `live_batch_size`, `live_batch_interval_ms`, `socket_recv_buffer_kb`, `max_connections`, `http_read_timeout_secs`, `max_connections_per_sec_per_ip`, `rpc.max_admin_body_bytes`, `relay.max_groups`, `blossom.host`, `blossom.storage`, `blossom.local_path`, `blossom.max_upload_bytes`, `blossom.min_free_bytes`, `blossom.s3_*` |
 
 `[access]` is **not** applied by a reload: the access lists are seeded once at startup and then managed at runtime via NIP-86.
 
-The log warns whenever a change requires a restart (`... a restart is required to apply it`).
+The log warns when one of the restart-required settings changed (`... a restart is required to apply it`). A few startup-captured settings (`relay.max_groups`, the LMDB map size floor) are not checked by the reload.
 
 ---
 

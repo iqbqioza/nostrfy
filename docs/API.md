@@ -76,7 +76,7 @@ Author identifiers (`{npub1...}`) may also be given as a **64-hex pubkey** (case
 ```
 
 - `since` / `until` bound the range (unix seconds); without them the **whole period** is covered, from the earliest stored event of that author and kind to now (an author with no events returns an empty list).
-- Every month in the range is reported, zero-filled, oldest first; the range is capped at **1200 months** (exceeding it returns `400`, as does `until < since`).
+- Every month in the range is reported, zero-filled, oldest first; the range is capped at **120 months** (exceeding it returns `400`, as does `until < since`).
 - `approximate: true` marks a month whose count hit the collection limit (`limits.max_count`), mirroring NIP-45.
 - The same visibility rules as the rest of the API apply (protected events, gift wraps and private/hidden group content are withheld).
 
@@ -216,8 +216,8 @@ Errors return a JSON body with an `error` field:
 | --- | --- |
 | `invalid identifier: ...` | The NIP-19 identifier cannot be decoded (400) |
 | `the endpoint requires an npub1 identifier or a 64-hex pubkey` | A kind path given with a note1/nevent1/naddr1 identifier, or an unrecognized path (400) |
-| `offset exceeds the maximum of 10000` | `offset` above `max_api_offset` (400) |
-| `search exceeds the maximum of 1024 bytes` | `search` longer than `max_api_search_bytes` (400) |
+| `offset exceeds the maximum of 50000` | `offset` above `max_api_offset` (400) |
+| `search exceeds the maximum of 2048 bytes` | `search` longer than `max_api_search_bytes` (400) |
 | `server is busy, try again shortly` | Too many concurrent API requests (`max_api_concurrent` reached) (503) |
 | `not found` | The path does not exist, or the Host header does not match `api_host` (404) |
 
