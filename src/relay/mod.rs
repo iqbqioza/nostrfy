@@ -127,11 +127,15 @@ impl StampClock {
     }
 
     /// Returns a timestamp strictly greater than every previously issued
-    /// stamp and at least `floor`.
+    /// stamp and at least `floor`. Stamps saturate at `u64::MAX - 1` so
+    /// the issued value can never collide with a previous one.
     pub(crate) fn stamp(&self, floor: u64) -> u64 {
         let mut cur = self.last.load(Ordering::Relaxed);
         loop {
-            let next = cur.max(floor.saturating_sub(1)).saturating_add(1);
+            let next = cur
+                .max(floor.saturating_sub(1))
+                .min(u64::MAX - 1)
+                .saturating_add(1);
             match self
                 .last
                 .compare_exchange_weak(cur, next, Ordering::Relaxed, Ordering::Relaxed)
@@ -255,12 +259,32 @@ impl Relay {
         // predates the flag) would otherwise silently override it with the
         // serde default `false`.
         access.restrict_relay = config.read().await.access.restrict_relay;
-        let (deny, allow) = db.load_relay_pubkeys().await;
+        // The pubkey lists and the Blossom allowlist are stored in the
+        // relay database and loaded into memory at startup (and refreshed
+        // on SIGHUP). A failed load must stop the relay instead of
+        // starting with empty (fail-open) security state: an empty deny
+        // list lifts every ban, and an empty allowlist opens an
+        // allowlist-only relay.
+        let (deny, allow) = match db.load_relay_pubkeys().await {
+            Some(lists) => lists,
+            None => {
+                log::error!(
+                    "cannot load the persisted relay pubkey access lists; refusing to start"
+                );
+                std::process::exit(1);
+            }
+        };
         access.blocked_pubkeys = deny;
         access.allowed_pubkeys = allow;
-        // The Blossom upload allowlist is stored in the relay database and
-        // loaded into memory at startup (and refreshed on SIGHUP).
-        let blossom_allow = db.load_blossom_allow().await;
+        let blossom_allow = match db.load_blossom_allow().await {
+            Some(list) => list,
+            None => {
+                log::error!(
+                    "cannot load the persisted Blossom upload allowlist; refusing to start"
+                );
+                std::process::exit(1);
+            }
+        };
         Relay {
             config: Arc::clone(&config),
             access: Arc::new(RwLock::new(access)),
@@ -387,8 +411,11 @@ impl Relay {
 
     /// Whether `pubkey` may publish another event under
     /// `relay.max_events_per_min_per_pubkey` (a sliding 60-second window;
-    /// 0 = unlimited). The window map is bounded at 10,000 pubkeys — when
-    /// the bound is reached the map is cleared, not grown.
+    /// 0 = unlimited). The window map is bounded at 10,000 pubkeys — the
+    /// cap never clears the whole map (a clear would reset every window
+    /// and permanently disable the limit): expired windows are evicted
+    /// first, and a still-full map skips tracking the new pubkey only
+    /// (fail-open for that key, limits preserved for everyone else).
     pub(crate) fn publish_rate_allowed(&self, cfg: &Config, pubkey: &str, now: u64) -> bool {
         const MAX_TRACKED_PUBKEYS: usize = 10_000;
         let max = cfg.relay.max_events_per_min_per_pubkey;
@@ -396,17 +423,31 @@ impl Relay {
             return true;
         }
         let mut rate = self.publish_rate.lock().unwrap_or_else(|p| p.into_inner());
+        // Already-tracked pubkeys are always enforced: the cap logic below
+        // only decides whether a *new* pubkey is tracked, so a full map
+        // can never disable the limit for tracked keys.
+        if let Some(window) = rate.get_mut(pubkey) {
+            while window.front().is_some_and(|t| now.saturating_sub(*t) >= 60) {
+                window.pop_front();
+            }
+            if window.len() >= max as usize {
+                return false;
+            }
+            window.push_back(now);
+            return true;
+        }
+        // New pubkey: never clear the whole map (a clear would reset every
+        // window and permanently disable the limit). Expired windows are
+        // evicted first; a still-full map skips tracking the new pubkey
+        // only (fail-open for that key, limits preserved for everyone
+        // else).
         if rate.len() >= MAX_TRACKED_PUBKEYS {
-            rate.clear();
+            rate.retain(|_, w| w.front().is_some_and(|t| now.saturating_sub(*t) < 60));
+            if rate.len() >= MAX_TRACKED_PUBKEYS {
+                return true;
+            }
         }
-        let window = rate.entry(pubkey.to_string()).or_default();
-        while window.front().is_some_and(|t| now.saturating_sub(*t) >= 60) {
-            window.pop_front();
-        }
-        if window.len() >= max as usize {
-            return false;
-        }
-        window.push_back(now);
+        rate.entry(pubkey.to_string()).or_default().push_back(now);
         true
     }
 

@@ -192,10 +192,10 @@ fn handle_read_msg(store: &Store, errors: &Arc<std::sync::atomic::AtomicU64>, ms
         }
         Msg::LoadBlossomAllow { reply } => {
             let list = match store.load_blossom_allow() {
-                Ok(list) => list,
+                Ok(list) => Some(list),
                 Err(e) => {
                     db_error(errors, &e);
-                    Vec::new()
+                    None
                 }
             };
             let _ = reply.send(list);
@@ -203,10 +203,10 @@ fn handle_read_msg(store: &Store, errors: &Arc<std::sync::atomic::AtomicU64>, ms
         }
         Msg::LoadRelayPubkeys { reply } => {
             let lists = match store.load_relay_pubkeys() {
-                Ok(lists) => lists,
+                Ok(lists) => Some(lists),
                 Err(e) => {
                     db_error(errors, &e);
-                    (Vec::new(), Vec::new())
+                    None
                 }
             };
             let _ = reply.send(lists);
@@ -511,20 +511,20 @@ pub(crate) fn spawn(
                                 }
                                 Msg::LoadBlossomAllow { reply } => {
                                     let list = match store.load_blossom_allow() {
-                                        Ok(list) => list,
+                                        Ok(list) => Some(list),
                                         Err(e) => {
                                             db_error(&thread_errors, &e);
-                                            Vec::new()
+                                            None
                                         }
                                     };
                                     let _ = reply.send(list);
                                 }
                                 Msg::LoadRelayPubkeys { reply } => {
                                     let lists = match store.load_relay_pubkeys() {
-                                        Ok(lists) => lists,
+                                        Ok(lists) => Some(lists),
                                         Err(e) => {
                                             db_error(&thread_errors, &e);
-                                            (Vec::new(), Vec::new())
+                                            None
                                         }
                                     };
                                     let _ = reply.send(lists);

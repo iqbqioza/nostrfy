@@ -1024,7 +1024,7 @@ fn access_control_persists_across_reopen() {
             vec![(String::from("203.0.113.9"), String::new())]
         );
         // The dedicated pubkey key survives the reopen.
-        let (deny, allow) = db.load_relay_pubkeys().await;
+        let (deny, allow) = db.load_relay_pubkeys().await.unwrap_or_default();
         assert_eq!(deny, vec![("aa".repeat(32), String::new())]);
         assert!(allow.is_empty());
     });
@@ -1081,7 +1081,7 @@ fn schema_upgrade_creates_missing_tables_instantly() {
             .await;
         let loaded = db.load_access().await.unwrap();
         assert_eq!(loaded.blocked_ips[0].0, "203.0.113.9");
-        let (deny, _) = db.load_relay_pubkeys().await;
+        let (deny, _) = db.load_relay_pubkeys().await.unwrap_or_default();
         assert_eq!(deny[0].0, "aa".repeat(32));
         // The Blossom mapping works (blossom table + migration marker).
         db.blossom_add_owner(
@@ -1153,7 +1153,7 @@ fn legacy_access_blob_pubkeys_migrate_to_dedicated_key() {
             262144,
         )
         .unwrap();
-        let (deny, allow) = db.load_relay_pubkeys().await;
+        let (deny, allow) = db.load_relay_pubkeys().await.unwrap_or_default();
         assert_eq!(deny, vec![("bb".repeat(32), "spam".to_string())]);
         assert_eq!(allow, vec![("aa".repeat(32), String::new())]);
         // The migration is idempotent: reopening does not double entries.
@@ -1168,7 +1168,7 @@ fn legacy_access_blob_pubkeys_migrate_to_dedicated_key() {
             262144,
         )
         .unwrap();
-        let (deny, allow) = db.load_relay_pubkeys().await;
+        let (deny, allow) = db.load_relay_pubkeys().await.unwrap_or_default();
         assert_eq!(deny.len(), 1);
         assert_eq!(allow.len(), 1);
     });
@@ -2373,14 +2373,17 @@ fn startup_loads_bypass_fail_fast_and_timeout() {
     rt.block_on(async {
         db.save_relay_pubkeys(&[("aa".repeat(32), "test".into())], &[])
             .await;
-        let (deny, _) = db.load_relay_pubkeys().await;
+        let (deny, _) = db.load_relay_pubkeys().await.unwrap_or_default();
         assert_eq!(
             deny.len(),
             1,
             "the blocking startup load must not fail fast"
         );
         let allow = db.load_blossom_allow().await;
-        assert!(allow.is_empty(), "no blossom allowlist persisted");
+        assert!(
+            allow.unwrap_or_default().is_empty(),
+            "no blossom allowlist persisted"
+        );
         db.shutdown();
     });
 }

@@ -810,17 +810,29 @@ impl IpConnLimiter {
     fn allow(&self, ip: std::net::IpAddr, now: u64) -> bool {
         const MAX_TRACKED_IPS: usize = 10_000;
         let mut seen = self.seen.lock().unwrap_or_else(|p| p.into_inner());
+        // Already-tracked ips are always enforced: a full map can never
+        // disable the limit for tracked ips.
+        if let Some(window) = seen.get_mut(&ip) {
+            while window.front().is_some_and(|t| now.saturating_sub(*t) >= 1) {
+                window.pop_front();
+            }
+            if window.len() >= self.max_per_sec as usize {
+                return false;
+            }
+            window.push_back(now);
+            return true;
+        }
+        // New ip: never clear the whole map (a clear would reset every
+        // window and permanently disable the per-IP limit): expired
+        // windows are evicted first, a still-full map skips tracking the
+        // new ip only.
         if seen.len() >= MAX_TRACKED_IPS {
-            seen.clear();
+            seen.retain(|_, w| w.front().is_some_and(|t| now.saturating_sub(*t) < 1));
+            if seen.len() >= MAX_TRACKED_IPS {
+                return true;
+            }
         }
-        let window = seen.entry(ip).or_default();
-        while window.front().is_some_and(|t| now.saturating_sub(*t) >= 1) {
-            window.pop_front();
-        }
-        if window.len() >= self.max_per_sec as usize {
-            return false;
-        }
-        window.push_back(now);
+        seen.entry(ip).or_default().push_back(now);
         true
     }
 }

@@ -354,7 +354,10 @@ impl super::Conn {
             self.send_closed(sub_id, "restricted: you are not allowed to subscribe");
             return;
         }
-        if self.subs.len() >= max_subscriptions {
+        // NIP-01: re-REQ with an existing id replaces the subscription, so it
+        // must not count against the cap — only genuinely new subscriptions
+        // are limited.
+        if !self.subs.contains_key(sub_id) && self.subs.len() >= max_subscriptions {
             self.send_closed(sub_id, "error: too many subscriptions");
             return;
         }
@@ -550,10 +553,13 @@ impl super::Conn {
             // Bound the list: repeated AUTHs with the same key are
             // deduplicated and the number of distinct keys is capped so a
             // connection cannot grow this vector (or the per-event
-            // visibility scan over it) without limit.
-            if !self.authed_pubkeys.iter().any(|pk| pk == &event.pubkey)
-                && self.authed_pubkeys.len() < 64
-            {
+            // visibility scan over it) without limit. At the cap the
+            // oldest key is evicted (FIFO) so every accepted AUTH stays
+            // recorded and the OK reply stays truthful.
+            if !self.authed_pubkeys.iter().any(|pk| pk == &event.pubkey) {
+                if self.authed_pubkeys.len() >= 64 {
+                    self.authed_pubkeys.remove(0);
+                }
                 self.authed_pubkeys.push(event.pubkey.clone());
             }
         }
@@ -687,36 +693,43 @@ impl super::Conn {
     /// made by command events or NIP-86 apply to live connections without
     /// a reconnect.
     pub(crate) async fn access_allows_read(&self) -> bool {
-        let access = self.relay.access.read().await;
-        // The relay's own pubkey and the admin pubkey (`relay.pubkey`)
-        // are always admitted: the operator must be able to read
-        // command-event replies on restricted relays.
+        // Lock order: config before access — the same order as the accept
+        // path (`config.read` held across `access.read`). Acquiring access
+        // first and then awaiting config would set up a lock cycle with an
+        // access writer and a config writer (tokio RwLocks are fair).
         let admin = self.relay.config.read().await.relay.pubkey.clone();
-        if self.is_operator_pubkey(&admin) {
-            return true;
-        }
-        if self.authed_pubkeys.is_empty() {
-            !access.restrict_relay
-        } else {
-            self.authed_pubkeys
-                .iter()
-                .any(|pk| access.allows_pubkey(pk))
-        }
+        let access = self.relay.access.read().await;
+        self.read_verdict(&access, &admin)
     }
 
-    /// Non-blocking variant for the hot live-delivery path: skips the
-    /// check (fail-open, re-checked on the next event) only when a list
-    /// is momentarily contended.
-    pub(crate) fn access_allows_read_sync(&self) -> bool {
+    /// Non-blocking variant for the hot live-delivery path: recomputes the
+    /// verdict from a non-blocking lock read (the steady state), and when
+    /// the lists are momentarily contended falls back to the verdict of
+    /// the last successful check (stale by at most one write hold). It
+    /// never fails open to "allowed".
+    pub(crate) fn access_allows_read_sync(&mut self) -> bool {
         let Ok(access) = self.relay.access.try_read() else {
-            return true;
+            return self.access_allowed_cache;
         };
-        // `relay.pubkey` is SIGHUP-reloadable, so it is read without
-        // blocking the hot path (fail-open, re-checked per event).
-        let Ok(cfg) = self.relay.config.try_read() else {
-            return true;
-        };
-        if self.is_operator_pubkey(&cfg.relay.pubkey) {
+        let admin = self
+            .relay
+            .config
+            .try_read()
+            .map(|cfg| cfg.relay.pubkey.clone())
+            .unwrap_or_default();
+        let verdict = self.read_verdict(&access, &admin);
+        self.access_allowed_cache = verdict;
+        verdict
+    }
+
+    /// The access-list verdict for this connection: the relay's own pubkey
+    /// and the admin pubkey (`relay.pubkey`) are always admitted — the
+    /// operator must be able to read command-event replies on restricted
+    /// relays — then the deny list gates authenticated pubkeys, and
+    /// `restrict_relay` narrows reading to the allow list (anonymous
+    /// connections are then refused too).
+    fn read_verdict(&self, access: &crate::config::AccessControl, admin: &str) -> bool {
+        if self.is_operator_pubkey(admin) {
             return true;
         }
         if self.authed_pubkeys.is_empty() {

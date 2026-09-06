@@ -1431,10 +1431,15 @@ pub(crate) fn set_relay_field_in_text(text: &str, field: &str, value: &str) -> S
     let section = &text[header_end..section_end];
 
     // Case 1: a matching line already exists in the section — replace it.
-    if let Some(offset) = section
-        .lines()
-        .position(|l| l.trim_start().starts_with(field))
-    {
+    // The line must be the field itself (followed by `=`, whitespace or
+    // end-of-line), not an unrelated key that merely starts with the
+    // field name (unknown keys are warned about but never rejected, so
+    // e.g. `private_key_note = "x"` must not be clobbered by genkey).
+    if let Some(offset) = section.lines().position(|l| {
+        l.trim_start().strip_prefix(field).is_some_and(|rest| {
+            rest.is_empty() || rest.starts_with('=') || rest.starts_with([' ', '\t'])
+        })
+    }) {
         let mut new_section = String::new();
         for (i, l) in section.lines().enumerate() {
             if i == offset {
@@ -1765,6 +1770,24 @@ mod tests {
                 "config section [{section}] is missing from the known-keys list"
             );
         }
+    }
+
+    #[test]
+    fn set_relay_field_does_not_clobber_prefix_matches() {
+        // Unknown keys are warned about but never rejected, so a line that
+        // merely starts with the field name (e.g. `name_note`) must not be
+        // replaced — only the exact `field = ...` line is.
+        let text = "[relay]\nname = \"relay\"\nname_note = \"keep\"\nother = 1\n";
+        let out = set_relay_field_in_text(text, "name", "renamed");
+        assert!(out.contains("name = \"renamed\""), "{out}");
+        assert!(out.contains("name_note = \"keep\""), "{out}");
+        assert!(out.contains("other = 1"), "{out}");
+        // The same boundary protects the private key: `private_key_note`
+        // is not the `private_key` line.
+        let text = "[relay]\nprivate_key_note = \"x\"\n";
+        let out = set_relay_field_in_text(text, "private_key", "ab");
+        assert!(out.contains("private_key = \"ab\""), "{out}");
+        assert!(out.contains("private_key_note = \"x\""), "{out}");
     }
 
     #[test]

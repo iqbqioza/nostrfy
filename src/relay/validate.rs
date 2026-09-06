@@ -643,8 +643,10 @@ mod tests {
                 0,
                 "no window is recorded when the limit is disabled"
             );
-            // The map is bounded: with the limit on, many pubkeys evict the
-            // map instead of growing it.
+            // The map is bounded: with the limit on, many pubkeys are skipped
+            // (never tracked) instead of growing the map, and a full map
+            // must not clear everyone's windows — the first 10k pubkeys
+            // are still rate-limited.
             let mut cfg = Config::default();
             cfg.relay.max_events_per_min_per_pubkey = 1;
             for i in 0..20_000u64 {
@@ -654,6 +656,22 @@ mod tests {
             assert!(
                 relay.publish_rate.lock().unwrap().len() <= 10_000,
                 "the tracked-pubkey map must not exceed its bound"
+            );
+            // A tracked pubkey stays limited while the map is full: its
+            // second event within the 60-second window is rejected.
+            let tracked = format!("{:064x}", 0u64);
+            assert!(
+                !relay.publish_rate_allowed(&cfg, &tracked, unix_now()),
+                "a full map must not reset a tracked pubkey's window"
+            );
+            // A fresh pubkey is skipped (fail-open for it alone) and the
+            // map is never cleared.
+            let fresh = "f".repeat(64);
+            assert!(relay.publish_rate_allowed(&cfg, &fresh, unix_now()));
+            assert_eq!(
+                relay.publish_rate.lock().unwrap().len(),
+                10_000,
+                "the map is never cleared"
             );
             relay.db.shutdown();
         });

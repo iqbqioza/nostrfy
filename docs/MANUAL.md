@@ -217,7 +217,7 @@ To generate a secret key, use the `nostrd genkey` command (see [5. Command Refer
 | `max_tag_value_bytes` | Max bytes per tag value | `1024` |
 | `max_created_at_future_secs` | How many seconds of future timestamps are tolerated | `3600` |
 | `max_neg_items` | Max records per NIP-77 negentropy sync | `100000` |
-| `max_out_queue_bytes` | Per-connection outgoing queue cap (bytes) | `262144` |
+| `max_out_queue_bytes` | Per-connection outgoing queue cap (bytes; `0` = unlimited) | `262144` |
 | `ws_idle_timeout_secs` | Close idle connections after this many seconds (0 = off) | `300` |
 | `http_read_timeout_secs` | Seconds to complete an HTTP request head (0 = disabled; slow-loris defense, applies to WS upgrades too) | `30` |
 | `max_connections_per_sec_per_ip` | Max new connections per second per source IP (0 = unlimited) | `0` |

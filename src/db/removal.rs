@@ -9,6 +9,13 @@ use crate::error::Result;
 use crate::event::Event;
 use crate::nips::nip09;
 
+/// Bounds how many index entries a removal pass materializes at once: a
+/// vanished pubkey's full history, every expired id or every version of
+/// a deleted addressable event must never pin the writer thread's memory
+/// in one `Vec`. The walks below resume just past the last collected key,
+/// so entries the caller leaves in place cannot loop forever.
+const REMOVAL_CHUNK: usize = 4096;
+
 impl Store {
     /// Applies a deletion request.
     ///
@@ -92,48 +99,56 @@ impl Store {
             }
             let start = replaceable_key(address.kind, &pubkey, "");
             let end = replaceable_key(address.kind.saturating_add(1), &pubkey, "");
-            let range = (
-                std::ops::Bound::Included(start.as_slice()),
-                std::ops::Bound::Excluded(end.as_slice()),
-            );
-            let entries: Vec<(Vec<u8>, Vec<u8>)> = self
-                .replaceable
-                .range(&wtxn, &range)?
-                .filter_map(|item| item.ok().map(|(k, v)| (k.to_vec(), v.to_vec())))
-                .collect();
-            for (key, value) in entries {
-                // key = kind(8) + pubkey(32) + dlen(4) + d
-                if key.len() < CREATED_LEN + ID_LEN + 4 {
-                    continue;
+            let mut last_key: Option<Vec<u8>> = None;
+            loop {
+                let lower = match &last_key {
+                    Some(k) => std::ops::Bound::Excluded(k.as_slice()),
+                    None => std::ops::Bound::Included(start.as_slice()),
+                };
+                let entries: Vec<(Vec<u8>, Vec<u8>)> = self
+                    .replaceable
+                    .range(&wtxn, &(lower, std::ops::Bound::Excluded(end.as_slice())))?
+                    .filter_map(|item| item.ok().map(|(k, v)| (k.to_vec(), v.to_vec())))
+                    .take(REMOVAL_CHUNK)
+                    .collect();
+                if entries.is_empty() {
+                    break;
                 }
-                if key[CREATED_LEN..CREATED_LEN + ID_LEN] != pubkey {
-                    continue;
+                last_key = Some(entries.last().unwrap().0.clone());
+                for (key, value) in entries {
+                    // key = kind(8) + pubkey(32) + dlen(4) + d
+                    if key.len() < CREATED_LEN + ID_LEN + 4 {
+                        continue;
+                    }
+                    if key[CREATED_LEN..CREATED_LEN + ID_LEN] != pubkey {
+                        continue;
+                    }
+                    let dlen = u32::from_be_bytes(
+                        key[CREATED_LEN + ID_LEN..CREATED_LEN + ID_LEN + 4]
+                            .try_into()
+                            .unwrap(),
+                    ) as usize;
+                    if key.len() != CREATED_LEN + ID_LEN + 4 + dlen {
+                        continue;
+                    }
+                    let d = &key[CREATED_LEN + ID_LEN + 4..];
+                    // The stored slot key truncates over-long `d` tags (see
+                    // `dtag_key_safe`), so compare against the truncated form.
+                    if d != dtag_key_safe(&address.d).as_bytes() {
+                        continue;
+                    }
+                    if value.len() < CREATED_LEN + ID_LEN {
+                        continue;
+                    }
+                    let created = u64::from_be_bytes(value[..CREATED_LEN].try_into().unwrap());
+                    if created > request_created {
+                        continue;
+                    }
+                    let id = &value[CREATED_LEN..CREATED_LEN + ID_LEN];
+                    self.deleted.put(&mut wtxn, id, b"")?;
+                    self.remove_event(&mut wtxn, id)?;
+                    removed += 1;
                 }
-                let dlen = u32::from_be_bytes(
-                    key[CREATED_LEN + ID_LEN..CREATED_LEN + ID_LEN + 4]
-                        .try_into()
-                        .unwrap(),
-                ) as usize;
-                if key.len() != CREATED_LEN + ID_LEN + 4 + dlen {
-                    continue;
-                }
-                let d = &key[CREATED_LEN + ID_LEN + 4..];
-                // The stored slot key truncates over-long `d` tags (see
-                // `dtag_key_safe`), so compare against the truncated form.
-                if d != dtag_key_safe(&address.d).as_bytes() {
-                    continue;
-                }
-                if value.len() < CREATED_LEN + ID_LEN {
-                    continue;
-                }
-                let created = u64::from_be_bytes(value[..CREATED_LEN].try_into().unwrap());
-                if created > request_created {
-                    continue;
-                }
-                let id = &value[CREATED_LEN..CREATED_LEN + ID_LEN];
-                self.deleted.put(&mut wtxn, id, b"")?;
-                self.remove_event(&mut wtxn, id)?;
-                removed += 1;
             }
         }
 
@@ -242,40 +257,48 @@ impl Store {
         let mut removed = 0usize;
         let start = pubkey_key(pubkey, 0, &[0u8; ID_LEN]);
         let end = pubkey_key(pubkey, u64::MAX, &[0xffu8; ID_LEN]);
-        let range = (
-            std::ops::Bound::Included(start.as_slice()),
-            std::ops::Bound::Excluded(end.as_slice()),
-        );
-        let entries: Vec<(Vec<u8>, Vec<u8>)> = self
-            .by_pubkey
-            .range(&wtxn, &range)?
-            .filter_map(|item| {
-                item.ok()
-                    .map(|(k, _)| (k.to_vec(), k[k.len() - ID_LEN..].to_vec()))
-            })
-            .collect();
-        let pubkey_hex = hex::encode(pubkey);
-        for (key, id) in entries {
-            let Some(raw) = self.events.get(&wtxn, &id)? else {
-                continue;
+        let mut last_key: Option<Vec<u8>> = None;
+        loop {
+            let lower = match &last_key {
+                Some(k) => std::ops::Bound::Excluded(k.as_slice()),
+                None => std::ops::Bound::Included(start.as_slice()),
             };
-            let Ok(event) = serde_json::from_slice::<Event>(raw) else {
-                continue;
-            };
-            // NIP-62: only events *authored* by the vanished pubkey are
-            // removed. NIP-26 delegatee events are indexed under the
-            // delegator's pubkey too, but they belong to the delegatee and
-            // must survive a delegator's request to vanish. Their
-            // delegator-side index entry is dropped nevertheless, so the
-            // vanished identity's feed is not revived by the delegation.
-            if event.pubkey != pubkey_hex {
-                if crate::nips::nip26::delegation(&event).is_some() {
-                    self.by_pubkey.delete(&mut wtxn, &key)?;
-                }
-                continue;
+            let entries: Vec<(Vec<u8>, Vec<u8>)> = self
+                .by_pubkey
+                .range(&wtxn, &(lower, std::ops::Bound::Excluded(end.as_slice())))?
+                .filter_map(|item| {
+                    item.ok()
+                        .map(|(k, _)| (k.to_vec(), k[k.len() - ID_LEN..].to_vec()))
+                })
+                .take(REMOVAL_CHUNK)
+                .collect();
+            if entries.is_empty() {
+                break;
             }
-            self.remove_event(&mut wtxn, &id)?;
-            removed += 1;
+            last_key = Some(entries.last().unwrap().0.clone());
+            let pubkey_hex = hex::encode(pubkey);
+            for (key, id) in entries {
+                let Some(raw) = self.events.get(&wtxn, &id)? else {
+                    continue;
+                };
+                let Ok(event) = serde_json::from_slice::<Event>(raw) else {
+                    continue;
+                };
+                // NIP-62: only events *authored* by the vanished pubkey are
+                // removed. NIP-26 delegatee events are indexed under the
+                // delegator's pubkey too, but they belong to the delegatee and
+                // must survive a delegator's request to vanish. Their
+                // delegator-side index entry is dropped nevertheless, so the
+                // vanished identity's feed is not revived by the delegation.
+                if event.pubkey != pubkey_hex {
+                    if crate::nips::nip26::delegation(&event).is_some() {
+                        self.by_pubkey.delete(&mut wtxn, &key)?;
+                    }
+                    continue;
+                }
+                self.remove_event(&mut wtxn, &id)?;
+                removed += 1;
+            }
         }
 
         // NIP-59 gift wraps addressed to the vanished pubkey. The by_tag
@@ -284,25 +307,36 @@ impl Store {
         let pubkey_hex = hex::encode(pubkey).into_bytes();
         let start = tag_key(b'p', &pubkey_hex, 0, &[0u8; ID_LEN]);
         let end = tag_key(b'p', &pubkey_hex, u64::MAX, &[0xffu8; ID_LEN]);
-        let range = (
-            std::ops::Bound::Included(start.as_slice()),
-            std::ops::Bound::Excluded(end.as_slice()),
-        );
-        let ids: Vec<Vec<u8>> = self
-            .by_tag
-            .range(&wtxn, &range)?
-            .filter_map(|item| item.ok().map(|(k, _)| k[k.len() - ID_LEN..].to_vec()))
-            .collect();
-        for id in ids {
-            let Some(raw) = self.events.get(&wtxn, &id)? else {
-                continue;
+        let mut last_key: Option<Vec<u8>> = None;
+        loop {
+            let lower = match &last_key {
+                Some(k) => std::ops::Bound::Excluded(k.as_slice()),
+                None => std::ops::Bound::Included(start.as_slice()),
             };
-            let Ok(event) = serde_json::from_slice::<Event>(raw) else {
-                continue;
-            };
-            if event.kind == crate::nips::nip62::GIFT_WRAP_KIND {
-                self.remove_event(&mut wtxn, &id)?;
-                removed += 1;
+            let entries: Vec<(Vec<u8>, Vec<u8>)> = self
+                .by_tag
+                .range(&wtxn, &(lower, std::ops::Bound::Excluded(end.as_slice())))?
+                .filter_map(|item| {
+                    item.ok()
+                        .map(|(k, _)| (k.to_vec(), k[k.len() - ID_LEN..].to_vec()))
+                })
+                .take(REMOVAL_CHUNK)
+                .collect();
+            if entries.is_empty() {
+                break;
+            }
+            last_key = Some(entries.last().unwrap().0.clone());
+            for (_, id) in entries {
+                let Some(raw) = self.events.get(&wtxn, &id)? else {
+                    continue;
+                };
+                let Ok(event) = serde_json::from_slice::<Event>(raw) else {
+                    continue;
+                };
+                if event.kind == crate::nips::nip62::GIFT_WRAP_KIND {
+                    self.remove_event(&mut wtxn, &id)?;
+                    removed += 1;
+                }
             }
         }
 
@@ -321,26 +355,37 @@ impl Store {
         let pubkey_hex = hex::encode(pubkey).into_bytes();
         let start = tag_key(b'p', &pubkey_hex, 0, &[0u8; ID_LEN]);
         let end = tag_key(b'p', &pubkey_hex, u64::MAX, &[0xffu8; ID_LEN]);
-        let range = (
-            std::ops::Bound::Included(start.as_slice()),
-            std::ops::Bound::Excluded(end.as_slice()),
-        );
-        let ids: Vec<Vec<u8>> = self
-            .by_tag
-            .range(&wtxn, &range)?
-            .filter_map(|item| item.ok().map(|(k, _)| k[k.len() - ID_LEN..].to_vec()))
-            .collect();
+        let mut last_key: Option<Vec<u8>> = None;
         let mut removed = 0usize;
-        for id in ids {
-            let Some(raw) = self.events.get(&wtxn, &id)? else {
-                continue;
+        loop {
+            let lower = match &last_key {
+                Some(k) => std::ops::Bound::Excluded(k.as_slice()),
+                None => std::ops::Bound::Included(start.as_slice()),
             };
-            let Ok(event) = serde_json::from_slice::<Event>(raw) else {
-                continue;
-            };
-            if event.kind == crate::nips::nip62::GIFT_WRAP_KIND {
-                self.remove_event(&mut wtxn, &id)?;
-                removed += 1;
+            let entries: Vec<(Vec<u8>, Vec<u8>)> = self
+                .by_tag
+                .range(&wtxn, &(lower, std::ops::Bound::Excluded(end.as_slice())))?
+                .filter_map(|item| {
+                    item.ok()
+                        .map(|(k, _)| (k.to_vec(), k[k.len() - ID_LEN..].to_vec()))
+                })
+                .take(REMOVAL_CHUNK)
+                .collect();
+            if entries.is_empty() {
+                break;
+            }
+            last_key = Some(entries.last().unwrap().0.clone());
+            for (_, id) in entries {
+                let Some(raw) = self.events.get(&wtxn, &id)? else {
+                    continue;
+                };
+                let Ok(event) = serde_json::from_slice::<Event>(raw) else {
+                    continue;
+                };
+                if event.kind == crate::nips::nip62::GIFT_WRAP_KIND {
+                    self.remove_event(&mut wtxn, &id)?;
+                    removed += 1;
+                }
             }
         }
         wtxn.commit()?;
@@ -361,20 +406,34 @@ impl Store {
         let mut wtxn = self.env.write_txn()?;
         let since_key = created_key(0, &[0u8; ID_LEN]);
         let until_key = created_key(now, &[0xffu8; ID_LEN]);
-        let range = (
-            std::ops::Bound::Included(since_key.as_slice()),
-            std::ops::Bound::Excluded(until_key.as_slice()),
-        );
-        let to_delete: Vec<Vec<u8>> = self
-            .expiry
-            .range(&wtxn, &range)?
-            .filter_map(|item| item.ok().map(|(k, _)| k[k.len() - ID_LEN..].to_vec()))
-            .collect();
+        let mut last_key: Option<Vec<u8>> = None;
         let mut removed = 0usize;
-        for id in to_delete {
-            if self.events.get(&wtxn, &id)?.is_some() {
-                self.remove_event(&mut wtxn, &id)?;
-                removed += 1;
+        loop {
+            let lower = match &last_key {
+                Some(k) => std::ops::Bound::Excluded(k.as_slice()),
+                None => std::ops::Bound::Included(since_key.as_slice()),
+            };
+            let entries: Vec<(Vec<u8>, Vec<u8>)> = self
+                .expiry
+                .range(
+                    &wtxn,
+                    &(lower, std::ops::Bound::Excluded(until_key.as_slice())),
+                )?
+                .filter_map(|item| {
+                    item.ok()
+                        .map(|(k, _)| (k.to_vec(), k[k.len() - ID_LEN..].to_vec()))
+                })
+                .take(REMOVAL_CHUNK)
+                .collect();
+            if entries.is_empty() {
+                break;
+            }
+            last_key = Some(entries.last().unwrap().0.clone());
+            for (_, id) in entries {
+                if self.events.get(&wtxn, &id)?.is_some() {
+                    self.remove_event(&mut wtxn, &id)?;
+                    removed += 1;
+                }
             }
         }
         wtxn.commit()?;

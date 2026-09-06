@@ -378,9 +378,14 @@ pub async fn rpc_handler(
             if !is_pubkey(pubkey) {
                 return rpc_err("invalid pubkey");
             }
-            relay.unassign_role(pubkey, role).await;
-            audit!(&relay, &identity, "unassignrole", params);
-            rpc_ok(json!(true))
+            if relay.unassign_role(pubkey, role).await {
+                audit!(&relay, &identity, "unassignrole", params);
+                rpc_ok(json!(true))
+            } else {
+                rpc_err(
+                    "restricted: NIP-43 is disabled, the relay key is missing or the assignment does not exist",
+                )
+            }
         }
         "blockip" => {
             let (Some(ip), reason) = (

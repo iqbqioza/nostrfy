@@ -826,6 +826,21 @@ impl GroupStore {
                 seen_gids.insert(gid.to_string());
             }
         }
+        // The relay-signed metadata (39000-39005: name/picture, the admins
+        // and members lists, pins) survives a vanished creator — and is
+        // not part of the moderation walk above. Include its group ids in
+        // the ghost detection, so a private group whose only surviving
+        // events are its metadata cannot become world-readable after a
+        // restart.
+        let meta_kinds: Vec<u64> = (GROUP_META..=GROUP_PINS).collect();
+        let meta_filter: Filter =
+            serde_json::from_value(json!({ "kinds": meta_kinds })).expect("static filter");
+        let (meta_events, _) = db.query_full(vec![meta_filter], PAGE, unix_now()).await;
+        for event in &meta_events {
+            if let Some(gid) = crate::nips::nip29::group_id_d(event) {
+                seen_gids.insert(gid.to_string());
+            }
+        }
         for mut event in events {
             // A vanished author must not be resurrected as a member by
             // replaying pre-vanish events signed by others (the vanish

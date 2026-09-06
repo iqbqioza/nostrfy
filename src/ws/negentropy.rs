@@ -118,7 +118,10 @@ impl super::Conn {
 
         let max_items = self.relay.config.read().await.limits.max_neg_items;
         let max_subs = self.relay.config.read().await.limits.max_subscriptions;
-        if self.neg.len() >= max_subs {
+        // NIP-77: a NEG-OPEN for an already open id replaces it, so it
+        // must not count against the cap — only new subscriptions are
+        // limited.
+        if !self.neg.contains_key(&sub_id) && self.neg.len() >= max_subs {
             self.send_neg_err(&sub_id, "error: too many subscriptions");
             return;
         }

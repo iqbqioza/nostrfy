@@ -224,7 +224,7 @@ The changes take effect immediately and are persisted (same lists as `nostrd rel
 | `max_ws_message_bytes` | integer | `1048576` | Max bytes per WebSocket message/frame |
 | `db_buffer_size` | integer | `2048` | Initial per-connection buffer size (bytes) |
 | `socket_recv_buffer_kb` | integer | `64` | Per-connection kernel receive buffer (KiB, `0` = kernel default; the kernel may double it). Larger values let a fast publisher's burst absorb into one batch while the relay commits; the buffer uses real memory only while data is queued |
-| `max_out_queue_bytes` | integer | `262144` | Per-connection outgoing queue cap (bytes) |
+| `max_out_queue_bytes` | integer | `262144` | Per-connection outgoing queue cap (bytes; `0` = unlimited) |
 | `ws_idle_timeout_secs` | integer | `300` | Close idle connections after this long (`0` = never) |
 | `http_read_timeout_secs` | integer | `30` | Seconds to deliver a complete HTTP request head before the connection is closed (`0` = disabled; slow-loris defense — applies to WebSocket upgrades too) |
 | `max_connections_per_sec_per_ip` | integer | `0` | Max new connections per second per source IP (`0` = unlimited) |
@@ -294,7 +294,7 @@ The changes take effect immediately and are persisted (same lists as `nostrd rel
 
 **`max_ws_message_bytes`** — The maximum size of a single WebSocket message/frame in bytes. Oversized frames are rejected at the protocol layer and the connection is closed with a `message too large` notice. Also the effective ceiling for any single event.
 
-**`max_out_queue_bytes`** — The per-connection cap on queued outgoing bytes, protecting memory against slow readers. REQ responses are pumped through the queue in bounded chunks (see `max_req_response_bytes`), so they cannot pin more than the cap either; EOSE and CLOSED messages are tiny and take the uncapped path. Live traffic is dropped when full (recoverable by re-subscribing).
+**`max_out_queue_bytes`** — The per-connection cap on queued outgoing bytes, protecting memory against slow readers (`0` = unlimited). REQ responses are pumped through the queue in bounded chunks (see `max_req_response_bytes`), so they cannot pin more than the cap either; EOSE and CLOSED messages are tiny and take the uncapped path. Live traffic is dropped when full (recoverable by re-subscribing).
 
 **`max_req_response_bytes`** — Byte budget for a single REQ response (the stored events delivered for one subscription). The response is pumped into the capped outgoing queue in chunks as the socket drains; when the budget is exceeded the subscription is closed with `CLOSED ... blocked: response too large; narrow the filter or paginate` and the client can re-request with a narrower filter. `0` disables the budget. A connection may queue at most four pending responses; older ones are cut off with their EOSE.
 

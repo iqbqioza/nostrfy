@@ -46,7 +46,6 @@ pub(crate) async fn livekit_token(
             Json(json!({ "error": "livekit not configured" })),
         );
     }
-    let expected_path = format!("/.well-known/nip29/livekit/{group}");
     let encoded = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -60,7 +59,10 @@ pub(crate) async fn livekit_token(
     };
     // NIP-29: the auth event's `u` tag must point at this group's livekit
     // token endpoint (exact path and query), and its `method` tag must
-    // match the GET request.
+    // match the GET request. The signed URL is the path as sent, so the
+    // raw (percent-encoded) request path is compared — decoding the
+    // `{group}` parameter would never match an id that needs encoding.
+    let expected_path = uri.path().to_string();
     let authed = crate::nips::nip98::verify(&encoded, None, relay.secp(), false, "GET", |url| {
         crate::nips::nip98::matches_request_url(
             url,
@@ -234,7 +236,9 @@ mod tests {
             axum::http::header::AUTHORIZATION,
             format!("Nostr {}", encode(auth)).parse().unwrap(),
         );
-        let uri = axum::http::Uri::from_static("/.well-known/nip29/livekit/x");
+        let uri: axum::http::Uri = format!("/.well-known/nip29/livekit/{group}")
+            .parse()
+            .unwrap();
         let resp = livekit_token(
             State(relay.clone()),
             headers,

@@ -121,6 +121,10 @@ pub struct Conn {
     /// served to the authenticated owner when the AUTH gate is on (cached
     /// from the config on connect and refreshed after a SIGHUP reload).
     pub(crate) nip78_restricted: bool,
+    /// Last verdict of the access-list read gate (see
+    /// [`Conn::access_allows_read_sync`]): the non-blocking hot path falls
+    /// back to this instead of failing open when the lists are contended.
+    pub(crate) access_allowed_cache: bool,
     pub(crate) dropped: u64,
     /// Per-connection message/byte counters, flushed into the shared stats
     /// once on disconnect so that a million connections do not hammer the
@@ -142,8 +146,10 @@ pub(crate) type LiveBatch = Arc<Vec<(crate::event::Event, Arc<String>)>>;
 impl Conn {
     pub(crate) fn send(&mut self, msg: Message) {
         let size = message_size(&msg);
-        let over_byte_cap =
-            !self.outgoing.is_empty() && self.out_bytes.saturating_add(size) > self.out_queue_bytes;
+        // 0 = unlimited (the REQ-response budget documents the same meaning).
+        let over_byte_cap = self.out_queue_bytes > 0
+            && !self.outgoing.is_empty()
+            && self.out_bytes.saturating_add(size) > self.out_queue_bytes;
         if self.outgoing.len() >= OUT_QUEUE_LIMIT || over_byte_cap {
             self.dropped += 1;
             self.relay.stats.bump(&self.relay.stats.buffers_dropped, 1);
@@ -302,7 +308,9 @@ impl Conn {
                 // would lose data permanently), so the first push may
                 // exceed the cap by one message; afterwards the queue
                 // cannot grow past the cap.
-                if self.out_bytes > 0 && self.out_bytes.saturating_add(size) > self.out_queue_bytes
+                if self.out_queue_bytes > 0
+                    && self.out_bytes > 0
+                    && self.out_bytes.saturating_add(size) > self.out_queue_bytes
                 {
                     break;
                 }
@@ -593,6 +601,7 @@ pub async fn handle_connection(
         expiry_enabled,
         giftwrap_restricted,
         nip78_restricted,
+        access_allowed_cache: false,
         config_version: 0,
         dropped: 0,
         in_msgs: 0,
@@ -1111,6 +1120,7 @@ mod tests {
             expiry_enabled,
             giftwrap_restricted,
             nip78_restricted,
+            access_allowed_cache: false,
             config_version: 0,
             dropped: 0,
             in_msgs: 0,
@@ -1610,7 +1620,7 @@ mod tests {
                     .any(|(p, _)| p == &target),
                 "relay allow must add the pubkey to the allow list"
             );
-            let (deny, allow) = relay.db.load_relay_pubkeys().await;
+            let (deny, allow) = relay.db.load_relay_pubkeys().await.unwrap_or_default();
             assert!(allow.iter().any(|(p, _)| p == &target));
             assert!(deny.is_empty());
 
@@ -1693,7 +1703,12 @@ mod tests {
                 "blossom allow must add the uploader"
             );
             assert!(
-                relay.db.load_blossom_allow().await.contains(&uploader),
+                relay
+                    .db
+                    .load_blossom_allow()
+                    .await
+                    .unwrap_or_default()
+                    .contains(&uploader),
                 "the blossom allowlist must be persisted"
             );
             let cmd = signed_command_event(
@@ -2332,6 +2347,45 @@ mod tests {
                 msgs.iter().any(|m| m[0] == "CLOSED"
                     && m[2].as_str().unwrap_or("").contains("too many filters")),
                 "too many filters must be refused with CLOSED"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn req_replacement_is_allowed_at_the_subscription_cap() {
+        // NIP-01: re-REQ with an existing id replaces the subscription, so
+        // it must work even when the connection already holds the maximum
+        // number of subscriptions.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let max = conn.relay.config.read().await.limits.max_subscriptions;
+            for i in 0..max {
+                conn.handle_req(&[json!(format!("s{i}")), json!({"kinds": [1]})])
+                    .await;
+            }
+            assert_eq!(conn.subs.len(), max, "the cap is reached");
+
+            // Replacing an existing subscription is accepted...
+            conn.handle_req(&[json!("s0"), json!({"kinds": [2]})]).await;
+            assert!(
+                !outgoing_json(&conn).iter().any(|m| m[0] == "CLOSED"),
+                "re-REQ of an existing id must replace, not be refused"
+            );
+            assert_eq!(conn.subs.len(), max, "a replacement adds no subscription");
+
+            // ...while a genuinely new id is refused at the cap.
+            conn.handle_req(&[json!("s-extra"), json!({"kinds": [1]})])
+                .await;
+            assert!(
+                outgoing_json(&conn).iter().any(|m| m[0] == "CLOSED"
+                    && m[1] == "s-extra"
+                    && m[2]
+                        .as_str()
+                        .unwrap_or("")
+                        .contains("too many subscriptions")),
+                "a new subscription is refused at the cap"
             );
             conn.relay.db.shutdown();
         });
