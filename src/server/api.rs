@@ -185,9 +185,9 @@ fn api_visible(
 }
 
 /// Whether the NIP-78 AUTH gate is active in the current config.
-async fn nip78_auth_active(relay: &Arc<Relay>) -> bool {
+async fn enabled_nip78_auth_active(relay: &Arc<Relay>) -> bool {
     let cfg = relay.config.read().await;
-    cfg.nip_enabled(78) && cfg.relay.nip78_auth
+    cfg.nip_enabled(78) && cfg.relay.enabled_nip78_auth
 }
 
 fn apply_params(mut filter: Filter, params: &ApiParams) -> Filter {
@@ -496,7 +496,7 @@ pub async fn api_monthly_handler(
     };
     let count_limit = relay.config.read().await.limits.max_count;
     let no_tags = excluded_tags(&params);
-    let nip78 = nip78_auth_active(&relay).await;
+    let nip78 = enabled_nip78_auth_active(&relay).await;
 
     let mut month_counts = Vec::with_capacity(months.len());
     let mut total = 0u64;
@@ -598,7 +598,7 @@ pub async fn api_count_handler(
     // The absence filters apply like the /query path (a `no_p` count must
     // agree with the visible rows of a `no_p` query).
     let no_tags = excluded_tags(&params);
-    let nip78 = nip78_auth_active(&relay).await;
+    let nip78 = enabled_nip78_auth_active(&relay).await;
     let (events, more) = relay.db.api_count(vec![filter], count_limit, now).await;
     let has_group_events = events.iter().any(nip29::is_group_event);
     let groups = if has_group_events {
@@ -649,7 +649,7 @@ pub async fn api_kinds_handler(
         None
     };
     let no_tags = excluded_tags(&params);
-    let nip78 = nip78_auth_active(&relay).await;
+    let nip78 = enabled_nip78_auth_active(&relay).await;
     let mut by_kind: std::collections::BTreeMap<u64, usize> = std::collections::BTreeMap::new();
     for e in events
         .iter()
@@ -721,7 +721,7 @@ pub async fn api_daily_handler(
     };
     let count_limit = relay.config.read().await.limits.max_count;
     let no_tags = excluded_tags(&params);
-    let nip78 = nip78_auth_active(&relay).await;
+    let nip78 = enabled_nip78_auth_active(&relay).await;
 
     let mut day_counts = Vec::with_capacity(days_in_month as usize);
     let mut total = 0u64;
@@ -824,7 +824,7 @@ pub async fn api_stats_handler(
     let now = unix_now();
     let filter: Filter = serde_json::from_value(json!({ "authors": [hex_pk] })).expect("static");
     let no_tags = excluded_tags(&params);
-    let nip78 = nip78_auth_active(&relay).await;
+    let nip78 = enabled_nip78_auth_active(&relay).await;
 
     let (events, more) = relay
         .db
@@ -948,7 +948,7 @@ pub async fn api_hourly_handler(
     };
     let count_limit = relay.config.read().await.limits.max_count;
     let no_tags = excluded_tags(&params);
-    let nip78 = nip78_auth_active(&relay).await;
+    let nip78 = enabled_nip78_auth_active(&relay).await;
 
     let mut hour_counts = Vec::with_capacity(24);
     let mut total = 0u64;
@@ -1309,7 +1309,7 @@ async fn query_and_respond(
             f.search = None;
         }
     }
-    let nip78 = nip78_auth_active(relay).await;
+    let nip78 = enabled_nip78_auth_active(relay).await;
     // Pagination: fetch `limit + offset + 1` so `more` can be decided from
     // the *visible* sequence (events hidden between pages — protected, gift
     // wraps, private groups — must not make a client skip a page or stop
@@ -2217,7 +2217,7 @@ mod tests {
     #[test]
     fn api_hides_nip78_events() {
         // The unauthenticated REST API must not leak kind 78/30078 events
-        // while relay.nip78_auth is on (the default).
+        // while relay.enabled_nip78_auth is on (the default).
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let relay = build_relay().await;

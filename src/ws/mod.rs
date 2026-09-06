@@ -511,7 +511,7 @@ pub async fn handle_connection(
             cfg.limits.max_req_response_bytes,
             cfg.nip_enabled(40),
             cfg.nip_enabled(42),
-            cfg.nip_enabled(78) && cfg.relay.nip78_auth,
+            cfg.nip_enabled(78) && cfg.relay.enabled_nip78_auth,
             cfg.limits.ws_idle_timeout_secs,
         )
     };
@@ -733,7 +733,7 @@ pub async fn handle_connection(
                             let cfg = conn.relay.config.read().await;
                             conn.expiry_enabled = cfg.nip_enabled(40);
                             conn.giftwrap_restricted = cfg.nip_enabled(42);
-                            conn.nip78_restricted = cfg.nip_enabled(78) && cfg.relay.nip78_auth;
+                            conn.nip78_restricted = cfg.nip_enabled(78) && cfg.relay.enabled_nip78_auth;
                         }
                     }
                 }
@@ -827,7 +827,7 @@ pub async fn handle_connection(
                             let cfg = conn.relay.config.read().await;
                             conn.expiry_enabled = cfg.nip_enabled(40);
                             conn.giftwrap_restricted = cfg.nip_enabled(42);
-                            conn.nip78_restricted = cfg.nip_enabled(78) && cfg.relay.nip78_auth;
+                            conn.nip78_restricted = cfg.nip_enabled(78) && cfg.relay.enabled_nip78_auth;
                         }
                         // The group store lock and its Arc clone are only
                         // taken when the batch actually contains group
@@ -1070,7 +1070,7 @@ mod tests {
                 cfg.limits.max_out_queue_bytes,
                 cfg.nip_enabled(40),
                 cfg.nip_enabled(42),
-                cfg.nip_enabled(78) && cfg.relay.nip78_auth,
+                cfg.nip_enabled(78) && cfg.relay.enabled_nip78_auth,
             )
         };
         let conn_id = relay

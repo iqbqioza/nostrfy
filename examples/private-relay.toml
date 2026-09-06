@@ -15,8 +15,10 @@ public_url = "wss://private.example.com"
 # Only authenticated clients (NIP-42 AUTH before EVENT) may publish.
 require_auth = true
 send_auth_challenge = true
+# NIP-78 app-specific events: AUTH to publish, owner-only to serve (default).
+enabled_nip78_auth = true
 # Keep it small: no search, no groups, no negentropy, no NIP-50.
-enabled_nips = [1, 9, 11, 40, 42, 45, 46, 59, 65, 70, 84]
+enabled_nips = [1, 9, 11, 40, 42, 45, 46, 59, 65, 70, 78, 84]
 disabled_nips = [29, 43, 50, 77, 86, 98]
 
 [access]

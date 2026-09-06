@@ -89,7 +89,7 @@ Every key is optional; a missing key uses the default shown below.
 | `max_events_per_min_per_pubkey` | integer | `0` | Publish rate limit per pubkey (events per minute; `0` = no limit) |
 | `require_auth` | boolean | `false` | Require NIP-42 authentication for all REQ/EVENT/COUNT/NEG |
 | `send_auth_challenge` | boolean | `true` | Send the AUTH challenge on connect |
-| `nip78_auth` | boolean | `true` | Require NIP-42 AUTH before accepting kind 78/30078 events and serve them only to the authenticated owner |
+| `enabled_nip78_auth` | boolean | `true` | Require NIP-42 AUTH before accepting kind 78/30078 events and serve them only to the authenticated owner |
 
 ### Key details
 
@@ -135,7 +135,7 @@ Every key is optional; a missing key uses the default shown below.
 
 **`send_auth_challenge`** — When `true`, every new connection receives a NIP-42 auth-request challenge. `require_auth = true` with `send_auth_challenge = false` locks everyone out — the relay warns about the combination at startup.
 
-**`nip78_auth`** — NIP-78 application-specific events (kinds `78` and `30078`) are a private data store: when `true`, the relay requires the NIP-42 AUTH flow before accepting them (`auth-required: application-specific events require authentication`), and serves them only to the authenticated owner (the event author's pubkey) — REQ results, live events, COUNT and NIP-77 syncs withhold them from everyone else, and the unauthenticated REST API hides them. Set to `false` to restore the legacy behavior (public app-specific events). Requires NIP-42 to be enabled (the relay refuses to start otherwise) and is inactive when NIP-78 is disabled. Takes effect immediately on `SIGHUP` reload and on the next REQ/publish. Default `true`.
+**`enabled_nip78_auth`** — NIP-78 application-specific events (kinds `78` and `30078`) are a private data store: when `true`, the relay requires the NIP-42 AUTH flow before accepting them (`auth-required: application-specific events require authentication`), and serves them only to the authenticated owner (the event author's pubkey) — REQ results, live events, COUNT and NIP-77 syncs withhold them from everyone else, and the unauthenticated REST API hides them. Set to `false` to restore the legacy behavior (public app-specific events). Requires NIP-42 to be enabled (the relay refuses to start otherwise) and is inactive when NIP-78 is disabled. Takes effect immediately on `SIGHUP` reload and on the next REQ/publish. Default `true`.
 
 ### Behavior notes
 
@@ -558,7 +558,7 @@ Editing the file and sending `kill -HUP $(cat nostrd.pid)` reloads it **without 
 
 | Applies on SIGHUP | Requires `nostrd restart` |
 | --- | --- |
-| `relay.name`, `description`, `pubkey`, `contact`, `icon`, `post_policy`, `public_url`, `relay.reject_ephemeral`, `relay.enabled_git`, `relay.nip78_auth` | `relay.private_key` |
+| `relay.name`, `description`, `pubkey`, `contact`, `icon`, `post_policy`, `public_url`, `relay.reject_ephemeral`, `relay.enabled_git`, `relay.enabled_nip78_auth` | `relay.private_key` |
 | most of `[limits]` (the restart-column entries below apply on restart only) | `relay.livekit_*`, `relay.enabled_nips` / `disabled_nips` |
 | NIP-40 on/off, API concurrency | `server.host`, `server.port`, `server.api_host`, `server.ws_paths`, `rpc.management_port`, `rpc.management_host`, `server.metrics_enabled` |
 | — | `database.path`, `database.purge_interval_secs`, `daemon.max_log_size_bytes`, `max_log_files`, `stats_interval_secs`, `database.db_request_timeout_secs`, `max_db_queue_msgs`, `max_db_queue_events`, `max_indexed_words`, `live_buffer`, `live_batch_size`, `live_batch_interval_ms`, `max_connections`, `http_read_timeout_secs`, `max_connections_per_sec_per_ip`, `rpc.max_admin_body_bytes`, `relay.max_groups`, `blossom.host`, `blossom.storage`, `blossom.local_path`, `blossom.max_upload_bytes`, `blossom.min_free_bytes`, `blossom.s3_*` |
@@ -599,7 +599,7 @@ management_token = ""
 admin_pubkey = ""
 require_auth = false
 send_auth_challenge = true
-nip78_auth = true
+enabled_nip78_auth = true
 metrics_enabled = true
 
 [limits]

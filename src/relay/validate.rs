@@ -360,7 +360,7 @@ impl super::Relay {
         // accepting kind 30078 events (and kind 78) — application-specific
         // data that is only served to the authenticated owner.
         if cfg.nip_enabled(78)
-            && cfg.relay.nip78_auth
+            && cfg.relay.enabled_nip78_auth
             && crate::nips::nip78::is_app_specific(event)
             && authed.is_empty()
         {
