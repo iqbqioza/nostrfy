@@ -12,7 +12,7 @@ pubkey = ""
 private_key = ""
 public_url = "wss://search.example.com"
 # The word index and the scan prefilter are what this relay is about.
-enabled_nips = [1, 9, 11, 40, 45, 46, 50, 57, 59, 65, 70, 77, 84, 94]
+enabled_nips = [1, 9, 11, 40, 42, 45, 46, 50, 57, 59, 65, 70, 77, 78, 84, 94]
 
 [database]
 path = "./data"

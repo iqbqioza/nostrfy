@@ -13,25 +13,21 @@
 #   nostrfy stats    show live statistics of the running daemon
 #   nostrfy check    validate this file and exit
 #   nostrfy init     write a default configuration and exit
-#   nostrfy genkey   generate a relay secret key (NIP-29) and write it into
-#                   relay.private_key of this file (confirms overwrite if set)
+#   nostrfy genkey   generate a relay secret key and write it into
+#                    relay.private_key (confirms overwrite if set)
 #
 # Sending SIGHUP to the daemon reloads this file at runtime: most limits,
-# server auth settings, the NIP toggles (including the NIP-40 toggle, applied
-# live) and the REST API concurrency ceiling apply immediately. A few settings
-# are captured at startup and require a full restart: live_buffer /
-# live_batch_size / live_batch_interval_ms, server.api_host,
-# rpc.management_port, server.metrics_enabled, relay.private_key (a reload
-# warns that it is ignored), relay.livekit_url, daemon.max_log_size_bytes /
-# max_log_files, the database request timeouts and queue caps,
-# purge_interval_secs, stats_interval_secs and database.max_indexed_words.
-# An invalid reloaded file is rejected (the old configuration stays in force).
+# the server auth settings, the NIP toggles and the REST API concurrency
+# ceiling apply immediately. A few settings are captured at startup and
+# require a restart (see docs/CONFIGURATION.md for the exact list). An
+# invalid reloaded file is rejected (the old configuration stays in force).
 # =============================================================================
 
 # -----------------------------------------------------------------------------
 # Relay identity and metadata (advertised in the NIP-11 info document)
 # -----------------------------------------------------------------------------
 [relay]
+
 # Human-readable relay name.
 name = "nostrfy"
 
@@ -53,10 +49,9 @@ post_policy = ""
 
 # Hex-encoded secret key of the relay itself. When set, the relay can sign
 # and publish NIP-29 group metadata events (39000-39005, including the
-# 39001 admins / 39002 members snapshots) and NIP-43 role/membership events,
-# and its pubkey is advertised as the NIP-11 `self` field. Without a key,
-# NIP-29 groups still work but the relay cannot generate the 39000-39005
-# snapshots at group creation. Generate one with `nostrfy genkey`.
+# 39001 admins / 39002 members snapshots) and NIP-43 role/membership events.
+# Without a key, NIP-29 groups still work but the relay cannot generate the
+# 39000-39005 snapshots at group creation. Generate one with `nostrfy genkey`.
 private_key = ""
 
 # Public URL of this relay as seen by clients (e.g. "wss://relay.example.com").
@@ -64,11 +59,11 @@ private_key = ""
 # NIP-86 NIP-98 admin auth; falls back to server.host:server.port when empty,
 # which with a wildcard or loopback bind (0.0.0.0, 127.0.0.1) never matches a
 # client's URL and silently breaks all three. Always set this when the relay
-# sits behind a TLS-terminating proxy or Cloudflare Tunnel, where the public
-# scheme is wss while the local listener is plain ws.
+# sits behind a TLS-terminating proxy (nginx, Caddy, Cloudflare Tunnel, ...).
 public_url = ""
 
-# Optional LiveKit server URL for NIP-29 live audio/video rooms.
+# Optional LiveKit server URL for NIP-29 live audio/video rooms, together
+# with the API credentials used to sign the room tokens.
 livekit_url = ""
 livekit_api_key = ""
 livekit_api_secret = ""
@@ -77,9 +72,8 @@ livekit_api_secret = ""
 # and their behavior is enabled. Empty means "all except disabled_nips".
 enabled_nips = []
 
-# NIPs to disable (behavior off and not advertised). File-storage NIPs
-# (34 git, 94 file metadata, 95/96 HTTP storage) are never implemented
-# (except Blossom, which is provided by the dedicated [blossom] file server).
+# NIPs to disable (behavior off and not advertised). See
+# docs/CONFIGURATION.md for the full list of relay-side NIPs.
 disabled_nips = []
 
 # When true, ephemeral events (NIP-01 kinds 20000-29999) are rejected at
@@ -117,25 +111,29 @@ require_auth = false
 # warns about the combination.
 send_auth_challenge = true
 
-# Require NIP-42 AUTH before accepting kind 78/30078 events and serve them
-# only to the authenticated owner. Default true; requires NIP-42 enabled.
+# When true, NIP-78 application-specific events (kinds 78/30078) require the
+# NIP-42 AUTH flow before they are accepted and are served only to the
+# authenticated owner. Requires NIP-42 to be enabled.
 enabled_nip78_auth = true
 
-# Execute kind:1 events authored by relay.pubkey (the admin) as operator
-# commands ("/relay allow|deny <npub|hex>", "/blossom allow|deny <npub|hex>";
-# the operand may carry the nostr: URI prefix), answered with kind:1111
-# events signed by relay.private_key. Default false.
+# When true, kind:1 events authored by relay.pubkey (the admin) are executed
+# as operator commands without the CLI:
+#   /relay allow|add <npub1...|nostr:npub1...|hex>   allowlist a pubkey
+#   /relay deny <...>                                 denylist a pubkey
+#   /blossom allow|deny <...>                         edit the Blossom upload allowlist
+# The relay answers each command with a kind:1111 event signed by
+# relay.private_key (tagged `e` to the command and `p` to the admin).
 enabled_command_events = false
 
 # -----------------------------------------------------------------------------
-# Network server
+# Network server (WebSocket relay, NIP-11, REST API, NIP-86, Blossom)
 # -----------------------------------------------------------------------------
 [server]
+
 # Bind address of the relay's WebSocket/HTTP endpoint. The default binds
 # loopback only: clients on other machines cannot connect. Use "0.0.0.0" to
 # listen on every interface (direct remote access), or keep "127.0.0.1" when
-# the relay is reached through a reverse proxy on the same machine (nginx,
-# Caddy, cloudflared, ...).
+# the relay is reached through a reverse proxy on the same machine.
 host = "127.0.0.1"
 port = 8080
 
@@ -143,36 +141,26 @@ port = 8080
 # API and the WebSocket relay are split by Host header on the same port:
 #   - requests whose Host header matches this value serve ONLY /api/v1
 #     (and /health);
-#   - every other host serves ONLY the WebSocket/NIP-11/NIP-86 routes, and
-#     /api/v1 is never reachable on them.
-# Point the API's DNS name and the relay's DNS name at the same server
-# (e.g. via Cloudflare) and the two never bleed into each other. Empty =
-# the API is served on every host, next to the WebSocket endpoint.
+#   - every other host serves ONLY the WebSocket/NIP-11/NIP-86 routes.
+# Empty = the API is served on every host, next to the WebSocket endpoint.
 api_host = ""
-
-# WebSocket upgrades are also accepted when a TLS-terminating proxy announces
-# the client scheme via `X-Forwarded-Proto` (ws/wss/http/https are all
-# accepted), so Cloudflare Tunnel and similar setups work out of the box.
-# For those setups set relay.public_url to the public wss:// address.
 
 # Expose Prometheus metrics on GET /metrics (text format). Served on the API
 # host when one is configured; without api_host the metrics are public on
-# every host (point a monitoring system at it, or set this to false).
+# every host (set this to false to hide them).
 metrics_enabled = true
 
 # Which paths serve the WebSocket endpoint (and the NIP-11 document):
-#   root         - "/" only (default; the legacy /ws and /ws/ paths are gone)
-#   inbox-outbox - only "/inbox" and "/outbox"; the root answers the Blossom
-#                  server info on the Blossom host only (404 elsewhere)
+#   root         - "/" only (default)
+#   inbox-outbox - only "/inbox" and "/outbox"
 #   all          - the root and the inbox/outbox paths
 # The inbox/outbox paths give the relay distinct endpoints for the
 # inbox/outbox routing model (e.g. wss://relay.example.com/inbox).
-# Fixed at startup (a reload keeps the previous value).
 ws_paths = "root"
 
 # Write policy for events published through /inbox (enforced only when the
 # path is served):
-#   any - the event must carry at least one "p" tag (addressed to anyone)
+#   any   - the event must carry at least one "p" tag (default)
 #   relay - the event must "p"-tag the relay's own pubkey (requires
 #           relay.private_key)
 inbox_write_policy = "any"
@@ -182,14 +170,14 @@ inbox_write_policy = "any"
 #   any   - the event must be authored by the connection's NIP-42
 #           authenticated pubkey (default)
 #   relay - only events authored by the relay's own pubkey are accepted
-#           (requires relay.private_key); /outbox becomes a pure relay
-#           outbox
+#           (requires relay.private_key)
 outbox_write_policy = "any"
 
 # -----------------------------------------------------------------------------
-# Limits (anti-abuse and resource bounds)
+# Management API (NIP-86)
 # -----------------------------------------------------------------------------
 [rpc]
+
 # Separate localhost management port for the legacy NIP-86 REST endpoints;
 # 0 disables the management server entirely. The NIP-86 JSON-RPC API is
 # always served on the relay's own HTTP endpoint.
@@ -204,22 +192,31 @@ management_token = ""
 # (Authorization: Nostr <base64 event>). Empty disables this method.
 admin_pubkey = ""
 
-# Body limit for the NIP-86 management RPC (JSON-RPC and the legacy
-# management endpoints); oversized requests are refused with 413.
+# Body limit for the NIP-86 management RPC; oversized requests are refused
+# with 413.
 max_admin_body_bytes = 65536
 
+# -----------------------------------------------------------------------------
+# Limits (anti-abuse and resource bounds)
+# -----------------------------------------------------------------------------
 [limits]
+
 # Maximum number of concurrent connections (WebSocket and HTTP).
 max_connections = 10000
 
 # Per-source-IP cap on connections: a single host cannot consume the whole
-# connection budget (a socket flood from one IP would otherwise evict
-# legitimate clients). 0 = no per-IP cap.
+# connection budget. 0 = no per-IP cap.
 max_connections_per_ip = 64
 
 # Maximum number of new connections a single source IP may open per second
 # (sliding window; sockets beyond it are refused immediately). 0 = unlimited.
 max_connections_per_sec_per_ip = 0
+
+# Maximum size in bytes of a single incoming WebSocket message.
+max_ws_message_bytes = 1048576
+
+# Kernel receive buffer size (kilobytes) requested per WebSocket socket.
+socket_recv_buffer_kb = 64
 
 # Seconds a connection has to deliver a complete HTTP request head (the
 # request line and headers) before it is closed: closes slow-loris sockets
@@ -227,15 +224,8 @@ max_connections_per_sec_per_ip = 0
 # upgrades too. Requires a restart to change.
 http_read_timeout_secs = 30
 
-# Maximum size in bytes of a single incoming WebSocket message.
-max_ws_message_bytes = 1048576
-
 # Maximum number of filters in a single REQ/COUNT message.
 max_filters = 20
-
-# A single filter may carry at most 512 `ids` or `authors` entries (a fixed
-# relay limit, not configurable): the per-candidate match is linear in these
-# arrays, and larger filters are rejected to bound per-request work.
 
 # Maximum number of active subscriptions per connection.
 max_subscriptions = 20
@@ -254,6 +244,7 @@ max_sub_id_len = 64
 # matching the NIP-11 `max_content_length` semantics. The byte size is
 # bounded by max_ws_message_bytes instead.
 max_content_bytes = 65536
+
 # Maximum number of tags on an event.
 max_tags = 2000
 
@@ -268,19 +259,52 @@ max_created_at_future_secs = 3600
 # exceeding this are rejected with a NEG-ERR carrying the cap.
 max_neg_items = 100000
 
-# Spam defense: a pubkey's first accepted event is recorded, and events from
+# Maximum total bytes of subscription filters held per connection.
+max_sub_bytes = 1048576
+
+# NIP-29: reject group events whose created_at is older than this many
+# seconds (late-publication prevention); 0 disables the check.
+group_late_publish_secs = 3600
+
+# Maximum number of concurrent `/api/v1` queries served at once. Requests
+# beyond this limit fail fast with a 503 instead of queuing up behind
+# WebSocket work.
+max_api_concurrent = 8
+
+# Upper bound for the API `limit` query parameter (0 = no bound). Larger
+# values are clamped down to this ceiling.
+max_api_limit = 5000
+
+# Upper bound for the API `offset` query parameter (0 = no bound). Larger
+# values are rejected with a 400.
+max_api_offset = 50000
+
+# Maximum length in bytes of the API `search` query parameter (0 = no bound).
+# Longer values are rejected with a 400.
+max_api_search_bytes = 2048
+
 # Maximum bytes of outgoing messages queued per connection before new ones
-# are dropped (protects memory against slow readers).
+# are dropped (protects memory against slow readers). 0 = unlimited.
 max_out_queue_bytes = 262144
 
 # Seconds a connection may stay idle (no inbound frames) before it is closed.
 # When non-zero the relay also sends periodic WebSocket PINGs, so an
 # alive-but-silent subscriber (which auto-answers with a PONG) keeps its slot
-# while dead peers are detected and reaped — otherwise a flood of idle
-# connections can exhaust max_connections. 0 disables the idle timeout.
+# while dead peers are detected and reaped. 0 disables the idle timeout.
 ws_idle_timeout_secs = 300
 
-# Spam defense: a pubkey may publish at most this many events per minute
+# Live fan-out batching: events are broadcast to subscribers in batches of
+# at most `live_batch_size` events every `live_batch_interval_ms`
+# milliseconds, so idle connections wake up once per batch. Fixed at
+# startup (a reload keeps the previous values).
+live_batch_interval_ms = 20
+live_batch_size = 32
+
+# Bounded queue of events waiting to be broadcast live; messages are dropped
+# (never stored) when it overflows, remaining available via subscriptions.
+# Fixed at startup.
+live_buffer = 65536
+
 # Byte budget for a single REQ response: the stored events are pumped to the
 # socket in bounded chunks as it drains, so a slow reader cannot pin more
 # than max_out_queue_bytes in the queue — or more than this budget per
@@ -288,47 +312,11 @@ ws_idle_timeout_secs = 300
 # `CLOSED ... response too large`. 0 disables the budget.
 max_req_response_bytes = 33554432
 
-# Maximum total bytes of subscription filters held per connection.
-max_sub_bytes = 524288
-
-# NIP-29: reject group events whose created_at is older than this many
-# seconds (late-publication prevention); 0 disables the check.
-group_late_publish_secs = 604800
-
-# Live fan-out batching: events are broadcast to subscribers in batches of
-# at most `live_batch_size` events every `live_batch_interval_ms`
-# milliseconds, so idle connections wake up once per batch.
-live_batch_interval_ms = 10
-live_batch_size = 64
-
-# Bounded queue of events waiting to be broadcast live; messages are dropped
-# (never stored) when it overflows, remaining available via subscriptions.
-live_buffer = 65536
-
-# REST API (`/api/v1/...`) protection. The API shares the database with the
-# WebSocket server, so these bounds keep a flood of REST traffic from
-# degrading (or crashing) the WebSocket subscribers.
-# Maximum number of concurrent `/api/v1` queries served at once. Requests
-# beyond this limit fail fast with a 503 instead of queuing up behind
-# WebSocket work.
-max_api_concurrent = 32
-
-# Upper bound for the `limit` query parameter (0 = no bound). Larger values
-# are clamped down to this ceiling.
-max_api_limit = 500
-
-# Upper bound for the `offset` query parameter (0 = no bound). Larger values
-# are rejected with a 400.
-max_api_offset = 10000
-
-# Maximum length in bytes of the `search` query parameter (0 = no bound).
-# Longer values are rejected with a 400.
-max_api_search_bytes = 1024
-
 # -----------------------------------------------------------------------------
 # Database (LMDB via heed)
 # -----------------------------------------------------------------------------
 [database]
+
 # Directory holding the LMDB environment.
 path = "./data"
 
@@ -341,10 +329,8 @@ max_readers = 128
 # Memory map size in bytes. The map is a virtual address space reservation
 # backed by a sparse file: physical memory and disk usage grow only with the
 # data actually stored. The map is opened at max_map_size (or map_size,
-# whichever is larger) and never resized at runtime: resizing would require
-# that no read transactions are active, which cannot be guaranteed while the
-# shared reader and the REST API reader threads hold concurrent read
-# transactions. This setting therefore acts as a floor.
+# whichever is larger) and never resized at runtime. This setting therefore
+# acts as a floor.
 map_size = 1073741824
 
 # Real ceiling of the memory map in bytes. On 32-bit systems it is capped at
@@ -354,15 +340,31 @@ max_map_size = 1099511627776
 # Interval in seconds between NIP-40 expired-event purge runs.
 purge_interval_secs = 300
 
+# Number of dedicated database reader threads (WebSocket REQ scans and the
+# REST API each use their own, so the ingest path never blocks on reads).
+reader_threads = 2
+
 # Build the NIP-50 full-text word index (searches still work without it via
 # a full scan, but are slower).
 search_index = true
+
+# Maximum number of words indexed per event (longer content is truncated
+# for the index).
+max_indexed_words = 32
+
+# Index the per-event metadata header (kind/created_at/pubkey/expiry) used
+# as the scan prefilter — keep it on for fast queries.
+meta_index = true
 
 # LMDB read/write buffer size in bytes.
 db_buffer_size = 2048
 
 # Seconds a database request may wait before timing out (0 = forever).
 db_request_timeout_secs = 30
+
+# When true, fsync is skipped after each write batch (faster, but a power
+# loss can lose recent writes or corrupt the database — not recommended).
+disabled_fsync = false
 
 # Overload protection: when the database thread's queue holds more than
 # these many pending messages/events, new requests fail fast.
@@ -373,6 +375,7 @@ max_db_queue_events = 262144
 # Daemon
 # -----------------------------------------------------------------------------
 [daemon]
+
 # PID file used by `nostrfy start/stop/restart`.
 pid_file = "./nostrfy.pid"
 
@@ -393,35 +396,20 @@ max_log_size_bytes = 52428800
 max_log_files = 5
 
 # -----------------------------------------------------------------------------
-# Access control (seeded from this file on the very first run). NIP-86
-# management calls (banpubkey, allowkind, blockip, ...) mutate these lists at
-# runtime, and the runtime state is persisted in the database so it survives
-# restarts; this section only seeds the initial state when no runtime state
-# exists yet. A SIGHUP reload does not overwrite the runtime lists.
+# Access control
+#
+# Seeded from this file on the very first run only: NIP-86 management calls
+# (banpubkey, allowkind, blockip, ...) and the `nostrfy relay` / `nostrfy
+# blossom` commands mutate these lists at runtime, and the runtime state is
+# persisted in the database so it survives restarts. A SIGHUP reload does
+# not overwrite the runtime lists.
 # -----------------------------------------------------------------------------
-
-
-# Blossom file server (media hosting). Active when `host` is set: requests
-# with this Host header are served only the Blossom routes (like
-# server.api_host for the REST API).
-[blossom]
-host = ""                          # e.g. "media.example.com" (empty = disabled)
-storage = "local"                  # "local" or "s3" (Cloudflare R2 is S3-compatible)
-local_path = "./data/images"       # local storage: <local_path>/<npub1...>/<sha256>
-max_upload_bytes = 20971520        # 20 MiB max upload size
-min_free_bytes = 33554432         # refuse uploads (507) while the local disk has
-                                    # less than this many free bytes; 0 disables
-restrict_uploads = false            # only allowlisted pubkeys may upload
-                                    # (list managed via 'nostrfy blossom allow/deny')
-s3_endpoint = ""                   # e.g. "https://<account>.r2.cloudflarestorage.com"
-s3_region = "auto"                 # R2 uses "auto"; AWS uses e.g. "us-east-1"
-s3_bucket = ""                     # the "bucket" of bucket/{npub1}/{file}
-s3_access_key = ""
-s3_secret_key = ""
 [access]
-# true = only allow-listed pubkeys may publish. The allow/deny lists are
-# NOT config keys: they live in the relay database (LMDB) and are managed
-# with `nostrfy relay allow/deny`. A denied pubkey is always rejected, even
+
+# true = only allow-listed pubkeys may publish AND read. The pubkey allow and
+# deny lists are NOT config keys: they live in the relay database (LMDB) and
+# are managed with `nostrfy relay allow/deny` (or via command events when
+# enabled_command_events is on). A denied pubkey is always rejected, even
 # with restrict_relay = false.
 restrict_relay = false
 
@@ -433,3 +421,40 @@ allowed_kinds = []
 
 # IP addresses refused at the WebSocket endpoint.
 blocked_ips = []
+
+# -----------------------------------------------------------------------------
+# Blossom file server (media hosting)
+#
+# Active when `host` is set: requests with this Host header are served only
+# the Blossom routes (like server.api_host for the REST API).
+# -----------------------------------------------------------------------------
+[blossom]
+
+# Hostname serving the Blossom routes, e.g. "media.example.com" (empty =
+# the Blossom file server is disabled).
+host = ""
+
+# "local" or "s3" (Cloudflare R2 is S3-compatible).
+storage = "local"
+
+# Local storage directory: files are stored as
+# <local_path>/<npub1...>/<sha256> ("bucket/{npub1}/{file}").
+local_path = "./data/images"
+
+# Maximum upload size in bytes (20 MiB default).
+max_upload_bytes = 20971520
+
+# Refuse uploads (507) while the local disk has less than this many free
+# bytes; 0 disables the check.
+min_free_bytes = 33554432
+
+# S3-compatible storage settings (used when storage = "s3"):
+s3_endpoint = ""                 # e.g. "https://<account>.r2.cloudflarestorage.com"
+s3_region = ""                   # R2 uses "auto"; AWS uses e.g. "us-east-1"
+s3_bucket = ""                   # the "bucket" of bucket/{npub1}/{file}
+s3_access_key = ""
+s3_secret_key = ""
+
+# When true, only allowlisted pubkeys may upload (the list is managed via
+# `nostrfy blossom allow/deny`, persisted in LMDB).
+restrict_uploads = false

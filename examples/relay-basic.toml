@@ -15,7 +15,7 @@ description = "A minimal and stable Nostr relay"
 pubkey = ""                 # your public key (npub or hex), shown in NIP-11
 contact = ""                # admin contact, shown in NIP-11
 icon = ""                   # relay icon URL, shown in NIP-11
-post_policy = ""            # a NIP-01 filter to accept only matching events
+post_policy = ""            # a free-text posting-policy URL/text shown in NIP-11
 private_key = ""            # run `nostrfy genkey` to generate one
 public_url = ""             # e.g. "wss://relay.example.com" behind a proxy
 enabled_nips = []           # empty = all supported NIPs are enabled

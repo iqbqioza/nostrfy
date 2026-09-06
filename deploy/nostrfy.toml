@@ -3,6 +3,7 @@
 #   - `public_url`  = "wss://relay.example.com"  (required for NIP-42/62/98)
 #   - `private_key` = generated with `nostrfy genkey` (required for NIP-29)
 # The database lives at /var/lib/nostrfy (create the directory first).
+# All values below are the built-in defaults; adjust as needed.
 
 [relay]
 name = "nostrfy"
@@ -18,64 +19,79 @@ livekit_api_key = ""
 livekit_api_secret = ""
 enabled_nips = []
 disabled_nips = []
+reject_ephemeral = false
+enabled_git = false
+require_pow = 0
+new_pubkey_min_age_secs = 0
+max_events_per_min_per_pubkey = 0
+max_groups = 1000
+require_auth = false
+send_auth_challenge = true
+enabled_nip78_auth = true
+enabled_command_events = false
 
 [server]
 host = "0.0.0.0"
 port = 8080
 api_host = ""
+metrics_enabled = true
+ws_paths = "root"
+inbox_write_policy = "any"
+outbox_write_policy = "any"
+
+[rpc]
 management_port = 0
 management_host = "127.0.0.1"
 management_token = ""
 admin_pubkey = ""
-require_auth = false
-send_auth_challenge = true
-# NIP-78 app-specific events: AUTH to publish, owner-only to serve (default).
-enabled_nip78_auth = true
-# Command events: kind:1 admin commands from relay.pubkey, replied with relay.private_key (default off).
-enabled_command_events = false
-metrics_enabled = true
+max_admin_body_bytes = 65536
 
 [limits]
 max_connections = 10000
-max_connections_per_ip = 0
-max_ws_message_size = 1048576
+max_connections_per_ip = 64
+max_connections_per_sec_per_ip = 0
+max_ws_message_bytes = 1048576
+socket_recv_buffer_kb = 64
+http_read_timeout_secs = 30
 max_filters = 20
 max_subscriptions = 20
 max_limit = 500
-count_limit = 2000
+max_count = 2000
 max_sub_id_len = 64
 max_content_bytes = 65536
 max_tags = 2000
 max_tag_value_bytes = 1024
-max_created_at_future = 3600
-require_pow = 0
-max_indexed_words = 128
-buffer_size = 2048
-neg_max_items = 100000
-db_request_timeout_secs = 30
-new_pubkey_min_age_secs = 0
+max_created_at_future_secs = 3600
+max_neg_items = 100000
+max_sub_bytes = 1048576
+group_late_publish_secs = 3600
+max_api_concurrent = 8
+max_api_limit = 5000
+max_api_offset = 50000
+max_api_search_bytes = 2048
 max_out_queue_bytes = 262144
-ws_idle_timeout_secs = 0
-db_queue_msgs = 4096
-db_queue_events = 262144
-max_sub_bytes = 524288
-group_late_publish_secs = 604800
-api_max_concurrent = 32
-api_max_limit = 500
-api_max_offset = 10000
-api_max_search_bytes = 1024
-live_batch_interval_ms = 10
-live_batch_size = 64
+ws_idle_timeout_secs = 300
+live_batch_interval_ms = 20
+live_batch_size = 32
 live_buffer = 65536
+max_req_response_bytes = 33554432
 
 [database]
 path = "/var/lib/nostrfy"
 max_dbs = 32
 max_readers = 128
 map_size = 1073741824
-map_max_size = 1099511627776
+max_map_size = 1099511627776
 purge_interval_secs = 300
+reader_threads = 2
 search_index = true
+max_indexed_words = 32
+meta_index = true
+db_buffer_size = 2048
+db_request_timeout_secs = 30
+disabled_fsync = false
+max_db_queue_msgs = 4096
+max_db_queue_events = 262144
 
 [daemon]
 # Foreground mode under systemd: these are unused but must be non-empty.
@@ -83,26 +99,27 @@ pid_file = "/var/lib/nostrfy/nostrfy.pid"
 log_file = "/var/lib/nostrfy/nostrfy.log"
 stats_file = "/var/lib/nostrfy/nostrfy.stats.json"
 stats_interval_secs = 5
-log_max_size_bytes = 52428800
-log_max_files = 5
+max_log_size_bytes = 52428800
+max_log_files = 5
+
+[access]
+restrict_relay = false
+blocked_kinds = []
+allowed_kinds = []
+blocked_ips = []
 
 # Blossom file server (media hosting) — enabled when `host` is set.
 # Files are stored as <local_path>/<npub1...>/<sha256> ("bucket/{npub1}/{file}")
 # or in an S3-compatible bucket (R2) when storage = "s3".
 [blossom]
-host = ""                          # e.g. "media.example.com" (empty = disabled)
-storage = "local"                  # "local" or "s3"
+host = ""                        # e.g. "media.example.com" (empty = disabled)
+storage = "local"                # "local" or "s3"
 local_path = "/var/lib/nostrfy/images"
-max_upload_bytes = 20971520        # 20 MiB
-restrict_uploads = false            # only allowlisted pubkeys may upload
-s3_endpoint = ""                   # e.g. "https://<account>.r2.cloudflarestorage.com"
-s3_region = "auto"
+max_upload_bytes = 20971520      # 20 MiB
+min_free_bytes = 33554432
+s3_endpoint = ""                 # e.g. "https://<account>.r2.cloudflarestorage.com"
+s3_region = ""                   # R2 uses "auto"
 s3_bucket = ""
 s3_access_key = ""
 s3_secret_key = ""
-
-[access]
-restrict_relay = false   # allow/deny lists are managed via 'nostrfy relay allow/deny' (LMDB)
-blocked_kinds = []
-allowed_kinds = []
-blocked_ips = []
+restrict_uploads = false         # only allowlisted pubkeys may upload

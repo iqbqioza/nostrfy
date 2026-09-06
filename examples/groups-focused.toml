@@ -14,7 +14,7 @@ description = "Nostr groups relay (NIP-29 + NIP-43)"
 pubkey = ""
 private_key = ""            # REQUIRED: `nostrfy genkey` — signs group metadata
 public_url = "wss://groups.example.com"
-enabled_nips = [1, 9, 11, 29, 40, 42, 43, 45, 46, 50, 57, 59, 65, 70, 77, 86, 94]
+enabled_nips = [1, 9, 11, 29, 40, 42, 43, 45, 46, 50, 57, 59, 65, 70, 77, 78, 86, 94]
 # NIP-29 group events can be a significant share of the write load:
 max_groups = 5000           # more groups than the default 1000
 

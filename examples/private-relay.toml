@@ -3,8 +3,9 @@
 # For a closed community: only authenticated clients (NIP-42) may
 # publish, only allow-listed pubkeys are served, and the relay is
 # locked down to a fixed audience. Combine `require_auth` (any
-# authenticated user may publish) with the allow list (only these
-# pubkeys are served at all) for a truly private relay.
+# authenticated user may publish) with `restrict_relay = true` + the
+# allow list (only these pubkeys are served at all) for a truly private
+# relay.
 
 [relay]
 name = "nostrfy private"
@@ -12,26 +13,25 @@ description = "Private relay for a closed group of friends"
 pubkey = ""
 private_key = ""            # `nostrfy genkey`
 public_url = "wss://private.example.com"
+# Small audience: tighten the publish rate.
+max_events_per_min_per_pubkey = 30
 # Only authenticated clients (NIP-42 AUTH before EVENT) may publish.
 require_auth = true
 send_auth_challenge = true
 # NIP-78 app-specific events: AUTH to publish, owner-only to serve (default).
 enabled_nip78_auth = true
-# Command events: kind:1 admin commands from relay.pubkey, replied with relay.private_key (default off).
+# Command events: kind:1 admin commands from relay.pubkey, replied with
+# relay.private_key (default off). Set relay.pubkey to the admin pubkey.
 enabled_command_events = false
 # Keep it small: no search, no groups, no negentropy, no NIP-50.
 enabled_nips = [1, 9, 11, 40, 42, 45, 46, 59, 65, 70, 78, 84]
-disabled_nips = [29, 43, 50, 77, 86, 98]
 
 [access]
-# Allow list: only these pubkeys may read (REQ) and write. Leave empty
-# to skip the allow list (require_auth alone then governs writes).
-allowed_pubkeys = [
-    # "npub1..." or 64-hex pubkey of each member, e.g.:
-    # "npub1yourfriend1",
-]
-# Deny list: never serve these pubkeys even when they authenticate.
-blocked_pubkeys = []
+# Only allow-listed pubkeys may read (REQ) and write. The allow/deny
+# lists are NOT config keys: they live in the relay database and are
+# managed with `nostrfy relay allow <pubkey>` / `nostrfy relay deny
+# <pubkey>` (the admin and the relay's own pubkey are always exempt).
+restrict_relay = true
 # Optional: only accept these kinds (empty = all kinds allowed).
 allowed_kinds = [1, 4, 6, 7, 14, 42, 9735]
 blocked_kinds = []
@@ -40,7 +40,6 @@ blocked_kinds = []
 # A private relay is small: tighten everything.
 max_connections = 500
 max_connections_per_ip = 8
-max_events_per_min_per_pubkey = 30
 
 [rpc]
 # Management API (NIP-86) on its own port (must differ from

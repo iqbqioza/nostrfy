@@ -11,7 +11,7 @@
 # (fly deploy does this for you.)
 #
 # To pin a specific release instead of the latest:
-#   docker build --build-arg NOSTRFY_VERSION=v0.1.0-alpha-01 .
+#   docker build --build-arg NOSTRFY_VERSION=v0.1.3 .
 
 # syntax=docker/dockerfile:1
 
