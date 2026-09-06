@@ -130,6 +130,14 @@ impl BlobStore {
             // unreachable, billed orphan) — but only when this upload
             // created the mapping (a failed re-upload keeps the
             // pre-existing valid mapping).
+            //
+            // Known race (accepted, astronomically rare): two concurrent
+            // FIRST uploads of the same bytes by the same owner both read
+            // `was_owner = false`; if exactly one storage write then
+            // fails, its rollback removes the owner mapping the other
+            // upload just committed (the stored blob stays unmapped until
+            // a re-upload). The add/remove are separate LMDB transactions,
+            // so the read-check-act is not atomic.
             if !was_owner {
                 self.db.blossom_remove_owner(sha256, pubkey).await;
             }
@@ -1035,6 +1043,12 @@ mod tests {
                 std::fs::read(&external).unwrap(),
                 b"precious",
                 "the symlink target must be untouched"
+            );
+            // A failed re-upload must keep the uploader's pre-existing,
+            // valid mapping (the blob from the second put is still there).
+            assert!(
+                s.find(&sha).await.is_some(),
+                "a failed re-upload must not roll back the existing mapping"
             );
             std::fs::remove_file(&external).unwrap();
             s.db.shutdown();
