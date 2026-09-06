@@ -100,6 +100,14 @@ impl BlobStore {
         // committed).
         self.check_space()?;
         let uploaded = crate::util::unix_now() as i64;
+        // Whether the uploader already owned the blob BEFORE this upload
+        // (read before the add: a failed re-upload of identical bytes must
+        // not roll back their pre-existing, valid mapping).
+        let was_owner = self
+            .db
+            .blossom_load(sha256)
+            .await
+            .is_some_and(|m| m.owners.iter().any(|o| o == pubkey));
         // The mapping must land first: without it the file would be an
         // unreachable orphan. Abort the upload when the commit fails.
         if !self
@@ -112,14 +120,6 @@ impl BlobStore {
             ));
         }
         let npub = npub_of(pubkey);
-        // Whether the uploader already owned the blob before this upload:
-        // a failed re-upload of identical bytes must not roll back their
-        // pre-existing, valid mapping.
-        let was_owner = self
-            .db
-            .blossom_load(sha256)
-            .await
-            .is_some_and(|m| m.owners.iter().any(|o| o == pubkey));
         let stored = match &self.storage {
             Storage::Local(s) => s.put(&npub, sha256, bytes, mime, uploaded).await,
             Storage::S3(s) => s.put(&npub, sha256, bytes, mime, uploaded).await,
@@ -127,8 +127,9 @@ impl BlobStore {
         if let Err(e) = stored {
             // Roll the owner mapping back: a failed PUT must not leave a
             // mapping pointing at an object that was never stored (an
-            // unreachable, billed orphan) — but only when the mapping was
-            // created by this upload.
+            // unreachable, billed orphan) — but only when this upload
+            // created the mapping (a failed re-upload keeps the
+            // pre-existing valid mapping).
             if !was_owner {
                 self.db.blossom_remove_owner(sha256, pubkey).await;
             }
@@ -982,6 +983,10 @@ mod tests {
             assert!(
                 s.open_stream(&npub, &sha, 0, 1).await.unwrap().is_none(),
                 "the blob must not be readable through the symlink"
+            );
+            assert!(
+                s.find(&sha).await.is_none(),
+                "the failed upload must roll back its owner mapping (no orphan)"
             );
             let _ = std::fs::remove_dir_all(&external);
             s.db.shutdown();
