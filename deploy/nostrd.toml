@@ -31,6 +31,8 @@ require_auth = false
 send_auth_challenge = true
 # NIP-78 app-specific events: AUTH to publish, owner-only to serve (default).
 enabled_nip78_auth = true
+# Command events: kind:1 admin commands from relay.pubkey, replied with relay.private_key (default off).
+enabled_command_events = false
 metrics_enabled = true
 
 [limits]

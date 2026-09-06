@@ -257,6 +257,13 @@ impl Conn {
     /// a narrower filter.
     pub(crate) fn pump_pending_reqs(&mut self) {
         loop {
+            // The access lists gate the pump too: results queued before a
+            // deny are dropped, so the restriction applies immediately
+            // without disconnecting the connection.
+            if !self.access_allows_read_sync() {
+                self.pending_reqs.clear();
+                break;
+            }
             // A subscription closed while its response was still pumping
             // is dropped without an EOSE (the client already closed it).
             let closed = self
@@ -1518,6 +1525,472 @@ mod tests {
                     .iter()
                     .any(|m| m[0] == "OK" && m[1] == app.id && m[2] == true),
                 "an authenticated client may publish kind 78"
+            );
+
+            conn.relay.db.shutdown();
+        });
+    }
+
+    /// Hex pubkey of a secret key (hex), for tests that act as the admin.
+    fn pubkey_of_secret(secp: &Secp256k1<secp256k1::All>, secret_hex: &str) -> String {
+        let secret = hex::decode(secret_hex).unwrap();
+        let keypair = Keypair::from_seckey_slice(secp, &secret).unwrap();
+        XOnlyPublicKey::from_keypair(&keypair).0.to_string()
+    }
+
+    /// A kind:1 event signed with an explicit secret key (hex), so a test
+    /// can publish "as the admin" (relay.pubkey holder).
+    fn signed_command_event(
+        secp: &Secp256k1<secp256k1::All>,
+        secret_hex: &str,
+        content: &str,
+        created: u64,
+    ) -> Event {
+        let secret = hex::decode(secret_hex).unwrap();
+        let keypair = Keypair::from_seckey_slice(secp, &secret).unwrap();
+        let pubkey = XOnlyPublicKey::from_keypair(&keypair).0.to_string();
+        let mut ev = Event {
+            id: String::new(),
+            pubkey,
+            created_at: created,
+            kind: 1,
+            tags: Vec::new(),
+            content: content.into(),
+            sig: String::new(),
+        };
+        sign(&mut ev, &keypair, secp).unwrap();
+        ev
+    }
+
+    /// Stored kind:1111 events matching the `e` tag.
+    async fn stored_replies(relay: &Arc<Relay>, e_tag: &str, now: u64) -> Vec<Event> {
+        let f: Vec<crate::filter::Filter> = serde_json::from_value(serde_json::json!([
+            { "kinds": [1111], "#e": [e_tag] }
+        ]))
+        .unwrap();
+        let (events, _) = relay.db.query_req(f, 500, now).await;
+        events
+    }
+
+    #[test]
+    fn command_events_edit_lists_and_reply_with_1111() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let secret = "aa".repeat(32);
+            let relay = build_relay_with(&secret).await;
+            relay.config.write().await.relay.pubkey = pubkey_of_secret(relay.secp(), &secret);
+            relay.config.write().await.relay.enabled_command_events = true;
+            let mut conn = build_conn_on(relay.clone()).await;
+            let now = unix_now();
+            let target = "bb".repeat(32);
+
+            // relay allow: the access list changes immediately and the
+            // change is persisted for the CLI/restart.
+            let cmd = signed_command_event(
+                relay.secp(),
+                &secret,
+                &format!("/relay allow {target}"),
+                now,
+            );
+            conn.queue_event_value(cmd.clone()).await;
+            conn.flush_pending_events().await;
+            assert!(
+                outgoing_json(&conn)
+                    .iter()
+                    .any(|m| m[0] == "OK" && m[1] == cmd.id && m[2] == true),
+                "the command event is accepted"
+            );
+            assert!(
+                relay
+                    .access
+                    .read()
+                    .await
+                    .allowed_pubkeys
+                    .iter()
+                    .any(|(p, _)| p == &target),
+                "relay allow must add the pubkey to the allow list"
+            );
+            let (deny, allow) = relay.db.load_relay_pubkeys().await;
+            assert!(allow.iter().any(|(p, _)| p == &target));
+            assert!(deny.is_empty());
+
+            // The kind:1111 reply is stored, tagged to the command and
+            // served publicly (no `-` tag): visible even without NIP-42.
+            let replies = stored_replies(&relay, &cmd.id, now).await;
+            assert_eq!(replies.len(), 1, "one reply per command");
+            assert_eq!(replies[0].pubkey, relay.relay_pubkey().unwrap());
+            assert!(
+                replies[0]
+                    .tags
+                    .iter()
+                    .all(|t| t.first().map(String::as_str) != Some("-")),
+                "the reply must be public, not NIP-70 protected"
+            );
+            let admin = pubkey_of_secret(relay.secp(), &secret);
+            assert!(
+                replies[0]
+                    .tags
+                    .iter()
+                    .any(|t| t == &vec!["p".into(), admin.clone()]),
+                "the reply must mention the admin with a p tag"
+            );
+            assert!(
+                replies[0]
+                    .content
+                    .contains(&format!("/relay allow {target}")),
+                "reply content: {}",
+                replies[0].content
+            );
+
+            // relay deny: moves the pubkey from allow to deny (the `nostr:`
+            // URI prefix is accepted on the operand).
+            let cmd = signed_command_event(
+                relay.secp(),
+                &secret,
+                &format!("/relay deny nostr:{target}"),
+                now + 1,
+            );
+            conn.queue_event_value(cmd.clone()).await;
+            conn.flush_pending_events().await;
+            assert!(
+                relay
+                    .access
+                    .read()
+                    .await
+                    .blocked_pubkeys
+                    .iter()
+                    .any(|(p, _)| p == &target),
+                "relay deny must add the pubkey to the deny list"
+            );
+            assert!(
+                !relay
+                    .access
+                    .read()
+                    .await
+                    .allowed_pubkeys
+                    .iter()
+                    .any(|(p, _)| p == &target),
+                "relay deny must remove the pubkey from the allow list"
+            );
+
+            // blossom allow/deny edits the upload allowlist, persisted.
+            let uploader = "cc".repeat(32);
+            let cmd = signed_command_event(
+                relay.secp(),
+                &secret,
+                &format!("/blossom allow {uploader}"),
+                now + 2,
+            );
+            conn.queue_event_value(cmd.clone()).await;
+            conn.flush_pending_events().await;
+            assert!(
+                relay
+                    .blossom_allow
+                    .read()
+                    .await
+                    .iter()
+                    .any(|p| p == &uploader),
+                "blossom allow must add the uploader"
+            );
+            assert!(
+                relay.db.load_blossom_allow().await.contains(&uploader),
+                "the blossom allowlist must be persisted"
+            );
+            let cmd = signed_command_event(
+                relay.secp(),
+                &secret,
+                &format!("/blossom deny {uploader}"),
+                now + 3,
+            );
+            conn.queue_event_value(cmd.clone()).await;
+            conn.flush_pending_events().await;
+            assert!(
+                !relay.blossom_allow.read().await.contains(&uploader),
+                "blossom deny must remove the uploader"
+            );
+
+            // An invalid operand gets an error reply, lists unchanged.
+            let cmd = signed_command_event(relay.secp(), &secret, "/relay allow zzz", now + 4);
+            conn.queue_event_value(cmd.clone()).await;
+            conn.flush_pending_events().await;
+            let replies = stored_replies(&relay, &cmd.id, now + 4).await;
+            assert_eq!(replies.len(), 1);
+            assert!(
+                replies[0].content.starts_with("error: invalid pubkey"),
+                "reply content: {}",
+                replies[0].content
+            );
+            assert!(
+                !relay
+                    .access
+                    .read()
+                    .await
+                    .allowed_pubkeys
+                    .iter()
+                    .any(|(p, _)| p == "zzz"),
+                "an invalid command must not change the lists"
+            );
+
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn command_events_require_flag_and_owner_author() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let secret = "aa".repeat(32);
+            let relay = build_relay_with(&secret).await; // flag defaults to false
+            relay.config.write().await.relay.pubkey = pubkey_of_secret(relay.secp(), &secret);
+            let mut conn = build_conn_on(relay.clone()).await;
+            let now = unix_now();
+            let target = "bb".repeat(32);
+
+            // Flag off: the note is stored, but nothing is executed.
+            let cmd = signed_command_event(
+                relay.secp(),
+                &secret,
+                &format!("/relay allow {target}"),
+                now,
+            );
+            conn.queue_event_value(cmd.clone()).await;
+            conn.flush_pending_events().await;
+            assert!(
+                relay.access.read().await.allowed_pubkeys.is_empty(),
+                "no list change while the flag is off"
+            );
+            assert!(stored_replies(&relay, &cmd.id, now).await.is_empty());
+
+            // A different author cannot run commands even with the flag on.
+            relay.config.write().await.relay.enabled_command_events = true;
+            let impostor = signed_note(
+                relay.secp(),
+                &format!("/relay allow {target}"),
+                now + 1,
+                vec![],
+            );
+            conn.queue_event_value(impostor.clone()).await;
+            conn.flush_pending_events().await;
+            assert!(
+                relay.access.read().await.allowed_pubkeys.is_empty(),
+                "a non-owner cannot run commands"
+            );
+            assert!(
+                stored_replies(&relay, &impostor.id, now + 1)
+                    .await
+                    .is_empty()
+            );
+
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn command_deny_applies_to_live_connections_immediately() {
+        // A `/relay deny` command must take effect on an already-open
+        // connection without disconnecting it: new REQs/COUNTs are refused
+        // and live delivery stops, but the connection stays up.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let secret = "aa".repeat(32);
+            let relay = build_relay_with(&secret).await;
+            relay.config.write().await.relay.pubkey = pubkey_of_secret(relay.secp(), &secret);
+            relay.config.write().await.relay.enabled_command_events = true;
+            let mut operator = build_conn_on(relay.clone()).await;
+            let victim = "cc".repeat(32);
+            let mut victim_conn = build_conn_on(relay.clone()).await;
+            victim_conn.authed_pubkeys = vec![victim.clone()];
+            let now = unix_now();
+
+            // The victim reads fine before the command...
+            victim_conn
+                .handle_req(&[json!("sub"), json!({"kinds": [1]})])
+                .await;
+            assert!(
+                !outgoing_json(&victim_conn)
+                    .iter()
+                    .any(|m| m[0] == "CLOSED" && m[1] == "sub"),
+                "the victim may subscribe before the deny"
+            );
+
+            // ...the operator runs /relay deny...
+            let cmd =
+                signed_command_event(relay.secp(), &secret, &format!("/relay deny {victim}"), now);
+            operator.queue_event_value(cmd.clone()).await;
+            operator.flush_pending_events().await;
+            assert!(
+                relay
+                    .access
+                    .read()
+                    .await
+                    .blocked_pubkeys
+                    .iter()
+                    .any(|(p, _)| p == &victim),
+                "the deny is applied"
+            );
+
+            // Results queued before the deny are dropped by the pump...
+            victim_conn.pump_pending_reqs();
+            assert!(
+                !outgoing_json(&victim_conn).iter().any(|m| m[0] == "EVENT"),
+                "pre-deny REQ results are dropped after the deny"
+            );
+
+            // ...and the very same connection is refused new reads while
+            // staying connected (no connection-level close is sent).
+            victim_conn.outgoing.clear();
+            victim_conn
+                .handle_req(&[json!("sub2"), json!({"kinds": [1]})])
+                .await;
+            assert!(
+                outgoing_json(&victim_conn).iter().any(|m| m[0] == "CLOSED"
+                    && m[1] == "sub2"
+                    && m[2].as_str().unwrap_or("").starts_with("restricted:")),
+                "the new REQ is refused with restricted"
+            );
+            victim_conn
+                .handle_count(&[json!("cnt"), json!({"kinds": [1]})])
+                .await;
+            assert!(
+                outgoing_json(&victim_conn).iter().any(|m| m[0] == "CLOSED"
+                    && m[1] == "cnt"
+                    && m[2].as_str().unwrap_or("").starts_with("restricted:")),
+                "the COUNT is refused with restricted"
+            );
+            victim_conn.outgoing.clear();
+            let ev = signed_note(relay.secp(), "live", now + 1, vec![]);
+            victim_conn.deliver_live(&ev, &serde_json::to_string(&ev).unwrap_or_default(), None);
+            assert!(
+                !outgoing_json(&victim_conn).iter().any(|m| m[0] == "EVENT"),
+                "live delivery stops for the denied pubkey"
+            );
+
+            operator.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn restrict_relay_gates_reads_to_the_allow_list() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_relay_with(&"aa".repeat(32)).await;
+            let allowed = "bb".repeat(32);
+            {
+                let mut access = relay.access.write().await;
+                access.restrict_relay = true;
+                access
+                    .allowed_pubkeys
+                    .push((allowed.clone(), String::new()));
+            }
+
+            // Anonymous connections cannot read a restricted relay.
+            let mut anon = build_conn_on(relay.clone()).await;
+            anon.handle_req(&[json!("sub"), json!({"kinds": [1]})])
+                .await;
+            assert!(
+                outgoing_json(&anon)
+                    .iter()
+                    .any(|m| m[0] == "CLOSED"
+                        && m[2].as_str().unwrap_or("").starts_with("restricted:")),
+                "anonymous is refused on a restricted relay"
+            );
+
+            // A member of the allow list reads normally...
+            let mut member = build_conn_on(relay.clone()).await;
+            member.authed_pubkeys = vec![allowed.clone()];
+            member
+                .handle_req(&[json!("sub"), json!({"kinds": [1]})])
+                .await;
+            member.pump_pending_reqs();
+            assert!(
+                !outgoing_json(&member).iter().any(|m| m[0] == "CLOSED"),
+                "the allowed member may subscribe"
+            );
+
+            // ...while an authenticated outsider is refused.
+            let mut outsider = build_conn_on(relay.clone()).await;
+            outsider.authed_pubkeys = vec!["dd".repeat(32)];
+            outsider
+                .handle_req(&[json!("sub"), json!({"kinds": [1]})])
+                .await;
+            assert!(
+                outgoing_json(&outsider)
+                    .iter()
+                    .any(|m| m[0] == "CLOSED"
+                        && m[2].as_str().unwrap_or("").starts_with("restricted:")),
+                "an outsider is refused on a restricted relay"
+            );
+
+            // ...but the relay's own pubkey is always admitted, even when
+            // it is not on the allow list (the operator reads command
+            // replies on restricted relays).
+            let mut self_conn = build_conn_on(relay.clone()).await;
+            self_conn.authed_pubkeys = vec![relay.relay_pubkey().unwrap()];
+            self_conn
+                .handle_req(&[json!("sub"), json!({"kinds": [1]})])
+                .await;
+            self_conn.pump_pending_reqs();
+            assert!(
+                !outgoing_json(&self_conn).iter().any(|m| m[0] == "CLOSED"),
+                "the relay's own pubkey may subscribe on a restricted relay"
+            );
+
+            anon.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn command_events_work_on_restricted_relays() {
+        // On a `restrict_relay` relay the allow list gates reads and
+        // writes — but the relay's own pubkey is exempt, so command
+        // events still run and the reply stays readable by the operator.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let secret = "aa".repeat(32);
+            let relay = build_relay_with(&secret).await;
+            relay.config.write().await.relay.pubkey = pubkey_of_secret(relay.secp(), &secret);
+            relay.config.write().await.relay.enabled_command_events = true;
+            {
+                let mut access = relay.access.write().await;
+                access.restrict_relay = true;
+            }
+            let mut conn = build_conn_on(relay.clone()).await;
+            conn.authed_pubkeys = vec![relay.relay_pubkey().unwrap()];
+            let now = unix_now();
+            let target = "bb".repeat(32);
+
+            let cmd = signed_command_event(
+                relay.secp(),
+                &secret,
+                &format!("/relay allow {target}"),
+                now,
+            );
+            conn.queue_event_value(cmd.clone()).await;
+            conn.flush_pending_events().await;
+            assert!(
+                outgoing_json(&conn)
+                    .iter()
+                    .any(|m| m[0] == "OK" && m[1] == cmd.id && m[2] == true),
+                "the command event is accepted on a restricted relay"
+            );
+            assert!(
+                relay
+                    .access
+                    .read()
+                    .await
+                    .allowed_pubkeys
+                    .iter()
+                    .any(|(p, _)| p == &target),
+                "the allow is applied"
+            );
+            let replies = stored_replies(&relay, &cmd.id, now).await;
+            assert_eq!(replies.len(), 1, "the reply is stored");
+            assert!(
+                replies[0]
+                    .content
+                    .contains(&format!("/relay allow {target}")),
+                "reply content: {}",
+                replies[0].content
             );
 
             conn.relay.db.shutdown();

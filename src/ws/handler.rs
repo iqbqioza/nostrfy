@@ -345,6 +345,15 @@ impl super::Conn {
             );
             return;
         }
+        // The access lists gate reading too: a denied pubkey is never
+        // served (even when authenticated), and `restrict_relay` narrows
+        // subscriptions to the allow list. Changes made by command events
+        // (or NIP-86) apply to this connection immediately — the list is
+        // read fresh per message, no reconnect needed.
+        if !self.access_allows_read().await {
+            self.send_closed(sub_id, "restricted: you are not allowed to subscribe");
+            return;
+        }
         if self.subs.len() >= max_subscriptions {
             self.send_closed(sub_id, "error: too many subscriptions");
             return;
@@ -580,6 +589,10 @@ impl super::Conn {
             self.send_closed(sub_id, "auth-required: please authenticate before counting");
             return;
         }
+        if !self.access_allows_read().await {
+            self.send_closed(sub_id, "restricted: you are not allowed to count");
+            return;
+        }
         let mut filters = Vec::new();
         for f in &rest[1..] {
             let mut f = f.clone();
@@ -667,6 +680,63 @@ impl super::Conn {
     /// authenticated pubkey (NIP-70 protected, NIP-59 gift-wrap recipient,
     /// NIP-78 owner, NIP-29 privacy-gated group member). Drives the NIP-67
     /// `"auth"` EOSE hint.
+    /// Whether this connection may read at all: a denied pubkey is never
+    /// served (even when authenticated), and with `restrict_relay` only
+    /// allow-listed pubkeys are served — anonymous connections are then
+    /// refused too. The list is read fresh on every message, so changes
+    /// made by command events or NIP-86 apply to live connections without
+    /// a reconnect.
+    pub(crate) async fn access_allows_read(&self) -> bool {
+        let access = self.relay.access.read().await;
+        // The relay's own pubkey and the admin pubkey (`relay.pubkey`)
+        // are always admitted: the operator must be able to read
+        // command-event replies on restricted relays.
+        let admin = self.relay.config.read().await.relay.pubkey.clone();
+        if self.is_operator_pubkey(&admin) {
+            return true;
+        }
+        if self.authed_pubkeys.is_empty() {
+            !access.restrict_relay
+        } else {
+            self.authed_pubkeys
+                .iter()
+                .any(|pk| access.allows_pubkey(pk))
+        }
+    }
+
+    /// Non-blocking variant for the hot live-delivery path: skips the
+    /// check (fail-open, re-checked on the next event) only when a list
+    /// is momentarily contended.
+    pub(crate) fn access_allows_read_sync(&self) -> bool {
+        let Ok(access) = self.relay.access.try_read() else {
+            return true;
+        };
+        // `relay.pubkey` is SIGHUP-reloadable, so it is read without
+        // blocking the hot path (fail-open, re-checked per event).
+        let Ok(cfg) = self.relay.config.try_read() else {
+            return true;
+        };
+        if self.is_operator_pubkey(&cfg.relay.pubkey) {
+            return true;
+        }
+        if self.authed_pubkeys.is_empty() {
+            !access.restrict_relay
+        } else {
+            self.authed_pubkeys
+                .iter()
+                .any(|pk| access.allows_pubkey(pk))
+        }
+    }
+
+    /// Whether any authenticated pubkey is an operator identity: the
+    /// relay's own key or the admin pubkey (`relay.pubkey`).
+    fn is_operator_pubkey(&self, admin: &str) -> bool {
+        self.authed_pubkeys.iter().any(|pk| {
+            self.relay.relay_pubkey.as_ref().is_some_and(|r| r == pk)
+                || admin.eq_ignore_ascii_case(pk)
+        })
+    }
+
     pub(crate) fn auth_hidden_behind(&self, groups: &nip29::GroupStore, event: &Event) -> bool {
         // NIP-70: protected events are served to any authenticated client.
         if !self.is_authed() && nip70::is_protected(event) {
@@ -743,6 +813,13 @@ impl super::Conn {
     ) {
         // Fast path: most connections have no subscriptions.
         if self.subs.is_empty() {
+            return;
+        }
+        // The access lists gate live delivery too: a pubkey that was
+        // denied (or a connection that `restrict_relay` no longer admits)
+        // stops receiving events immediately — the list is read per event,
+        // no reconnect needed.
+        if !self.access_allows_read_sync() {
             return;
         }
         // NIP-70: protected events are only delivered to authenticated

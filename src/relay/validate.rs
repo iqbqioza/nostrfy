@@ -108,8 +108,17 @@ impl super::Relay {
         {
             return Precheck::Vanish;
         }
-        // Access control: blocked/allowlisted pubkeys and kinds.
-        if !access.allows_pubkey(&event.pubkey) {
+        // Access control: blocked/allowlisted pubkeys and kinds. The relay's
+        // own pubkey and the admin pubkey (`relay.pubkey`) are exempt:
+        // the operator must be able to publish command events even when
+        // the relay is restricted to an allow list that does not include
+        // them (the signed internal events bypass this path entirely).
+        let is_operator = self
+            .relay_pubkey
+            .as_ref()
+            .is_some_and(|pk| pk == &event.pubkey)
+            || cfg.relay.pubkey.eq_ignore_ascii_case(&event.pubkey);
+        if !is_operator && !access.allows_pubkey(&event.pubkey) {
             return Precheck::Reject("blocked: pubkey not allowed".into());
         }
         if !access.allows_kind(event.kind) {
