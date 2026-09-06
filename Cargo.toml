@@ -31,6 +31,9 @@ sha2 = "0.10"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "sync", "fs"] }
 tower = { version = "0.5", features = ["util"] }
 toml = "0.8"
+# `nostrfy upgrade`: fetches the latest release binary (and the latest
+# version tag) over HTTPS with rustls; no other network use.
+ureq = { version = "2", default-features = false, features = ["tls", "gzip"] }
 
 # Release build tuning: full LTO across all crates, single codegen unit and
 # stripped symbols give the best runtime performance and the smallest binary

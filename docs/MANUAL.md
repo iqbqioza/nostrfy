@@ -334,9 +334,8 @@ All commands accept `--config <path>` (default: `nostrfy.toml`).
 
 | Command | Description |
 | --- | --- |
-| `nostrfy init` | Write a default config file (refuses to overwrite an existing one) |
-| `nostrfy genkey` | Generate a secret key for NIP-29 groups and write it into `relay.private_key`. Asks for confirmation (y/N) if a key already exists. Also prints the public key (the NIP-11 `self`). The config file is restricted to `0600` after the write (it now contains a secret) |
 | `nostrfy init` | Write a default `nostrfy.toml` and exit. The file is created `0600` — it will hold secrets later (the private key, S3 keys, the management token) |
+| `nostrfy genkey` | Generate a secret key for NIP-29 groups and write it into `relay.private_key`. Asks for confirmation (y/N) if a key already exists. Also prints the public key (the NIP-11 `self`). The config file is restricted to `0600` after the write (it now contains a secret) |
 | `nostrfy check` | Validate the config file (run before starting) |
 | `nostrfy start` | Start as a daemon (`--foreground` to run in the terminal) |
 | `nostrfy stop` | Stop the running daemon |
@@ -344,6 +343,7 @@ All commands accept `--config <path>` (default: `nostrfy.toml`).
 | `nostrfy stats` | Show live statistics |
 | `nostrfy blossom allow <pubkey>` / `deny <pubkey>` / `list` | Manage the Blossom upload allowlist (persisted in LMDB; the running relay applies it on SIGHUP) |
 | `nostrfy relay allow <pubkey>` / `deny <pubkey>` / `list` | Manage the relay pubkey allow/deny lists (persisted in LMDB; a denied pubkey is always rejected when publishing and never served when reading; the running relay applies changes on SIGHUP) |
+| `nostrfy upgrade [version]` | Update the relay binary to the latest GitHub release, or to the given version. Downloads the asset for this platform (`nostrfy-linux-x86_64`, `-aarch64` or `-freebsd-x86_64`), verifies it runs (`--version` probe) and atomically replaces the binary — a crash mid-upgrade keeps the old binary. Never downgrades a newer local build unless a version is given explicitly; `--force` reinstalls the current version. A running daemon keeps the old binary until `nostrfy restart` |
 
 ### Inbox/outbox subscription filters
 

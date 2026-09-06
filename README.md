@@ -280,6 +280,7 @@ nostrfy blossom list
 | `nostrfy check` | Validate `nostrfy.toml` and exit |
 | `nostrfy blossom allow <pubkey>` / `deny <pubkey>` / `list` | Manage the Blossom upload allowlist (persisted in LMDB, applied on SIGHUP) |
 | `nostrfy relay allow <pubkey>` / `deny <pubkey>` / `list` | Manage the relay pubkey allow/deny lists (persisted in LMDB, applied on SIGHUP) |
+| `nostrfy upgrade [version]` | Update the relay binary to the latest GitHub release (or a given version): downloads the asset for this platform, verifies it runs and atomically replaces the binary (`--force` reinstalls the current version; a running daemon needs `nostrfy restart` to pick it up) |
 
 All commands accept `--config <path>` (default `./nostrfy.toml`).
 

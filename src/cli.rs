@@ -61,6 +61,19 @@ pub enum Command {
         #[command(subcommand)]
         action: RelayAction,
     },
+    /// Update the relay binary to the latest release (or a given version).
+    ///
+    /// Downloads the GitHub release asset for this platform and atomically
+    /// replaces the running binary; the new version applies on the next
+    /// start (or after `nostrfy restart` when a daemon is running).
+    #[command(name = "upgrade")]
+    Upgrade {
+        /// Version to install (e.g. "0.1.3"; default: the latest release).
+        version: Option<String>,
+        /// Reinstall even when the binary is already at the target version.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -118,6 +131,7 @@ impl Cli {
             }
             Command::Blossom { action } => return self.blossom_allowlist(action),
             Command::Relay { action } => return self.relay_access(action),
+            Command::Upgrade { version, force } => return self.upgrade(version.as_deref(), *force),
             _ => {}
         }
 
@@ -430,6 +444,136 @@ impl Cli {
         Ok(())
     }
 
+    /// `nostrfy upgrade`: replaces the relay binary with a GitHub release
+    /// asset (the version given on the command line, or the latest release).
+    /// The download is written to a temp file next to the current
+    /// executable, verified by running `--version` on it, and atomically
+    /// renamed over the binary — a crash mid-upgrade leaves the old binary
+    /// intact. A running daemon keeps using the old file (already mapped);
+    /// the operator is reminded to `restart` to apply the update.
+    fn upgrade(&self, version: Option<&str>, force: bool) -> Result<()> {
+        const REPO: &str = "iqbqioza/nostrfy";
+        const MAX_ASSET_BYTES: u64 = 256 * 1024 * 1024;
+
+        let current = env!("CARGO_PKG_VERSION");
+        let Some(asset) = upgrade_asset_name(std::env::consts::OS, std::env::consts::ARCH) else {
+            return Err(Error::Config(format!(
+                "upgrade is not supported on {}-{}; install manually from \
+                 https://github.com/{REPO}/releases",
+                std::env::consts::OS,
+                std::env::consts::ARCH
+            )));
+        };
+        let target = match version {
+            Some(v) => v.trim_start_matches('v').to_string(),
+            None => latest_release_version(REPO)?,
+        };
+        let tag = format!("v{target}");
+        if target == current {
+            if !force {
+                print_line(&format!(
+                    "nostrfy {current} is already the latest version; use --force to reinstall"
+                ));
+                flush_stdout();
+                return Ok(());
+            }
+        } else if version.is_none() && version_gt(current, &target) {
+            // No explicit version: never downgrade a newer local build to
+            // the latest release (e.g. a dev build newer than the newest
+            // published tag).
+            print_line(&format!(
+                "the installed binary ({current}) is newer than the latest release ({target}); \
+                 nothing to upgrade"
+            ));
+            flush_stdout();
+            return Ok(());
+        }
+        if target != current {
+            print_line(&format!("upgrading nostrfy {current} -> {target}"));
+        } else {
+            print_line(&format!("reinstalling nostrfy {target}"));
+        }
+        let exe = std::env::current_exe().map_err(Error::Io)?;
+        let dir = exe
+            .parent()
+            .ok_or_else(|| Error::Other("cannot locate the binary's directory".into()))?;
+        let tmp = dir.join(format!(".nostrfy-upgrade-{}-tmp", std::process::id()));
+        let url = format!("https://github.com/{REPO}/releases/download/{tag}/{asset}");
+        print_line(&format!("downloading {url} ..."));
+        flush_stdout();
+        let result = (|| -> Result<()> {
+            let response = ureq::get(&url)
+                .set("User-Agent", "nostrfy-upgrade")
+                .call()
+                .map_err(|e| Error::Other(format!("download failed: {e}")))?;
+            if response.status() != 200 {
+                return Err(Error::Other(format!(
+                    "download failed: HTTP {}",
+                    response.status()
+                )));
+            }
+            let mut reader = response.into_reader();
+            let mut out = std::fs::File::create(&tmp).map_err(Error::Io)?;
+            // Stream with a hard byte cap: the trait-object reader cannot
+            // be `take()`d, and a huge (or hostile) response must not be
+            // buffered or written out unbounded.
+            let mut buf = [0u8; 64 * 1024];
+            let mut copied: u64 = 0;
+            use std::io::{Read, Write};
+            loop {
+                let n = reader.read(&mut buf).map_err(Error::Io)?;
+                if n == 0 {
+                    break;
+                }
+                copied += n as u64;
+                if copied > MAX_ASSET_BYTES {
+                    return Err(Error::Other("the downloaded binary is too large".into()));
+                }
+                out.write_all(&buf[..n]).map_err(Error::Io)?;
+            }
+            // Make it executable and prove it runs before replacing the
+            // live binary: a corrupt or truncated download must not clobber
+            // a working relay.
+            let mut perms = out.metadata().map_err(Error::Io)?.permissions();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                perms.set_mode(0o755);
+            }
+            out.set_permissions(perms).map_err(Error::Io)?;
+            drop(out);
+            let probe = std::process::Command::new(&tmp)
+                .arg("--version")
+                .output()
+                .map_err(|e| Error::Other(format!("downloaded binary does not run: {e}")))?;
+            if !probe.status.success() {
+                return Err(Error::Other(
+                    "downloaded binary failed its version check; keeping the current binary".into(),
+                ));
+            }
+            std::fs::rename(&tmp, &exe).map_err(Error::Io)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        result?;
+        print_line(&format!("replaced {} with nostrfy {target}", exe.display()));
+        // A running daemon has the old binary mapped already: tell the
+        // operator to restart to apply the update.
+        if self.config.exists()
+            && let Ok(cfg) = self.load_config()
+            && let Some(pid) = running_pid(&cfg.daemon.pid_file)
+        {
+            print_line(&format!(
+                "a daemon is running (pid {pid}) and still uses the old binary; \
+                 run 'nostrfy restart' to apply the update"
+            ));
+        }
+        flush_stdout();
+        Ok(())
+    }
+
     /// `nostrfy genkey`: generates a relay secret key (for NIP-29 group
     /// metadata and NIP-43 membership events) and writes it into
     /// `relay.private_key` of the config file, preserving the rest of the
@@ -540,6 +684,58 @@ fn init_config(path: &Path) -> Result<()> {
         Err(e) => return Err(e),
     }
     Ok(())
+}
+
+/// Parses "X.Y.Z" into numeric parts, for the upgrade version comparison.
+fn version_parse(v: &str) -> Option<(u64, u64, u64)> {
+    let parts: Vec<&str> = v.split('.').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    Some((
+        parts[0].parse().ok()?,
+        parts[1].parse().ok()?,
+        parts[2].parse().ok()?,
+    ))
+}
+
+/// Whether `a` is strictly newer than `b` (numeric X.Y.Z comparison;
+/// unparsable versions compare as equal, so a bad tag never triggers an
+/// unwanted downgrade).
+fn version_gt(a: &str, b: &str) -> bool {
+    let (Some(a), Some(b)) = (version_parse(a), version_parse(b)) else {
+        return false;
+    };
+    a > b
+}
+
+/// The GitHub release asset name for a platform, mirroring install.sh
+/// (e.g. "nostrfy-linux-x86_64"). `None` when the platform has no
+/// prebuilt asset.
+fn upgrade_asset_name(os: &str, arch: &str) -> Option<String> {
+    let asset = match (os, arch) {
+        ("linux", "x86_64") => "nostrfy-linux-x86_64",
+        ("linux", "aarch64") => "nostrfy-linux-aarch64",
+        ("freebsd", "x86_64") => "nostrfy-freebsd-x86_64",
+        _ => return None,
+    };
+    Some(asset.into())
+}
+
+/// The tag of the latest GitHub release (without the leading "v").
+fn latest_release_version(repo: &str) -> Result<String> {
+    let url = format!("https://api.github.com/repos/{repo}/releases/latest");
+    let response = ureq::get(&url)
+        .set("User-Agent", "nostrfy-upgrade")
+        .call()
+        .map_err(|e| Error::Other(format!("cannot query the latest release: {e}")))?;
+    let value: serde_json::Value = serde_json::from_reader(response.into_reader())
+        .map_err(|e| Error::Other(format!("invalid release response: {e}")))?;
+    value
+        .get("tag_name")
+        .and_then(serde_json::Value::as_str)
+        .map(|t| t.trim_start_matches('v').to_string())
+        .ok_or_else(|| Error::Other("the release response has no tag_name".into()))
 }
 
 /// Generates a random secp256k1 secret key as lowercase hex (64 chars),
@@ -801,6 +997,35 @@ mod tests {
     use super::*;
 
     const KEY: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+
+    #[test]
+    fn upgrade_asset_names_cover_the_release_platforms() {
+        assert_eq!(
+            upgrade_asset_name("linux", "x86_64").as_deref(),
+            Some("nostrfy-linux-x86_64")
+        );
+        assert_eq!(
+            upgrade_asset_name("linux", "aarch64").as_deref(),
+            Some("nostrfy-linux-aarch64")
+        );
+        assert_eq!(
+            upgrade_asset_name("freebsd", "x86_64").as_deref(),
+            Some("nostrfy-freebsd-x86_64")
+        );
+        assert!(upgrade_asset_name("windows", "x86_64").is_none());
+        assert!(upgrade_asset_name("linux", "riscv64").is_none());
+    }
+
+    #[test]
+    fn upgrade_version_comparison() {
+        assert!(version_gt("0.1.4", "0.1.3"));
+        assert!(version_gt("0.2.0", "0.1.99"));
+        assert!(version_gt("1.0.0", "0.9.9"));
+        assert!(!version_gt("0.1.3", "0.1.3"));
+        assert!(!version_gt("0.1.2", "0.1.3"));
+        // Unparsable versions never trigger a downgrade.
+        assert!(!version_gt("dev", "0.1.3"));
+    }
 
     #[test]
     fn genkey_writes_private_key_with_0600_permissions() {
