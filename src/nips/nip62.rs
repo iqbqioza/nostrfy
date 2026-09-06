@@ -81,8 +81,14 @@ pub fn tag_matches(tag: &str, identity: &RelayIdentity<'_>) -> bool {
         // A bare host (no scheme) has no default port: keep the lenient
         // any-port behavior.
         (None, Some(op)) => scheme_default_port(tag_scheme.as_deref()).is_none_or(|dp| dp == op),
+        // Mirror case: a tag with an explicit port matches a portless
+        // relay identity when the port is the scheme's default (`wss://
+        // host:443` ≡ the relay's portless `wss://host`). Without this a
+        // NIP-62 vanish / NIP-42 auth / NIP-98 admin event tagging an
+        // explicit default port would be ignored whenever the operator
+        // left the port off `relay.public_url`.
+        (Some(tp), None) => scheme_default_port(tag_scheme.as_deref()).is_none_or(|dp| dp == tp),
         (None, None) => true,
-        (Some(_), None) => false,
     }
 }
 

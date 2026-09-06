@@ -100,6 +100,14 @@ impl BlobStore {
         // committed).
         self.check_space()?;
         let uploaded = crate::util::unix_now() as i64;
+        // Whether the uploader already owned the blob BEFORE this upload
+        // (read before the add: a failed re-upload of identical bytes must
+        // not roll back their pre-existing, valid mapping).
+        let was_owner = self
+            .db
+            .blossom_load(sha256)
+            .await
+            .is_some_and(|m| m.owners.iter().any(|o| o == pubkey));
         // The mapping must land first: without it the file would be an
         // unreachable orphan. Abort the upload when the commit fails.
         if !self
@@ -112,9 +120,28 @@ impl BlobStore {
             ));
         }
         let npub = npub_of(pubkey);
-        match &self.storage {
-            Storage::Local(s) => s.put(&npub, sha256, bytes, mime, uploaded).await?,
-            Storage::S3(s) => s.put(&npub, sha256, bytes, mime, uploaded).await?,
+        let stored = match &self.storage {
+            Storage::Local(s) => s.put(&npub, sha256, bytes, mime, uploaded).await,
+            Storage::S3(s) => s.put(&npub, sha256, bytes, mime, uploaded).await,
+        };
+        if let Err(e) = stored {
+            // Roll the owner mapping back: a failed PUT must not leave a
+            // mapping pointing at an object that was never stored (an
+            // unreachable, billed orphan) — but only when this upload
+            // created the mapping (a failed re-upload keeps the
+            // pre-existing valid mapping).
+            //
+            // Known race (accepted, astronomically rare): two concurrent
+            // FIRST uploads of the same bytes by the same owner both read
+            // `was_owner = false`; if exactly one storage write then
+            // fails, its rollback removes the owner mapping the other
+            // upload just committed (the stored blob stays unmapped until
+            // a re-upload). The add/remove are separate LMDB transactions,
+            // so the read-check-act is not atomic.
+            if !was_owner {
+                self.db.blossom_remove_owner(sha256, pubkey).await;
+            }
+            return Err(e);
         }
         Ok(Descriptor {
             sha256: sha256.to_string(),
@@ -662,7 +689,7 @@ mod tests {
     async fn db(tmp: &str) -> (DbClient, std::path::PathBuf) {
         let cfg = crate::config::DatabaseConfig {
             path: std::env::temp_dir().join(format!(
-                "nostrd-blossom-store-test-{tmp}-{}",
+                "nostrfy-blossom-store-test-{tmp}-{}",
                 std::process::id()
             )),
             ..Default::default()
@@ -720,7 +747,7 @@ mod tests {
     async fn store(tmp: &str) -> (BlobStore, std::path::PathBuf) {
         let (db, db_path) = db(tmp).await;
         let dir =
-            std::env::temp_dir().join(format!("nostrd-blossom-test-{tmp}-{}", std::process::id()));
+            std::env::temp_dir().join(format!("nostrfy-blossom-test-{tmp}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let s = BlobStore::new("local", &dir, 0, None, db).await.unwrap();
         (s, db_path)
@@ -779,8 +806,10 @@ mod tests {
         s.put(&a, &sha, bytes, "text/plain").await.unwrap();
         let npub_a = npub_of(&a);
         assert_eq!(read_all(&s, &npub_a, &sha).await.unwrap(), bytes);
-        let npub_dir =
-            std::env::temp_dir().join(format!("nostrd-blossom-test-atomic-{}", std::process::id()));
+        let npub_dir = std::env::temp_dir().join(format!(
+            "nostrfy-blossom-test-atomic-{}",
+            std::process::id()
+        ));
         let dir = npub_dir.join(&npub_a);
         let entries = std::fs::read_dir(&dir).unwrap();
         let names: Vec<String> = entries
@@ -798,7 +827,7 @@ mod tests {
             let sha = "cd".repeat(32);
             // A margin above any real free space: the put is refused.
             let dir = std::env::temp_dir()
-                .join(format!("nostrd-blossom-test-full-{}", std::process::id()));
+                .join(format!("nostrfy-blossom-test-full-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             let full = crate::server::blossom::storage::BlobStore::new(
                 "local",
@@ -883,7 +912,7 @@ mod tests {
             s.put(&a, &sha, b"real", "text/plain").await.unwrap();
             // Replace the blob file with a symlink to an external file.
             let external = std::env::temp_dir().join(format!(
-                "nostrd-blossom-symlink-external-{}",
+                "nostrfy-blossom-symlink-external-{}",
                 std::process::id()
             ));
             std::fs::write(&external, b"secret").unwrap();
@@ -910,8 +939,10 @@ mod tests {
             let npub = npub_of(&a);
             s.put(&a, &sha, b"real", "text/plain").await.unwrap();
             // Point the npub directory at an external directory.
-            let external = std::env::temp_dir()
-                .join(format!("nostrd-blossom-symlink-dir-{}", std::process::id()));
+            let external = std::env::temp_dir().join(format!(
+                "nostrfy-blossom-symlink-dir-{}",
+                std::process::id()
+            ));
             let _ = std::fs::remove_dir_all(&external);
             std::fs::create_dir_all(&external).unwrap();
             std::fs::write(external.join("victim"), b"keep me").unwrap();
@@ -942,7 +973,7 @@ mod tests {
             let npub = npub_of(&a);
             // Point the npub directory at an external directory.
             let external = std::env::temp_dir().join(format!(
-                "nostrd-blossom-symlink-write-{}",
+                "nostrfy-blossom-symlink-write-{}",
                 std::process::id()
             ));
             let _ = std::fs::remove_dir_all(&external);
@@ -960,6 +991,10 @@ mod tests {
             assert!(
                 s.open_stream(&npub, &sha, 0, 1).await.unwrap().is_none(),
                 "the blob must not be readable through the symlink"
+            );
+            assert!(
+                s.find(&sha).await.is_none(),
+                "the failed upload must roll back its owner mapping (no orphan)"
             );
             let _ = std::fs::remove_dir_all(&external);
             s.db.shutdown();
@@ -990,8 +1025,10 @@ mod tests {
             assert_eq!(buf, b"second", "the stale temp must be overwritten");
             // A symlink at the temp path: the write is refused, the link
             // (not its target) is removed.
-            let external = std::env::temp_dir()
-                .join(format!("nostrd-blossom-symlink-tmp-{}", std::process::id()));
+            let external = std::env::temp_dir().join(format!(
+                "nostrfy-blossom-symlink-tmp-{}",
+                std::process::id()
+            ));
             std::fs::write(&external, b"precious").unwrap();
             // The second put's rename consumed the temp: plant a fresh
             // symlink at the temp path.
@@ -1007,6 +1044,12 @@ mod tests {
                 b"precious",
                 "the symlink target must be untouched"
             );
+            // A failed re-upload must keep the uploader's pre-existing,
+            // valid mapping (the blob from the second put is still there).
+            assert!(
+                s.find(&sha).await.is_some(),
+                "a failed re-upload must not roll back the existing mapping"
+            );
             std::fs::remove_file(&external).unwrap();
             s.db.shutdown();
         });
@@ -1020,7 +1063,7 @@ mod tests {
             // An external directory looks like a legacy store: it must
             // not be scanned through a symlinked npub directory.
             let external = std::env::temp_dir().join(format!(
-                "nostrd-blossom-symlink-migrate-{}",
+                "nostrfy-blossom-symlink-migrate-{}",
                 std::process::id()
             ));
             let _ = std::fs::remove_dir_all(&external);
@@ -1059,14 +1102,14 @@ mod tests {
             // symlinked meta must not be mapped: their descriptors are
             // not external metadata to leak.
             let external = std::env::temp_dir().join(format!(
-                "nostrd-blossom-symlink-migrate2-{}",
+                "nostrfy-blossom-symlink-migrate2-{}",
                 std::process::id()
             ));
             let _ = std::fs::remove_file(&external);
             std::fs::write(&external, b"secret payload").unwrap();
             std::os::unix::fs::symlink(&external, dir.join("ab".repeat(32))).unwrap();
             let meta = std::env::temp_dir().join(format!(
-                "nostrd-blossom-symlink-migrate2-meta-{}",
+                "nostrfy-blossom-symlink-migrate2-meta-{}",
                 std::process::id()
             ));
             let _ = std::fs::remove_file(&meta);
@@ -1088,8 +1131,10 @@ mod tests {
         // The mapping lives in LMDB: a reopened store (new process, no
         // scan, no index) resolves everything.
         let (db, db_path) = db("reopen").await;
-        let dir =
-            std::env::temp_dir().join(format!("nostrd-blossom-test-reopen-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "nostrfy-blossom-test-reopen-{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         {
             let s = BlobStore::new("local", &dir, 0, None, db).await.unwrap();
@@ -1126,7 +1171,7 @@ mod tests {
     async fn auto_migration_merges_multi_owner_blobs() {
         let (db, db_path) = db("mig2").await;
         let dir =
-            std::env::temp_dir().join(format!("nostrd-blossom-test-mig2-{}", std::process::id()));
+            std::env::temp_dir().join(format!("nostrfy-blossom-test-mig2-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         // レガシー: 同一 blob が 2 つの npub ディレクトリに存在（メタあり）
         let sha = "dd".repeat(32);
@@ -1174,7 +1219,7 @@ mod scan_debug {
     #[tokio::test]
     async fn scan_legacy_finds_legacy_files() {
         let dir =
-            std::env::temp_dir().join(format!("nostrd-blossom-scan-debug-{}", std::process::id()));
+            std::env::temp_dir().join(format!("nostrfy-blossom-scan-debug-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         // The directory name comes from the same npub_of() the uploads use
         // (bech32m) — never handcraft a checksum in the test.

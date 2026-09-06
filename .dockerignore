@@ -1,4 +1,4 @@
 # Only the Fly config template is needed in the build context: the binary
 # is downloaded from GitHub releases, not compiled here.
 *
-!deploy/nostrd.container.toml
+!deploy/nostrfy.container.toml

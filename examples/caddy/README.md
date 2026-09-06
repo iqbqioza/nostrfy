@@ -1,13 +1,13 @@
-# Caddy + nostrd templates
+# Caddy + nostrfy templates
 #
 # Caddyfile      — one relay behind automatic HTTPS
 # Caddyfile.multi— several relays (and a Blossom media server) on one
 #                  machine, each with its own hostname and certificate
-# relay-1.toml   — nostrd config for the first relay (general-purpose
+# relay-1.toml   — nostrfy config for the first relay (general-purpose
 #                  + Blossom for media.example.com)
-# relay-2.toml   — nostrd config for the second relay (groups-focused)
+# relay-2.toml   — nostrfy config for the second relay (groups-focused)
 #
-# The relay itself never terminates TLS: Caddy does. nostrd only
+# The relay itself never terminates TLS: Caddy does. nostrfy only
 # listens on 127.0.0.1 and trusts the X-Forwarded-Proto header Caddy
 # sets (README: "Works behind TLS-terminating proxies").
 #
@@ -19,11 +19,11 @@
 #
 # 2. Copy the configs:
 #      cp Caddyfile /etc/caddy/Caddyfile
-#      cp examples/relay-basic.toml nostrd.toml   # or relay-1.toml
-#      nostrd check
+#      cp examples/relay-basic.toml nostrfy.toml   # or relay-1.toml
+#      nostrfy check
 #
 # 3. Edit the hostname in /etc/caddy/Caddyfile and set relay.public_url
-#    + relay.private_key (nostrd genkey) in nostrd.toml.
+#    + relay.private_key (nostrfy genkey) in nostrfy.toml.
 #
 # 4. Start both services (systemd: `systemctl enable --now caddy`).
 #    Caddy obtains the TLS certificate automatically on first request;
@@ -33,7 +33,7 @@
 #
 # --- Several relays on one server ------------------------------------------
 #
-# Each relay is a separate nostrd process with its own config, port and
+# Each relay is a separate nostrfy process with its own config, port and
 # database. The rule of thumb: one process = one relay = one hostname
 # (the only in-process multiplexing is the Blossom media server, which
 # is routed by the Host header via [blossom] host).
@@ -45,7 +45,7 @@
 #   4. systemctl reload caddy   # pick up the Caddyfile changes
 #
 # Backups, disk space and upgrades apply per relay (each has its own
-# database and logs). To stop one relay, `nostrd --config relay-N.toml
+# database and logs). To stop one relay, `nostrfy --config relay-N.toml
 # stop` — the other keeps running.
 #
 # --- Troubleshooting ------------------------------------------------------

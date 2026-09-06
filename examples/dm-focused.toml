@@ -1,4 +1,4 @@
-# nostrd.toml — DM-focused relay
+# nostrfy.toml — DM-focused relay
 #
 # A relay for private direct messages (NIP-04 legacy kind 4, NIP-17
 # kind 14, NIP-59 gift-wrapped kind 1059). Encrypted content is
@@ -8,17 +8,17 @@
 # envelope store.
 
 [relay]
-name = "nostrd dm"
+name = "nostrfy dm"
 description = "Private direct-message relay"
 pubkey = ""
 private_key = ""            # optional; only needed for NIP-29 metadata
 public_url = "wss://dm.example.com"
 # Only what a DM relay needs: NIP-01 (core), 04 (legacy DMs), 17 (DMs),
 # 42 (auth), 59 (gift wraps), 70 (protected events), 11, 33, 40.
-enabled_nips = [1, 4, 11, 17, 33, 40, 42, 59, 70]
-# Strong privacy default: keep DMs out of NIP-50 search entirely.
-disabled_nips = [50]
+enabled_nips = [1, 4, 11, 17, 33, 40, 42, 59, 70, 78]
 require_auth = false        # true = only authenticated clients may publish
+# DM writers are steady, not bursty.
+max_events_per_min_per_pubkey = 60
 
 [limits]
 # Encrypted envelopes are bigger than plain notes: allow larger bodies
@@ -26,8 +26,6 @@ require_auth = false        # true = only authenticated clients may publish
 max_content_bytes = 131072
 max_tag_value_bytes = 2048
 max_ws_message_bytes = 2097152
-# DM writers are steady, not bursty; keep the default rate limit.
-max_events_per_min_per_pubkey = 60
 # Long-polling DM clients keep connections open.
 ws_idle_timeout_secs = 1800
 

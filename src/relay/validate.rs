@@ -168,6 +168,26 @@ impl super::Relay {
                 if let Some(reason) = reason {
                     return Precheck::Reject(reason);
                 }
+                // The in-memory invite set never forgets a code whose 9009
+                // was NIP-09-deleted or NIP-40-expired (revocation only
+                // takes effect after a restart). A JOIN with a code is
+                // therefore confirmed against the stored, unexpired 9009
+                // before admission — the same visibility the in-memory
+                // check has (a 9009 of the same batch is not committed
+                // yet either way).
+                if event.kind == nip29::JOIN
+                    && let Some(code) = nip29::event_code(event)
+                    && let Some(gid) = nip29::group_id(event)
+                {
+                    let f: Vec<crate::filter::Filter> = serde_json::from_value(serde_json::json!([
+                        { "kinds": [9009], "#h": [gid], "#code": [code] }
+                    ]))
+                    .expect("static filter");
+                    let (stored, _) = self.db.query_req(f, 1, now).await;
+                    if stored.is_empty() {
+                        return Precheck::Reject("restricted: invalid invite code".into());
+                    }
+                }
                 // NIP-29 `previous` timeline references must exist.
                 let mut unknown: Option<&str> = None;
                 for prefix in nip29::previous_tags(event) {
@@ -291,6 +311,14 @@ impl super::Relay {
             Some(false) => return Err("invalid: signature verification failed".to_string()),
             None => nip01::verify(event, self.secp())
                 .map_err(|_| "invalid: signature verification failed".to_string())?,
+        }
+        // NIP-01: hex fields are lowercase by convention. An uppercase-hex
+        // pubkey would be stored verbatim and then never match the
+        // case-sensitive author/tag filters (the event becomes invisible
+        // to clients), while normalizing it would break the id/signature
+        // that were computed over the original string — so reject it.
+        if event.pubkey != event.pubkey.to_ascii_lowercase() {
+            return Err("invalid: pubkey must be lowercase hex".into());
         }
 
         if cfg.nip_enabled(26) && !nip26::verify(event, self.secp()) {
@@ -482,7 +510,7 @@ mod tests {
             let mut cfg = Config::default();
             cfg.database.map_size = 16 * 1024 * 1024;
             cfg.database.max_map_size = 256 * 1024 * 1024;
-            cfg.database.path = std::env::temp_dir().join("nostrd-vanish-test");
+            cfg.database.path = std::env::temp_dir().join("nostrfy-vanish-test");
             let _ = std::fs::remove_dir_all(&cfg.database.path);
             let db = crate::db::DbClient::open(
                 &cfg.database,
@@ -528,7 +556,7 @@ mod tests {
             cfg.relay.max_events_per_min_per_pubkey = 3;
             cfg.database.map_size = 16 * 1024 * 1024;
             cfg.database.max_map_size = 256 * 1024 * 1024;
-            cfg.database.path = std::env::temp_dir().join("nostrd-rate-test");
+            cfg.database.path = std::env::temp_dir().join("nostrfy-rate-test");
             let _ = std::fs::remove_dir_all(&cfg.database.path);
             let db = crate::db::DbClient::open(
                 &cfg.database,
@@ -608,7 +636,7 @@ mod tests {
             let mut cfg = Config::default();
             cfg.database.map_size = 16 * 1024 * 1024;
             cfg.database.max_map_size = 256 * 1024 * 1024;
-            cfg.database.path = std::env::temp_dir().join("nostrd-rate-map-test");
+            cfg.database.path = std::env::temp_dir().join("nostrfy-rate-map-test");
             let _ = std::fs::remove_dir_all(&cfg.database.path);
             let db = crate::db::DbClient::open(
                 &cfg.database,
@@ -643,8 +671,10 @@ mod tests {
                 0,
                 "no window is recorded when the limit is disabled"
             );
-            // The map is bounded: with the limit on, many pubkeys evict the
-            // map instead of growing it.
+            // The map is bounded: with the limit on, many pubkeys are skipped
+            // (never tracked) instead of growing the map, and a full map
+            // must not clear everyone's windows — the first 10k pubkeys
+            // are still rate-limited.
             let mut cfg = Config::default();
             cfg.relay.max_events_per_min_per_pubkey = 1;
             for i in 0..20_000u64 {
@@ -654,6 +684,22 @@ mod tests {
             assert!(
                 relay.publish_rate.lock().unwrap().len() <= 10_000,
                 "the tracked-pubkey map must not exceed its bound"
+            );
+            // A tracked pubkey stays limited while the map is full: its
+            // second event within the 60-second window is rejected.
+            let tracked = format!("{:064x}", 0u64);
+            assert!(
+                !relay.publish_rate_allowed(&cfg, &tracked, unix_now()),
+                "a full map must not reset a tracked pubkey's window"
+            );
+            // A fresh pubkey is skipped (fail-open for it alone) and the
+            // map is never cleared.
+            let fresh = "f".repeat(64);
+            assert!(relay.publish_rate_allowed(&cfg, &fresh, unix_now()));
+            assert_eq!(
+                relay.publish_rate.lock().unwrap().len(),
+                10_000,
+                "the map is never cleared"
             );
             relay.db.shutdown();
         });
@@ -668,7 +714,7 @@ mod tests {
             let mut cfg = Config::default();
             cfg.database.map_size = 16 * 1024 * 1024;
             cfg.database.max_map_size = 256 * 1024 * 1024;
-            cfg.database.path = std::env::temp_dir().join("nostrd-git-test-disabled");
+            cfg.database.path = std::env::temp_dir().join("nostrfy-git-test-disabled");
             let _ = std::fs::remove_dir_all(&cfg.database.path);
             let db = crate::db::DbClient::open(
                 &cfg.database,
@@ -724,7 +770,7 @@ mod tests {
             // enable_git = true: the kinds are accepted.
             let mut cfg2 = Config::default();
             cfg2.relay.enabled_git = true;
-            cfg2.database.path = std::env::temp_dir().join("nostrd-git-test-enabled");
+            cfg2.database.path = std::env::temp_dir().join("nostrfy-git-test-enabled");
             let _ = std::fs::remove_dir_all(&cfg2.database.path);
             let db2 = crate::db::DbClient::open(
                 &cfg2.database,
@@ -776,7 +822,7 @@ mod tests {
             let mut cfg = Config::default();
             cfg.database.map_size = 16 * 1024 * 1024;
             cfg.database.max_map_size = 256 * 1024 * 1024;
-            cfg.database.path = std::env::temp_dir().join("nostrd-ephemeral-test-allow");
+            cfg.database.path = std::env::temp_dir().join("nostrfy-ephemeral-test-allow");
             let _ = std::fs::remove_dir_all(&cfg.database.path);
             let db = crate::db::DbClient::open(
                 &cfg.database,
@@ -833,7 +879,7 @@ mod tests {
             // With reject_ephemeral = true: ephemeral range is blocked.
             let mut cfg2 = Config::default();
             cfg2.relay.reject_ephemeral = true;
-            cfg2.database.path = std::env::temp_dir().join("nostrd-ephemeral-test-reject");
+            cfg2.database.path = std::env::temp_dir().join("nostrfy-ephemeral-test-reject");
             let _ = std::fs::remove_dir_all(&cfg2.database.path);
             let db2 = crate::db::DbClient::open(
                 &cfg2.database,
@@ -934,7 +980,7 @@ mod tests {
             cfg.relay.reject_ephemeral = true;
             cfg.database.map_size = 16 * 1024 * 1024;
             cfg.database.max_map_size = 256 * 1024 * 1024;
-            cfg.database.path = std::env::temp_dir().join("nostrd-ephemeral-validate-base");
+            cfg.database.path = std::env::temp_dir().join("nostrfy-ephemeral-validate-base");
             let _ = std::fs::remove_dir_all(&cfg.database.path);
             let db = crate::db::DbClient::open(
                 &cfg.database,
@@ -989,7 +1035,7 @@ mod tests {
             let mut cfg = Config::default();
             cfg.database.map_size = 16 * 1024 * 1024;
             cfg.database.max_map_size = 256 * 1024 * 1024;
-            cfg.database.path = std::env::temp_dir().join("nostrd-vanish-test");
+            cfg.database.path = std::env::temp_dir().join("nostrfy-vanish-test");
             let _ = std::fs::remove_dir_all(&cfg.database.path);
             let db = crate::db::DbClient::open(
                 &cfg.database,

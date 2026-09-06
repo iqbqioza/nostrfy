@@ -1,4 +1,4 @@
-# nostrd — Fly.io container image
+# nostrfy — Fly.io container image
 #
 # The binary is NOT compiled here: it is downloaded from the GitHub
 # release assets built by the Release workflow (x86_64 and aarch64) and
@@ -11,42 +11,42 @@
 # (fly deploy does this for you.)
 #
 # To pin a specific release instead of the latest:
-#   docker build --build-arg NOSTRD_VERSION=v0.1.0-alpha-01 .
+#   docker build --build-arg NOSTRFY_VERSION=v0.1.3 .
 
 # syntax=docker/dockerfile:1
 
 FROM debian:bookworm-slim
 
 ARG TARGETARCH
-ARG NOSTRD_VERSION
+ARG NOSTRFY_VERSION
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl \
     && case "${TARGETARCH}" in \
-         amd64) ASSET="nostrd-linux-x86_64" ;; \
-         arm64) ASSET="nostrd-linux-aarch64" ;; \
+         amd64) ASSET="nostrfy-linux-x86_64" ;; \
+         arm64) ASSET="nostrfy-linux-aarch64" ;; \
          *) echo "error: unsupported architecture ${TARGETARCH}" >&2; exit 1 ;; \
        esac \
-    && if [ -n "${NOSTRD_VERSION}" ]; then \
-         BASE="https://github.com/iqbqioza/nostrd/releases/download/${NOSTRD_VERSION}"; \
+    && if [ -n "${NOSTRFY_VERSION}" ]; then \
+         BASE="https://github.com/iqbqioza/nostrfy/releases/download/${NOSTRFY_VERSION}"; \
        else \
-         BASE="https://github.com/iqbqioza/nostrd/releases/latest/download"; \
+         BASE="https://github.com/iqbqioza/nostrfy/releases/latest/download"; \
        fi \
     && echo "downloading ${BASE}/${ASSET}" \
     && curl -fsSL "${BASE}/${ASSET}" -o "/tmp/${ASSET}" \
     && curl -fsSL "${BASE}/${ASSET}.sha256" -o "/tmp/${ASSET}.sha256" \
     && (cd /tmp && sha256sum -c "${ASSET}.sha256") \
-    && install -m 0755 "/tmp/${ASSET}" /usr/local/bin/nostrd \
+    && install -m 0755 "/tmp/${ASSET}" /usr/local/bin/nostrfy \
     && rm -f "/tmp/${ASSET}" "/tmp/${ASSET}.sha256" \
     && apt-get purge -y --auto-remove curl \
     && rm -rf /var/lib/apt/lists/*
 
-# The container configuration template (edit deploy/nostrd.container.toml
+# The container configuration template (edit deploy/nostrfy.container.toml
 # before building to set the relay name, public_url and private_key).
-COPY deploy/nostrd.container.toml /etc/nostrd/nostrd.toml
+COPY deploy/nostrfy.container.toml /etc/nostrfy/nostrfy.toml
 
 # LMDB data lives on the Fly volume mounted at /data (see fly.toml).
-RUN mkdir -p /data /etc/nostrd
+RUN mkdir -p /data /etc/nostrfy
 VOLUME ["/data"]
 EXPOSE 8080
-CMD ["nostrd", "--config", "/etc/nostrd/nostrd.toml", "start", "--foreground"]
+CMD ["nostrfy", "--config", "/etc/nostrfy/nostrfy.toml", "start", "--foreground"]

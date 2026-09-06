@@ -1,4 +1,4 @@
-//! `nostrd.toml` configuration: relay identity, server binding,
+//! `nostrfy.toml` configuration: relay identity, server binding,
 //! limits, database, daemon paths and NIP toggles.
 
 use std::path::{Path, PathBuf};
@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 
-pub const DEFAULT_CONFIG: &str = "nostrd.toml";
+pub const DEFAULT_CONFIG: &str = "nostrfy.toml";
 
 /// NIPs advertised in the NIP-11 document. NIPs whose behaviour is purely
 /// client-side are generally not advertised (NIP-11: "Client-side NIPs SHOULD
@@ -19,9 +19,10 @@ pub const DEFAULT_CONFIG: &str = "nostrd.toml";
 /// `relay.enabled_git` is set (the kinds are rejected otherwise). NIP-A3
 /// (kind 10133) is served but cannot be advertised: it is a `draft` with no
 /// integer identifier and NIP-11's `supported_nips` is an array of integer
-/// identifiers. The remaining file-storage NIPs (95/96 HTTP file storage)
-/// are excluded per the project rules (Blossom is provided separately by
-/// the `[blossom]` file server). NIP-33 was merged into NIP-01 but remains
+/// identifiers. File storage is covered too: NIP-94 (file metadata) is
+/// stored and served like any other event, and NIP-96 (Blossom) is served
+/// by the dedicated `[blossom]` file server; only NIP-95 (plain HTTP file
+/// storage) is not implemented. NIP-33 was merged into NIP-01 but remains
 /// advertised for clients that check it.
 pub const RELAY_NIPS: &[u16] = &[
     1, 9, 11, 13, 17, 22, 26, 29, 32, 33, 34, 40, 42, 43, 45, 46, 47, 50, 57, 59, 62, 65, 66, 67,
@@ -82,7 +83,7 @@ pub struct BlossomConfig {
     pub s3_secret_key: String,
     /// When true, only the pubkeys in the Blossom upload allowlist may
     /// upload blobs. The allowlist itself lives in the relay database
-    /// (LMDB), managed with `nostrd blossom allow/deny`.
+    /// (LMDB), managed with `nostrfy blossom allow/deny`.
     pub restrict_uploads: bool,
 }
 
@@ -156,12 +157,13 @@ pub struct RelayConfig {
     /// require the NIP-42 AUTH flow before they are accepted, and are only
     /// served to the authenticated owner (the event author's pubkey).
     pub enabled_nip78_auth: bool,
-    /// When true, kind:1 events authored by the relay's own pubkey
-    /// (`relay.private_key`) are executed as operator commands: content
-    /// "relay allow/deny <npub1...|hex>" edits the relay access lists and
-    /// "blossom allow/deny <npub1...|hex>" edits the Blossom upload
+    /// When true, kind:1 events authored by the admin pubkey (`relay.pubkey`)
+    /// are executed as operator commands: content
+    /// "/relay allow/deny <npub1...|hex>" edits the relay access lists and
+    /// "/blossom allow/deny <npub1...|hex>" edits the Blossom upload
     /// allowlist, without the CLI. The relay answers each command with a
-    /// relay-signed kind:1111 event (tagged to the command).
+    /// kind:1111 event signed with `relay.private_key` (tagged to the
+    /// command).
     pub enabled_command_events: bool,
 }
 
@@ -372,7 +374,7 @@ pub struct DaemonConfig {
 impl Default for RelayConfig {
     fn default() -> Self {
         RelayConfig {
-            name: "nostrd".into(),
+            name: "nostrfy".into(),
             description: "A minimal and stable Nostr relay".into(),
             pubkey: String::new(),
             contact: String::new(),
@@ -487,9 +489,9 @@ impl Default for DatabaseConfig {
 impl Default for DaemonConfig {
     fn default() -> Self {
         DaemonConfig {
-            pid_file: PathBuf::from("./nostrd.pid"),
-            log_file: PathBuf::from("./nostrd.log"),
-            stats_file: PathBuf::from("./nostrd.stats.json"),
+            pid_file: PathBuf::from("./nostrfy.pid"),
+            log_file: PathBuf::from("./nostrfy.log"),
+            stats_file: PathBuf::from("./nostrfy.stats.json"),
             stats_interval_secs: 5,
             max_log_size_bytes: 50 * 1024 * 1024,
             max_log_files: 5,
@@ -910,7 +912,7 @@ impl Config {
     }
 
     /// Validates the configuration values. Returns a clear error message for
-    /// the first problem found, so `nostrd check` and startup fail fast
+    /// the first problem found, so `nostrfy check` and startup fail fast
     /// instead of misbehaving at runtime with a typo'd key or an impossible
     /// database layout.
     pub fn validate(&self) -> Result<()> {
@@ -1196,7 +1198,7 @@ impl Config {
             log::warn!(
                 "relay.private_key is empty while NIP-29 is enabled: the relay cannot sign \
                  group metadata (39000-39005), so 39001 (admins) / 39002 (members) snapshots \
-                 are not generated at group creation; run 'nostrd genkey' to set a key"
+                 are not generated at group creation; run 'nostrfy genkey' to set a key"
             );
         }
 
@@ -1213,7 +1215,7 @@ impl Config {
             if self.relay.private_key.trim().is_empty() {
                 log::warn!(
                     "relay.enabled_command_events is true but relay.private_key is empty: \
-                     the kind:1111 replies cannot be signed; run 'nostrd genkey' to set a key"
+                     the kind:1111 replies cannot be signed; run 'nostrfy genkey' to set a key"
                 );
             }
         }
@@ -1266,7 +1268,7 @@ fn bare_host_has_port(host: &str) -> bool {
 }
 
 /// Whether a string is a 64-hex pubkey or a parseable `npub1...`.
-/// Shared with the CLI (`nostrd blossom allow/deny`).
+/// Shared with the CLI (`nostrfy blossom allow/deny`).
 pub(crate) fn is_pubkey_or_npub(value: &str) -> bool {
     if value.len() == 64 && hex::decode(value).map(|b| b.len() == 32).unwrap_or(false) {
         return true;
@@ -1281,7 +1283,7 @@ pub(crate) fn is_pubkey_or_npub(value: &str) -> bool {
 }
 
 // The pubkey allow/deny lists are runtime state managed via
-// `nostrd relay allow/deny` and NIP-86, persisted in the relay database
+// `nostrfy relay allow/deny` and NIP-86, persisted in the relay database
 // (LMDB) — not in the config file (see `restrict_relay`). The fields stay
 // in this struct for the in-memory checks but are excluded from both the
 // TOML `[access]` section and the persisted JSON.
@@ -1299,7 +1301,7 @@ pub struct AccessControl {
     /// (ip, reason) pairs, reported by NIP-86 `listblockedips`.
     #[serde(deserialize_with = "de_access_entries")]
     pub blocked_ips: Vec<(String, String)>,
-    /// When true, only the pubkeys on the allow list (`nostrd relay allow`)
+    /// When true, only the pubkeys on the allow list (`nostrfy relay allow`)
     /// may publish. When false (default), everyone except the denied
     /// pubkeys may publish.
     pub restrict_relay: bool,
@@ -1376,7 +1378,7 @@ pub(crate) fn toml_escape(value: &str) -> String {
 /// and section. Handles three cases: a matching line already present in the
 /// `[relay]` section (replaced), no such line in `[relay]` (inserted right
 /// after the header), and no `[relay]` section at all (appended).
-/// Used by `nostrd genkey` (private_key) and the NIP-86 relay-name changes.
+/// Used by `nostrfy genkey` (private_key) and the NIP-86 relay-name changes.
 pub(crate) fn set_relay_field_in_text(text: &str, field: &str, value: &str) -> String {
     let line = format!("{field} = \"{}\"", toml_escape(value));
 
@@ -1431,10 +1433,15 @@ pub(crate) fn set_relay_field_in_text(text: &str, field: &str, value: &str) -> S
     let section = &text[header_end..section_end];
 
     // Case 1: a matching line already exists in the section — replace it.
-    if let Some(offset) = section
-        .lines()
-        .position(|l| l.trim_start().starts_with(field))
-    {
+    // The line must be the field itself (followed by `=`, whitespace or
+    // end-of-line), not an unrelated key that merely starts with the
+    // field name (unknown keys are warned about but never rejected, so
+    // e.g. `private_key_note = "x"` must not be clobbered by genkey).
+    if let Some(offset) = section.lines().position(|l| {
+        l.trim_start().strip_prefix(field).is_some_and(|rest| {
+            rest.is_empty() || rest.starts_with('=') || rest.starts_with([' ', '\t'])
+        })
+    }) {
         let mut new_section = String::new();
         for (i, l) in section.lines().enumerate() {
             if i == offset {
@@ -1519,7 +1526,7 @@ pub(crate) fn write_text_atomic(path: &Path, text: &str) -> std::io::Result<()> 
 /// hard error because older config files legitimately carry keys the schema
 /// dropped (e.g. `software`/`version`).
 /// The known config keys per section, used by [`warn_unknown_fields`] to
-/// flag typos. A section or key missing from this list makes `nostrd check`
+/// flag typos. A section or key missing from this list makes `nostrfy check`
 /// (and every start) warn about perfectly valid settings — the list must
 /// cover every serializable field (enforced by the
 /// `known_keys_cover_every_serialized_field` test).
@@ -1741,7 +1748,7 @@ mod tests {
     #[test]
     fn known_keys_cover_every_serialized_field() {
         // The `warn_unknown_fields` list must cover every serializable
-        // config field, or `nostrd check` (and every start) warns about
+        // config field, or `nostrfy check` (and every start) warns about
         // perfectly valid settings. Serialize the default config and
         // cross-check every emitted section and key against the list.
         let cfg = Config::default();
@@ -1765,6 +1772,24 @@ mod tests {
                 "config section [{section}] is missing from the known-keys list"
             );
         }
+    }
+
+    #[test]
+    fn set_relay_field_does_not_clobber_prefix_matches() {
+        // Unknown keys are warned about but never rejected, so a line that
+        // merely starts with the field name (e.g. `name_note`) must not be
+        // replaced — only the exact `field = ...` line is.
+        let text = "[relay]\nname = \"relay\"\nname_note = \"keep\"\nother = 1\n";
+        let out = set_relay_field_in_text(text, "name", "renamed");
+        assert!(out.contains("name = \"renamed\""), "{out}");
+        assert!(out.contains("name_note = \"keep\""), "{out}");
+        assert!(out.contains("other = 1"), "{out}");
+        // The same boundary protects the private key: `private_key_note`
+        // is not the `private_key` line.
+        let text = "[relay]\nprivate_key_note = \"x\"\n";
+        let out = set_relay_field_in_text(text, "private_key", "ab");
+        assert!(out.contains("private_key = \"ab\""), "{out}");
+        assert!(out.contains("private_key_note = \"x\""), "{out}");
     }
 
     #[test]
@@ -1903,9 +1928,9 @@ log_max_files = 2
         let mut cfg = Config::default();
         cfg.blossom.local_path = PathBuf::from("./data/images");
         cfg.database.path = PathBuf::from("./data");
-        let dir = std::env::temp_dir().join("nostrd-abs-test");
+        let dir = std::env::temp_dir().join("nostrfy-abs-test");
         let _ = std::fs::create_dir_all(&dir);
-        let cfg_path = dir.join("nostrd.toml");
+        let cfg_path = dir.join("nostrfy.toml");
         cfg.absolutize_paths(&cfg_path);
         assert!(
             cfg.blossom.local_path.is_absolute(),
@@ -1937,9 +1962,9 @@ log_max_files = 2
         // `[server]` send_auth_challenge default was true.
         assert!(!cfg.relay.require_auth && cfg.relay.send_auth_challenge);
         // The written default file loads back with the same values.
-        let dir = std::env::temp_dir().join("nostrd-config-limits-test");
+        let dir = std::env::temp_dir().join("nostrfy-config-limits-test");
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("nostrd.toml");
+        let path = dir.join("nostrfy.toml");
         Config::write_default(&path).unwrap();
         let loaded = Config::load(&path).unwrap();
         assert_eq!(loaded.limits.max_connections_per_ip, 64);
@@ -1964,11 +1989,11 @@ log_max_files = 2
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = std::env::temp_dir()
-            .join("nostrd-init-test")
+            .join("nostrfy-init-test")
             .join(format!("{:x}-{id}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("nostrd.toml");
+        let path = dir.join("nostrfy.toml");
         Config::write_default(&path).unwrap();
         let mode = std::os::unix::fs::PermissionsExt::mode(
             &std::fs::metadata(&path).unwrap().permissions(),
@@ -1985,11 +2010,11 @@ log_max_files = 2
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = std::env::temp_dir()
-            .join("nostrd-config-write-test")
+            .join("nostrfy-config-write-test")
             .join(format!("{:x}-{id}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("nostrd.toml");
+        let path = dir.join("nostrfy.toml");
         std::fs::write(&path, "a = 1").unwrap();
         // A genkey-style 0600 config: the atomic rewrite (NIP-86
         // `changerelay*` persistence) must not revert it to 0644.
@@ -2029,9 +2054,9 @@ log_max_files = 2
 
     #[test]
     fn default_config_roundtrip() {
-        let dir = std::env::temp_dir().join("nostrd-config-test");
+        let dir = std::env::temp_dir().join("nostrfy-config-test");
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("nostrd.toml");
+        let path = dir.join("nostrfy.toml");
         Config::write_default(&path).unwrap();
         let cfg = Config::load(&path).unwrap();
         assert_eq!(cfg.server.port, 8080);

@@ -1,0 +1,22 @@
+# systemd unit for running nostrfy on a VM (see docs/deploy/).
+# Copy to /etc/systemd/system/nostrfy.service, adjust the config path,
+# then: sudo systemctl daemon-reload && sudo systemctl enable --now nostrfy
+
+[Unit]
+Description=nostrfy Nostr relay server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/nostrfy --config /etc/nostrfy/nostrfy.toml start --foreground
+Restart=always
+RestartSec=5
+# Harden the service.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

@@ -148,14 +148,14 @@ fn split_blob(segment: &str) -> Option<String> {
 
 /// Whether `pubkey` (hex) may upload: unrestricted, or present in
 /// `blossom.allow_pubkeys` (npub1... or hex). Read from the live config so
-/// `nostrd blossom allow/deny` + a SIGHUP applies without a restart.
+/// `nostrfy blossom allow/deny` + a SIGHUP applies without a restart.
 async fn upload_allowed(relay: &Relay, pubkey: &str) -> Result<(), ()> {
     let cfg = relay.config.read().await;
     if !cfg.blossom.restrict_uploads {
         return Ok(());
     }
     // The allowlist lives in the relay database (LMDB), loaded into
-    // memory at startup and refreshed on SIGHUP (`nostrd blossom allow/deny`).
+    // memory at startup and refreshed on SIGHUP (`nostrfy blossom allow/deny`).
     let allowed = relay
         .blossom_allow
         .read()
@@ -576,7 +576,7 @@ async fn upload(State(relay): State<Arc<Relay>>, headers: HeaderMap, body: Bytes
     put_blob(relay, headers, body, "upload").await
 }
 
-/// `PUT /media` — media optimization upload (BUD-05). nostrd stores the
+/// `PUT /media` — media optimization upload (BUD-05). nostrfy stores the
 /// exact bytes received (optimization is a SHOULD, not a MUST); the
 /// endpoint exists so clients that treat it as a trusted processing
 /// server (e.g. nostter) can upload without changes.
@@ -906,7 +906,7 @@ mod tests {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = std::env::temp_dir()
-            .join("nostrd-blossom-handler")
+            .join("nostrfy-blossom-handler")
             .join(format!("{:x}-{id}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut cfg = Config::default();

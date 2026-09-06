@@ -1,4 +1,4 @@
-# nostrd.toml — Blossom-only media server
+# nostrfy.toml — Blossom-only media server
 #
 # Runs the Blossom file server (NIP-98 upload/download) on its own
 # hostname while the relay keeps serving on the main host: requests with
@@ -14,10 +14,10 @@
 # [blossom].
 
 [relay]
-name = "nostrd media"
+name = "nostrfy media"
 description = "Blossom file storage for nostr media"
 pubkey = ""                 # your pubkey (shown in NIP-11)
-private_key = ""            # run `nostrd genkey` to generate one
+private_key = ""            # run `nostrfy genkey` to generate one
 public_url = "wss://relay.example.com"
 
 [server]
@@ -31,13 +31,13 @@ host = "media.example.com"
 
 # --- local storage -----------------------------------------------------------
 storage = "local"
-local_path = "/var/lib/nostrd/images"
+local_path = "/var/lib/nostrfy/images"
 # Maximum upload size: 20 MiB by default. Raise it for video/large files:
 max_upload_bytes = 20971520
 # Refuse uploads when the disk has less free space than this (avoids a
 # full disk taking the LMDB writer down with it). 0 disables the check.
 min_free_bytes = 33554432
-# Only pubkeys listed via `nostrd blossom allow <pubkey>` may upload.
+# Only pubkeys listed via `nostrfy blossom allow <pubkey>` may upload.
 restrict_uploads = false
 
 # --- S3-compatible storage (Cloudflare R2, AWS S3, MinIO, ...) -------------
@@ -45,7 +45,7 @@ restrict_uploads = false
 #   storage = "s3"
 #   s3_endpoint = "https://<account>.r2.cloudflarestorage.com"   # R2 example
 #   s3_region = "auto"                                           # "auto" for R2
-#   s3_bucket = "nostrd-media"
+#   s3_bucket = "nostrfy-media"
 #   s3_access_key = "..."
 #   s3_secret_key = "..."
 

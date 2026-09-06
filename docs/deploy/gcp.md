@@ -1,4 +1,4 @@
-# Deploying nostrd on Google Cloud
+# Deploying nostrfy on Google Cloud
 
 Options: **Compute Engine** (VM, recommended) or **Cloud Run** (containers).
 
@@ -9,15 +9,15 @@ Options: **Compute Engine** (VM, recommended) or **Cloud Run** (containers).
 3. **SSH in** (the console's SSH button works) and follow the generic [VPS guide](vps.md):
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/iqbqioza/nostrd/main/install.sh | sh
-sudo mkdir -p /etc/nostrd
-sudo curl -fsSL -o /etc/nostrd/nostrd.toml \
-  https://raw.githubusercontent.com/iqbqioza/nostrd/main/deploy/nostrd.toml
-sudo nano /etc/nostrd/nostrd.toml                 # set name, public_url, private_key
-sudo curl -fsSL -o /etc/systemd/system/nostrd.service \
-  https://raw.githubusercontent.com/iqbqioza/nostrd/main/deploy/nostrd.service
+curl -fsSL https://raw.githubusercontent.com/iqbqioza/nostrfy/main/install.sh | sh
+sudo mkdir -p /etc/nostrfy
+sudo curl -fsSL -o /etc/nostrfy/nostrfy.toml \
+  https://raw.githubusercontent.com/iqbqioza/nostrfy/main/deploy/nostrfy.toml
+sudo nano /etc/nostrfy/nostrfy.toml                 # set name, public_url, private_key
+sudo curl -fsSL -o /etc/systemd/system/nostrfy.service \
+  https://raw.githubusercontent.com/iqbqioza/nostrfy/main/deploy/nostrfy.service
 sudo systemctl daemon-reload
-sudo systemctl enable --now nostrd
+sudo systemctl enable --now nostrfy
 ```
 
 4. **Reserve a static IP** (External IP → Reserve) so `public_url` stays valid across reboots.
@@ -39,4 +39,4 @@ Cloud Run builds from the repository `Dockerfile` (which downloads the pre-built
 4. **Persistent storage**: attach a **Cloud Run volume (filestore/gcsfuse)** at `/data` — LMDB needs a filesystem, so a GCS FUSE mount at `/data` works for persistence.
 5. **TLS**: Cloud Run provides `https://` automatically — set `relay.public_url = "wss://<service>.a.run.app"` (or your custom domain).
 
-> **Note**: Cloud Run scales to zero by default — for a relay, set **min instances = 1** so it never goes cold. The `deploy/nostrd.container.toml` baked into the image can be replaced by mounting your own `nostrd.toml` at `/etc/nostrd/nostrd.toml`.
+> **Note**: Cloud Run scales to zero by default — for a relay, set **min instances = 1** so it never goes cold. The `deploy/nostrfy.container.toml` baked into the image can be replaced by mounting your own `nostrfy.toml` at `/etc/nostrfy/nostrfy.toml`.

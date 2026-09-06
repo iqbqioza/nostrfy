@@ -150,11 +150,14 @@ impl SubscriptionIndex {
         {
             out.extend(set.iter().copied());
         }
-        // NIP-26: an event published under a delegation tag matches
+        // NIP-26: an event published under a valid delegation tag matches
         // filters on the delegator's pubkey too (see `Filter::matches`),
-        // so those connections must be woken as well.
+        // so those connections must be woken as well. Only well-formed
+        // delegation tags (exactly 4 elements, see `nip26::delegation`)
+        // count: a malformed tag of any other length must not wake the
+        // delegator's subscriptions.
         for tag in &event.tags {
-            if tag.len() >= 2
+            if tag.len() == 4
                 && tag[0] == "delegation"
                 && let Ok(bytes) = hex::decode(&tag[1])
                 && bytes.len() == 32
@@ -311,7 +314,12 @@ mod tests {
         );
         let mut e = ev(
             1,
-            vec![vec!["delegation".into(), "aa".repeat(32), "sig".into()]],
+            vec![vec![
+                "delegation".into(),
+                "aa".repeat(32),
+                "kind=1".into(),
+                "sig".into(),
+            ]],
         );
         e.pubkey = "bb".repeat(32);
         let candidates = index.candidates(&e);
@@ -322,5 +330,32 @@ mod tests {
         // An event without a delegation tag does not.
         let e = ev(1, vec![]);
         assert!(index.candidates(&e).is_empty());
+    }
+
+    #[test]
+    fn malformed_delegation_tags_do_not_wake_delegator_subscribers() {
+        // NIP-26 delegation tags have exactly 4 elements; a shorter tag is
+        // not a delegation and must not let the event match (or wake) the
+        // delegator's author feed.
+        let mut index = SubscriptionIndex::default();
+        index.register(
+            7,
+            &[FilterComponents::Indexed {
+                kinds: vec![],
+                authors: vec![[0xaa; 32]],
+                tags: vec![],
+            }],
+        );
+        for tag in [
+            vec!["delegation".into(), "aa".repeat(32)],
+            vec!["delegation".into(), "aa".repeat(32), "sig".into()],
+        ] {
+            let mut e = ev(1, vec![tag]);
+            e.pubkey = "bb".repeat(32);
+            assert!(
+                !index.candidates(&e).contains(&7),
+                "a malformed delegation tag must not wake the delegator's subscribers"
+            );
+        }
     }
 }

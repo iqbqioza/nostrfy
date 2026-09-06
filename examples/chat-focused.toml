@@ -1,4 +1,4 @@
-# nostrd.toml — chat-focused relay
+# nostrfy.toml — chat-focused relay
 #
 # Optimized for real-time chat (NIP-29 group chat messages, kind 11):
 # low-latency live delivery, long-lived connections and fast message
@@ -6,13 +6,15 @@
 # for interactive chat rather than large community catalogs.
 
 [relay]
-name = "nostrd chat"
+name = "nostrfy chat"
 description = "Real-time Nostr chat relay"
 pubkey = ""
-private_key = ""            # `nostrd genkey` — signs NIP-29 group metadata
+private_key = ""            # `nostrfy genkey` — signs NIP-29 group metadata
 public_url = "wss://chat.example.com"
-enabled_nips = [1, 9, 11, 29, 40, 42, 43, 50, 57, 59, 65, 70, 77, 86, 94]
+enabled_nips = [1, 9, 11, 29, 40, 42, 43, 50, 57, 59, 65, 70, 77, 78, 86, 94]
 max_groups = 2000
+# Chat messages are short; more of them per minute than a general relay.
+max_events_per_min_per_pubkey = 120
 
 [limits]
 # Interactive chat: deliver live batches as fast as the writer drains.
@@ -26,9 +28,6 @@ max_subscriptions = 40
 max_filters = 40
 # A larger send buffer keeps the stream flowing during bursts.
 max_out_queue_bytes = 524288
-# Chat messages are short; more of them per minute than a general relay.
-max_events_per_min_per_pubkey = 120
-
 [database]
 path = "./data"
 search_index = true         # searchable chat history (NIP-50)

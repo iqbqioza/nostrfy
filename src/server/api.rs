@@ -1232,16 +1232,20 @@ fn month_start_of_next(y: i64, m: u32) -> u64 {
 /// years of history).
 const MAX_MONTHS: usize = 120;
 
+/// The months covered by `[since, until]`, oldest first, capped at
+/// `MAX_MONTHS + 1` entries: the caller rejects anything beyond
+/// `MAX_MONTHS`, so the walk must never build more than that (a client
+/// sending `since=0&until=u64::MAX` must not loop ~7e12 times).
 fn month_range(since: u64, until: u64) -> Vec<(i64, u32)> {
     if until < since {
         return Vec::new();
     }
     let (sy, sm) = month_of(since);
     let (ey, em) = month_of(until);
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity((MAX_MONTHS + 1).min(64));
     let mut y = sy;
     let mut m = sm;
-    loop {
+    for _ in 0..=MAX_MONTHS {
         out.push((y, m));
         if (y, m) == (ey, em) {
             break;
@@ -1413,7 +1417,7 @@ mod tests {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let path = std::env::temp_dir()
-            .join("nostrd-api-test")
+            .join("nostrfy-api-test")
             .join(format!("{:x}-{id}", std::process::id()));
         let _ = std::fs::remove_dir_all(&path);
         let mut cfg = Config::default();

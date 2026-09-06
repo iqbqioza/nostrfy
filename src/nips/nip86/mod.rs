@@ -378,9 +378,14 @@ pub async fn rpc_handler(
             if !is_pubkey(pubkey) {
                 return rpc_err("invalid pubkey");
             }
-            relay.unassign_role(pubkey, role).await;
-            audit!(&relay, &identity, "unassignrole", params);
-            rpc_ok(json!(true))
+            if relay.unassign_role(pubkey, role).await {
+                audit!(&relay, &identity, "unassignrole", params);
+                rpc_ok(json!(true))
+            } else {
+                rpc_err(
+                    "restricted: NIP-43 is disabled, the relay key is missing or the assignment does not exist",
+                )
+            }
         }
         "blockip" => {
             let (Some(ip), reason) = (
@@ -579,7 +584,7 @@ mod tests {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let path = std::env::temp_dir()
-            .join("nostrd-nip86-test")
+            .join("nostrfy-nip86-test")
             .join(format!("{:x}-{id}", std::process::id()));
         let _ = std::fs::remove_dir_all(&path);
         let mut cfg = Config::default();

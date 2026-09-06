@@ -500,7 +500,7 @@ fn rebuild_keeps_join_membership() {
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let path = std::env::temp_dir()
-        .join("nostrd-nip29-rebuild")
+        .join("nostrfy-nip29-rebuild")
         .join(format!("{:x}-{id}", std::process::id()));
     let _ = std::fs::remove_dir_all(&path);
     let cfg = crate::config::DatabaseConfig {
@@ -541,6 +541,70 @@ fn rebuild_keeps_join_membership() {
         let g = store.group("g1").expect("group rebuilt");
         assert!(g.is_admin(ADMIN), "creator is admin after rebuild");
         assert!(g.is_member(OTHER), "JOIN membership survives rebuild");
+    });
+}
+
+#[test]
+fn rebuild_ghosts_group_whose_only_surviving_events_are_relay_metadata() {
+    // A vanished creator leaves the relay-signed 39000-39005 behind (they
+    // are not authored by the creator). The rebuild's ghost detection must
+    // see them, or the private group's metadata becomes world-readable
+    // after a restart.
+    use crate::db::DbClient;
+    use crate::nips::nip01;
+    use std::sync::Arc;
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = std::env::temp_dir()
+        .join("nostrfy-nip29-ghost-meta")
+        .join(format!("{:x}-{id}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&path);
+    let cfg = crate::config::DatabaseConfig {
+        path,
+        ..Default::default()
+    };
+    let db = DbClient::open(
+        &cfg,
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let now = 1_700_000_000;
+        // Only relay-signed metadata survives: no moderation event. The
+        // relay's metadata events are addressable (`d` tag = group id).
+        for kind in GROUP_META..=GROUP_PINS {
+            let mut meta = Event {
+                id: String::new(),
+                pubkey: "11".repeat(32),
+                created_at: now,
+                kind,
+                tags: vec![vec![D.to_string(), "g1".to_string()]],
+                content: String::new(),
+                sig: String::new(),
+            };
+            meta.id = nip01::compute_id(&meta);
+            assert_eq!(
+                db.put(meta.clone(), now).await,
+                crate::db::PutOutcome::Stored
+            );
+        }
+
+        let mut store = GroupStore::default();
+        store.rebuild(&db).await;
+        assert!(
+            store.ghost.contains("g1"),
+            "a group with only relay metadata must be ghosted"
+        );
+        assert!(
+            !store.visible_gid("g1", true, None),
+            "the ghosted group's metadata is withheld"
+        );
     });
 }
 

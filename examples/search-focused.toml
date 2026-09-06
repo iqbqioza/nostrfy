@@ -1,4 +1,4 @@
-# nostrd.toml — search-focused relay
+# nostrfy.toml — search-focused relay
 #
 # Tuned for NIP-50 full-text search: the word index is fully enabled,
 # more words per event are indexed, and the metadata prefilter keeps
@@ -6,13 +6,13 @@
 # serves as a searchable archive (e.g. a "nostr search" instance).
 
 [relay]
-name = "nostrd search"
+name = "nostrfy search"
 description = "Searchable Nostr relay (NIP-50)"
 pubkey = ""
 private_key = ""
 public_url = "wss://search.example.com"
 # The word index and the scan prefilter are what this relay is about.
-enabled_nips = [1, 9, 11, 40, 45, 46, 50, 57, 59, 65, 70, 77, 84, 94]
+enabled_nips = [1, 9, 11, 40, 42, 45, 46, 50, 57, 59, 65, 70, 77, 78, 84, 94]
 
 [database]
 path = "./data"

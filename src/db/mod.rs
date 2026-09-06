@@ -63,7 +63,7 @@ pub(crate) fn db_error(errors: &Arc<std::sync::atomic::AtomicU64>, e: &crate::er
         e,
         crate::error::Error::Heed(heed::Error::Mdb(heed::MdbError::MapFull))
     ) {
-        log::error!("database map is full: increase database.max_map_size in nostrd.toml");
+        log::error!("database map is full: increase database.max_map_size in nostrfy.toml");
     } else {
         log::error!("database error: {e}");
     }
@@ -189,11 +189,11 @@ enum Msg {
     },
     /// Loads the persisted Blossom upload allowlist.
     LoadBlossomAllow {
-        reply: oneshot::Sender<Vec<String>>,
+        reply: oneshot::Sender<Option<Vec<String>>>,
     },
     /// Loads the persisted relay pubkey access lists (deny, allow).
     LoadRelayPubkeys {
-        reply: oneshot::Sender<crate::db::store::RelayPubkeyLists>,
+        reply: oneshot::Sender<Option<crate::db::store::RelayPubkeyLists>>,
     },
     /// Persists the relay pubkey access lists (deny, allow).
     SaveRelayPubkeys {
@@ -348,10 +348,6 @@ impl DbClient {
             .store(enabled, std::sync::atomic::Ordering::Relaxed);
     }
 
-    async fn request<R: Default>(&self, make: impl FnOnce(oneshot::Sender<R>) -> Msg) -> R {
-        self.request_with(make, &self.tx).await
-    }
-
     /// Sends a read-only request to the dedicated reader thread. The
     /// writer-queue counters are not part of the gate: the reader threads
     /// exist so reads keep working while the writer is stalled.
@@ -489,14 +485,6 @@ impl DbClient {
             return None;
         }
         Some(rx)
-    }
-
-    async fn request_with<R: Default>(
-        &self,
-        make: impl FnOnce(oneshot::Sender<R>) -> Msg,
-        channel: &mpsc::UnboundedSender<Msg>,
-    ) -> R {
-        self.request_with_checked(make, channel, true).await
     }
 
     async fn request_with_checked<R: Default>(
@@ -679,8 +667,12 @@ impl DbClient {
 
     /// Records the first-seen time of each pubkey when unknown; returns
     /// `(created, first_seen)` per entry, aligned with the input.
+    /// Records the first-seen timestamp of new accounts. A write: it is
+    /// routed without a response timeout like every other write, so a
+    /// stalled writer cannot silently drop the record (which would
+    /// disable the account-age gate while the writer is busy).
     pub async fn touch_first_seen_batch(&self, entries: Vec<([u8; 32], u64)>) -> Vec<(bool, u64)> {
-        self.request(|reply| Msg::TouchFirstSeen { entries, reply })
+        self.request_write(|reply| Msg::TouchFirstSeen { entries, reply })
             .await
     }
 
@@ -862,7 +854,7 @@ impl DbClient {
     }
 
     /// Persists the Blossom upload allowlist under its dedicated LMDB key
-    /// (the same key `nostrd blossom allow/deny` writes).
+    /// (the same key `nostrfy blossom allow/deny` writes).
     pub async fn save_blossom_allow(&self, entries: &[String]) {
         let entries = entries.to_vec();
         let _ = self
@@ -880,15 +872,19 @@ impl DbClient {
     }
 
     /// Loads the persisted Blossom upload allowlist at startup (see
-    /// [`Self::load_access`]).
-    pub async fn load_blossom_allow(&self) -> Vec<String> {
+    /// [`Self::load_access`]). `None` reports a database failure: the
+    /// caller must fail stop instead of starting with an empty (fail-open)
+    /// allowlist.
+    pub async fn load_blossom_allow(&self) -> Option<Vec<String>> {
         self.request_read_blocking(|reply| Msg::LoadBlossomAllow { reply })
             .await
     }
 
     /// Loads the persisted relay pubkey access lists (deny, allow) at
-    /// startup (see [`Self::load_access`]).
-    pub async fn load_relay_pubkeys(&self) -> crate::db::store::RelayPubkeyLists {
+    /// startup (see [`Self::load_access`]). `None` reports a database
+    /// failure: the caller must fail stop instead of starting with empty
+    /// (fail-open) lists.
+    pub async fn load_relay_pubkeys(&self) -> Option<crate::db::store::RelayPubkeyLists> {
         self.request_read_blocking(|reply| Msg::LoadRelayPubkeys { reply })
             .await
     }
@@ -899,6 +895,7 @@ impl DbClient {
     pub async fn try_load_blossom_allow(&self) -> Option<Vec<String>> {
         self.request_read_result(|reply| Msg::LoadBlossomAllow { reply })
             .await
+            .flatten()
     }
 
     /// Reload variant with failure reporting, see
@@ -906,6 +903,7 @@ impl DbClient {
     pub async fn try_load_relay_pubkeys(&self) -> Option<crate::db::store::RelayPubkeyLists> {
         self.request_read_result(|reply| Msg::LoadRelayPubkeys { reply })
             .await
+            .flatten()
     }
 
     /// Adds an owner to a Blossom blob's persisted metadata. Returns

@@ -107,13 +107,12 @@ fn bech32_decode(input: &str) -> Result<(String, Vec<u8>, bool), Bech32Error> {
     // Must be lowercase or uppercase, not mixed.
     let input_lower = input.to_lowercase();
     let input_upper = input.to_uppercase();
-    let normalized: &str = if input == input_lower {
-        &input_lower
-    } else if input == input_upper {
-        &input_upper
-    } else {
+    // BIP-173: all-uppercase input is valid — decode it as its lowercase
+    // form (the charset, separator and checksum are case-insensitive).
+    if input != input_lower && input != input_upper {
         return Err(Bech32Error::InvalidChar('?'));
-    };
+    }
+    let normalized: &str = &input_lower;
 
     // Find the last '1' separator.
     let sep_pos = normalized.rfind('1').ok_or(Bech32Error::MissingSeparator)?;
@@ -464,6 +463,18 @@ mod tests {
         // bech32m-encoded npub for pubkey 3bf0c63f...
         let result = parse_nip19("npub180cvv07tjdrrgpa0j7j7tmnyl2yr6yr7l8j4s3evf6u64th6gkws3w8ktc");
         assert!(result.is_ok(), "failed to parse npub: {:?}", result.err());
+    }
+
+    #[test]
+    fn uppercase_bech32_is_accepted() {
+        // BIP-173: all-uppercase input is valid; it decodes to the same
+        // pubkey as its lowercase form.
+        let hex_pk = "3bf0c63fcb93463407af97a5e5ee64fa883d107ef9e558472c4eb9aaaefa459d";
+        let npub = "npub180cvv07tjdrrgpa0j7j7tmnyl2yr6yr7l8j4s3evf6u64th6gkws3w8ktc";
+        match parse_nip19(&npub.to_uppercase()).unwrap() {
+            Nip19Entity::Pubkey(pk) => assert_eq!(hex::encode(pk), hex_pk),
+            _ => panic!("expected Pubkey"),
+        }
     }
 
     #[test]

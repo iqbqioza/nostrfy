@@ -1,12 +1,12 @@
-# nostrd
+# nostrfy
 
 <p align="center">
-  <img src="docs/images/nostrd-banner.png" alt="nostrd — a minimal and stable Nostr relay server" width="100%">
+  <img src="docs/images/nostrfy-banner.png" alt="nostrfy — a minimal and stable Nostr relay server" width="100%">
 </p>
 
 <p align="center">
-  <a href="https://github.com/iqbqioza/nostrd/actions/workflows/ci.yml"><img src="https://github.com/iqbqioza/nostrd/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <a href="https://github.com/iqbqioza/nostrd/actions/workflows/release.yml"><img src="https://github.com/iqbqioza/nostrd/actions/workflows/release.yml/badge.svg" alt="Release"></a>
+  <a href="https://github.com/iqbqioza/nostrfy/actions/workflows/ci.yml"><img src="https://github.com/iqbqioza/nostrfy/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/iqbqioza/nostrfy/actions/workflows/release.yml"><img src="https://github.com/iqbqioza/nostrfy/actions/workflows/release.yml/badge.svg" alt="Release"></a>
 </p>
 
 > [!NOTE]
@@ -21,12 +21,12 @@
 > [!TIP]
 > This project's relay is running live at **wss://relay.damustr.com**.
 
-**All in one Nostr relay server written in Rust. Blazing fast by Design. Lean by Nature. Powerful by Default.**
+**All in one Nostr relay server engine written in Rust. Blazing fast by Design. Lean by Nature. Powerful by Default.**
 
-nostrd is designed around two goals:
+nostrfy is designed around two goals:
 
 - **Never go down.** Overload protection, a dedicated reader thread, panic containment and strict resource bounds keep the relay serving even under sustained abuse, a stalled disk or a memory-constrained host. The HTTP layer is hardened too: a connection cap that also covers plain HTTP, a header-read timeout that closes slow-loris sockets, per-IP connection-rate limiting, and optional per-pubkey publish rate limits.
-- **Spec-complete.** All relay-side NIPs are implemented and verified against the official specifications (file-storage NIPs excluded by design, except Blossom via the dedicated file server).
+- **Spec-complete.** All relay-side NIPs are implemented and verified against the official specifications — file-storage is covered too: NIP-94 (file metadata) events are stored and served like any other event, and NIP-96 (Blossom) is served by the dedicated file server.
 
 ## Table of contents
 
@@ -61,7 +61,7 @@ The detailed guides live in the [`docs/`](docs/) directory:
 | Document | Contents |
 | --- | --- |
 | [Manual](docs/MANUAL.md) | Installation, configuration, operation, NIP support, NIP-29 groups, LiveKit, the Blossom file server, logs and statistics |
-| [Configuration reference](docs/CONFIGURATION.md) | Every `nostrd.toml` option with its default and exact behavior, validation rules, SIGHUP reload, full example |
+| [Configuration reference](docs/CONFIGURATION.md) | Every `nostrfy.toml` option with its default and exact behavior, validation rules, SIGHUP reload, full example |
 | [HTTP REST API reference](docs/API.md) | `/api/v1` endpoints, query parameters, pagination, errors, status codes |
 | [Troubleshooting](docs/TROUBLESHOOTING.md) | Common errors and their step-by-step fixes |
 | [Deployment guides](docs/deploy/README.md) | Deploy the pre-built release binary to Fly.io, Digital Ocean, AWS, GCP, Azure or any VPS |
@@ -69,7 +69,7 @@ The detailed guides live in the [`docs/`](docs/) directory:
 ## Features
 
 - **All relay-side NIPs implemented** — see the [NIP support](#nip-support) table.
-- **Blossom file server** — a media/blob store on its own hostname (like the API): uploads addressed by SHA-256, stored as `bucket/{npub1}/{file}` on local disk or in an S3-compatible bucket (AWS S3 / Cloudflare R2), with NIP-98-style kind-24242 auth, and an optional upload allowlist (`nostrd blossom allow/deny`, persisted in LMDB). Async storage I/O and an LMDB-persisted sha→owner mapping (no in-memory index) keep the relay's WebSocket path untouched.
+- **Blossom file server** — a media/blob store on its own hostname (like the API): uploads addressed by SHA-256, stored as `bucket/{npub1}/{file}` on local disk or in an S3-compatible bucket (AWS S3 / Cloudflare R2), with NIP-98-style kind-24242 auth, and an optional upload allowlist (`nostrfy blossom allow/deny`, persisted in LMDB). Async storage I/O and an LMDB-persisted sha→owner mapping (no in-memory index) keep the relay's WebSocket path untouched.
 - **REST API** — a read-only HTTP API at `/api/v1/...` for querying events by `npub1`, `nevent1` or `naddr1`, with its own dedicated database reader thread and concurrency limiter so REST traffic can never stall WebSocket subscribers.
 - **LMDB persistence (via `heed`)** — durable, crash-safe storage; the memory map is a sparse virtual-address reservation opened at its configured ceiling, so it never needs a runtime resize (which would be unsafe with concurrent reader threads) and physical memory stays small.
 - **Overload protection** — the database queue is bounded; when it fills up, new requests fail fast instead of accumulating in memory. Writes that reach the queue always wait for their true outcome, so a queued event can never silently commit after the relay reported a false failure (which would skip its side-effects).
@@ -78,37 +78,37 @@ The detailed guides live in the [`docs/`](docs/) directory:
 - **Optional WS idle timeout** — close connections that stay silent for a configured period (sending periodic PINGs so alive-but-idle subscribers keep their slot while dead peers are reaped), preventing a socket flood from exhausting the connection budget.
 - **Panic-safe** — task panics are contained and logged, and connection accounting is released on every exit path.
 - **Efficient hot paths** — single-pass event parsing, deduplicated live serialization, batched commits (one fsync per batch), merged multi-range scans with a per-scan work budget, and NIP-67 boundary handling.
-- **Everything configurable** via `nostrd.toml` — no compile-time options.
+- **Everything configurable** via `nostrfy.toml` — no compile-time options.
 - **Works behind TLS-terminating proxies** (nginx, Caddy, Cloudflare Tunnel): WebSocket upgrades are honored via `X-Forwarded-Proto`.
 
 ## Install (pre-built binary)
 
-The GitHub Actions release workflow builds `nostrd` for **Linux (x86_64 + aarch64)** and **FreeBSD (x86_64)** and attaches the binaries (plus checksums) to every release. The `install.sh` script detects the OS and architecture, downloads the right binary, verifies its sha256 checksum and installs it into a directory on `PATH`.
+The GitHub Actions release workflow builds `nostrfy` for **Linux (x86_64 + aarch64)** and **FreeBSD (x86_64)** and attaches the binaries (plus checksums) to every release. The `install.sh` script detects the OS and architecture, downloads the right binary, verifies its sha256 checksum and installs it into a directory on `PATH`.
 
 The fastest way — **one-liner, no clone needed**:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/iqbqioza/nostrd/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/iqbqioza/nostrfy/main/install.sh | sh
 ```
 
 Or download and run it manually (useful to inspect the script first, or to pass options):
 
 ```sh
-curl -fsSL -o install.sh https://raw.githubusercontent.com/iqbqioza/nostrd/main/install.sh
+curl -fsSL -o install.sh https://raw.githubusercontent.com/iqbqioza/nostrfy/main/install.sh
 chmod +x install.sh
 ./install.sh                       # latest release, into ~/.local/bin (no sudo needed)
 
 VERSION=v0.1.2 ./install.sh            # a specific release
 INSTALL_DIR=/usr/local/bin sudo ./install.sh    # system-wide (requires sudo)
 ./install.sh --force                            # overwrite without asking
-curl -fsSL https://raw.githubusercontent.com/iqbqioza/nostrd/main/install.sh | sh -s -- --force
+curl -fsSL https://raw.githubusercontent.com/iqbqioza/nostrfy/main/install.sh | sh -s -- --force
 ```
 
-The script picks the first of `~/.local/bin`, `~/bin` and `~/.cargo/bin` that is already on `PATH` (falling back to `~/.local/bin`, which it then tells you how to add to `PATH`). If `nostrd` already exists at the install location it asks for confirmation before overwriting. The install directory can be overridden with the `INSTALL_DIR` environment variable.
+The script picks the first of `~/.local/bin`, `~/bin` and `~/.cargo/bin` that is already on `PATH` (falling back to `~/.local/bin`, which it then tells you how to add to `PATH`). If `nostrfy` already exists at the install location it asks for confirmation before overwriting. The install directory can be overridden with the `INSTALL_DIR` environment variable.
 
 ## Deployment
 
-nostrd ships pre-built binaries for x86_64 and aarch64 (GitHub release assets) and a container image that downloads them — no compilation anywhere. Deployment guides are available for:
+nostrfy ships pre-built binaries for x86_64 and aarch64 (GitHub release assets) and a container image that downloads them — no compilation anywhere. Deployment guides are available for:
 
 | Platform | Guide |
 | --- | --- |
@@ -119,39 +119,39 @@ nostrd ships pre-built binaries for x86_64 and aarch64 (GitHub release assets) a
 | Azure | [docs/deploy/azure.md](docs/deploy/azure.md) — VM or Container Apps |
 | Any VPS | [docs/deploy/vps.md](docs/deploy/vps.md) — systemd service behind nginx/Caddy |
 
-The VM guides share one pattern: `install.sh` → the `deploy/nostrd.toml` template → the `deploy/nostrd.service` systemd unit → open port 8080 → TLS proxy in front. Overview: [docs/deploy/README.md](docs/deploy/README.md).
+The VM guides share one pattern: `install.sh` → the `deploy/nostrfy.toml` template → the `deploy/nostrfy.service` systemd unit → open port 8080 → TLS proxy in front. Overview: [docs/deploy/README.md](docs/deploy/README.md).
 
 ### Registering the relay as a systemd service (VMs)
 
-The repository ships a hardened unit at `deploy/nostrd.service` (it runs `nostrd start --foreground` and restarts the relay on failure):
+The repository ships a hardened unit at `deploy/nostrfy.service` (it runs `nostrfy start --foreground` and restarts the relay on failure):
 
 1. **Fetch the config template and edit it** (no repository clone needed):
 
    ```sh
-   sudo mkdir -p /etc/nostrd
-   sudo curl -fsSL -o /etc/nostrd/nostrd.toml \
-     https://raw.githubusercontent.com/iqbqioza/nostrd/main/deploy/nostrd.toml
-   sudo nano /etc/nostrd/nostrd.toml        # set name, public_url, private_key
+   sudo mkdir -p /etc/nostrfy
+   sudo curl -fsSL -o /etc/nostrfy/nostrfy.toml \
+     https://raw.githubusercontent.com/iqbqioza/nostrfy/main/deploy/nostrfy.toml
+   sudo nano /etc/nostrfy/nostrfy.toml        # set name, public_url, private_key
    ```
 
 2. **Fetch the unit and start it**:
 
    ```sh
-   sudo curl -fsSL -o /etc/systemd/system/nostrd.service \
-     https://raw.githubusercontent.com/iqbqioza/nostrd/main/deploy/nostrd.service
+   sudo curl -fsSL -o /etc/systemd/system/nostrfy.service \
+     https://raw.githubusercontent.com/iqbqioza/nostrfy/main/deploy/nostrfy.service
    sudo systemctl daemon-reload
-   sudo systemctl enable --now nostrd
+   sudo systemctl enable --now nostrfy
    ```
 
 3. **Check it**:
 
    ```sh
-   sudo systemctl status nostrd             # active (running)
+   sudo systemctl status nostrfy             # active (running)
    curl http://localhost:8080/health        # {"status":"ok"}
-   journalctl -u nostrd -f                  # logs
+   journalctl -u nostrfy -f                  # logs
    ```
 
-The unit restarts the relay automatically on crashes and on boot. `sudo systemctl restart nostrd` applies config changes.
+The unit restarts the relay automatically on crashes and on boot. `sudo systemctl restart nostrfy` applies config changes.
 
 ## Requirements
 
@@ -164,28 +164,28 @@ The unit restarts the relay automatically on crashes and on boot. `sudo systemct
 
 ```sh
 cargo build --release
-# the binary is at target/release/nostrd
+# the binary is at target/release/nostrfy
 ```
 
 ## Quick start
 
 ```sh
-# write a default nostrd.toml and exit
-nostrd init
+# write a default nostrfy.toml and exit
+nostrfy init
 
 # start the relay as a daemon (add --foreground to run in the shell)
-nostrd start
+nostrfy start
 
 # check it is up
-nostrd stats
+nostrfy stats
 ```
 
 Point your Nostr client at `ws://<host>:8080` (or `wss://<domain>` behind a TLS proxy).
 
 ### Ready-made configurations
 
-The `examples/` directory contains validated `nostrd.toml` templates for
-specialized deployments — copy one, adjust it and `nostrd check` it:
+The `examples/` directory contains validated `nostrfy.toml` templates for
+specialized deployments — copy one, adjust it and `nostrfy check` it:
 
 | Template | Purpose |
 | --- | --- |
@@ -200,11 +200,11 @@ specialized deployments — copy one, adjust it and `nostrd check` it:
 | `caddy/Caddyfile` | Automatic-HTTPS reverse proxy for one relay |
 | `caddy/Caddyfile.multi` | Several relays + Blossom on one server (one Caddyfile) |
 | `caddy/relay-1.toml` / `relay-2.toml` | Configs for the multi-relay setup (distinct ports and databases) |
-| `caddy/README.md` | Step-by-step Caddy + nostrd setup and troubleshooting |
+| `caddy/README.md` | Step-by-step Caddy + nostrfy setup and troubleshooting |
 
 ## REST API
 
-nostrd exposes a **read-only HTTP API** on the same port under `/api/v1`, served by a dedicated database reader thread with its own concurrency limiter, so heavy REST traffic can never stall WebSocket subscribers.
+nostrfy exposes a **read-only HTTP API** on the same port under `/api/v1`, served by a dedicated database reader thread with its own concurrency limiter, so heavy REST traffic can never stall WebSocket subscribers.
 
 | Endpoint | Description |
 | --- | --- |
@@ -234,7 +234,7 @@ By default the API is served on every host; set `server.api_host` (e.g. `api_hos
 
 ## Blossom file server (media hosting)
 
-nostrd doubles as a [Blossom](https://github.com/hzrd149/blossom) blob server on a dedicated hostname: clients upload files addressed by their SHA-256, and the relay serves them back — with `bucket/{npub1}/{file}` storage on local disk or in an S3-compatible bucket (AWS S3 / Cloudflare R2).
+nostrfy doubles as a [Blossom](https://github.com/hzrd149/blossom) blob server on a dedicated hostname: clients upload files addressed by their SHA-256, and the relay serves them back — with `bucket/{npub1}/{file}` storage on local disk or in an S3-compatible bucket (AWS S3 / Cloudflare R2).
 
 ```toml
 [blossom]
@@ -260,9 +260,9 @@ restrict_uploads = false            # true = only allow-listed pubkeys may uploa
 The upload allowlist is managed in the relay database (LMDB), independent from the relay's own allow/deny lists:
 
 ```sh
-nostrd blossom allow npub1...       # allow a pubkey to upload
-nostrd blossom deny npub1...        # revoke a pubkey
-nostrd blossom list
+nostrfy blossom allow npub1...       # allow a pubkey to upload
+nostrfy blossom deny npub1...        # revoke a pubkey
+nostrfy blossom list
 ```
 
 **Full guide: [Blossom chapter of the manual](docs/MANUAL.md#11-blossom-file-server-media-hosting).**
@@ -271,23 +271,24 @@ nostrd blossom list
 
 | Command | Description |
 | --- | --- |
-| `nostrd init` | Write a default configuration file and exit |
-| `nostrd genkey` | Generate a relay secret key (for NIP-29 group metadata and NIP-43 membership events) and write it into `relay.private_key` of the config file. Preserves the rest of the file; asks for confirmation (y/N) when a key is already set. Prints the relay pubkey (the NIP-11 `self`). |
-| `nostrd start` | Start the relay as a daemon (`--foreground` to stay in the shell) |
-| `nostrd stop` | Stop the running daemon |
-| `nostrd restart` | Stop and start again (reloads `nostrd.toml`) |
-| `nostrd stats` | Show live statistics of the running daemon |
-| `nostrd check` | Validate `nostrd.toml` and exit |
-| `nostrd blossom allow <pubkey>` / `deny <pubkey>` / `list` | Manage the Blossom upload allowlist (persisted in LMDB, applied on SIGHUP) |
-| `nostrd relay allow <pubkey>` / `deny <pubkey>` / `list` | Manage the relay pubkey allow/deny lists (persisted in LMDB, applied on SIGHUP) |
+| `nostrfy init` | Write a default configuration file and exit |
+| `nostrfy genkey` | Generate a relay secret key (for NIP-29 group metadata and NIP-43 membership events) and write it into `relay.private_key` of the config file. Preserves the rest of the file; asks for confirmation (y/N) when a key is already set. Prints the relay pubkey (the NIP-11 `self`). |
+| `nostrfy start` | Start the relay as a daemon (`--foreground` to stay in the shell) |
+| `nostrfy stop` | Stop the running daemon |
+| `nostrfy restart` | Stop and start again (reloads `nostrfy.toml`) |
+| `nostrfy stats` | Show live statistics of the running daemon |
+| `nostrfy check` | Validate `nostrfy.toml` and exit |
+| `nostrfy blossom allow <pubkey>` / `deny <pubkey>` / `list` | Manage the Blossom upload allowlist (persisted in LMDB, applied on SIGHUP) |
+| `nostrfy relay allow <pubkey>` / `deny <pubkey>` / `list` | Manage the relay pubkey allow/deny lists (persisted in LMDB, applied on SIGHUP) |
+| `nostrfy upgrade [version]` | Update the relay binary to the latest GitHub release (or a given version): downloads the asset for this platform, verifies it runs and atomically replaces the binary (`--force` reinstalls the current version; a running daemon needs `nostrfy restart` to pick it up) |
 
-All commands accept `--config <path>` (default `./nostrd.toml`).
+All commands accept `--config <path>` (default `./nostrfy.toml`).
 
 Sending `SIGHUP` to the daemon reloads the configuration at runtime: most limits, server auth settings, the NIP toggles (including the NIP-40 toggle, applied live) and the REST API concurrency ceiling apply immediately. A few settings are captured at startup and require a full restart — the log warns when one of them changed: `server.host`, `server.port`, `server.api_host`, `server.ws_paths`, `rpc.management_port`, `rpc.management_host`, `server.metrics_enabled`, `database.path`, `database.purge_interval_secs`, `relay.private_key` (a reload warns that it is ignored), `relay.enabled_nips`/`disabled_nips`, `relay.livekit_*`, `blossom.host`/`storage`/`local_path`/`max_upload_bytes`/`s3_*`, `daemon.max_log_size_bytes`/`max_log_files`/`stats_interval_secs`, the database request timeouts/queue caps, `live_buffer`/`live_batch_size`/`live_batch_interval_ms`, `max_indexed_words`, and the HTTP-layer limits `max_connections`/`http_read_timeout_secs`/`max_connections_per_sec_per_ip` (they shape the accept loop built at startup). An invalid reloaded file is rejected (the old configuration stays in force). The access control lists are runtime-managed (NIP-86) and are **not** overwritten by a reload.
 
 ## Configuration
 
-Every setting is optional — missing entries fall back to the defaults, and `nostrd.toml.example` documents every option with comments. The configuration has six sections:
+Every setting is optional — missing entries fall back to the defaults, and `nostrfy.toml.example` documents every option with comments. The configuration has six sections:
 
 | Section | Purpose |
 | --- | --- |
@@ -298,7 +299,7 @@ Every setting is optional — missing entries fall back to the defaults, and `no
 | `[daemon]` | PID/log/stats files and log rotation |
 | `[access]` | Initial access control lists (NIP-86 manages them at runtime) |
 
-`nostrd check` (and startup) validate the file and warn about common misconfigurations — e.g. an empty `relay.public_url` with a wildcard/loopback bind (which would break NIP-42 AUTH, NIP-62 vanish and NIP-86 NIP-98 auth), a `require_pow` high enough to make mining infeasible, incomplete LiveKit settings, or the `require_auth` + `send_auth_challenge = false` lockout.
+`nostrfy check` (and startup) validate the file and warn about common misconfigurations — e.g. an empty `relay.public_url` with a wildcard/loopback bind (which would break NIP-42 AUTH, NIP-62 vanish and NIP-86 NIP-98 auth), a `require_pow` high enough to make mining infeasible, incomplete LiveKit settings, or the `require_auth` + `send_auth_challenge = false` lockout.
 
 **Full reference — every key, its default and its exact behavior, validation rules, SIGHUP reload, full example: [Configuration reference](docs/CONFIGURATION.md).**
 
@@ -312,7 +313,7 @@ In addition to the tunables above, a few hard bounds are fixed to keep the relay
 
 ### Inbox/outbox subscription filters
 
-nostrd extends the REQ filter syntax with two convenience keys for the inbox/outbox routing model:
+nostrfy extends the REQ filter syntax with two convenience keys for the inbox/outbox routing model:
 
 - `"outbox": "<pubkey>"` — expands to `"authors": ["<pubkey>"]`: only events **authored by** the pubkey (stored and live).
 - `"inbox": "<pubkey>"` — expands to `"#p": ["<pubkey>"]`: only events **addressed to** the pubkey — mentions, replies, zaps and DMs that `p`-tag it.
@@ -330,7 +331,7 @@ With `server.ws_paths = "inbox-outbox"` the relay's WebSocket endpoint is served
 
 ## NIP support
 
-All relay-side NIPs are implemented; client-side NIPs are stored and served as plain events. A subset of client-side NIPs that clients rely on (17, 22, 32, 46, 47, 57, 59, 65, 78, 84, 85, 87, 88, 94) is **deliberately** advertised in the NIP-11 document; the rest are not (per the spec: "Client-side NIPs SHOULD NOT be advertised"). NIP-34 (git) is opt-in via `relay.enabled_git` — off by default, since patch payloads can be large. NIP-A3 (kind 10133) is served but cannot be advertised: it is a `draft` with no integer identifier, and NIP-11's `supported_nips` is an array of integer identifiers. The remaining file-storage NIPs (95/96 HTTP file storage) are excluded by design — NIP-94 file-metadata events are stored and served like any other event, and Blossom is provided by the dedicated [Blossom file server](#features).
+All relay-side NIPs are implemented; client-side NIPs are stored and served as plain events. A subset of client-side NIPs that clients rely on (17, 22, 32, 46, 47, 57, 59, 65, 78, 84, 85, 87, 88, 94) is **deliberately** advertised in the NIP-11 document; the rest are not (per the spec: "Client-side NIPs SHOULD NOT be advertised"). NIP-34 (git) is opt-in via `relay.enabled_git` — off by default, since patch payloads can be large. NIP-A3 (kind 10133) is served but cannot be advertised: it is a `draft` with no integer identifier, and NIP-11's `supported_nips` is an array of integer identifiers. The remaining file-storage NIPs are covered: NIP-94 file-metadata events are stored and served like any other event, and Blossom (NIP-96) is provided by the dedicated [Blossom file server](#features) — only NIP-95 (plain HTTP file storage) is not implemented.
 
 The advertised `supported_nips` list is **dynamic**: a NIP is dropped when all the kinds it defines are blocked by `blocked_kinds`/`allowed_kinds` (e.g. blocking kind 5 hides NIP-09), when `reject_ephemeral` rejects every kind it relies on, or when it is disabled via `enabled_nips`/`disabled_nips`. Runtime changes (NIP-86 `allowkind`/`disallowkind`, `SIGHUP` reloads) are reflected in the next NIP-11 fetch.
 
@@ -386,25 +387,35 @@ The advertised `supported_nips` list is **dynamic**: a NIP is dropped when all t
 
 ## Performance
 
-Measured on the release build (5 concurrent connections, fresh database, fsync per commit):
+Measured on the release build with a fresh database using the bundled load
+client [`examples/bench.rs`](examples/bench.rs) (an 8-thread laptop: Intel
+Core i5-8265U, 8 GB RAM). Publish rates are limited by the single LMDB
+writer thread and the fsync-free commit batching; readers run on their own
+threads and never block the writer.
 
-| Operation | Result |
-| --- | --- |
-| Event publish (signature verification + fsync commit) | ~1,100–1,400 events/s |
-| Query (limit 100, tag filter) | 50 queries in ~1.4 s |
-| Live notification delivery (publish → subscriber) | median ~6 ms, p95 ~12 ms |
-| COUNT (NIP-45) | 50 counts in ~0.9 s |
+| Scenario | Command | Result |
+| --- | --- | --- |
+| Event ingest (1 connection) | `bench ws://127.0.0.1:18999 ingest 10000` | **~21,000 events/s** (10,000 events in 0.48 s, all accepted) |
+| Parallel ingest (5 connections) | `bench ... parallel-ingest 5 5000` | **~22,000 events/s** (25,000 events in 1.14 s) |
+| Live fan-out (50 subscribers, 200 publishes) | `bench ... fanout 50 200` | **10,000/10,000 deliveries** (100% fan-out) |
+| Stored query (20,000 events) | `bench ... req 20000` | 20,000 events in **0.32 s** |
+| NIP-50 search (10,000 results) | `bench ... search <term>` | 10,000 events in **0.26 s** |
+| Concurrent search (20 parallel scans) | `bench ... parallel-req 20 <term>` | worst **1.7 s**, avg 0.94 s over a 35k-event store |
 
-Sustained-load stability test (10 connections × 30 s, ~20,000 published events):
-zero database errors, zero panics, zero rejected events. The memory map is a
-virtual address-space reservation: a freshly started relay uses only a few
-tens of MB of physical memory regardless of `map_size`.
+To reproduce: `cargo build --release --examples`, start a relay
+(`target/release/nostrfy --config ... start`, e.g. on port 18999) and run the
+scenarios above — raise `limits.max_limit` for the query/search scenarios
+(the default 500 caps the results). Keep subscriber counts under
+`limits.max_connections_per_ip` (default 64).
+
+The memory map is a virtual address-space reservation: a freshly started
+relay uses only a few tens of MB of physical memory regardless of `map_size`.
 
 ## Repository layout
 
 ```
 src/
-├── main.rs, cli.rs, config.rs   entry point, CLI, nostrd.toml (validation,
+├── main.rs, cli.rs, config.rs   entry point, CLI, nostrfy.toml (validation,
 │                                legacy-key aliases, atomic rewrites)
 ├── audit.rs, logging.rs         rate-limited NIP-86 audit log, rotating logger
 ├── util.rs, error.rs, event.rs, filter.rs, stats.rs

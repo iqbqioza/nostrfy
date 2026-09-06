@@ -135,8 +135,12 @@ fn authority_matches(
         (None, Some(op)) => {
             crate::nips::nip62::scheme_default_port(scheme).is_none_or(|dp| dp == op)
         }
+        // Mirror case: a tag with the scheme's default port matches a
+        // portless relay identity (`wss://host:443` ≡ portless `wss://host`).
+        (Some(tp), None) => {
+            crate::nips::nip62::scheme_default_port(scheme).is_none_or(|dp| dp == tp)
+        }
         (None, None) => true,
-        (Some(_), None) => false,
     }
 }
 

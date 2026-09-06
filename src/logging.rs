@@ -122,9 +122,10 @@ impl FileLogger {
         // rename is logged (the old log content between the rotation size
         // and the failure would otherwise be silently lost).
         let first = backup_path(&self.path, 1);
-        if let Err(e) = std::fs::rename(&self.path, &first) {
+        let rotated = std::fs::rename(&self.path, &first).is_ok();
+        if !rotated {
             eprintln!(
-                "cannot rotate log {} -> {}: {e}",
+                "cannot rotate log {} -> {}",
                 self.path.display(),
                 first.display()
             );
@@ -136,7 +137,13 @@ impl FileLogger {
         {
             Ok(file) => {
                 state.file = file;
-                state.size = 0;
+                // Only a successful rotation may reset the size counter: a
+                // failed rename leaves the (still oversized) current file
+                // in place, and resetting to 0 would stop rotation attempts
+                // while the log grows unbounded.
+                if rotated {
+                    state.size = 0;
+                }
             }
             Err(e) => eprintln!("cannot reopen log file: {e}"),
         }
@@ -244,7 +251,7 @@ mod tests {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = std::env::temp_dir()
-            .join("nostrd-log-poison-test")
+            .join("nostrfy-log-poison-test")
             .join(format!("{:x}-{id}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -282,10 +289,10 @@ mod tests {
 
     #[test]
     fn rotation_keeps_bounded_backups() {
-        let dir = std::env::temp_dir().join("nostrd-log-test");
+        let dir = std::env::temp_dir().join("nostrfy-log-test");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("nostrd.log");
+        let path = dir.join("nostrfy.log");
         let _ = FileLogger::open(path.clone(), 8, 3).unwrap(); // rotate at 8 bytes
         log::set_logger(&LOGGER).ok();
         log::set_max_level(log::LevelFilter::Info);
@@ -300,7 +307,7 @@ mod tests {
             "current file should be rotated at 8 bytes, got {size}"
         );
         // Backups exist and are bounded.
-        assert!(path.with_file_name("nostrd.log.1").exists() || backup_path(&path, 1).exists());
+        assert!(path.with_file_name("nostrfy.log.1").exists() || backup_path(&path, 1).exists());
         assert!(!backup_path(&path, 4).exists(), "only 3 backups are kept");
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -14,7 +14,7 @@ use crate::server::run_server;
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "nostrd",
+    name = "nostrfy",
     version,
     about = "A minimal and stable Nostr relay server"
 )]
@@ -30,9 +30,9 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Write a default nostrd.toml and exit.
+    /// Write a default nostrfy.toml and exit.
     Init,
-    /// Generate a relay secret key for NIP-29 and write it into nostrd.toml
+    /// Generate a relay secret key for NIP-29 and write it into nostrfy.toml
     /// (asks for confirmation when relay.private_key is already set).
     #[command(name = "genkey")]
     GenKey,
@@ -43,11 +43,11 @@ pub enum Command {
     },
     /// Stop the running daemon.
     Stop,
-    /// Stop the daemon and start it again (reloads nostrd.toml).
+    /// Stop the daemon and start it again (reloads nostrfy.toml).
     Restart,
     /// Show live statistics of the running daemon.
     Stats,
-    /// Validate nostrd.toml and exit.
+    /// Validate nostrfy.toml and exit.
     Check,
     /// Manage the Blossom upload allowlist (npub1... or hex pubkeys).
     #[command(name = "blossom")]
@@ -60,6 +60,19 @@ pub enum Command {
     Relay {
         #[command(subcommand)]
         action: RelayAction,
+    },
+    /// Update the relay binary to the latest release (or a given version).
+    ///
+    /// Downloads the GitHub release asset for this platform and atomically
+    /// replaces the running binary; the new version applies on the next
+    /// start (or after `nostrfy restart` when a daemon is running).
+    #[command(name = "upgrade")]
+    Upgrade {
+        /// Version to install (e.g. "0.1.3"; default: the latest release).
+        version: Option<String>,
+        /// Reinstall even when the binary is already at the target version.
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -111,13 +124,14 @@ impl Cli {
                 cfg.validate()?;
                 if let Some(pid) = running_pid(&cfg.daemon.pid_file) {
                     return Err(Error::Config(format!(
-                        "already running (pid {pid}); use 'nostrd stop' or 'nostrd restart'"
+                        "already running (pid {pid}); use 'nostrfy stop' or 'nostrfy restart'"
                     )));
                 }
                 return Ok(());
             }
             Command::Blossom { action } => return self.blossom_allowlist(action),
             Command::Relay { action } => return self.relay_access(action),
+            Command::Upgrade { version, force } => return self.upgrade(version.as_deref(), *force),
             _ => {}
         }
 
@@ -133,7 +147,7 @@ impl Cli {
         cfg.validate()?;
         if let Some(pid) = running_pid(&cfg.daemon.pid_file) {
             return Err(Error::Config(format!(
-                "already running (pid {pid}); use 'nostrd stop' or 'nostrd restart'"
+                "already running (pid {pid}); use 'nostrfy stop' or 'nostrfy restart'"
             )));
         }
         self.daemonize(&cfg)?;
@@ -203,13 +217,13 @@ impl Cli {
             // Parent: the daemon has forked and the first child exited.
             // Report the pid (read from the pid file, which the daemon
             // writes just after the first child exits) and terminate, so the
-            // foreground `nostrd start`/`restart` returns with a clear
+            // foreground `nostrfy start`/`restart` returns with a clear
             // message instead of silently.
             daemonize::Outcome::Parent(result) => {
                 result.map_err(|e| Error::Config(format!("failed to daemonize: {e}")))?;
                 match wait_for_pid_file(&cfg.daemon.pid_file) {
-                    Some(pid) => print_line(&format!("nostrd started (pid {pid})")),
-                    None => print_line("nostrd started"),
+                    Some(pid) => print_line(&format!("nostrfy started (pid {pid})")),
+                    None => print_line("nostrfy started"),
                 }
                 flush_stdout();
                 std::process::exit(0);
@@ -232,11 +246,11 @@ impl Cli {
         let pid = match running_pid(&self.load_config()?.daemon.pid_file) {
             Some(pid) => pid,
             None => {
-                print_line("nostrd is not running");
+                print_line("nostrfy is not running");
                 return Ok(());
             }
         };
-        print_line(&format!("stopping nostrd (pid {pid})"));
+        print_line(&format!("stopping nostrfy (pid {pid})"));
         // SAFETY: `kill` only touches the targeted process id.
         let ret = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
         if ret != 0 {
@@ -250,7 +264,7 @@ impl Cli {
                 "daemon (pid {pid}) did not stop in time"
             )));
         }
-        print_line("nostrd stopped");
+        print_line("nostrfy stopped");
         Ok(())
     }
 
@@ -258,7 +272,7 @@ impl Cli {
         let cfg = self.load_config()?;
         if !cfg.daemon.stats_file.exists() {
             return Err(Error::Config(
-                "nostrd is not running (no stats file)".into(),
+                "nostrfy is not running (no stats file)".into(),
             ));
         }
         let raw = std::fs::read_to_string(&cfg.daemon.stats_file)?;
@@ -267,14 +281,14 @@ impl Cli {
         Ok(())
     }
 
-    /// `nostrd blossom allow/deny/list`: manages the Blossom upload allowlist.
+    /// `nostrfy blossom allow/deny/list`: manages the Blossom upload allowlist.
     /// The list lives in the relay database (LMDB) — never the config file —
     /// so it survives restarts and is shared with the running daemon. The
     /// daemon is reloaded via SIGHUP so changes apply without a restart.
     fn blossom_allowlist(&self, action: &BlossomAction) -> Result<()> {
         if !self.config.exists() {
             return Err(Error::Config(format!(
-                "{} not found; run 'nostrd init' first",
+                "{} not found; run 'nostrfy init' first",
                 self.config.display()
             )));
         }
@@ -332,7 +346,7 @@ impl Cli {
                     print_line(&format!("the running daemon (pid {pid}) was reloaded"));
                 } else {
                     print_line(
-                        "warning: could not signal the running daemon; run 'nostrd restart' to apply",
+                        "warning: could not signal the running daemon; run 'nostrfy restart' to apply",
                     );
                 }
             }
@@ -343,14 +357,14 @@ impl Cli {
         Ok(())
     }
 
-    /// `nostrd relay allow/deny/list`: manages the relay pubkey allow/deny
+    /// `nostrfy relay allow/deny/list`: manages the relay pubkey allow/deny
     /// lists. They live in the relay database (LMDB) — never the config
     /// file — and the daemon is reloaded via SIGHUP so changes apply
     /// immediately.
     fn relay_access(&self, action: &RelayAction) -> Result<()> {
         if !self.config.exists() {
             return Err(Error::Config(format!(
-                "{} not found; run 'nostrd init' first",
+                "{} not found; run 'nostrfy init' first",
                 self.config.display()
             )));
         }
@@ -419,7 +433,7 @@ impl Cli {
                     print_line(&format!("the running daemon (pid {pid}) was reloaded"));
                 } else {
                     print_line(
-                        "warning: could not signal the running daemon; run 'nostrd restart' to apply",
+                        "warning: could not signal the running daemon; run 'nostrfy restart' to apply",
                     );
                 }
             }
@@ -430,7 +444,222 @@ impl Cli {
         Ok(())
     }
 
-    /// `nostrd genkey`: generates a relay secret key (for NIP-29 group
+    /// `nostrfy upgrade`: replaces the relay binary with a GitHub release
+    /// asset (the version given on the command line, or the latest release).
+    /// The download is written to a temp file next to the current
+    /// executable (created with O_EXCL, so a planted symlink is never
+    /// followed), its sha256 is verified against the published checksum,
+    /// the binary is proven to run (`--version` probe with a deadline),
+    /// and it is atomically renamed over the binary with an fsync of both
+    /// the file and the directory — a crash or power loss mid-upgrade
+    /// leaves the old binary intact. A running daemon keeps using the old
+    /// file (already mapped); the operator is reminded to `restart` to
+    /// apply the update.
+    fn upgrade(&self, version: Option<&str>, force: bool) -> Result<()> {
+        const REPO: &str = "iqbqioza/nostrfy";
+        const MAX_ASSET_BYTES: u64 = 256 * 1024 * 1024;
+
+        let current = env!("CARGO_PKG_VERSION");
+        let Some(asset) = upgrade_asset_name(std::env::consts::OS, std::env::consts::ARCH) else {
+            return Err(Error::Config(format!(
+                "upgrade is not supported on {}-{}; install manually from \
+                 https://github.com/{REPO}/releases",
+                std::env::consts::OS,
+                std::env::consts::ARCH
+            )));
+        };
+        let target = match version {
+            Some(v) => v.trim_start_matches('v').to_string(),
+            None => latest_release_version(REPO)?,
+        };
+        let tag = format!("v{target}");
+        if target == current {
+            if !force {
+                print_line(&format!(
+                    "nostrfy {current} is already the latest version; use --force to reinstall"
+                ));
+                flush_stdout();
+                return Ok(());
+            }
+        } else if version.is_none() && !force && version_gt(current, &target) {
+            // No explicit version and no --force: never downgrade a newer
+            // local build to the latest release (e.g. a dev build newer
+            // than the newest published tag). --force bypasses the guard.
+            print_line(&format!(
+                "the installed binary ({current}) is newer than the latest release ({target}); \
+                 nothing to upgrade (use --force to downgrade)"
+            ));
+            flush_stdout();
+            return Ok(());
+        }
+        if target != current {
+            print_line(&format!("upgrading nostrfy {current} -> {target}"));
+        } else {
+            print_line(&format!("reinstalling nostrfy {target}"));
+        }
+        let exe = std::env::current_exe().map_err(Error::Io)?;
+        let dir = exe
+            .parent()
+            .ok_or_else(|| Error::Other("cannot locate the binary's directory".into()))?;
+        // Best-effort cleanup of temp files left behind by a hard-killed
+        // previous upgrade (same pattern, any pid).
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name.starts_with(".nostrfy-upgrade-") && name.ends_with("-tmp") {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+        let tmp = dir.join(format!(".nostrfy-upgrade-{}-tmp", std::process::id()));
+        let url = format!("https://github.com/{REPO}/releases/download/{tag}/{asset}");
+        print_line(&format!("downloading {url} ..."));
+        flush_stdout();
+        // Timeouts for every network step: a blackholed connection must not
+        // hang the CLI forever (ureq's default agent has no read timeout).
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_secs(30))
+            .timeout_read(Duration::from_secs(120))
+            .timeout_write(Duration::from_secs(120))
+            .build();
+        let result = (|| -> Result<()> {
+            let response = agent
+                .get(&url)
+                .set("User-Agent", "nostrfy-upgrade")
+                .call()
+                .map_err(|e| Error::Other(format!("download failed: {e}")))?;
+            if response.status() != 200 {
+                return Err(Error::Other(format!(
+                    "download failed: HTTP {}",
+                    response.status()
+                )));
+            }
+            let mut reader = response.into_reader();
+            // create_new (O_EXCL): never follow a pre-planted symlink or
+            // truncate an existing file.
+            let mut out = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)
+                .map_err(|e| Error::Other(format!("cannot create {}: {e}", tmp.display())))?;
+            // Stream with a hard byte cap: the trait-object reader cannot
+            // be `take()`d, and a huge (or hostile) response must not be
+            // buffered or written out unbounded.
+            let mut buf = [0u8; 64 * 1024];
+            let mut copied: u64 = 0;
+            use std::io::{Read, Write};
+            loop {
+                let n = reader.read(&mut buf).map_err(Error::Io)?;
+                if n == 0 {
+                    break;
+                }
+                copied += n as u64;
+                if copied > MAX_ASSET_BYTES {
+                    return Err(Error::Other("the downloaded binary is too large".into()));
+                }
+                out.write_all(&buf[..n]).map_err(Error::Io)?;
+            }
+            // The release pipeline publishes <asset>.sha256 next to the
+            // binary (install.sh verifies it the same way): verify the
+            // digest BEFORE executing anything downloaded.
+            let checksum = agent
+                .get(&format!("{url}.sha256"))
+                .set("User-Agent", "nostrfy-upgrade")
+                .call()
+                .map_err(|e| Error::Other(format!("cannot fetch the checksum: {e}")))?
+                .into_string()
+                .map_err(|e| Error::Other(format!("invalid checksum response: {e}")))?;
+            let expected = checksum
+                .split_whitespace()
+                .next()
+                .and_then(|h| hex::decode(h).ok())
+                .filter(|b| b.len() == 32)
+                .ok_or_else(|| Error::Other("the published checksum is not a sha256".into()))?;
+            out.sync_all().map_err(Error::Io)?;
+            drop(out);
+            let actual = {
+                use sha2::Digest;
+                let mut hasher = sha2::Sha256::new();
+                let mut f = std::fs::File::open(&tmp).map_err(Error::Io)?;
+                std::io::copy(&mut f, &mut hasher).map_err(Error::Io)?;
+                hasher.finalize().to_vec()
+            };
+            if actual != expected {
+                return Err(Error::Other(
+                    "sha256 of the downloaded binary does not match the published checksum; \
+                     keeping the current binary"
+                        .into(),
+                ));
+            }
+            // Make it executable and prove it runs before replacing the
+            // live binary.
+            let mut perms = std::fs::metadata(&tmp).map_err(Error::Io)?.permissions();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                perms.set_mode(0o755);
+            }
+            std::fs::set_permissions(&tmp, perms).map_err(Error::Io)?;
+            // The probe runs with a hard deadline: a downloaded binary that hangs
+            // must not hang the CLI, and the child process is killed on
+            // timeout instead of being left orphaned.
+            let mut child = std::process::Command::new(&tmp)
+                .arg("--version")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .map_err(|e| Error::Other(format!("downloaded binary does not run: {e}")))?;
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            let probe_ok = loop {
+                match child.try_wait().map_err(Error::Io)? {
+                    Some(status) => break status.success(),
+                    None => {
+                        if std::time::Instant::now() >= deadline {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            break false;
+                        }
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                }
+            };
+            if !probe_ok {
+                return Err(Error::Other(
+                    "downloaded binary failed or timed out in its version check; \
+                     keeping the current binary"
+                        .into(),
+                ));
+            };
+            std::fs::rename(&tmp, &exe).map_err(Error::Io)?;
+            // fsync the directory so the rename survives a power loss, not
+            // just a process crash.
+            if let Ok(d) = std::fs::File::open(dir) {
+                let _ = d.sync_all();
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        result?;
+        print_line(&format!("replaced {} with nostrfy {target}", exe.display()));
+        // A running daemon has the old binary mapped already: tell the
+        // operator to restart to apply the update.
+        if self.config.exists()
+            && let Ok(cfg) = self.load_config()
+            && let Some(pid) = running_pid(&cfg.daemon.pid_file)
+        {
+            print_line(&format!(
+                "a daemon is running (pid {pid}) and still uses the old binary; \
+                 run 'nostrfy restart' to apply the update"
+            ));
+        }
+        flush_stdout();
+        Ok(())
+    }
+
+    /// `nostrfy genkey`: generates a relay secret key (for NIP-29 group
     /// metadata and NIP-43 membership events) and writes it into
     /// `relay.private_key` of the config file, preserving the rest of the
     /// file. When `relay.private_key` is already set, the operator is asked
@@ -438,7 +667,7 @@ impl Cli {
     fn genkey(&self) -> Result<()> {
         if !self.config.exists() {
             return Err(Error::Config(format!(
-                "{} not found; run 'nostrd init' first",
+                "{} not found; run 'nostrfy init' first",
                 self.config.display()
             )));
         }
@@ -503,7 +732,7 @@ fn open_db(cfg: &Config) -> Result<crate::db::DbClient> {
     )
 }
 
-/// Prints a line to stdout, ignoring broken-pipe errors (e.g. `nostrd stats
+/// Prints a line to stdout, ignoring broken-pipe errors (e.g. `nostrfy stats
 /// | head`): a closed pipe must not panic the process like `println!` does.
 fn print_line(text: &str) {
     use std::io::Write;
@@ -540,6 +769,64 @@ fn init_config(path: &Path) -> Result<()> {
         Err(e) => return Err(e),
     }
     Ok(())
+}
+
+/// Parses "X.Y.Z" into numeric parts, for the upgrade version comparison.
+fn version_parse(v: &str) -> Option<(u64, u64, u64)> {
+    let parts: Vec<&str> = v.split('.').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    Some((
+        parts[0].parse().ok()?,
+        parts[1].parse().ok()?,
+        parts[2].parse().ok()?,
+    ))
+}
+
+/// Whether `a` is strictly newer than `b` (numeric X.Y.Z comparison;
+/// unparsable versions compare as equal, so a bad tag never triggers an
+/// unwanted downgrade).
+fn version_gt(a: &str, b: &str) -> bool {
+    let (Some(a), Some(b)) = (version_parse(a), version_parse(b)) else {
+        return false;
+    };
+    a > b
+}
+
+/// The GitHub release asset name for a platform, mirroring install.sh
+/// (e.g. "nostrfy-linux-x86_64"). `None` when the platform has no
+/// prebuilt asset.
+fn upgrade_asset_name(os: &str, arch: &str) -> Option<String> {
+    let asset = match (os, arch) {
+        ("linux", "x86_64") => "nostrfy-linux-x86_64",
+        ("linux", "aarch64") => "nostrfy-linux-aarch64",
+        ("freebsd", "x86_64") => "nostrfy-freebsd-x86_64",
+        _ => return None,
+    };
+    Some(asset.into())
+}
+
+/// The tag of the latest GitHub release (without the leading "v").
+fn latest_release_version(repo: &str) -> Result<String> {
+    let url = format!("https://api.github.com/repos/{repo}/releases/latest");
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(30))
+        .timeout_read(Duration::from_secs(60))
+        .timeout_write(Duration::from_secs(60))
+        .build();
+    let response = agent
+        .get(&url)
+        .set("User-Agent", "nostrfy-upgrade")
+        .call()
+        .map_err(|e| Error::Other(format!("cannot query the latest release: {e}")))?;
+    let value: serde_json::Value = serde_json::from_reader(response.into_reader())
+        .map_err(|e| Error::Other(format!("invalid release response: {e}")))?;
+    value
+        .get("tag_name")
+        .and_then(serde_json::Value::as_str)
+        .map(|t| t.trim_start_matches('v').to_string())
+        .ok_or_else(|| Error::Other("the release response has no tag_name".into()))
 }
 
 /// Generates a random secp256k1 secret key as lowercase hex (64 chars),
@@ -726,7 +1013,7 @@ fn process_alive(pid: u32) -> bool {
     // Best-effort name check: a reused pid running a different program is
     // not our daemon.
     match process_name(pid) {
-        Some(name) => name == "nostrd",
+        Some(name) => name == "nostrfy",
         None => true,
     }
 }
@@ -803,19 +1090,48 @@ mod tests {
     const KEY: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
 
     #[test]
+    fn upgrade_asset_names_cover_the_release_platforms() {
+        assert_eq!(
+            upgrade_asset_name("linux", "x86_64").as_deref(),
+            Some("nostrfy-linux-x86_64")
+        );
+        assert_eq!(
+            upgrade_asset_name("linux", "aarch64").as_deref(),
+            Some("nostrfy-linux-aarch64")
+        );
+        assert_eq!(
+            upgrade_asset_name("freebsd", "x86_64").as_deref(),
+            Some("nostrfy-freebsd-x86_64")
+        );
+        assert!(upgrade_asset_name("windows", "x86_64").is_none());
+        assert!(upgrade_asset_name("linux", "riscv64").is_none());
+    }
+
+    #[test]
+    fn upgrade_version_comparison() {
+        assert!(version_gt("0.1.4", "0.1.3"));
+        assert!(version_gt("0.2.0", "0.1.99"));
+        assert!(version_gt("1.0.0", "0.9.9"));
+        assert!(!version_gt("0.1.3", "0.1.3"));
+        assert!(!version_gt("0.1.2", "0.1.3"));
+        // Unparsable versions never trigger a downgrade.
+        assert!(!version_gt("dev", "0.1.3"));
+    }
+
+    #[test]
     fn genkey_writes_private_key_with_0600_permissions() {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = std::env::temp_dir()
-            .join("nostrd-genkey-test")
+            .join("nostrfy-genkey-test")
             .join(format!("{:x}-{id}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let config_path = dir.join("nostrd.toml");
+        let config_path = dir.join("nostrfy.toml");
         std::fs::write(
             &config_path,
             "[relay]
-name = \"nostrd\"\n",
+name = \"nostrfy\"\n",
         )
         .unwrap();
         let mut cli = Cli {
@@ -843,23 +1159,23 @@ name = \"nostrd\"\n",
 
     #[test]
     fn replaces_existing_private_key_preserving_comments() {
-        let text = "# comment\n[relay]\nname = \"nostrd\"\n# my key\nprivate_key = \"\"\npublic_url = \"wss://x\"\n";
+        let text = "# comment\n[relay]\nname = \"nostrfy\"\n# my key\nprivate_key = \"\"\npublic_url = \"wss://x\"\n";
         let out = set_private_key_in_text(text, KEY);
         assert!(out.contains(&format!("private_key = \"{KEY}\"")));
         assert!(!out.contains("private_key = \"\""));
         // Comments and unrelated lines survive.
         assert!(out.contains("# comment"));
         assert!(out.contains("# my key"));
-        assert!(out.contains("name = \"nostrd\""));
+        assert!(out.contains("name = \"nostrfy\""));
         assert!(out.contains("public_url = \"wss://x\""));
     }
 
     #[test]
     fn inserts_private_key_after_relay_header() {
-        let text = "[relay]\nname = \"nostrd\"\n\n[server]\nport = 8080\n";
+        let text = "[relay]\nname = \"nostrfy\"\n\n[server]\nport = 8080\n";
         let out = set_private_key_in_text(text, KEY);
         assert!(out.contains(&format!(
-            "[relay]\nprivate_key = \"{KEY}\"\nname = \"nostrd\""
+            "[relay]\nprivate_key = \"{KEY}\"\nname = \"nostrfy\""
         )));
         assert!(out.contains("[server]\nport = 8080"));
     }
@@ -901,7 +1217,7 @@ name = \"nostrd\"\n",
         // recognized as the `[relay]` section; before the fix the key was
         // appended as a *second* `[relay]` section, breaking the file with
         // a duplicate key.
-        let text = "[relay]# my relay\nname = \"nostrd\"\n[server]\nport = 8080\n";
+        let text = "[relay]# my relay\nname = \"nostrfy\"\n[server]\nport = 8080\n";
         let out = set_private_key_in_text(text, KEY);
         assert!(out.contains(&format!("[relay]# my relay\nprivate_key = \"{KEY}\"")));
         assert!(out.contains("[server]\nport = 8080"));

@@ -1,5 +1,5 @@
 /target
 *.mdb
-nostrd.toml
-!deploy/nostrd.toml
-nostrd.stats.json
+nostrfy.toml
+!deploy/nostrfy.toml
+nostrfy.stats.json

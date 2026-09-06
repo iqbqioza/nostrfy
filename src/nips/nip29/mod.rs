@@ -826,6 +826,53 @@ impl GroupStore {
                 seen_gids.insert(gid.to_string());
             }
         }
+        // The relay-signed metadata (39000-39005: name/picture, the admins
+        // and members lists, pins) survives a vanished creator — and is
+        // not part of the moderation walk above. Include its group ids in
+        // the ghost detection, so a private group whose only surviving
+        // events are its metadata cannot become world-readable after a
+        // restart. Walk it in pages like the moderation walk: a relay
+        // hosting many groups can hold far more than one page of metadata,
+        // and a truncated walk would silently fail the ghost detection
+        // open (private metadata world-readable).
+        let meta_kinds: Vec<u64> = (GROUP_META..=GROUP_PINS).collect();
+        let mut meta_events: Vec<Event> = Vec::new();
+        let mut until: Option<u64> = None;
+        loop {
+            let mut filter: Filter =
+                serde_json::from_value(json!({ "kinds": meta_kinds })).expect("static filter");
+            filter.until = until;
+            let (page, more) = db.query_full(vec![filter], PAGE, unix_now()).await;
+            if page.is_empty() {
+                break;
+            }
+            let min_created = page.iter().map(|e| e.created_at).min().unwrap_or(0);
+            let full = page.len() >= PAGE;
+            if !full && more {
+                // The scan budget was exhausted mid-timestamp: the page is
+                // partial and stepping the cursor would silently skip the
+                // unexamined events of the same timestamp, leaving their
+                // groups out of the ghost detection (fail-open). Stop and
+                // warn, like the moderation walk above.
+                log::warn!(
+                    "group metadata scan ended early (scan budget exhausted with {} events in \
+                     the page): the ghost detection may be incomplete after this restart",
+                    page.len()
+                );
+                meta_events.extend(page);
+                break;
+            }
+            meta_events.extend(page);
+            if !full || min_created == 0 {
+                break;
+            }
+            until = Some(min_created - 1);
+        }
+        for event in &meta_events {
+            if let Some(gid) = crate::nips::nip29::group_id_d(event) {
+                seen_gids.insert(gid.to_string());
+            }
+        }
         for mut event in events {
             // A vanished author must not be resurrected as a member by
             // replaying pre-vanish events signed by others (the vanish
@@ -873,7 +920,7 @@ fn group_rank(kind: u64) -> u8 {
     }
 }
 
-fn event_code(event: &Event) -> Option<&str> {
+pub(crate) fn event_code(event: &Event) -> Option<&str> {
     tag_value(event, CODE)
 }
 

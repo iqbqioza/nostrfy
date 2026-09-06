@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# install.sh — download and install the nostrd relay server.
+# install.sh — download and install the nostrfy relay server.
 #
 # Downloads the binary built by the GitHub Actions release workflow and
 # installs it into a directory on PATH. Works without sudo: by default the
@@ -17,14 +17,14 @@
 
 set -eu
 
-REPO="iqbqioza/nostrd"
+REPO="iqbqioza/nostrfy"
 VERSION="${VERSION:-}"          # empty = latest release
 INSTALL_DIR="${INSTALL_DIR:-}"  # empty = auto-detect (see below)
 FORCE=0
 
 usage() {
   cat <<'EOF'
-install.sh — download and install the nostrd relay server.
+install.sh — download and install the nostrfy relay server.
 
 Usage:
   ./install.sh                         install the latest release
@@ -33,8 +33,8 @@ Usage:
   ./install.sh --force                 overwrite without asking
 
 One-liner (no clone needed):
-  curl -fsSL https://raw.githubusercontent.com/iqbqioza/nostrd/main/install.sh | sh
-  curl -fsSL https://raw.githubusercontent.com/iqbqioza/nostrd/main/install.sh | sh -s -- --force
+  curl -fsSL https://raw.githubusercontent.com/iqbqioza/nostrfy/main/install.sh | sh
+  curl -fsSL https://raw.githubusercontent.com/iqbqioza/nostrfy/main/install.sh | sh -s -- --force
 EOF
 }
 
@@ -71,11 +71,11 @@ esac
 
 case "$(uname -m)" in
   x86_64 | amd64)
-    if [ "$OS" = "linux" ]; then ASSET="nostrd-linux-x86_64"; else ASSET="nostrd-freebsd-x86_64"; fi
+    if [ "$OS" = "linux" ]; then ASSET="nostrfy-linux-x86_64"; else ASSET="nostrfy-freebsd-x86_64"; fi
     ;;
   aarch64 | arm64)
     [ "$OS" = "linux" ] || { echo "error: FreeBSD is only packaged for x86_64" >&2; exit 1; }
-    ASSET="nostrd-linux-aarch64"
+    ASSET="nostrfy-linux-aarch64"
     ;;
   *)
     echo "error: unsupported architecture: $(uname -m)" >&2
@@ -110,7 +110,7 @@ if ! mkdir -p "$INSTALL_DIR"; then
   exit 1
 fi
 
-TARGET="$INSTALL_DIR/nostrd"
+TARGET="$INSTALL_DIR/nostrfy"
 
 # --- overwrite confirmation -------------------------------------------------
 
@@ -118,14 +118,14 @@ if [ -e "$TARGET" ]; then
   if [ "$FORCE" -eq 1 ]; then
     echo "overwriting $TARGET (--force)"
   elif [ -t 0 ]; then
-    printf "nostrd already exists at %s. Overwrite it? [y/N] " "$TARGET"
+    printf "nostrfy already exists at %s. Overwrite it? [y/N] " "$TARGET"
     read -r answer
     case "$answer" in
       y | Y | yes | Yes | YES) echo "overwriting $TARGET" ;;
       *) echo "aborted: $TARGET unchanged" >&2; exit 1 ;;
     esac
   else
-    echo "error: nostrd already exists at $TARGET" >&2
+    echo "error: nostrfy already exists at $TARGET" >&2
     echo "hint: rerun with --force to overwrite it" >&2
     exit 1
   fi
@@ -168,9 +168,9 @@ install -m 0755 "$tmpdir/$ASSET" "$TARGET"
 "$TARGET" --version
 
 echo
-echo "nostrd installed at $TARGET"
+echo "nostrfy installed at $TARGET"
 if printf ':%s:' "$PATH" | grep -q ":$INSTALL_DIR:"; then
-  echo "run 'nostrd --help' to get started"
+  echo "run 'nostrfy --help' to get started"
 else
   echo "$INSTALL_DIR is not on PATH — add it to your shell profile, e.g.:"
   echo "  echo 'export PATH=\"$INSTALL_DIR:\$PATH\"' >> ~/.bashrc"

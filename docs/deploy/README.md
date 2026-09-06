@@ -1,6 +1,6 @@
-# Deploying nostrd
+# Deploying nostrfy
 
-nostrd ships pre-built binaries for **x86_64** and **aarch64** (GitHub release assets, checksum-verified by `install.sh`), a container image that **downloads those binaries** (no compilation needed), and deployment guides for the major platforms.
+nostrfy ships pre-built binaries for **x86_64** and **aarch64** (GitHub release assets, checksum-verified by `install.sh`), a container image that **downloads those binaries** (no compilation needed), and deployment guides for the major platforms.
 
 | Platform | Type | Guide |
 | --- | --- | --- |
@@ -17,19 +17,19 @@ All the VM guides (Digital Ocean, AWS EC2, GCP, Azure, any VPS) follow the same 
 
 ```sh
 # 1. Install the latest release binary (no sudo needed for the install itself)
-curl -fsSL https://raw.githubusercontent.com/iqbqioza/nostrd/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/iqbqioza/nostrfy/main/install.sh | sh
 
 # 2. Fetch the config template and edit it (no repository clone needed)
-sudo mkdir -p /etc/nostrd
-sudo curl -fsSL -o /etc/nostrd/nostrd.toml \
-  https://raw.githubusercontent.com/iqbqioza/nostrd/main/deploy/nostrd.toml
-sudo nano /etc/nostrd/nostrd.toml                   # set name, public_url, private_key
+sudo mkdir -p /etc/nostrfy
+sudo curl -fsSL -o /etc/nostrfy/nostrfy.toml \
+  https://raw.githubusercontent.com/iqbqioza/nostrfy/main/deploy/nostrfy.toml
+sudo nano /etc/nostrfy/nostrfy.toml                   # set name, public_url, private_key
 
 # 3. Fetch the systemd unit and start the service
-sudo curl -fsSL -o /etc/systemd/system/nostrd.service \
-  https://raw.githubusercontent.com/iqbqioza/nostrd/main/deploy/nostrd.service
+sudo curl -fsSL -o /etc/systemd/system/nostrfy.service \
+  https://raw.githubusercontent.com/iqbqioza/nostrfy/main/deploy/nostrfy.service
 sudo systemctl daemon-reload
-sudo systemctl enable --now nostrd
+sudo systemctl enable --now nostrfy
 
 # 4. Open the port (usually 8080) in the provider's firewall and verify
 curl http://localhost:8080/health
@@ -37,17 +37,17 @@ curl http://localhost:8080/health
 
 **Blossom media host**: if `blossom.host` is set, point that hostname at the same port in the TLS proxy too (see the [vps guide](vps.md) for nginx/Caddy blocks).
 
-For VMs, the relay itself serves plain WebSocket on port 8080; a reverse proxy (nginx/Caddy) or the provider's TLS termination in front of it provides `wss://` — nostrd honors `X-Forwarded-Proto`, so it works behind any TLS-terminating proxy.
+For VMs, the relay itself serves plain WebSocket on port 8080; a reverse proxy (nginx/Caddy) or the provider's TLS termination in front of it provides `wss://` — nostrfy honors `X-Forwarded-Proto`, so it works behind any TLS-terminating proxy.
 
 ## Configuring the relay
 
-Every deployment uses the same `nostrd.toml` options — the [Configuration reference](../CONFIGURATION.md) explains each one. Before going live, set at least:
+Every deployment uses the same `nostrfy.toml` options — the [Configuration reference](../CONFIGURATION.md) explains each one. Before going live, set at least:
 
 ```toml
 [relay]
 name = "My Relay"
 public_url = "wss://relay.example.com"   # required for NIP-42 AUTH / NIP-62 / NIP-98
-private_key = ""                          # run `nostrd genkey` and paste the key
+private_key = ""                          # run `nostrfy genkey` and paste the key
 ```
 
 ## Choosing between VM and containers

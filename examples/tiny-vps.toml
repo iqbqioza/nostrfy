@@ -1,11 +1,11 @@
-# nostrd.toml — tiny VPS (512 MB RAM, minimal footprint)
+# nostrfy.toml — tiny VPS (512 MB RAM, minimal footprint)
 #
 # A smallest-footprint relay for a 512 MB VPS: no search index, a small
 # LMDB map, tight connection limits, and the Blossom file server
 # disabled. See docs/MANUAL.md "Memory" for the numbers behind this.
 
 [relay]
-name = "nostrd tiny"
+name = "nostrfy tiny"
 description = "Small personal relay"
 pubkey = ""
 private_key = ""
@@ -43,7 +43,7 @@ max_db_queue_msgs = 1024
 max_db_queue_events = 32768
 
 [daemon]
-log_file = "./nostrd.log"
+log_file = "./nostrfy.log"
 max_log_size_bytes = 10485760
 max_log_files = 2
 
