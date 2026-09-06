@@ -477,10 +477,17 @@ impl Relay {
         }
         match self.db.try_load_relay_pubkeys().await {
             Some((deny, allow)) => {
+                // Read the config *before* taking the access write lock: the
+                // accept paths hold `config.read` while awaiting
+                // `access.read`, so acquiring `access.write` first and then
+                // awaiting `config.read` would set up a lock cycle (this
+                // method holding the write lock awaiting `config.read`,
+                // an accept holding `config.read` awaiting `access.read`).
+                let restrict_relay = self.config.read().await.access.restrict_relay;
                 let mut access = self.access.write().await;
                 access.blocked_pubkeys = deny;
                 access.allowed_pubkeys = allow;
-                access.restrict_relay = self.config.read().await.access.restrict_relay;
+                access.restrict_relay = restrict_relay;
                 log::info!("relay pubkey access lists reloaded from the database");
             }
             None => {

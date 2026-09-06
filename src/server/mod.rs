@@ -1094,6 +1094,10 @@ async fn reload_handler(
                                 old.database.reader_threads != new_config.database.reader_threads,
                             ),
                             (
+                                "database.disabled_fsync",
+                                old.database.disabled_fsync != new_config.database.disabled_fsync,
+                            ),
+                            (
                                 "blossom.host",
                                 old.blossom.host != new_config.blossom.host,
                             ),
