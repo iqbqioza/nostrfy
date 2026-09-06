@@ -15,7 +15,14 @@ pub(crate) struct S3Client {
     bucket: String,
     access_key: String,
     secret_key: String,
+    /// Bounded client for full-body operations (PUT/DELETE/migration
+    /// GETs): a hung S3 endpoint must not hold a request handler forever.
     http: reqwest::Client,
+    /// Unbounded-streaming client for the blob GET: the body is relayed
+    /// 1:1 to the client, so a total request timeout would truncate large
+    /// blobs under slow clients (the client connection itself bounds the
+    /// stream lifetime).
+    http_stream: reqwest::Client,
 }
 
 impl S3Client {
@@ -32,12 +39,11 @@ impl S3Client {
             bucket: bucket.to_string(),
             access_key: access_key.to_string(),
             secret_key: secret_key.to_string(),
-            // A hung S3 endpoint must not hold a request handler forever. The
-            // connect phase is bounded; the body is streamed 1:1 to the
-            // client, so a total request timeout would truncate large blobs
-            // under slow clients (the client connection itself bounds the
-            // stream lifetime).
             http: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(60))
+                .build()
+                .expect("reqwest client"),
+            http_stream: reqwest::Client::builder()
                 .connect_timeout(std::time::Duration::from_secs(30))
                 .build()
                 .expect("reqwest client"),
@@ -104,6 +110,63 @@ impl S3Client {
         }
         if let Some(bytes) = body {
             builder = builder.body(bytes.to_vec());
+        }
+        builder
+            .send()
+            .await
+            .map_err(|e| crate::error::Error::Other(format!("s3 request failed: {e}")))
+    }
+
+    /// Like [`Self::request`] but on the unbounded-streaming client, used
+    /// only by the blob GET whose body is relayed to the client (a total
+    /// timeout would truncate slow downloads; the client connection
+    /// bounds the stream lifetime).
+    async fn request_stream(
+        &self,
+        method: &str,
+        key: &str,
+        query: &str,
+        content_type: Option<&str>,
+        extra_headers: &[(&str, &str)],
+    ) -> Result<reqwest::Response> {
+        let url = self.url(key);
+        let url = if query.is_empty() {
+            url
+        } else {
+            format!("{url}?{query}")
+        };
+        let now = crate::util::unix_now();
+        let amz_date = amz_datetime(now);
+        let date = &amz_date[..8];
+        let payload_hash = if method == "GET" {
+            sha256_hex(b"")
+        } else {
+            "UNSIGNED-PAYLOAD".to_string()
+        };
+        let authorization = self.sign(
+            method,
+            key,
+            query,
+            &payload_hash,
+            &amz_date,
+            date,
+            content_type,
+            extra_headers,
+        );
+        let mut builder = self
+            .http_stream
+            .request(
+                reqwest::Method::from_bytes(method.as_bytes()).unwrap(),
+                &url,
+            )
+            .header("x-amz-date", &amz_date)
+            .header("x-amz-content-sha256", &payload_hash)
+            .header("Authorization", authorization);
+        if let Some(ct) = content_type {
+            builder = builder.header("Content-Type", ct);
+        }
+        for (name, value) in extra_headers {
+            builder = builder.header(*name, *value);
         }
         builder
             .send()
@@ -238,10 +301,10 @@ impl S3Client {
         };
         let resp = match &range {
             Some(r) => {
-                self.request("GET", key, "", None, None, &[("Range", r)])
+                self.request_stream("GET", key, "", None, &[("Range", r)])
                     .await?
             }
-            None => self.request("GET", key, "", None, None, &[]).await?,
+            None => self.request_stream("GET", key, "", None, &[]).await?,
         };
         let status = resp.status();
         if status == reqwest::StatusCode::NOT_FOUND {

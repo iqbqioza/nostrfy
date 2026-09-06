@@ -112,6 +112,14 @@ impl BlobStore {
             ));
         }
         let npub = npub_of(pubkey);
+        // Whether the uploader already owned the blob before this upload:
+        // a failed re-upload of identical bytes must not roll back their
+        // pre-existing, valid mapping.
+        let was_owner = self
+            .db
+            .blossom_load(sha256)
+            .await
+            .is_some_and(|m| m.owners.iter().any(|o| o == pubkey));
         let stored = match &self.storage {
             Storage::Local(s) => s.put(&npub, sha256, bytes, mime, uploaded).await,
             Storage::S3(s) => s.put(&npub, sha256, bytes, mime, uploaded).await,
@@ -119,8 +127,11 @@ impl BlobStore {
         if let Err(e) = stored {
             // Roll the owner mapping back: a failed PUT must not leave a
             // mapping pointing at an object that was never stored (an
-            // unreachable, billed orphan).
-            self.db.blossom_remove_owner(sha256, pubkey).await;
+            // unreachable, billed orphan) — but only when the mapping was
+            // created by this upload.
+            if !was_owner {
+                self.db.blossom_remove_owner(sha256, pubkey).await;
+            }
             return Err(e);
         }
         Ok(Descriptor {
