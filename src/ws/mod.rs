@@ -1595,10 +1595,10 @@ mod tests {
 
     #[test]
     fn group_join_requires_a_stored_invite() {
-        // A JOIN with an invite code is only admitted while a stored,
-        // undeleted 9009 backs the code: revoking the 9009 (NIP-09) must
-        // take effect immediately, even though the in-memory invite set
-        // still holds the code.
+        // On a CLOSED group, a JOIN with an invite code is only admitted
+        // while a stored, undeleted 9009 backs the code: revoking the
+        // 9009 (NIP-09) must take effect immediately, even though the
+        // in-memory invite set still holds the code.
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let relay = build_relay_with("").await;
@@ -1606,7 +1606,8 @@ mod tests {
             let now = unix_now();
             let code = "abc123";
 
-            // Create the group, issue the invite, and join with the code.
+            // Create the group, close it, issue the invite, and join
+            // with the code.
             let create = signed_kind_note_seeded(
                 relay.secp(),
                 1,
@@ -1614,6 +1615,14 @@ mod tests {
                 "",
                 now,
                 vec![vec!["h".into(), "g1".into()]],
+            );
+            let close = signed_kind_note_seeded(
+                relay.secp(),
+                1,
+                9002,
+                "",
+                now,
+                vec![vec!["h".into(), "g1".into()], vec!["closed".into()]],
             );
             let invite = signed_kind_note_seeded(
                 relay.secp(),
@@ -1637,14 +1646,14 @@ mod tests {
                     vec!["code".into(), code.into()],
                 ],
             );
-            for ev in [&create, &invite, &join] {
+            for ev in [&create, &close, &invite, &join] {
                 conn.queue_event_value(ev.clone()).await;
                 conn.flush_pending_events().await;
                 assert!(
                     outgoing_json(&conn)
                         .iter()
                         .any(|m| m[0] == "OK" && m[1] == ev.id && m[2] == true),
-                    "the group/invite/join sequence is accepted"
+                    "the create/close/invite/join sequence is accepted"
                 );
             }
 

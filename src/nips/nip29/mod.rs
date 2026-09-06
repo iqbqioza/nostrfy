@@ -116,8 +116,16 @@ fn tag_value_light<'a, E: crate::filter::EventFields>(
 }
 
 /// The `previous` tag values of an event (NIP-29 timeline references).
+/// The spec's canonical form is one tag with any number of values —
+/// `["previous", "eb96c864", "2db75638", "b5d1065f"]` — so every value of
+/// every `previous` tag counts.
 pub fn previous_tags(event: &Event) -> Vec<String> {
-    tag_values(event, "previous").map(str::to_string).collect()
+    event
+        .tags
+        .iter()
+        .filter(|t| t.len() >= 2 && t[0] == "previous")
+        .flat_map(|t| t[1..].iter().cloned())
+        .collect()
 }
 
 /// `e`-tag target ids of a `kind:9005` delete-event moderation action.
@@ -238,21 +246,26 @@ impl GroupStore {
             if group.is_member(pubkey) {
                 return Err("duplicate: you are already a member of this group".into());
             }
-            if let Some(code) = event_code(event) {
-                if !group.has_invite(code) {
-                    return Err("restricted: invalid invite code".into());
-                }
-                return Ok(());
-            }
             if group.settings.closed {
                 // NIP-29: `closed` means join requests are ignored — the
                 // request is rejected (final) and not stored. Admission to
                 // a closed group happens via an invite code or a kind:9000
                 // issued by an admin.
+                //
+                // The `code` tag is optional preauthorization (NIP-29): on
+                // a closed group a JOIN must carry a valid invite code.
+                if let Some(code) = event_code(event) {
+                    if !group.has_invite(code) {
+                        return Err("restricted: invalid invite code".into());
+                    }
+                    return Ok(());
+                }
                 return Err("restricted: this group is closed".into());
             }
             // NIP-29: omitting the `closed` tag means join requests are
-            // honored; the relay admits the user right away.
+            // honored; the relay admits the user right away. A `code` tag
+            // on an open group is irrelevant to admission (an unknown or
+            // stale code must not block an otherwise-honored join).
             return Ok(());
         }
 
@@ -361,15 +374,18 @@ impl GroupStore {
         let mut out = Vec::new();
         match event.kind {
             JOIN => {
-                // Joined via a valid invite code, or honored on an open
-                // group (not `closed`): admit the user with no privileges.
-                // A closed group without a valid code leaves the request
-                // pending for an admin to review.
-                let admitted = if let Some(code) = event_code(event) {
-                    self.groups.get(gid).is_some_and(|g| g.has_invite(code))
-                } else {
-                    self.groups.get(gid).is_some_and(|g| !g.settings.closed)
-                };
+                // Joined via a valid invite code on a closed group, or
+                // honored on an open group (not `closed`): the `code` tag
+                // is optional preauthorization and irrelevant to admission
+                // on open groups. A closed group without a valid code
+                // leaves the request pending for an admin to review.
+                let admitted = self.groups.get(gid).is_some_and(|g| {
+                    if g.settings.closed {
+                        event_code(event).is_some_and(|code| g.has_invite(code))
+                    } else {
+                        true
+                    }
+                });
                 if admitted {
                     let member = event.pubkey.clone();
                     if let Some(group) = self.groups.get_mut(gid) {
@@ -639,27 +655,11 @@ impl GroupStore {
                     ));
                 }
             }
-            9011 => {
-                // NIP-29 remove-pin: the referenced pins are dropped (the
-                // add-pin event 9010 replaces the whole list).
-                if let Some(group) = self.groups.get_mut(gid) {
-                    for tag in event
-                        .tags
-                        .iter()
-                        .filter(|t| t.len() >= 2 && (t[0] == E || t[0] == A))
-                    {
-                        group.pins.retain(|(k, v)| k != &tag[0] || v != &tag[1]);
-                    }
-                }
-                if emit {
-                    out.push(build_pins_event(
-                        gid,
-                        self.groups.get(gid),
-                        relay_pubkey,
-                        now,
-                    ));
-                }
-            }
+            // No 9011: the current NIP-29 defines no remove-pin kind —
+            // pinning, unpinning, reordering and clearing are all done by
+            // submitting a new kind:9010 list. A stray 9011 is an inert
+            // unknown moderation event (admin-gated by the 9000-9020
+            // window, stored, and replayed as such after a restart).
             _ => {}
         }
         out

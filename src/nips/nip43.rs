@@ -40,6 +40,13 @@ pub struct RoleStore {
 }
 
 impl RoleStore {
+    /// Whether `pubkey` holds at least one role assignment.
+    pub fn is_member_of(&self, pubkey: &str) -> bool {
+        self.assignments
+            .get(pubkey)
+            .is_some_and(|roles| !roles.is_empty())
+    }
+
     pub fn create(
         &mut self,
         id: &str,

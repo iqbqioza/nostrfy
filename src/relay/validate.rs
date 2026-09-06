@@ -133,8 +133,15 @@ impl super::Relay {
         }
         // NIP-43: join requests carry an invite code, which this relay
         // never issues; every claim therefore fails (NIP-43 mandates an
-        // OK reply).
+        // OK reply). A member who already belongs to the relay gets the
+        // spec's `duplicate:` verdict instead of a blanket refusal.
         if cfg.nip_enabled(43) && event.kind == nip43::JOIN {
+            let is_member = self.roles.read().await.is_member_of(&event.pubkey);
+            if is_member {
+                return Precheck::Reject(
+                    "duplicate: you are already a member of this relay".into(),
+                );
+            }
             return Precheck::Reject("restricted: this relay does not issue invite codes".into());
         }
         // NIP-29: group action events MUST carry an `h` tag.
@@ -170,22 +177,33 @@ impl super::Relay {
                 }
                 // The in-memory invite set never forgets a code whose 9009
                 // was NIP-09-deleted or NIP-40-expired (revocation only
-                // takes effect after a restart). A JOIN with a code is
+                // takes effect after a restart). On a CLOSED group (where
+                // the code decides admission) a JOIN with a code is
                 // therefore confirmed against the stored, unexpired 9009
                 // before admission — the same visibility the in-memory
                 // check has (a 9009 of the same batch is not committed
-                // yet either way).
+                // yet either way). On open groups the code is optional
+                // preauthorization and does not gate admission.
                 if event.kind == nip29::JOIN
                     && let Some(code) = nip29::event_code(event)
                     && let Some(gid) = nip29::group_id(event)
                 {
-                    let f: Vec<crate::filter::Filter> = serde_json::from_value(serde_json::json!([
-                        { "kinds": [9009], "#h": [gid], "#code": [code] }
-                    ]))
-                    .expect("static filter");
-                    let (stored, _) = self.db.query_req(f, 1, now).await;
-                    if stored.is_empty() {
-                        return Precheck::Reject("restricted: invalid invite code".into());
+                    let closed = self
+                        .groups
+                        .read()
+                        .await
+                        .group(gid)
+                        .is_some_and(|g| g.settings.closed);
+                    if closed {
+                        let f: Vec<crate::filter::Filter> =
+                            serde_json::from_value(serde_json::json!([
+                                { "kinds": [9009], "#h": [gid], "#code": [code] }
+                            ]))
+                            .expect("static filter");
+                        let (stored, _) = self.db.query_req(f, 1, now).await;
+                        if stored.is_empty() {
+                            return Precheck::Reject("restricted: invalid invite code".into());
+                        }
                     }
                 }
                 // NIP-29 `previous` timeline references must exist.
