@@ -469,7 +469,6 @@ async fn get_blob(
         return error(StatusCode::NOT_FOUND, "blob not found");
     };
     let size = desc.size;
-    let npub = desc.npub();
     let base_headers = [
         (axum::http::header::CONTENT_TYPE, desc.mime),
         (axum::http::header::ETAG, format!("\"{sha}\"")),
@@ -511,7 +510,7 @@ async fn get_blob(
     };
     match state
         .store
-        .open_stream(&npub, &sha, start as u64, len)
+        .open_stream(&desc.pubkey, &sha, start as u64, len)
         .await
     {
         Ok(Some(stream)) => {

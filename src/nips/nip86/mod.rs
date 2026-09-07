@@ -129,7 +129,15 @@ pub async fn rpc_handler(
     let params = params.as_deref().unwrap_or(&[]);
 
     match method {
-        "supportedmethods" => rpc_ok(json!(SUPPORTED_METHODS)),
+        // NIP-86: the result lists "all the OTHER supported methods".
+        "supportedmethods" => {
+            let others: Vec<&str> = SUPPORTED_METHODS
+                .iter()
+                .copied()
+                .filter(|m| *m != "supportedmethods")
+                .collect();
+            rpc_ok(json!(others))
+        }
         "banpubkey" => {
             let (Some(pubkey), reason) = (
                 params.first().and_then(Value::as_str),

@@ -2156,9 +2156,10 @@ mod tests {
 
     #[test]
     fn command_events_work_on_restricted_relays() {
-        // On a `restrict_relay` relay the allow list gates reads and
-        // writes — but the relay's own pubkey is exempt, so command
-        // events still run and the reply stays readable by the operator.
+        // On a `restrict_relay` relay the allow list gates publishing only
+        // (reading stays open) — and the relay's own pubkey is exempt
+        // from the lists, so command events still run and the reply
+        // stays readable.
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let secret = "aa".repeat(32);

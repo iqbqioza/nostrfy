@@ -1564,7 +1564,7 @@ mod tests {
             )
             .0
             .to_string();
-            let npub = crate::nips::nip19::bech32m_encode("npub", &hex::decode(&pk).unwrap())
+            let npub = crate::nips::nip19::bech32_encode("npub", &hex::decode(&pk).unwrap())
                 .expect("npub encoding");
             let aug1 = 1_785_542_400u64;
 
@@ -1798,7 +1798,7 @@ mod tests {
             )
             .0
             .to_string();
-            let npub = crate::nips::nip19::bech32m_encode("npub", &hex::decode(&pk).unwrap())
+            let npub = crate::nips::nip19::bech32_encode("npub", &hex::decode(&pk).unwrap())
                 .expect("npub encoding");
             let feb1 = 1_706_745_600u64; // 2024-02-01
             let leap_day = signed_note(relay.secp(), "leap day", feb1 + 28 * 86400 + 100, vec![]);
@@ -1838,7 +1838,7 @@ mod tests {
             )
             .0
             .to_string();
-            let npub = crate::nips::nip19::bech32m_encode("npub", &hex::decode(&pk).unwrap())
+            let npub = crate::nips::nip19::bech32_encode("npub", &hex::decode(&pk).unwrap())
                 .expect("npub encoding");
             let aug1 = 1_785_542_400u64;
 
@@ -1971,7 +1971,7 @@ mod tests {
             )
             .0
             .to_string();
-            let npub = crate::nips::nip19::bech32m_encode("npub", &hex::decode(&pk).unwrap())
+            let npub = crate::nips::nip19::bech32_encode("npub", &hex::decode(&pk).unwrap())
                 .expect("npub encoding");
             let now = unix_now();
 
@@ -2045,7 +2045,7 @@ mod tests {
             )
             .0
             .to_string();
-            let npub = crate::nips::nip19::bech32m_encode("npub", &hex::decode(&pk).unwrap())
+            let npub = crate::nips::nip19::bech32_encode("npub", &hex::decode(&pk).unwrap())
                 .expect("npub encoding");
 
             // Two events in August 2026, one in September.

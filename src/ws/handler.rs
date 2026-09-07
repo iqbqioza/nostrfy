@@ -346,8 +346,9 @@ impl super::Conn {
             return;
         }
         // The access lists gate reading too: a denied pubkey is never
-        // served (even when authenticated), and `restrict_relay` narrows
-        // subscriptions to the allow list. Changes made by command events
+        // served (even when authenticated); `restrict_relay` narrows
+        // publishing to the allow list, reading stays open to everyone.
+        // Changes made by command events
         // (or NIP-86) apply to this connection immediately — the list is
         // read fresh per message, no reconnect needed.
         if !self.access_allows_read().await {
@@ -703,9 +704,9 @@ impl super::Conn {
     /// NIP-78 owner, NIP-29 privacy-gated group member). Drives the NIP-67
     /// `"auth"` EOSE hint.
     /// Whether this connection may read at all: a denied pubkey is never
-    /// served (even when authenticated), and with `restrict_relay` only
-    /// allow-listed pubkeys are served — anonymous connections are then
-    /// refused too. The list is read fresh on every message, so changes
+    /// served (even when authenticated); `restrict_relay` gates publishing
+    /// only, reading stays open to everyone. The list is read fresh on
+    /// every message, so changes
     /// made by command events or NIP-86 apply to live connections without
     /// a reconnect.
     pub(crate) async fn access_allows_read(&mut self) -> bool {
@@ -854,10 +855,9 @@ impl super::Conn {
         if self.subs.is_empty() {
             return;
         }
-        // The access lists gate live delivery too: a pubkey that was
-        // denied (or a connection that `restrict_relay` no longer admits)
-        // stops receiving events immediately — the list is read per event,
-        // no reconnect needed.
+        // The access lists gate live delivery too: a denied pubkey stops
+        // receiving events immediately — the list is read per event, no
+        // reconnect needed.
         if !self.access_allows_read_sync() {
             return;
         }

@@ -60,7 +60,7 @@ pub fn relay_info(
         "fees": {
             "admission": [],
             "subscription": [],
-            "periodic": []
+            "publication": []
         },
         "stats": stats.as_json(),
     });

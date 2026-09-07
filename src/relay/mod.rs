@@ -1253,7 +1253,7 @@ mod tests {
     #[test]
     fn nsec_detection() {
         // A real nsec (checksum-valid bech32m) is detected.
-        let key = crate::nips::nip19::bech32m_encode("nsec", &[0x42u8; 32]).unwrap();
+        let key = crate::nips::nip19::bech32_encode("nsec", &[0x42u8; 32]).unwrap();
         assert_eq!(key.len(), 63);
         assert!(contains_secret_key(&format!("look at my key {key} here")));
         assert!(contains_secret_key(&key));

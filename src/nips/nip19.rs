@@ -91,12 +91,29 @@ pub(crate) fn bech32_checksum_valid(hrp: &str, s: &str) -> bool {
     verify_checksum(hrp.as_bytes(), &data).is_some()
 }
 
-/// Create a bech32m checksum for `data` (without checksum).
+/// Create a bech32 checksum for `data` (without checksum). NIP-19
+/// mandates legacy bech32 (constant `1`) for its entities — the spec's
+/// own example strings validate with `1`, not the bech32m constant — so
+/// the encoder emits the canonical form mainstream decoders accept. The
+/// decoder still accepts both constants.
 fn create_checksum(hrp: &[u8], data: &[u8]) -> Vec<u8> {
     let mut values = hrp_expand(hrp);
     values.extend_from_slice(data);
     values.extend_from_slice(&[0u8; 6]);
-    let poly = polymod(&values) ^ 0x2bc830a3; // bech32m
+    let poly = polymod(&values) ^ 1; // bech32 (BIP-173)
+    (0..6)
+        .map(|i| ((poly >> (5 * (5 - i))) & 31) as u8)
+        .collect()
+}
+
+/// Legacy bech32m checksum, used only for the Blossom storage paths that
+/// predate the canonical encoder (existing blob directories keep the old
+/// bech32m npub names).
+fn create_checksum_m(hrp: &[u8], data: &[u8]) -> Vec<u8> {
+    let mut values = hrp_expand(hrp);
+    values.extend_from_slice(data);
+    values.extend_from_slice(&[0u8; 6]);
+    let poly = polymod(&values) ^ 0x2bc830a3; // bech32m (BIP-350)
     (0..6)
         .map(|i| ((poly >> (5 * (5 - i))) & 31) as u8)
         .collect()
@@ -395,11 +412,26 @@ pub fn parse_nip19(input: &str) -> Result<Nip19Entity, Bech32Error> {
     }
 }
 
-/// Encode 8-bit bytes into bech32m with the given HRP.
-#[allow(dead_code)]
-pub(crate) fn bech32m_encode(hrp: &str, data: &[u8]) -> Result<String, Bech32Error> {
+/// Encode 8-bit bytes into bech32 with the given HRP (the NIP-19
+/// canonical form: legacy bech32 constant).
+pub(crate) fn bech32_encode(hrp: &str, data: &[u8]) -> Result<String, Bech32Error> {
     let data_5bit = convert_bits(data, 8, 5, true)?;
     let checksum = create_checksum(hrp.as_bytes(), &data_5bit);
+    let mut combined = data_5bit;
+    combined.extend_from_slice(&checksum);
+    let encoded: String = combined
+        .iter()
+        .map(|&b| CHARSET[b as usize] as char)
+        .collect();
+    Ok(format!("{hrp}1{encoded}"))
+}
+
+/// Encode into bech32m — kept only for the Blossom storage paths that
+/// used it before the encoder became canonical (the legacy directory
+/// names must still be reproducible for the migration fallback).
+pub(crate) fn bech32m_encode(hrp: &str, data: &[u8]) -> Result<String, Bech32Error> {
+    let data_5bit = convert_bits(data, 8, 5, true)?;
+    let checksum = create_checksum_m(hrp.as_bytes(), &data_5bit);
     let mut combined = data_5bit;
     combined.extend_from_slice(&checksum);
     let encoded: String = combined
@@ -449,7 +481,7 @@ mod tests {
         // npub1 for a known pubkey
         let hex_pk = "3bf0c63fcb93463407af97a5e5ee64fa883d107ef9e558472c4eb9aaaefa459d";
         let pk_bytes = hex::decode(hex_pk).unwrap();
-        let encoded = bech32m_encode("npub", &pk_bytes).unwrap();
+        let encoded = bech32_encode("npub", &pk_bytes).unwrap();
 
         let entity = parse_nip19(&encoded).unwrap();
         match entity {
@@ -458,6 +490,33 @@ mod tests {
             }
             _ => panic!("expected Pubkey"),
         }
+    }
+
+    #[test]
+    fn encoder_emits_the_spec_canonical_bech32_checksum() {
+        // NIP-19 mandates bech32-(not-m) for the entities; the spec's own
+        // example npub for this pubkey validates with the legacy constant.
+        let hex_pk = "3bf0c63fcb93463407af97a5e5ee64fa883d107ef9e558472c4eb9aaaefa459d";
+        let pk_bytes = hex::decode(hex_pk).unwrap();
+        let encoded = bech32_encode("npub", &pk_bytes).unwrap();
+        // The spec example string (legacy bech32 checksum):
+        // npub180cvv07tjdrrgpa0j7j7tmnyl2yr6yr7l8j4s3evf6u64th6gkwsyjh6w6
+        assert_eq!(
+            encoded,
+            "npub180cvv07tjdrrgpa0j7j7tmnyl2yr6yr7l8j4s3evf6u64th6gkwsyjh6w6"
+        );
+        // The old bech32m form differs and must NOT be emitted.
+        assert_ne!(
+            encoded,
+            "npub180cvv07tjdrrgpa0j7j7tmnyl2yr6yr7l8j4s3evf6u64th6gkws3w8ktc"
+        );
+        // The legacy bech32m encoder is still available for the storage
+        // path fallback.
+        let legacy = bech32m_encode("npub", &pk_bytes).unwrap();
+        assert_eq!(
+            legacy,
+            "npub180cvv07tjdrrgpa0j7j7tmnyl2yr6yr7l8j4s3evf6u64th6gkws3w8ktc"
+        );
     }
 
     #[test]
@@ -500,7 +559,7 @@ mod tests {
         // nsec1 has a valid bech32m checksum but is not a known NIP-19 prefix.
         // Encode a valid nsec1 string to ensure it decodes.
         let data = [0x01u8; 32];
-        let encoded = bech32m_encode("nsec", &data).unwrap();
+        let encoded = bech32_encode("nsec", &data).unwrap();
         assert!(encoded.starts_with("nsec1"));
         let result = parse_nip19(&encoded);
         assert!(
@@ -552,7 +611,7 @@ mod tests {
         data.push(relay.len() as u8);
         data.extend_from_slice(relay);
 
-        let encoded = bech32m_encode("nevent", &data).unwrap();
+        let encoded = bech32_encode("nevent", &data).unwrap();
         let parsed = parse_nip19(&encoded).unwrap();
         assert_eq!(parsed, entity);
     }
@@ -577,7 +636,7 @@ mod tests {
         data.push(4);
         data.extend_from_slice(&30023u32.to_be_bytes());
 
-        let encoded = bech32m_encode("naddr", &data).unwrap();
+        let encoded = bech32_encode("naddr", &data).unwrap();
         let parsed = parse_nip19(&encoded).unwrap();
         assert_eq!(
             parsed,
@@ -607,7 +666,7 @@ mod tests {
         data.push(4);
         data.extend_from_slice(&7u32.to_be_bytes());
 
-        let encoded = bech32m_encode("nevent", &data).unwrap();
+        let encoded = bech32_encode("nevent", &data).unwrap();
         match parse_nip19(&encoded).unwrap() {
             Nip19Entity::Event {
                 id: got_id,
@@ -650,7 +709,7 @@ mod tests {
         data.push(TLV_KIND);
         data.push(4);
         data.extend_from_slice(&1u32.to_be_bytes());
-        let encoded = bech32m_encode("nevent", &data).unwrap();
+        let encoded = bech32_encode("nevent", &data).unwrap();
         match parse_nip19(&encoded).unwrap() {
             Nip19Entity::Event { id, kind, .. } => {
                 assert_eq!(id, [0x42u8; 32]);
@@ -670,7 +729,7 @@ mod tests {
         data.push(TLV_KIND);
         data.push(4);
         data.extend_from_slice(&0u32.to_be_bytes());
-        let encoded = bech32m_encode("naddr", &data).unwrap();
+        let encoded = bech32_encode("naddr", &data).unwrap();
         match parse_nip19(&encoded).unwrap() {
             Nip19Entity::Addr {
                 kind,
