@@ -3189,6 +3189,131 @@ mod tests {
     }
 
     #[test]
+    fn neg_open_remaining_gates_and_limit() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let now = unix_now();
+            // A search filter over-fetches (the relevance budget): with a
+            // small max_neg_items the query returns more records than the
+            // cap and the NIP-77 "too big" NEG-ERR fires.
+            for i in 0..5 {
+                let e = signed_note(conn.relay.secp(), &format!("needle {i}"), now - i, vec![]);
+                conn.relay.db.put(e.clone(), now).await;
+            }
+            {
+                let mut w = conn.relay.config.write().await;
+                w.limits.max_neg_items = 2;
+            }
+            conn.handle_neg_open(&[json!("big"), json!({"search": "needle"}), json!("61000000")])
+                .await;
+            assert!(
+                outgoing_json(&conn)
+                    .iter()
+                    .any(|m| m[0] == "NEG-ERR" && m[2].as_str().unwrap().contains("too big")),
+                "a search query over the cap must close with NEG-ERR: {:?}",
+                outgoing_json(&conn)
+            );
+            conn.outgoing.clear();
+            {
+                let mut w = conn.relay.config.write().await;
+                w.limits.max_neg_items = 100_000;
+            }
+
+            // NIP-78 / NIP-59 / NIP-29 item filtering: a kind-78 event, a
+            // gift wrap for another recipient and a private group event are
+            // withheld from an anonymous peer (the response is empty).
+            let secp = conn.relay.secp();
+            let mut app = signed_note(secp, "app data", now, vec![]);
+            app.kind = crate::nips::nip78::APP_SPECIFIC_KIND;
+            conn.relay.db.put(app, now).await;
+            let mut wrap = signed_note(secp, "secret dm", now, vec![]);
+            wrap.kind = crate::nips::nip62::GIFT_WRAP_KIND;
+            wrap.tags = vec![vec!["p".into(), "cc".repeat(32)]];
+            conn.relay.db.put(wrap, now).await;
+            conn.handle_neg_open(&[
+                json!("filtered"),
+                json!({"kinds": [78, 1059]}),
+                json!("61000000"),
+            ])
+            .await;
+            let msgs = outgoing_json(&conn);
+            assert!(
+                msgs.iter().any(|m| m[0] == "NEG-MSG" && m[2] == "61000000"),
+                "withheld items must produce an empty sync response: {msgs:?}"
+            );
+            conn.outgoing.clear();
+            conn.handle_neg_close(&[json!("filtered")]);
+
+            // The per-connection NEG-OPEN limit (MAX_NEG_OPENS).
+            conn.neg_opens_total = super::negentropy::MAX_NEG_OPENS;
+            conn.handle_neg_open(&[json!("s"), json!({}), json!("61000000")])
+                .await;
+            assert!(
+                outgoing_json(&conn)
+                    .iter()
+                    .any(|m| m[0] == "NEG-ERR"
+                        && m[2].as_str().unwrap().contains("connection limit")),
+                "the NEG-OPEN count limit must be enforced"
+            );
+            conn.outgoing.clear();
+            conn.neg_opens_total = 0;
+
+            // A blocked authed pubkey: NEG-MSG is refused and the state is
+            // released.
+            let blocked = "dd".repeat(32);
+            conn.authed_pubkeys.push(blocked.clone());
+            conn.relay
+                .access
+                .write()
+                .await
+                .blocked_pubkeys
+                .push((blocked, String::new()));
+            conn.handle_neg_open(&[json!("bk"), json!({}), json!("61000000")])
+                .await;
+            conn.outgoing.clear();
+            conn.handle_neg_msg(&[json!("bk"), json!("61000000")]).await;
+            assert!(
+                outgoing_json(&conn)
+                    .iter()
+                    .any(|m| m[0] == "NEG-ERR" && m[2].as_str().unwrap().contains("restricted")),
+                "a blocked pubkey's NEG-MSG must be refused"
+            );
+            assert!(!conn.neg.contains_key("bk"), "the blocked sync is released");
+            conn.outgoing.clear();
+            conn.authed_pubkeys.clear();
+            conn.relay.access.write().await.blocked_pubkeys.clear();
+
+            // A NEG-MSG that fails to parse closes the subscription and
+            // releases its items (an over-range-count message fails the
+            // response).
+            conn.handle_neg_open(&[json!("r2"), json!({}), json!("61000000")])
+                .await;
+            conn.outgoing.clear();
+            // Many fingerprint ranges force the codec's per-message range
+            // cap to trip: MAX_NEG_RANGES_PER_MSG + 1 ranges.
+            let ranges = 1025; // MAX_NEG_RANGES_PER_MSG + 1
+            // Encode each range as [infinity bound][mode fingerprint][fp]:
+            // a single multi-range message.
+            let mut wire = vec![0x61u8];
+            for _ in 0..ranges {
+                wire.extend_from_slice(&[0x00, 0x00, 0x01]);
+                wire.extend_from_slice(&[0u8; 16]);
+            }
+            let hex_msg = hex::encode(&wire);
+            conn.handle_neg_msg(&[json!("r2"), json!(hex_msg)]).await;
+            assert!(
+                outgoing_json(&conn).iter().any(|m| m[0] == "NEG-ERR"),
+                "an unprocessable NEG-MSG must close the subscription: {:?}",
+                outgoing_json(&conn)
+            );
+            assert!(!conn.neg.contains_key("r2"), "the sub is released");
+
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
     fn neg_open_counts_towards_active_subscriptions() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {

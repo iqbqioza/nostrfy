@@ -251,6 +251,43 @@ mod tests {
     }
 
     #[test]
+    fn candidates_skip_malformed_delegation_and_unknown_delegators() {
+        let mut index = SubscriptionIndex::default();
+        index.register(
+            7,
+            &[FilterComponents::Indexed {
+                kinds: vec![],
+                authors: vec![[0xaa; 32]],
+                tags: vec![],
+            }],
+        );
+        // A delegation tag of the wrong length must not wake the
+        // delegator's subscribers.
+        let mut e = ev(
+            1,
+            vec![vec!["delegation".into(), "aa".repeat(32), "kind=1".into()]],
+        );
+        e.pubkey = "bb".repeat(32);
+        assert!(
+            index.candidates(&e).is_empty(),
+            "a 3-element delegation tag is malformed and must not wake"
+        );
+        // A well-formed delegation to a delegator with no subscribers
+        // wakes nobody.
+        let mut e = ev(
+            1,
+            vec![vec![
+                "delegation".into(),
+                "cc".repeat(32),
+                "kind=1".into(),
+                "sig".into(),
+            ]],
+        );
+        e.pubkey = "bb".repeat(32);
+        assert!(index.candidates(&e).is_empty());
+    }
+
+    #[test]
     fn filter_components_derivation() {
         let filter: crate::filter::Filter =
             serde_json::from_value(serde_json::json!({"kinds": [1], "authors": ["ab".repeat(32)]}))
