@@ -15,6 +15,9 @@ const NSEC_BODY_LEN: usize = 58;
 pub(crate) enum Precheck {
     Accept,
     Reject(String),
+    /// The event is acknowledged as a duplicate (OK true, not stored):
+    /// NIP-43's example for a member's repeated join claim.
+    Duplicate(String),
     /// NIP-62: the event is a valid request to vanish.
     Vanish,
 }
@@ -138,7 +141,10 @@ impl super::Relay {
         if cfg.nip_enabled(43) && event.kind == nip43::JOIN {
             let is_member = self.roles.read().await.is_member_of(&event.pubkey);
             if is_member {
-                return Precheck::Reject(
+                // NIP-43: the spec's example replies OK `true` with the
+                // `duplicate:` prefix for a member's repeated claim (the
+                // claim itself is never stored — kind 28934 is ephemeral).
+                return Precheck::Duplicate(
                     "duplicate: you are already a member of this relay".into(),
                 );
             }
@@ -202,7 +208,9 @@ impl super::Relay {
                             .expect("static filter");
                         let (stored, _) = self.db.query_req(f, 1, now).await;
                         if stored.is_empty() {
-                            return Precheck::Reject("restricted: invalid invite code".into());
+                            return Precheck::Reject(
+                                "restricted: invalid invite code (final decision)".into(),
+                            );
                         }
                     }
                 }
@@ -276,6 +284,11 @@ impl super::Relay {
         // NIP-01: each tag is an array of one or more strings.
         if event.tags.iter().any(|t| t.is_empty()) {
             return Err("invalid: empty tag".into());
+        }
+        // NIP-59: "Tags MUST always be empty in a `kind:13`" (the seal
+        // wrapping an encrypted rumor) — a seal with tags is malformed.
+        if event.kind == 13 && !event.tags.is_empty() {
+            return Err("invalid: kind 13 seals must not have tags".into());
         }
         // NIP-09: a deletion request is defined as having a list of one or
         // more `e` or `a` tags. A kind-5 event with no targets has no
@@ -578,7 +591,9 @@ mod tests {
             relay.start_live_bus();
             let relay = Arc::new(relay);
             let vanished = signed_with_seed(42u8, 1, vec![]);
-            relay.vanish_pubkey(vanished.pubkey_bytes().unwrap()).await;
+            relay
+                .vanish_pubkey(vanished.pubkey_bytes().unwrap(), vanished.created_at)
+                .await;
             let outcome = relay.accept_event(vanished, &[], None).await.0;
             assert!(
                 matches!(&outcome, crate::db::PutOutcome::Invalid(reason) if reason.contains("vanish")),
@@ -1147,6 +1162,121 @@ mod tests {
     }
 
     #[test]
+    fn nip43_member_claim_acknowledged_as_duplicate() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut cfg = Config::default();
+            cfg.database.map_size = 16 * 1024 * 1024;
+            cfg.database.max_map_size = 256 * 1024 * 1024;
+            cfg.database.path =
+                std::env::temp_dir().join("nostrfy-nip43-claim-test");
+            let _ = std::fs::remove_dir_all(&cfg.database.path);
+            let db = crate::db::DbClient::open(
+                &cfg.database,
+                true,
+                Arc::new(Default::default()),
+                0,
+                128,
+                4096,
+                262144,
+            )
+            .unwrap();
+            let config = Arc::new(RwLock::new(cfg));
+            let relay = Relay::new(
+                config.clone(),
+                db,
+                crate::stats::Stats::new(),
+                "",
+                crate::relay::LiveBusConfig {
+                    buffer: 1024,
+                    batch_interval_ms: 10,
+                    batch_size: 64,
+                },
+            )
+            .await;
+            let relay = Arc::new(relay);
+            let member = signed_with_seed(9u8, 1, vec![]);
+            {
+                let mut roles = relay.roles.write().await;
+                roles.create("member", "Member", "", "", None);
+                roles.assign(&member.pubkey, "member");
+            }
+            let claim = signed_with_seed(9u8, crate::nips::nip43::JOIN, vec![]);
+            let (outcome, _) = relay.accept_event(claim, &[], None).await;
+            assert!(
+                matches!(
+                    &outcome,
+                    crate::db::PutOutcome::Duplicate(msg) if msg == "duplicate: you are already a member of this relay"
+                ),
+                "a member's repeated claim must be OK true with the duplicate: prefix: {outcome:?}"
+            );
+            // A non-member's claim is refused (this relay issues no invites).
+            let stranger = signed_with_seed(10u8, crate::nips::nip43::JOIN, vec![]);
+            let (outcome, _) = relay.accept_event(stranger, &[], None).await;
+            assert!(
+                matches!(&outcome, crate::db::PutOutcome::Invalid(reason) if reason.contains("invite codes")),
+                "a non-member claim is refused: {outcome:?}"
+            );
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn seal_events_must_not_carry_tags() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_validate_relay("nostrfy-seal-test").await;
+            let cfg = relay.config.read().await;
+            let now = unix_now();
+            // NIP-59: "Tags MUST always be empty in a `kind:13`".
+            let tagged = signed(13, vec![vec!["p".into(), "aa".repeat(32)]]);
+            let err = relay
+                .validate_base(&cfg, &tagged, now, &[], None)
+                .unwrap_err();
+            assert!(
+                err.starts_with("invalid: kind 13 seals must not have tags"),
+                "{err}"
+            );
+            let clean = signed(13, vec![]);
+            assert!(relay.validate_base(&cfg, &clean, now, &[], None).is_ok());
+            drop(cfg);
+            relay.db.shutdown();
+        });
+    }
+
+    async fn build_validate_relay(dir: &str) -> Arc<Relay> {
+        let mut cfg = Config::default();
+        cfg.database.map_size = 16 * 1024 * 1024;
+        cfg.database.max_map_size = 256 * 1024 * 1024;
+        cfg.database.path = std::env::temp_dir().join(dir);
+        let _ = std::fs::remove_dir_all(&cfg.database.path);
+        let db = crate::db::DbClient::open(
+            &cfg.database,
+            true,
+            Arc::new(Default::default()),
+            0,
+            128,
+            4096,
+            262144,
+        )
+        .unwrap();
+        let config = Arc::new(RwLock::new(cfg));
+        let relay = Relay::new(
+            config,
+            db,
+            crate::stats::Stats::new(),
+            "",
+            crate::relay::LiveBusConfig {
+                buffer: 1024,
+                batch_interval_ms: 10,
+                batch_size: 64,
+            },
+        )
+        .await;
+        Arc::new(relay)
+    }
+
+    #[test]
     fn ephemeral_rejection_via_validate_base() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -1209,7 +1339,7 @@ mod tests {
             let mut cfg = Config::default();
             cfg.database.map_size = 16 * 1024 * 1024;
             cfg.database.max_map_size = 256 * 1024 * 1024;
-            cfg.database.path = std::env::temp_dir().join("nostrfy-vanish-test");
+            cfg.database.path = std::env::temp_dir().join("nostrfy-vanish-blocked-test");
             let _ = std::fs::remove_dir_all(&cfg.database.path);
             let db = crate::db::DbClient::open(
                 &cfg.database,

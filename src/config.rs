@@ -184,10 +184,11 @@ pub struct ServerConfig {
     /// are public on every host.
     pub metrics_enabled: bool,
     /// Which paths serve the WebSocket endpoint (and the NIP-11 document):
-    /// `root` (default) serves `/`, `/ws` and `/ws/`; `inbox-outbox` serves
-    /// only `/inbox` and `/outbox`; `all` serves all of them. The inbox and
-    /// outbox paths let a relay advertise distinct endpoints for the
-    /// inbox/outbox routing model (e.g. `wss://relay.example.com/inbox`).
+    /// `root` (default) serves `/` only (the legacy `/ws` and `/ws/` paths
+    /// are no longer served); `inbox-outbox` serves only `/inbox` and
+    /// `/outbox`; `all` serves all of them. The inbox and outbox paths let
+    /// a relay advertise distinct endpoints for the inbox/outbox routing
+    /// model (e.g. `wss://relay.example.com/inbox`).
     pub ws_paths: String,
     /// Write policy for events published through `/inbox` (only enforced
     /// when the path is served): `any` accepts events carrying at least

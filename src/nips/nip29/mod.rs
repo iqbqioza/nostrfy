@@ -254,13 +254,16 @@ impl GroupStore {
                 //
                 // The `code` tag is optional preauthorization (NIP-29): on
                 // a closed group a JOIN must carry a valid invite code.
+                // NIP-29: the rejection message SHOULD explain whether the
+                // decision is final or pending — this relay has no pending
+                // flow, so every rejection is marked final.
                 if let Some(code) = event_code(event) {
                     if !group.has_invite(code) {
-                        return Err("restricted: invalid invite code".into());
+                        return Err("restricted: invalid invite code (final decision)".into());
                     }
                     return Ok(());
                 }
-                return Err("restricted: this group is closed".into());
+                return Err("restricted: this group is closed (final decision)".into());
             }
             // NIP-29: omitting the `closed` tag means join requests are
             // honored; the relay admits the user right away. A `code` tag

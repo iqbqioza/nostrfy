@@ -249,14 +249,17 @@ impl Store {
     /// NIP-62: deletes every event authored by `pubkey` (including NIP-09
     /// deletion requests and NIP-59 gift wraps that p-tag it) and records the
     /// pubkey so that no future event from it is accepted.
-    pub(crate) fn apply_vanish(&self, pubkey: &[u8]) -> Result<usize> {
+    pub(crate) fn apply_vanish(&self, pubkey: &[u8], until_created: u64) -> Result<usize> {
         self.disk_full_error()?;
         let mut wtxn = self.env.write_txn()?;
         self.vanish.put(&mut wtxn, pubkey, b"")?;
 
         let mut removed = 0usize;
         let start = pubkey_key(pubkey, 0, &[0u8; ID_LEN]);
-        let end = pubkey_key(pubkey, u64::MAX, &[0xffu8; ID_LEN]);
+        // NIP-62: the request deletes the pubkey's history *until its
+        // `.created_at`* — events published (timestamped) after the request
+        // are not covered by it.
+        let end = pubkey_key(pubkey, until_created, &[0xffu8; ID_LEN]);
         let mut last_key: Option<Vec<u8>> = None;
         loop {
             let lower = match &last_key {

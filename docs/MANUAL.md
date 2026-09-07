@@ -496,7 +496,7 @@ If `rpc.management_port` is set, the legacy REST endpoints are available at `htt
 | 34 | git stuff (kinds 1617-1633, 30617/30618 — **opt-in** via `relay.enabled_git`, off by default) |
 | 40 | Expiration timestamp |
 | 42 | Client authentication |
-| 43 | Relay access metadata (roles) |
+| 43 | Relay access metadata (roles) — the relay-signed metadata events (33534/13534/8000/8001) carry the NIP-70 `-` tag as the spec requires, so they are only served to authenticated clients (AUTH-gated, like NIP-78) |
 | 45 | Counting results (COUNT / HyperLogLog) |
 | 46 | Nostr Connect (ephemeral kind 24133, exempt from `reject_ephemeral`) |
 | 47 | Nostr Wallet Connect (ephemeral kinds 23194/23195, exempt from `reject_ephemeral`) |
@@ -508,7 +508,7 @@ If `rpc.management_port` is set, the legacy REST endpoints are available at `htt
 | 66 | Relay discovery & liveness (self-publishes kind 30166 when `relay.private_key` is set, refreshed every 12 h) |
 | 67 | EOSE completeness hint (incl. the `"auth"` hint with a challenge when AUTH-gated events were withheld) |
 | 70 | Protected events |
-| 77 | Negentropy syncing |
+| 77 | Negentropy syncing — note: when a `NEG-OPEN` replaces a currently open subscription and the new query fails, the existing subscription is **kept** (the spec's "first close the existing one" would destroy a working sync on a failed replacement); the replacement only happens once the new query succeeds |
 | 78 | Application-specific data (kind 30078, addressable; **AUTH-gated** — see `relay.enabled_nip78_auth`) |
 | 84 | Highlights (kind 9802) |
 | 85 | Trusted assertions (kinds 30382/30383/30384, addressable) |

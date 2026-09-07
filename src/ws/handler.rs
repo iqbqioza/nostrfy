@@ -251,8 +251,8 @@ impl super::Conn {
                     // stored; the NIP-01 `mute:` prefix acknowledges this.
                     self.send_ok(&id, true, "mute: ephemeral event not stored");
                 }
-                crate::db::PutOutcome::Duplicate => {
-                    self.send_ok(&id, true, "duplicate: event already stored");
+                crate::db::PutOutcome::Duplicate(msg) => {
+                    self.send_ok(&id, true, &msg);
                 }
                 crate::db::PutOutcome::Invalid(reason) => {
                     self.send_ok(&id, false, &reason);
