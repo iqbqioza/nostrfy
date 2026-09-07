@@ -42,7 +42,13 @@ pub fn hll(filters: &[Filter], events: &[Event]) -> Option<String> {
             continue;
         };
         let register = pubkey[offset] as usize;
-        let zeros = nip13::leading_zero_bits(&pubkey[offset + 1..]);
+        // NIP-45: count the leading zero bits starting at `offset + 1`.
+        // The canonical implementation (fiatjaf/nostr) slices the 7 bytes
+        // after the register byte (a 56-bit window): counting to the end
+        // of the pubkey (up to 192 bits) would inflate the register when
+        // the tail is all zeros and produce a different hll than every
+        // reference relay.
+        let zeros = nip13::leading_zero_bits(&pubkey[offset + 1..offset + 8]);
         let value = (zeros + 1) as u8;
         if value > registers[register] {
             registers[register] = value;

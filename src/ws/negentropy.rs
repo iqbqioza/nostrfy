@@ -108,9 +108,9 @@ impl super::Conn {
             return;
         }
         // The access lists gate syncing like the REQ path: denied pubkeys
-        // are never served, and `restrict_relay` narrows syncs to the
-        // allow list. Read fresh per message, so command-event changes
-        // apply immediately without a reconnect.
+        // are never served; `restrict_relay` gates publishing only, so
+        // reading stays open. Read fresh per message, so command-event
+        // changes apply immediately without a reconnect.
         if !self.access_allows_read().await {
             self.send_neg_err(&sub_id, "restricted: you are not allowed to sync");
             return;

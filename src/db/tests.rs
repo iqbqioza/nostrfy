@@ -618,6 +618,125 @@ fn nip28_channel_queries_use_e_tag_index() {
 }
 
 #[test]
+fn store_blossom_mapping_lifecycle() {
+    use crate::db::store::{Store, apply_put_batch};
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    let cfg = config();
+    let errors = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let store = Store::open(&cfg, Arc::new(AtomicBool::new(true)), 512).unwrap();
+    let sha = "aa".repeat(32);
+    let sha2 = "ee".repeat(32);
+    let alice = "cc".repeat(32);
+    let bob = "dd".repeat(32);
+    // An empty batch commits nothing and returns no outcomes.
+    assert!(apply_put_batch(&store, &errors, None, &[]).is_empty());
+    // A fresh mapping + a mapping that already carries the owner: the
+    // duplicate entry must be skipped, and a second owner merges in.
+    store
+        .add_blossom_mappings(&[(sha.clone(), "image/png".into(), 3, 100, alice.clone())])
+        .unwrap();
+    store
+        .add_blossom_mappings(&[(sha.clone(), "image/png".into(), 3, 100, alice.clone())])
+        .unwrap();
+    store
+        .add_blossom_mappings(&[(sha.clone(), "image/png".into(), 3, 100, bob.clone())])
+        .unwrap();
+    store
+        .add_blossom_mappings(&[(sha2.clone(), "text/plain".into(), 1, 200, bob.clone())])
+        .unwrap();
+    let meta = store.load_blossom_mapping(&sha).unwrap().unwrap();
+    assert_eq!(meta.owners.len(), 2, "both owners merge into the mapping");
+    assert_eq!(
+        store.list_blossom_shas(&alice).unwrap(),
+        vec![sha.clone()],
+        "the reverse index lists the blob for the owner"
+    );
+    assert_eq!(store.list_blossom_shas(&bob).unwrap().len(), 2);
+    // Unknown blob / unknown owner return false.
+    assert!(
+        !store
+            .remove_blossom_owner(&"bb".repeat(32), &alice)
+            .unwrap()
+    );
+    assert!(!store.remove_blossom_owner(&sha, &"ff".repeat(32)).unwrap());
+    // Removing one owner keeps the mapping; removing the last deletes it.
+    assert!(store.remove_blossom_owner(&sha, &alice).unwrap());
+    assert_eq!(
+        store.load_blossom_mapping(&sha).unwrap().unwrap().owners,
+        vec![bob.clone()]
+    );
+    assert!(!store.remove_blossom_owner(&sha, &alice).unwrap());
+    assert!(store.remove_blossom_owner(&sha, &bob).unwrap());
+    assert!(store.load_blossom_mapping(&sha).unwrap().is_none());
+    assert!(store.list_blossom_shas(&bob).unwrap().contains(&sha2));
+    // A corrupt metadata blob reports None (both loads and removals).
+    {
+        let mut wtxn = store.env.write_txn().unwrap();
+        store
+            .blossom
+            .put(&mut wtxn, format!("sha:{sha2}").as_bytes(), b"not-json")
+            .unwrap();
+        wtxn.commit().unwrap();
+    }
+    assert!(store.load_blossom_mapping(&sha2).unwrap().is_none());
+    assert!(!store.remove_blossom_owner(&sha2, &bob).unwrap());
+}
+
+#[test]
+fn all_values_of_a_single_letter_tag_are_indexed() {
+    // NIP-01: the filter match is "at least one item in common" over all
+    // tag values, so a stored query for the SECOND value of a same-name
+    // tag pair must find the event exactly like the live path does. Only
+    // single-letter names are indexed (the spec's indexing convention).
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let ev = event(
+            1,
+            "multi-value tag",
+            now,
+            vec![vec!["e".into(), "aa".repeat(32), "bb".repeat(32)]],
+        );
+        assert_eq!(db.put(ev.clone(), now).await, PutOutcome::Stored);
+        for value in ["aa".repeat(32).as_str(), "bb".repeat(32).as_str()] {
+            let f: Filter =
+                serde_json::from_value(serde_json::json!({ "kinds": [1], "#e": [value] })).unwrap();
+            let (res, _) = db.query(vec![f], 500, now).await;
+            assert_eq!(
+                res.len(),
+                1,
+                "the event must be found via every value of the tag"
+            );
+            assert_eq!(res[0].id, ev.id);
+        }
+        // Removing the event removes every value's index entry: a later
+        // query for the second value returns nothing.
+        db.apply_deletion(vec![ev.id.clone()], vec![], Some(ev.pubkey.clone()), now)
+            .await;
+        let f: Filter =
+            serde_json::from_value(serde_json::json!({ "kinds": [1], "#e": ["bb".repeat(32)] }))
+                .unwrap();
+        let (res, _) = db.query(vec![f], 500, now).await;
+        assert!(
+            res.is_empty(),
+            "deleted events must not be served via any tag value"
+        );
+    });
+    db.shutdown();
+}
+
+#[test]
 fn nip22_comments_are_stored_and_served() {
     // NIP-22 (kind 1111) comments are regular events: stored like any other
     // kind and served through the `#e` threading index (the lowercase parent

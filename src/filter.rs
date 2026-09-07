@@ -167,7 +167,7 @@ impl Filter {
             tag_values(value).any(|v| {
                 ev.tags()
                     .iter()
-                    .any(|t| t.len() >= 2 && t[0] == tag_name && t[1] == v)
+                    .any(|t| t.len() >= 2 && t[0] == tag_name && t[1..].iter().any(|x| x == v))
             })
         })
     }
@@ -335,6 +335,31 @@ mod tests {
     }
 
     #[test]
+    fn tag_match_any_value_in_common() {
+        // NIP-01: a `#` constraint matches when at least one of the
+        // filter's values equals at least one of the event tag's values.
+        // Both the first and the second value of a same-name tag pair
+        // must match — the live path compares every value, like the stored
+        // tag index (see the `all_values_of_a_single_letter_tag_are_indexed`
+        // db test).
+        let e = ev(1, vec![vec!["e".into(), "aa".repeat(32), "bb".repeat(32)]]);
+        let f: Filter =
+            serde_json::from_value(serde_json::json!({"#e": ["aa".repeat(32)]})).unwrap();
+        assert!(f.matches(&e), "the first tag value must match");
+        let f: Filter =
+            serde_json::from_value(serde_json::json!({"#e": ["bb".repeat(32)]})).unwrap();
+        assert!(f.matches(&e), "the second tag value must match");
+        let f: Filter =
+            serde_json::from_value(serde_json::json!({"#e": ["cc".repeat(32)]})).unwrap();
+        assert!(!f.matches(&e), "a value present in no tag must not match");
+        // The filter value can match any one of several values too.
+        let f: Filter =
+            serde_json::from_value(serde_json::json!({"#e": ["cc".repeat(32), "bb".repeat(32)]}))
+                .unwrap();
+        assert!(f.matches(&e));
+    }
+
+    #[test]
     fn tag_match() {
         let e = ev(1, vec![vec!["t".into(), "rust".into()]]);
         let f: Filter = serde_json::from_value(serde_json::json!({"#t": ["rust"]})).unwrap();
@@ -451,6 +476,55 @@ mod tests {
             3,
             "inbox values merge with existing #p"
         );
+    }
+
+    #[test]
+    fn delegation_tag_does_not_match_other_authors() {
+        // NIP-26: a delegation tag only extends the match to the DELEGATOR
+        // named in the tag; filters on an unrelated pubkey must not match.
+        let e = ev(
+            1,
+            vec![vec![
+                "delegation".into(),
+                "aa".repeat(32),
+                "sig".into(),
+                "kind".into(),
+            ]],
+        );
+        let mut f: Filter = serde_json::from_value(serde_json::json!({})).unwrap();
+        f.authors = Some(vec!["cc".repeat(32)]);
+        assert!(!f.matches(&e));
+        f.authors = Some(vec!["aa".repeat(32)]);
+        assert!(f.matches(&e), "the delegator named in the tag matches");
+    }
+
+    #[test]
+    fn until_rejects_younger_events() {
+        let e = ev(1, vec![]);
+        let mut f: Filter = serde_json::from_value(serde_json::json!({"kinds": [1]})).unwrap();
+        f.until = Some(e.created_at - 1);
+        assert!(!f.matches(&e), "an event newer than `until` must not match");
+        f.until = Some(e.created_at);
+        assert!(f.matches(&e));
+    }
+
+    #[test]
+    fn inbox_outbox_dedupes_and_rejects_bad_shapes() {
+        let pk = "aa".repeat(32);
+        // A value already present in the target entry is not duplicated.
+        let mut v = serde_json::json!({"inbox": pk, "#p": [pk]});
+        rewrite_inbox_outbox(&mut v).unwrap();
+        assert_eq!(v["#p"].as_array().unwrap().len(), 1);
+        // Non-object input is left untouched.
+        let mut v = serde_json::json!(42);
+        rewrite_inbox_outbox(&mut v).unwrap();
+        assert_eq!(v, serde_json::json!(42));
+        // An array with a non-string element is invalid.
+        let mut v = serde_json::json!({"inbox": [1]});
+        assert!(rewrite_inbox_outbox(&mut v).is_err());
+        // A pre-existing `#p`/`authors` entry of the wrong shape is invalid.
+        let mut v = serde_json::json!({"inbox": pk, "#p": 42});
+        assert!(rewrite_inbox_outbox(&mut v).is_err());
     }
 
     #[test]

@@ -27,12 +27,6 @@ pub(crate) struct Descriptor {
     pub pubkey: String,
 }
 
-impl Descriptor {
-    pub(crate) fn npub(&self) -> String {
-        npub_of(&self.pubkey)
-    }
-}
-
 /// The file storage backend, chosen by `blossom.storage`.
 enum Storage {
     Local(LocalStore),
@@ -178,15 +172,25 @@ impl BlobStore {
     /// blob is never materialized in memory in full.
     pub(crate) async fn open_stream(
         &self,
-        npub: &str,
+        pubkey: &str,
         sha256: &str,
         start: u64,
         len: u64,
     ) -> Result<Option<BlobStream>> {
-        match &self.storage {
-            Storage::Local(s) => s.open(npub, sha256, start, len).await,
-            Storage::S3(s) => s.open(npub, sha256, start, len).await,
+        // The canonical npub first; a blob stored under the legacy
+        // bech32m npub directory (before the encoder became canonical)
+        // is found via the fallback so old uploads stay readable.
+        let npub = npub_of(pubkey);
+        let legacy = legacy_npub_of(pubkey);
+        for candidate in [npub.as_str(), legacy.as_str()] {
+            if let Some(stream) = match &self.storage {
+                Storage::Local(s) => s.open(candidate, sha256, start, len).await?,
+                Storage::S3(s) => s.open(candidate, sha256, start, len).await?,
+            } {
+                return Ok(Some(stream));
+            }
         }
+        Ok(None)
     }
 
     /// Deletes the requester's copy: the file under their npub directory
@@ -194,10 +198,18 @@ impl BlobStore {
     /// the LMDB mapping. Other uploaders of the same bytes keep theirs.
     pub(crate) async fn delete(&self, pubkey: &str, sha256: &str) -> Result<bool> {
         let npub = npub_of(pubkey);
-        let existed = match &self.storage {
-            Storage::Local(s) => s.delete(&npub, sha256).await?,
-            Storage::S3(s) => s.delete(&npub, sha256).await?,
-        };
+        let legacy = legacy_npub_of(pubkey);
+        let mut existed = false;
+        for candidate in [npub.as_str(), legacy.as_str()] {
+            let hit = match &self.storage {
+                Storage::Local(s) => s.delete(candidate, sha256).await?,
+                Storage::S3(s) => s.delete(candidate, sha256).await?,
+            };
+            existed |= hit;
+            if hit {
+                break;
+            }
+        }
         self.db.blossom_remove_owner(sha256, pubkey).await;
         Ok(existed)
     }
@@ -259,6 +271,18 @@ pub(crate) fn npub_from_dir(dir: &Path) -> std::result::Result<String, ()> {
 }
 
 fn npub_of(pubkey: &str) -> String {
+    match hex::decode(pubkey) {
+        Ok(bytes) if bytes.len() == 32 => {
+            crate::nips::nip19::bech32_encode("npub", &bytes).unwrap_or_else(|_| pubkey.to_string())
+        }
+        _ => pubkey.to_string(),
+    }
+}
+
+/// The legacy bech32m npub that earlier releases used for the storage
+/// paths: blobs written before the encoder became spec-canonical stay
+/// reachable through this name.
+fn legacy_npub_of(pubkey: &str) -> String {
     match hex::decode(pubkey) {
         Ok(bytes) if bytes.len() == 32 => crate::nips::nip19::bech32m_encode("npub", &bytes)
             .unwrap_or_else(|_| pubkey.to_string()),
@@ -718,9 +742,9 @@ mod tests {
     }
 
     /// Reads a blob through the streaming path (open + collect).
-    async fn read_all(store: &BlobStore, npub: &str, sha: &str) -> Option<Vec<u8>> {
+    async fn read_all(store: &BlobStore, pubkey: &str, sha: &str) -> Option<Vec<u8>> {
         use futures_util::StreamExt as _;
-        let stream = store.open_stream(npub, sha, 0, u64::MAX).await.unwrap()?;
+        let stream = store.open_stream(pubkey, sha, 0, u64::MAX).await.unwrap()?;
         let mut out = Vec::new();
         match stream {
             crate::server::blossom::storage::BlobStream::Local(mut file) => {
@@ -846,10 +870,7 @@ mod tests {
             // The guard runs before any write: neither a file nor an orphan
             // mapping may be left behind.
             assert!(
-                full.open_stream(&npub_of(&a), &sha, 0, 1)
-                    .await
-                    .unwrap()
-                    .is_none(),
+                full.open_stream(&a, &sha, 0, 1).await.unwrap().is_none(),
                 "no file may be written for the refused upload"
             );
             assert!(
@@ -877,12 +898,11 @@ mod tests {
             s.put(&a, &sha, &data, "application/octet-stream")
                 .await
                 .unwrap();
-            let npub = npub_of(&a);
             // Full read: everything from offset 0.
-            let full = read_all(&s, &npub, &sha).await.unwrap();
+            let full = read_all(&s, &a, &sha).await.unwrap();
             assert_eq!(full, data);
             // Range read: the caller reads at most `len` bytes after seek.
-            let mut file = match s.open_stream(&npub, &sha, 1_000, 1_000).await.unwrap() {
+            let mut file = match s.open_stream(&a, &sha, 1_000, 1_000).await.unwrap() {
                 Some(crate::server::blossom::storage::BlobStream::Local(f)) => f,
                 other => panic!("expected a local stream, got {other:?}"),
             };
@@ -892,7 +912,7 @@ mod tests {
             assert_eq!(buf, data[1_000..2_000], "the range must be exact");
             // Nonexistent blob: None.
             assert!(
-                s.open_stream(&npub, &"ab".repeat(32), 0, 10)
+                s.open_stream(&a, &"ab".repeat(32), 0, 10)
                     .await
                     .unwrap()
                     .is_none()
@@ -921,7 +941,7 @@ mod tests {
             // The symlink is refused: the blob reads as missing, and the
             // external content is never served.
             assert!(
-                s.open_stream(&npub, &sha, 0, 1).await.unwrap().is_none(),
+                s.open_stream(&a, &sha, 0, 1).await.unwrap().is_none(),
                 "a symlinked blob must not be followed"
             );
             std::fs::remove_file(&external).unwrap();
@@ -1015,7 +1035,7 @@ mod tests {
             s.put(&a, &sha, b"first", "text/plain").await.unwrap();
             std::fs::write(&tmp, b"stale").unwrap();
             s.put(&a, &sha, b"second", "text/plain").await.unwrap();
-            let mut file = match s.open_stream(&npub, &sha, 0, 6).await.unwrap() {
+            let mut file = match s.open_stream(&a, &sha, 0, 6).await.unwrap() {
                 Some(crate::server::blossom::storage::BlobStream::Local(f)) => f,
                 other => panic!("expected a local stream, got {other:?}"),
             };

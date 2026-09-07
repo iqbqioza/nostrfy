@@ -1323,6 +1323,89 @@ mod tests {
     }
 
     #[test]
+    fn item_collector_boundary_giftwrap_groupmeta_and_sorts() {
+        use super::{ItemCollector, NegLight, ScanCollector};
+        use crate::nips::nip29::{GROUP_META, GROUP_PINS};
+        use crate::nips::nip62::GIFT_WRAP_KIND;
+        let mut c = ItemCollector::new(2);
+        assert_eq!(c.cap(), 2);
+        assert!(!c.full());
+        // The first push at the limit sets the boundary timestamp.
+        let e = ev("a", 1000);
+        assert!(c.push(e.clone(), [0xAAu8; 32], 2));
+        let e = ev("b", 999);
+        assert!(c.push(e.clone(), [0xBBu8; 32], 2));
+        assert_eq!(c.items[0].created, 1000);
+        assert_eq!(c.items[0].id, [0xAAu8; 32]);
+        assert!(!c.push(ev("c", 998), [0xCCu8; 32], 2), "limit reached");
+        // Events at the boundary timestamp are still collected; older ones
+        // are rejected.
+        let e = ev("d", 999);
+        assert!(c.push(e.clone(), [0xDDu8; 32], 2), "boundary tie collected");
+        assert_eq!(c.items.len(), 3);
+        // The light path shares the boundary semantics.
+        let light = NegLight {
+            id: "a".repeat(64),
+            pubkey: "b".repeat(64),
+            created_at: 999,
+            kind: 1,
+            tags: vec![],
+        };
+        assert!(
+            c.push_light(&light, [0xEEu8; 32], 2),
+            "light boundary tie collected"
+        );
+        let light2 = NegLight {
+            created_at: 998,
+            ..light
+        };
+        assert!(
+            !c.push_light(&light2, [0xFFu8; 32], 2),
+            "light limit reached"
+        );
+        c.reset_boundary();
+        // A fresh collector (its own limit) for the per-kind tagging checks.
+        let mut c = ItemCollector::new(8);
+        // Gift wraps record their p-tag recipients; group metadata records
+        // the meta flag; NIP-78 kinds record app_specific.
+        let mut wrap = ev("w", 1);
+        wrap.kind = GIFT_WRAP_KIND;
+        wrap.tags = vec![
+            vec!["p".into(), "aa".repeat(32)],
+            vec!["p".into(), "bb".repeat(32)],
+        ];
+        assert!(c.push(wrap, [0x11u8; 32], 8));
+        assert_eq!(
+            c.items[0].wrap_recipients,
+            Some(vec!["aa".repeat(32), "bb".repeat(32)])
+        );
+        let mut meta = ev("m", 1);
+        meta.kind = GROUP_META;
+        meta.tags = vec![vec!["d".into(), "g".into()]];
+        assert!(c.push(meta, [0x22u8; 32], 8));
+        assert_eq!(c.items[1].gid.as_deref(), Some("g"));
+        assert!(c.items[1].meta);
+        let mut pin = ev("p", 1);
+        pin.kind = GROUP_PINS;
+        pin.tags = vec![vec!["d".into(), "g".into()]];
+        assert!(c.push(pin, [0x33u8; 32], 8));
+        assert!(c.items[2].meta);
+        let mut app = ev("x", 1);
+        app.kind = crate::nips::nip78::APP_SPECIFIC_KIND;
+        assert!(c.push(app, [0x44u8; 32], 8));
+        assert!(c.items[3].app_specific);
+        // Ordering helpers: newest-first by created then id, ascending by
+        // created, relevance as a no-op and truncation to a count.
+        c.sort_key();
+        assert_eq!(c.items[0].created, 1);
+        c.sort_asc();
+        assert_eq!(c.items[0].created, 1);
+        c.sort_relevance(&[], &[]);
+        c.truncate_to(3);
+        assert_eq!(c.items.len(), 3);
+    }
+
+    #[test]
     fn relevance_score_counts_whole_words_only() {
         let terms = vec!["ru".to_string(), "rust".to_string()];
         let weights = vec![1.0, 1.0];
