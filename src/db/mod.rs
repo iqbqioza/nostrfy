@@ -774,26 +774,6 @@ impl DbClient {
         .await
     }
 
-    pub async fn neg_items(&self, filter: Filter, limit: usize, now: u64) -> (NegItems, bool) {
-        self.request_read(|reply| Msg::NegQuery {
-            filter,
-            limit,
-            now,
-            reply,
-        })
-        .await
-    }
-
-    pub async fn count(&self, filters: Vec<Filter>, limit: usize, now: u64) -> (Vec<Event>, bool) {
-        self.request_read(|reply| Msg::Count {
-            filters,
-            limit,
-            now,
-            reply,
-        })
-        .await
-    }
-
     /// Relay-wide per-kind event counts (REST API).
     pub async fn kind_counts(&self, max_keys: usize) -> (Vec<(u64, u64)>, bool) {
         self.request_read(|reply| Msg::KindCounts { max_keys, reply })

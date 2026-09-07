@@ -128,7 +128,11 @@ impl super::Conn {
         let now = unix_now();
         // The negentropy query only needs (created_at, id) records, so it
         // never materializes every matching full event in memory.
-        let Some((items, more)) = self.relay.db.neg_items_reported(filter, max_items, now).await
+        let Some((items, more)) = self
+            .relay
+            .db
+            .neg_items_reported(filter, max_items, now)
+            .await
         else {
             // A timed-out sync must never be answered with an empty item
             // set: the peer would conclude everything is gone locally and
