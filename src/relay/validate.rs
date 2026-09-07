@@ -4,7 +4,7 @@
 
 use crate::config::{AccessControl, Config};
 use crate::event::Event;
-use crate::nips::{nip01, nip09, nip13, nip26, nip29, nip43, nip62, nip70};
+use crate::nips::{nip01, nip09, nip13, nip26, nip29, nip40, nip43, nip62, nip70};
 
 /// A bech32-encoded nsec secret key is `nsec1` followed by 58 characters
 /// (52 data characters plus a 6-character checksum), 63 characters in total.
@@ -307,10 +307,25 @@ impl super::Relay {
             return Err("invalid: tag value too large".into());
         }
         // Events with a future created_at (beyond the tolerated skew) are
-        // dropped silently with the NIP-01 `mute:` prefix instead of being
-        // rejected as invalid.
+        // rejected as invalid (the NIP-01 example for this case carries
+        // the `invalid:` prefix; `mute:` is reserved for ignored ephemeral
+        // events).
         if event.created_at > now.saturating_add(limits.max_created_at_future_secs) {
-            return Err("mute: event creation date is in the future".into());
+            return Err("invalid: event creation date is in the future".into());
+        }
+
+        // NIP-40: the expiration value is required to be a unix timestamp.
+        // A malformed value must not silently mean "no expiration" — the
+        // client asked for expiry, so the relay would keep the event
+        // forever. Rejected while NIP-40 is enabled.
+        if cfg.nip_enabled(40)
+            && event
+                .tags
+                .iter()
+                .any(|t| t.first().is_some_and(|n| n == nip40::EXPIRATION_TAG))
+            && nip40::expiry(event).is_none()
+        {
+            return Err("invalid: malformed expiration tag".into());
         }
 
         // Security: events carrying secret key material (bech32 `nsec1`
@@ -338,6 +353,12 @@ impl super::Relay {
         if event.pubkey != event.pubkey.to_ascii_lowercase() {
             return Err("invalid: pubkey must be lowercase hex".into());
         }
+        // The same convention applies to the signature: an uppercase-hex
+        // sig would be stored verbatim (and never match a lowercase
+        // re-computation), so reject it.
+        if event.sig != event.sig.to_ascii_lowercase() {
+            return Err("invalid: sig must be lowercase hex".into());
+        }
 
         if cfg.nip_enabled(26) && !nip26::verify(event, self.secp()) {
             return Err("invalid: delegation failed".into());
@@ -351,8 +372,10 @@ impl super::Relay {
         }
 
         // NIP-42: auth events are ephemeral and must never be stored or
-        // broadcast.
-        if cfg.nip_enabled(42) && event.kind == crate::nips::nip42::AUTH_KIND {
+        // broadcast. The MUST is unconditional: a relay that does not
+        // advertise NIP-42 must still not broadcast kind 22242 to other
+        // clients, so the check runs regardless of the NIP-42 toggle.
+        if event.kind == crate::nips::nip42::AUTH_KIND {
             return Err("invalid: authentication events cannot be published".into());
         }
 
@@ -400,12 +423,11 @@ impl super::Relay {
             return Err("auth-required: this relay requires authentication".into());
         }
 
-        // NIP-70: protected events may only be published by their author,
-        // so the event's own pubkey must be among the authenticated keys.
-        if cfg.nip_enabled(70)
-            && nip70::is_protected(event)
-            && !authed.iter().any(|pk| pk == &event.pubkey)
-        {
+        // NIP-70: "The default behavior of a relay MUST be to reject any
+        // event that contains `["-"]`"; the only acceptance path is the
+        // author's own NIP-42 authentication. The rule is unconditional —
+        // the NIP-70 toggle only relaxes the SHOULD-level repost check.
+        if nip70::is_protected(event) && !authed.iter().any(|pk| pk == &event.pubkey) {
             return Err(
                 "auth-required: protected events may only be published by their author".into(),
             );
@@ -987,6 +1009,140 @@ mod tests {
             );
             drop(cfg2_reloaded);
             relay2.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn spec_strictness_prefixes_sig_auth_nip70_expiration() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut cfg = Config::default();
+            cfg.database.map_size = 16 * 1024 * 1024;
+            cfg.database.max_map_size = 256 * 1024 * 1024;
+            cfg.database.path = std::env::temp_dir().join("nostrfy-spec-strictness-validate");
+            let _ = std::fs::remove_dir_all(&cfg.database.path);
+            let db = crate::db::DbClient::open(
+                &cfg.database,
+                true,
+                Arc::new(Default::default()),
+                0,
+                128,
+                4096,
+                262144,
+            )
+            .unwrap();
+            let config = Arc::new(RwLock::new(cfg));
+            let relay = Relay::new(
+                config.clone(),
+                db,
+                crate::stats::Stats::new(),
+                "",
+                crate::relay::LiveBusConfig {
+                    buffer: 1024,
+                    batch_interval_ms: 10,
+                    batch_size: 64,
+                },
+            )
+            .await;
+            let relay = Arc::new(relay);
+            let now = unix_now();
+            let cfg = relay.config.read().await;
+
+            // Item 3: a future-dated event is rejected with the NIP-01
+            // `invalid:` prefix (the spec's example), not `mute:`.
+            let mut future = signed(1, vec![]);
+            future.created_at = now + 10_000;
+            let secp = Secp256k1::new();
+            let keypair = Keypair::from_seckey_slice(&secp, &[3u8; 32]).unwrap();
+            future.id = crate::nips::nip01::compute_id(&future);
+            let id = future.id_bytes().unwrap();
+            future.sig = secp.sign_schnorr_no_aux_rand(&id, &keypair).to_string();
+            let err = relay
+                .validate_base(&cfg, &future, now, &[], None)
+                .unwrap_err();
+            assert!(
+                err.starts_with("invalid: event creation date is in the future"),
+                "{err}"
+            );
+
+            // Item 7: a malformed expiration value is rejected while NIP-40
+            // is enabled (it must not silently mean "no expiration").
+            let bad = signed(1, vec![vec!["expiration".into(), "not-a-number".into()]]);
+            let err = relay.validate_base(&cfg, &bad, now, &[], None).unwrap_err();
+            assert!(
+                err.starts_with("invalid: malformed expiration tag"),
+                "{err}"
+            );
+            // A bare `["expiration"]` tag (the value is required) is
+            // malformed too.
+            let bare = signed(1, vec![vec!["expiration".into()]]);
+            assert!(relay.validate_base(&cfg, &bare, now, &[], None).is_err());
+            // A well-formed value passes.
+            let good = signed(1, vec![vec!["expiration".into(), (now + 100).to_string()]]);
+            assert!(relay.validate_base(&cfg, &good, now, &[], None).is_ok());
+
+            // Item 4: an uppercase-hex sig is rejected like an uppercase
+            // pubkey.
+            let mut upper = signed(1, vec![]);
+            upper.sig = upper.sig.to_ascii_uppercase();
+            let err = relay
+                .validate_base(&cfg, &upper, now, &[], None)
+                .unwrap_err();
+            assert!(
+                err.starts_with("invalid: sig must be lowercase hex"),
+                "{err}"
+            );
+
+            // Item 5: kind 22242 is rejected even when NIP-42 is disabled
+            // (the MUST NOT broadcast rule is unconditional).
+            let auth = signed(22242, vec![]);
+            let err = relay
+                .validate_base(&cfg, &auth, now, &[], None)
+                .unwrap_err();
+            assert!(
+                err.starts_with("invalid: authentication events cannot be published"),
+                "{err}"
+            );
+
+            // Item 6: NIP-70's default MUST ("reject any event that contains
+            // `["-"]`") holds even when the NIP-70 toggle is off; the only
+            // acceptance path is the author's own AUTH.
+            drop(cfg);
+            {
+                let mut w = relay.config.write().await;
+                w.relay.disabled_nips.push(70);
+                w.relay.disabled_nips.push(42);
+            }
+            let cfg = relay.config.read().await;
+            let protected = signed(1, vec![vec!["-".into()]]);
+            let err = relay
+                .validate_base(&cfg, &protected, now, &[], None)
+                .unwrap_err();
+            assert!(
+                err.starts_with("auth-required: protected events may only be published"),
+                "{err}"
+            );
+            // The author's own authenticated key is the exception.
+            let authed = vec![protected.pubkey.clone()];
+            assert!(
+                relay
+                    .validate_base(&cfg, &protected, now, &authed, None)
+                    .is_ok()
+            );
+
+            // With NIP-40 disabled, the malformed expiration tag is not
+            // rejected (the relay does not interpret the tag at all).
+            drop(cfg);
+            {
+                let mut w = relay.config.write().await;
+                w.relay.disabled_nips.push(40);
+            }
+            let cfg = relay.config.read().await;
+            let bad = signed(1, vec![vec!["expiration".into(), "not-a-number".into()]]);
+            assert!(relay.validate_base(&cfg, &bad, now, &[], None).is_ok());
+
+            drop(cfg);
+            relay.db.shutdown();
         });
     }
 
