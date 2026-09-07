@@ -84,6 +84,26 @@ fn check_role_fields(label: &str, description: &str, color: &str) -> Result<(), 
     Ok(())
 }
 
+/// Validates a NIP-43 role id: non-empty (after trimming), within the byte
+/// length bound, and free of control characters (it lands in a stored relay
+/// event's `d` tag and the in-memory role map). Character count is used for
+/// the length bound like the other role fields so multibyte ids cannot
+/// bypass the intent.
+fn check_role_id(id: &str) -> Result<(), String> {
+    if id.trim().is_empty() {
+        return Err("role id must not be empty".into());
+    }
+    if id.chars().count() > MAX_ROLE_ID_LEN {
+        return Err(format!(
+            "role id exceeds the maximum of {MAX_ROLE_ID_LEN} characters"
+        ));
+    }
+    if id.chars().any(|c| c.is_control()) {
+        return Err("role id must not contain control characters".into());
+    }
+    Ok(())
+}
+
 fn rpc_ok(result: Value) -> Response {
     (StatusCode::OK, Json(json!({ "result": result }))).into_response()
 }
@@ -326,10 +346,8 @@ pub async fn rpc_handler(
             let Some(id) = params.first().and_then(Value::as_str) else {
                 return rpc_err("invalid params");
             };
-            if id.len() > MAX_ROLE_ID_LEN {
-                return rpc_err(&format!(
-                    "role id exceeds the maximum of {MAX_ROLE_ID_LEN} characters"
-                ));
+            if let Err(msg) = check_role_id(id) {
+                return rpc_err(&msg);
             }
             let label = params.get(1).and_then(Value::as_str).unwrap_or("");
             let description = params.get(2).and_then(Value::as_str).unwrap_or("");
@@ -354,10 +372,8 @@ pub async fn rpc_handler(
             let Some(id) = params.first().and_then(Value::as_str) else {
                 return rpc_err("invalid params");
             };
-            if id.len() > MAX_ROLE_ID_LEN {
-                return rpc_err(&format!(
-                    "role id exceeds the maximum of {MAX_ROLE_ID_LEN} characters"
-                ));
+            if let Err(msg) = check_role_id(id) {
+                return rpc_err(&msg);
             }
             let label = params.get(1).and_then(Value::as_str).unwrap_or("");
             let description = params.get(2).and_then(Value::as_str).unwrap_or("");
@@ -379,6 +395,9 @@ pub async fn rpc_handler(
             let Some(id) = params.first().and_then(Value::as_str) else {
                 return rpc_err("invalid params");
             };
+            if let Err(msg) = check_role_id(id) {
+                return rpc_err(&msg);
+            }
             if relay.delete_role(id).await {
                 audit!(&relay, &identity, "deleterole", params);
                 rpc_ok(json!(true))
@@ -804,6 +823,12 @@ mod tests {
         assert!(rpc_err_of(resp).await.contains("params"));
         let resp = rpc_call(&relay, "createrole", vec![json!("x".repeat(200))]).await;
         assert!(rpc_err_of(resp).await.contains("maximum"));
+        let resp = rpc_call(&relay, "createrole", vec![json!("")]).await;
+        assert!(rpc_err_of(resp).await.contains("empty"));
+        let resp = rpc_call(&relay, "createrole", vec![json!("   ")]).await;
+        assert!(rpc_err_of(resp).await.contains("empty"));
+        let resp = rpc_call(&relay, "deleterole", vec![json!("")]).await;
+        assert!(rpc_err_of(resp).await.contains("empty"));
         let resp = rpc_call(
             &relay,
             "createrole",

@@ -838,9 +838,9 @@ impl Config {
             kind,
             22242 // NIP-42 AUTH
                 | 27235 // NIP-98 HTTP auth
-                | 28934 // NIP-43 JOIN
-                | 28935 // NIP-43 Invite Request
-                | 28936 // NIP-43 LEAVE
+                | crate::nips::nip43::JOIN
+                | crate::nips::nip43::INVITE
+                | crate::nips::nip43::LEAVE
                 | 24133 // NIP-46 Nostr Connect
                 | 23194 // NIP-47 wallet request
                 | 23195 // NIP-47 wallet response
@@ -1049,8 +1049,11 @@ impl Config {
                 "relay.enabled_nips and relay.disabled_nips are both set; enabled_nips wins"
             );
         }
-        // Typo guard: an unknown NIP id silently disables real behaviour
-        // (`nip_enabled(42) == false` for `enabled_nips = [500]`), so warn.
+        // Typo guard: an unknown NIP id is ignored with a warning (not a
+        // hard error, so a future NIP number in a shared config file never
+        // prevents startup on this version). Note this means a typo like
+        // `enabled_nips = [500]` yields an empty advertisement plus the
+        // warning — check the log if NIPs go missing unexpectedly.
         for nip in self
             .relay
             .enabled_nips

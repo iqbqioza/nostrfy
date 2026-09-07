@@ -104,7 +104,9 @@ impl super::Relay {
         // The spec requires the relay to honor the request "regardless of
         // the user's status", so it is detected *before* the access-control
         // checks: a blocked or restricted pubkey must still be able to
-        // vanish.
+        // vanish. Note: `validate_base` (signatures, PoW when configured)
+        // still runs first — "status" covers allow/block state, not proof
+        // of authorship or anti-spam proof-of-work.
         if cfg.nip_enabled(62)
             && nip62::is_vanish(event)
             && nip62::targets_us(event, &cfg.relay_identity())
@@ -472,8 +474,8 @@ impl super::Relay {
             crate::nips::nip42::AUTH_KIND
                 | crate::nips::nip98::AUTH_KIND
                 | crate::nips::nip43::JOIN
+                | crate::nips::nip43::INVITE
                 | crate::nips::nip43::LEAVE
-                | 28935 // NIP-43 Invite Request
                 | 24133 // NIP-46 Nostr Connect
                 | 23194 // NIP-47 wallet request
                 | 23195 // NIP-47 wallet response
@@ -993,9 +995,9 @@ mod tests {
             for kind in [
                 22242, // NIP-42 AUTH
                 27235, // NIP-98 HTTP auth
-                28934, // NIP-43 JOIN
-                28935, // NIP-43 Invite Request
-                28936, // NIP-43 LEAVE
+                crate::nips::nip43::JOIN,
+                crate::nips::nip43::INVITE,
+                crate::nips::nip43::LEAVE,
                 24133, // NIP-46 Nostr Connect
                 23194, // NIP-47 wallet request
                 23195, // NIP-47 wallet response

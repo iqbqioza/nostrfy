@@ -469,7 +469,20 @@ impl super::Conn {
             }
         }
         let truncated = to_send.len() > original_total;
-        to_send.truncate(original_total);
+        // NIP-01/NIP-67 boundary rule: events sharing the boundary
+        // `created_at` belong to the same page. The scan already continues
+        // ties past its limit; extend the visible truncation the same way so
+        // a tie split by withheld events is not cut in half here.
+        if truncated && original_total > 0 {
+            let boundary = to_send[original_total - 1].created_at;
+            let mut end = original_total;
+            while end < to_send.len() && to_send[end].created_at == boundary {
+                end += 1;
+            }
+            to_send.truncate(end);
+        } else {
+            to_send.truncate(original_total);
+        }
         // The response is queued for the pump instead of being pushed into
         // the outgoing queue all at once: the connection loop moves it into
         // the capped queue in bounded chunks as the socket drains, so a

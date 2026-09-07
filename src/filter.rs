@@ -190,6 +190,10 @@ impl Filter {
             if !name.starts_with('#') {
                 return true;
             }
+            // Note: tag values compare exactly (case-sensitive), unlike
+            // `ids`/`authors` which decode hex case-insensitively. An
+            // uppercase `#e`/`#p` value therefore matches nothing on either
+            // path — consistent, but clients should send lowercase hex.
             let tag_name = name.strip_prefix('#').unwrap_or(name);
             tag_values(value).any(|v| {
                 ev.tags()

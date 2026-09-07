@@ -33,11 +33,11 @@ pub(crate) const MAX_NEG_OPENS: u32 = 256;
 
 impl super::Conn {
     pub(crate) fn send_neg_err(&mut self, sub_id: &str, reason: &str) {
-        self.send_json(json!(["NEG-ERR", sub_id, reason]));
+        self.send_control(json!(["NEG-ERR", sub_id, reason]));
     }
 
     pub(crate) fn send_neg_msg(&mut self, sub_id: &str, message: &[u8]) {
-        self.send_json(json!(["NEG-MSG", sub_id, hex::encode(message)]));
+        self.send_control(json!(["NEG-MSG", sub_id, hex::encode(message)]));
     }
 
     pub(crate) async fn handle_neg_open(&mut self, rest: &[Value]) {
@@ -161,7 +161,7 @@ impl super::Conn {
         if more || items.len() > max_items {
             // NIP-77: the maximum number of processable records may be
             // returned as the fourth element.
-            self.send_json(json!([
+            self.send_control(json!([
                 "NEG-ERR",
                 sub_id,
                 "blocked: this query is too big",
@@ -241,7 +241,7 @@ impl super::Conn {
             .saturating_add(items.len())
             > total_cap
         {
-            self.send_json(json!([
+            self.send_control(json!([
                 "NEG-ERR",
                 sub_id,
                 "blocked: too many negentropy items",
@@ -321,11 +321,14 @@ impl super::Conn {
     pub(crate) async fn handle_neg_msg(&mut self, rest: &[Value]) {
         if rest.len() < 2 {
             // Correlate with NEG-ERR when the id is known, else NOTICE.
+            // NIP-77: after NEG-ERR the subscription is closed, so a named
+            // id is released like every other malformed continuation.
             if let Some(sub_id) = rest
                 .first()
                 .and_then(value_string)
                 .filter(|s| !s.is_empty())
             {
+                self.remove_neg_subscription(&sub_id);
                 self.send_neg_err(
                     &sub_id,
                     "error: NEG-MSG requires a subscription id and message",

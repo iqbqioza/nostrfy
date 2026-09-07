@@ -167,12 +167,14 @@ impl Conn {
         }
     }
 
-    /// Queues a completion-critical control message (EOSE / CLOSED) without
-    /// any outgoing cap: a dropped EOSE would leave the client hanging on
-    /// a completed subscription — worse than a dropped live event. The
-    /// messages are tiny and their volume is bounded by the REQ/CLOSE
-    /// rate, so bypassing the caps does not meaningfully weaken the
-    /// queue's memory bound.
+    /// Queues a completion-critical control message (EOSE / CLOSED /
+    /// NEG-MSG / NEG-ERR) without any outgoing cap: a dropped EOSE would
+    /// leave the client hanging on a completed subscription, and a dropped
+    /// NEG-MSG/NEG-ERR would hang a sync — worse than a dropped live event.
+    /// The messages are tiny except for NEG-MSG id lists (bounded by
+    /// `max_neg_items` and `max_req_response_bytes`), and their volume is
+    /// bounded by the REQ/NEG rate, so bypassing the caps does not
+    /// meaningfully weaken the queue's memory bound.
     pub(crate) fn send_control(&mut self, value: Value) {
         if let Ok(text) = serde_json::to_string(&value) {
             let size = text.len();
@@ -3249,6 +3251,10 @@ mod tests {
                 "a short NEG-MSG must yield a NEG-ERR: {:?}",
                 outgoing_json(&conn)
             );
+            assert!(
+                !conn.neg.contains_key("s"),
+                "a short NEG-MSG must close the subscription"
+            );
             conn.outgoing.clear();
             conn.handle_neg_msg(&[json!(true), json!("61000000")]).await;
             assert!(
@@ -3671,6 +3677,37 @@ mod tests {
                 contents,
                 vec!["v1", "v2", "v3"],
                 "the hidden event must not consume a limit slot"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn req_visible_truncate_keeps_created_at_ties() {
+        // NIP-01/NIP-67 boundary rule: events sharing the boundary
+        // `created_at` belong to the same page — the visible truncation
+        // must extend ties instead of cutting them in half.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let now = unix_now();
+            let v1 = signed_note(conn.relay.secp(), "v1", now, vec![]);
+            let v2 = signed_note(conn.relay.secp(), "v2", now, vec![]);
+            let v3 = signed_note(conn.relay.secp(), "v3", now - 1, vec![]);
+            for e in [&v1, &v2, &v3] {
+                conn.relay.db.put(e.clone(), now).await;
+            }
+            conn.handle_req(&[json!("sub"), json!({"kinds": [1], "limit": 1})])
+                .await;
+            conn.pump_pending_reqs();
+            let contents: Vec<String> = outgoing_json(&conn)
+                .iter()
+                .filter(|m| m[0] == "EVENT")
+                .map(|m| m[2]["content"].as_str().unwrap().to_string())
+                .collect();
+            assert!(
+                contents.contains(&"v1".to_string()) && contents.contains(&"v2".to_string()),
+                "same-timestamp ties must stay together: {contents:?}"
             );
             conn.relay.db.shutdown();
         });

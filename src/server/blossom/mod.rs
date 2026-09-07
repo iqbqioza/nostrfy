@@ -169,6 +169,12 @@ async fn upload_allowed(relay: &Relay, pubkey: &str) -> Result<(), ()> {
 /// with `blossom.host`: strips the scheme and any path, IPv6 literals keep
 /// their bracket contents (colons are part of the host), and a DNS/IPv4
 /// `:port` suffix is removed.
+///
+/// The port is intentionally ignored: `blossom.host` is a bare hostname
+/// (validated portless), and routing matches on hostname only, so a token
+/// naming `https://media.example.com:443` and one naming the bare host are
+/// the same identity. Unlike NIP-42/98 (whose relay identity carries a
+/// port), there is no configured port to compare against.
 fn auth_server_host(server: &str) -> String {
     let host_part = server
         .strip_prefix("https://")

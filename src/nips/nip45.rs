@@ -172,6 +172,41 @@ mod tests {
     }
 
     #[test]
+    fn hll_reference_vector_pins_algorithm() {
+        // Pinned reference vector against the canonical `fiatjaf/nostr`
+        // interpretation: offset 8 (tag `00..00`), 56-bit window
+        // (`offset+1..offset+8`), value = leading-zero-bits + 1.
+        fn ev_with_pubkey(pubkey: &str) -> Event {
+            let mut ev = Event {
+                id: String::new(),
+                pubkey: pubkey.to_string(),
+                created_at: 1,
+                kind: 7,
+                tags: vec![],
+                content: String::new(),
+                sig: String::new(),
+            };
+            ev.id = crate::nips::nip01::compute_id(&ev);
+            ev
+        }
+        let filter = filter_with_tag(&"0".repeat(64)); // nibble 0 -> offset 8
+        assert_eq!(hll_offset(&filter), Some(8));
+        // pubkey[8] selects the register; the next 7 bytes set the value.
+        // All-zero tail => 56 zero bits => value 57 (0x39).
+        let zero = ev_with_pubkey(&"00".repeat(32));
+        let ff_reg = format!("{}{}{}", "00".repeat(8), "ff", "00".repeat(23));
+        let ff = ev_with_pubkey(&ff_reg);
+        let h = hll(&[filter], &[zero, ff]).unwrap();
+        assert_eq!(h.len(), 512);
+        assert_eq!(&h[0..2], "39", "register 0 must hold 57");
+        assert_eq!(&h[510..512], "39", "register 255 must hold 57");
+        assert!(
+            h[2..510].chars().all(|c| c == '0'),
+            "all other registers must be zero"
+        );
+    }
+
+    #[test]
     fn hll_offset_ignores_non_tag_keys() {
         // NIP-45: the offset comes from the first `#`-prefixed tag
         // attribute; a non-`#` key (an unknown filter field) must not
