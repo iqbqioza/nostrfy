@@ -121,6 +121,11 @@ fn create_checksum_m(hrp: &[u8], data: &[u8]) -> Vec<u8> {
 
 /// Decode a bech32/bech32m string into HRP and 5-bit data.
 fn bech32_decode(input: &str) -> Result<(String, Vec<u8>, bool), Bech32Error> {
+    // NIP-19: bech32-formatted strings SHOULD be limited to 5000 characters
+    // — beyond that the string is a DoS vector, not a NIP-19 entity.
+    if input.chars().count() > 5000 {
+        return Err(Bech32Error::TooLong);
+    }
     // Must be lowercase or uppercase, not mixed.
     let input_lower = input.to_lowercase();
     let input_upper = input.to_uppercase();
@@ -235,12 +240,17 @@ pub enum Nip19Entity {
 #[derive(Debug, Clone)]
 pub enum Bech32Error {
     MissingSeparator,
+    /// NIP-19: the string exceeds the 5000-character limit.
+    TooLong,
     EmptyHrp,
     EmptyData,
     InvalidChar(char),
     InvalidChecksum,
     InvalidData,
-    InvalidLength { expected: usize, got: usize },
+    InvalidLength {
+        expected: usize,
+        got: usize,
+    },
     UnknownPrefix(String),
     InvalidTlv,
 }
@@ -252,6 +262,7 @@ impl fmt::Display for Bech32Error {
             Self::EmptyHrp => write!(f, "empty human-readable part"),
             Self::EmptyData => write!(f, "empty data part"),
             Self::InvalidChar(c) => write!(f, "invalid bech32 character '{c}'"),
+            Self::TooLong => write!(f, "bech32 string exceeds the 5000-character limit"),
             Self::InvalidChecksum => write!(f, "invalid bech32m checksum"),
             Self::InvalidData => write!(f, "invalid data in bech32 encoding"),
             Self::InvalidLength { expected, got } => {
@@ -475,6 +486,30 @@ pub enum Nip19Hex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn overlong_bech32_strings_are_rejected() {
+        // NIP-19: "Bech32-formatted strings SHOULD be limited in size to
+        // 5000 characters" — beyond that the string is not a NIP-19 entity.
+        let mut long = "npub1".to_string();
+        while long.chars().count() < 6000 {
+            long.push('q');
+        }
+        assert!(
+            matches!(parse_nip19(&long), Err(Bech32Error::TooLong)),
+            "a >5000-character string must be rejected with TooLong"
+        );
+        // The boundary itself is accepted for parsing (and then fails the
+        // checksum, which is the correct next error for a fabricated string).
+        let mut edge = "npub1".to_string();
+        while edge.chars().count() < 5000 {
+            edge.push('q');
+        }
+        assert!(
+            !matches!(parse_nip19(&edge), Err(Bech32Error::TooLong)),
+            "exactly 5000 characters is still within the limit"
+        );
+    }
 
     #[test]
     fn bech32m_roundtrip() {

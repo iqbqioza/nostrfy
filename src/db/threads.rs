@@ -637,8 +637,12 @@ pub(crate) fn spawn(
                                     };
                                     let _ = reply.send(n);
                                 }
-                                Msg::Vanish { pubkey, reply } => {
-                                    let n = match store.apply_vanish(&pubkey) {
+                                Msg::Vanish {
+                                    pubkey,
+                                    until_created,
+                                    reply,
+                                } => {
+                                    let n = match store.apply_vanish(&pubkey, until_created) {
                                         Ok(n) => n,
                                         Err(e) => {
                                             db_error(&thread_errors, &e);

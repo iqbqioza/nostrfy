@@ -59,7 +59,10 @@ fn insert_and_query() {
         let e3 = event(2, "another", now - 10, vec![]);
 
         assert_eq!(db.put(e1.clone(), now).await, PutOutcome::Stored);
-        assert_eq!(db.put(e1.clone(), now).await, PutOutcome::Duplicate);
+        assert_eq!(
+            db.put(e1.clone(), now).await,
+            PutOutcome::Duplicate("duplicate: event already stored".into())
+        );
         assert_eq!(db.put(e2.clone(), now).await, PutOutcome::Stored);
         assert_eq!(db.put(e3, now).await, PutOutcome::Stored);
 
@@ -519,7 +522,7 @@ fn map_grows_beyond_initial_size() {
             );
             let out = db.put(ev.clone(), now).await;
             assert!(
-                matches!(out, PutOutcome::Stored | PutOutcome::Duplicate),
+                matches!(out, PutOutcome::Stored | PutOutcome::Duplicate(_)),
                 "event {i} failed: {out:?}"
             );
         }
@@ -1040,6 +1043,56 @@ fn group_deletion_is_scoped_to_the_group() {
 }
 
 #[test]
+fn vanish_respects_the_request_created_at_bound() {
+    // NIP-62: the request deletes the pubkey's history "until its
+    // `.created_at`" — events timestamped after the request are not
+    // covered by the deletion.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let pubkey = "aa".repeat(32);
+        let ev = |created| {
+            let mut e = event(1, "v", created, vec![]);
+            e.pubkey = pubkey.clone();
+            e.id = nip01::compute_id(&e);
+            e
+        };
+        let old = ev(1_000);
+        let newer = ev(3_000);
+        assert_eq!(db.put(old.clone(), 4_000).await, PutOutcome::Stored);
+        assert_eq!(db.put(newer.clone(), 4_000).await, PutOutcome::Stored);
+        // The vanish request was created at t=2000: only older events go.
+        let removed = db
+            .apply_vanish(hex::decode(&pubkey).unwrap().try_into().unwrap(), 2_000)
+            .await;
+        assert_eq!(removed, 1, "only events up to the request's created_at");
+        let f: Filter = serde_json::from_value(serde_json::json!({"kinds": [1]})).unwrap();
+        let (res, _) = db.query(vec![f], 10, 4_000).await;
+        assert_eq!(res.len(), 1, "the newer event survives the vanish");
+        assert_eq!(res[0].id, newer.id);
+        // The pubkey is vanish-listed regardless: new events are rejected.
+        let rejected = ev(4_000);
+        assert!(
+            matches!(
+                db.put(rejected, 4_000).await,
+                PutOutcome::Invalid(reason) if reason.contains("vanish")
+            ),
+            "a vanished pubkey cannot publish again"
+        );
+    });
+    db.shutdown();
+}
+
+#[test]
 fn vanish_keeps_delegatee_events_of_a_delegator() {
     // NIP-62: a request to vanish removes only events *authored* by the
     // pubkey. NIP-26 delegatee events are indexed under the delegator too,
@@ -1076,7 +1129,10 @@ fn vanish_keeps_delegatee_events_of_a_delegator() {
 
         // Vanish the delegator: the delegatee-authored event survives.
         let removed = db
-            .apply_vanish(hex::decode(&delegator).unwrap().try_into().unwrap())
+            .apply_vanish(
+                hex::decode(&delegator).unwrap().try_into().unwrap(),
+                u64::MAX,
+            )
             .await;
         assert_eq!(removed, 0, "delegator's vanish removes no delegatee events");
         let f: Filter = serde_json::from_value(serde_json::json!({"ids": [e.id]})).unwrap();
@@ -1085,7 +1141,10 @@ fn vanish_keeps_delegatee_events_of_a_delegator() {
 
         // Vanish the delegatee: their own event is removed.
         let removed = db
-            .apply_vanish(hex::decode(&delegatee).unwrap().try_into().unwrap())
+            .apply_vanish(
+                hex::decode(&delegatee).unwrap().try_into().unwrap(),
+                u64::MAX,
+            )
             .await;
         assert_eq!(removed, 1);
         let f: Filter = serde_json::from_value(serde_json::json!({"ids": [e.id]})).unwrap();

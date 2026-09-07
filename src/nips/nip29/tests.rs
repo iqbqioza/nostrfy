@@ -216,7 +216,7 @@ fn invalid_invite_code_is_final() {
     );
     assert_eq!(
         store.validate_write(&join).unwrap_err(),
-        "restricted: invalid invite code"
+        "restricted: invalid invite code (final decision)"
     );
     let join = event(
         JOIN,

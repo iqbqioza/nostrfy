@@ -37,7 +37,9 @@ use crate::nips::nip09;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PutOutcome {
     Stored,
-    Duplicate,
+    /// A duplicate (or a duplicate-style acknowledgement such as NIP-43's
+    /// repeated join claim): acknowledged with OK true and not stored.
+    Duplicate(String),
     Replaced,
     Expired,
     PreviouslyDeleted,
@@ -148,6 +150,9 @@ enum Msg {
     },
     Vanish {
         pubkey: Vec<u8>,
+        /// NIP-62: events up to this created_at (the request's `.created_at`)
+        /// are deleted.
+        until_created: u64,
         reply: oneshot::Sender<usize>,
     },
     /// NIP-59: delete gift wraps addressed to a pubkey (on NIP-09 deletion).
@@ -825,9 +830,10 @@ impl DbClient {
             .await
     }
 
-    pub async fn apply_vanish(&self, pubkey: [u8; 32]) -> usize {
+    pub async fn apply_vanish(&self, pubkey: [u8; 32], until_created: u64) -> usize {
         self.request_write(|reply| Msg::Vanish {
             pubkey: pubkey.to_vec(),
+            until_created,
             reply,
         })
         .await

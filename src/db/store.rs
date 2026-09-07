@@ -926,7 +926,9 @@ impl Store {
                 let newer = event.created_at > old_created
                     || (event.created_at == old_created && id.as_slice() < old_id.as_slice());
                 if !newer {
-                    return Ok(PutOutcome::Duplicate);
+                    return Ok(PutOutcome::Duplicate(
+                        "duplicate: event already stored".into(),
+                    ));
                 }
                 self.remove_event(wtxn, &old_id)?;
             }
@@ -941,7 +943,9 @@ impl Store {
             }
         } else {
             if self.events.get(wtxn, &id)?.is_some() {
-                return Ok(PutOutcome::Duplicate);
+                return Ok(PutOutcome::Duplicate(
+                    "duplicate: event already stored".into(),
+                ));
             }
             PutOutcome::Stored
         };

@@ -611,6 +611,10 @@ impl Relay {
                 self.stats.bump(&self.stats.events_rejected, 1);
                 return (PutOutcome::Invalid(reason), None);
             }
+            crate::relay::validate::Precheck::Duplicate(msg) => {
+                self.stats.bump(&self.stats.events_duplicate, 1);
+                return (PutOutcome::Duplicate(msg), None);
+            }
             crate::relay::validate::Precheck::Vanish => {
                 // NIP-62: delete everything by this pubkey and never
                 // accept anything from it again.
@@ -619,7 +623,7 @@ impl Relay {
                 };
                 drop(cfg);
                 drop(access);
-                self.vanish_pubkey(pubkey).await;
+                self.vanish_pubkey(pubkey, event.created_at).await;
                 // A vanish request is accepted like any other event (the
                 // OK:true is sent): count it so the accepted/rejected
                 // accounting stays consistent with the OKs.
@@ -679,7 +683,7 @@ impl Relay {
                 self.after_put(event, now, nip9, nip43, nip29_enabled).await;
                 (outcome, None)
             }
-            PutOutcome::Duplicate => {
+            PutOutcome::Duplicate(_) => {
                 self.stats.bump(&self.stats.events_duplicate, 1);
                 (outcome, None)
             }
@@ -825,6 +829,11 @@ impl Relay {
                     results.push((String::new(), PutOutcome::Invalid(String::new())));
                     continue;
                 }
+                crate::relay::validate::Precheck::Duplicate(msg) => {
+                    self.stats.bump(&self.stats.events_duplicate, 1);
+                    results.push((id, PutOutcome::Duplicate(msg)));
+                    continue;
+                }
                 crate::relay::validate::Precheck::Accept => {}
             }
             put_slots.push(results.len());
@@ -962,9 +971,9 @@ impl Relay {
     /// NIP-62: deletes every event by `pubkey` and removes the pubkey from
     /// every NIP-29 group (its moderation events were deleted along with
     /// everything else).
-    async fn vanish_pubkey(&self, pubkey: [u8; 32]) {
+    async fn vanish_pubkey(&self, pubkey: [u8; 32], until_created: u64) {
         let pubkey_hex = hex::encode(pubkey);
-        let removed = self.db.apply_vanish(pubkey).await;
+        let removed = self.db.apply_vanish(pubkey, until_created).await;
         self.stats.bump(&self.stats.events_deleted, removed as u64);
         if self.config.read().await.nip_enabled(29) {
             let mut groups = self.groups.write().await;
@@ -1076,6 +1085,17 @@ impl PendingBatch {
                     PutOutcome::Invalid("error: database overloaded".into()),
                 );
             }
+            // A batch that only carries vanish requests has no puts and
+            // therefore no receiver: the vanish acknowledgements must be
+            // resolved here all the same, or the placeholder replies
+            // (empty id, `invalid:`) would leak to the client.
+            for (slot, id, event) in vanishes {
+                if let Some(pubkey) = event.pubkey_bytes() {
+                    relay.vanish_pubkey(pubkey, event.created_at).await;
+                }
+                relay.stats.bump(&relay.stats.events_accepted, 1);
+                results[slot] = (id, PutOutcome::Stored);
+            }
             return results;
         };
         let mut outcomes = receiver.await.unwrap_or_default();
@@ -1111,7 +1131,7 @@ impl PendingBatch {
                     }
                     relay.after_put(event, now, nip9, nip43, nip29).await;
                 }
-                PutOutcome::Duplicate => {
+                PutOutcome::Duplicate(_) => {
                     relay.stats.bump(&relay.stats.events_duplicate, 1);
                 }
                 _ => {
@@ -1131,7 +1151,7 @@ impl PendingBatch {
 
         for (slot, id, event) in vanishes {
             if let Some(pubkey) = event.pubkey_bytes() {
-                relay.vanish_pubkey(pubkey).await;
+                relay.vanish_pubkey(pubkey, event.created_at).await;
             }
             // Same accounting as the single-event path: a vanish is
             // accepted (its OK:true is sent) and counts as accepted.
@@ -1235,6 +1255,38 @@ mod tests {
             1,
             "the previous allowlist must survive a failed reload"
         );
+    }
+
+    #[test]
+    fn batch_path_vanish_replies_ok_with_real_id() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_relay().await;
+            let now = crate::util::unix_now();
+            let secp = secp256k1::Secp256k1::new();
+            let keypair = secp256k1::Keypair::from_seckey_slice(&secp, &[3u8; 32]).unwrap();
+            let pubkey = secp256k1::XOnlyPublicKey::from_keypair(&keypair).0.to_string();
+            let mut ev = crate::event::Event {
+                id: String::new(),
+                pubkey: pubkey.clone(),
+                created_at: now,
+                kind: 62,
+                tags: vec![vec!["relay".into(), "ws://127.0.0.1:8080".into()]],
+                content: "vanish".into(),
+                sig: String::new(),
+            };
+            ev.id = crate::nips::nip01::compute_id(&ev);
+            let id = ev.id_bytes().unwrap();
+            ev.sig = secp.sign_schnorr_no_aux_rand(&id, &keypair).to_string();
+            let results = relay.accept_events_batch(vec![ev], &[]).await;
+            assert_eq!(results.len(), 1);
+            assert!(
+                matches!(&results[0], (rid, crate::db::PutOutcome::Stored) if rid == &results[0].0 && !rid.is_empty()),
+                "the vanish reply must carry the event's real id: {:?}",
+                results
+            );
+            relay.db.shutdown();
+        });
     }
 
     #[test]
