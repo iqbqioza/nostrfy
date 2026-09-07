@@ -339,6 +339,193 @@ mod tests {
         std::sync::Arc::new(relay)
     }
 
+    async fn call(
+        relay: &std::sync::Arc<crate::relay::Relay>,
+        method: &str,
+        path: &str,
+        token: bool,
+    ) -> Response {
+        let router = router(
+            relay.clone(),
+            tokio::sync::watch::channel(false).0,
+            crate::config::Config::default().rpc.max_admin_body_bytes,
+        );
+        let mut req = Request::builder().method(method).uri(path);
+        if token {
+            req = req.header(axum::http::header::AUTHORIZATION, "Bearer test-token");
+        }
+        router
+            .oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn legacy_endpoints_and_error_paths() {
+        let relay = build_mgmt_relay().await;
+        // Unauthenticated requests are refused.
+        let resp = call(&relay, "GET", "/admin/info", false).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let resp = call(&relay, "GET", "/admin/stats", false).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        // A wrong token falls through to the NIP-98 check and fails.
+        let resp = call(&relay, "GET", "/admin/info", true).await;
+        assert_eq!(resp.status(), StatusCode::OK, "info with the bearer token");
+
+        // A relay without a token configured reports the API as disabled.
+        let keyless = build_mgmt_relay().await;
+        keyless.config.write().await.rpc.management_token.clear();
+        let resp = call(&keyless, "GET", "/admin/info", false).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // block_pubkey: an unparsable body is refused by the extractor.
+        let resp = call(&relay, "POST", "/admin/block_pubkey", true).await;
+        assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        let router = super::router(
+            relay.clone(),
+            tokio::sync::watch::channel(false).0,
+            crate::config::Config::default().rpc.max_admin_body_bytes,
+        );
+        let bad = router
+            .clone()
+            .oneshot(
+                Request::post("/admin/block_pubkey")
+                    .header(axum::http::header::AUTHORIZATION, "Bearer test-token")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(format!(r#"{{"pubkey":"{}"}}"#, "zz")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+        let ok = router
+            .clone()
+            .oneshot(
+                Request::post("/admin/block_pubkey")
+                    .header(axum::http::header::AUTHORIZATION, "Bearer test-token")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(format!(r#"{{"pubkey":"{}"}}"#, "aa".repeat(32))))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+        let again = router
+            .clone()
+            .oneshot(
+                Request::post("/admin/block_pubkey")
+                    .header(axum::http::header::AUTHORIZATION, "Bearer test-token")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(format!(r#"{{"pubkey":"{}"}}"#, "aa".repeat(32))))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(again.status(), StatusCode::OK, "re-blocking is idempotent");
+
+        // allow_pubkey unblocks.
+        let ok = router
+            .clone()
+            .oneshot(
+                Request::post("/admin/allow_pubkey")
+                    .header(axum::http::header::AUTHORIZATION, "Bearer test-token")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(format!(r#"{{"pubkey":"{}"}}"#, "aa".repeat(32))))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+        assert!(relay.access.read().await.blocked_pubkeys.is_empty());
+
+        // block_kind / allow_kind.
+        let ok = router
+            .clone()
+            .oneshot(
+                Request::post("/admin/block_kind")
+                    .header(axum::http::header::AUTHORIZATION, "Bearer test-token")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"kind": 7}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+        let ok = router
+            .clone()
+            .oneshot(
+                Request::post("/admin/allow_kind")
+                    .header(axum::http::header::AUTHORIZATION, "Bearer test-token")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"kind": 7}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+        assert!(relay.access.read().await.blocked_kinds.is_empty());
+
+        // event_status: missing then present.
+        let resp = call(
+            &relay,
+            "GET",
+            &format!("/admin/status/{}", "ab".repeat(32)),
+            true,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap()["found"],
+            false
+        );
+        let mut ev = crate::event::Event {
+            id: String::new(),
+            pubkey: "aa".repeat(32),
+            created_at: crate::util::unix_now(),
+            kind: 1,
+            tags: vec![],
+            content: "hi".into(),
+            sig: String::new(),
+        };
+        ev.id = crate::nips::nip01::compute_id(&ev);
+        relay.db.put(ev.clone(), crate::util::unix_now()).await;
+        let resp = call(
+            &relay,
+            "GET",
+            format!("/admin/status/{}", ev.id).as_str(),
+            true,
+        )
+        .await;
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap()["found"],
+            true
+        );
+
+        // shutdown answers OK and flips the watch.
+        let (tx, mut rx) = tokio::sync::watch::channel(false);
+        let router = super::router(
+            relay.clone(),
+            tx,
+            crate::config::Config::default().rpc.max_admin_body_bytes,
+        );
+        let resp = router
+            .oneshot(
+                Request::post("/admin/shutdown")
+                    .header(axum::http::header::AUTHORIZATION, "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(*rx.borrow_and_update(), "the shutdown watch must flip");
+
+        relay.db.shutdown();
+        keyless.db.shutdown();
+    }
+
     #[tokio::test]
     async fn body_over_admin_limit_is_413() {
         let relay = build_mgmt_relay().await;
