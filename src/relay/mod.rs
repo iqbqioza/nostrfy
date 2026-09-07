@@ -1213,6 +1213,139 @@ mod tests {
         std::sync::Arc::new(relay)
     }
 
+    /// Builds a relay with NIP-43 enabled and an optional relay key.
+    async fn build_role_relay(key: Option<&str>) -> std::sync::Arc<Relay> {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir()
+            .join("nostrfy-role-test")
+            .join(format!("{:x}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        let mut cfg = crate::config::Config::default();
+        cfg.database.path = path;
+        cfg.database.map_size = 16 * 1024 * 1024;
+        cfg.database.max_map_size = 256 * 1024 * 1024;
+        if let Some(key) = key {
+            cfg.relay.enabled_nips = vec![43];
+            cfg.relay.private_key = key.to_string();
+        }
+        let db = crate::db::DbClient::open(
+            &cfg.database,
+            true,
+            std::sync::Arc::new(Default::default()),
+            0,
+            128,
+            4096,
+            262144,
+        )
+        .unwrap();
+        let config = std::sync::Arc::new(tokio::sync::RwLock::new(cfg));
+        let stats = crate::stats::Stats::new();
+        let relay = Relay::new(
+            config,
+            db,
+            stats,
+            key.unwrap_or(""),
+            crate::relay::LiveBusConfig {
+                buffer: 1024,
+                batch_interval_ms: 10,
+                batch_size: 64,
+            },
+        )
+        .await;
+        std::sync::Arc::new(relay)
+    }
+
+    #[tokio::test]
+    async fn role_admin_lifecycle() {
+        let key = "01".repeat(32);
+        let relay = build_role_relay(Some(&key)).await;
+        let member = "aa".repeat(32);
+
+        // Without NIP-43 / a relay key every operation reports false.
+        let keyless = build_role_relay(None).await;
+        assert!(!keyless.create_role("r1", "R", "", "", None).await);
+        assert!(!keyless.assign_role(&member, "r1").await);
+        assert!(!keyless.delete_role("r1").await);
+        assert!(
+            !keyless
+                .publish_membership(Some((true, member.clone())))
+                .await
+        );
+
+        // create -> edit -> assign -> unassign -> delete.
+        assert!(
+            relay
+                .create_role("r1", "Role 1", "desc", "red", Some(1))
+                .await
+        );
+        assert!(relay.roles.read().await.roles.contains_key("r1"));
+        // The role event (kind 33534) landed in the database.
+        let f: crate::filter::Filter =
+            serde_json::from_value(serde_json::json!({"kinds": [33534]})).unwrap();
+        let (stored, _) = relay.db.query(vec![f], 10, crate::util::unix_now()).await;
+        assert_eq!(stored.len(), 1, "the role definition must be stored");
+
+        // edit on a missing id fails; on an existing id succeeds.
+        assert!(!relay.edit_role("nope", "R", "", "", None).await);
+        assert!(
+            relay
+                .edit_role("r1", "Role 1b", "desc2", "blue", None)
+                .await
+        );
+
+        // assign to an unknown role fails; to a known role succeeds and
+        // publishes the membership (kind 39002 for this relay... the
+        // membership event kind is derived from the relay's own key).
+        assert!(!relay.assign_role(&member, "nope").await);
+        assert!(relay.assign_role(&member, "r1").await);
+        assert!(relay.roles.read().await.is_member_of(&member));
+
+        // unassign a non-assignment fails; the real one succeeds.
+        assert!(!relay.unassign_role(&member, "nope").await);
+        assert!(relay.unassign_role(&member, "r1").await);
+        assert!(!relay.roles.read().await.is_member_of(&member));
+
+        // delete a missing role fails; the real one succeeds and stores a
+        // tombstone (kind 33534 with a `deleted` tag).
+        assert!(!relay.delete_role("nope").await);
+        assert!(relay.delete_role("r1").await);
+        assert!(!relay.roles.read().await.roles.contains_key("r1"));
+
+        // A leave request from a member removes and republishes; a
+        // non-member is a no-op.
+        assert!(relay.create_role("r1", "Role 1", "desc", "red", None).await);
+        assert!(relay.assign_role(&member, "r1").await);
+        let mut leave = crate::event::Event {
+            id: String::new(),
+            pubkey: member.clone(),
+            created_at: crate::util::unix_now(),
+            kind: 28936,
+            tags: vec![],
+            content: String::new(),
+            sig: String::new(),
+        };
+        leave.id = crate::nips::nip01::compute_id(&leave);
+        relay.apply_leave_request(&leave).await;
+        assert!(!relay.roles.read().await.is_member_of(&member));
+        let other = "bb".repeat(32);
+        let mut leave = crate::event::Event {
+            id: String::new(),
+            pubkey: other.clone(),
+            created_at: crate::util::unix_now(),
+            kind: 28936,
+            tags: vec![],
+            content: String::new(),
+            sig: String::new(),
+        };
+        leave.id = crate::nips::nip01::compute_id(&leave);
+        relay.apply_leave_request(&leave).await;
+        assert!(!relay.roles.read().await.is_member_of(&other));
+
+        relay.db.shutdown();
+        keyless.db.shutdown();
+    }
+
     #[tokio::test]
     async fn reload_db_state_applies_persisted_lists() {
         let relay = build_relay().await;

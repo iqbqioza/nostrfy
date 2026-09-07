@@ -2870,6 +2870,325 @@ mod tests {
     }
 
     #[test]
+    fn neg_open_error_paths() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+
+            // NIP-77 disabled: a notice, not a NEG-ERR.
+            {
+                let mut w = conn.relay.config.write().await;
+                w.relay.disabled_nips.push(77);
+            }
+            conn.handle_neg_open(&[json!("s"), json!({}), json!("61000000")])
+                .await;
+            assert!(
+                outgoing_json(&conn)
+                    .iter()
+                    .any(|m| m[0] == "NOTICE" && m[1].as_str().unwrap().contains("not enabled")),
+                "a disabled NIP-77 must yield a NOTICE"
+            );
+            conn.outgoing.clear();
+            {
+                let mut w = conn.relay.config.write().await;
+                w.relay.disabled_nips.retain(|n| *n != 77);
+            }
+
+            // Malformed NEG-OPEN frames.
+            conn.handle_neg_open(&[json!("s"), json!({})]).await;
+            assert!(
+                outgoing_json(&conn)
+                    .iter()
+                    .any(|m| m[0] == "NOTICE" && m[1].as_str().unwrap().contains("NEG-OPEN")),
+                "a short NEG-OPEN must yield a NOTICE"
+            );
+            conn.outgoing.clear();
+            conn.handle_neg_open(&[json!(""), json!({}), json!("61000000")])
+                .await;
+            assert!(
+                outgoing_json(&conn)
+                    .iter()
+                    .any(|m| m[0] == "NOTICE" && m[1].as_str().unwrap().contains("non-empty")),
+                "an empty sub id must yield a NOTICE"
+            );
+            conn.outgoing.clear();
+            let max_sub = conn.relay.config.read().await.limits.max_sub_id_len;
+            conn.handle_neg_open(&[json!("x".repeat(max_sub + 1)), json!({}), json!("61000000")])
+                .await;
+            assert!(
+                outgoing_json(&conn)
+                    .iter()
+                    .any(|m| m[0] == "NEG-ERR" && m[2].as_str().unwrap().contains("too long")),
+                "an over-long sub id must yield a NEG-ERR"
+            );
+            conn.outgoing.clear();
+            conn.handle_neg_open(&[json!("s"), json!({"inbox": 42}), json!("61000000")])
+                .await;
+            assert!(
+                outgoing_json(&conn)
+                    .iter()
+                    .any(|m| m[0] == "NEG-ERR" && m[2].as_str().unwrap().contains("filter")),
+                "an invalid inbox/outbox filter must yield a NEG-ERR"
+            );
+            conn.outgoing.clear();
+            conn.handle_neg_open(&[json!("s"), json!("not-a-filter"), json!("61000000")])
+                .await;
+            assert!(
+                outgoing_json(&conn)
+                    .iter()
+                    .any(|m| m[0] == "NEG-ERR" && m[2].as_str().unwrap().contains("filter")),
+                "a non-filter JSON must yield a NEG-ERR"
+            );
+            conn.outgoing.clear();
+            conn.handle_neg_open(&[
+                json!("s"),
+                json!({"ids": vec![json!("a".repeat(64)); 513]}),
+                json!("61000000"),
+            ])
+            .await;
+            assert!(
+                outgoing_json(&conn)
+                    .iter()
+                    .any(|m| m[0] == "NEG-ERR" && m[2].as_str().unwrap().contains("too many")),
+                "a filter over the member cap must yield a NEG-ERR"
+            );
+            conn.outgoing.clear();
+            conn.handle_neg_open(&[json!("s"), json!({"#t": 42}), json!("61000000")])
+                .await;
+            assert!(
+                outgoing_json(&conn)
+                    .iter()
+                    .any(|m| m[0] == "NEG-ERR" && m[2].as_str().unwrap().contains("strings")),
+                "a filter with non-string tag values must yield a NEG-ERR"
+            );
+            conn.outgoing.clear();
+            conn.handle_neg_open(&[json!("s"), json!({}), json!(42)])
+                .await;
+            assert!(
+                outgoing_json(&conn)
+                    .iter()
+                    .any(|m| m[0] == "NEG-ERR" && m[2].as_str().unwrap().contains("hex")),
+                "a non-string initial message must yield a NEG-ERR"
+            );
+            conn.outgoing.clear();
+            conn.handle_neg_open(&[json!("s"), json!({}), json!("zzz")])
+                .await;
+            assert!(
+                outgoing_json(&conn)
+                    .iter()
+                    .any(|m| m[0] == "NEG-ERR" && m[2].as_str().unwrap().contains("hex")),
+                "a non-hex initial message must yield a NEG-ERR"
+            );
+            conn.outgoing.clear();
+
+            // AUTH-required relay: an unauthenticated NEG-OPEN is refused.
+            {
+                let mut w = conn.relay.config.write().await;
+                w.relay.require_auth = true;
+            }
+            conn.handle_neg_open(&[json!("s"), json!({}), json!("61000000")])
+                .await;
+            assert!(
+                outgoing_json(&conn)
+                    .iter()
+                    .any(|m| m[0] == "NEG-ERR" && m[2].as_str().unwrap().contains("auth-required")),
+                "an unauthenticated NEG-OPEN on an auth-requiring relay must be refused"
+            );
+            conn.outgoing.clear();
+            {
+                let mut w = conn.relay.config.write().await;
+                w.relay.require_auth = false;
+            }
+
+            // A blocked (authed) pubkey is refused syncing.
+            let blocked = "bb".repeat(32);
+            conn.authed_pubkeys.push(blocked.clone());
+            conn.relay
+                .access
+                .write()
+                .await
+                .blocked_pubkeys
+                .push((blocked, String::new()));
+            conn.handle_neg_open(&[json!("s"), json!({}), json!("61000000")])
+                .await;
+            assert!(
+                outgoing_json(&conn)
+                    .iter()
+                    .any(|m| m[0] == "NEG-ERR" && m[2].as_str().unwrap().contains("restricted")),
+                "a blocked pubkey must be refused syncing"
+            );
+            conn.outgoing.clear();
+            conn.authed_pubkeys.clear();
+            conn.relay.access.write().await.blocked_pubkeys.clear();
+
+            // The subscription cap applies to new ids only.
+            {
+                let mut w = conn.relay.config.write().await;
+                w.limits.max_subscriptions = 1;
+            }
+            conn.handle_neg_open(&[json!("s1"), json!({}), json!("61000000")])
+                .await;
+            conn.outgoing.clear();
+            conn.handle_neg_open(&[json!("s2"), json!({}), json!("61000000")])
+                .await;
+            assert!(
+                outgoing_json(&conn)
+                    .iter()
+                    .any(|m| m[0] == "NEG-ERR" && m[2].as_str().unwrap().contains("too many")),
+                "a new NEG-OPEN over the subscription cap must be refused"
+            );
+            conn.outgoing.clear();
+            {
+                let mut w = conn.relay.config.write().await;
+                w.limits.max_subscriptions = 100;
+            }
+
+            // A timed-out query (the reader is gone) closes with NEG-ERR.
+            conn.relay.db.shutdown();
+            conn.handle_neg_open(&[json!("s"), json!({}), json!("61000000")])
+                .await;
+            assert!(
+                outgoing_json(&conn)
+                    .iter()
+                    .any(|m| m[0] == "NEG-ERR" && m[2].as_str().unwrap().contains("timeout")),
+                "a timed-out sync must close with NEG-ERR"
+            );
+        });
+    }
+
+    #[test]
+    fn neg_open_query_size_and_item_filters() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let now = unix_now();
+            for i in 0..5 {
+                let e = signed_note(conn.relay.secp(), &format!("e{i}"), now - i, vec![]);
+                let out = conn.relay.db.put(e.clone(), now).await;
+                assert_eq!(out, crate::db::PutOutcome::Stored, "event {i} stored");
+            }
+            let f: crate::filter::Filter =
+                serde_json::from_value(serde_json::json!({"kinds": [1]})).unwrap();
+            let (stored, _) = conn.relay.db.query(vec![f.clone()], 10, now).await;
+            assert_eq!(stored.len(), 5, "all five events are queryable");
+
+            // The per-connection item cap is enforced across concurrent
+            // subscriptions (cap = max_neg_items * 2).
+            {
+                let mut w = conn.relay.config.write().await;
+                w.limits.max_neg_items = 3;
+            }
+            conn.handle_neg_open(&[json!("a"), json!({"kinds": [1]}), json!("61000000")])
+                .await;
+            conn.outgoing.clear();
+            conn.handle_neg_open(&[json!("b"), json!({"kinds": [1]}), json!("61000000")])
+                .await;
+            conn.outgoing.clear();
+            conn.handle_neg_open(&[json!("c"), json!({"kinds": [1]}), json!("61000000")])
+                .await;
+            assert!(
+                outgoing_json(&conn)
+                    .iter()
+                    .any(|m| m[0] == "NEG-ERR" && m[2].as_str().unwrap().contains("too many")),
+                "the total item cap must close the third subscription"
+            );
+            conn.outgoing.clear();
+            conn.handle_neg_close(&[json!("a")]);
+            conn.handle_neg_close(&[json!("b")]);
+            conn.handle_neg_close(&[json!("c")]);
+
+            // Protected events are withheld from anonymous peers.
+            let mut protected = signed_note(conn.relay.secp(), "secret", now, vec![]);
+            protected.tags = vec![vec!["-".into()]];
+            protected.id = crate::nips::nip01::compute_id(&protected);
+            conn.relay.db.put(protected, now).await;
+            conn.handle_neg_open(&[json!("s"), json!({"kinds": [1]}), json!("61000000")])
+                .await;
+            assert!(
+                outgoing_json(&conn).iter().any(|m| m[0] == "NEG-MSG"),
+                "an anonymous NEG-OPEN over protected events still succeeds"
+            );
+            conn.outgoing.clear();
+
+            // A NEG-MSG for an unknown subscription closes with NEG-ERR.
+            conn.handle_neg_msg(&[json!("ghost"), json!("61000000")])
+                .await;
+            assert!(
+                outgoing_json(&conn)
+                    .iter()
+                    .any(|m| m[0] == "NEG-ERR" && m[2].as_str().unwrap().contains("unknown")),
+                "a NEG-MSG for an unknown sub must close with NEG-ERR"
+            );
+            conn.outgoing.clear();
+            // Malformed NEG-MSG frames.
+            conn.handle_neg_msg(&[json!("s")]).await;
+            assert!(
+                outgoing_json(&conn).iter().any(|m| m[0] == "NOTICE"),
+                "a short NEG-MSG must yield a NOTICE: {:?}",
+                outgoing_json(&conn)
+            );
+            conn.outgoing.clear();
+            conn.handle_neg_msg(&[json!(true), json!("61000000")]).await;
+            assert!(
+                outgoing_json(&conn).iter().any(|m| m[0] == "NOTICE"),
+                "a non-string sub id must yield a NOTICE: {:?}",
+                outgoing_json(&conn)
+            );
+            conn.outgoing.clear();
+            conn.handle_neg_msg(&[json!("s"), json!(42)]).await;
+            assert!(outgoing_json(&conn).iter().any(|m| m[0] == "NOTICE"));
+            conn.outgoing.clear();
+            conn.handle_neg_msg(&[json!("s"), json!("zzz")]).await;
+            assert!(outgoing_json(&conn).iter().any(|m| m[0] == "NOTICE"));
+            conn.outgoing.clear();
+
+            // Exhausting the round budget closes the subscription.
+            conn.handle_neg_open(&[json!("r"), json!({}), json!("61000000")])
+                .await;
+            conn.outgoing.clear();
+            if let Some(state) = conn.neg.get_mut("r") {
+                state.rounds_left = 0;
+            }
+            conn.handle_neg_msg(&[json!("r"), json!("61000000")]).await;
+            assert!(
+                outgoing_json(&conn)
+                    .iter()
+                    .any(|m| m[0] == "NEG-ERR" && m[2].as_str().unwrap().contains("too many")),
+                "an exhausted round budget must close the subscription"
+            );
+            assert!(!conn.neg.contains_key("r"), "the sub must be released");
+            conn.outgoing.clear();
+
+            // A NEG-MSG whose response exceeds the byte budget closes the
+            // subscription and releases its items.
+            conn.handle_neg_open(&[json!("b"), json!({"kinds": [1]}), json!("61000000")])
+                .await;
+            conn.outgoing.clear();
+            conn.req_response_bytes = 10;
+            // A fingerprint range with a bogus fingerprint forces the relay
+            // to answer with the full id list (a large response).
+            let ask_all = format!("61000001{}", "00".repeat(16));
+            conn.handle_neg_msg(&[json!("b"), json!(ask_all)]).await;
+            assert!(
+                outgoing_json(&conn)
+                    .iter()
+                    .any(|m| m[0] == "NEG-ERR" && m[2].as_str().unwrap().contains("too large")),
+                "an over-budget NEG-MSG response must close the subscription: {:?}",
+                outgoing_json(&conn)
+            );
+            assert!(!conn.neg.contains_key("b"), "the sub must be released");
+            conn.outgoing.clear();
+
+            // NEG-CLOSE with a missing id yields a NOTICE.
+            conn.handle_neg_close(&[]);
+            assert!(outgoing_json(&conn).iter().any(|m| m[0] == "NOTICE"));
+            conn.outgoing.clear();
+
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
     fn neg_open_counts_towards_active_subscriptions() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
