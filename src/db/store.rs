@@ -57,10 +57,17 @@ pub(crate) fn decode_meta(raw: &[u8]) -> Option<(u64, u64, [u8; 32], u64)> {
     if raw.len() < META_LEN {
         return None;
     }
-    let kind = u64::from_be_bytes(raw[0..8].try_into().ok()?);
-    let created = u64::from_be_bytes(raw[8..16].try_into().ok()?);
-    let pubkey = raw[16..48].try_into().ok()?;
-    let expiry = u64::from_be_bytes(raw[48..56].try_into().ok()?);
+    // The length guard above guarantees every slice below is in bounds, so
+    // the extraction cannot fail (no unreachable fallback branches).
+    let mut b = [0u8; 8];
+    b.copy_from_slice(&raw[0..8]);
+    let kind = u64::from_be_bytes(b);
+    b.copy_from_slice(&raw[8..16]);
+    let created = u64::from_be_bytes(b);
+    let mut pubkey = [0u8; 32];
+    pubkey.copy_from_slice(&raw[16..48]);
+    b.copy_from_slice(&raw[48..56]);
+    let expiry = u64::from_be_bytes(b);
     Some((kind, created, pubkey, expiry))
 }
 
@@ -1053,11 +1060,17 @@ impl Store {
         }
         for tag in &event.tags {
             if indexable_tag(tag) {
-                let key = tag_key(tag[0].as_bytes()[0], tag[1].as_bytes(), created, id);
-                // Skip rather than error: an over-long key would abort the
-                // whole write batch (see MAX_INDEX_KEY).
-                if key.len() <= MAX_INDEX_KEY {
-                    self.by_tag.put(wtxn, &key, b"")?;
+                // Index every value of a single-letter tag: NIP-01 says the
+                // "at least one item in common" match applies to all tag
+                // values, so a stored query for the second value must find
+                // the event exactly like the live path does.
+                for value in &tag[1..] {
+                    let key = tag_key(tag[0].as_bytes()[0], value.as_bytes(), created, id);
+                    // Skip rather than error: an over-long key would abort
+                    // the whole write batch (see MAX_INDEX_KEY).
+                    if key.len() <= MAX_INDEX_KEY {
+                        self.by_tag.put(wtxn, &key, b"")?;
+                    }
                 }
             }
         }
@@ -1130,15 +1143,12 @@ impl Store {
         }
         for tag in &event.tags {
             if indexable_tag(tag) {
-                self.by_tag.delete(
-                    wtxn,
-                    &tag_key(
-                        tag[0].as_bytes()[0],
-                        tag[1].as_bytes(),
-                        event.created_at,
-                        id,
-                    ),
-                )?;
+                for value in &tag[1..] {
+                    self.by_tag.delete(
+                        wtxn,
+                        &tag_key(tag[0].as_bytes()[0], value.as_bytes(), event.created_at, id),
+                    )?;
+                }
             }
         }
         // The expiry entry is deleted regardless of the NIP-40 toggle: a

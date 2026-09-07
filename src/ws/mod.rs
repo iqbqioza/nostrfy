@@ -1223,6 +1223,51 @@ mod tests {
     }
 
     #[test]
+    fn req_timeout_closes_and_releases_the_subscription() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let now = unix_now();
+            let e1 = signed_note(conn.relay.secp(), "hello", now, vec![]);
+            conn.relay.db.put(e1.clone(), now).await;
+            // Killing the DB reader makes the REQ query fail deterministically
+            // (`query_req_reported` returns None), exactly like a timed-out
+            // scan: the CLOSED path must release the subscription it had
+            // registered before the query, or the dead sub keeps receiving
+            // live events under a closed id.
+            conn.relay.db.shutdown();
+            conn.handle_req(&[json!("sub"), json!({"kinds": [1]})])
+                .await;
+            conn.pump_pending_reqs();
+            let msgs = outgoing_json(&conn);
+            assert!(
+                msgs.iter().any(|m| m[0] == "CLOSED"
+                    && m[1] == "sub"
+                    && m[2] == "error: database timeout, please retry"),
+                "a timed-out REQ must be closed with a retryable reason"
+            );
+            assert!(
+                !conn.subs.contains_key("sub"),
+                "the subscription must be released on a timed-out query"
+            );
+            assert!(
+                !msgs.iter().any(|m| m[0] == "EVENT" && m[1] == "sub"),
+                "no events may be delivered for the closed subscription"
+            );
+            // A live event published afterwards must not reach the closed
+            // sub (deliver_live reads `self.subs`).
+            let e2 = signed_note(conn.relay.secp(), "late", now + 1, vec![]);
+            conn.deliver_live(&e2, &serde_json::to_string(&e2).unwrap_or_default(), None);
+            assert!(
+                !outgoing_json(&conn)
+                    .iter()
+                    .any(|m| m[0] == "EVENT" && m[1] == "sub"),
+                "live delivery must stop for the released subscription"
+            );
+        });
+    }
+
+    #[test]
     fn req_hides_protected_events_from_anonymous() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {

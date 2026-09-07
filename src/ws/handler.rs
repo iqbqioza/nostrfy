@@ -438,8 +438,12 @@ impl super::Conn {
         else {
             // A timed-out query must not be presented as an empty
             // timeline: close the subscription with a clear reason so the
-            // client can retry.
-            self.send_closed(sub_id, "error: database timeout, please retry");
+            // client can retry. The subscription (which was registered
+            // before the query) must be released too — a CLOSED sub must
+            // not keep receiving live events.
+            let sub_id = sub_id.to_string();
+            self.remove_subscription(&sub_id);
+            self.send_closed(&sub_id, "error: database timeout, please retry");
             return;
         };
         let mut to_send = Vec::new();

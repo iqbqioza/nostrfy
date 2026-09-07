@@ -147,6 +147,33 @@ mod tests {
     }
 
     #[test]
+    fn nak_generated_event_id_and_signature_verify() {
+        // Cross-implementation check against fiatjaf's `nak` (v0.20.6):
+        // an event built and signed by nak must have its id recomputed to
+        // the identical value by nostrfy's canonical serializer and its
+        // signature must verify (independent-ecosystem agreement).
+        let ev = Event {
+            id: "989a6847782177472741aafc77bef7b888c19157484488bbffe0bf558d1c8002".into(),
+            pubkey: "5fab88cf2058ada0f460f9b07623f62be4ad378ea95bcf3823ddabc81f580cf0".into(),
+            created_at: 1788752313,
+            kind: 1,
+            tags: vec![],
+            content: "nak cross-check: hello world".into(),
+            sig: "e5d00726edaec764b220b6bf5f2e2b19b0cf12925c89263b66d4e8308a3cb213fe71a57f0f3d97d59b5320e83dd389ab0639e68d2a5acbac3d0b4b49d0407f63".into(),
+        };
+        assert_eq!(
+            compute_id(&ev),
+            ev.id,
+            "nostrfy's canonical id must match nak's"
+        );
+        let secp = Secp256k1::new();
+        assert!(
+            verify(&ev, &secp).is_ok(),
+            "an event signed by nak must verify"
+        );
+    }
+
+    #[test]
     fn signature_verification_roundtrip() {
         let secp = Secp256k1::new();
         let keypair = Keypair::from_seckey_slice(&secp, &[7u8; 32]).unwrap();
