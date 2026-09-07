@@ -124,3 +124,68 @@ pub(crate) fn parse_message(data: &[u8]) -> Result<Vec<Range>, String> {
     }
     Ok(ranges)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn varint(mut v: u64) -> Vec<u8> {
+        // Big-endian groups (the codec's read_varint is `value * 128 + group`).
+        let mut groups = vec![(v & 0x7f) as u8];
+        v >>= 7;
+        while v != 0 {
+            groups.push((v & 0x7f) as u8);
+            v >>= 7;
+        }
+        groups.reverse();
+        let n = groups.len();
+        groups
+            .iter()
+            .enumerate()
+            .map(|(i, g)| if i < n - 1 { g | 0x80 } else { *g })
+            .collect()
+    }
+
+    #[test]
+    fn parse_message_error_paths() {
+        // Empty and wrong-version messages are refused up front.
+        assert_eq!(parse_message(&[]).unwrap_err(), "empty message");
+        assert_eq!(
+            parse_message(&[0x62]).unwrap_err(),
+            "unsupported protocol version"
+        );
+        // A bound prefix longer than 32 bytes is refused.
+        let mut msg = vec![PROTOCOL_VERSION];
+        msg.extend(varint(1)); // ts delta
+        msg.extend(varint(33)); // prefix length > 32
+        assert_eq!(parse_message(&msg).unwrap_err(), "bound prefix too long");
+        // An id list longer than the cap is refused.
+        let mut msg = vec![PROTOCOL_VERSION];
+        msg.extend(varint(0)); // ts delta = infinity
+        msg.extend(varint(0)); // empty prefix
+        msg.extend(varint(2)); // mode = id list
+        msg.extend(varint(10_000_001));
+        assert_eq!(parse_message(&msg).unwrap_err(), "id list too long");
+        // A truncated id list is refused.
+        let mut msg = vec![PROTOCOL_VERSION];
+        msg.extend(varint(0));
+        msg.extend(varint(0));
+        msg.extend(varint(2));
+        msg.extend(varint(2)); // two ids claimed...
+        msg.extend(vec![0u8; 10]); // ...but only 10 bytes present
+        assert_eq!(parse_message(&msg).unwrap_err(), "truncated id list");
+        // A truncated fingerprint is refused.
+        let mut msg = vec![PROTOCOL_VERSION];
+        msg.extend(varint(0));
+        msg.extend(varint(0));
+        msg.extend(varint(1)); // mode = fingerprint
+        msg.extend(vec![0u8; 4]); // only 4 of 16 bytes
+        assert_eq!(parse_message(&msg).unwrap_err(), "truncated fingerprint");
+        // An unknown mode is refused.
+        let mut msg = vec![PROTOCOL_VERSION];
+        msg.extend(varint(0));
+        msg.extend(varint(0));
+        msg.extend(varint(5));
+        assert_eq!(parse_message(&msg).unwrap_err(), "unknown mode 5");
+    }
+}

@@ -1277,6 +1277,415 @@ mod tests {
     }
 
     #[test]
+    fn validate_base_remaining_rejections() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_validate_relay("nostrfy-validate-rest-test").await;
+            let cfg = relay.config.read().await;
+            let access = AccessControl::default();
+            let now = unix_now();
+
+            // Kind out of range.
+            let out = relay
+                .precheck(&cfg, &access, &signed(65_536, vec![]), now, &[], None, None)
+                .await;
+            assert!(matches!(out, super::Precheck::Reject(m) if m.contains("kind out of range")));
+            // An empty tag array.
+            let mut ev = signed(1, vec![]);
+            ev.tags = vec![vec![]];
+            let out = relay
+                .precheck(&cfg, &access, &ev, now, &[], None, None)
+                .await;
+            assert!(matches!(out, super::Precheck::Reject(m) if m.contains("empty tag")));
+            // Oversized content / tags / tag values.
+            let mut cfg2 = (*cfg).clone();
+            cfg2.limits.max_content_bytes = 10;
+            cfg2.limits.max_tags = 3;
+            cfg2.limits.max_tag_value_bytes = 100;
+            let relay2 = {
+                let db = relay.db.clone();
+                let config = Arc::new(RwLock::new(cfg2));
+                Arc::new(
+                    super::super::Relay::new(
+                        config,
+                        db,
+                        crate::stats::Stats::new(),
+                        "",
+                        crate::relay::LiveBusConfig {
+                            buffer: 1024,
+                            batch_interval_ms: 10,
+                            batch_size: 64,
+                        },
+                    )
+                    .await,
+                )
+            };
+            let cfg2r = relay2.config.read().await;
+            let access2 = AccessControl::default();
+            let big = signed(1, vec![]);
+            let mut ev = big.clone();
+            ev.content = "x".repeat(11);
+            let out = relay2
+                .precheck(&cfg2r, &access2, &ev, now, &[], None, None)
+                .await;
+            assert!(matches!(out, super::Precheck::Reject(m) if m.contains("content too large")));
+            let mut ev = big.clone();
+            ev.tags = vec![vec!["t".into(), "1".into()]; 4];
+            let out = relay2
+                .precheck(&cfg2r, &access2, &ev, now, &[], None, None)
+                .await;
+            assert!(matches!(out, super::Precheck::Reject(m) if m.contains("too many tags")));
+            let mut ev = big.clone();
+            ev.tags = vec![vec!["t".into(), "x".repeat(101)]];
+            let out = relay2
+                .precheck(&cfg2r, &access2, &ev, now, &[], None, None)
+                .await;
+            assert!(matches!(out, super::Precheck::Reject(m) if m.contains("tag value too large")));
+            drop(cfg2r);
+
+            // Secret key material in the content is dropped.
+            let nsec = crate::nips::nip19::bech32_encode("nsec", &[1u8; 32]).unwrap();
+            let mut ev = signed(1, vec![]);
+            ev.content = format!("key: {nsec}");
+            let out = relay
+                .precheck(&cfg, &access, &ev, now, &[], None, None)
+                .await;
+            assert!(matches!(out, super::Precheck::Reject(m) if m.contains("secret key")));
+
+            // A wrong signature is rejected.
+            let mut ev = signed(1, vec![]);
+            ev.sig = "00".repeat(64);
+            let out = relay
+                .precheck(&cfg, &access, &ev, now, &[], None, None)
+                .await;
+            assert!(matches!(out, super::Precheck::Reject(m) if m.contains("signature")));
+
+            // A bad delegation is rejected when NIP-26 is enabled.
+            let ev = signed(
+                1,
+                vec![vec![
+                    "delegation".into(),
+                    "zz".into(),
+                    "kind=1".into(),
+                    "sig".into(),
+                ]],
+            );
+            let out = relay
+                .precheck(&cfg, &access, &ev, now, &[], None, None)
+                .await;
+            assert!(matches!(out, super::Precheck::Reject(m) if m.contains("delegation")));
+
+            // Uppercase pubkey: without a verified verdict the signature
+            // fails first; with the verdict the pubkey check itself runs.
+            let mut ev = signed(1, vec![]);
+            ev.pubkey = ev.pubkey.to_ascii_uppercase();
+            let out = relay
+                .precheck(&cfg, &access, &ev, now, &[], None, None)
+                .await;
+            assert!(matches!(out, super::Precheck::Reject(m) if m.contains("signature")));
+            let out = relay
+                .precheck(&cfg, &access, &ev, now, &[], None, Some(true))
+                .await;
+            assert!(
+                matches!(out, super::Precheck::Reject(m) if m.contains("pubkey must be lowercase"))
+            );
+
+            // A kind blocked by the access control.
+            let mut access = AccessControl::default();
+            access.blocked_kinds.push(7);
+            let out = relay
+                .precheck(&cfg, &access, &signed(7, vec![]), now, &[], None, None)
+                .await;
+            assert!(matches!(out, super::Precheck::Reject(m) if m.contains("kind not allowed")));
+
+            drop(cfg);
+            relay.db.shutdown();
+            relay2.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn validate_base_group_nip43_pow_and_auth_gates() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_validate_relay("nostrfy-validate-gates-test").await;
+            let cfg = relay.config.read().await;
+            let access = AccessControl::default();
+            let now = unix_now();
+            let secp = Secp256k1::new();
+            let h = |kind: u64, tags: Vec<Vec<String>>| {
+                let keypair = Keypair::from_seckey_slice(&secp, &[5u8; 32]).unwrap();
+                let pubkey = XOnlyPublicKey::from_keypair(&keypair).0.to_string();
+                let mut e = Event {
+                    id: String::new(),
+                    pubkey,
+                    created_at: now,
+                    kind,
+                    tags,
+                    content: String::new(),
+                    sig: String::new(),
+                };
+                e.id = crate::nips::nip01::compute_id(&e);
+                let id = e.id_bytes().unwrap();
+                e.sig = secp.sign_schnorr_no_aux_rand(&id, &keypair).to_string();
+                e
+            };
+            let gh = |kind: u64, tags: Vec<Vec<String>>| {
+                let mut tags = tags;
+                tags.insert(0, vec!["h".to_string(), "g".into()]);
+                h(kind, tags)
+            };
+
+            // A group action without an h tag is rejected.
+            let join = h(
+                crate::nips::nip29::JOIN,
+                vec![vec!["code".into(), "x".into()]],
+            );
+            let out = relay
+                .precheck(&cfg, &access, &join, now, &[], None, None)
+                .await;
+            assert!(matches!(out, super::Precheck::Reject(m) if m.contains("h tag")));
+
+            // Group metadata not signed by the relay is rejected.
+            let meta = gh(39000, vec![vec!["d".into(), "g".into()]]);
+            let out = relay
+                .precheck(&cfg, &access, &meta, now, &[], None, None)
+                .await;
+            assert!(matches!(out, super::Precheck::Reject(m) if m.contains("relay")));
+
+            // NIP-43 metadata by a non-relay pubkey is rejected.
+            let role_def = h(crate::nips::nip43::ROLE_DEFINITION, vec![]);
+            let out = relay
+                .precheck(&cfg, &access, &role_def, now, &[], None, None)
+                .await;
+            assert!(matches!(out, super::Precheck::Reject(m) if m.contains("relay")));
+
+            // A NIP-43 leave request that is too old is rejected.
+            let secp2 = Secp256k1::new();
+            let mut leave = h(crate::nips::nip43::LEAVE, vec![vec!["-".into()]]);
+            leave.created_at = now - 1000;
+            leave.id = crate::nips::nip01::compute_id(&leave);
+            let kp = Keypair::from_seckey_slice(&secp2, &[5u8; 32]).unwrap();
+            let id = leave.id_bytes().unwrap();
+            leave.sig = secp2.sign_schnorr_no_aux_rand(&id, &kp).to_string();
+            let out = relay
+                .precheck(&cfg, &access, &leave, now, &[], None, None)
+                .await;
+            assert!(matches!(out, super::Precheck::Reject(m) if m.contains("too old")));
+
+            // A repost embedding a protected event is rejected.
+            let protected = Event {
+                id: String::new(),
+                pubkey: "aa".repeat(32),
+                created_at: now,
+                kind: 1,
+                tags: vec![vec!["-".into()]],
+                content: "secret".into(),
+                sig: String::new(),
+            };
+            let mut repost = h(6, vec![]);
+            repost.content = serde_json::to_string(&protected).unwrap();
+            repost.id = crate::nips::nip01::compute_id(&repost);
+            let kp = Keypair::from_seckey_slice(&secp, &[5u8; 32]).unwrap();
+            let id = repost.id_bytes().unwrap();
+            repost.sig = secp.sign_schnorr_no_aux_rand(&id, &kp).to_string();
+            let out = relay
+                .precheck(&cfg, &access, &repost, now, &[], None, None)
+                .await;
+            assert!(matches!(out, super::Precheck::Reject(m) if m.contains("repost")));
+
+            // require_auth without authentication.
+            let mut cfg2 = (*cfg).clone();
+            cfg2.relay.require_auth = true;
+            let relay2 = {
+                let db = relay.db.clone();
+                let config = Arc::new(RwLock::new(cfg2));
+                Arc::new(
+                    super::super::Relay::new(
+                        config,
+                        db,
+                        crate::stats::Stats::new(),
+                        "",
+                        crate::relay::LiveBusConfig {
+                            buffer: 1024,
+                            batch_interval_ms: 10,
+                            batch_size: 64,
+                        },
+                    )
+                    .await,
+                )
+            };
+            let cfg2r = relay2.config.read().await;
+            let access2 = AccessControl::default();
+            let out = relay2
+                .precheck(&cfg2r, &access2, &signed(1, vec![]), now, &[], None, None)
+                .await;
+            assert!(matches!(out, super::Precheck::Reject(m) if m.contains("auth-required")));
+            // NIP-78 AUTH-gated kind 78 without authentication.
+            let mut ev = signed(1, vec![]);
+            ev.kind = 78;
+            ev.id = crate::nips::nip01::compute_id(&ev);
+            let kp = Keypair::from_seckey_slice(&secp, &[3u8; 32]).unwrap();
+            let id = ev.id_bytes().unwrap();
+            ev.sig = secp.sign_schnorr_no_aux_rand(&id, &kp).to_string();
+            let out = relay2
+                .precheck(&cfg2r, &access2, &ev, now, &[], None, None)
+                .await;
+            assert!(matches!(out, super::Precheck::Reject(m) if m.contains("auth-required")));
+            drop(cfg2r);
+
+            // A PoW requirement rejects under-difficulty events.
+            let mut cfg3 = (*cfg).clone();
+            cfg3.relay.require_pow = 25;
+            let relay3 = {
+                let db = relay.db.clone();
+                let config = Arc::new(RwLock::new(cfg3));
+                Arc::new(
+                    super::super::Relay::new(
+                        config,
+                        db,
+                        crate::stats::Stats::new(),
+                        "",
+                        crate::relay::LiveBusConfig {
+                            buffer: 1024,
+                            batch_interval_ms: 10,
+                            batch_size: 64,
+                        },
+                    )
+                    .await,
+                )
+            };
+            let cfg3r = relay3.config.read().await;
+            let out = relay3
+                .precheck(&cfg3r, &access, &signed(1, vec![]), now, &[], None, None)
+                .await;
+            assert!(matches!(out, super::Precheck::Reject(m) if m.contains("pow")));
+            drop(cfg3r);
+
+            // The parallel signature verification path (16+ events).
+            let mut events = Vec::new();
+            for seed in 1..=20u8 {
+                events.push(signed_with_seed(seed, 1, vec![]));
+            }
+            let verdicts =
+                crate::relay::validate::verify_signatures_parallel(&events, relay.secp());
+            assert_eq!(verdicts.len(), 20);
+            assert!(verdicts.iter().all(|v| *v));
+            let mut bad = events.clone();
+            bad[3].sig = "00".repeat(64);
+            let verdicts = crate::relay::validate::verify_signatures_parallel(&bad, relay.secp());
+            assert!(!verdicts[3]);
+            assert!(verdicts[0]);
+
+            drop(cfg);
+            relay.db.shutdown();
+            relay2.db.shutdown();
+            relay3.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn validate_base_group_previous_and_late_publish() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_validate_relay("nostrfy-validate-previous-test").await;
+            let cfg = relay.config.read().await;
+            let access = AccessControl::default();
+            let now = unix_now();
+            let secp = Secp256k1::new();
+            let h = |kind: u64, tags: Vec<Vec<String>>| {
+                let keypair = Keypair::from_seckey_slice(&secp, &[6u8; 32]).unwrap();
+                let pubkey = XOnlyPublicKey::from_keypair(&keypair).0.to_string();
+                let mut e = Event {
+                    id: String::new(),
+                    pubkey,
+                    created_at: now,
+                    kind,
+                    tags,
+                    content: String::new(),
+                    sig: String::new(),
+                };
+                e.id = crate::nips::nip01::compute_id(&e);
+                let id = e.id_bytes().unwrap();
+                e.sig = secp.sign_schnorr_no_aux_rand(&id, &keypair).to_string();
+                e
+            };
+            let gh = |kind: u64, tags: Vec<Vec<String>>| {
+                let mut tags = tags;
+                tags.insert(0, vec!["h".to_string(), "g".into()]);
+                h(kind, tags)
+            };
+            // Create the group so a post to it reaches the previous-tag
+            // validation.
+            {
+                let mut groups = relay.groups.write().await;
+                let create = gh(crate::nips::nip29::CREATE_GROUP, vec![]);
+                groups.apply(&create, "relay", now, false, false);
+            }
+            // A malformed previous tag is rejected.
+            let ev = gh(1, vec![vec!["previous".into(), "zz".into()]]);
+            let out = relay
+                .precheck(&cfg, &access, &ev, now, &[], None, None)
+                .await;
+            assert!(matches!(out, super::Precheck::Reject(m) if m.contains("malformed previous")));
+            // An unknown previous reference is rejected.
+            let ev = gh(1, vec![vec!["previous".into(), "aa".repeat(32)]]);
+            let out = relay
+                .precheck(&cfg, &access, &ev, now, &[], None, None)
+                .await;
+            assert!(matches!(out, super::Precheck::Reject(m) if m.contains("unknown previous")));
+            // A known prefix (via the known-prefixes set) passes.
+            let ev = gh(1, vec![vec!["previous".into(), "ab".repeat(32)]]);
+            let known = std::collections::HashSet::from([hex::decode("ab".repeat(32)).unwrap()]);
+            let out = relay
+                .precheck(&cfg, &access, &ev, now, &[], Some(&known), None)
+                .await;
+            assert!(matches!(out, super::Precheck::Accept));
+
+            // The late-publish guard rejects old group events.
+            let mut cfg2 = (*cfg).clone();
+            cfg2.limits.group_late_publish_secs = 60;
+            let relay2 = {
+                let db = relay.db.clone();
+                let config = Arc::new(RwLock::new(cfg2));
+                Arc::new(
+                    super::super::Relay::new(
+                        config,
+                        db,
+                        crate::stats::Stats::new(),
+                        "",
+                        crate::relay::LiveBusConfig {
+                            buffer: 1024,
+                            batch_interval_ms: 10,
+                            batch_size: 64,
+                        },
+                    )
+                    .await,
+                )
+            };
+            {
+                let mut groups = relay2.groups.write().await;
+                let create = gh(crate::nips::nip29::CREATE_GROUP, vec![]);
+                groups.apply(&create, "relay", now, false, false);
+            }
+            let cfg2r = relay2.config.read().await;
+            let access2 = AccessControl::default();
+            let mut old = gh(1, vec![]);
+            old.created_at = now - 100;
+            old.id = crate::nips::nip01::compute_id(&old);
+            let kp = Keypair::from_seckey_slice(&secp, &[6u8; 32]).unwrap();
+            let id = old.id_bytes().unwrap();
+            old.sig = secp.sign_schnorr_no_aux_rand(&id, &kp).to_string();
+            let out = relay2
+                .precheck(&cfg2r, &access2, &old, now, &[], None, None)
+                .await;
+            assert!(matches!(out, super::Precheck::Reject(m) if m.contains("too old")));
+            drop(cfg2r);
+            relay2.db.shutdown();
+            relay.db.shutdown();
+        });
+    }
+    #[test]
     fn ephemeral_rejection_via_validate_base() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {

@@ -535,6 +535,259 @@ mod tests {
 }
 
 #[cfg(test)]
+mod mock_server {
+    use super::*;
+    use axum::body::Body;
+    use axum::extract::{Path, RawQuery, State};
+    use axum::http::{HeaderMap, StatusCode};
+    use axum::response::{IntoResponse, Response};
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    type Store = Arc<Mutex<HashMap<String, Vec<u8>>>>;
+
+    async fn put(
+        Path((_bucket, key)): Path<(String, String)>,
+        State(store): State<Store>,
+        body: axum::body::Bytes,
+    ) -> StatusCode {
+        store.lock().unwrap().insert(key, body.to_vec());
+        StatusCode::OK
+    }
+
+    async fn get(
+        Path((_bucket, key)): Path<(String, String)>,
+        State(store): State<Store>,
+        headers: HeaderMap,
+        RawQuery(query): RawQuery,
+    ) -> Response {
+        if key.is_empty() {
+            return list(State(store), RawQuery(query)).await;
+        }
+        let data = store.lock().unwrap().get(&key).cloned();
+        let Some(data) = data else {
+            return axum::http::StatusCode::NOT_FOUND.into_response();
+        };
+        if let Some(range) = headers.get("range")
+            && let Ok(range) = range.to_str()
+            && let Some(rest) = range.strip_prefix("bytes=")
+        {
+            let (start, end): (usize, usize) = rest
+                .split_once('-')
+                .map(|(a, b)| (a.parse().unwrap_or(0), b.parse().unwrap_or(data.len() - 1)))
+                .unwrap_or((0, data.len() - 1));
+            let slice = &data[start.min(data.len())..end.saturating_add(1).min(data.len())];
+            let mut resp = Response::new(Body::from(slice.to_vec()));
+            resp.headers_mut().insert(
+                "content-range",
+                format!("bytes {start}-{}/{}", start + slice.len() - 1, data.len())
+                    .parse()
+                    .unwrap(),
+            );
+            return resp;
+        }
+        Response::new(Body::from(data))
+    }
+
+    async fn delete(
+        Path((_bucket, key)): Path<(String, String)>,
+        State(store): State<Store>,
+    ) -> StatusCode {
+        match store.lock().unwrap().remove(&key) {
+            Some(_) => StatusCode::NO_CONTENT,
+            None => StatusCode::NOT_FOUND,
+        }
+    }
+
+    async fn list(State(store): State<Store>, RawQuery(query): RawQuery) -> Response {
+        let query = query.unwrap_or_default();
+        let prefix = query
+            .split('&')
+            .find_map(|p| p.strip_prefix("prefix="))
+            .map(percent_decode)
+            .unwrap_or_default();
+        let token = query
+            .split('&')
+            .find_map(|p| p.strip_prefix("continuation-token="))
+            .map(percent_decode)
+            .unwrap_or_default();
+        let page = 2usize;
+        let mut keys: Vec<String> = store
+            .lock()
+            .unwrap()
+            .keys()
+            .filter(|k| k.starts_with(&prefix))
+            .cloned()
+            .collect();
+        keys.sort();
+        let skip = token.parse::<usize>().unwrap_or(0);
+        let page_keys: Vec<String> = keys.into_iter().skip(skip).take(page).collect();
+        let mut xml = String::from("<?xml version=\"1.0\"?><ListBucketResult>");
+        for k in &page_keys {
+            let size = store.lock().unwrap().get(k).unwrap().len();
+            xml.push_str(&format!(
+                "<Contents><Key>{k}</Key><Size>{size}</Size></Contents>"
+            ));
+        }
+        if skip + page
+            < store
+                .lock()
+                .unwrap()
+                .keys()
+                .filter(|k| k.starts_with(&prefix))
+                .count()
+        {
+            xml.push_str(&format!(
+                "<NextContinuationToken>{}</NextContinuationToken>",
+                skip + page
+            ));
+        }
+        xml.push_str("</ListBucketResult>");
+        Response::new(Body::from(xml))
+    }
+
+    fn percent_decode(s: &str) -> String {
+        let mut out = Vec::new();
+        let mut chars = s.chars();
+        while let Some(c) = chars.next() {
+            if c == '%' {
+                let hi = chars.next().unwrap();
+                let lo = chars.next().unwrap();
+                let byte = u8::from_str_radix(&format!("{hi}{lo}"), 16).unwrap();
+                out.push(byte);
+            } else {
+                out.extend(c.to_string().as_bytes());
+            }
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    async fn build_mock() -> (String, Store) {
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        let app = axum::Router::new()
+            .route(
+                "/{bucket}/{*key}",
+                axum::routing::put(put).get(get).delete(delete),
+            )
+            .route("/{bucket}/", axum::routing::get(list))
+            .with_state(store.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}"), store)
+    }
+
+    #[tokio::test]
+    async fn s3_operations_against_a_mock_bucket() {
+        let (endpoint, store) = build_mock().await;
+        let client = S3Client::new(&endpoint, "us-east-1", "bucket", "ak", "sk");
+
+        // put_object success; the body lands in the mock bucket.
+        client
+            .put_object("dir/file.txt", b"hello s3", "text/plain")
+            .await
+            .unwrap();
+        assert_eq!(
+            store.lock().unwrap().get("dir/file.txt").unwrap(),
+            b"hello s3"
+        );
+
+        // get_object: found, 404 -> None.
+        let got = client.get_object("dir/file.txt").await.unwrap().unwrap();
+        assert_eq!(got, b"hello s3");
+        let missing = client.get_object("nope").await.unwrap();
+        assert!(missing.is_none());
+
+        // get_object_range: ranged response, and the zero-length full fetch.
+        let resp = client
+            .get_object_range("dir/file.txt", 1, 3)
+            .await
+            .unwrap()
+            .unwrap();
+        let body = resp.bytes().await.unwrap();
+        assert_eq!(&body[..], b"ell");
+        let resp = client
+            .get_object_range("dir/file.txt", 0, 0)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(resp.status().is_success());
+        let missing = client.get_object_range("nope", 0, 8).await.unwrap();
+        assert!(missing.is_none());
+
+        // delete_object: present -> true, missing -> false.
+        assert!(client.delete_object("dir/file.txt").await.unwrap());
+        assert!(!client.delete_object("dir/file.txt").await.unwrap());
+
+        // list_keys with paging (2 keys, page size 2 -> continuation).
+        client.put_object("a", b"1", "text/plain").await.unwrap();
+        client.put_object("b", b"22", "text/plain").await.unwrap();
+        client.put_object("c", b"333", "text/plain").await.unwrap();
+        let keys = client.list_keys("").await.unwrap();
+        assert_eq!(keys.len(), 3);
+        assert!(keys.contains(&("a".to_string(), 1)));
+        assert!(keys.contains(&("c".to_string(), 3)));
+        let keys = client.list_keys("a").await.unwrap();
+        assert_eq!(keys, vec![("a".to_string(), 1)]);
+    }
+
+    #[tokio::test]
+    async fn s3_error_paths() {
+        let (_endpoint, _store) = build_mock().await;
+        // A bucket route that fails: a 500 status propagates as an error.
+        let app = axum::Router::new().route(
+            "/fail/{*rest}",
+            axum::routing::any(|| async { StatusCode::INTERNAL_SERVER_ERROR }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let failing = S3Client::new(
+            &format!("http://{addr}/fail"),
+            "us-east-1",
+            "bucket",
+            "ak",
+            "sk",
+        );
+        let err = failing
+            .put_object("k", b"v", "text/plain")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("put failed"), "{err}");
+        let err = failing.get_object("k").await.unwrap_err();
+        assert!(err.to_string().contains("get failed"), "{err}");
+        let err = failing.delete_object("k").await.unwrap_err();
+        assert!(err.to_string().contains("delete failed"), "{err}");
+        let err = failing.list_keys("").await.unwrap_err();
+        assert!(err.to_string().contains("list failed"), "{err}");
+    }
+
+    #[test]
+    fn sigv4_helpers_cover_the_remaining_shapes() {
+        // extract_tag: absent tag -> "", nested content kept.
+        assert_eq!(extract_tag("<a>1</a>", "b"), "");
+        assert_eq!(extract_tag("<Key>k&amp;ey</Key>", "Key"), "k&amp;ey");
+        // encoded_key: hex stays raw, path segments encoded.
+        assert_eq!(encoded_key("aa..bb"), "aa..bb");
+        assert_eq!(
+            encoded_key("a/b c"),
+            "a/b%20c",
+            "the slash is preserved (each path segment is encoded)"
+        );
+        // sorted_query: pairs sorted by name.
+        assert_eq!(sorted_query("b=2&a=1"), "a=1&b=2");
+        assert_eq!(sorted_query(""), "");
+        // amz_datetime: zero -> 19700101T000000Z.
+        assert_eq!(amz_datetime(0), "19700101T000000Z");
+        assert_eq!(amz_datetime(1_700_000_000), "20231114T221320Z");
+    }
+}
+
+#[cfg(test)]
 mod hmac_checks {
     #[test]
     fn hmac_sha256_rfc4231_vector() {

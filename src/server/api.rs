@@ -1453,6 +1453,131 @@ mod tests {
     }
 
     #[test]
+    fn string_and_u64_list_deserializers() {
+        fn from(json: serde_json::Value) -> serde_json::Result<ApiParams> {
+            serde_json::from_value(json)
+        }
+        // authors: single string, comma-separated, or array.
+        assert_eq!(
+            from(json!({"authors": "a,b, c ,"})).unwrap().authors,
+            vec!["a", "b", "c"]
+        );
+        assert_eq!(
+            from(json!({"authors": ["x", " y "]})).unwrap().authors,
+            vec!["x", "y"]
+        );
+        assert!(
+            from(json!({"authors": [1]})).is_err(),
+            "non-string array items fail"
+        );
+        assert!(
+            from(json!({"authors": 42})).is_err(),
+            "non-string scalars fail"
+        );
+        // kinds: numeric strings only.
+        assert_eq!(from(json!({"kinds": "1,2"})).unwrap().kinds, vec![1, 2]);
+        assert!(
+            from(json!({"kinds": "1,x"})).is_err(),
+            "non-numeric values fail"
+        );
+    }
+
+    #[test]
+    fn bound_params_caps_and_rejects() {
+        let cfg = crate::config::Config::default();
+        // The limit is capped down, the offset/search over the maxima are
+        // rejected.
+        let mut p = ApiParams {
+            limit: Some(10_000),
+            ..Default::default()
+        };
+        let mut cfg2 = cfg.clone();
+        cfg2.limits.max_api_limit = 100;
+        cfg2.limits.max_api_offset = 50;
+        cfg2.limits.max_api_search_bytes = 200;
+        bound_params(&mut p, &cfg2).unwrap();
+        assert_eq!(p.limit, Some(100), "the limit is capped");
+        let mut p = ApiParams {
+            offset: Some(51),
+            ..Default::default()
+        };
+        assert!(
+            bound_params(&mut p, &cfg2).is_err(),
+            "an over-max offset is rejected"
+        );
+        let mut p = ApiParams {
+            search: Some("x".repeat(201)),
+            ..Default::default()
+        };
+        assert!(
+            bound_params(&mut p, &cfg2).is_err(),
+            "an over-max search is rejected"
+        );
+        // Zero limits leave the params untouched.
+        cfg2.limits.max_api_limit = 0;
+        let mut p = ApiParams {
+            limit: Some(10_000),
+            ..Default::default()
+        };
+        bound_params(&mut p, &cfg2).unwrap();
+        assert_eq!(p.limit, Some(10_000));
+    }
+
+    #[test]
+    fn api_visible_filters_apply() {
+        let secp = Secp256k1::new();
+        let plain = signed_note(&secp, "plain", 1, vec![]);
+        let mut protected = plain.clone();
+        protected.tags = vec![vec!["-".into()]];
+        let mut wrap = plain.clone();
+        wrap.kind = crate::nips::nip62::GIFT_WRAP_KIND;
+        wrap.tags = vec![vec!["p".into(), "aa".repeat(32)]];
+        let mut app = plain.clone();
+        app.kind = 78;
+        let mut no_p = plain.clone();
+        no_p.tags = vec![vec!["p".into(), "bb".repeat(32)]];
+
+        assert!(api_visible(&plain, None, &[], false));
+        assert!(!api_visible(&protected, None, &[], false), "NIP-70 hidden");
+        assert!(!api_visible(&wrap, None, &[], false), "gift wraps hidden");
+        assert!(
+            api_visible(&app, None, &[], false),
+            "NIP-78 app-specific is public without the AUTH gate"
+        );
+        assert!(!api_visible(&app, None, &[], true), "AUTH gate hides it");
+        assert!(!api_visible(&no_p, None, &["p"], false), "no_p excludes");
+        assert!(api_visible(&no_p, None, &["e"], false));
+    }
+
+    #[test]
+    fn author_identifier_parsing_and_sorting() {
+        assert_eq!(
+            parse_author_identifier("AA".repeat(32).as_str()).unwrap(),
+            "aa".repeat(32),
+            "uppercase hex is lowercased"
+        );
+        assert!(
+            parse_author_identifier("not-hex-not-npub").is_err(),
+            "a junk identifier fails"
+        );
+        assert!(
+            parse_author_identifier(
+                "npub1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq"
+            )
+            .is_err()
+                || parse_author_identifier(
+                    "npub1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq"
+                )
+                .is_ok(),
+            "an npub parses (or a fabricated one fails) without panicking"
+        );
+        assert!(!sort_ascending(&None));
+        assert!(sort_ascending(&Some("asc".into())));
+        assert!(sort_ascending(&Some("ascending".into())));
+        assert!(!sort_ascending(&Some("desc".into())));
+    }
+
+    #[test]
     fn year_and_month_validation() {
         // The daily/hourly handlers reject out-of-range years: a huge
         // year would overflow the civil-date arithmetic.

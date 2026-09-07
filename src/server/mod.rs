@@ -1308,6 +1308,170 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cors_websocket_and_blossom_root_helpers() {
+        // cors_middleware: OPTIONS answers 204 with the CORS headers.
+        let app = axum::Router::new()
+            .route("/", axum::routing::get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn(cors_middleware));
+        let request = Request::builder()
+            .method(Method::OPTIONS)
+            .uri("/")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(
+            response
+                .headers()
+                .get("access-control-allow-origin")
+                .is_some(),
+            "the preflight must carry the CORS headers"
+        );
+        // A regular request passes through and gets the CORS headers.
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response
+                .headers()
+                .get("access-control-allow-origin")
+                .is_some()
+        );
+
+        // is_websocket_request: the full upgrade set passes; a missing
+        // header or an invalid X-Forwarded-Proto fails.
+        let mut h = HeaderMap::new();
+        h.insert(axum::http::header::UPGRADE, "websocket".parse().unwrap());
+        h.insert(
+            axum::http::header::CONNECTION,
+            "keep-alive, Upgrade".parse().unwrap(),
+        );
+        h.insert(
+            axum::http::header::SEC_WEBSOCKET_VERSION,
+            "13".parse().unwrap(),
+        );
+        h.insert(
+            axum::http::header::SEC_WEBSOCKET_KEY,
+            "abcd".parse().unwrap(),
+        );
+        assert!(is_websocket_request(&h));
+        let mut no_key = h.clone();
+        no_key.remove(axum::http::header::SEC_WEBSOCKET_KEY);
+        assert!(!is_websocket_request(&no_key));
+        let mut bad_proto = h.clone();
+        bad_proto.insert("x-forwarded-proto", "ftp".parse().unwrap());
+        assert!(
+            !is_websocket_request(&bad_proto),
+            "an unknown proxy proto fails"
+        );
+        let mut good_proto = h.clone();
+        good_proto.insert("x-forwarded-proto", "WSS".parse().unwrap());
+        assert!(
+            is_websocket_request(&good_proto),
+            "WSS is accepted case-insensitively"
+        );
+
+        // reject_ws_upgrade: a WebSocket handshake is refused with 403.
+        let app = axum::Router::new()
+            .route("/", axum::routing::get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn(reject_ws_upgrade));
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/")
+            .header(axum::http::header::UPGRADE, "websocket")
+            .header(axum::http::header::CONNECTION, "upgrade")
+            .header(axum::http::header::SEC_WEBSOCKET_VERSION, "13")
+            .header(axum::http::header::SEC_WEBSOCKET_KEY, "abcd")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // await_shutdown returns once the watch flips.
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(await_shutdown(rx));
+        tx.send(true).unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ws_handler_and_blossom_root_gate() {
+        let relay = blossom_relay().await;
+        // A WebSocket handshake from a blocked IP is refused with 403.
+        relay
+            .access
+            .write()
+            .await
+            .blocked_ips
+            .push(("198.51.100.7".into(), String::new()));
+        let mut request = Request::builder()
+            .method(Method::GET)
+            .uri("/")
+            .header(axum::http::header::UPGRADE, "websocket")
+            .header(axum::http::header::CONNECTION, "upgrade")
+            .header(axum::http::header::SEC_WEBSOCKET_VERSION, "13")
+            .header(axum::http::header::SEC_WEBSOCKET_KEY, "abcd")
+            .body(Body::empty())
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(axum::extract::connect_info::ConnectInfo::<
+                std::net::SocketAddr,
+            >("198.51.100.7:1234".parse().unwrap()));
+        let response = ws_handler(State(relay.clone()), request).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        // Blossom host root: a WebSocket upgrade is 404, a plain GET gets
+        // the server-info document.
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/")
+            .header(axum::http::header::HOST, "media.example.com")
+            .header(axum::http::header::UPGRADE, "websocket")
+            .header(axum::http::header::CONNECTION, "upgrade")
+            .header(axum::http::header::SEC_WEBSOCKET_VERSION, "13")
+            .header(axum::http::header::SEC_WEBSOCKET_KEY, "abcd")
+            .body(Body::empty())
+            .unwrap();
+        let response = root_inbox_outbox(State(relay.clone()), request).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/")
+            .header(axum::http::header::HOST, "media.example.com")
+            .body(Body::empty())
+            .unwrap();
+        let response = root_inbox_outbox(State(relay.clone()), request).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let info: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(info["name"], "example relay (media)");
+        // The relay host gets no blossom info on the inbox-outbox root.
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/")
+            .header(axum::http::header::HOST, "relay.example.com")
+            .body(Body::empty())
+            .unwrap();
+        let response = root_inbox_outbox(State(relay.clone()), request).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
     async fn blossom_server_info_carries_name_and_file_nips() {
         let relay = blossom_relay().await;
         let resp = blossom_root_info(relay.clone(), Some("media.example.com"), false)

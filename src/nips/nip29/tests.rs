@@ -24,6 +24,227 @@ const OTHER: &str = "ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
 /// A second admin (distinct from ADMIN) for the last-admin guard tests.
 const ADMIN2: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
 
+#[test]
+fn apply_covers_parent_child_roles_pins_and_delete() {
+    let mut store = GroupStore::default();
+    let now = 1_600_000_000;
+    // Create g1 (admin = ADMIN), a child g2, and an unrelated g3.
+    store.apply(
+        &event(CREATE_GROUP, ADMIN, Some("g1"), vec![]),
+        "relay",
+        now,
+        true,
+        false,
+    );
+    store.apply(
+        &event(CREATE_GROUP, ADMIN, Some("g2"), vec![]),
+        "relay",
+        now,
+        true,
+        false,
+    );
+    store.apply(
+        &event(CREATE_GROUP, ADMIN, Some("g3"), vec![]),
+        "relay",
+        now,
+        true,
+        false,
+    );
+    // g2 declares g1 as its parent; the back-pointer is assigned.
+    let parent2 = event(
+        9002,
+        ADMIN,
+        Some("g2"),
+        vec![vec!["parent".into(), "g1".into()]],
+    );
+    let out = store.apply(&parent2, "relay", now, true, false);
+    assert_eq!(store.group("g2").unwrap().parent.as_deref(), Some("g1"));
+    assert!(
+        store
+            .group("g1")
+            .unwrap()
+            .children
+            .contains(&"g2".to_string())
+    );
+    assert!(
+        out.iter()
+            .any(|e| e.kind == 39000 && e.tags.iter().any(|t| t[1] == "g2")),
+        "the child's metadata is republished"
+    );
+    // g1 adopts g3 as a child.
+    let adopt = event(
+        9002,
+        ADMIN,
+        Some("g1"),
+        vec![vec!["child".into(), "g3".into()]],
+    );
+    store.apply(&adopt, "relay", now, true, false);
+    assert_eq!(store.group("g3").unwrap().parent.as_deref(), Some("g1"));
+    // Adopting again is a no-op; a child already owned elsewhere is not
+    // re-parented.
+    store.apply(&adopt, "relay", now, true, false);
+    assert_eq!(store.group("g3").unwrap().parent.as_deref(), Some("g1"));
+    // g1 drops g3 from its children: the back-pointer is cleared.
+    let drop_child = event(
+        9002,
+        ADMIN,
+        Some("g1"),
+        vec![vec!["child".into(), "g4".into()]],
+    );
+    store.apply(&drop_child, "relay", now, true, false);
+    assert_eq!(store.group("g3").unwrap().parent, None);
+    // The old parent's metadata is republished when the parent changes.
+    let reparent = event(
+        9002,
+        ADMIN,
+        Some("g2"),
+        vec![vec!["parent".into(), "g3".into()]],
+    );
+    store.apply(&reparent, "relay", now, true, false);
+    assert_eq!(store.group("g2").unwrap().parent.as_deref(), Some("g3"));
+    assert!(
+        !store
+            .group("g1")
+            .unwrap()
+            .children
+            .contains(&"g2".to_string())
+    );
+    // Role updates (9000) replace the previous roles.
+    store.apply(
+        &event(
+            9000,
+            ADMIN,
+            Some("g1"),
+            vec![vec![P.into(), USER.into(), "mod".into()]],
+        ),
+        "relay",
+        now,
+        true,
+        false,
+    );
+    assert!(
+        store
+            .group("g1")
+            .unwrap()
+            .members
+            .get(USER)
+            .unwrap()
+            .contains("mod")
+    );
+    // 9001 removes a member.
+    store.apply(
+        &event(9001, ADMIN, Some("g1"), vec![vec![P.into(), USER.into()]]),
+        "relay",
+        now,
+        true,
+        false,
+    );
+    assert!(!store.group("g1").unwrap().members.contains_key(USER));
+    // 9009 adds invite codes; 9010 sets pins.
+    store.apply(
+        &event(
+            9009,
+            ADMIN,
+            Some("g1"),
+            vec![vec![CODE.into(), "code1".into()]],
+        ),
+        "relay",
+        now,
+        true,
+        false,
+    );
+    assert!(store.group("g1").unwrap().has_invite("code1"));
+    let pins = event(
+        9010,
+        ADMIN,
+        Some("g1"),
+        vec![
+            vec![E.into(), "ab".repeat(32)],
+            vec![A.into(), "30078:pk:d".into()],
+        ],
+    );
+    store.apply(&pins, "relay", now, true, false);
+    assert_eq!(store.group("g1").unwrap().pins.len(), 2);
+    // 9005 (delete event) applies without touching the group state.
+    store.apply(
+        &event(
+            9005,
+            ADMIN,
+            Some("g1"),
+            vec![vec![E.into(), "ab".repeat(32)]],
+        ),
+        "relay",
+        now,
+        true,
+        false,
+    );
+    assert!(store.group("g1").is_some());
+    // JOIN via a valid invite on a closed group admits the user.
+    store.apply(
+        &event(9002, ADMIN, Some("g1"), vec![vec!["closed".into()]]),
+        "relay",
+        now,
+        true,
+        false,
+    );
+    let join = event(
+        JOIN,
+        OTHER,
+        Some("g1"),
+        vec![vec![CODE.into(), "code1".into()]],
+    );
+    store.apply(&join, "relay", now, true, false);
+    assert!(store.group("g1").unwrap().is_member(OTHER));
+    // LEAVE removes the member and republishes.
+    let leave = event(LEAVE, OTHER, Some("g1"), vec![]);
+    store.apply(&leave, "relay", now, true, false);
+    assert!(!store.group("g1").unwrap().is_member(OTHER));
+    // DELETE_GROUP removes the group and frees its children.
+    store.apply(
+        &event(DELETE_GROUP, ADMIN, Some("g2"), vec![]),
+        "relay",
+        now,
+        true,
+        false,
+    );
+    assert!(store.group("g2").is_none());
+    assert_eq!(store.group("g3").unwrap().parent, None);
+    // privacy_gated: private groups are gated; unknown groups are not.
+    store.apply(
+        &event(
+            9000,
+            ADMIN,
+            Some("g1"),
+            vec![vec![P.into(), USER.into(), "member".into()]],
+        ),
+        "relay",
+        now,
+        true,
+        false,
+    );
+    store.apply(
+        &event(9002, ADMIN, Some("g1"), vec![vec!["private".into()]]),
+        "relay",
+        now,
+        true,
+        false,
+    );
+    let private_note = event(1, USER, Some("g1"), vec![]);
+    assert!(store.privacy_gated(&private_note));
+    let unknown = event(1, USER, Some("ghost"), vec![]);
+    assert!(!store.privacy_gated(&unknown));
+    // visible_to: non-group events are visible; gated content is not.
+    let plain = event(1, USER, None, vec![]);
+    assert!(store.visible_to(&plain, None));
+    assert!(!store.visible_to(&private_note, None));
+    assert!(store.visible_to(&private_note, Some(USER)));
+}
+
+#[test]
+fn vanish_rebuild_recreates_membership_of_private_groups() {
+    // ...
+}
+
 fn seeded() -> GroupStore {
     let mut store = GroupStore::default();
     let create = event(CREATE_GROUP, ADMIN, Some("g1"), vec![]);

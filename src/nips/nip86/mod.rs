@@ -650,6 +650,230 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rpc_error_paths_and_remaining_methods() {
+        let relay = build_admin_relay().await;
+
+        // The content type and the auth gate.
+        let resp = rpc_handler(
+            State(relay.clone()),
+            axum::extract::ConnectInfo("127.0.0.1:1234".parse().unwrap()),
+            axum::http::Uri::from_static("/"),
+            HeaderMap::new(),
+            "{}".into(),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "missing content type"
+        );
+        let resp = rpc_handler(
+            State(relay.clone()),
+            axum::extract::ConnectInfo("127.0.0.1:1234".parse().unwrap()),
+            axum::http::Uri::from_static("/"),
+            bearer_headers(),
+            "not-json".into(),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "invalid JSON is a JSON-RPC error"
+        );
+        let resp = rpc_call(&relay, "", vec![]).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "missing method is a JSON-RPC error"
+        );
+        let resp = rpc_call(&relay, "nosuchmethod", vec![]).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "unsupported method is an rpc error"
+        );
+
+        // supportedmethods excludes itself.
+        let resp = rpc_call(&relay, "supportedmethods", vec![]).await;
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        let list = body["result"].as_array().unwrap();
+        assert!(!list.iter().any(|m| m == "supportedmethods"));
+
+        // Access list mutations and their error paths.
+        let resp = rpc_call(&relay, "banpubkey", vec![]).await;
+        assert!(rpc_err_of(resp).await.contains("params"));
+        let resp = rpc_call(&relay, "banpubkey", vec![json!("zz")]).await;
+        assert!(rpc_err_of(resp).await.contains("pubkey"));
+        let resp = rpc_call(&relay, "banpubkey", vec![json!("aa".repeat(32))]).await;
+        assert!(rpc_ok_of(resp).await);
+        let resp = rpc_call(&relay, "banpubkey", vec![json!("aa".repeat(32))]).await;
+        assert!(rpc_ok_of(resp).await, "re-banning is idempotent");
+        assert_eq!(
+            rpc_call(&relay, "unbanpubkey", vec![]).await.status(),
+            StatusCode::OK
+        );
+        let resp = rpc_call(&relay, "unbanpubkey", vec![json!("aa".repeat(32))]).await;
+        assert!(rpc_ok_of(resp).await);
+        let resp = rpc_call(&relay, "allowpubkey", vec![]).await;
+        assert!(rpc_err_of(resp).await.contains("params"));
+        let resp = rpc_call(&relay, "allowpubkey", vec![json!("zz")]).await;
+        assert!(rpc_err_of(resp).await.contains("pubkey"));
+        let resp = rpc_call(
+            &relay,
+            "allowpubkey",
+            vec![json!("aa".repeat(32)), json!("r")],
+        )
+        .await;
+        assert!(rpc_ok_of(resp).await);
+        // Allowing also un-bans (the duplicate is a no-op).
+        let _ = rpc_call(&relay, "banpubkey", vec![json!("aa".repeat(32))]).await;
+        let resp = rpc_call(&relay, "allowpubkey", vec![json!("aa".repeat(32))]).await;
+        assert!(rpc_ok_of(resp).await);
+        let resp = rpc_call(&relay, "unallowpubkey", vec![]).await;
+        assert!(rpc_err_of(resp).await.contains("params"));
+        let resp = rpc_call(&relay, "unallowpubkey", vec![json!("aa".repeat(32))]).await;
+        assert!(rpc_ok_of(resp).await);
+        let resp = rpc_call(&relay, "listallowedpubkeys", vec![]).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Kind allow/disallow.
+        let resp = rpc_call(&relay, "allowkind", vec![]).await;
+        assert!(rpc_err_of(resp).await.contains("params"));
+        let resp = rpc_call(&relay, "allowkind", vec![json!(5)]).await;
+        assert!(rpc_ok_of(resp).await);
+        let resp = rpc_call(&relay, "allowkind", vec![json!(5)]).await;
+        assert!(rpc_ok_of(resp).await, "re-allowing is idempotent");
+        let resp = rpc_call(&relay, "disallowkind", vec![]).await;
+        assert!(rpc_err_of(resp).await.contains("params"));
+        let resp = rpc_call(&relay, "disallowkind", vec![json!(5)]).await;
+        assert!(rpc_ok_of(resp).await);
+        let resp = rpc_call(&relay, "listallowedkinds", vec![]).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Relay name/description/icon changes.
+        let resp = rpc_call(&relay, "changerelayname", vec![]).await;
+        assert!(rpc_err_of(resp).await.contains("params"));
+        let long = "x".repeat(201);
+        let resp = rpc_call(&relay, "changerelayname", vec![json!(long)]).await;
+        assert!(rpc_err_of(resp).await.contains("too long"));
+        let resp = rpc_call(&relay, "changerelayname", vec![json!("\u{0}")]).await;
+        assert!(rpc_err_of(resp).await.contains("control"));
+        let resp = rpc_call(&relay, "changerelayname", vec![json!("newname")]).await;
+        assert!(rpc_ok_of(resp).await);
+        assert_eq!(relay.config.read().await.relay.name, "newname");
+        let resp = rpc_call(&relay, "changerelaydescription", vec![json!("new desc")]).await;
+        assert!(rpc_ok_of(resp).await);
+        let resp = rpc_call(&relay, "changerelayicon", vec![json!("https://x/i.png")]).await;
+        assert!(rpc_ok_of(resp).await);
+
+        // Role methods through the RPC (the relay has no key: they fail
+        // with the restricted error, which covers the else branches).
+        let resp = rpc_call(&relay, "createrole", vec![]).await;
+        assert!(rpc_err_of(resp).await.contains("params"));
+        let resp = rpc_call(&relay, "createrole", vec![json!("x".repeat(200))]).await;
+        assert!(rpc_err_of(resp).await.contains("maximum"));
+        let resp = rpc_call(&relay, "createrole", vec![json!("r1")]).await;
+        assert!(rpc_err_of(resp).await.contains("restricted"));
+        let resp = rpc_call(&relay, "editrole", vec![]).await;
+        assert!(rpc_err_of(resp).await.contains("params"));
+        let resp = rpc_call(&relay, "deleterole", vec![]).await;
+        assert!(rpc_err_of(resp).await.contains("params"));
+        let resp = rpc_call(&relay, "deleterole", vec![json!("r1")]).await;
+        assert!(rpc_err_of(resp).await.contains("restricted"));
+        let resp = rpc_call(&relay, "assignrole", vec![]).await;
+        assert!(rpc_err_of(resp).await.contains("params"));
+        let resp = rpc_call(&relay, "assignrole", vec![json!("zz"), json!("r1")]).await;
+        assert!(rpc_err_of(resp).await.contains("pubkey"));
+        let resp = rpc_call(
+            &relay,
+            "assignrole",
+            vec![json!("aa".repeat(32)), json!("r1")],
+        )
+        .await;
+        assert!(rpc_err_of(resp).await.contains("restricted"));
+        let resp = rpc_call(&relay, "unassignrole", vec![]).await;
+        assert!(rpc_err_of(resp).await.contains("params"));
+        let resp = rpc_call(&relay, "unassignrole", vec![json!("zz"), json!("r1")]).await;
+        assert!(rpc_err_of(resp).await.contains("pubkey"));
+        let resp = rpc_call(
+            &relay,
+            "unassignrole",
+            vec![json!("aa".repeat(32)), json!("r1")],
+        )
+        .await;
+        assert!(rpc_err_of(resp).await.contains("restricted"));
+
+        // blockip / unblockip / listblockedips.
+        let resp = rpc_call(&relay, "blockip", vec![]).await;
+        assert!(rpc_err_of(resp).await.contains("params"));
+        let resp = rpc_call(&relay, "blockip", vec![json!("not-an-ip")]).await;
+        assert!(rpc_err_of(resp).await.contains("ip address"));
+        let resp = rpc_call(&relay, "unblockip", vec![]).await;
+        assert!(rpc_err_of(resp).await.contains("params"));
+        let resp = rpc_call(&relay, "unblockip", vec![json!("127.0.0.1")]).await;
+        assert!(rpc_ok_of(resp).await);
+        let resp = rpc_call(&relay, "listblockedips", vec![]).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // banevent / allowevent / listbannedevents.
+        let id = "ab".repeat(32);
+        let resp = rpc_call(&relay, "banevent", vec![]).await;
+        assert!(rpc_err_of(resp).await.contains("params"));
+        let resp = rpc_call(&relay, "banevent", vec![json!("zz")]).await;
+        assert!(rpc_err_of(resp).await.contains("event id"));
+        let resp = rpc_call(&relay, "banevent", vec![json!("ab".repeat(31))]).await;
+        assert!(rpc_err_of(resp).await.contains("event id"));
+        let resp = rpc_call(&relay, "banevent", vec![json!(id.clone()), json!("bad")]).await;
+        assert!(rpc_ok_of(resp).await);
+        let resp = rpc_call(&relay, "allowevent", vec![]).await;
+        assert!(rpc_err_of(resp).await.contains("params"));
+        let resp = rpc_call(&relay, "allowevent", vec![json!("zz")]).await;
+        assert!(rpc_err_of(resp).await.contains("event id"));
+        let resp = rpc_call(&relay, "allowevent", vec![json!(id.clone())]).await;
+        assert!(rpc_ok_of(resp).await);
+        let resp = rpc_call(&relay, "listbannedevents", vec![]).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = rpc_call(&relay, "listeventsneedingmoderation", vec![]).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // A blocked peer gets 403 before anything else (blocked IPs apply
+        // to the management endpoint too).
+        let _ = rpc_call(&relay, "blockip", vec![json!("127.0.0.1"), json!("x")]).await;
+        let resp = rpc_call(&relay, "listallowedkinds", vec![]).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // The audit params are bounded (a long reason is truncated).
+        let long = "x".repeat(500);
+        let _ = rpc_call(
+            &relay,
+            "banpubkey",
+            vec![json!("cc".repeat(32)), json!(long)],
+        )
+        .await;
+        let recent = relay.audit.recent();
+        assert!(
+            recent.iter().any(|l| l.len() < 400),
+            "the audit trail must truncate long params: {:?}",
+            recent
+        );
+        relay.db.shutdown();
+    }
+
+    async fn rpc_err_of(resp: Response) -> String {
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        serde_json::from_slice::<Value>(&body).unwrap()["error"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    async fn rpc_ok_of(resp: Response) -> bool {
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        serde_json::from_slice::<Value>(&body).unwrap()["result"] == json!(true)
+    }
+
+    #[tokio::test]
     async fn mutations_are_audited() {
         let relay = build_admin_relay().await;
         relay.audit.clear();
