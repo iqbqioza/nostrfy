@@ -128,7 +128,15 @@ impl super::Conn {
         let now = unix_now();
         // The negentropy query only needs (created_at, id) records, so it
         // never materializes every matching full event in memory.
-        let (items, more) = self.relay.db.neg_items(filter, max_items, now).await;
+        let Some((items, more)) = self.relay.db.neg_items_reported(filter, max_items, now).await
+        else {
+            // A timed-out sync must never be answered with an empty item
+            // set: the peer would conclude everything is gone locally and
+            // delete its events. NEG-ERR closes the subscription per
+            // NIP-77, which is the safe failure mode.
+            self.send_neg_err(&sub_id, "error: database timeout, please retry");
+            return;
+        };
         if more || items.len() > max_items {
             // NIP-77: the maximum number of processable records may be
             // returned as the fourth element.

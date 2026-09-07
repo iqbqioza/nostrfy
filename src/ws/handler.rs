@@ -429,7 +429,18 @@ impl super::Conn {
             .iter()
             .map(|f| f.limit.unwrap_or(max_limit).min(max_limit))
             .sum();
-        let (events, more) = self.relay.db.query_req(stored, max_limit, now).await;
+        let Some((events, more)) = self
+            .relay
+            .db
+            .query_req_reported(stored, max_limit, now)
+            .await
+        else {
+            // A timed-out query must not be presented as an empty
+            // timeline: close the subscription with a clear reason so the
+            // client can retry.
+            self.send_closed(sub_id, "error: database timeout, please retry");
+            return;
+        };
         let mut to_send = Vec::new();
         // NIP-67: whether any withheld event could be revealed by AUTH, in
         // which case the `EOSE` carries the `"auth"` hint (challenges must
@@ -646,11 +657,16 @@ impl super::Conn {
                 f.search = None;
             }
         }
-        let (events, more) = self
+        let Some((events, more)) = self
             .relay
             .db
-            .count(count_filters, count_limit, unix_now())
-            .await;
+            .count_reported(count_filters, count_limit, unix_now())
+            .await
+        else {
+            // A timed-out count must not be reported as zero.
+            self.send_closed(sub_id, "error: database timeout, please retry");
+            return;
+        };
         // NIP-70/59/29: COUNT applies the same visibility rules as REQ, so
         // an unauthenticated peer cannot learn the size of a private group,
         // the existence of gift wraps or the count of protected events.
