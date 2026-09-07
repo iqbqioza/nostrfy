@@ -262,12 +262,12 @@ To generate a secret key, use the `nostrfy genkey` command (see [5. Command Refe
 
 | Option | Description |
 | --- | --- |
-| `restrict_relay` | `true` = only allow-listed pubkeys may read and post (the lists are managed at runtime, see below) |
+| `restrict_relay` | `true` = only allow-listed pubkeys may post (NIP-11 `restricted_writes`; reading stays open to everyone except denied pubkeys) |
 | `blocked_kinds` | Event kinds to reject |
 | `allowed_kinds` | Kind allowlist. When non-empty, only these kinds are accepted |
 | `blocked_ips` | IP addresses to refuse connections from |
 
-> **Note**: The pubkey allow/deny lists are **not** config keys — they live in the relay database and are managed with `nostrfy relay allow/deny` (see [Section 7](#7-nip-86-management-api) / the blossom-style CLI), or at runtime via command events (`/relay allow|deny`, `/blossom allow|deny`). A denied pubkey is always rejected when **publishing**, even with `restrict_relay = false`, and is **never served either**: subscriptions (REQ), COUNT and negentropy syncs are refused with `restricted:`, and live events stop being delivered to its connections — immediately, without disconnecting them. With `restrict_relay = true`, reading is narrowed to allow-listed pubkeys too (anonymous connections are refused as well). The admin pubkey (`relay.pubkey`) and the relay's own pubkey (`relay.private_key`) are exempt from the lists, so the operator can always publish command events and read the replies.
+> **Note**: The pubkey allow/deny lists are **not** config keys — they live in the relay database and are managed with `nostrfy relay allow/deny` (see [Section 7](#7-nip-86-management-api) / the blossom-style CLI), or at runtime via command events (`/relay allow|deny`, `/blossom allow|deny`). A denied pubkey is always rejected when **publishing**, even with `restrict_relay = false`, and is **never served either**: subscriptions (REQ), COUNT and negentropy syncs are refused with `restricted:`, and live events stop being delivered to its connections — immediately, without disconnecting them. With `restrict_relay = true`, only the allow-listed pubkeys may post (NIP-11 `restricted_writes`), while reading stays open to everyone — anonymous readers and non-listed pubkeys can still subscribe, so the allowed pubkeys' posts remain publicly readable. Denied pubkeys are the only ones cut off from reading. The admin pubkey (`relay.pubkey`) and the relay's own pubkey (`relay.private_key`) are exempt from the lists, so the operator can always publish command events and read the replies.
 
 ---
 

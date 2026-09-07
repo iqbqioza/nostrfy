@@ -1702,6 +1702,83 @@ mod tests {
     }
 
     #[test]
+    fn allowed_authors_posts_stay_readable_on_write_restricted_relays() {
+        // End-to-end: with
+        // `restrict_relay = true` + an allow list, the allowed author's
+        // posts must remain readable by anonymous and non-listed readers
+        // (the allow list is a write restriction, NIP-11
+        // `restricted_writes`). Before the fix, anonymous readers were
+        // refused entirely and the posts were unreadable.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_relay_with("").await;
+            // The author of `signed_note` (seed 1) is the allowed pubkey.
+            let author = {
+                let keypair = Keypair::from_seckey_slice(relay.secp(), &[1u8; 32]).unwrap();
+                XOnlyPublicKey::from_keypair(&keypair).0.to_string()
+            };
+            {
+                let mut access = relay.access.write().await;
+                access.restrict_relay = true;
+                access.allowed_pubkeys.push((author.clone(), String::new()));
+            }
+
+            // The allowed author publishes.
+            let mut author_conn = build_conn_on(relay.clone()).await;
+            let note = signed_note(relay.secp(), "issue-61 note", unix_now(), vec![]);
+            author_conn.queue_event_value(note.clone()).await;
+            author_conn.flush_pending_events().await;
+            assert!(
+                outgoing_json(&author_conn)
+                    .iter()
+                    .any(|m| m[0] == "OK" && m[1] == note.id && m[2] == true),
+                "the allowed author may publish"
+            );
+
+            // An anonymous reader sees the note (the reported symptom).
+            let mut anon = build_conn_on(relay.clone()).await;
+            anon.handle_req(&[json!("sub"), json!({"kinds": [1]})])
+                .await;
+            anon.pump_pending_reqs();
+            let msgs = outgoing_json(&anon);
+            assert!(
+                !msgs.iter().any(|m| m[0] == "CLOSED"),
+                "anonymous may subscribe on a write-restricted relay"
+            );
+            assert!(
+                msgs.iter()
+                    .any(|m| m[0] == "EVENT" && m[2]["id"] == note.id),
+                "the anonymous reader receives the allowed author's post"
+            );
+
+            // A non-listed pubkey can read the post...
+            let mut outsider = build_conn_on(relay.clone()).await;
+            outsider
+                .handle_req(&[json!("sub"), json!({"kinds": [1]})])
+                .await;
+            outsider.pump_pending_reqs();
+            assert!(
+                outgoing_json(&outsider)
+                    .iter()
+                    .any(|m| m[0] == "EVENT" && m[2]["id"] == note.id),
+                "a non-listed pubkey can read the allowed author's post"
+            );
+            // ...but cannot publish (the write restriction stays).
+            let outsider_note = signed_note_seeded(relay.secp(), 2, "outsider", unix_now(), vec![]);
+            outsider.queue_event_value(outsider_note.clone()).await;
+            outsider.flush_pending_events().await;
+            assert!(
+                !outgoing_json(&outsider)
+                    .iter()
+                    .any(|m| m[0] == "OK" && m[1] == outsider_note.id && m[2] == true),
+                "a non-listed pubkey cannot publish (write restriction)"
+            );
+
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
     fn command_events_edit_lists_and_reply_with_1111() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -2004,60 +2081,64 @@ mod tests {
     }
 
     #[test]
-    fn restrict_relay_gates_reads_to_the_allow_list() {
+    fn restrict_relay_gates_writes_only() {
+        // `restrict_relay` + the allow list gate WRITES only (NIP-11
+        // `restricted_writes`): the allowed pubkey's posts stay readable
+        // by everyone — anonymous connections, outsiders and the relay's
+        // own key. Only a denied pubkey loses read access.
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let relay = build_relay_with(&"aa".repeat(32)).await;
             let allowed = "bb".repeat(32);
+            let denied = "dd".repeat(32);
             {
                 let mut access = relay.access.write().await;
                 access.restrict_relay = true;
                 access
                     .allowed_pubkeys
                     .push((allowed.clone(), String::new()));
+                access.blocked_pubkeys.push((denied.clone(), String::new()));
             }
 
-            // Anonymous connections cannot read a restricted relay.
+            // Anonymous readers are always admitted: the allow list is a
+            // write restriction, not a read one.
             let mut anon = build_conn_on(relay.clone()).await;
             anon.handle_req(&[json!("sub"), json!({"kinds": [1]})])
                 .await;
+            anon.pump_pending_reqs();
             assert!(
-                outgoing_json(&anon)
-                    .iter()
-                    .any(|m| m[0] == "CLOSED"
-                        && m[2].as_str().unwrap_or("").starts_with("restricted:")),
-                "anonymous is refused on a restricted relay"
+                !outgoing_json(&anon).iter().any(|m| m[0] == "CLOSED"),
+                "anonymous may read on a write-restricted relay"
             );
 
-            // A member of the allow list reads normally...
-            let mut member = build_conn_on(relay.clone()).await;
-            member.authed_pubkeys = vec![allowed.clone()];
-            member
-                .handle_req(&[json!("sub"), json!({"kinds": [1]})])
-                .await;
-            member.pump_pending_reqs();
-            assert!(
-                !outgoing_json(&member).iter().any(|m| m[0] == "CLOSED"),
-                "the allowed member may subscribe"
-            );
-
-            // ...while an authenticated outsider is refused.
+            // An authenticated outsider may read too.
             let mut outsider = build_conn_on(relay.clone()).await;
-            outsider.authed_pubkeys = vec!["dd".repeat(32)];
+            outsider.authed_pubkeys = vec!["ee".repeat(32)];
             outsider
                 .handle_req(&[json!("sub"), json!({"kinds": [1]})])
                 .await;
+            outsider.pump_pending_reqs();
             assert!(
-                outgoing_json(&outsider)
+                !outgoing_json(&outsider).iter().any(|m| m[0] == "CLOSED"),
+                "an authenticated outsider may read on a write-restricted relay"
+            );
+
+            // A denied pubkey loses read access.
+            let mut denier = build_conn_on(relay.clone()).await;
+            denier.authed_pubkeys = vec![denied.clone()];
+            denier
+                .handle_req(&[json!("sub"), json!({"kinds": [1]})])
+                .await;
+            assert!(
+                outgoing_json(&denier)
                     .iter()
                     .any(|m| m[0] == "CLOSED"
                         && m[2].as_str().unwrap_or("").starts_with("restricted:")),
-                "an outsider is refused on a restricted relay"
+                "a denied pubkey is refused reads"
             );
 
-            // ...but the relay's own pubkey is always admitted, even when
-            // it is not on the allow list (the operator reads command
-            // replies on restricted relays).
+            // The relay's own pubkey is always admitted (the operator
+            // reads command replies on restricted relays).
             let mut self_conn = build_conn_on(relay.clone()).await;
             self_conn.authed_pubkeys = vec![relay.relay_pubkey().unwrap()];
             self_conn

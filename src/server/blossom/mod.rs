@@ -775,10 +775,7 @@ async fn list(
     }
     // BUD-12: malformed query parameters are a 400, not silently ignored
     // (an ignored `cursor` would return an unbounded page).
-    if params
-        .get("cursor")
-        .is_some_and(|c| !is_pubkey(c))
-    {
+    if params.get("cursor").is_some_and(|c| !is_pubkey(c)) {
         return error(StatusCode::BAD_REQUEST, "invalid cursor");
     }
     let limit = match params.get("limit") {

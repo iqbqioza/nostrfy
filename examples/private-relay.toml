@@ -1,11 +1,11 @@
 # nostrfy.toml — private (invite-only / authenticated) relay
 #
 # For a closed community: only authenticated clients (NIP-42) may
-# publish, only allow-listed pubkeys are served, and the relay is
-# locked down to a fixed audience. Combine `require_auth` (any
-# authenticated user may publish) with `restrict_relay = true` + the
-# allow list (only these pubkeys are served at all) for a truly private
-# relay.
+# publish, and `restrict_relay = true` narrows publishing to the allow
+# list. Reading stays open to everyone (NIP-11 `restricted_writes`
+# semantics), so the members' posts remain publicly readable — add
+# `require_auth` if you want publishing restricted to authenticated
+# clients as well.
 
 [relay]
 name = "nostrfy private"
@@ -27,10 +27,11 @@ enabled_command_events = false
 enabled_nips = [1, 9, 11, 40, 42, 45, 46, 59, 65, 70, 78, 84]
 
 [access]
-# Only allow-listed pubkeys may read (REQ) and write. The allow/deny
-# lists are NOT config keys: they live in the relay database and are
-# managed with `nostrfy relay allow <pubkey>` / `nostrfy relay deny
-# <pubkey>` (the admin and the relay's own pubkey are always exempt).
+# Only allow-listed pubkeys may POST (reading stays open to everyone;
+# denied pubkeys are the only ones refused reads). The allow/deny lists
+# are NOT config keys: they live in the relay database and are managed
+# with `nostrfy relay allow <pubkey>` / `nostrfy relay deny <pubkey>`
+# (the admin and the relay's own pubkey are always exempt).
 restrict_relay = true
 # Optional: only accept these kinds (empty = all kinds allowed).
 allowed_kinds = [1, 4, 6, 7, 14, 42, 9735]
