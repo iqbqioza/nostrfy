@@ -235,10 +235,11 @@ fn validate_auth_event(
     if crate::nips::nip01::verify(event, secp).is_err() {
         return None;
     }
-    // BUD-11: `created_at` must be in the past. The relay additionally
-    // enforces a freshness window: an intercepted token cannot be replayed
-    // long after signing (the 10-minute slack tolerates client clock skew).
-    if event.created_at.abs_diff(now) > 600 {
+    // BUD-11: `created_at` must be in the past — nothing more. A future
+    // `created_at` (client clock ahead) is rejected; past timestamps
+    // are valid as long as `expiration` (checked below) has not
+    // passed, so pre-signed tokens for future uploads stay valid.
+    if event.created_at > now {
         return None;
     }
     if !event_tags(event, "t").any(|t| t == verb) {
@@ -514,30 +515,54 @@ async fn get_blob(
         .await
     {
         Ok(Some(stream)) => {
-            let body = match stream {
-                storage::BlobStream::Local(file) => axum::body::Body::from_stream(FileChunks {
-                    file,
-                    remaining: len,
-                    buf: vec![0u8; 64 * 1024],
-                }),
+            // A range-unaware S3-compatible backend answers a ranged GET
+            // with 200 and the full object from byte 0: serve the whole
+            // blob as a 200 instead of mislabeling bytes 0..len as
+            // `start..start+len` (BUD-01 range semantics).
+            let (body, honored, served_len) = match stream {
+                storage::BlobStream::Local(file) => (
+                    axum::body::Body::from_stream(FileChunks {
+                        file,
+                        remaining: len,
+                        buf: vec![0u8; 64 * 1024],
+                    }),
+                    true,
+                    len,
+                ),
                 storage::BlobStream::S3(resp) => {
-                    axum::body::Body::from_stream(S3Chunks::new(resp, len))
+                    let honored = resp.status() == reqwest::StatusCode::PARTIAL_CONTENT;
+                    let served = if honored { len } else { size };
+                    (
+                        axum::body::Body::from_stream(S3Chunks::new(resp, served)),
+                        honored,
+                        served,
+                    )
                 }
             };
-            // A response is 206 only for a genuine single satisfiable range: a
-            // multi-range or non-bytes Range header is ignored (RFC 7233)
-            // and serves the full blob with 200.
-            let mut response = if matches!(range, Some(Ok(Some(_)))) {
+            // A response is 206 only for a genuine single satisfiable range
+            // that the backend honored: a multi-range or non-bytes Range
+            // header, or an ignored backend range, serves the full blob
+            // with 200 (RFC 7233).
+            let ranged = matches!(range, Some(Ok(Some(_))));
+            let mut response = if ranged && honored {
                 (StatusCode::PARTIAL_CONTENT, base_headers, body).into_response()
             } else {
                 (StatusCode::OK, base_headers, body).into_response()
             };
-            if let Some(Ok(Some((start, end)))) = range {
+            if ranged
+                && honored
+                && let Some(Ok(Some((start, end)))) = range
+            {
                 response.headers_mut().insert(
                     axum::http::header::CONTENT_RANGE,
                     format!("bytes {start}-{end}/{size}").parse().unwrap(),
                 );
             }
+            // BUD-01: HEAD must answer with the same Content-Length as GET.
+            response.headers_mut().insert(
+                axum::http::header::CONTENT_LENGTH,
+                served_len.to_string().parse().unwrap(),
+            );
             response
         }
         Ok(None) => error(StatusCode::NOT_FOUND, "blob not found"),
@@ -748,11 +773,19 @@ async fn list(
     if !is_pubkey(&pubkey) {
         return error(StatusCode::BAD_REQUEST, "invalid pubkey");
     }
-    let cursor = params
-        .get("cursor")
-        .map(String::as_str)
-        .filter(|c| is_pubkey(c));
-    let limit = params.get("limit").and_then(|v| v.parse::<usize>().ok());
+    // BUD-12: malformed query parameters are a 400, not silently ignored
+    // (an ignored `cursor` would return an unbounded page).
+    if params.get("cursor").is_some_and(|c| !is_pubkey(c)) {
+        return error(StatusCode::BAD_REQUEST, "invalid cursor");
+    }
+    let limit = match params.get("limit") {
+        Some(v) => match v.parse::<usize>() {
+            Ok(l) => Some(l),
+            Err(_) => return error(StatusCode::BAD_REQUEST, "invalid limit"),
+        },
+        None => None,
+    };
+    let cursor = params.get("cursor").map(String::as_str);
     let mut blobs = state.store.list(&pubkey).await;
     // BUD-12: sorted by `uploaded` descending; the page starts after the
     // cursor and never includes it.
@@ -1302,7 +1335,9 @@ mod tests {
             None,
             "an x tag for a different blob must be rejected"
         );
-        // A token stamped too far in the past or the future is stale.
+        // BUD-11: `created_at` must be in the past — a token stamped well
+        // in the past stays valid as long as `expiration` has not passed
+        // (pre-signed tokens are spec-conformant).
         let ev = auth_event(
             &secp,
             now - 601,
@@ -1313,8 +1348,10 @@ mod tests {
         );
         assert_eq!(
             validate_auth_event(&secp, &ev, host, "upload", Some(&sha), now),
-            None
+            Some(ev.pubkey.clone()),
+            "a past-stamped token with a future expiration is valid"
         );
+        // A future `created_at` is rejected.
         let ev = auth_event(
             &secp,
             now + 601,

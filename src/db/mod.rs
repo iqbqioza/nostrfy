@@ -499,10 +499,20 @@ impl DbClient {
         if self.timeout_secs == 0 {
             return rx.await.unwrap_or_default();
         }
-        tokio::time::timeout(std::time::Duration::from_secs(self.timeout_secs), rx)
-            .await
-            .map(|r| r.unwrap_or_default())
-            .unwrap_or_default()
+        match tokio::time::timeout(std::time::Duration::from_secs(self.timeout_secs), rx).await {
+            Ok(Ok(value)) => value,
+            // The timeout must not silently turn a query into an empty
+            // answer (an empty timeline / a destructive negentropy sync):
+            // report it loudly, and the WebSocket callers that use the
+            // reporting variants respond with an error instead.
+            _ => {
+                log::warn!(
+                    "database request timed out after {}s (a query result was dropped)",
+                    self.timeout_secs
+                );
+                R::default()
+            }
+        }
     }
 
     pub async fn put(&self, event: Event, now: u64) -> PutOutcome {
@@ -706,9 +716,39 @@ impl DbClient {
 
     /// NIP-77: returns only `(created_at, id)` records of the matching
     /// events, keeping the memory footprint at a few bytes per record.
-    pub async fn neg_items(&self, filter: Filter, limit: usize, now: u64) -> (NegItems, bool) {
-        self.request_read(|reply| Msg::NegQuery {
-            filter,
+    /// WebSocket REQ query that reports failure: `None` when the reader
+    /// timed out (or the request failed fast). The caller must not
+    /// present an empty result as a complete answer — a timed-out query
+    /// presented as empty would make the client believe the timeline is
+    /// empty.
+    pub async fn query_req_reported(
+        &self,
+        filters: Vec<Filter>,
+        limit: usize,
+        now: u64,
+    ) -> Option<(Vec<Event>, bool)> {
+        self.request_read_result(|reply| Msg::Query {
+            filters,
+            limit,
+            now,
+            ascending: false,
+            budget: SCAN_BUDGET,
+            hidden_slack: 1,
+            reply,
+        })
+        .await
+    }
+
+    /// COUNT that reports failure (`None` on timeout / fail-fast): a
+    /// timed-out count must not be reported as zero.
+    pub async fn count_reported(
+        &self,
+        filters: Vec<Filter>,
+        limit: usize,
+        now: u64,
+    ) -> Option<(Vec<Event>, bool)> {
+        self.request_read_result(|reply| Msg::Count {
+            filters,
             limit,
             now,
             reply,
@@ -716,9 +756,17 @@ impl DbClient {
         .await
     }
 
-    pub async fn count(&self, filters: Vec<Filter>, limit: usize, now: u64) -> (Vec<Event>, bool) {
-        self.request_read(|reply| Msg::Count {
-            filters,
+    /// Negentropy query that reports failure (`None` on timeout /
+    /// fail-fast): a timed-out sync must not be answered with an empty
+    /// item set, or the peer would delete its local events.
+    pub async fn neg_items_reported(
+        &self,
+        filter: Filter,
+        limit: usize,
+        now: u64,
+    ) -> Option<(NegItems, bool)> {
+        self.request_read_result(|reply| Msg::NegQuery {
+            filter,
             limit,
             now,
             reply,

@@ -1587,7 +1587,7 @@ fn neg_items_carry_visibility_flags() {
             assert_eq!(db.put(e.clone(), now).await, PutOutcome::Stored);
         }
         let f: Filter = serde_json::from_value(serde_json::json!({"kinds": [1]})).unwrap();
-        let (items, _) = db.neg_items(f, 100, now).await;
+        let (items, _) = db.neg_items_reported(f, 100, now).await.unwrap_or_default();
         let by_id = |id: &str| items.iter().find(|i| hex::encode(i.id) == id).unwrap();
         assert!(by_id(&protected.id).protected, "protected flag set");
         assert!(
@@ -1634,7 +1634,7 @@ fn neg_items_carry_nip78_flag() {
             assert_eq!(db.put(e.clone(), now).await, PutOutcome::Stored);
         }
         let f: Filter = serde_json::from_value(serde_json::json!({"kinds": [1, 30078]})).unwrap();
-        let (items, _) = db.neg_items(f, 100, now).await;
+        let (items, _) = db.neg_items_reported(f, 100, now).await.unwrap_or_default();
         let by_id = |id: &str| items.iter().find(|i| hex::encode(i.id) == id).unwrap();
         assert!(by_id(&app.id).app_specific, "app-specific flag set");
         assert_eq!(
@@ -1681,7 +1681,7 @@ fn count_stops_exactly_at_the_cap() {
         let f: Filter =
             serde_json::from_value(serde_json::json!({"kinds": [7], "#e": ["t".repeat(64)]}))
                 .unwrap();
-        let (events, more) = db.count(vec![f], 5, now).await;
+        let (events, more) = db.count_reported(vec![f], 5, now).await.unwrap_or_default();
         assert_eq!(events.len(), 5, "the cap cuts exactly");
         assert!(more, "the capped scan is flagged as approximate");
     });
@@ -2016,7 +2016,7 @@ fn neg_items_carry_gift_wrap_recipients() {
         assert_eq!(db.put(wrap.clone(), now).await, PutOutcome::Stored);
         assert_eq!(db.put(plain.clone(), now).await, PutOutcome::Stored);
         let f: Filter = serde_json::from_value(serde_json::json!({"kinds": [1, 1059]})).unwrap();
-        let (items, _) = db.neg_items(f, 100, now).await;
+        let (items, _) = db.neg_items_reported(f, 100, now).await.unwrap_or_default();
         let wrap_item = items.iter().find(|i| hex::encode(i.id) == wrap.id).unwrap();
         assert_eq!(
             wrap_item.wrap_recipients.as_deref(),

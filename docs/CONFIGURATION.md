@@ -461,7 +461,7 @@ nostrfy relay deny npub1...       # deny a pubkey — its events are always reje
 nostrfy relay list                # show both lists and restrict_relay
 ```
 
-- `restrict_relay = true`: **only** the pubkeys on the allow list may publish (everyone else is rejected with `blocked: pubkey not allowed`).
+- `restrict_relay = true`: **only** the pubkeys on the allow list may publish (everyone else is rejected with `blocked: pubkey not allowed`). This is the NIP-11 `restricted_writes` semantics: **reading stays open to everyone** (anonymous and non-listed pubkeys can still subscribe), so an allowed pubkey's posts remain publicly readable. Denied pubkeys are the only ones refused reads.
 - `restrict_relay = false` (default): everyone may publish **except** the denied pubkeys — a denied entry always wins, with or without `restrict_relay`.
 - **The restriction is write-only**: reading is never limited — any client may query/subscribe, fetch via the REST API and browse the NIP-11 document, regardless of the allow/deny lists.
 - Each `allow`/`deny` writes the database and reloads the running daemon (SIGHUP), so the change applies immediately. NIP-86 (`banpubkey`/`allowpubkey`/...) manages the same lists.

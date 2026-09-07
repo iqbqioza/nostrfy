@@ -429,7 +429,18 @@ impl super::Conn {
             .iter()
             .map(|f| f.limit.unwrap_or(max_limit).min(max_limit))
             .sum();
-        let (events, more) = self.relay.db.query_req(stored, max_limit, now).await;
+        let Some((events, more)) = self
+            .relay
+            .db
+            .query_req_reported(stored, max_limit, now)
+            .await
+        else {
+            // A timed-out query must not be presented as an empty
+            // timeline: close the subscription with a clear reason so the
+            // client can retry.
+            self.send_closed(sub_id, "error: database timeout, please retry");
+            return;
+        };
         let mut to_send = Vec::new();
         // NIP-67: whether any withheld event could be revealed by AUTH, in
         // which case the `EOSE` carries the `"auth"` hint (challenges must
@@ -646,11 +657,16 @@ impl super::Conn {
                 f.search = None;
             }
         }
-        let (events, more) = self
+        let Some((events, more)) = self
             .relay
             .db
-            .count(count_filters, count_limit, unix_now())
-            .await;
+            .count_reported(count_filters, count_limit, unix_now())
+            .await
+        else {
+            // A timed-out count must not be reported as zero.
+            self.send_closed(sub_id, "error: database timeout, please retry");
+            return;
+        };
         // NIP-70/59/29: COUNT applies the same visibility rules as REQ, so
         // an unauthenticated peer cannot learn the size of a private group,
         // the existence of gift wraps or the count of protected events.
@@ -728,23 +744,27 @@ impl super::Conn {
         verdict
     }
 
-    /// The access-list verdict for this connection: the relay's own pubkey
+    /// The access-list verdict for this connection: the deny list gates
+    /// identified pubkeys (publish AND read — "never serve these
+    /// pubkeys"), while `restrict_relay` and the allow list gate WRITES
+    /// only (the NIP-11 `restricted_writes` semantics): reading stays
+    /// open to everyone else, including anonymous connections (they
+    /// cannot be identified against the lists). The relay's own pubkey
     /// and the admin pubkey (`relay.pubkey`) are always admitted — the
     /// operator must be able to read command-event replies on restricted
-    /// relays — then the deny list gates authenticated pubkeys, and
-    /// `restrict_relay` narrows reading to the allow list (anonymous
-    /// connections are then refused too).
+    /// relays.
     fn read_verdict(&self, access: &crate::config::AccessControl, admin: &str) -> bool {
         if self.is_operator_pubkey(admin) {
             return true;
         }
         if self.authed_pubkeys.is_empty() {
-            !access.restrict_relay
-        } else {
-            self.authed_pubkeys
-                .iter()
-                .any(|pk| access.allows_pubkey(pk))
+            // Anonymous connections cannot be identified against the
+            // lists, so the lists cannot apply to them: they always read.
+            return true;
         }
+        self.authed_pubkeys
+            .iter()
+            .any(|pk| !access.blocked_pubkeys.iter().any(|(p, _)| p == pk))
     }
 
     /// Whether any authenticated pubkey is an operator identity: the

@@ -19,8 +19,15 @@ pub const SIG_BYTES: usize = 64;
 /// The payload is serialized directly from a tuple — the `serde_json::json!`
 /// macro would build an intermediate `Value` tree first, doubling the
 /// allocation work on this hot path (every published event is hashed here).
+///
+/// C0 control bytes in the content stay escaped (`\u00XX`), exactly as
+/// mainstream clients serialize them (`JSON.stringify` in nostr-tools,
+/// `encoding/json` in go-nostr, serde in the Rust `nostr` crate all escape
+/// control bytes, and the id is computed over that escaped text): restoring
+/// them to raw bytes would reject every ecosystem-signed event that
+/// contains a control byte.
 pub fn canonical_payload(event: &Event) -> Vec<u8> {
-    let mut out = serde_json::to_vec(&(
+    serde_json::to_vec(&(
         0u8,
         &event.pubkey,
         event.created_at,
@@ -28,65 +35,7 @@ pub fn canonical_payload(event: &Event) -> Vec<u8> {
         &event.tags,
         &event.content,
     ))
-    .expect("canonical serialization cannot fail");
-    restore_raw_control_bytes(&mut out);
-    out
-}
-
-/// NIP-01 serializes control bytes verbatim: only `" \ \n \r \t \b
-/// \f` are escaped. serde_json additionally escapes the other C0 control
-/// bytes as `\u00XX`, which would change the event id; this restores them
-/// to their raw form. The scan is a single pass over the serialized bytes:
-/// `\u00XX` can only appear inside a string literal (the keys and numbers
-/// of the canonical tuple never contain backslashes), and a `\` (escaped
-/// backslash) is always followed by a non-`u` byte, so the two-byte window
-/// is unambiguous.
-fn restore_raw_control_bytes(json: &mut Vec<u8>) {
-    // Single pass into a fresh buffer: an in-place `drain` per escape
-    // would be O(n²) when a content is full of control bytes (a client
-    // could burn seconds of CPU per event before any signature check).
-    let mut out = Vec::with_capacity(json.len());
-    let mut i = 0;
-    while i < json.len() {
-        if i + 5 < json.len() && json[i] == b'\\' && json[i + 1] == b'u' {
-            // serde escapes a literal backslash as `\\`, so an escape
-            // sequence preceded by an even number of consecutive
-            // backslashes is a real escape (restore it), while an odd
-            // number means the `u` is part of the literal text (keep it).
-            // A content like `"\\" + 0x01` serializes as `\\\u0001`
-            // — three backslashes then the escape.
-            let mut slashes = 0usize;
-            while i > slashes && json[i - slashes - 1] == b'\\' {
-                slashes += 1;
-            }
-            if slashes % 2 == 1 {
-                out.push(b'\\');
-                out.push(b'u');
-                i += 2;
-                continue;
-            }
-            let hi = (hex_val(json[i + 2]) as u16) << 12
-                | (hex_val(json[i + 3]) as u16) << 8
-                | (hex_val(json[i + 4]) as u16) << 4
-                | hex_val(json[i + 5]) as u16;
-            if hi <= 0x1f {
-                out.push(hi as u8);
-                i += 6;
-                continue;
-            }
-        }
-        out.push(json[i]);
-        i += 1;
-    }
-    *json = out;
-}
-
-fn hex_val(b: u8) -> u8 {
-    match b {
-        b'0'..=b'9' => b - b'0',
-        b'a'..=b'f' => b - b'a' + 10,
-        _ => 0,
-    }
+    .expect("canonical serialization cannot fail")
 }
 
 pub fn compute_id(event: &Event) -> String {
@@ -241,11 +190,12 @@ mod control_tests {
     use crate::event::Event;
 
     #[test]
-    fn canonical_payload_keeps_control_bytes_verbatim() {
-        // NIP-01: only \" \\ \n \r \t \b \f are escaped; every other
-        // control byte is serialized verbatim. serde_json escapes the
-        // other C0 controls as \u00XX, which the canonical payload must
-        // restore (an escaped control byte would change the event id).
+    fn canonical_payload_escapes_control_bytes_like_the_ecosystem() {
+        // Mainstream clients (nostr-tools' JSON.stringify, go-nostr,
+        // the Rust nostr crate) escape C0 control bytes as `\u00XX` and
+        // compute the event id over that escaped text. The canonical
+        // payload must match them: restoring raw bytes (the old behavior)
+        // rejected every ecosystem-signed event containing a control byte.
         let mut event = Event {
             id: "0".repeat(64),
             pubkey: "1".repeat(64),
@@ -258,19 +208,17 @@ mod control_tests {
         let payload = canonical_payload(&event);
         let text = String::from_utf8_lossy(&payload);
         assert!(
-            text.contains('\u{1}') && text.contains('\u{b}') && text.contains('\u{1f}'),
-            "control bytes stay raw: {text:?}"
+            text.contains("\\u0001") && text.contains("\\u000b") && text.contains("\\u001f"),
+            "control bytes stay escaped like client serializers: {text:?}"
         );
         assert!(
-            !text.contains("\\u0001"),
-            "no \\uXXXX for C0 controls: {text:?}"
+            !text.contains('\u{1}'),
+            "no raw control bytes in the payload: {text:?}"
         );
-        // The 7 escaped forms and the escaped backslash survive untouched.
+        // The 7 escaped forms survive untouched.
         assert!(text.contains("\\t") && text.contains("\\n"));
         assert!(text.contains("\\\"") && text.contains("\\\\"));
-        // A literal backslash-u in the content is not mistaken for an
-        // escape (serde escapes the backslash, so the serialized bytes
-        // are `\\\\u0002` — two backslashes then the literal text).
+        // A literal backslash-u in the content stays escaped text.
         event.content = "literal \\\\u0002 text".into();
         let payload = canonical_payload(&event);
         let text = String::from_utf8_lossy(&payload);
@@ -278,28 +226,13 @@ mod control_tests {
             text.contains("\\\\u0002"),
             "a literal backslash-u stays escaped: {text:?}"
         );
-        // A control byte immediately after a literal backslash: serde
-        // serializes it as `\\` + `\u0001` (three backslashes then the
-        // escape), and the escape must still be restored — the parity of
-        // the preceding backslashes decides, not the single preceding byte.
-        event.content = "\\\u{1}".into();
-        let payload = canonical_payload(&event);
-        let text = String::from_utf8_lossy(&payload);
-        assert!(
-            text.contains("\\\u{1}"),
-            "a control byte after a literal backslash is restored: {text:?}"
-        );
-        assert!(
-            !text.contains("\\\\\\u0001"),
-            "the escape is not left as text: {text:?}"
-        );
     }
 
     #[test]
     fn control_bytes_roundtrip_through_verify() {
         // An event with C0 control bytes in its content must verify with
-        // its own compute_id (the id the client computed with a spec
-        // compliant serializer matches).
+        // its own compute_id (the id a mainstream client computes over
+        // the escaped serialization).
         let event = Event {
             id: String::new(),
             pubkey: "ab".repeat(32),
@@ -315,8 +248,8 @@ mod control_tests {
         let secp = secp256k1::Secp256k1::new();
         // The id check runs first: reaching the signature check means the
         // canonical id computed by this crate matches the one signed by
-        // the (spec-compliant) client, so a canonicalization bug would
-        // fail here with an id error instead.
+        // the client, so a canonicalization bug would fail here with an
+        // id error instead.
         let err = verify(&signed, &secp).unwrap_err();
         // The id check runs first and returns its own error string: if the
         // canonical id did not match, the verify would report the id (not

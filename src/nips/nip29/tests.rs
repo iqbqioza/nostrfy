@@ -193,10 +193,24 @@ fn invalid_invite_code_is_final() {
         vec![vec![CODE.into(), "abc".into()]],
     );
     store.apply(&invite, "", 1, false, false);
-    // A wrong code is rejected even on an otherwise open group.
+    // On an OPEN group the `code` tag is optional preauthorization: a
+    // wrong code does not block the (otherwise honored) join.
     let join = event(
         JOIN,
         USER,
+        Some("g1"),
+        vec![vec![CODE.into(), "wrong".into()]],
+    );
+    assert!(store.validate_write(&join).is_ok());
+    store.apply(&join, "", 1, false, false);
+    assert!(store.group("g1").unwrap().is_member(USER));
+    // A closed group honors a valid invite code and rejects a wrong one.
+    let stranger = "ee".repeat(32);
+    let edit = event(9002, ADMIN, Some("g1"), vec![vec!["closed".into()]]);
+    store.apply(&edit, "", 1, false, false);
+    let join = event(
+        JOIN,
+        &stranger,
         Some("g1"),
         vec![vec![CODE.into(), "wrong".into()]],
     );
@@ -204,12 +218,9 @@ fn invalid_invite_code_is_final() {
         store.validate_write(&join).unwrap_err(),
         "restricted: invalid invite code"
     );
-    // A closed group honors a valid invite code.
-    let edit = event(9002, ADMIN, Some("g1"), vec![vec!["closed".into()]]);
-    store.apply(&edit, "", 1, false, false);
     let join = event(
         JOIN,
-        USER,
+        &stranger,
         Some("g1"),
         vec![vec![CODE.into(), "abc".into()]],
     );
