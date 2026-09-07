@@ -859,11 +859,10 @@ impl Config {
             22 => Some(&[1111]),
             26 => None,
             29 => Some(&[
-                // Current NIP-29 kinds (the moderation table and the
-                // relay-generated metadata): 9000/9001/9002/9005/9007/
-                // 9008/9009/9010, 9021/9022 and 39000-39005.
-                9000, 9001, 9002, 9005, 9007, 9008, 9009, 9010, 9021, 9022, 39000, 39001, 39002,
-                39003, 39004, 39005,
+                // Current NIP-29 kinds: the full moderation range 9000-9010
+                // (including reserved slots), 9021/9022 and 39000-39005.
+                9000, 9001, 9002, 9003, 9004, 9005, 9006, 9007, 9008, 9009, 9010, 9021, 9022, 39000,
+                39001, 39002, 39003, 39004, 39005,
             ]),
             32 => Some(&[1985]),
             33 => None, // range 30000-39999 — not checked against kind block lists
@@ -1050,6 +1049,20 @@ impl Config {
                 "relay.enabled_nips and relay.disabled_nips are both set; enabled_nips wins"
             );
         }
+        // Typo guard: an unknown NIP id silently disables real behaviour
+        // (`nip_enabled(42) == false` for `enabled_nips = [500]`), so warn.
+        for nip in self
+            .relay
+            .enabled_nips
+            .iter()
+            .chain(self.relay.disabled_nips.iter())
+        {
+            if !RELAY_NIPS.contains(nip) {
+                log::warn!(
+                    "relay.enabled_nips/disabled_nips contains unknown NIP-{nip}; it is ignored"
+                );
+            }
+        }
 
         // `require_auth` only takes effect when NIP-42 is enabled (the
         // AUTH message is the only way to authenticate); silently ignoring
@@ -1073,7 +1086,8 @@ impl Config {
             );
         }
         // Limits must be usable (zero would disable core functionality or
-        // make the queue fail fast on the first request).
+        // make the queue fail fast on the first request, or — for content
+        // and tag caps — reject every EVENT and make the relay look dead).
         let l = &self.limits;
         let nonzero = [
             ("limits.max_connections", l.max_connections),
@@ -1088,6 +1102,10 @@ impl Config {
             ("limits.live_buffer", l.live_buffer),
             ("limits.live_batch_size", l.live_batch_size),
             ("limits.max_out_queue_bytes", l.max_out_queue_bytes),
+            ("limits.max_content_bytes", l.max_content_bytes),
+            ("limits.max_tags", l.max_tags),
+            ("limits.max_tag_value_bytes", l.max_tag_value_bytes),
+            ("limits.max_sub_id_len", l.max_sub_id_len),
         ];
         let db_nonzero = [
             ("database.db_buffer_size", self.database.db_buffer_size),
@@ -1224,8 +1242,17 @@ impl Config {
         }
 
         // Blossom file server: the storage backend must be known, and S3
-        // storage needs its credentials. The feature is opt-in via `host`.
+        // storage needs its credentials. The backend value is validated even
+        // while the feature is disabled (`host == ""`) so a latent typo does
+        // not surface only when the operator later enables the host via
+        // SIGHUP (when the reload would be rejected and the old config kept).
         let b = &self.blossom;
+        if !["local", "s3"].contains(&b.storage.as_str()) {
+            return Err(Error::Config(format!(
+                "blossom.storage must be \"local\" or \"s3\", got {:?}",
+                b.storage
+            )));
+        }
         if !b.host.trim().is_empty() {
             if b.max_upload_bytes == 0 {
                 return Err(Error::Config(
@@ -1238,24 +1265,19 @@ impl Config {
                         return Err(Error::Config("blossom.local_path must not be empty".into()));
                     }
                 }
-                "s3" => {
-                    if b.s3_endpoint.trim().is_empty()
-                        || b.s3_bucket.trim().is_empty()
-                        || b.s3_access_key.trim().is_empty()
-                        || b.s3_secret_key.trim().is_empty()
-                    {
-                        return Err(Error::Config(
-                            "blossom.storage = \"s3\" requires s3_endpoint, s3_bucket, \
-                             s3_access_key and s3_secret_key"
-                                .into(),
-                        ));
-                    }
+                "s3" if b.s3_endpoint.trim().is_empty()
+                    || b.s3_bucket.trim().is_empty()
+                    || b.s3_access_key.trim().is_empty()
+                    || b.s3_secret_key.trim().is_empty() =>
+                {
+                    return Err(Error::Config(
+                        "blossom.storage = \"s3\" requires s3_endpoint, s3_bucket, \
+                         s3_access_key and s3_secret_key"
+                            .into(),
+                    ));
                 }
-                other => {
-                    return Err(Error::Config(format!(
-                        "blossom.storage must be \"local\" or \"s3\", got {other:?}"
-                    )));
-                }
+                // Unreachable: validated above even when disabled.
+                _ => {}
             }
         }
         Ok(())
@@ -2551,6 +2573,36 @@ log_max_files = 2
             cfg.validate().is_err(),
             "max_connections must be at least 1"
         );
+        // Content/tag caps of zero would reject every EVENT.
+        for set in [
+            |c: &mut Config| c.limits.max_content_bytes = 0,
+            |c: &mut Config| c.limits.max_tags = 0,
+            |c: &mut Config| c.limits.max_tag_value_bytes = 0,
+            |c: &mut Config| c.limits.max_sub_id_len = 0,
+        ] {
+            let mut cfg = Config::default();
+            set(&mut cfg);
+            assert!(cfg.validate().is_err(), "zero content/tag caps must fail");
+        }
+    }
+
+    #[test]
+    fn validation_rejects_unknown_blossom_storage_even_when_disabled() {
+        let mut cfg = Config::default();
+        cfg.blossom.host = String::new();
+        cfg.blossom.storage = "bogus".into();
+        assert!(
+            cfg.validate().is_err(),
+            "an unknown storage backend must fail even while disabled"
+        );
+    }
+
+    #[test]
+    fn nip29_kinds_cover_the_full_moderation_range() {
+        let kinds = Config::nip_kinds(29).expect("NIP-29 has kinds");
+        for k in [9000u64, 9003, 9004, 9006, 9010, 9021, 39000, 39005] {
+            assert!(kinds.contains(&k), "NIP-29 kinds must include {k}");
+        }
     }
 
     #[test]

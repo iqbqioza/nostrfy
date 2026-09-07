@@ -508,12 +508,8 @@ async fn get_blob(
     } else {
         (end - start + 1) as u64
     };
-    match state
-        .store
-        .open_stream(&desc.pubkey, &sha, start as u64, len)
-        .await
-    {
-        Ok(Some(stream)) => {
+    match state.store.open_stream_any(&sha, start as u64, len).await {
+        Ok(Some((stream, _owner))) => {
             // A range-unaware S3-compatible backend answers a ranged GET
             // with 200 and the full object from byte 0: serve the whole
             // blob as a 200 instead of mislabeling bytes 0..len as
@@ -779,10 +775,12 @@ async fn list(
     }
     let limit = match params.get("limit") {
         Some(v) => match v.parse::<usize>() {
-            Ok(l) => Some(l),
+            // Bound the page: an unbounded `?limit=9999999` would serialize
+            // every blob of a heavy uploader into one response.
+            Ok(l) => Some(l.min(1000)),
             Err(_) => return error(StatusCode::BAD_REQUEST, "invalid limit"),
         },
-        None => None,
+        None => Some(100),
     };
     let cursor = params.get("cursor").map(String::as_str);
     let mut blobs = state.store.list(&pubkey).await;
@@ -1495,5 +1493,53 @@ mod tests {
         assert_eq!(split_blob("short"), None);
         assert_eq!(split_blob(&format!("{}.png/x", "a".repeat(64))), None);
         assert_eq!(split_blob(&"A".repeat(64)), Some("a".repeat(64)));
+    }
+
+    #[tokio::test]
+    async fn list_caps_page_size() {
+        // `?limit=` is capped at 1000 with a default of 100: a heavy
+        // uploader cannot force a single unbounded JSON page.
+        let relay = build_blossom_relay(0).await;
+        let pk = "aa".repeat(32);
+        let state = state_of(&relay).await.expect("blossom state");
+        for i in 0..5 {
+            let sha = sha256_hex(format!("blob-{i}").as_bytes());
+            state
+                .store
+                .put(&pk, &sha, format!("blob-{i}").as_bytes(), "text/plain")
+                .await
+                .unwrap();
+        }
+        let query = |limit: Option<&str>| {
+            let mut map = std::collections::HashMap::new();
+            if let Some(l) = limit {
+                map.insert("limit".to_string(), l.to_string());
+            }
+            axum::extract::Query(map)
+        };
+        let resp = list(
+            State(relay.clone()),
+            AxPath(pk.clone()),
+            query(Some("9999999")),
+        )
+        .await;
+        let body = axum::body::to_bytes(resp.into_body(), 256 * 1024)
+            .await
+            .unwrap();
+        let items: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            items.as_array().unwrap().len() <= 1000,
+            "huge limit must be capped"
+        );
+        let resp = list(State(relay.clone()), AxPath(pk), query(None)).await;
+        let body = axum::body::to_bytes(resp.into_body(), 256 * 1024)
+            .await
+            .unwrap();
+        let items: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            items.as_array().unwrap().len() <= 100,
+            "default page must be bounded"
+        );
+        relay.db.shutdown();
     }
 }

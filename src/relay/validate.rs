@@ -502,7 +502,11 @@ pub(crate) fn contains_secret_key(text: &str) -> bool {
     let win = NSEC_PREFIX.len() + NSEC_BODY_LEN;
     let mut i = 0;
     while i + win <= bytes.len() {
+        // Both window edges must lie on character boundaries: slicing in the
+        // middle of a multi-byte character would panic and turn a crafted
+        // UTF-8 event into a connection-task abort (DoS).
         if text.is_char_boundary(i)
+            && text.is_char_boundary(i + win)
             && bytes[i..i + NSEC_PREFIX.len()]
                 .iter()
                 .zip(NSEC_PREFIX)

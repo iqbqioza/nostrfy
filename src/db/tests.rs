@@ -1930,6 +1930,44 @@ fn reader_requests_survive_a_writer_backlog() {
 }
 
 #[test]
+fn read_flood_does_not_fail_fast_writes() {
+    // Reads are counted separately (`pending_reads`): a REQ flood must not
+    // trip the writer fail-fast gate.
+    let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0, 128, 4, 8).unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let now = unix_now();
+        db.pending_reads
+            .store(1000, std::sync::atomic::Ordering::Relaxed);
+        let out = db.put(event(1, "w", now, vec![]), now).await;
+        assert!(
+            matches!(out, PutOutcome::Stored),
+            "writes must survive a read backlog: {out:?}"
+        );
+        db.shutdown();
+    });
+}
+
+#[test]
+fn kind_and_author_counts_serve_through_the_api_reader() {
+    let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0, 128, 4, 8).unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let now = unix_now();
+        db.put(event(1, "a", now, vec![]), now).await;
+        db.put(event(7, "b", now, vec![]), now).await;
+        let (kinds, _) = db.kind_counts(100).await;
+        assert!(
+            kinds.iter().any(|(k, c)| *k == 1 && *c >= 1),
+            "kind counts must include stored events: {kinds:?}"
+        );
+        let (authors, _) = db.author_counts(100).await;
+        assert!(!authors.is_empty(), "author counts must be served");
+        db.shutdown();
+    });
+}
+
+#[test]
 fn request_fails_fast_when_the_queue_is_full() {
     // Overload protection: with a full queue, new requests fail fast
     // instead of accumulating in memory, and the overload is surfaced

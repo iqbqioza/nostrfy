@@ -222,14 +222,16 @@ impl S3Client {
             ("x-amz-date".to_string(), amz_date.to_string()),
         ];
         if let Some(ct) = content_type {
-            headers.push(("content-type".to_string(), ct.trim().to_ascii_lowercase()));
+            // SigV4 signs header values verbatim (trimmed): lowercasing a
+            // mixed-case MIME (`Text/Plain`) would mismatch the sent value.
+            headers.push(("content-type".to_string(), ct.trim().to_string()));
         }
         for (name, value) in extra_headers {
-            // The name must be lowercased too: S3 canonicalizes the
-            // received headers (HTTP names are case-insensitive and the
-            // client sends them lowercase), so a signed "Range" would
-            // never match the sent "range" — every ranged GET would 403.
-            headers.push((name.to_ascii_lowercase(), value.trim().to_ascii_lowercase()));
+            // Only the name is lowercased: S3 canonicalizes the received
+            // header names (HTTP names are case-insensitive and the client
+            // sends them lowercase), but values are verbatim. Lowercasing a
+            // value would break the signature for mixed-case values.
+            headers.push((name.to_ascii_lowercase(), value.trim().to_string()));
         }
         headers.sort_by(|a, b| a.0.cmp(&b.0));
         let mut canonical_headers = String::new();

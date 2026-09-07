@@ -58,6 +58,31 @@ const SUPPORTED_METHODS: &[&str] = &[
 /// the id lands in a stored relay event and the in-memory role map, so it
 /// must not be able to grow to the full RPC body size.
 const MAX_ROLE_ID_LEN: usize = 64;
+/// Bounds for the free-text role fields (same order as `changerelay*`):
+/// without them a single 64 KiB `createrole` would persist as a relay event
+/// and stay resident in the in-memory role map.
+const MAX_ROLE_LABEL_LEN: usize = 200;
+const MAX_ROLE_DESC_LEN: usize = 1000;
+const MAX_ROLE_COLOR_LEN: usize = 64;
+
+fn check_role_fields(label: &str, description: &str, color: &str) -> Result<(), String> {
+    if label.chars().count() > MAX_ROLE_LABEL_LEN {
+        return Err(format!(
+            "role label exceeds the maximum of {MAX_ROLE_LABEL_LEN} characters"
+        ));
+    }
+    if description.chars().count() > MAX_ROLE_DESC_LEN {
+        return Err(format!(
+            "role description exceeds the maximum of {MAX_ROLE_DESC_LEN} characters"
+        ));
+    }
+    if color.chars().count() > MAX_ROLE_COLOR_LEN {
+        return Err(format!(
+            "role color exceeds the maximum of {MAX_ROLE_COLOR_LEN} characters"
+        ));
+    }
+    Ok(())
+}
 
 fn rpc_ok(result: Value) -> Response {
     (StatusCode::OK, Json(json!({ "result": result }))).into_response()
@@ -310,6 +335,9 @@ pub async fn rpc_handler(
             let description = params.get(2).and_then(Value::as_str).unwrap_or("");
             let color = params.get(3).and_then(Value::as_str).unwrap_or("");
             let order = params.get(4).and_then(Value::as_i64);
+            if let Err(msg) = check_role_fields(label, description, color) {
+                return rpc_err(&msg);
+            }
             if relay
                 .create_role(id, label, description, color, order)
                 .await
@@ -335,6 +363,9 @@ pub async fn rpc_handler(
             let description = params.get(2).and_then(Value::as_str).unwrap_or("");
             let color = params.get(3).and_then(Value::as_str).unwrap_or("");
             let order = params.get(4).and_then(Value::as_i64);
+            if let Err(msg) = check_role_fields(label, description, color) {
+                return rpc_err(&msg);
+            }
             if relay.edit_role(id, label, description, color, order).await {
                 audit!(&relay, &identity, "editrole", params);
                 rpc_ok(json!(true))
@@ -772,6 +803,27 @@ mod tests {
         let resp = rpc_call(&relay, "createrole", vec![]).await;
         assert!(rpc_err_of(resp).await.contains("params"));
         let resp = rpc_call(&relay, "createrole", vec![json!("x".repeat(200))]).await;
+        assert!(rpc_err_of(resp).await.contains("maximum"));
+        let resp = rpc_call(
+            &relay,
+            "createrole",
+            vec![json!("r"), json!("l".repeat(201))],
+        )
+        .await;
+        assert!(rpc_err_of(resp).await.contains("maximum"));
+        let resp = rpc_call(
+            &relay,
+            "createrole",
+            vec![json!("r"), json!(""), json!("d".repeat(1001))],
+        )
+        .await;
+        assert!(rpc_err_of(resp).await.contains("maximum"));
+        let resp = rpc_call(
+            &relay,
+            "createrole",
+            vec![json!("r"), json!(""), json!(""), json!("c".repeat(65))],
+        )
+        .await;
         assert!(rpc_err_of(resp).await.contains("maximum"));
         let resp = rpc_call(&relay, "createrole", vec![json!("r1")]).await;
         assert!(rpc_err_of(resp).await.contains("restricted"));

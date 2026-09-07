@@ -388,15 +388,31 @@ impl Relay {
                         Some((event, json)) => {
                             batch.push((event, json));
                             if batch.len() >= batch_size {
-                                flush(&mut batch);
+                                // A panic in candidate lookup must not kill
+                                // the bus (which would silently stop all live
+                                // delivery once the channel fills): contain it
+                                // and keep serving.
+                                let r = std::panic::catch_unwind(
+                                    std::panic::AssertUnwindSafe(|| flush(&mut batch)),
+                                );
+                                if r.is_err() {
+                                    log::error!("live bus recovered from a panic");
+                                    batch.clear();
+                                }
                             }
                         }
                         None => {
-                            flush(&mut batch);
+                            let _ = std::panic::catch_unwind(
+                                std::panic::AssertUnwindSafe(|| flush(&mut batch)),
+                            );
                             return;
                         }
                     },
-                    _ = interval.tick() => flush(&mut batch),
+                    _ = interval.tick() => {
+                        let _ = std::panic::catch_unwind(
+                            std::panic::AssertUnwindSafe(|| flush(&mut batch)),
+                        );
+                    }
                 }
             }
         });
@@ -1618,6 +1634,22 @@ mod tests {
         // A *mixed-case* string (uppercase prefix, lowercase data) is
         // invalid bech32 and must not be flagged.
         assert!(!contains_secret_key(&format!("NSEC1{}", &key[5..])));
+
+        // A multi-byte boundary must not panic: a 63-byte window ending
+        // inside a multi-byte character is skipped, not sliced.
+        let boundary = format!("{}😀{}ab", "a".repeat(60), key);
+        assert!(contains_secret_key(&boundary));
+        let split_emoji = format!("{}😀{}", "a".repeat(60), "b".repeat(60));
+        assert!(!contains_secret_key(&split_emoji));
+
+        // A bech32m-valid look-alike is not a spendable nsec key (real nsec
+        // is legacy bech32) and must not mute the event.
+        let m_key = crate::nips::nip19::bech32m_encode("nsec", &[0x42u8; 32]).unwrap();
+        assert_ne!(m_key, key, "bech32m encoding differs from bech32");
+        assert!(
+            !contains_secret_key(&m_key),
+            "a bech32m-only nsec look-alike must not be flagged"
+        );
     }
 
     /// Ingestion throughput benchmark through the real write path:

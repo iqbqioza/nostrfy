@@ -2638,6 +2638,49 @@ mod tests {
     }
 
     #[test]
+    fn req_failed_replacement_releases_the_old_subscription() {
+        // A failed re-REQ (CLOSED) must release the previous subscription
+        // held under the same id: otherwise the ghost keeps receiving live
+        // events for a client-considered-closed id.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            conn.handle_req(&[json!("ghost"), json!({"kinds": [1]})])
+                .await;
+            assert!(conn.subs.contains_key("ghost"));
+            conn.outgoing.clear();
+
+            let mut args = vec![json!("ghost")];
+            for _ in 0..25 {
+                args.push(json!({"kinds": [1]}));
+            }
+            conn.handle_req(&args).await;
+            assert!(
+                outgoing_json(&conn)
+                    .iter()
+                    .any(|m| m[0] == "CLOSED" && m[1] == "ghost"),
+                "the failed re-REQ must close the id"
+            );
+            assert!(
+                !conn.subs.contains_key("ghost"),
+                "the old subscription must be released"
+            );
+
+            // No live delivery for the closed id.
+            let now = unix_now();
+            let ev = signed_note(conn.relay.secp(), "live", now, vec![]);
+            conn.deliver_live(&ev, &serde_json::to_string(&ev).unwrap_or_default(), None);
+            assert!(
+                !outgoing_json(&conn)
+                    .iter()
+                    .any(|m| m[0] == "EVENT" && m[1] == "ghost"),
+                "a closed id must not receive live events"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
     fn text_ping_is_answered_with_pong() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -3073,10 +3116,13 @@ mod tests {
             assert_eq!(stored.len(), 5, "all five events are queryable");
 
             // The per-connection item cap is enforced across concurrent
-            // subscriptions (cap = max_neg_items * 2).
+            // subscriptions (cap = max_neg_items * 2). Use a max that covers
+            // the five stored events so each query is complete (`more ==
+            // false`); a smaller max would correctly reject every query as
+            // "too big" instead of syncing a truncated set.
             {
                 let mut w = conn.relay.config.write().await;
-                w.limits.max_neg_items = 3;
+                w.limits.max_neg_items = 5;
             }
             conn.handle_neg_open(&[json!("a"), json!({"kinds": [1]}), json!("61000000")])
                 .await;
@@ -3097,7 +3143,14 @@ mod tests {
             conn.handle_neg_close(&[json!("b")]);
             conn.handle_neg_close(&[json!("c")]);
 
-            // Protected events are withheld from anonymous peers.
+            // Protected events are withheld from anonymous peers. Raise the
+            // item cap so the six stored events (five public + one hidden)
+            // fit: the query is complete and the hidden event is filtered
+            // after the scan.
+            {
+                let mut w = conn.relay.config.write().await;
+                w.limits.max_neg_items = 10;
+            }
             let mut protected = signed_note(conn.relay.secp(), "secret", now, vec![]);
             protected.tags = vec![vec!["-".into()]];
             protected.id = crate::nips::nip01::compute_id(&protected);
@@ -3184,6 +3237,35 @@ mod tests {
             assert!(outgoing_json(&conn).iter().any(|m| m[0] == "NOTICE"));
             conn.outgoing.clear();
 
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn neg_syncs_loose_protected_tag_as_public() {
+        // `["-", "extra"]` is public like the REQ path: only the exact
+        // `["-"]` tag is protected. An anonymous NEG-OPEN must include it
+        // in the sync set instead of withholding it.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let now = unix_now();
+            let mut ev = signed_note(conn.relay.secp(), "loose", now, vec![]);
+            ev.tags = vec![vec!["-".into(), "extra".into()]];
+            ev.id = crate::nips::nip01::compute_id(&ev);
+            conn.relay.db.put(ev.clone(), now).await;
+            {
+                let mut w = conn.relay.config.write().await;
+                w.limits.max_neg_items = 10;
+            }
+            conn.handle_neg_open(&[json!("loose"), json!({"kinds": [1]}), json!("61000000")])
+                .await;
+            let state = conn.neg.get("loose").expect("sync must stay open");
+            let want = ev.id_bytes().expect("test event id");
+            assert!(
+                state.items.iter().any(|(_, id)| *id == want),
+                "a [\"-\", \"extra\"] event must be synced to anonymous peers"
+            );
             conn.relay.db.shutdown();
         });
     }

@@ -292,6 +292,10 @@ pub struct DbClient {
     /// Events inside the queued `PutBatch`/`Put` messages (the dominant
     /// memory of the queue).
     pending_events: Arc<std::sync::atomic::AtomicUsize>,
+    /// Read-only messages queued but not yet drained by the reader threads.
+    /// Counted separately from the writer queue so a REQ flood cannot
+    /// fail-fast the EVENT writes (and vice versa).
+    pending_reads: Arc<std::sync::atomic::AtomicUsize>,
     /// Queued-but-unprocessed REST API queries, counted separately so an API
     /// flood fails fast without tripping the WebSocket-side caps.
     api_pending: Arc<std::sync::atomic::AtomicUsize>,
@@ -340,6 +344,7 @@ impl DbClient {
             timeout_secs: threads.timeout_secs,
             pending_msgs: threads.pending_msgs,
             pending_events: threads.pending_events,
+            pending_reads: threads.pending_reads,
             api_pending: threads.api_pending,
             max_pending_msgs: threads.max_pending_msgs,
             max_pending_events: threads.max_pending_events,
@@ -373,12 +378,12 @@ impl DbClient {
     ) -> R {
         let (tx, rx) = oneshot::channel();
         let msg = make(tx);
-        self.pending_msgs
+        self.pending_reads
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if self.read_tx.send(msg).is_err() {
             // The reader thread's receiver is gone: the relay is shutting
             // down or the thread died. There is no state to load.
-            self.pending_msgs
+            self.pending_reads
                 .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             log::error!("database reader is gone; cannot load persisted state");
             return R::default();
@@ -441,51 +446,87 @@ impl DbClient {
     }
 
     /// Like [`Self::send_request`], but with `check_writer` the fail-fast
-    /// gate also inspects the writer-queue counters (`pending_msgs` /
+    /// gate inspects only the writer-queue counters (`pending_msgs` /
     /// `pending_events`). Read-only requests on the dedicated reader
-    /// channel pass `false`: the whole point of the separate reader threads
-    /// is that reads keep working while the writer is stalled, so a
-    /// write-backlog must not fail-fast the reads.
+    /// channel pass `false`: they are counted in `pending_reads` (never in
+    /// the writer counters), so a read flood cannot fail-fast the writes
+    /// and a write backlog must not fail-fast the reads. Accounting uses
+    /// add-then-check with rollback so concurrent bursts cannot overshoot
+    /// the caps without bound (check-then-add had a TOCTOU window).
     fn send_request_checked<R>(
         &self,
         make: impl FnOnce(oneshot::Sender<R>) -> Msg,
         channel: &mpsc::UnboundedSender<Msg>,
         check_writer: bool,
     ) -> Option<oneshot::Receiver<R>> {
-        let writer_stalled = check_writer
-            && (self.pending_msgs.load(std::sync::atomic::Ordering::Relaxed)
-                >= self.max_pending_msgs
-                || self
-                    .pending_events
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                    >= self.max_pending_events);
-        if writer_stalled {
-            // Surface the overload in the stats (db_errors).
-            self.errors
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return None;
-        }
         let (tx, rx) = oneshot::channel();
         let msg = make(tx);
-        self.pending_msgs
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if let Msg::PutBatch { events, .. } = &msg {
-            self.pending_events
-                .fetch_add(events.len(), std::sync::atomic::Ordering::Relaxed);
-        } else if let Msg::Put { .. } = &msg {
-            self.pending_events
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let is_write = matches!(msg, Msg::Put { .. } | Msg::PutBatch { .. });
+        let write_events = match &msg {
+            Msg::PutBatch { events, .. } => events.len(),
+            Msg::Put { .. } => 1,
+            _ => 0,
+        };
+        if check_writer || is_write {
+            // Writer path (and any gated path): reserve first, then enforce.
+            let msgs = self
+                .pending_msgs
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                .saturating_add(1);
+            let events = if write_events > 0 {
+                self.pending_events
+                    .fetch_add(write_events, std::sync::atomic::Ordering::Relaxed)
+                    .saturating_add(write_events)
+            } else {
+                self.pending_events
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            };
+            if msgs > self.max_pending_msgs || events > self.max_pending_events {
+                self.pending_msgs
+                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                if write_events > 0 {
+                    self.pending_events
+                        .fetch_sub(write_events, std::sync::atomic::Ordering::Relaxed);
+                }
+                self.errors
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return None;
+            }
+        } else {
+            // Reader path: separate counter with the same message cap so a
+            // REQ flood fails fast instead of growing unbounded and (via the
+            // old shared counter) blocking the writes.
+            let reads = self
+                .pending_reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                .saturating_add(1);
+            if reads > self.max_pending_msgs {
+                self.pending_reads
+                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                self.errors
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return None;
+            }
         }
         if let Err(err) = channel.send(msg) {
             let msg = err.0;
-            self.pending_msgs
-                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-            if let Msg::PutBatch { events, .. } = &msg {
-                self.pending_events
-                    .fetch_sub(events.len(), std::sync::atomic::Ordering::Relaxed);
-            } else if let Msg::Put { .. } = &msg {
-                self.pending_events
-                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            match &msg {
+                Msg::PutBatch { events, .. } => {
+                    self.pending_msgs
+                        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    self.pending_events
+                        .fetch_sub(events.len(), std::sync::atomic::Ordering::Relaxed);
+                }
+                Msg::Put { .. } => {
+                    self.pending_msgs
+                        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    self.pending_events
+                        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                _ => {
+                    self.pending_reads
+                        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                }
             }
             return None;
         }
@@ -779,16 +820,47 @@ impl DbClient {
         .await
     }
 
-    /// Relay-wide per-kind event counts (REST API).
+    /// Relay-wide per-kind event counts (REST API). Served by the dedicated
+    /// API reader thread so heavy aggregate walks never stall WebSocket
+    /// REQ/COUNT/NEG queries on the shared reader.
     pub async fn kind_counts(&self, max_keys: usize) -> (Vec<(u64, u64)>, bool) {
-        self.request_read(|reply| Msg::KindCounts { max_keys, reply })
+        self.api_request(|reply| Msg::KindCounts { max_keys, reply })
             .await
     }
 
-    /// Relay-wide per-author event counts (REST API).
+    /// Relay-wide per-author event counts (REST API). Same isolation as
+    /// [`Self::kind_counts`].
     pub async fn author_counts(&self, max_keys: usize) -> (AuthorCounts, bool) {
-        self.request_read(|reply| Msg::AuthorCounts { max_keys, reply })
+        self.api_request(|reply| Msg::AuthorCounts { max_keys, reply })
             .await
+    }
+
+    /// Generic REST-API reader request with the API queue cap and timeout.
+    async fn api_request<R: Default>(&self, make: impl FnOnce(oneshot::Sender<R>) -> Msg) -> R {
+        if self.api_pending.load(std::sync::atomic::Ordering::Relaxed) >= self.max_api_pending {
+            self.errors
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return R::default();
+        }
+        let (tx, rx) = oneshot::channel();
+        self.api_pending
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let msg = make(tx);
+        if self.api_read_tx.send(msg).is_err() {
+            self.api_pending
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            return R::default();
+        }
+        // The API reader thread decrements `api_pending` on completion
+        // (including its panic path), so this path must not decrement again.
+        if self.timeout_secs == 0 {
+            rx.await.unwrap_or_default()
+        } else {
+            tokio::time::timeout(std::time::Duration::from_secs(self.timeout_secs), rx)
+                .await
+                .map(|r| r.unwrap_or_default())
+                .unwrap_or_default()
+        }
     }
 
     pub async fn apply_deletion(

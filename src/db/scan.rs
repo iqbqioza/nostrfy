@@ -322,10 +322,9 @@ impl ScanCollector for ItemCollector {
         } else if self.items.len() + 1 == limit {
             self.boundary = Some(event.created_at());
         }
-        let protected = event
-            .tags()
-            .iter()
-            .any(|t| t.first().map(String::as_str) == Some(crate::nips::nip70::PROTECTED_TAG));
+        let protected = event.tags().iter().any(|t| {
+            t.len() == 1 && t.first().map(String::as_str) == Some(crate::nips::nip70::PROTECTED_TAG)
+        });
         let (gid, meta) = match crate::nips::nip29::group_id_any_light(event) {
             Some(gid) => {
                 let meta = (crate::nips::nip29::GROUP_META..=crate::nips::nip29::GROUP_PINS)
@@ -1224,10 +1223,16 @@ fn consider_event<C: ScanCollector>(
         if !is_deliverable(ctx, &event, filter, terms, now)? {
             return Ok(true);
         }
+        // Only record the event as seen when it was actually collected, like
+        // the full path below: an event that hit this filter's limit must
+        // still be available to a later filter and must stop the walk with
+        // `more` instead of silently claiming completeness.
         if out.push_light(&event, id, limit) {
             seen.insert(id.to_vec());
+            return Ok(true);
+        } else {
+            return Ok(false);
         }
-        return Ok(true);
     }
     let Ok(event) = serde_json::from_slice::<Event>(raw) else {
         return Ok(true);
@@ -1403,6 +1408,31 @@ mod tests {
         c.sort_relevance(&[], &[]);
         c.truncate_to(3);
         assert_eq!(c.items.len(), 3);
+    }
+
+    #[test]
+    fn push_light_matches_strict_protected_semantics() {
+        use super::{ItemCollector, NegLight, ScanCollector};
+        let mut c = ItemCollector::new(8);
+        let strict = NegLight {
+            id: "a".repeat(64),
+            pubkey: "b".repeat(64),
+            created_at: 1,
+            kind: 1,
+            tags: vec![vec!["-".into()]],
+        };
+        assert!(c.push_light(&strict, [0x01u8; 32], 8));
+        assert!(c.items[0].protected, "exact [\"-\"] is protected");
+        let mut c = ItemCollector::new(8);
+        let loose = NegLight {
+            tags: vec![vec!["-".into(), "extra".into()]],
+            ..strict
+        };
+        assert!(c.push_light(&loose, [0x02u8; 32], 8));
+        assert!(
+            !c.items[0].protected,
+            "[\"-\", \"extra\"] is public like the full path"
+        );
     }
 
     #[test]

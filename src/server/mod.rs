@@ -939,6 +939,22 @@ async fn serve_limited(
                     }),
                 );
                 conn_tasks.push(tokio::spawn(async move {
+                    // Guard the accept-layer connection count: a panic in the
+                    // serve path must still release the slot, otherwise the
+                    // `>= max_connections` check above would refuse every new
+                    // connection forever (the WS layer already uses
+                    // `ConnectionGuard` for the same reason).
+                    struct ActiveGuard {
+                        active: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+                    }
+                    impl Drop for ActiveGuard {
+                        fn drop(&mut self) {
+                            self.active.fetch_sub(1, Ordering::Relaxed);
+                        }
+                    }
+                    let _guard = ActiveGuard {
+                        active: Arc::clone(&active),
+                    };
                     let mut builder = hyper_util::server::conn::auto::Builder::new(
                         hyper_util::rt::TokioExecutor::new(),
                     );
@@ -966,7 +982,7 @@ async fn serve_limited(
                             let _ = conn.as_mut().await;
                         }
                     }
-                    active.fetch_sub(1, Ordering::Relaxed);
+                    // Released by `_guard` on every exit path including panic.
                 }));
                 // Bound the handle vector: prune the finished tasks once
                 // it grows past 1024 entries (amortized constant work per
@@ -1227,6 +1243,18 @@ async fn reload_handler(
                                 old.rpc.max_admin_body_bytes
                                     != new_config.rpc.max_admin_body_bytes,
                             ),
+                            (
+                                "relay.max_groups",
+                                old.relay.max_groups != new_config.relay.max_groups,
+                            ),
+                            (
+                                "daemon.log_file",
+                                old.daemon.log_file != new_config.daemon.log_file,
+                            ),
+                            (
+                                "daemon.pid_file",
+                                old.daemon.pid_file != new_config.daemon.pid_file,
+                            ),
                         ];
                         for (name, changed) in static_routes {
                             if changed {
@@ -1235,6 +1263,22 @@ async fn reload_handler(
                                      fixed at startup; a restart is required to apply it"
                                 );
                             }
+                        }
+                        // The kind/IP access lists are runtime-managed via NIP-86
+                        // and persisted in the database: editing them in the
+                        // config file has no effect after the first run (the
+                        // persisted state wins). Warn so the operator uses the
+                        // management API instead of wondering why the file is
+                        // ignored. `restrict_relay` is config-owned and applies.
+                        if old.access.blocked_kinds != new_config.access.blocked_kinds
+                            || old.access.allowed_kinds != new_config.access.allowed_kinds
+                            || old.access.blocked_ips != new_config.access.blocked_ips
+                        {
+                            warn!(
+                                "access.blocked_kinds/allowed_kinds/blocked_ips changed in the \
+                                 reloaded config but access lists are runtime-managed (NIP-86) \
+                                 and persisted in the database; the file change is ignored"
+                            );
                         }
                         drop(old);
                         *config.write().await = new_config;

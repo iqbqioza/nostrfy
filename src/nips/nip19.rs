@@ -58,11 +58,13 @@ fn verify_checksum(hrp: &[u8], data: &[u8]) -> Option<bool> {
     }
 }
 
-/// Whether `s` is a complete `hrp`-prefixed bech32/bech32m string with a
+/// Whether `s` is a complete `hrp`-prefixed bech32 string with a
 /// valid checksum (BIP-173). Case-insensitive (BIP-173 permits all-lowercase
 /// or all-uppercase) but a *mixed-case* string is invalid bech32 and
 /// returns `false`, so the nsec-leak detector never mistakes a mixed-case
-/// look-alike for a real secret key.
+/// look-alike for a real secret key. Only legacy bech32 (constant `1`) is
+/// accepted: a bech32m-valid look-alike is not a spendable `nsec` key and
+/// must not mute the event.
 pub(crate) fn bech32_checksum_valid(hrp: &str, s: &str) -> bool {
     let is_lower = !s.chars().any(|c| c.is_ascii_uppercase());
     let is_upper = !s.chars().any(|c| c.is_ascii_lowercase());
@@ -88,7 +90,7 @@ pub(crate) fn bech32_checksum_valid(hrp: &str, s: &str) -> bool {
     let Some(data) = data else {
         return false;
     };
-    verify_checksum(hrp.as_bytes(), &data).is_some()
+    verify_checksum(hrp.as_bytes(), &data) == Some(false)
 }
 
 /// Create a bech32 checksum for `data` (without checksum). NIP-19
@@ -418,6 +420,22 @@ pub fn parse_nip19(input: &str) -> Result<Nip19Entity, Bech32Error> {
                 d_tag,
                 relays,
             })
+        }
+        // NIP-19 `nprofile1...`: TLV with type 0 = 32-byte pubkey and
+        // optional type 1 relays. Resolves to the author like `npub1...`
+        // so REST identifiers and inbox/outbox filters accept it.
+        "nprofile" => {
+            let tlv = parse_tlv(&data)?;
+            let mut pubkey = None;
+            for (tlv_type, value) in &tlv {
+                if *tlv_type == TLV_SPECIAL && value.len() == 32 {
+                    let mut buf = [0u8; 32];
+                    buf.copy_from_slice(value);
+                    pubkey = Some(buf);
+                }
+            }
+            let pubkey = pubkey.ok_or(Bech32Error::InvalidTlv)?;
+            Ok(Nip19Entity::Pubkey(pubkey))
         }
         other => Err(Bech32Error::UnknownPrefix(other.to_string())),
     }

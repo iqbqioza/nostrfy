@@ -37,7 +37,11 @@ pub(crate) async fn livekit_token(
     AxPath(group): AxPath<String>,
 ) -> impl IntoResponse {
     let cfg = relay.config.read().await;
+    // Gate on the URL too (mirroring `livekit_supported`): with `url == ""`
+    // a minted token carries an empty endpoint and is unusable; fail closed
+    // instead of issuing it.
     if !cfg.nip_enabled(29)
+        || cfg.relay.livekit_url.is_empty()
         || cfg.relay.livekit_api_key.is_empty()
         || cfg.relay.livekit_api_secret.is_empty()
     {
@@ -263,6 +267,33 @@ mod tests {
             status,
             StatusCode::UNAUTHORIZED,
             "a group the relay does not host must not mint a token"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn missing_url_refuses_token() {
+        // `livekit_url == ""` must fail closed like `livekit_supported`'s
+        // 404: a minted token with an empty endpoint is unusable.
+        let relay = build_relay().await;
+        relay.groups.write().await.groups.insert(
+            "open".into(),
+            crate::nips::nip29::Group {
+                settings: crate::nips::nip29::GroupSettings::default(),
+                ..Default::default()
+            },
+        );
+        {
+            let mut cfg = relay.config.write().await;
+            cfg.relay.livekit_url = String::new();
+        }
+        let secp = relay.secp().clone();
+        let ev = signed_token_auth(&relay, &secp, "open").await;
+        let (status, _, _) = token_status(&relay, "open", &ev).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "an empty livekit_url must not mint a token"
         );
         relay.db.shutdown();
     }

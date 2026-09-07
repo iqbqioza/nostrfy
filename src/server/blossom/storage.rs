@@ -23,7 +23,10 @@ pub(crate) struct Descriptor {
     pub size: u64,
     pub mime: String,
     pub uploaded: i64,
-    /// The uploader's hex pubkey.
+    /// One uploader (the first reachable copy); kept for callers that
+    /// report ownership. GET opens via `open_stream_any`, which tries every
+    /// owner, so this field is informational.
+    #[allow(dead_code)]
     pub pubkey: String,
 }
 
@@ -156,6 +159,27 @@ impl BlobStore {
             uploaded: meta.uploaded,
             pubkey: meta.owners.into_iter().next()?,
         })
+    }
+
+    /// Opens a blob by hash, trying every owner in upload order. The first
+    /// owner's file may be gone (crash/manual delete) while a later owner's
+    /// copy is intact: opening only `owners[0]` would 404 a retrievable blob.
+    /// Returns the stream and the owner whose file was opened.
+    pub(crate) async fn open_stream_any(
+        &self,
+        sha256: &str,
+        start: u64,
+        len: u64,
+    ) -> Result<Option<(BlobStream, String)>> {
+        let Some(meta) = self.db.blossom_load(sha256).await else {
+            return Ok(None);
+        };
+        for owner in &meta.owners {
+            if let Some(stream) = self.open_stream(owner, sha256, start, len).await? {
+                return Ok(Some((stream, owner.clone())));
+            }
+        }
+        Ok(None)
     }
 
     /// Whether `pubkey` has uploaded this blob.
@@ -817,6 +841,35 @@ mod tests {
         // The last owner's delete removes the mapping.
         assert!(s.delete(&a, &sha).await.unwrap());
         assert!(s.find(&sha).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn open_stream_any_falls_back_to_second_owner() {
+        // The first owner's file may vanish out-of-band while a later
+        // owner's copy is intact: the blob must still stream.
+        let (s, _db_path) = store("fallback").await;
+        let a = pk(1);
+        let b = pk(2);
+        let sha = "cd".repeat(32);
+        let bytes = b"fallback blob";
+        s.put(&a, &sha, bytes, "text/plain").await.unwrap();
+        s.put(&b, &sha, bytes, "text/plain").await.unwrap();
+        // Delete A's file behind the mapping's back (same layout as
+        // `store()`: tempdir/nostrfy-blossom-test-fallback-<pid>/<npub>/<sha>).
+        let dir = std::env::temp_dir().join(format!(
+            "nostrfy-blossom-test-fallback-{}",
+            std::process::id()
+        ));
+        tokio::fs::remove_file(dir.join(npub_of(&a)).join(&sha))
+            .await
+            .unwrap();
+        let (stream, owner) = s
+            .open_stream_any(&sha, 0, bytes.len() as u64)
+            .await
+            .unwrap()
+            .expect("second owner's copy must stream");
+        assert_eq!(owner, b);
+        drop(stream);
     }
 
     #[tokio::test]

@@ -241,7 +241,10 @@ pub(crate) fn rewrite_inbox_outbox(value: &mut Value) -> Result<(), String> {
         for item in items {
             let valid_hex = item.len() == 64 && item.chars().all(|c| c.is_ascii_hexdigit());
             let hex_pk = if valid_hex {
-                item.to_string()
+                // Normalize to lowercase: the stored index is byte-based
+                // (case-insensitive) while the live match is string-based, so
+                // an uppercase filter would hit history but miss live events.
+                item.to_ascii_lowercase()
             } else if let Ok(crate::nips::nip19::Nip19Entity::Pubkey(pk)) =
                 crate::nips::nip19::parse_nip19(&item)
             {
@@ -252,6 +255,13 @@ pub(crate) fn rewrite_inbox_outbox(value: &mut Value) -> Result<(), String> {
             pubkeys.push(hex_pk);
         }
         let entry = map.entry(dst.to_string()).or_insert_with(|| json!([]));
+        // A single-string `#p`/`authors` is valid NIP-01 (`tag_values` and
+        // `invalid_tag_values` accept it): promote it to an array instead of
+        // rejecting the subscription.
+        if entry.is_string() {
+            let s = entry.as_str().unwrap_or_default().to_string();
+            *entry = json!([s]);
+        }
         if let Some(arr) = entry.as_array_mut() {
             for pk in pubkeys {
                 if !arr.iter().any(|v| v == &json!(pk)) {
@@ -476,6 +486,23 @@ mod tests {
             3,
             "inbox values merge with existing #p"
         );
+    }
+
+    #[test]
+    fn inbox_merges_with_single_string_tag_and_lowercases() {
+        // A single-string `#p` is valid NIP-01: promote, don't reject.
+        let pk = "aa".repeat(32);
+        let mut v = serde_json::json!({"inbox": pk, "#p": "bb".repeat(32)});
+        rewrite_inbox_outbox(&mut v).unwrap();
+        let arr = v["#p"].as_array().expect("promoted to array");
+        assert_eq!(arr.len(), 2, "single-string #p merges with inbox");
+
+        // Uppercase hex is normalized so live (string) and stored (byte)
+        // matches agree.
+        let upper = "AA".repeat(32);
+        let mut v = serde_json::json!({"inbox": upper});
+        rewrite_inbox_outbox(&mut v).unwrap();
+        assert_eq!(v, serde_json::json!({"#p": ["aa".repeat(32)]}));
     }
 
     #[test]

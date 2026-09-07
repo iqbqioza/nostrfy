@@ -293,11 +293,11 @@ impl super::Conn {
         let eose_hint = cfg.nip_enabled(67);
         drop(cfg);
         if sub_id.is_empty() {
-            self.send_closed(sub_id, "invalid: subscription id must not be empty");
+            self.reject_req(sub_id, "invalid: subscription id must not be empty");
             return;
         }
         if sub_id.len() > max_sub_id_len {
-            self.send_closed(sub_id, "invalid: subscription id too long");
+            self.reject_req(sub_id, "invalid: subscription id too long");
             return;
         }
 
@@ -308,38 +308,38 @@ impl super::Conn {
             // value makes the whole subscription invalid like any other
             // malformed filter field.
             if crate::filter::rewrite_inbox_outbox(&mut f).is_err() {
-                self.send_closed(sub_id, "invalid: invalid filter");
+                self.reject_req(sub_id, "invalid: invalid filter");
                 return;
             }
             match serde_json::from_value::<Filter>(f) {
                 Ok(filter) => filters.push(filter),
                 Err(_) => {
-                    self.send_closed(sub_id, "invalid: invalid filter");
+                    self.reject_req(sub_id, "invalid: invalid filter");
                     return;
                 }
             }
         }
         if filters.is_empty() {
-            self.send_closed(sub_id, "invalid: REQ requires at least one filter");
+            self.reject_req(sub_id, "invalid: REQ requires at least one filter");
             return;
         }
         if filters.len() > max_filters {
-            self.send_closed(sub_id, "invalid: too many filters");
+            self.reject_req(sub_id, "invalid: too many filters");
             return;
         }
         if filters.iter().any(|f| f.too_many_members()) {
-            self.send_closed(sub_id, "invalid: too many ids or authors in a filter");
+            self.reject_req(sub_id, "invalid: too many ids or authors in a filter");
             return;
         }
         if filters.iter().any(|f| f.invalid_tag_values()) {
-            self.send_closed(sub_id, "invalid: tag constraint values must be strings");
+            self.reject_req(sub_id, "invalid: tag constraint values must be strings");
             return;
         }
 
         let search_disabled = filters.iter().any(|f| f.has_search()) && !search_enabled;
 
         if require_auth && !self.is_authed() {
-            self.send_closed(
+            self.reject_req(
                 sub_id,
                 "auth-required: please authenticate before subscribing",
             );
@@ -352,14 +352,14 @@ impl super::Conn {
         // (or NIP-86) apply to this connection immediately — the list is
         // read fresh per message, no reconnect needed.
         if !self.access_allows_read().await {
-            self.send_closed(sub_id, "restricted: you are not allowed to subscribe");
+            self.reject_req(sub_id, "restricted: you are not allowed to subscribe");
             return;
         }
         // NIP-01: re-REQ with an existing id replaces the subscription, so it
         // must not count against the cap — only genuinely new subscriptions
         // are limited.
         if !self.subs.contains_key(sub_id) && self.subs.len() >= max_subscriptions {
-            self.send_closed(sub_id, "error: too many subscriptions");
+            self.reject_req(sub_id, "error: too many subscriptions");
             return;
         }
 
@@ -388,7 +388,7 @@ impl super::Conn {
             .saturating_sub(replacing.unwrap_or(0))
             .saturating_add(sub_bytes);
         if next_total > sub_bytes_limit {
-            self.send_closed(sub_id, "error: too many subscriptions");
+            self.reject_req(sub_id, "error: too many subscriptions");
             return;
         }
         self.sub_bytes = next_total;
@@ -492,6 +492,15 @@ impl super::Conn {
         };
         // `remove_subscription` re-syncs the live index.
         self.remove_subscription(sub_id);
+    }
+
+    /// Rejects a REQ with CLOSED, releasing any previous subscription held
+    /// under the same id first. NIP-01 treats CLOSED as terminal: without the
+    /// removal a failed re-REQ would leave a ghost subscription that keeps
+    /// receiving live events for a client-considered-closed id.
+    fn reject_req(&mut self, sub_id: &str, reason: &str) {
+        self.remove_subscription(sub_id);
+        self.send_closed(sub_id, reason);
     }
 
     /// Re-derives the connection's entries in the live subscription

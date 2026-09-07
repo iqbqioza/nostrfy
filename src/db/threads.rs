@@ -46,6 +46,7 @@ pub(crate) struct DbThreads {
     pub(crate) timeout_secs: u64,
     pub(crate) pending_msgs: Arc<std::sync::atomic::AtomicUsize>,
     pub(crate) pending_events: Arc<std::sync::atomic::AtomicUsize>,
+    pub(crate) pending_reads: Arc<std::sync::atomic::AtomicUsize>,
     pub(crate) api_pending: Arc<std::sync::atomic::AtomicUsize>,
     pub(crate) max_pending_msgs: usize,
     pub(crate) max_pending_events: usize,
@@ -297,9 +298,11 @@ pub(crate) fn spawn(
     let thread_errors = Arc::clone(&errors);
     let pending_msgs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let pending_events = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let pending_reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let thread_pending_msgs = Arc::clone(&pending_msgs);
     let thread_pending_events = Arc::clone(&pending_events);
-    let read_pending = Arc::clone(&pending_msgs);
+    let thread_pending_reads = Arc::clone(&pending_reads);
+    let read_pending = Arc::clone(&pending_reads);
     let api_pending = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let api_thread_pending = Arc::clone(&api_pending);
     // Dedicated reader threads: serve Query/Count/NEG and the small
@@ -319,7 +322,11 @@ pub(crate) fn spawn(
             let read_pending = Arc::clone(&read_pending);
             std::thread::spawn(move || {
                 'reader: loop {
-                    let Some(msg) = read_rx.lock().unwrap().blocking_recv() else {
+                    let Some(msg) = read_rx
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .blocking_recv()
+                    else {
                         break;
                     };
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -881,6 +888,7 @@ pub(crate) fn spawn(
         timeout_secs: request_timeout_secs,
         pending_msgs,
         pending_events,
+        pending_reads: thread_pending_reads,
         api_pending,
         max_pending_msgs: max_pending_msgs.max(1),
         max_pending_events: max_pending_events.max(1),
