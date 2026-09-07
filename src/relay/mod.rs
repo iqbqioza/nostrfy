@@ -1347,6 +1347,149 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn api_limiter_and_connection_slots() {
+        // The limiter caps concurrent acquisitions and honors set_max.
+        let limiter = build_relay().await.api_limit.clone();
+        limiter.set_max(2);
+        let a = limiter.try_acquire().unwrap();
+        let b = limiter.try_acquire().unwrap();
+        assert!(limiter.try_acquire().is_none(), "the cap is enforced");
+        drop(b);
+        let c = limiter.try_acquire().unwrap();
+        limiter.set_max(1);
+        assert!(
+            limiter.try_acquire().is_none(),
+            "a lower ceiling applies to new acquisitions"
+        );
+        drop(a);
+        drop(c);
+        limiter.set_max(0);
+        let _d = limiter.try_acquire().unwrap();
+        assert!(limiter.try_acquire().is_none());
+        drop(_d);
+        assert_eq!(
+            limiter.in_flight.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+
+        // Per-IP connection registration and release.
+        let relay = build_relay().await;
+        let ip: std::net::IpAddr = "198.51.100.9".parse().unwrap();
+        assert!(relay.try_register_connection(&ip, 0), "max 0 = unlimited");
+        assert!(relay.try_register_connection(&ip, 2));
+        assert!(relay.try_register_connection(&ip, 2));
+        assert!(
+            !relay.try_register_connection(&ip, 2),
+            "the per-IP cap holds"
+        );
+        relay.release_connection(&ip);
+        assert!(relay.try_register_connection(&ip, 2));
+        // Releasing a slot for an unknown IP is a no-op.
+        relay.release_connection(&"203.0.113.5".parse().unwrap());
+        relay.release_connection(&ip);
+        relay.release_connection(&ip);
+        assert_eq!(
+            relay.per_ip_connections.lock().unwrap().len(),
+            0,
+            "the map entry is removed at zero"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn persist_relay_field_roundtrip() {
+        let relay = build_relay().await;
+        // No config path: the change warns and stays in memory.
+        *relay.config_path.write().await = None;
+        relay.persist_relay_field("name", "newname").await;
+        // A writable temp config: the field is updated on disk.
+        let dir = std::env::temp_dir().join("nostrfy-persist-field-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("nostrfy.toml");
+        std::fs::write(&path, "[relay]\nname = \"old\"\ndescription = \"d\"\n").unwrap();
+        *relay.config_path.write().await = Some(path.clone());
+        relay.persist_relay_field("name", "newname").await;
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("newname"),
+            "the field must be persisted: {text}"
+        );
+        // An unreadable path warns and leaves the in-memory change applied.
+        *relay.config_path.write().await = Some(dir.join("missing.toml"));
+        relay.persist_relay_field("description", "x").await;
+        let _ = std::fs::remove_dir_all(&dir);
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn first_seen_min_age_gates_new_pubkeys() {
+        let relay = build_relay().await;
+        {
+            let mut cfg = relay.config.write().await;
+            cfg.relay.new_pubkey_min_age_secs = 100;
+        }
+        let secp = secp256k1::Secp256k1::new();
+        let keypair = secp256k1::Keypair::from_seckey_slice(&secp, &[7u8; 32]).unwrap();
+        let pubkey = secp256k1::XOnlyPublicKey::from_keypair(&keypair)
+            .0
+            .to_string();
+        let mut ev = crate::event::Event {
+            id: String::new(),
+            pubkey: pubkey.clone(),
+            created_at: crate::util::unix_now(),
+            kind: 1,
+            tags: vec![],
+            content: "too young".into(),
+            sig: String::new(),
+        };
+        ev.id = crate::nips::nip01::compute_id(&ev);
+        let id = ev.id_bytes().unwrap();
+        ev.sig = secp.sign_schnorr_no_aux_rand(&id, &keypair).to_string();
+        // A pubkey recorded ten seconds ago is still inside the 100-second
+        // gate: its event is rejected as too new.
+        relay
+            .db
+            .touch_first_seen_batch(vec![(
+                hex::decode(&pubkey).unwrap().try_into().unwrap(),
+                crate::util::unix_now() - 10,
+            )])
+            .await;
+        let (outcome, _) = relay.accept_event(ev.clone(), &[], None).await;
+        assert!(
+            matches!(&outcome, crate::db::PutOutcome::Invalid(r) if r.contains("too new")),
+            "a too-new account must be gated: {outcome:?}"
+        );
+        // A pubkey with no recorded first-seen (its very first event) is
+        // allowed: the event establishes the account's arrival time.
+        let other_keypair = secp256k1::Keypair::from_seckey_slice(&secp, &[8u8; 32]).unwrap();
+        let other_pubkey = secp256k1::XOnlyPublicKey::from_keypair(&other_keypair)
+            .0
+            .to_string();
+        let mut ev2 = crate::event::Event {
+            id: String::new(),
+            pubkey: other_pubkey,
+            created_at: crate::util::unix_now(),
+            kind: 1,
+            tags: vec![],
+            content: "first event".into(),
+            sig: String::new(),
+        };
+        ev2.id = crate::nips::nip01::compute_id(&ev2);
+        let id = ev2.id_bytes().unwrap();
+        ev2.sig = secp
+            .sign_schnorr_no_aux_rand(&id, &other_keypair)
+            .to_string();
+        let (outcome, _) = relay.accept_event(ev2, &[], None).await;
+        assert!(
+            matches!(outcome, crate::db::PutOutcome::Stored),
+            "the first event of an unknown pubkey is accepted"
+        );
+        let _ = ev;
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
     async fn reload_db_state_applies_persisted_lists() {
         let relay = build_relay().await;
         relay
