@@ -207,7 +207,7 @@ When publishing fails, the 4th element of the `OK` message explains why. The com
 | `invalid: content too large` | Content exceeds `max_content_bytes` (default 64K characters). Shorten it or raise the limit |
 | `invalid: too many tags` | More tags than `max_tags` (default 2000) |
 | `invalid: tag value too large` | A tag value exceeds `max_tag_value_bytes` (default 1 KB) |
-| `mute: event creation date is in the future` | Timestamp too far in the future (beyond `max_created_at_future_secs`) |
+| `invalid: event creation date is in the future` | Timestamp too far in the future (beyond `max_created_at_future_secs`) |
 | `mute: event contains secret key material` | The content or tags contain an nsec-looking string. **Never post secret keys.** Remove the string and the event is accepted |
 | `duplicate: event already stored` | The same event is already stored (normal) |
 | `blocked: pubkey not allowed` | The pubkey is banned (`banpubkey`) or outside the allowlist |

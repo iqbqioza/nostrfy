@@ -322,7 +322,7 @@ The changes take effect immediately and are persisted (same lists as `nostrfy re
 
 **`max_tag_value_bytes`** — The maximum size (bytes) of a single tag value. Longer values are rejected with `invalid: tag value too large`.
 
-**`max_created_at_future_secs`** — How far into the future an event's `created_at` may be. Beyond this the event is **silently dropped** (`OK false` with `mute: event creation date is in the future`) instead of being rejected as invalid.
+**`max_created_at_future_secs`** — How far into the future an event's `created_at` may be. Beyond this the event is rejected as invalid (`OK false` with `invalid: event creation date is in the future`).
 
 **`max_neg_items`** — The maximum number of records a single NIP-77 negentropy sync may process. Larger syncs are refused with a `NEG-ERR`.
 
@@ -346,7 +346,7 @@ The changes take effect immediately and are persisted (same lists as `nostrfy re
 
 ### Behavior notes
 
-- **`max_created_at_future_secs`** uses the NIP-01 `mute:` prefix — the event is silently dropped, not rejected as invalid.
+- **`max_created_at_future_secs`** uses the NIP-01 `invalid:` prefix — the event is rejected as invalid (the NIP-01 example for this case).
 - **`max_out_queue_bytes`** protects against slow readers; REQ responses are never dropped by it (see key details).
 - **`new_pubkey_min_age_secs`**: the first-seen timestamp is only recorded when an event actually stores, so failed first events cannot pre-warm the account-age clock.
 - **`max_api_limit`** clamps silently; **`max_api_offset`** and **`max_api_search_bytes`** reject with a clear `400` error message.

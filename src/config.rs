@@ -249,7 +249,7 @@ pub struct LimitsConfig {
     pub max_tags: usize,
     pub max_tag_value_bytes: usize,
     /// Events whose created_at is more than this many seconds in the future
-    /// are silently dropped (OK `mute:`) instead of rejected as invalid.
+    /// are rejected as invalid (OK `invalid:`).
     pub max_created_at_future_secs: u64,
     /// NIP-77: maximum number of records a single NEG-OPEN may process.
     pub max_neg_items: usize,
@@ -857,7 +857,6 @@ impl Config {
             17 => Some(&[14, 15, 1059, 21059]),
             22 => Some(&[1111]),
             26 => None,
-            28 => Some(&[40, 41, 42, 43, 44]),
             29 => Some(&[
                 // Current NIP-29 kinds (the moderation table and the
                 // relay-generated metadata): 9000/9001/9002/9005/9007/
@@ -2072,6 +2071,19 @@ log_max_files = 2
                 .contains(&11)
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn nip_kinds_has_no_entries_outside_relay_nips() {
+        // Every `nip_kinds` arm is only reached for entries of RELAY_NIPS
+        // (the advertisement filter iterates that list): an arm for a NIP
+        // outside it is dead code. NIP-28 imposes no relay requirements and
+        // is not advertised, so its arm was removed.
+        assert!(Config::nip_kinds(28).is_none());
+        assert!(Config::nip_kinds(2).is_none());
+        assert!(Config::nip_kinds(99).is_none());
+        // A reachable arm still resolves.
+        assert_eq!(Config::nip_kinds(29).unwrap()[0], 9000);
     }
 
     #[test]
