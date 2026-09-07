@@ -88,18 +88,43 @@ impl Filter {
                 .is_some_and(|v| v.len() > MAX_FILTER_MEMBERS)
     }
 
+    /// Case-insensitive hex equality: stored events are lowercase hex while
+    /// filters may carry uppercase hex. The historical scan decodes hex
+    /// (case-insensitive), so the live match must compare the same way or a
+    /// filter like `{"authors": ["AA.."]}` hits history but misses live.
+    fn hex_eq(a: &str, b: &str) -> bool {
+        a.len() == b.len()
+            && a.bytes()
+                .zip(b.bytes())
+                .all(|(x, y)| x.eq_ignore_ascii_case(&y))
+    }
+
+    /// Case-insensitive prefix check for `ids` prefixes (same reason).
+    fn hex_starts_with(haystack: &str, needle: &str) -> bool {
+        haystack.len() >= needle.len()
+            && haystack
+                .bytes()
+                .zip(needle.bytes())
+                .all(|(x, y)| x.eq_ignore_ascii_case(&y))
+    }
+
     /// Performs an in-memory match (used for live events and final checks).
     pub fn matches<E: EventFields>(&self, ev: &E) -> bool {
         if let Some(ids) = &self.ids {
-            // NIP-01: `ids` entries may be full ids or prefixes. Only
+            // `ids` entries may be full ids or prefixes: strict NIP-01
+            // requires exact 64-char lowercase hex, but prefixes are an
+            // ecosystem-wide convention, so they are accepted here. Only
             // even-length, non-empty prefixes are matched, mirroring the
             // historical scan (which decodes hex) so live and stored results
             // agree; an empty or odd-length entry matches nothing.
+            // Comparison is ASCII case-insensitive like the scan's hex
+            // decode, so uppercase filters agree on both paths.
             let id_str = ev.id();
             let matches = ids.iter().any(|id| {
                 !id.is_empty()
                     && id.len() % 2 == 0
-                    && (id == id_str || (id.len() < id_str.len() && id_str.starts_with(id)))
+                    && (Self::hex_eq(id, id_str)
+                        || (id.len() < id_str.len() && Self::hex_starts_with(id_str, id)))
             });
             if !matches {
                 return false;
@@ -110,13 +135,15 @@ impl Filter {
         // Only a well-formed delegation (`delegation` tags have exactly 4
         // elements, see `nip26::delegation`) counts: a malformed tag of
         // any other length must not let an attacker's event match filters
-        // on somebody else's pubkey.
+        // on somebody else's pubkey. Pubkey comparison is case-insensitive
+        // for the same stored/live agreement reason as `ids` above.
         if let Some(authors) = &self.authors
-            && !authors.iter().any(|a| a == ev.pubkey())
-            && !ev
-                .tags()
-                .iter()
-                .any(|t| t.len() == 4 && t[0] == "delegation" && authors.iter().any(|a| a == &t[1]))
+            && !authors.iter().any(|a| Self::hex_eq(a, ev.pubkey()))
+            && !ev.tags().iter().any(|t| {
+                t.len() == 4
+                    && t[0] == "delegation"
+                    && authors.iter().any(|a| Self::hex_eq(a, &t[1]))
+            })
         {
             return false;
         }
@@ -423,6 +450,19 @@ mod tests {
         assert!(!f.matches(&e));
         let f: Filter = serde_json::from_value(serde_json::json!({"ids": ["bb"]})).unwrap();
         assert!(!f.matches(&e));
+    }
+
+    #[test]
+    fn ids_and_authors_match_uppercase_like_the_scan() {
+        // The stored scan decodes hex (case-insensitive): the live match
+        // must agree, so uppercase filters hit both paths.
+        let e = ev(1, vec![]);
+        let upper_id = e.id.to_ascii_uppercase();
+        let f: Filter = serde_json::from_value(serde_json::json!({"ids": [upper_id]})).unwrap();
+        assert!(f.matches(&e), "uppercase ids must match live");
+        let upper_pk = e.pubkey.to_ascii_uppercase();
+        let f: Filter = serde_json::from_value(serde_json::json!({"authors": [upper_pk]})).unwrap();
+        assert!(f.matches(&e), "uppercase authors must match live");
     }
 
     #[test]

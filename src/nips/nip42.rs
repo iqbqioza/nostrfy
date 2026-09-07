@@ -49,8 +49,14 @@ pub fn verify(
         .tags
         .iter()
         .any(|t| t.len() >= 2 && t[0] == CHALLENGE_TAG && t[1] == challenge);
+    // `ALL_RELAYS` is a NIP-62 vanish scope, not a relay URL: it must not
+    // authenticate a connection on its own (the per-connection challenge
+    // would still bind it, but the spec requires the relay URL).
     let has_relay = event.tags.iter().any(|t| {
-        t.len() >= 2 && t[0] == RELAY_TAG && crate::nips::nip62::tag_matches(&t[1], identity)
+        t.len() >= 2
+            && t[0] == RELAY_TAG
+            && t[1] != crate::nips::nip62::ALL_RELAYS
+            && crate::nips::nip62::tag_matches(&t[1], identity)
     });
     has_challenge && has_relay
 }
@@ -216,5 +222,29 @@ mod tests {
             now,
             &RelayIdentity::new("127.0.0.1", 8080, "wss://public.example.net")
         ));
+    }
+
+    #[test]
+    fn all_relays_does_not_authenticate() {
+        // `ALL_RELAYS` is a NIP-62 vanish scope, not a relay URL.
+        let secp = Secp256k1::new();
+        let now = 1_700_000_000;
+        let ev = signed_event(
+            now,
+            vec![
+                vec!["relay".into(), crate::nips::nip62::ALL_RELAYS.into()],
+                vec!["challenge".into(), "abc".into()],
+            ],
+        );
+        assert!(
+            !verify(
+                &ev,
+                "abc",
+                &secp,
+                now,
+                &RelayIdentity::new("localhost", 8080, "")
+            ),
+            "ALL_RELAYS must not satisfy the NIP-42 relay tag"
+        );
     }
 }

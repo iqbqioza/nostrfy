@@ -273,7 +273,7 @@ impl Conn {
                 self.pending_reqs.clear();
                 for id in ids {
                     self.send_closed(&id, "restricted: you are not allowed to subscribe");
-                    self.remove_subscription(&id);
+                    self.remove_req_subscription(&id);
                 }
                 break;
             }
@@ -343,7 +343,8 @@ impl Conn {
                 ]));
                 // The CLOSED ends the subscription: release it exactly
                 // like a client CLOSE (filter bytes, live slot, stats).
-                self.remove_subscription(&sub_id);
+                // REQ namespace only (NIP-77 separate namespace).
+                self.remove_req_subscription(&sub_id);
                 self.pending_reqs.pop_front();
                 continue;
             }
@@ -1405,6 +1406,61 @@ mod tests {
             assert!(
                 ids.contains(&protected.id),
                 "authed client sees protected events"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn auth_disabled_still_answers_ok() {
+        // NIP-42: client AUTH MUST be answered with OK even when the relay
+        // has NIP-42 disabled.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            {
+                let mut w = conn.relay.config.write().await;
+                w.relay.disabled_nips.push(42);
+            }
+            let now = unix_now();
+            let auth = signed_auth(conn.relay.secp(), "test-challenge", now);
+            conn.handle_auth(&[serde_json::to_value(&auth).unwrap()])
+                .await;
+            let msgs = outgoing_json(&conn);
+            assert!(
+                msgs.iter()
+                    .any(|m| m[0] == "OK" && m[1] == auth.id && m[2] == false),
+                "disabled AUTH must still answer OK false: {msgs:?}"
+            );
+            assert!(!conn.is_authed(), "disabled AUTH must not authenticate");
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn close_and_neg_close_use_separate_namespaces() {
+        // NIP-77: CLOSE releases only REQ, NEG-CLOSE only NEG.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            conn.handle_req(&[json!("s"), json!({"kinds": [1]})]).await;
+            conn.handle_neg_open(&[json!("s"), json!({"kinds": [1]}), json!("61000000")])
+                .await;
+            assert!(conn.subs.contains_key("s"));
+            assert!(conn.neg.contains_key("s"));
+            conn.handle_close(&[json!("s")]);
+            assert!(
+                !conn.subs.contains_key("s"),
+                "CLOSE must release the REQ sub"
+            );
+            assert!(
+                conn.neg.contains_key("s"),
+                "CLOSE must leave NEG state untouched"
+            );
+            conn.handle_neg_close(&[json!("s")]);
+            assert!(
+                !conn.neg.contains_key("s"),
+                "NEG-CLOSE must release the NEG state"
             );
             conn.relay.db.shutdown();
         });
@@ -2918,7 +2974,8 @@ mod tests {
         rt.block_on(async {
             let mut conn = build_conn().await;
 
-            // NIP-77 disabled: a notice, not a NEG-ERR.
+            // NIP-77 disabled: NEG-ERR with the id (NIP-77 error path),
+            // not a NOTICE — the client can correlate the failure.
             {
                 let mut w = conn.relay.config.write().await;
                 w.relay.disabled_nips.push(77);
@@ -2926,10 +2983,19 @@ mod tests {
             conn.handle_neg_open(&[json!("s"), json!({}), json!("61000000")])
                 .await;
             assert!(
+                outgoing_json(&conn).iter().any(|m| m[0] == "NEG-ERR"
+                    && m[1] == "s"
+                    && m[2].as_str().unwrap().contains("not enabled")),
+                "a disabled NIP-77 must yield a NEG-ERR"
+            );
+            conn.outgoing.clear();
+            // Without an id there is nothing to correlate: NOTICE.
+            conn.handle_neg_open(&[]).await;
+            assert!(
                 outgoing_json(&conn)
                     .iter()
                     .any(|m| m[0] == "NOTICE" && m[1].as_str().unwrap().contains("not enabled")),
-                "a disabled NIP-77 must yield a NOTICE"
+                "a disabled NIP-77 without id must yield a NOTICE"
             );
             conn.outgoing.clear();
             {
@@ -2937,13 +3003,13 @@ mod tests {
                 w.relay.disabled_nips.retain(|n| *n != 77);
             }
 
-            // Malformed NEG-OPEN frames.
+            // Malformed NEG-OPEN frames with an id correlate via NEG-ERR.
             conn.handle_neg_open(&[json!("s"), json!({})]).await;
             assert!(
-                outgoing_json(&conn)
-                    .iter()
-                    .any(|m| m[0] == "NOTICE" && m[1].as_str().unwrap().contains("NEG-OPEN")),
-                "a short NEG-OPEN must yield a NOTICE"
+                outgoing_json(&conn).iter().any(|m| m[0] == "NEG-ERR"
+                    && m[1] == "s"
+                    && m[2].as_str().unwrap().contains("NEG-OPEN")),
+                "a short NEG-OPEN must yield a NEG-ERR"
             );
             conn.outgoing.clear();
             conn.handle_neg_open(&[json!(""), json!({}), json!("61000000")])
@@ -3173,11 +3239,14 @@ mod tests {
                 "a NEG-MSG for an unknown sub must close with NEG-ERR"
             );
             conn.outgoing.clear();
-            // Malformed NEG-MSG frames.
+            // Malformed NEG-MSG frames: with a known id they close via
+            // NEG-ERR (NIP-77), without one via NOTICE.
             conn.handle_neg_msg(&[json!("s")]).await;
             assert!(
-                outgoing_json(&conn).iter().any(|m| m[0] == "NOTICE"),
-                "a short NEG-MSG must yield a NOTICE: {:?}",
+                outgoing_json(&conn).iter().any(|m| m[0] == "NEG-ERR"
+                    && m[1] == "s"
+                    && m[2].as_str().unwrap().contains("NEG-MSG")),
+                "a short NEG-MSG must yield a NEG-ERR: {:?}",
                 outgoing_json(&conn)
             );
             conn.outgoing.clear();
@@ -3189,10 +3258,28 @@ mod tests {
             );
             conn.outgoing.clear();
             conn.handle_neg_msg(&[json!("s"), json!(42)]).await;
-            assert!(outgoing_json(&conn).iter().any(|m| m[0] == "NOTICE"));
+            assert!(
+                outgoing_json(&conn).iter().any(|m| m[0] == "NEG-ERR"
+                    && m[1] == "s"
+                    && m[2].as_str().unwrap().contains("hex")),
+                "a non-string NEG-MSG message must yield a NEG-ERR"
+            );
+            assert!(
+                !conn.neg.contains_key("s"),
+                "a malformed NEG-MSG must close the subscription"
+            );
             conn.outgoing.clear();
             conn.handle_neg_msg(&[json!("s"), json!("zzz")]).await;
-            assert!(outgoing_json(&conn).iter().any(|m| m[0] == "NOTICE"));
+            assert!(
+                outgoing_json(&conn).iter().any(|m| m[0] == "NEG-ERR"
+                    && m[1] == "s"
+                    && m[2].as_str().unwrap().contains("hex")),
+                "a non-hex NEG-MSG message must yield a NEG-ERR"
+            );
+            assert!(
+                !conn.neg.contains_key("s"),
+                "a non-hex NEG-MSG must close the subscription"
+            );
             conn.outgoing.clear();
 
             // Exhausting the round budget closes the subscription.

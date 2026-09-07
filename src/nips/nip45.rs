@@ -92,6 +92,9 @@ fn hex_nibble(byte: u8) -> Option<u8> {
     match byte {
         b'0'..=b'9' => Some(byte - b'0'),
         b'a'..=b'f' => Some(byte - b'a' + 10),
+        // Uppercase hex carries the same value: the offset must agree with
+        // the stored (lowercase) form instead of dropping HLL eligibility.
+        b'A'..=b'F' => Some(byte - b'A' + 10),
         _ => None,
     }
 }
@@ -123,6 +126,10 @@ mod tests {
         let mut hex = "a".repeat(64);
         hex.replace_range(32..33, "c"); // c = 12 -> offset 20
         let f = filter_with_tag(&hex);
+        assert_eq!(hll_offset(&f), Some(20));
+        // Uppercase carries the same value as lowercase.
+        let upper = hex.to_ascii_uppercase();
+        let f = filter_with_tag(&upper);
         assert_eq!(hll_offset(&f), Some(20));
     }
 

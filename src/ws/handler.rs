@@ -440,9 +440,9 @@ impl super::Conn {
             // timeline: close the subscription with a clear reason so the
             // client can retry. The subscription (which was registered
             // before the query) must be released too — a CLOSED sub must
-            // not keep receiving live events.
+            // not keep receiving live events. REQ namespace only.
             let sub_id = sub_id.to_string();
-            self.remove_subscription(&sub_id);
+            self.remove_req_subscription(&sub_id);
             self.send_closed(&sub_id, "error: database timeout, please retry");
             return;
         };
@@ -490,8 +490,9 @@ impl super::Conn {
             self.send_notice("error: CLOSE requires a subscription id");
             return;
         };
-        // `remove_subscription` re-syncs the live index.
-        self.remove_subscription(sub_id);
+        // NIP-77: REQ and NEG-OPEN live in separate namespaces, so CLOSE
+        // releases only the REQ subscription (`NEG-CLOSE` releases NEG).
+        self.remove_req_subscription(sub_id);
     }
 
     /// Rejects a REQ with CLOSED, releasing any previous subscription held
@@ -499,7 +500,7 @@ impl super::Conn {
     /// removal a failed re-REQ would leave a ghost subscription that keeps
     /// receiving live events for a client-considered-closed id.
     fn reject_req(&mut self, sub_id: &str, reason: &str) {
-        self.remove_subscription(sub_id);
+        self.remove_req_subscription(sub_id);
         self.send_closed(sub_id, reason);
     }
 
@@ -522,9 +523,10 @@ impl super::Conn {
         index.register(self.conn_id, &components);
     }
 
-    /// Releases a subscription (and any negentropy state held under the
-    /// same id): its filter bytes, its live slot and its negentropy items.
-    pub(crate) fn remove_subscription(&mut self, sub_id: &str) {
+    /// Releases a REQ subscription only (NIP-77 separate namespace):
+    /// its filter bytes and its live slot. NEG state under the same id is
+    /// left untouched (`NEG-CLOSE` releases NEG).
+    pub(crate) fn remove_req_subscription(&mut self, sub_id: &str) {
         if let Some((_, bytes, _)) = self.subs.remove(sub_id) {
             self.sub_bytes = self.sub_bytes.saturating_sub(bytes);
             self.relay
@@ -534,21 +536,30 @@ impl super::Conn {
             self.subscriptions_held
                 .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         }
-        // NIP-77: a CLOSE on a subscription id also ends any negentropy
-        // state held under the same id (even when no REQ subscription with
-        // that id exists — a NEG-OPEN-only id must still be closable),
-        // releasing its items from the connection's memory accounting and
-        // its subscription slot.
+        self.sync_live_index();
+    }
+
+    /// Releases negentropy state only (NIP-77 separate namespace).
+    pub(crate) fn remove_neg_subscription(&mut self, sub_id: &str) {
         if let Some(state) = self.neg.remove(sub_id) {
             self.neg_total = self.neg_total.saturating_sub(state.items.len());
             self.release_neg_stats_subscription();
         }
-        self.sync_live_index();
     }
 
     pub(crate) async fn handle_auth(&mut self, rest: &[Value]) {
         if !self.relay.config.read().await.nip_enabled(42) {
-            self.send_notice("error: authentication is not enabled on this relay");
+            // NIP-42: client AUTH messages MUST be answered with OK, even
+            // when the relay does not support authentication. Correlate with
+            // the event id when one is present; otherwise fall back to NOTICE.
+            if let Some(event) = rest
+                .first()
+                .and_then(|v| serde_json::from_value::<Event>(v.clone()).ok())
+            {
+                self.send_control(nip42::ok(&event.id, false));
+            } else {
+                self.send_notice("error: authentication is not enabled on this relay");
+            }
             return;
         }
         if rest.is_empty() {
