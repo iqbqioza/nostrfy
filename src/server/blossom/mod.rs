@@ -791,12 +791,17 @@ async fn list(
     let cursor = params.get("cursor").map(String::as_str);
     let mut blobs = state.store.list(&pubkey).await;
     // BUD-12: sorted by `uploaded` descending; the page starts after the
-    // cursor and never includes it.
+    // cursor and never includes it. An unknown (but well-formed) cursor
+    // yields an empty page — not the first page — so a client paging with
+    // a stale cursor cannot loop over duplicates forever.
     blobs.sort_by_key(|d| std::cmp::Reverse(d.uploaded));
-    if let Some(cursor) = cursor
-        && let Some(pos) = blobs.iter().position(|d| d.sha256 == cursor)
-    {
-        blobs.drain(..=pos);
+    if let Some(cursor) = cursor {
+        match blobs.iter().position(|d| d.sha256 == cursor) {
+            Some(pos) => {
+                blobs.drain(..=pos);
+            }
+            None => blobs.clear(),
+        }
     }
     if let Some(limit) = limit {
         blobs.truncate(limit);
@@ -1545,6 +1550,34 @@ mod tests {
         assert!(
             items.as_array().unwrap().len() <= 100,
             "default page must be bounded"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn list_unknown_cursor_yields_empty_page() {
+        // A well-formed but unknown cursor must not restart at page one
+        // (a stale cursor would loop duplicates forever).
+        let relay = build_blossom_relay(0).await;
+        let pk = "bb".repeat(32);
+        let state = state_of(&relay).await.expect("blossom state");
+        let sha = sha256_hex(b"one blob");
+        state
+            .store
+            .put(&pk, &sha, b"one blob", "text/plain")
+            .await
+            .unwrap();
+        let mut map = std::collections::HashMap::new();
+        map.insert("cursor".to_string(), "cc".repeat(32));
+        let resp = list(State(relay.clone()), AxPath(pk), axum::extract::Query(map)).await;
+        let body = axum::body::to_bytes(resp.into_body(), 256 * 1024)
+            .await
+            .unwrap();
+        let items: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            items.as_array().unwrap().len(),
+            0,
+            "an unknown cursor must yield an empty page"
         );
         relay.db.shutdown();
     }

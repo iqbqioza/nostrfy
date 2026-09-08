@@ -93,9 +93,16 @@ fn check_role_id(id: &str) -> Result<(), String> {
     if id.trim().is_empty() {
         return Err("role id must not be empty".into());
     }
-    if id.chars().count() > MAX_ROLE_ID_LEN {
+    // Compare against the trimmed form so `" admin"` and `"admin"` cannot
+    // become distinct map keys / `d` tags for the same logical role.
+    if id != id.trim() {
+        return Err("role id must not have leading or trailing whitespace".into());
+    }
+    // Byte length: the id lands in a stored event's `d` tag and the LMDB
+    // index, so multibyte ids must not bypass the bound via char count.
+    if id.len() > MAX_ROLE_ID_LEN {
         return Err(format!(
-            "role id exceeds the maximum of {MAX_ROLE_ID_LEN} characters"
+            "role id exceeds the maximum of {MAX_ROLE_ID_LEN} bytes"
         ));
     }
     if id.chars().any(|c| c.is_control()) {
@@ -827,8 +834,10 @@ mod tests {
         // with the restricted error, which covers the else branches).
         let resp = rpc_call(&relay, "createrole", vec![]).await;
         assert!(rpc_err_of(resp).await.contains("params"));
-        let resp = rpc_call(&relay, "createrole", vec![json!("x".repeat(200))]).await;
+        let resp = rpc_call(&relay, "createrole", vec![json!("x".repeat(65))]).await;
         assert!(rpc_err_of(resp).await.contains("maximum"));
+        let resp = rpc_call(&relay, "createrole", vec![json!(" admin")]).await;
+        assert!(rpc_err_of(resp).await.contains("whitespace"));
         let resp = rpc_call(&relay, "createrole", vec![json!("")]).await;
         assert!(rpc_err_of(resp).await.contains("empty"));
         let resp = rpc_call(&relay, "createrole", vec![json!("   ")]).await;

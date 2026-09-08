@@ -488,6 +488,19 @@ pub async fn handle_connection(
     peer_ip: std::net::IpAddr,
     path: String,
 ) {
+    // Read the caps before accounting: everything between `fetch_add`
+    // and the guard below is synchronous (`try_register_connection` takes
+    // no lock across an await), so a panic cannot strand the slot across
+    // an await point before the guard owns it.
+    let (max_connections, max_per_ip) = {
+        let cfg = relay.config.read().await;
+        (
+            cfg.limits.max_connections,
+            cfg.limits.max_connections_per_ip,
+        )
+    };
+    // Account the connection with add-then-check so the cap stays exact
+    // under concurrency.
     let active = relay
         .stats
         .connections_active
@@ -495,10 +508,10 @@ pub async fn handle_connection(
         + 1;
     relay.stats.bump(&relay.stats.connections_total, 1);
 
-    let max_connections = relay.config.read().await.limits.max_connections;
-    let max_per_ip = relay.config.read().await.limits.max_connections_per_ip;
     // `active` is the post-increment count (this connection included), so
-    // `>` accepts exactly `max_connections` connections.
+    // `>` accepts exactly `max_connections` connections. Short-circuit
+    // order matters: when the global cap already refuses, the per-IP slot
+    // is never taken, so only the global counter is rolled back.
     if active > max_connections as u64 || !relay.try_register_connection(&peer_ip, max_per_ip) {
         relay
             .stats
@@ -3323,6 +3336,27 @@ mod tests {
                 outgoing_json(&conn)
             );
             assert!(!conn.neg.contains_key("b"), "the sub must be released");
+            conn.outgoing.clear();
+
+            // A saturated outgoing queue fails the round with a retryable
+            // NEG-ERR instead of accumulating unbounded NEG bytes.
+            conn.handle_neg_open(&[json!("q"), json!({"kinds": [1]}), json!("61000000")])
+                .await;
+            conn.outgoing.clear();
+            conn.out_queue_bytes = 1;
+            conn.out_bytes = 100;
+            conn.handle_neg_msg(&[json!("q"), json!("61000000")]).await;
+            assert!(
+                outgoing_json(&conn).iter().any(|m| m[0] == "NEG-ERR"
+                    && m[1] == "q"
+                    && m[2].as_str().unwrap().contains("overloaded")),
+                "a backpressured NEG-MSG must fail retryably: {:?}",
+                outgoing_json(&conn)
+            );
+            assert!(
+                !conn.neg.contains_key("q"),
+                "a backpressured round must close the subscription"
+            );
             conn.outgoing.clear();
 
             // NEG-CLOSE with a missing id yields a NOTICE.

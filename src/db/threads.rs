@@ -50,7 +50,9 @@ pub(crate) struct DbThreads {
     pub(crate) api_pending: Arc<std::sync::atomic::AtomicUsize>,
     pub(crate) max_pending_msgs: usize,
     pub(crate) max_pending_events: usize,
-    pub(crate) max_api_pending: usize,
+    /// Independent cap for the API reader queue (adjustable live via
+    /// [`super::DbClient::set_max_api_pending`], e.g. on SIGHUP reload).
+    pub(crate) max_api_pending: Arc<std::sync::atomic::AtomicUsize>,
     pub(crate) reader_threads: usize,
 }
 
@@ -892,7 +894,7 @@ pub(crate) fn spawn(
         api_pending,
         max_pending_msgs: max_pending_msgs.max(1),
         max_pending_events: max_pending_events.max(1),
-        max_api_pending: max_pending_msgs.max(1),
+        max_api_pending: Arc::new(std::sync::atomic::AtomicUsize::new(max_pending_msgs.max(1))),
         reader_threads,
     })
 }

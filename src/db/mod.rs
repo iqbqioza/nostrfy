@@ -299,10 +299,11 @@ pub struct DbClient {
     /// Queued-but-unprocessed REST API queries, counted separately so an API
     /// flood fails fast without tripping the WebSocket-side caps.
     api_pending: Arc<std::sync::atomic::AtomicUsize>,
-    /// Caps for the counters above.
+    /// Caps for the counters above (`max_api_pending` is shared so the
+    /// SIGHUP reload can adjust it live).
     max_pending_msgs: usize,
     max_pending_events: usize,
-    max_api_pending: usize,
+    max_api_pending: Arc<std::sync::atomic::AtomicUsize>,
     /// How many threads serve the WebSocket reader queue (from
     /// `database.reader_threads`); used to fan the shutdown messages out.
     reader_threads: usize,
@@ -358,6 +359,13 @@ impl DbClient {
             .store(enabled, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Adjusts the API reader queue cap live (SIGHUP reload). Values below
+    /// 1 are clamped to 1 so the API reader can always drain.
+    pub fn set_max_api_pending(&self, max: usize) {
+        self.max_api_pending
+            .store(max.max(1), std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Sends a read-only request to the dedicated reader thread. The
     /// writer-queue counters are not part of the gate: the reader threads
     /// exist so reads keep working while the writer is stalled.
@@ -404,12 +412,14 @@ impl DbClient {
     /// Read-only request that reports failure (`None`) instead of
     /// degrading to a default value: used by the SIGHUP reloads, where
     /// an empty result would overwrite the live deny/allow lists with
-    /// nothing (fail-open).
+    /// nothing (fail-open). Like [`Self::request_read`], reader-queue
+    /// accounting is used (never the writer counters), so a write backlog
+    /// must not fail-fast the reads.
     async fn request_read_result<R: Default>(
         &self,
         make: impl FnOnce(oneshot::Sender<R>) -> Msg,
     ) -> Option<R> {
-        let rx = self.send_request(make, &self.read_tx)?;
+        let rx = self.send_request_read(make, &self.read_tx)?;
         if self.timeout_secs == 0 {
             return rx.await.ok();
         }
@@ -417,6 +427,36 @@ impl DbClient {
             .await
             .ok()
             .and_then(|r| r.ok())
+    }
+
+    /// Reader-queue variant of [`Self::send_request`]: reserves in
+    /// `pending_reads` (add-then-check with rollback) and reports
+    /// fail-fast as `None`. The reader thread releases the slot on
+    /// completion, so this path must not decrement it.
+    fn send_request_read<R>(
+        &self,
+        make: impl FnOnce(oneshot::Sender<R>) -> Msg,
+        channel: &mpsc::UnboundedSender<Msg>,
+    ) -> Option<oneshot::Receiver<R>> {
+        let (tx, rx) = oneshot::channel();
+        let reads = self
+            .pending_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(1);
+        if reads > self.max_pending_msgs {
+            self.pending_reads
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            self.errors
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return None;
+        }
+        let msg = make(tx);
+        if channel.send(msg).is_err() {
+            self.pending_reads
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            return None;
+        }
+        Some(rx)
     }
 
     /// Sends a write request to the writer thread and waits for the reply
@@ -633,7 +673,8 @@ impl DbClient {
     /// `/api/v1` traffic never blocks WebSocket queries. Applies its own
     /// queue cap: when the API reader's queue is deep, the request fails
     /// fast with an empty result instead of piling up behind WebSocket
-    /// work.
+    /// work. Admission reserves first (add-then-check with rollback) so
+    /// concurrent bursts cannot overshoot the cap without bound.
     pub async fn api_query(
         &self,
         filters: Vec<Filter>,
@@ -641,14 +682,10 @@ impl DbClient {
         now: u64,
         ascending: bool,
     ) -> (Vec<Event>, bool) {
-        if self.api_pending.load(std::sync::atomic::Ordering::Relaxed) >= self.max_api_pending {
-            self.errors
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if !self.api_reserve() {
             return (Vec::new(), false);
         }
         let (tx, rx) = oneshot::channel();
-        self.api_pending
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let msg = Msg::Query {
             filters,
             limit,
@@ -688,14 +725,10 @@ impl DbClient {
         limit: usize,
         now: u64,
     ) -> (Vec<Event>, bool) {
-        if self.api_pending.load(std::sync::atomic::Ordering::Relaxed) >= self.max_api_pending {
-            self.errors
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if !self.api_reserve() {
             return (Vec::new(), false);
         }
         let (tx, rx) = oneshot::channel();
-        self.api_pending
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let msg = Msg::Count {
             filters,
             limit,
@@ -836,15 +869,12 @@ impl DbClient {
     }
 
     /// Generic REST-API reader request with the API queue cap and timeout.
+    /// Admission uses [`Self::api_reserve`] (add-then-check with rollback).
     async fn api_request<R: Default>(&self, make: impl FnOnce(oneshot::Sender<R>) -> Msg) -> R {
-        if self.api_pending.load(std::sync::atomic::Ordering::Relaxed) >= self.max_api_pending {
-            self.errors
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if !self.api_reserve() {
             return R::default();
         }
         let (tx, rx) = oneshot::channel();
-        self.api_pending
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let msg = make(tx);
         if self.api_read_tx.send(msg).is_err() {
             self.api_pending
@@ -861,6 +891,28 @@ impl DbClient {
                 .map(|r| r.unwrap_or_default())
                 .unwrap_or_default()
         }
+    }
+
+    /// Reserves one API-reader queue slot (add-then-check with rollback).
+    /// Returns `false` when the queue is deep (fail-fast, counted in stats).
+    /// The API reader thread releases the slot on completion.
+    fn api_reserve(&self) -> bool {
+        let pending = self
+            .api_pending
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(1);
+        if pending
+            > self
+                .max_api_pending
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            self.api_pending
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            self.errors
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return false;
+        }
+        true
     }
 
     pub async fn apply_deletion(

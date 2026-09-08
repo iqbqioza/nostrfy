@@ -16,6 +16,16 @@ use crate::nips::nip09;
 /// so entries the caller leaves in place cannot loop forever.
 const REMOVAL_CHUNK: usize = 4096;
 
+/// Compares two hex pubkeys/ids on decoded bytes (case-insensitive like
+/// the scan's hex decode), falling back to exact match when either side
+/// is not valid hex.
+fn pubkeys_equal(a: &str, b: &str) -> bool {
+    match (hex::decode(a), hex::decode(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
+}
+
 impl Store {
     /// Applies a deletion request.
     ///
@@ -56,12 +66,14 @@ impl Store {
             // NIP-09: only events authored by the request's pubkey are
             // deleted, and deletion requests cannot be deleted. NIP-26:
             // the delegator may also delete events published by a
-            // delegatee on their behalf.
+            // delegatee on their behalf. Compared on decoded bytes
+            // (case-insensitive like the scan), so an uppercase hex
+            // request still matches its lowercase targets.
             if event.kind == nip09::DELETION_KIND {
                 continue;
             }
             if let Some(pubkey) = request_pubkey
-                && event.pubkey != pubkey
+                && !pubkeys_equal(&event.pubkey, pubkey)
                 && !delegated_by(&event, pubkey)
             {
                 continue;
@@ -229,18 +241,31 @@ impl Store {
     /// order (pubkey-major), examining at most `max_keys` entries. `more`
     /// is true when the walk was cut short. Returns `(pubkey, count)` pairs
     /// in ascending pubkey order.
+    ///
+    /// Each event counts once: NIP-26 delegated events carry a second index
+    /// entry under the delegator, which is skipped when the event id was
+    /// already counted (attributed to the first pubkey in walk order).
     pub(crate) fn author_counts(&self, max_keys: usize) -> Result<(crate::db::AuthorCounts, bool)> {
         let rtxn = self.env.read_txn()?;
         let mut counts: crate::db::AuthorCounts = Vec::new();
+        let mut seen: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
         let mut examined = 0usize;
         let mut more = false;
         for item in self.by_pubkey.iter(&rtxn)? {
             let (key, _) = item?;
             if key.len() >= ID_LEN {
                 let pubkey = key[..ID_LEN].to_vec();
-                match counts.last_mut() {
-                    Some((p, c)) if *p == pubkey => *c += 1,
-                    _ => counts.push((pubkey, 1)),
+                let id: Option<[u8; 32]> = key
+                    .get(ID_LEN + CREATED_LEN..ID_LEN + CREATED_LEN + ID_LEN)
+                    .and_then(|s| s.try_into().ok());
+                // Skip the NIP-26 delegator duplicate of an already-counted
+                // event (same id under a second pubkey).
+                let duplicate = id.is_some_and(|id| !seen.insert(id));
+                if !duplicate {
+                    match counts.last_mut() {
+                        Some((p, c)) if *p == pubkey => *c += 1,
+                        _ => counts.push((pubkey, 1)),
+                    }
                 }
             }
             examined += 1;
@@ -299,7 +324,9 @@ impl Store {
                 // must survive a delegator's request to vanish. Their
                 // delegator-side index entry is dropped nevertheless, so the
                 // vanished identity's feed is not revived by the delegation.
-                if event.pubkey != pubkey_hex {
+                // Compared case-insensitively: history stored with an
+                // uppercase author hex must vanish like lowercase history.
+                if !pubkeys_equal(&event.pubkey, &pubkey_hex) {
                     if crate::nips::nip26::delegation(&event).is_some() {
                         self.by_pubkey.delete(&mut wtxn, &key)?;
                     }

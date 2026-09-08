@@ -265,6 +265,12 @@ pub struct LimitsConfig {
     /// instead of queuing, so a flood of API traffic cannot stall the
     /// WebSocket subscribers (which share the same database).
     pub max_api_concurrent: usize,
+    /// REST API: maximum number of queued-but-unprocessed `/api/v1`
+    /// requests waiting for the dedicated API reader thread. Beyond this
+    /// the request fails fast with an empty result instead of piling up in
+    /// memory. Independent from the WebSocket-side queue caps, and applied
+    /// live on SIGHUP reload.
+    pub max_api_queue_msgs: usize,
     /// REST API: upper bound for the `limit` query parameter (0 = no bound).
     pub max_api_limit: usize,
     /// REST API: upper bound for the `offset` query parameter (0 = no bound).
@@ -448,6 +454,7 @@ impl Default for LimitsConfig {
             max_sub_bytes: 1 << 20,
             group_late_publish_secs: 3_600,
             max_api_concurrent: 8,
+            max_api_queue_msgs: 512,
             max_api_limit: 5_000,
             max_api_offset: 50_000,
             max_api_search_bytes: 2_048,
@@ -792,7 +799,11 @@ impl Config {
                         .iter()
                         .any(|k| self.is_kind_effectively_allowed(*k, access))
                 } else {
-                    // No associated kinds (e.g. NIP-11, NIP-86) — always advertised when enabled.
+                    // No associated kinds (e.g. NIP-11, NIP-86, or NIPs like
+                    // NIP-33 whose range cannot be enumerated against block
+                    // lists) — always advertised when enabled. A restrictive
+                    // `allowed_kinds` may therefore still advertise these;
+                    // the kind filter itself is still enforced on writes.
                     true
                 }
             })
@@ -1104,6 +1115,7 @@ impl Config {
             ("limits.max_neg_items", l.max_neg_items),
             ("limits.max_sub_bytes", l.max_sub_bytes),
             ("limits.max_api_concurrent", l.max_api_concurrent),
+            ("limits.max_api_queue_msgs", l.max_api_queue_msgs),
             ("limits.live_buffer", l.live_buffer),
             ("limits.live_batch_size", l.live_batch_size),
             ("limits.max_out_queue_bytes", l.max_out_queue_bytes),
@@ -1290,6 +1302,16 @@ impl Config {
                         "blossom.storage = \"s3\" requires s3_endpoint, s3_bucket, \
                          s3_access_key and s3_secret_key"
                             .into(),
+                    ));
+                }
+                // R2-style endpoints accept an empty region (`auto`), but an
+                // AWS-style endpoint with no region signs an invalid scope
+                // and fails every request at runtime — catch the typo here.
+                "s3" if b.s3_region.trim().is_empty()
+                    && !b.s3_endpoint.contains("r2.cloudflarestorage.com") =>
+                {
+                    return Err(Error::Config(
+                        "blossom.s3_region must not be empty for non-R2 S3 endpoints".into(),
                     ));
                 }
                 // Unreachable: validated above even when disabled.
@@ -1655,6 +1677,7 @@ fn known_config_keys() -> &'static [(&'static str, &'static [&'static str])] {
                 "max_sub_bytes",
                 "group_late_publish_secs",
                 "max_api_concurrent",
+                "max_api_queue_msgs",
                 "max_api_limit",
                 "max_api_offset",
                 "max_api_search_bytes",
@@ -2595,6 +2618,7 @@ log_max_files = 2
             |c: &mut Config| c.limits.max_tags = 0,
             |c: &mut Config| c.limits.max_tag_value_bytes = 0,
             |c: &mut Config| c.limits.max_sub_id_len = 0,
+            |c: &mut Config| c.limits.max_api_queue_msgs = 0,
         ] {
             let mut cfg = Config::default();
             set(&mut cfg);
@@ -2610,6 +2634,31 @@ log_max_files = 2
         assert!(
             cfg.validate().is_err(),
             "an unknown storage backend must fail even while disabled"
+        );
+    }
+
+    #[test]
+    fn validation_rejects_empty_s3_region_for_non_r2() {
+        fn s3cfg(endpoint: &str) -> Config {
+            let mut cfg = Config::default();
+            cfg.blossom.host = "media.example.com".into();
+            cfg.blossom.storage = "s3".into();
+            cfg.blossom.s3_endpoint = endpoint.into();
+            cfg.blossom.s3_region = String::new();
+            cfg.blossom.s3_bucket = "b".into();
+            cfg.blossom.s3_access_key = "k".into();
+            cfg.blossom.s3_secret_key = "s".into();
+            cfg
+        }
+        assert!(
+            s3cfg("https://s3.amazonaws.com").validate().is_err(),
+            "an empty region must fail for AWS-style endpoints"
+        );
+        assert!(
+            s3cfg("https://acct.r2.cloudflarestorage.com")
+                .validate()
+                .is_ok(),
+            "an empty region stays allowed for R2 endpoints"
         );
     }
 

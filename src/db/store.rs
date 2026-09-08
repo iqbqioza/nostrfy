@@ -915,7 +915,9 @@ impl Store {
             // tags. The stored event keeps its full `d` tag.
             let rkey = replaceable_key(event.kind, &pubkey, &dtag_key_safe(&dtag));
             let old = self.replaceable.get(wtxn, &rkey)?;
-            let had_old = old.is_some();
+            let had_old = old
+                .as_ref()
+                .is_some_and(|o| o.len() >= CREATED_LEN + ID_LEN);
             if let Some(old) = old
                 && old.len() >= CREATED_LEN + ID_LEN
             {
@@ -1148,10 +1150,13 @@ impl Store {
         for tag in &event.tags {
             if indexable_tag(tag) {
                 for value in &tag[1..] {
-                    self.by_tag.delete(
-                        wtxn,
-                        &tag_key(tag[0].as_bytes()[0], value.as_bytes(), event.created_at, id),
-                    )?;
+                    // Mirror the put path: over-long keys were skipped at
+                    // index time, so deleting them would hit MDB_BAD_VALSIZE
+                    // and abort the whole write batch.
+                    let key = tag_key(tag[0].as_bytes()[0], value.as_bytes(), event.created_at, id);
+                    if key.len() <= MAX_INDEX_KEY {
+                        self.by_tag.delete(wtxn, &key)?;
+                    }
                 }
             }
         }
@@ -1167,7 +1172,11 @@ impl Store {
                 .iter()
                 .take(self.max_indexed_words)
             {
-                by_word.delete(wtxn, &word_key(word, event.created_at, id))?;
+                // Mirror the put path for the same reason as tags above.
+                let key = word_key(word, event.created_at, id);
+                if key.len() <= MAX_INDEX_KEY {
+                    by_word.delete(wtxn, &key)?;
+                }
             }
         }
         Ok(())
@@ -1265,10 +1274,11 @@ pub(crate) fn is_replaceable(event: &Event) -> bool {
 }
 
 /// Returns `true` when the event was published under a NIP-26 delegation
-/// granted by `delegator`.
+/// granted by `delegator`. Compared case-insensitively like every other
+/// hex comparison, so an uppercase filter still matches.
 pub(crate) fn delegated_by(event: &Event, delegator: &str) -> bool {
     event
         .tags
         .iter()
-        .any(|t| t.len() == 4 && t[0] == "delegation" && t[1] == delegator)
+        .any(|t| t.len() == 4 && t[0] == "delegation" && t[1].eq_ignore_ascii_case(delegator))
 }

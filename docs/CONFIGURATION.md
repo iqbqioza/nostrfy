@@ -128,7 +128,7 @@ Every key is optional; a missing key uses the default shown below.
 
 **`new_pubkey_min_age_secs`** — Spam defense: a pubkey's first accepted event is recorded, and events from pubkeys first seen less than this many seconds ago are rejected with `restricted: your account is too new`. `0` disables the check.
 
-**`max_events_per_min_per_pubkey`** — A pubkey may publish at most this many events per minute (sliding 60-second window); the excess is rejected with `rate-limited: too many events`. The window is bounded at 10,000 tracked pubkeys (the map is cleared, never grown). `0` = unlimited.
+**`max_events_per_min_per_pubkey`** — A pubkey may publish at most this many events per minute (sliding 60-second window); the excess is rejected with `rate-limited: too many events`. The window is bounded at 10,000 tracked pubkeys (a full map is never cleared — tracked windows are preserved and fresh pubkeys alone are fail-open until old windows expire). `0` = unlimited.
 
 **`max_groups`** — The cap on the in-memory NIP-29 group store. The store keeps the active groups plus a marker per deleted group (the marker is permanent so a deleted group cannot be resurrected), so without a cap an attacker could churn group ids and grow the memory without limit. The cap counts both, and group creation beyond it is rejected with `restricted: group limit reached` (both on the live write path and during the startup rebuild). `0` disables the cap. Read at startup — changing it requires a `restart`.
 
@@ -275,6 +275,7 @@ The changes take effect immediately and are persisted (same lists as `nostrfy re
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
 | `max_api_concurrent` | integer | `8` | Max concurrent `/api/v1` requests (503 beyond this) |
+| `max_api_queue_msgs` | integer | `512` | Max queued `/api/v1` requests for the API reader (fail-fast beyond this) |
 | `max_api_limit` | integer | `5000` | Ceiling for the API `limit` parameter (`0` = no bound) |
 | `max_api_offset` | integer | `50000` | Ceiling for the API `offset` parameter (`0` = no bound) |
 | `max_api_search_bytes` | integer | `2048` | Max bytes of the API `search` parameter (`0` = no bound) |
@@ -333,6 +334,8 @@ The changes take effect immediately and are persisted (same lists as `nostrfy re
 **`group_late_publish_secs`** — NIP-29: group events older than this many seconds are rejected (`invalid: event is too old for this group`), preventing re-writing of group history. `0` = disabled.
 
 **`max_api_concurrent`** — The maximum number of `/api/v1` requests served at once. Beyond it, new requests get `503 server is busy` immediately instead of queueing.
+
+**`max_api_queue_msgs`** — The maximum number of queued-but-unprocessed `/api/v1` requests waiting for the dedicated API reader thread. Beyond it, requests fail fast with an empty result instead of piling up in memory. Independent from the WebSocket-side queue caps; applied live on SIGHUP reload.
 
 **`max_api_limit`** — The ceiling for the API's `limit` parameter. Requests above it are silently clamped down. `0` = no bound.
 

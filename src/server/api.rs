@@ -434,10 +434,11 @@ pub async fn api_kind_handler(
 /// `GET /api/v1/npub1.../1/monthly` returns `{"months": [{"month": "2026-08",
 /// "count": 4}], "total": 4}` so a frontend can render "2026-08(4)". `since`
 /// and `until` bound the range (unix seconds); without them the whole period
-/// is covered, from the earliest stored event of that author and kind to
-/// now. Every month in the range is reported (zero-filled), oldest first,
-/// at most [`MAX_MONTHS`] months. A month whose count hit the collection
-/// limit is flagged `"approximate": true` (NIP-45 semantics).
+/// is covered, from the earliest *visible* stored event of that author and
+/// kind to now. Every month in the range is reported (zero-filled), oldest
+/// first, at most [`MAX_MONTHS`] months. A month whose count hit the
+/// collection limit is flagged `"approximate": true` (NIP-45 semantics), as
+/// is the top-level `"approximate"` when any month was capped.
 pub async fn api_monthly_handler(
     State(relay): State<Arc<Relay>>,
     Path((identifier, kind)): Path<(String, u64)>,
@@ -462,22 +463,50 @@ pub async fn api_monthly_handler(
     };
     let now = unix_now();
     let until = params.until.unwrap_or(now);
+    let no_tags_probe = excluded_tags(&params);
+    let nip78_probe = enabled_nip78_auth_active(&relay).await;
     let since = match params.since {
         Some(s) => s,
         None => {
-            // The whole period: probe the oldest stored event. The probe is
-            // a single ascending scan capped at one row.
+            // The whole period: probe the oldest *visible* stored event, so
+            // a hidden earliest event cannot leak its age through the
+            // range start. The probe is a bounded ascending window scan.
             let probe: Filter = serde_json::from_value(json!({
                 "authors": [hex_pk],
                 "kinds": [kind],
             }))
             .expect("static filter");
-            let (events, _) = relay.db.api_query(vec![probe], 1, now, true).await;
-            match events.first() {
-                Some(e) => e.created_at,
+            let mut start_ts = None;
+            let mut fetch = 64usize;
+            for _ in 0..4 {
+                let (events, _) = relay
+                    .db
+                    .api_query(vec![probe.clone()], fetch, now, true)
+                    .await;
+                let has_group_events = events.iter().any(nip29::is_group_event);
+                let groups = if has_group_events {
+                    Some(relay.groups.read().await)
+                } else {
+                    None
+                };
+                start_ts = events
+                    .iter()
+                    .find(|e| api_visible(e, groups.as_deref(), &no_tags_probe, nip78_probe))
+                    .map(|e| e.created_at);
+                drop(groups);
+                if start_ts.is_some() || fetch >= 1024 {
+                    break;
+                }
+                fetch = (fetch * 4).min(1024);
+            }
+            match start_ts {
+                Some(s) => s,
                 None => {
-                    // No events at all: an empty range, reported as such.
-                    return (StatusCode::OK, Json(json!({ "months": [], "total": 0 })));
+                    // No visible events at all: an empty range, reported as such.
+                    return (
+                        StatusCode::OK,
+                        Json(json!({ "months": [], "total": 0, "approximate": false })),
+                    );
                 }
             }
         }
@@ -502,6 +531,7 @@ pub async fn api_monthly_handler(
 
     let mut month_counts = Vec::with_capacity(months.len());
     let mut total = 0u64;
+    let mut approximate = false;
     for (y, m) in months {
         let start = month_start(y, m);
         let end = month_start_of_next(y, m);
@@ -513,6 +543,7 @@ pub async fn api_monthly_handler(
         }))
         .expect("static filter");
         let (events, more) = relay.db.api_count(vec![filter], count_limit, now).await;
+        approximate |= more;
         // The same visibility rules as the unauthenticated API: protected
         // events, gift wraps and private/hidden group content are withheld.
         let has_group_events = events.iter().any(nip29::is_group_event);
@@ -539,6 +570,7 @@ pub async fn api_monthly_handler(
         Json(json!({
             "months": month_counts,
             "total": total,
+            "approximate": approximate,
         })),
     )
 }
@@ -1796,6 +1828,45 @@ mod tests {
                     .iter()
                     .any(|d| d["approximate"] == true),
                 "the capped bucket must flag approximate"
+            );
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn monthly_reports_overall_approximate_when_capped() {
+        // A capped month must surface as top-level `approximate: true`
+        // (like daily/hourly), so clients know `total` is truncated.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_relay().await;
+            {
+                let mut cfg = relay.config.write().await;
+                cfg.limits.max_count = 1;
+            }
+            let now = unix_now();
+            let mut first_pk = String::new();
+            for i in 0..3 {
+                let e = signed_note(relay.secp(), &format!("m{i}"), now - i as u64, vec![]);
+                if i == 0 {
+                    first_pk = e.pubkey.clone();
+                }
+                assert_eq!(relay.db.put(e, now).await, crate::db::PutOutcome::Stored);
+            }
+            let (code, Json(resp)) = api_monthly_handler(
+                State(relay.clone()),
+                Path((first_pk, 1)),
+                Query(ApiParams {
+                    since: Some(now - 370 * 86400),
+                    until: Some(now),
+                    ..Default::default()
+                }),
+            )
+            .await;
+            assert_eq!(code, StatusCode::OK);
+            assert_eq!(
+                resp["approximate"], true,
+                "a capped month must flag overall approximate: {resp}"
             );
             relay.db.shutdown();
         });

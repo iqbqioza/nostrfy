@@ -271,6 +271,11 @@ group_late_publish_secs = 3600
 # WebSocket work.
 max_api_concurrent = 8
 
+# Maximum number of queued-but-unprocessed `/api/v1` requests waiting for
+# the dedicated API reader thread. Beyond this the request fails fast with
+# an empty result instead of piling up in memory.
+max_api_queue_msgs = 512
+
 # Upper bound for the API `limit` query parameter (0 = no bound). Larger
 # values are clamped down to this ceiling.
 max_api_limit = 5000

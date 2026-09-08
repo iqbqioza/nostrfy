@@ -40,6 +40,17 @@ impl super::Conn {
         self.send_control(json!(["NEG-MSG", sub_id, hex::encode(message)]));
     }
 
+    /// Whether the outgoing queue is too deep for another (potentially
+    /// multi-megabyte) negentropy reply: `send_control` bypasses the queue
+    /// caps so completion-critical messages are never dropped, but an
+    /// attacker driving rapid NEG-MSG rounds on a slow reader could
+    /// otherwise accumulate gigabytes. Callers fail the round with a
+    /// retryable NEG-ERR instead, bounding queued NEG bytes to a small
+    /// multiple of the per-connection cap.
+    fn neg_backpressured(&self) -> bool {
+        self.out_queue_bytes > 0 && self.out_bytes > self.out_queue_bytes.saturating_mul(4)
+    }
+
     pub(crate) async fn handle_neg_open(&mut self, rest: &[Value]) {
         // NIP-77 errors are NEG-ERR when a subscription id can be
         // correlated, NOTICE only when no id exists to echo.
@@ -315,6 +326,11 @@ impl super::Conn {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.subscriptions_held
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if self.neg_backpressured() {
+            self.remove_neg_subscription(&sub_id);
+            self.send_neg_err(&sub_id, "blocked: overloaded, please retry");
+            return;
+        }
         self.send_neg_msg(&sub_id, &response);
     }
 
@@ -403,6 +419,11 @@ impl super::Conn {
                         &sub_id,
                         "blocked: negentropy response too large (increase limits.max_req_response_bytes)",
                     );
+                    return;
+                }
+                if self.neg_backpressured() {
+                    self.remove_neg_subscription(&sub_id);
+                    self.send_neg_err(&sub_id, "blocked: overloaded, please retry");
                     return;
                 }
                 self.send_neg_msg(&sub_id, &response)

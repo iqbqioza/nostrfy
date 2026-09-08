@@ -721,7 +721,7 @@ impl Cli {
 }
 
 fn open_db(cfg: &Config) -> Result<crate::db::DbClient> {
-    crate::db::DbClient::open(
+    let db = crate::db::DbClient::open(
         &cfg.database,
         cfg.nip_enabled(40),
         std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -729,7 +729,10 @@ fn open_db(cfg: &Config) -> Result<crate::db::DbClient> {
         cfg.database.max_indexed_words,
         cfg.database.max_db_queue_msgs,
         cfg.database.max_db_queue_events,
-    )
+    )?;
+    // The API reader queue cap is independent from the WebSocket-side caps.
+    db.set_max_api_pending(cfg.limits.max_api_queue_msgs);
+    Ok(db)
 }
 
 /// Prints a line to stdout, ignoring broken-pipe errors (e.g. `nostrfy stats

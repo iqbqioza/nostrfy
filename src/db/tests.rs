@@ -1606,6 +1606,45 @@ fn search_results_are_relevance_ordered() {
 }
 
 #[test]
+fn multi_filter_search_limits_apply_per_filter() {
+    // Pure-search REQs with differing per-filter limits: each filter keeps
+    // its own quota in relevance order (a small limit must not starve a
+    // larger one).
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let a1 = event(1, "alpha one", now, vec![]);
+        let a2 = event(1, "alpha two", now - 1, vec![]);
+        let b1 = event(1, "beta one", now - 2, vec![]);
+        for e in [&a1, &a2, &b1] {
+            assert_eq!(db.put(e.clone(), now).await, PutOutcome::Stored);
+        }
+        let f: Vec<Filter> = serde_json::from_value(serde_json::json!([
+            {"search": "alpha", "limit": 1},
+            {"search": "beta", "limit": 2},
+        ]))
+        .unwrap();
+        let (res, _) = db.query(f, 500, now).await;
+        let contents: Vec<&str> = res.iter().map(|e| e.content.as_str()).collect();
+        assert!(
+            contents.contains(&"beta one"),
+            "the larger second-filter quota must survive: {contents:?}"
+        );
+        assert_eq!(res.len(), 2, "quotas are 1 + 1 matched: {contents:?}");
+    });
+}
+
+#[test]
 fn search_ranks_rare_terms_higher() {
     // NIP-50 with IDF weighting: a note matching the rarer term ranks above
     // a newer note matching only the common term.

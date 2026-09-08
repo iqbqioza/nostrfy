@@ -68,8 +68,10 @@ pub struct Relay {
     /// a single host cannot consume the whole connection budget.
     per_ip_connections: std::sync::Mutex<HashMap<String, usize>>,
     /// Per-pubkey sliding window of accepted event timestamps
-    /// (`relay.max_events_per_min_per_pubkey`). Bounded: the map is
-    /// cleared when it reaches its cap instead of growing.
+    /// (`relay.max_events_per_min_per_pubkey`). Bounded: at most 10k
+    /// pubkeys are tracked — a full map never clears (tracked windows are
+    /// preserved); fresh pubkeys alone are fail-open until old windows
+    /// expire.
     publish_rate: std::sync::Mutex<HashMap<String, std::collections::VecDeque<u64>>>,
     /// Bumped whenever the blocked-IP list changes (NIP-86 blockip/
     /// unblockip): connections compare this against the value captured at
