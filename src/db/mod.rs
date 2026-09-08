@@ -232,9 +232,11 @@ enum Msg {
         pubkey: String,
         reply: oneshot::Sender<bool>,
     },
-    /// Lists the blob hashes uploaded by a pubkey (reverse index).
+    /// Lists the blob hashes uploaded by a pubkey (reverse index), capped
+    /// at `limit` entries.
     BlossomList {
         pubkey: String,
+        limit: usize,
         reply: oneshot::Sender<Vec<String>>,
     },
     /// Adds many Blossom mappings in one transaction (auto-migration);
@@ -550,6 +552,12 @@ impl DbClient {
         }
         if let Err(err) = channel.send(msg) {
             let msg = err.0;
+            // Release the same counter that was reserved above: `Put` /
+            // `PutBatch` always reserve the writer counters, while every
+            // other message reserves whichever counter its channel path
+            // used (writer counters when gated, reader counters otherwise).
+            // Mismatching them here would leak one counter and underflow
+            // the other into a permanent fail-fast.
             match &msg {
                 Msg::PutBatch { events, .. } => {
                     self.pending_msgs
@@ -561,6 +569,10 @@ impl DbClient {
                     self.pending_msgs
                         .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                     self.pending_events
+                        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                _ if check_writer => {
+                    self.pending_msgs
                         .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                 }
                 _ => {
@@ -1124,10 +1136,12 @@ impl DbClient {
         .await
     }
 
-    /// Lists the blob hashes uploaded by a pubkey.
-    pub async fn blossom_list(&self, pubkey: &str) -> Vec<String> {
+    /// Lists the blob hashes uploaded by a pubkey, capped at `limit`
+    /// entries (see `Store::list_blossom_shas`).
+    pub async fn blossom_list(&self, pubkey: &str, limit: usize) -> Vec<String> {
         self.request_read(|reply| Msg::BlossomList {
             pubkey: pubkey.to_string(),
+            limit,
             reply,
         })
         .await

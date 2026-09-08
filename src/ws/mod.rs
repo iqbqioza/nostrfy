@@ -3340,6 +3340,7 @@ mod tests {
 
             // A saturated outgoing queue fails the round with a retryable
             // NEG-ERR instead of accumulating unbounded NEG bytes.
+            conn.req_response_bytes = 0;
             conn.handle_neg_open(&[json!("q"), json!({"kinds": [1]}), json!("61000000")])
                 .await;
             conn.outgoing.clear();
@@ -3358,6 +3359,8 @@ mod tests {
                 "a backpressured round must close the subscription"
             );
             conn.outgoing.clear();
+            conn.out_queue_bytes = 256 * 1024;
+            conn.out_bytes = 0;
 
             // NEG-CLOSE with a missing id yields a NOTICE.
             conn.handle_neg_close(&[]);

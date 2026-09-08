@@ -268,11 +268,12 @@ impl BlobStore {
         Ok(count)
     }
 
-    /// All blobs uploaded by `pubkey` (hex), via the persisted reverse
-    /// index.
-    pub(crate) async fn list(&self, pubkey: &str) -> Vec<Descriptor> {
+    /// Blobs uploaded by `pubkey` (hex), via the persisted reverse index,
+    /// resolving at most `limit` descriptors: cursors past the window yield
+    /// an empty page (see the `GET /list` handler).
+    pub(crate) async fn list(&self, pubkey: &str, limit: usize) -> Vec<Descriptor> {
         let mut out = Vec::new();
-        for sha in self.db.blossom_list(pubkey).await {
+        for sha in self.db.blossom_list(pubkey, limit).await {
             if let Some(desc) = self.find(&sha).await {
                 out.push(desc);
             }
@@ -819,9 +820,9 @@ mod tests {
         assert!(s.has(&a, &sha).await);
         assert!(s.has(&b, &sha).await);
         assert!(!s.has(&pk(3), &sha).await);
-        assert_eq!(s.list(&a).await.len(), 1);
-        assert_eq!(s.list(&b).await.len(), 1);
-        assert_eq!(s.list(&pk(3)).await.len(), 0);
+        assert_eq!(s.list(&a, 10_000).await.len(), 1);
+        assert_eq!(s.list(&b, 10_000).await.len(), 1);
+        assert_eq!(s.list(&pk(3), 10_000).await.len(), 0);
 
         let npub_a = npub_of(&a);
         let npub_b = npub_of(&b);
@@ -835,8 +836,8 @@ mod tests {
         assert!(read_all(&s, &npub_b, &sha).await.is_none());
         assert!(!s.has(&b, &sha).await);
         assert!(s.has(&a, &sha).await);
-        assert_eq!(s.list(&a).await.len(), 1);
-        assert_eq!(s.list(&b).await.len(), 0);
+        assert_eq!(s.list(&a, 10_000).await.len(), 1);
+        assert_eq!(s.list(&b, 10_000).await.len(), 0);
 
         // The last owner's delete removes the mapping.
         assert!(s.delete(&a, &sha).await.unwrap());
@@ -1235,8 +1236,8 @@ mod tests {
         assert_eq!(s.find(&sha).await.unwrap().pubkey, pk(1));
         assert!(s.has(&pk(1), &sha).await);
         assert!(s.has(&pk(2), &sha).await);
-        assert_eq!(s.list(&pk(1)).await.len(), 2);
-        assert_eq!(s.list(&pk(2)).await.len(), 1);
+        assert_eq!(s.list(&pk(1), 10_000).await.len(), 2);
+        assert_eq!(s.list(&pk(2), 10_000).await.len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1267,8 +1268,8 @@ mod tests {
             s.has(&pk(2), &sha).await,
             "second owner survives the migration"
         );
-        assert_eq!(s.list(&pk(1)).await.len(), 1);
-        assert_eq!(s.list(&pk(2)).await.len(), 1);
+        assert_eq!(s.list(&pk(1), 10_000).await.len(), 1);
+        assert_eq!(s.list(&pk(2), 10_000).await.len(), 1);
         // 一人削除してももう一人は残る
         assert!(s.delete(&pk(1), &sha).await.unwrap());
         assert!(s.find(&sha).await.is_some());

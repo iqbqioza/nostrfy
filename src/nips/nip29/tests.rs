@@ -1031,3 +1031,32 @@ fn pin_list_is_bounded() {
         "replayed history must still be capped"
     );
 }
+
+#[test]
+fn invite_codes_are_bounded() {
+    // Invite codes accumulate without consumption: validation rejects
+    // overflow and apply stops at the cap even for unvalidated history.
+    let mut store = seeded();
+    let many: Vec<Vec<String>> = (0..150)
+        .map(|i| vec!["code".into(), format!("code-{i}")])
+        .collect();
+    let invites = event(9009, ADMIN, Some("g1"), many);
+    assert!(
+        store.validate_write(&invites).is_err(),
+        "an oversized invite batch must be rejected"
+    );
+    store.apply(&invites, "", 1, false, false);
+    assert_eq!(
+        store.group("g1").unwrap().invites.len(),
+        super::MAX_INVITES,
+        "replayed history must still be capped"
+    );
+    // At the cap, one more fresh code is rejected.
+    let one_more = event(
+        9009,
+        ADMIN,
+        Some("g1"),
+        vec![vec!["code".into(), "extra".into()]],
+    );
+    assert!(store.validate_write(&one_more).is_err());
+}

@@ -226,8 +226,12 @@ fn handle_read_msg(store: &Store, errors: &Arc<std::sync::atomic::AtomicU64>, ms
             let _ = reply.send(meta);
             false
         }
-        Msg::BlossomList { pubkey, reply } => {
-            let shas = match store.list_blossom_shas(&pubkey) {
+        Msg::BlossomList {
+            pubkey,
+            limit,
+            reply,
+        } => {
+            let shas = match store.list_blossom_shas(&pubkey, limit) {
                 Ok(shas) => shas,
                 Err(e) => {
                     db_error(errors, &e);
@@ -508,8 +512,12 @@ pub(crate) fn spawn(
                                     };
                                     let _ = reply.send(meta);
                                 }
-                                Msg::BlossomList { pubkey, reply } => {
-                                    let shas = match store.list_blossom_shas(&pubkey) {
+                                Msg::BlossomList {
+                                    pubkey,
+                                    limit,
+                                    reply,
+                                } => {
+                                    let shas = match store.list_blossom_shas(&pubkey, limit) {
                                         Ok(shas) => shas,
                                         Err(e) => {
                                             db_error(&thread_errors, &e);

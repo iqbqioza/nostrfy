@@ -629,13 +629,19 @@ impl Store {
         Ok(true)
     }
 
-    /// Every blob hash uploaded by a pubkey (hex), via the reverse index.
-    pub(crate) fn list_blossom_shas(&self, pubkey: &str) -> Result<Vec<String>> {
+    /// Blob hashes uploaded by a pubkey (hex), via the reverse index,
+    /// capped at `limit` entries: `GET /list` pages through cursors, so an
+    /// unbounded walk for a heavy uploader would materialize hundreds of
+    /// thousands of entries per request.
+    pub(crate) fn list_blossom_shas(&self, pubkey: &str, limit: usize) -> Result<Vec<String>> {
         let rtxn = self.env.read_txn()?;
         let prefix = format!("own:{pubkey}:");
         let mut out = Vec::new();
         let mut iter = self.blossom.prefix_iter(&rtxn, prefix.as_bytes())?;
-        while let Some((key, _)) = iter.next().transpose()? {
+        while out.len() < limit {
+            let Some((key, _)) = iter.next().transpose()? else {
+                break;
+            };
             let key = String::from_utf8_lossy(key);
             if let Some(sha) = key.strip_prefix(&prefix) {
                 out.push(sha.to_string());

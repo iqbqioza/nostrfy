@@ -789,7 +789,11 @@ async fn list(
         None => Some(100),
     };
     let cursor = params.get("cursor").map(String::as_str);
-    let mut blobs = state.store.list(&pubkey).await;
+    // The store walk itself is capped (`LIST_SCAN_CAP`): resolving is what
+    // costs (one metadata read per blob), and pages past the window yield
+    // an empty page like an unknown cursor below.
+    const LIST_SCAN_CAP: usize = 5000;
+    let mut blobs = state.store.list(&pubkey, LIST_SCAN_CAP).await;
     // BUD-12: sorted by `uploaded` descending; the page starts after the
     // cursor and never includes it. An unknown (but well-formed) cursor
     // yields an empty page — not the first page — so a client paging with

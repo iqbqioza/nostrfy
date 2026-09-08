@@ -651,11 +651,11 @@ fn store_blossom_mapping_lifecycle() {
     let meta = store.load_blossom_mapping(&sha).unwrap().unwrap();
     assert_eq!(meta.owners.len(), 2, "both owners merge into the mapping");
     assert_eq!(
-        store.list_blossom_shas(&alice).unwrap(),
+        store.list_blossom_shas(&alice, 10_000).unwrap(),
         vec![sha.clone()],
         "the reverse index lists the blob for the owner"
     );
-    assert_eq!(store.list_blossom_shas(&bob).unwrap().len(), 2);
+    assert_eq!(store.list_blossom_shas(&bob, 10_000).unwrap().len(), 2);
     // Unknown blob / unknown owner return false.
     assert!(
         !store
@@ -672,7 +672,12 @@ fn store_blossom_mapping_lifecycle() {
     assert!(!store.remove_blossom_owner(&sha, &alice).unwrap());
     assert!(store.remove_blossom_owner(&sha, &bob).unwrap());
     assert!(store.load_blossom_mapping(&sha).unwrap().is_none());
-    assert!(store.list_blossom_shas(&bob).unwrap().contains(&sha2));
+    assert!(
+        store
+            .list_blossom_shas(&bob, 10_000)
+            .unwrap()
+            .contains(&sha2)
+    );
     // A corrupt metadata blob reports None (both loads and removals).
     {
         let mut wtxn = store.env.write_txn().unwrap();
@@ -1975,6 +1980,74 @@ fn reader_requests_survive_a_writer_backlog() {
             )
             .await;
         assert_eq!(res.len(), 1, "reads must not fail-fast on a write backlog");
+        db.shutdown();
+    });
+}
+
+#[test]
+fn reported_reads_survive_a_writer_backlog() {
+    // `request_read_result` (REQ/COUNT/NEG reporting paths) must use the
+    // reader-queue accounting: a saturated writer queue must neither
+    // fail-fast them nor leak the writer counter on completion.
+    let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0, 128, 4, 8).unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let now = unix_now();
+        db.put(event(1, "stored", now, vec![]), now).await;
+        db.pending_msgs
+            .store(4, std::sync::atomic::Ordering::Relaxed);
+        db.pending_events
+            .store(8, std::sync::atomic::Ordering::Relaxed);
+        let res = db
+            .query_req_reported(
+                vec![serde_json::from_value(serde_json::json!({"kinds": [1]})).unwrap()],
+                10,
+                now,
+            )
+            .await;
+        assert!(
+            res.is_some(),
+            "reporting reads must not fail-fast on a write backlog"
+        );
+        assert_eq!(res.unwrap().0.len(), 1);
+        // The writer counter is untouched by the reporting read (no leak).
+        assert_eq!(
+            db.pending_msgs.load(std::sync::atomic::Ordering::Relaxed),
+            4,
+            "reporting reads must not touch the writer counter"
+        );
+        db.pending_msgs
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        db.pending_events
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        db.shutdown();
+    });
+}
+
+#[test]
+fn removal_of_overlong_tag_index_skips_without_poisoning() {
+    // Put skips over-long index keys instead of aborting; removal must
+    // mirror that, or deleting one pathological event would poison the
+    // whole write batch (`Invalid(database error)` for everyone).
+    let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0, 128, 4, 8).unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let now = unix_now();
+        let big = "v".repeat(600);
+        let ev = event(1, "big", now, vec![vec!["t".into(), big]]);
+        assert_eq!(db.put(ev.clone(), now).await, PutOutcome::Stored);
+        assert_eq!(
+            db.apply_deletion(vec![ev.id.clone()], vec![], None, now)
+                .await,
+            1,
+            "deleting an event with an over-long tag value must succeed"
+        );
+        let ev2 = event(1, "after", now, vec![]);
+        assert_eq!(
+            db.put(ev2.clone(), now).await,
+            PutOutcome::Stored,
+            "the batch must not be poisoned by the removal"
+        );
         db.shutdown();
     });
 }

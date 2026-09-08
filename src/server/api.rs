@@ -1931,6 +1931,44 @@ mod tests {
     }
 
     #[test]
+    fn monthly_probe_ignores_hidden_earliest_events() {
+        // Without `since`, the range starts at the earliest *visible*
+        // event: an older hidden event must not leak its age through
+        // extra zero months.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_relay().await;
+            let now = unix_now();
+            let mut hidden = signed_note(relay.secp(), "old secret", now - 400 * 86400, vec![]);
+            hidden.tags = vec![vec!["-".into()]];
+            hidden.id = crate::nips::nip01::compute_id(&hidden);
+            let pubkey = hidden.pubkey.clone();
+            assert_eq!(
+                relay.db.put(hidden, now).await,
+                crate::db::PutOutcome::Stored
+            );
+            let visible = signed_note(relay.secp(), "new public", now, vec![]);
+            assert_eq!(
+                relay.db.put(visible, now).await,
+                crate::db::PutOutcome::Stored
+            );
+            let (code, Json(resp)) = api_monthly_handler(
+                State(relay.clone()),
+                Path((pubkey, 1)),
+                Query(ApiParams::default()),
+            )
+            .await;
+            assert_eq!(code, StatusCode::OK);
+            let months = resp["months"].as_array().unwrap();
+            assert!(
+                !months.is_empty() && months.len() <= 2,
+                "the range must start at the visible event, not the hidden one: {resp}"
+            );
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
     fn generic_query_count_kinds_daily_id_and_profile() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {

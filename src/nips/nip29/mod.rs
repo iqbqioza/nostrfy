@@ -54,6 +54,11 @@ const CODE: &str = "code";
 /// could pin unbounded in-memory and stored state.
 pub(crate) const MAX_PINS: usize = 100;
 
+/// Maximum invite codes per group (`kind:9009` accumulations). Codes are
+/// never consumed and vanish does not track their authors, so without a
+/// bound repeated `9009` events would grow the set without limit.
+pub(crate) const MAX_INVITES: usize = 100;
+
 fn tag_value<'a>(event: &'a Event, name: &str) -> Option<&'a str> {
     event
         .tags
@@ -325,6 +330,17 @@ impl GroupStore {
                     > MAX_PINS
             {
                 return Err("restricted: too many pinned events".into());
+            }
+            // Invite codes accumulate without consumption: bound the 9009
+            // additions so repeated events cannot grow the set without
+            // limit (the apply side stops inserting at the same bound).
+            if event.kind == 9009 {
+                let fresh = tag_values(event, CODE)
+                    .filter(|c| !group.has_invite(c))
+                    .count();
+                if group.invites.len().saturating_add(fresh) > MAX_INVITES {
+                    return Err("restricted: too many invite codes".into());
+                }
             }
             // NIP-29: the group must retain at least one admin — a 9000
             // without roles could silently demote the last admin, and a
@@ -683,6 +699,11 @@ impl GroupStore {
             9009 => {
                 if let Some(group) = self.groups.get_mut(gid) {
                     for code in tag_values(event, CODE) {
+                        // Bounded like validation (history replay bypasses
+                        // the check above, so stop inserting at the cap).
+                        if group.invites.len() >= MAX_INVITES {
+                            break;
+                        }
                         group.invites.insert(code.to_string());
                     }
                 }
