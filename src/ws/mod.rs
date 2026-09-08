@@ -540,6 +540,18 @@ pub async fn handle_connection(
         subscriptions_held: Arc::clone(&subscriptions_held),
     };
 
+    let challenge = match nip42::generate_challenge() {
+        // RNG failure must fail the connection closed: a constant fallback
+        // challenge would let one AUTH event replay across connections.
+        // `_guard` releases the slot on return.
+        None => {
+            log::error!("RNG failure generating AUTH challenge; refusing connection");
+            let _ = socket.close().await;
+            return;
+        }
+        Some(challenge) => challenge,
+    };
+
     let (mut sender, mut receiver) = socket.split();
     let (
         max_msg_size,
@@ -590,7 +602,6 @@ pub async fn handle_connection(
         interval
     });
 
-    let challenge = nip42::generate_challenge();
     // Blocked-IP version captured at connect: when the NIP-86 admin
     // blocks (or unblocks) an IP, every connection re-checks the list and
     // closes if its own source IP became blocked.
@@ -2816,6 +2827,34 @@ mod tests {
                     .iter()
                     .any(|m| m[0] == "NOTICE" || m[0] == "OK"),
                 "a malformed event must produce a diagnostic"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn deeply_nested_json_is_rejected_without_abort() {
+        // serde_json enforces a recursion limit (default 128): a deeply
+        // nested frame must fail parsing with a NOTICE, never abort the
+        // process with a stack overflow (which `catch_unwind` could not
+        // contain and which would kill every connection).
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let deep = format!("[\"REQ\",\"s\",{}]", "[".repeat(5000));
+            conn.handle_text(&deep).await;
+            assert!(
+                outgoing_json(&conn).iter().any(|m| m[0] == "NOTICE"),
+                "deep nesting must be rejected with a NOTICE: {:?}",
+                outgoing_json(&conn)
+            );
+            // The connection survives and still serves normal requests.
+            conn.outgoing.clear();
+            conn.handle_req(&[json!("alive"), json!({"kinds": [1]})])
+                .await;
+            assert!(
+                conn.subs.contains_key("alive"),
+                "the connection must stay usable after a hostile frame"
             );
             conn.relay.db.shutdown();
         });

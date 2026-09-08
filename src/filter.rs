@@ -76,14 +76,20 @@ pub struct Filter {
 }
 
 impl Filter {
-    /// Whether the filter exceeds the [`MAX_FILTER_MEMBERS`] bound on `ids`
-    /// or `authors`, which would make the in-memory match quadratic.
+    /// Whether the filter exceeds the [`MAX_FILTER_MEMBERS`] bound on
+    /// `ids`, `authors` or `kinds`, which would make the in-memory match
+    /// quadratic (`kinds.contains` is linear per live event per
+    /// subscription, and the scan fans out per kind).
     pub fn too_many_members(&self) -> bool {
         self.ids
             .as_ref()
             .is_some_and(|v| v.len() > MAX_FILTER_MEMBERS)
             || self
                 .authors
+                .as_ref()
+                .is_some_and(|v| v.len() > MAX_FILTER_MEMBERS)
+            || self
+                .kinds
                 .as_ref()
                 .is_some_and(|v| v.len() > MAX_FILTER_MEMBERS)
     }
@@ -480,6 +486,9 @@ mod tests {
         f.ids = None;
         f.authors = Some(vec!["a".repeat(64); MAX_FILTER_MEMBERS + 1]);
         assert!(f.too_many_members());
+        f.authors = None;
+        f.kinds = Some(vec![1; MAX_FILTER_MEMBERS + 1]);
+        assert!(f.too_many_members(), "oversized kinds must be rejected too");
     }
 
     #[test]

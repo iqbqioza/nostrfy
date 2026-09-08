@@ -1219,6 +1219,40 @@ impl Config {
             );
         }
 
+        // Absurdly large bounds are almost always typos, and they
+        // silently disable the memory protection the bound exists for
+        // (e.g. a gigabyte `max_ws_message_bytes` lets one client pin a
+        // gigabyte). Warn instead of rejecting: an operator may still mean
+        // it, but then it is a conscious choice in the log.
+        let l = &self.limits;
+        for (name, value, sane) in [
+            (
+                "limits.max_ws_message_bytes",
+                l.max_ws_message_bytes,
+                64 << 20,
+            ),
+            ("limits.max_sub_bytes", l.max_sub_bytes, 64 << 20),
+            ("limits.max_limit", l.max_limit, 100_000),
+            (
+                "blossom.max_upload_bytes",
+                self.blossom.max_upload_bytes,
+                1024 << 20,
+            ),
+        ] {
+            if value > sane {
+                log::warn!(
+                    "config.{name} = {value} is extraordinarily large; memory \
+                     protection is effectively disabled"
+                );
+            }
+        }
+        if l.max_req_response_bytes > 512 << 20 {
+            log::warn!(
+                "config.limits.max_req_response_bytes = {} is extraordinarily large; memory \
+                 protection is effectively disabled",
+                l.max_req_response_bytes
+            );
+        }
         // A very high PoW requirement makes every event infeasible to mine;
         // warn instead of silently disabling writes.
         if self.relay.require_pow >= 64 {

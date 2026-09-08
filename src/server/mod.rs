@@ -390,23 +390,56 @@ pub async fn run_server(config_path: PathBuf, config: Config, db: DbClient) -> R
         }));
     }
 
-    tasks.push(tokio::spawn(stats_writer(
-        relay.clone(),
-        shutdown_rx.clone(),
-    )));
-    tasks.push(tokio::spawn(purge_loop(relay.clone(), shutdown_rx.clone())));
-    tasks.push(tokio::spawn(nip66_publisher(
-        relay.clone(),
-        shutdown_rx.clone(),
-    )));
-    tasks.push(tokio::spawn(signal_handler(shutdown_tx.clone())));
-    tasks.push(tokio::spawn(reload_handler(
-        config_path,
-        relay.clone(),
-        relay.db.clone(),
-        relay.api_limit.clone(),
-        shutdown_rx.clone(),
-    )));
+    // Supervisor: a background task that exits before shutdown would
+    // silently lose its function (expiry purge, stats, discovery, SIGHUP).
+    // Today that is unreachable (DB helpers return defaults, never panic),
+    // but a future panic must be loud instead of silent.
+    for (name, handle) in [
+        (
+            "stats_writer",
+            tokio::spawn(stats_writer(relay.clone(), shutdown_rx.clone())),
+        ),
+        (
+            "purge_loop",
+            tokio::spawn(purge_loop(relay.clone(), shutdown_rx.clone())),
+        ),
+        (
+            "nip66_publisher",
+            tokio::spawn(nip66_publisher(relay.clone(), shutdown_rx.clone())),
+        ),
+        (
+            "signal_handler",
+            tokio::spawn(signal_handler(shutdown_tx.clone())),
+        ),
+        (
+            "reload_handler",
+            tokio::spawn(reload_handler(
+                config_path,
+                relay.clone(),
+                relay.db.clone(),
+                relay.api_limit.clone(),
+                shutdown_rx.clone(),
+            )),
+        ),
+    ] {
+        let shutdown = shutdown_rx.clone();
+        tasks.push(tokio::spawn(async move {
+            match handle.await {
+                Ok(()) => {
+                    if !*shutdown.borrow() {
+                        error!(
+                            "background task {name} exited unexpectedly; its function is lost until restart"
+                        );
+                    }
+                }
+                Err(e) => {
+                    error!(
+                        "background task {name} panicked: {e}; its function is lost until restart"
+                    );
+                }
+            }
+        }));
+    }
 
     let (header_timeout, max_connections, per_sec_per_ip, recv_buf_kb) = {
         let cfg = relay.config.read().await;

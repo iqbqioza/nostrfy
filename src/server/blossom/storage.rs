@@ -403,7 +403,7 @@ impl LocalStore {
         // NUL-terminated string.
         if unsafe { libc::statvfs(c_path.as_ptr(), stat.as_mut_ptr()) } == 0 {
             let stat = unsafe { stat.assume_init() };
-            Some(stat.f_bavail * stat.f_frsize)
+            Some(stat.f_bavail.saturating_mul(stat.f_frsize))
         } else {
             None
         }

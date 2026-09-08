@@ -443,7 +443,7 @@ impl Store {
         // NUL-terminated string.
         if unsafe { libc::statvfs(c_path.as_ptr(), stat.as_mut_ptr()) } == 0 {
             let stat = unsafe { stat.assume_init() };
-            Some(stat.f_bavail * stat.f_frsize)
+            Some(stat.f_bavail.saturating_mul(stat.f_frsize))
         } else {
             None
         }
@@ -1078,9 +1078,15 @@ impl Store {
                     let Ok(event) = serde_json::from_slice::<Event>(raw) else {
                         continue;
                     };
+                    // A non-32-byte hex pubkey (legacy corruption) must be
+                    // skipped: `encode_meta` slices `[..32]` below and would
+                    // panic the startup rebuild otherwise.
                     let Ok(pubkey) = hex::decode(&event.pubkey) else {
                         continue;
                     };
+                    if pubkey.len() != ID_LEN {
+                        continue;
+                    }
                     let expiry = crate::nips::nip40::expiry(&event).unwrap_or(0);
                     out.push((
                         id.to_vec(),

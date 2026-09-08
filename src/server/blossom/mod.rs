@@ -315,6 +315,15 @@ async fn verify_auth(
 }
 
 fn error(status: StatusCode, reason: &str) -> Response {
+    // The reason also goes into the `x-reason` header, where control
+    // characters and non-ASCII bytes (possible in io/S3 error strings:
+    // filenames, XML, OS messages) would panic the response builder.
+    // Sanitize the header value; the body keeps the full text.
+    let header_reason: String = reason
+        .chars()
+        .filter(|c| c.is_ascii_graphic() || *c == ' ')
+        .take(200)
+        .collect();
     let reason = reason.to_string();
     (
         status,
@@ -322,7 +331,7 @@ fn error(status: StatusCode, reason: &str) -> Response {
             (axum::http::header::CONTENT_TYPE, "text/plain".to_string()),
             (
                 axum::http::header::HeaderName::from_static("x-reason"),
-                reason.clone(),
+                header_reason,
             ),
         ],
         reason,
@@ -475,6 +484,12 @@ async fn get_blob(
         return error(StatusCode::NOT_FOUND, "blob not found");
     };
     let size = desc.size;
+    // `size` is a `u64` from a stored (possibly corrupt) descriptor: narrow
+    // it fallibly so a corrupt entry degrades to a 404-sized empty blob on
+    // 32-bit instead of truncating the range arithmetic.
+    let Ok(size_usize) = usize::try_from(size) else {
+        return error(StatusCode::NOT_FOUND, "blob not found");
+    };
     let base_headers = [
         (axum::http::header::CONTENT_TYPE, desc.mime),
         (axum::http::header::ETAG, format!("\"{sha}\"")),
@@ -491,7 +506,7 @@ async fn get_blob(
     let range = headers
         .get(axum::http::header::RANGE)
         .and_then(|v| v.to_str().ok())
-        .map(|r| parse_range(r, size as usize));
+        .map(|r| parse_range(r, size_usize));
     let (start, end) = match range {
         Some(Err(())) => {
             // Unsatisfiable or malformed range: 416 with the required
@@ -507,7 +522,7 @@ async fn get_blob(
             return response;
         }
         Some(Ok(Some((start, end)))) => (start, end),
-        _ => (0, size.saturating_sub(1) as usize),
+        _ => (0, size_usize.saturating_sub(1)),
     };
     let len = if size == 0 {
         0

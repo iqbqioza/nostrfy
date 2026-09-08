@@ -1006,6 +1006,15 @@ impl Store {
         };
         for item in iter {
             let (key, _) = item?;
+            // Corrupt short keys (bitrot/hand edit) must loud-fail the
+            // scan, never panic the reader thread: every sibling walk
+            // guards lengths before slicing.
+            if key.len() < ID_LEN {
+                return Err(crate::error::Error::Other(format!(
+                    "corrupt index key ({} bytes)",
+                    key.len()
+                )));
+            }
             let id = &key[key.len() - ID_LEN..];
             if !consider(id)? {
                 *more = true;

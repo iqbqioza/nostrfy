@@ -114,7 +114,10 @@ impl super::Conn {
             }
         };
         if filter.too_many_members() {
-            self.send_neg_err(&sub_id, "error: too many ids or authors in the filter");
+            self.send_neg_err(
+                &sub_id,
+                "error: too many ids, authors or kinds in the filter",
+            );
             return;
         }
         if filter.invalid_tag_values() {

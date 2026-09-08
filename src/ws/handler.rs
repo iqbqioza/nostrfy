@@ -328,7 +328,10 @@ impl super::Conn {
             return;
         }
         if filters.iter().any(|f| f.too_many_members()) {
-            self.reject_req(sub_id, "invalid: too many ids or authors in a filter");
+            self.reject_req(
+                sub_id,
+                "invalid: too many ids, authors or kinds in a filter",
+            );
             return;
         }
         if filters.iter().any(|f| f.invalid_tag_values()) {
@@ -381,7 +384,7 @@ impl super::Conn {
                     .map(|s| s.len())
                     .unwrap_or_default()
             })
-            .sum();
+            .fold(0usize, |acc, n| acc.saturating_add(n));
         let replacing = self.subs.get(sub_id).map(|(_, bytes, _)| *bytes);
         let next_total = self
             .sub_bytes
@@ -426,10 +429,13 @@ impl super::Conn {
         // the limit slots; the visible results are then truncated back to
         // the requested per-filter limits (their sum, since the scan unions
         // the filters).
+        // `max_limit` itself is operator-configured without an upper bound,
+        // so the sum saturates instead of overflowing (a wrap would truncate
+        // the page and confuse pagination).
         let original_total: usize = stored
             .iter()
             .map(|f| f.limit.unwrap_or(max_limit).min(max_limit))
-            .sum();
+            .fold(0usize, |acc, n| acc.saturating_add(n));
         let Some((events, more)) = self
             .relay
             .db
@@ -674,7 +680,10 @@ impl super::Conn {
             return;
         }
         if filters.iter().any(|f| f.too_many_members()) {
-            self.send_closed(sub_id, "invalid: too many ids or authors in a filter");
+            self.send_closed(
+                sub_id,
+                "invalid: too many ids, authors or kinds in a filter",
+            );
             return;
         }
         if filters.iter().any(|f| f.invalid_tag_values()) {

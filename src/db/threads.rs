@@ -363,6 +363,11 @@ pub(crate) fn spawn(
                     else {
                         break;
                     };
+                    // `Msg::Shutdown` is never counted: a panic while
+                    // handling it must not decrement either (that would
+                    // wrap the counter to `usize::MAX` and fail-fast every
+                    // later read forever).
+                    let is_shutdown = matches!(msg, Msg::Shutdown);
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         let shutdown = handle_read_msg(&read_store, &read_errors, msg);
                         // `Msg::Shutdown` is sent directly (never through
@@ -379,7 +384,9 @@ pub(crate) fn spawn(
                         Ok(false) => {}
                         Err(_) => {
                             log::error!("reader thread recovered from a panic");
-                            read_pending.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                            if !is_shutdown {
+                                read_pending.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                            }
                         }
                     }
                 }
@@ -398,6 +405,9 @@ pub(crate) fn spawn(
                 let Some(msg) = api_read_rx.blocking_recv() else {
                     break;
                 };
+                // See the reader thread above: never decrement for an
+                // uncounted `Shutdown`.
+                let is_shutdown = matches!(msg, Msg::Shutdown);
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let shutdown = handle_read_msg(&api_store, &api_errors, msg);
                     // `Msg::Shutdown` is not counted (see the reader thread).
@@ -411,7 +421,9 @@ pub(crate) fn spawn(
                     Ok(false) => {}
                     Err(_) => {
                         log::error!("api reader thread recovered from a panic");
-                        api_thread_pending.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                        if !is_shutdown {
+                            api_thread_pending.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                        }
                     }
                 }
             }

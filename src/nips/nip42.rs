@@ -19,10 +19,17 @@ pub fn auth_message(challenge: &str) -> Value {
     json!(["AUTH", challenge])
 }
 
-pub fn generate_challenge() -> String {
+pub fn generate_challenge() -> Option<String> {
+    // Never silently fall back to a constant: on RNG failure every
+    // connection would share the challenge `000...0`, letting one AUTH
+    // event replay across connections. Callers refuse the connection
+    // instead (fail-closed).
     let mut bytes = [0u8; 16];
-    let _ = getrandom(&mut bytes);
-    hex::encode(bytes)
+    getrandom(&mut bytes).ok()?;
+    if bytes == [0u8; 16] {
+        return None;
+    }
+    Some(hex::encode(bytes))
 }
 
 /// Verifies an AUTH event against the challenge this connection issued.
@@ -113,10 +120,11 @@ mod tests {
 
     #[test]
     fn challenge_generation() {
-        let a = generate_challenge();
-        let b = generate_challenge();
+        let a = generate_challenge().expect("RNG available in tests");
+        let b = generate_challenge().expect("RNG available in tests");
         assert_eq!(a.len(), 32);
         assert_ne!(a, b);
+        assert_ne!(a, "0".repeat(32), "must never be the zero fallback");
     }
 
     #[test]
