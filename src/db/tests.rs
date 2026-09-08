@@ -2027,6 +2027,18 @@ fn reported_reads_survive_a_writer_backlog() {
     rt.block_on(async {
         let now = unix_now();
         db.put(event(1, "stored", now, vec![]), now).await;
+        // The put's reply can arrive before the writer drain releases its
+        // accounting (reply-then-drop ordering): wait for the counters to
+        // settle before fabricating the backlog, or the late release races
+        // the fabricated values (flaky on slow schedulers).
+        for _ in 0..200 {
+            let settled = db.pending_msgs.load(std::sync::atomic::Ordering::Relaxed) == 0
+                && db.pending_events.load(std::sync::atomic::Ordering::Relaxed) == 0;
+            if settled {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
         db.pending_msgs
             .store(4, std::sync::atomic::Ordering::Relaxed);
         db.pending_events
