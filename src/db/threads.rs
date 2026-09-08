@@ -215,6 +215,34 @@ fn handle_read_msg(store: &Store, errors: &Arc<std::sync::atomic::AtomicU64>, ms
             let _ = reply.send(lists);
             false
         }
+        Msg::LoadGroups { reply } => {
+            // `Ok(None)` means no snapshot was ever written (pre-persistence
+            // database): the caller runs the replay migration. An `Err`
+            // also yields `None`, and the caller treats it the same way —
+            // but logs the failure so a corrupt snapshot is visible.
+            // (A corrupt snapshot replays history, which is fail-closed:
+            // tombstones rebuild from surviving events.)
+            let snap = match store.load_groups() {
+                Ok(snap) => snap,
+                Err(e) => {
+                    db_error(errors, &e);
+                    None
+                }
+            };
+            let _ = reply.send(snap);
+            false
+        }
+        Msg::LoadRoles { reply } => {
+            let snap = match store.load_roles() {
+                Ok(snap) => snap,
+                Err(e) => {
+                    db_error(errors, &e);
+                    None
+                }
+            };
+            let _ = reply.send(snap);
+            false
+        }
         Msg::BlossomLoad { sha256, reply } => {
             let meta = match store.load_blossom_mapping(&sha256) {
                 Ok(meta) => meta,
@@ -546,6 +574,26 @@ pub(crate) fn spawn(
                                     };
                                     let _ = reply.send(lists);
                                 }
+                                Msg::LoadGroups { reply } => {
+                                    let snap = match store.load_groups() {
+                                        Ok(snap) => snap,
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            None
+                                        }
+                                    };
+                                    let _ = reply.send(snap);
+                                }
+                                Msg::LoadRoles { reply } => {
+                                    let snap = match store.load_roles() {
+                                        Ok(snap) => snap,
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            None
+                                        }
+                                    };
+                                    let _ = reply.send(snap);
+                                }
                                 Msg::Query {
                                     filters,
                                     limit,
@@ -742,6 +790,18 @@ pub(crate) fn spawn(
                                 }
                                 Msg::SaveBlossomAllow { entries, reply } => {
                                     if let Err(e) = store.save_blossom_allow(&entries) {
+                                        db_error(&thread_errors, &e);
+                                    }
+                                    let _ = reply.send(());
+                                }
+                                Msg::SaveGroups { snapshot, reply } => {
+                                    if let Err(e) = store.save_groups(&snapshot) {
+                                        db_error(&thread_errors, &e);
+                                    }
+                                    let _ = reply.send(());
+                                }
+                                Msg::SaveRoles { snapshot, reply } => {
+                                    if let Err(e) = store.save_roles(&snapshot) {
                                         db_error(&thread_errors, &e);
                                     }
                                     let _ = reply.send(());

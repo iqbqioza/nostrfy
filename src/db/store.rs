@@ -86,6 +86,12 @@ pub(crate) const ACCESS: &str = "access";
 /// sha256 → blob metadata (mime/size/uploaded/owners) plus the per-owner
 /// reverse index, persisted so Blossom lookups need no in-memory index.
 pub(crate) const BLOSSOM: &str = "blossom";
+/// NIP-29 group state snapshot (`groups:snapshot`), persisted so restarts
+/// restore groups without replaying the full moderation history.
+pub(crate) const GROUPS: &str = "groups";
+/// NIP-43 role state snapshot (`roles:snapshot`), persisted for the same
+/// reason as [`GROUPS`].
+pub(crate) const ROLES: &str = "roles";
 pub(crate) const CREATED_LEN: usize = 8;
 pub(crate) const ID_LEN: usize = 32;
 pub(crate) const TAG_VALUE_MAX: usize = 1024;
@@ -273,6 +279,13 @@ pub(crate) struct Store {
     /// under a single fixed key so they survive restarts.
     pub(crate) access: Database<Bytes, Bytes>,
     pub(crate) blossom: Database<Bytes, Bytes>,
+    /// Serialized NIP-29 group state snapshot (see
+    /// [`crate::nips::nip29::GroupsSnapshot`]), written on every group
+    /// mutation so restarts restore groups without replaying history.
+    pub(crate) groups: Database<Bytes, Bytes>,
+    /// Serialized NIP-43 role state snapshot (see
+    /// [`crate::nips::nip43::RolesSnapshot`]), same lifecycle as [`Self::groups`].
+    pub(crate) roles: Database<Bytes, Bytes>,
     /// NIP-40 expiration handling is only active when the NIP is enabled.
     /// Shared with the relay so that a config reload can toggle it at runtime.
     pub(crate) expiry_enabled: Arc<std::sync::atomic::AtomicBool>,
@@ -354,14 +367,15 @@ impl Store {
         let first_seen = env.create_database::<Bytes, Bytes>(&mut wtxn, Some(FIRST_SEEN))?;
         let access = env.create_database::<Bytes, Bytes>(&mut wtxn, Some(ACCESS))?;
         let blossom = env.create_database::<Bytes, Bytes>(&mut wtxn, Some(BLOSSOM))?;
+        let groups = env.create_database::<Bytes, Bytes>(&mut wtxn, Some(GROUPS))?;
+        let roles = env.create_database::<Bytes, Bytes>(&mut wtxn, Some(ROLES))?;
         wtxn.commit()?;
         log::info!(
             "database ready at {} ({} tables, map {} MiB)",
             cfg.path.display(),
-            14,
+            16,
             map_size / (1024 * 1024)
         );
-
         Ok(Store {
             env,
             events,
@@ -380,6 +394,8 @@ impl Store {
             first_seen,
             access,
             blossom,
+            groups,
+            roles,
             expiry_enabled,
             max_indexed_words: max_indexed_words.max(1),
             map_max_size,
@@ -459,6 +475,8 @@ impl Store {
             first_seen: self.first_seen,
             access: self.access,
             blossom: self.blossom,
+            groups: self.groups,
+            roles: self.roles,
             expiry_enabled: Arc::clone(&self.expiry_enabled),
             max_indexed_words: self.max_indexed_words,
             map_max_size: self.map_max_size,
@@ -475,6 +493,50 @@ impl Store {
         self.access.put(&mut wtxn, b"access", &data)?;
         wtxn.commit()?;
         Ok(())
+    }
+
+    /// Persists the NIP-29 group state snapshot under a single fixed key.
+    /// Written on every group mutation (join/leave/moderation/vanish), so
+    /// restarts restore groups without replaying the full history.
+    pub(crate) fn save_groups(&self, snap: &crate::nips::nip29::GroupsSnapshot) -> Result<()> {
+        self.disk_full_error()?;
+        let data = serde_json::to_vec(snap)?;
+        let mut wtxn = self.env.write_txn()?;
+        self.groups.put(&mut wtxn, b"groups:snapshot", &data)?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    /// Loads the persisted NIP-29 group state snapshot, if any. `None`
+    /// means no snapshot was ever written (pre-persistence database): the
+    /// caller runs the event-replay migration instead.
+    pub(crate) fn load_groups(&self) -> Result<Option<crate::nips::nip29::GroupsSnapshot>> {
+        let rtxn = self.env.read_txn()?;
+        let Some(raw) = self.groups.get(&rtxn, b"groups:snapshot")? else {
+            return Ok(None);
+        };
+        Ok(Some(serde_json::from_slice(raw)?))
+    }
+
+    /// Persists the NIP-43 role state snapshot under a single fixed key.
+    /// Same lifecycle as [`Self::save_groups`].
+    pub(crate) fn save_roles(&self, snap: &crate::nips::nip43::RolesSnapshot) -> Result<()> {
+        self.disk_full_error()?;
+        let data = serde_json::to_vec(snap)?;
+        let mut wtxn = self.env.write_txn()?;
+        self.roles.put(&mut wtxn, b"roles:snapshot", &data)?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    /// Loads the persisted NIP-43 role state snapshot, if any (see
+    /// [`Self::load_groups`]).
+    pub(crate) fn load_roles(&self) -> Result<Option<crate::nips::nip43::RolesSnapshot>> {
+        let rtxn = self.env.read_txn()?;
+        let Some(raw) = self.roles.get(&rtxn, b"roles:snapshot")? else {
+            return Ok(None);
+        };
+        Ok(Some(serde_json::from_slice(raw)?))
     }
 
     /// Loads the persisted access control lists, if any.

@@ -211,6 +211,26 @@ enum Msg {
         entries: Vec<String>,
         reply: oneshot::Sender<()>,
     },
+    /// Persists the NIP-29 group state snapshot (write-through on every
+    /// group mutation).
+    SaveGroups {
+        snapshot: crate::nips::nip29::GroupsSnapshot,
+        reply: oneshot::Sender<()>,
+    },
+    /// Loads the persisted NIP-29 group state snapshot.
+    LoadGroups {
+        reply: oneshot::Sender<Option<crate::nips::nip29::GroupsSnapshot>>,
+    },
+    /// Persists the NIP-43 role state snapshot (write-through on every
+    /// role mutation).
+    SaveRoles {
+        snapshot: crate::nips::nip43::RolesSnapshot,
+        reply: oneshot::Sender<()>,
+    },
+    /// Loads the persisted NIP-43 role state snapshot.
+    LoadRoles {
+        reply: oneshot::Sender<Option<crate::nips::nip43::RolesSnapshot>>,
+    },
     /// Adds an owner to a Blossom blob's persisted metadata (atomic);
     /// the reply carries whether the commit succeeded.
     BlossomAddOwner {
@@ -1050,6 +1070,41 @@ impl DbClient {
         let _ = self
             .request_write(|reply| Msg::SaveBlossomAllow { entries, reply })
             .await;
+    }
+
+    /// Persists the NIP-29 group state snapshot (write-through: call after
+    /// every group mutation). Fire-and-forget like the other saves: the
+    /// writer always replies, and a failed commit only logs (the next
+    /// mutation retries the full snapshot).
+    pub async fn save_groups(&self, snapshot: crate::nips::nip29::GroupsSnapshot) {
+        let _ = self
+            .request_write(|reply| Msg::SaveGroups { snapshot, reply })
+            .await;
+    }
+
+    /// Loads the persisted NIP-29 group state snapshot at startup.
+    /// Returns `None` when no snapshot was ever written (pre-persistence
+    /// database) or the load failed: the caller runs the replay migration
+    /// instead of starting empty (fail-closed).
+    pub async fn load_groups(&self) -> Option<crate::nips::nip29::GroupsSnapshot> {
+        self.request_read_blocking(|reply| Msg::LoadGroups { reply })
+            .await
+    }
+
+    /// Persists the NIP-43 role state snapshot (write-through: call after
+    /// every role mutation). Same fire-and-forget semantics as
+    /// [`Self::save_groups`].
+    pub async fn save_roles(&self, snapshot: crate::nips::nip43::RolesSnapshot) {
+        let _ = self
+            .request_write(|reply| Msg::SaveRoles { snapshot, reply })
+            .await;
+    }
+
+    /// Loads the persisted NIP-43 role state snapshot at startup (see
+    /// [`Self::load_groups`]).
+    pub async fn load_roles(&self) -> Option<crate::nips::nip43::RolesSnapshot> {
+        self.request_read_blocking(|reply| Msg::LoadRoles { reply })
+            .await
     }
 
     /// Loads the persisted access control lists, if any.

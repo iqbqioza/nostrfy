@@ -302,9 +302,21 @@ pub async fn run_server(config_path: PathBuf, config: Config, db: DbClient) -> R
     // changes (relay name/description/icon) can be persisted to disk.
     *relay.config_path.write().await = Some(config_path.clone());
 
-    // Rebuild the NIP-29 group state from the stored moderation events.
+    // Restore the NIP-29 group state from the persisted snapshot. Only
+    // when no snapshot was ever written (pre-persistence database) fall
+    // back to replaying the stored moderation events, then persist the
+    // result so later restarts skip the replay.
     if relay.config.read().await.nip_enabled(29) {
-        relay.groups.write().await.rebuild(&relay.db).await;
+        match relay.db.load_groups().await {
+            Some(snap) => {
+                relay.groups.write().await.restore(snap);
+                info!("NIP-29 group state restored from the database snapshot");
+            }
+            None => {
+                relay.groups.write().await.rebuild(&relay.db).await;
+                relay.persist_groups().await;
+            }
+        }
         if relay.has_relay_key() {
             info!(
                 "NIP-29 groups enabled (relay key {})",
@@ -313,15 +325,24 @@ pub async fn run_server(config_path: PathBuf, config: Config, db: DbClient) -> R
         }
     }
 
-    // Rebuild the NIP-43 role store from the stored role definitions and
-    // membership lists.
+    // Same lifecycle for the NIP-43 role store: snapshot first, replay
+    // migration only when nothing was ever persisted.
     if relay.config.read().await.nip_enabled(43) {
-        relay
-            .roles
-            .write()
-            .await
-            .rebuild(&relay.db, &relay.relay_pubkey().unwrap_or_default())
-            .await;
+        match relay.db.load_roles().await {
+            Some(snap) => {
+                relay.roles.write().await.restore(snap);
+                info!("NIP-43 role state restored from the database snapshot");
+            }
+            None => {
+                relay
+                    .roles
+                    .write()
+                    .await
+                    .rebuild(&relay.db, &relay.relay_pubkey().unwrap_or_default())
+                    .await;
+                relay.persist_roles().await;
+            }
+        }
     }
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);

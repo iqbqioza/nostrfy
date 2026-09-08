@@ -988,6 +988,22 @@ impl Relay {
         self.broadcast(event);
     }
 
+    /// Persists the live NIP-29 group state (write-through: call after
+    /// every mutation so restarts restore without replaying history).
+    /// Fire-and-forget: a failed commit only logs (the next mutation
+    /// retries the full snapshot).
+    pub(crate) async fn persist_groups(&self) {
+        let snapshot = self.groups.read().await.snapshot();
+        self.db.save_groups(snapshot).await;
+    }
+
+    /// Persists the live NIP-43 role state (same lifecycle as
+    /// [`Self::persist_groups`]).
+    pub(crate) async fn persist_roles(&self) {
+        let snapshot = self.roles.read().await.snapshot();
+        self.db.save_roles(snapshot).await;
+    }
+
     /// NIP-62: deletes every event by `pubkey` and removes the pubkey from
     /// every NIP-29 group (its moderation events were deleted along with
     /// everything else).
@@ -1002,16 +1018,22 @@ impl Relay {
         let removed = self.db.apply_vanish(pubkey, until_created).await;
         self.stats.bump(&self.stats.events_deleted, removed as u64);
         if self.config.read().await.nip_enabled(29) {
-            let mut groups = self.groups.write().await;
-            for group in groups.groups.values_mut() {
-                group.members.remove(&pubkey_hex);
+            {
+                let mut groups = self.groups.write().await;
+                for group in groups.groups.values_mut() {
+                    group.members.remove(&pubkey_hex);
+                }
             }
+            self.persist_groups().await;
         }
         // NIP-43 role assignments hold pubkeys too: a vanished author
         // must not keep its roles.
         if self.config.read().await.nip_enabled(43) {
-            let mut roles = self.roles.write().await;
-            roles.assignments.remove(&pubkey_hex);
+            {
+                let mut roles = self.roles.write().await;
+                roles.assignments.remove(&pubkey_hex);
+            }
+            self.persist_roles().await;
         }
     }
 
@@ -1035,6 +1057,9 @@ impl Relay {
             self.has_relay_key(),
             false,
         );
+        // Write-through persistence: restarts restore from the snapshot
+        // instead of replaying history.
+        self.persist_groups().await;
 
         if event.kind == 9005 {
             // Group moderation delete-event: admins may delete events, but

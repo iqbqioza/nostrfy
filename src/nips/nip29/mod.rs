@@ -6,7 +6,7 @@
 
 pub(crate) mod events;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 use events::{
     apply_settings, build_admins_event, build_members_event, build_meta_event, build_pins_event,
@@ -154,7 +154,7 @@ pub fn delete_targets(event: &Event) -> Vec<String> {
     tag_values(event, E).map(str::to_string).collect()
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct GroupSettings {
     pub private: bool,
     pub restricted: bool,
@@ -169,7 +169,7 @@ pub struct GroupSettings {
     pub livekit: bool,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Group {
     /// pubkey -> set of roles.
     pub members: HashMap<String, HashSet<String>>,
@@ -218,12 +218,40 @@ pub struct GroupStore {
     max_groups: usize,
 }
 
+/// The persistable NIP-29 group state: everything [`GroupStore`] holds
+/// except the capacity cap (which comes from the config on every start).
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+pub(crate) struct GroupsSnapshot {
+    pub groups: HashMap<String, Group>,
+    pub deleted: HashSet<String>,
+    pub ghost: HashSet<String>,
+}
+
 impl GroupStore {
     pub fn with_cap(max_groups: usize) -> GroupStore {
         GroupStore {
             max_groups,
             ..Default::default()
         }
+    }
+
+    /// Persisted snapshot of the group state (see the `GROUP` table): the
+    /// live groups plus the delete/ghost markers. `max_groups` is config,
+    /// not state, and is never persisted.
+    pub(crate) fn snapshot(&self) -> GroupsSnapshot {
+        GroupsSnapshot {
+            groups: self.groups.clone(),
+            deleted: self.deleted.clone(),
+            ghost: self.ghost.clone(),
+        }
+    }
+
+    /// Restores state persisted by [`Self::snapshot`], keeping the current
+    /// capacity cap.
+    pub(crate) fn restore(&mut self, snap: GroupsSnapshot) {
+        self.groups = snap.groups;
+        self.deleted = snap.deleted;
+        self.ghost = snap.ghost;
     }
 
     /// Whether another group may be created. The deleted markers count

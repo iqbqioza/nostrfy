@@ -29,7 +29,7 @@ pub const LEAVE: u64 = 28936;
 /// Tag on a `kind:33534` tombstone marking a role as deleted.
 pub const DELETED_TAG: &str = "deleted";
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Role {
     pub label: String,
     pub description: String,
@@ -44,12 +44,33 @@ pub struct RoleStore {
     pub assignments: HashMap<String, Vec<String>>,
 }
 
+/// The persistable NIP-43 role state (see the `ROLE` table).
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+pub(crate) struct RolesSnapshot {
+    pub roles: HashMap<String, Role>,
+    pub assignments: HashMap<String, Vec<String>>,
+}
+
 impl RoleStore {
     /// Whether `pubkey` holds at least one role assignment.
     pub fn is_member_of(&self, pubkey: &str) -> bool {
         self.assignments
             .get(pubkey)
             .is_some_and(|roles| !roles.is_empty())
+    }
+
+    /// Persisted snapshot of the role state (see the `ROLE` table).
+    pub(crate) fn snapshot(&self) -> RolesSnapshot {
+        RolesSnapshot {
+            roles: self.roles.clone(),
+            assignments: self.assignments.clone(),
+        }
+    }
+
+    /// Restores state persisted by [`Self::snapshot`].
+    pub(crate) fn restore(&mut self, snap: RolesSnapshot) {
+        self.roles = snap.roles;
+        self.assignments = snap.assignments;
     }
 
     pub fn create(

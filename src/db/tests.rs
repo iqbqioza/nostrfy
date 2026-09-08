@@ -2890,3 +2890,49 @@ fn event_meta_rebuilds_from_stored_events() {
         assert_eq!(created, now);
     });
 }
+
+#[test]
+fn group_and_role_snapshots_survive_restart() {
+    // NIP-29/43 state must survive restarts without replaying history:
+    // persist a snapshot, then load + restore it into fresh stores.
+    let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0, 128, 4, 8).unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        // No snapshot on a fresh database: the caller must migrate.
+        assert!(db.load_groups().await.is_none());
+        assert!(db.load_roles().await.is_none());
+
+        let mut groups = crate::nips::nip29::GroupStore::with_cap(100);
+        let now = unix_now();
+        let create = crate::nips::nip29::tests::event(
+            crate::nips::nip29::CREATE_GROUP,
+            crate::nips::nip29::tests::ADMIN,
+            Some("g1"),
+            vec![],
+        );
+        groups.apply(&create, "relay", now, false, false);
+        db.save_groups(groups.snapshot()).await;
+        let mut restored = crate::nips::nip29::GroupStore::with_cap(7);
+        restored.restore(db.load_groups().await.expect("snapshot"));
+        assert!(restored.group("g1").is_some(), "groups must restore");
+        // The capacity cap comes from the config, not the snapshot.
+        assert!(
+            restored
+                .group("g1")
+                .unwrap()
+                .is_admin(crate::nips::nip29::tests::ADMIN)
+        );
+
+        let mut roles = crate::nips::nip43::RoleStore::default();
+        roles.create("mod", "Mod", "", "", None);
+        roles.assign(crate::nips::nip29::tests::USER, "mod");
+        db.save_roles(roles.snapshot()).await;
+        let mut restored_roles = crate::nips::nip43::RoleStore::default();
+        restored_roles.restore(db.load_roles().await.expect("snapshot"));
+        assert!(
+            restored_roles.is_member_of(crate::nips::nip29::tests::USER),
+            "roles must restore"
+        );
+        db.shutdown();
+    });
+}

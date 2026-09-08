@@ -90,6 +90,9 @@ impl super::Relay {
             roles.create(id, label, description, color, order);
             roles.role_event(id, &relay_pubkey, self.stamp_floor(unix_now()))
         };
+        // Write-through persistence (also on publish failure: memory
+        // changed, so the snapshot must follow or a restart would lose it).
+        self.persist_roles().await;
         self.publish_relay_event(event).await
     }
 
@@ -119,6 +122,10 @@ impl super::Relay {
         }
         let removed = self.roles.write().await.delete(id);
         if removed {
+            // Write-through persistence before publishing (see
+            // `create_role`): the tombstone path below must not lose the
+            // in-memory deletion on restart even if publishing fails.
+            self.persist_roles().await;
             // Publish a tombstone `kind:33534` so the deletion survives the
             // restart rebuild (the rebuild skips `["deleted"]` tombstones);
             // then republish the membership list without the deleted role.
@@ -156,6 +163,7 @@ impl super::Relay {
         }
         let assigned = self.roles.write().await.assign(pubkey, role);
         if assigned {
+            self.persist_roles().await;
             self.publish_membership(Some((true, pubkey.to_string())))
                 .await
         } else {
@@ -169,6 +177,7 @@ impl super::Relay {
         }
         let changed = self.roles.write().await.unassign(pubkey, role);
         if changed {
+            self.persist_roles().await;
             self.publish_membership(Some((false, pubkey.to_string())))
                 .await
         } else {
@@ -181,6 +190,7 @@ impl super::Relay {
     pub(crate) async fn apply_leave_request(&self, event: &Event) {
         let removed = self.roles.write().await.remove_pubkey(&event.pubkey);
         if removed {
+            self.persist_roles().await;
             // A failed republish would let the rebuild resurrect the
             // member after a restart: surface it in the log.
             if !self
