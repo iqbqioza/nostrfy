@@ -293,10 +293,12 @@ fn group_cap_counts_deleted_groups() {
         "restricted: group limit reached",
         "deleted groups must count toward the budget"
     );
-    // Re-creating the DELETED g1 is refused on other grounds.
+    // Re-creating the DELETED g1 is refused on capacity grounds here (the
+    // budget is full); with spare capacity a fresh create resurrects it
+    // (see `deleted_group_id_can_be_recreated`).
     assert_eq!(
         store.validate_write(&g1).unwrap_err(),
-        "blocked: the group has been deleted"
+        "restricted: group limit reached"
     );
 }
 
@@ -953,4 +955,79 @@ fn last_admin_cannot_be_demoted_or_removed() {
         vec![vec![P.into(), ADMIN2.into()]],
     );
     assert!(store.validate_write(&remove2).is_ok());
+}
+
+#[test]
+fn parent_side_adopt_requires_child_admin() {
+    // A parent admin must not hijack an orphan group by listing it: the
+    // author must also administer the child (the child's own 9002 remains
+    // the normal parenting path).
+    let mut store = seeded();
+    let create3 = event(CREATE_GROUP, OTHER, Some("g3"), vec![]);
+    store.apply(&create3, "", 1, false, false);
+    // ADMIN administers g1 but not g3: parent-side adoption is rejected.
+    let adopt = event(
+        9002,
+        ADMIN,
+        Some("g1"),
+        vec![vec!["child".into(), "g3".into()]],
+    );
+    assert!(
+        store.validate_write(&adopt).is_err(),
+        "adopting a group you do not administer must be rejected"
+    );
+    // Once ADMIN is also an admin of g3, the same edit validates.
+    let grant = event(
+        9000,
+        OTHER,
+        Some("g3"),
+        vec![vec![P.into(), ADMIN.into(), "mod".into()]],
+    );
+    assert!(store.validate_write(&grant).is_ok());
+    store.apply(&grant, "", 1, false, false);
+    assert!(store.validate_write(&adopt).is_ok());
+}
+
+#[test]
+fn deleted_group_id_can_be_recreated() {
+    // A fresh 9007 resurrects a deleted id (the tombstone blocks every
+    // other write but not re-creation).
+    let mut store = seeded();
+    let delete = event(DELETE_GROUP, ADMIN, Some("g1"), vec![]);
+    assert!(store.validate_write(&delete).is_ok());
+    store.apply(&delete, "", 1, false, false);
+    assert!(store.group("g1").is_none());
+    let rejoin = event(9021, USER, Some("g1"), vec![]);
+    assert!(
+        store.validate_write(&rejoin).is_err(),
+        "writes to a deleted group stay blocked"
+    );
+    let recreate = event(CREATE_GROUP, ADMIN, Some("g1"), vec![]);
+    assert!(store.validate_write(&recreate).is_ok());
+    store.apply(&recreate, "", 1, false, false);
+    assert!(
+        store.group("g1").is_some(),
+        "a fresh create must resurrect the id"
+    );
+}
+
+#[test]
+fn pin_list_is_bounded() {
+    // NIP-29 lets the relay limit pins: validation rejects oversized
+    // 9010 lists, and apply caps history replayed without validation.
+    let mut store = seeded();
+    let many: Vec<Vec<String>> = (0..150)
+        .map(|i| vec![E.into(), format!("{:064x}", i)])
+        .collect();
+    let pins = event(9010, ADMIN, Some("g1"), many.clone());
+    assert!(
+        store.validate_write(&pins).is_err(),
+        "an oversized pin list must be rejected"
+    );
+    store.apply(&pins, "", 1, false, false);
+    assert_eq!(
+        store.group("g1").unwrap().pins.len(),
+        super::MAX_PINS,
+        "replayed history must still be capped"
+    );
 }

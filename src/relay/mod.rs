@@ -987,6 +987,12 @@ impl Relay {
     /// NIP-62: deletes every event by `pubkey` and removes the pubkey from
     /// every NIP-29 group (its moderation events were deleted along with
     /// everything else).
+    ///
+    /// Membership/admin removal is immediate (`members` holds roles, so one
+    /// `remove` strips both). Settings/invites/pins/parent-links authored
+    /// solely by the vanished key converge on the next restart (the rebuild
+    /// replays only surviving events); until then the live view is a
+    /// transient superset, never a resurrection of the vanished content.
     async fn vanish_pubkey(&self, pubkey: [u8; 32], until_created: u64) {
         let pubkey_hex = hex::encode(pubkey);
         let removed = self.db.apply_vanish(pubkey, until_created).await;

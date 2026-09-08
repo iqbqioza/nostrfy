@@ -180,7 +180,11 @@ async fn build_router(
     if cfg.server.metrics_enabled {
         app = app.route("/metrics", get(metrics_handler));
     }
-    if cfg.nip_enabled(29) && !cfg.relay.livekit_url.is_empty() {
+    if cfg.nip_enabled(29)
+        && !cfg.relay.livekit_url.trim().is_empty()
+        && !cfg.relay.livekit_api_key.is_empty()
+        && !cfg.relay.livekit_api_secret.is_empty()
+    {
         app = app
             .route("/.well-known/nip29/livekit", get(livekit_supported))
             .route("/.well-known/nip29/livekit/{group}", get(livekit_token));

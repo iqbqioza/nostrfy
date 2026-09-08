@@ -49,6 +49,11 @@ const E: &str = "e";
 const A: &str = "a";
 const CODE: &str = "code";
 
+/// Maximum pinned events per group (`kind:9010` list / mirrored `39005`).
+/// NIP-29 lets the relay limit pins; without a bound one moderation event
+/// could pin unbounded in-memory and stored state.
+pub(crate) const MAX_PINS: usize = 100;
+
 fn tag_value<'a>(event: &'a Event, name: &str) -> Option<&'a str> {
     event
         .tags
@@ -230,6 +235,16 @@ impl GroupStore {
             return Ok(());
         };
         if self.deleted.contains(gid) {
+            // A deleted id stays closed except for a fresh create: the
+            // tombstone blocks every other write, but legitimate re-creation
+            // with the same id must remain possible (the create clears the
+            // marker in `apply`). Without this an id could never be reused.
+            if event.kind == CREATE_GROUP {
+                if self.at_capacity() {
+                    return Err("restricted: group limit reached".into());
+                }
+                return Ok(());
+            }
             return Err("blocked: the group has been deleted".into());
         }
         let Some(group) = self.groups.get(gid) else {
@@ -297,6 +312,19 @@ impl GroupStore {
             }
             if event.kind == 9002 {
                 validate_edit_metadata(self, gid, group, event)?;
+            }
+            // NIP-29 allows the relay to limit pins: bound the 9010 list
+            // so one event cannot pin unbounded state (the apply side caps
+            // too, for history replayed without validation).
+            if event.kind == 9010
+                && event
+                    .tags
+                    .iter()
+                    .filter(|t| t.len() >= 2 && (t[0] == E || t[0] == A))
+                    .count()
+                    > MAX_PINS
+            {
+                return Err("restricted: too many pinned events".into());
             }
             // NIP-29: the group must retain at least one admin — a 9000
             // without roles could silently demote the last admin, and a
@@ -457,8 +485,13 @@ impl GroupStore {
                         Some(group) => {
                             apply_settings(group, event);
                             let children_before = group.children.clone();
-                            group.children =
-                                tag_values(event, "child").map(str::to_string).collect();
+                            // Deduplicate while preserving order: a repeated
+                            // `child` tag must not list the same child twice.
+                            let mut seen = HashSet::new();
+                            group.children = tag_values(event, "child")
+                                .map(str::to_string)
+                                .filter(|c| seen.insert(c.clone()))
+                                .collect();
                             let before = group.parent.clone();
                             let after = tag_value(event, "parent").map(str::to_string);
                             (before, after, children_before)
@@ -587,6 +620,14 @@ impl GroupStore {
             }
             CREATE_GROUP => {
                 if !self.groups.contains_key(gid) && (ignore_capacity || !self.at_capacity()) {
+                    // A fresh create resurrects the id: clear a previous
+                    // delete tombstone (and ghost marker) so the id is
+                    // reusable. Note the tombstone itself is memory-only;
+                    // if the `9008` event is later lost (author vanish,
+                    // expiry, NIP-09 deletion), the next rebuild replays
+                    // surviving history and the group returns — events are
+                    // the source of truth, and an admin can re-delete.
+                    self.deleted.remove(gid);
                     self.unghost(gid);
                     let mut group = Group::default();
                     group
@@ -647,12 +688,15 @@ impl GroupStore {
                 }
             }
             9010 => {
+                // Bounded like validation (history replay bypasses the
+                // check above, so cap here too).
                 if let Some(group) = self.groups.get_mut(gid) {
                     group.pins = event
                         .tags
                         .iter()
                         .filter(|t| t.len() >= 2 && (t[0] == E || t[0] == A))
                         .map(|t| (t[0].clone(), t[1].clone()))
+                        .take(MAX_PINS)
                         .collect();
                 }
                 if emit {
@@ -1017,6 +1061,22 @@ fn validate_edit_metadata(
         .all(|c| children.contains(c.as_str()))
     {
         return Err("restricted: missing child tags in metadata edit".into());
+    }
+    // Adopting a new child through the parent's list requires authority
+    // over the child too: otherwise a foreign admin could hijack an
+    // orphan group by listing it (each group's own 39001 is authoritative
+    // for its scope). Reordering already-linked children stays parent-only.
+    // Unknown ids (no group yet) are still listable as placeholders.
+    for child in tag_values(event, "child") {
+        if _group.children.iter().any(|c| c == child) {
+            continue;
+        }
+        if let Some(child_group) = store.groups.get(child)
+            && child_group.parent.as_deref() != Some(gid)
+            && !child_group.is_admin(event.pubkey.as_str())
+        {
+            return Err("restricted: you are not an admin of the child group".into());
+        }
     }
     Ok(())
 }

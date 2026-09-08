@@ -19,9 +19,16 @@ use crate::util::unix_now;
 // ----- NIP-29 LiveKit integration -----
 
 /// `GET /.well-known/nip29/livekit` — 204 when LiveKit rooms are supported.
+/// All three credentials are required: with a URL but no key/secret every
+/// mint would 404, so capability is not advertised either (fail-closed and
+/// consistent with `livekit_token` below).
 pub(crate) async fn livekit_supported(State(relay): State<Arc<Relay>>) -> impl IntoResponse {
     let cfg = relay.config.read().await;
-    if cfg.nip_enabled(29) && !cfg.relay.livekit_url.is_empty() {
+    if cfg.nip_enabled(29)
+        && !cfg.relay.livekit_url.trim().is_empty()
+        && !cfg.relay.livekit_api_key.is_empty()
+        && !cfg.relay.livekit_api_secret.is_empty()
+    {
         StatusCode::NO_CONTENT
     } else {
         StatusCode::NOT_FOUND
@@ -41,7 +48,7 @@ pub(crate) async fn livekit_token(
     // a minted token carries an empty endpoint and is unusable; fail closed
     // instead of issuing it.
     if !cfg.nip_enabled(29)
-        || cfg.relay.livekit_url.is_empty()
+        || cfg.relay.livekit_url.trim().is_empty()
         || cfg.relay.livekit_api_key.is_empty()
         || cfg.relay.livekit_api_secret.is_empty()
     {

@@ -217,6 +217,10 @@ impl super::Relay {
                     }
                 }
                 // NIP-29 `previous` timeline references must exist.
+                // The recommendation (at least 3 refs from the last 50,
+                // 4-byte prefixes) is intentionally not enforced: zero refs
+                // are legal per spec, and any hex length is accepted so
+                // clients sending longer prefixes keep working.
                 let mut unknown: Option<&str> = None;
                 for prefix in nip29::previous_tags(event) {
                     let Ok(prefix) = hex::decode(&prefix) else {

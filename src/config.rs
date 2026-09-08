@@ -859,10 +859,12 @@ impl Config {
             22 => Some(&[1111]),
             26 => None,
             29 => Some(&[
-                // Current NIP-29 kinds: the full moderation range 9000-9010
-                // (including reserved slots), 9021/9022 and 39000-39005.
-                9000, 9001, 9002, 9003, 9004, 9005, 9006, 9007, 9008, 9009, 9010, 9021, 9022, 39000,
-                39001, 39002, 39003, 39004, 39005,
+                // NIP-29 moderation range 9000-9020 (9003/9004/9006 and
+                // 9011-9020 are reserved but admin-gated and stored like
+                // any other moderation kind), 9021/9022 and 39000-39005.
+                9000, 9001, 9002, 9003, 9004, 9005, 9006, 9007, 9008, 9009, 9010, 9011, 9012, 9013,
+                9014, 9015, 9016, 9017, 9018, 9019, 9020, 9021, 9022, 39000, 39001, 39002, 39003,
+                39004, 39005,
             ]),
             32 => Some(&[1985]),
             33 => None, // range 30000-39999 — not checked against kind block lists
@@ -1183,14 +1185,25 @@ impl Config {
             ));
         }
 
-        // LiveKit configuration must be complete when enabled.
+        // LiveKit configuration must be complete when enabled (fail-closed
+        // at runtime: capability is unadvertised and minting 404s — but a
+        // typo'd URL would silently disable AV, so warn loudly here).
         if !self.relay.livekit_url.trim().is_empty()
             && (self.relay.livekit_api_key.trim().is_empty()
                 || self.relay.livekit_api_secret.trim().is_empty())
         {
             log::warn!(
                 "relay.livekit_url is set but livekit_api_key/livekit_api_secret are empty: \
-                 tokens will be signed with an empty secret and rejected by LiveKit"
+                 LiveKit rooms are disabled (capability unadvertised, tokens 404)"
+            );
+        }
+        if !self.relay.livekit_url.trim().is_empty()
+            && !self.relay.livekit_url.starts_with("wss://")
+        {
+            log::warn!(
+                "relay.livekit_url should be a wss:// URL (got {:?}): clients expect a \
+                 LiveKit WebSocket endpoint",
+                self.relay.livekit_url
             );
         }
 
@@ -2603,7 +2616,9 @@ log_max_files = 2
     #[test]
     fn nip29_kinds_cover_the_full_moderation_range() {
         let kinds = Config::nip_kinds(29).expect("NIP-29 has kinds");
-        for k in [9000u64, 9003, 9004, 9006, 9010, 9021, 39000, 39005] {
+        for k in [
+            9000u64, 9003, 9004, 9006, 9010, 9011, 9020, 9021, 39000, 39005,
+        ] {
             assert!(kinds.contains(&k), "NIP-29 kinds must include {k}");
         }
     }

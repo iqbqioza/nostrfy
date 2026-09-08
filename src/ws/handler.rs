@@ -473,6 +473,11 @@ impl super::Conn {
         // `created_at` belong to the same page. The scan already continues
         // ties past its limit; extend the visible truncation the same way so
         // a tie split by withheld events is not cut in half here.
+        // Note: `truncated || more` below is computed pre-visibility-filter
+        // (like the scan's `more`), so a fully-withheld page can still
+        // report `more`. That is conservative on purpose: it prompts the
+        // client to authenticate (see the `auth` hint) instead of wrongly
+        // claiming completeness.
         if truncated && original_total > 0 {
             let boundary = to_send[original_total - 1].created_at;
             let mut end = original_total;
