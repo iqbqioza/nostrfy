@@ -110,10 +110,46 @@ fn add_cors_headers(headers: &mut HeaderMap) {
     );
 }
 
+/// Pending-connection backlog for the TCP listeners. `TcpListener::bind`
+/// uses a fixed small backlog (1024): a burst of new connections beyond it
+/// (benchmarks, reconnect storms) overflows the queue and the SYN
+/// retransmit timeout (~1 s) dominates the measured open rate, even though
+/// the accept loop itself drains thousands per second. An explicit large
+/// backlog absorbs such bursts; the kernel clamps it to `somaxconn`
+/// anyway, so this is headroom, not a commitment.
+const LISTEN_BACKLOG: u32 = 4096;
+
 /// Binds a TCP listener on `addr` and logs the given label with the
 /// address, turning a bind failure into a configuration error.
 async fn bind_listener(addr: &(String, u16), label: &str) -> Result<TcpListener> {
-    let listener = match TcpListener::bind(addr).await {
+    let bound: std::io::Result<TcpListener> = async {
+        // Try every resolved address like `TcpListener::bind` does, so a
+        // hostname resolving to both families keeps working.
+        let mut bound = None;
+        let mut last_err =
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "no address resolved");
+        for sock_addr in tokio::net::lookup_host((addr.0.as_str(), addr.1)).await? {
+            let attempt = (|| {
+                let socket = if sock_addr.is_ipv4() {
+                    tokio::net::TcpSocket::new_v4()?
+                } else {
+                    tokio::net::TcpSocket::new_v6()?
+                };
+                socket.bind(sock_addr)?;
+                socket.listen(LISTEN_BACKLOG)
+            })();
+            match attempt {
+                Ok(listener) => {
+                    bound = Some(listener);
+                    break;
+                }
+                Err(e) => last_err = e,
+            }
+        }
+        bound.ok_or(last_err)
+    }
+    .await;
+    let listener = match bound {
         Ok(listener) => listener,
         // Log through the logger too: in daemon mode the process stderr
         // goes to /dev/null, so a bind failure (e.g. the port is already
@@ -929,6 +965,12 @@ async fn serve_limited(
     // vector is pruned of finished handles above 1024 entries, so a
     // long-running relay cannot grow it without bound.
     let mut conn_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    // Accepts since the last prune: scanning the whole handle vector on
+    // every accept is O(live connections) per connection (~1 ms at 10k
+    // conns), which stalls the accept loop exactly when a burst needs it
+    // fastest. Pruning at most once per 128 accepts keeps the amortized
+    // cost constant while still bounding the vector.
+    let mut accepts_since_prune = 0usize;
 
     loop {
         tokio::select! {
@@ -1043,9 +1085,12 @@ async fn serve_limited(
                     // Released by `_guard` on every exit path including panic.
                 }));
                 // Bound the handle vector: prune the finished tasks once
-                // it grows past 1024 entries (amortized constant work per
-                // accept; live tasks are never pruned).
-                if conn_tasks.len() > 1024 {
+                // it grows past 1024 entries (live tasks are never pruned).
+                // Throttled to one scan per 128 accepts (see above): an
+                // unthrottled scan is O(live) on every accept.
+                accepts_since_prune += 1;
+                if conn_tasks.len() > 1024 && accepts_since_prune >= 128 {
+                    accepts_since_prune = 0;
                     conn_tasks.retain(|task| !task.is_finished());
                 }
             }
