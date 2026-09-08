@@ -294,7 +294,9 @@ impl super::Relay {
         }
         // NIP-09: a deletion request is defined as having a list of one or
         // more `e` or `a` tags. A kind-5 event with no targets has no
-        // effect and would only accumulate as meaningless history.
+        // effect and would only accumulate as meaningless history, so it is
+        // rejected (stricter than the letter of the spec, which only
+        // defines the shape — documented here).
         if cfg.nip_enabled(9)
             && event.kind == nip09::DELETION_KIND
             && !event

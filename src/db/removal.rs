@@ -86,10 +86,16 @@ impl Store {
         // addressable events published up to the deletion request.
         for address in addresses {
             // Only the author of the addressable event may delete it.
-            if let Some(pubkey) = request_pubkey
-                && address.pubkey != pubkey
-            {
-                continue;
+            // Compare decoded bytes (case-insensitive like the scan's hex
+            // decode) so an uppercase `a` value still matches the author.
+            if let Some(pubkey) = request_pubkey {
+                let same = hex::decode(&address.pubkey)
+                    .ok()
+                    .zip(hex::decode(pubkey).ok())
+                    .is_some_and(|(a, b)| a == b);
+                if !same {
+                    continue;
+                }
             }
             let Ok(pubkey) = hex::decode(&address.pubkey) else {
                 continue;

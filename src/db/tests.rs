@@ -964,6 +964,17 @@ fn multi_filter_req_survives_an_early_limit() {
         .unwrap();
         let (res, _) = db.query(f, 500, now).await;
         assert_eq!(res.len(), 2, "the second filter must still be evaluated");
+
+        // A lone `limit: 0` filter returns nothing with `more == false`
+        // (NIP-01: no stored events, subscription stays open — not a
+        // truncated page that would send clients into a pagination loop).
+        let f: Vec<Filter> = serde_json::from_value(serde_json::json!([
+            {"limit": 0}
+        ]))
+        .unwrap();
+        let (res, more) = db.query(f, 500, now).await;
+        assert!(res.is_empty());
+        assert!(!more, "limit: 0 must report finish, not more");
     });
 }
 

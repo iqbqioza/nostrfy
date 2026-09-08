@@ -103,6 +103,10 @@ async fn group_allows(relay: &Relay, group: &str, pubkey: &str) -> bool {
         // membership (the id may be a private group on another relay),
         // so no token is minted for them.
         None => false,
+        // LiveKit rooms are opt-in per group (`livekit` tag on the group
+        // metadata): a group without it never mints tokens, even when the
+        // relay has LiveKit configured globally.
+        Some(g) if !g.settings.livekit => false,
         Some(g) => !g.settings.private && !g.settings.restricted || g.is_member(pubkey),
     }
 }
@@ -301,10 +305,14 @@ mod tests {
     #[tokio::test]
     async fn known_open_group_mints_token() {
         let relay = build_relay().await;
+        let settings = crate::nips::nip29::GroupSettings {
+            livekit: true,
+            ..Default::default()
+        };
         relay.groups.write().await.groups.insert(
             "open".into(),
             crate::nips::nip29::Group {
-                settings: crate::nips::nip29::GroupSettings::default(),
+                settings,
                 ..Default::default()
             },
         );
@@ -322,10 +330,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn group_without_livekit_flag_mints_nothing() {
+        // LiveKit rooms are opt-in per group: without the `livekit` tag no
+        // token is minted even for an open group.
+        let relay = build_relay().await;
+        relay.groups.write().await.groups.insert(
+            "nolive".into(),
+            crate::nips::nip29::Group {
+                settings: crate::nips::nip29::GroupSettings::default(),
+                ..Default::default()
+            },
+        );
+        let secp = relay.secp().clone();
+        let ev = signed_token_auth(&relay, &secp, "nolive").await;
+        let (status, _, _) = token_status(&relay, "nolive", &ev).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "a group without the livekit flag must not mint"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
     async fn known_closed_group_refuses_non_member() {
         let relay = build_relay().await;
         let mut g = crate::nips::nip29::Group::default();
         g.settings.private = true;
+        g.settings.livekit = true;
         relay.groups.write().await.groups.insert("closed".into(), g);
         let secp = relay.secp().clone();
         let ev = signed_token_auth(&relay, &secp, "closed").await;
@@ -345,6 +377,7 @@ mod tests {
         let pubkey = XOnlyPublicKey::from_keypair(&keypair).0.to_string();
         let mut g = crate::nips::nip29::Group::default();
         g.settings.private = true;
+        g.settings.livekit = true;
         g.members.insert(pubkey.clone(), Default::default());
         relay.groups.write().await.groups.insert("closed".into(), g);
         let secp = relay.secp().clone();

@@ -417,6 +417,9 @@ pub async fn rpc_handler(
             if !is_pubkey(pubkey) {
                 return rpc_err("invalid pubkey");
             }
+            if let Err(msg) = check_role_id(role) {
+                return rpc_err(&msg);
+            }
             if relay.assign_role(pubkey, role).await {
                 audit!(&relay, &identity, "assignrole", params);
                 rpc_ok(json!(true))
@@ -435,6 +438,9 @@ pub async fn rpc_handler(
             };
             if !is_pubkey(pubkey) {
                 return rpc_err("invalid pubkey");
+            }
+            if let Err(msg) = check_role_id(role) {
+                return rpc_err(&msg);
             }
             if relay.unassign_role(pubkey, role).await {
                 audit!(&relay, &identity, "unassignrole", params);
@@ -862,6 +868,13 @@ mod tests {
         assert!(rpc_err_of(resp).await.contains("params"));
         let resp = rpc_call(&relay, "assignrole", vec![json!("zz"), json!("r1")]).await;
         assert!(rpc_err_of(resp).await.contains("pubkey"));
+        let resp = rpc_call(
+            &relay,
+            "assignrole",
+            vec![json!("aa".repeat(32)), json!("")],
+        )
+        .await;
+        assert!(rpc_err_of(resp).await.contains("empty"));
         let resp = rpc_call(
             &relay,
             "assignrole",

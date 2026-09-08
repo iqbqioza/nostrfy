@@ -28,6 +28,12 @@ use crate::util::unix_now;
 pub const GROUP_META: u64 = 39000;
 pub const GROUP_ADMINS: u64 = 39001;
 pub const GROUP_MEMBERS: u64 = 39002;
+/// Reserved group metadata kinds (no builder emits them yet): treated as
+/// relay-signed metadata for forward compatibility.
+#[allow(dead_code)]
+pub const GROUP_ROLES: u64 = 39003;
+#[allow(dead_code)]
+pub const GROUP_PARTICIPANTS: u64 = 39004;
 pub const GROUP_PINS: u64 = 39005;
 pub const MOD_MIN: u64 = 9000;
 pub const MOD_MAX: u64 = 9020;

@@ -612,6 +612,13 @@ impl Store {
                 more = true;
                 break;
             }
+            // NIP-01: `limit: 0` returns nothing for that filter but keeps
+            // the subscription alive — it must neither collect nor report
+            // `more` (otherwise a leading `{"limit": 0}` filter poisons the
+            // whole REQ into a pagination loop).
+            if !count_mode && filter.limit == Some(0) {
+                continue;
+            }
             let has_search = filter.has_search();
             let limit = if count_mode {
                 max_limit
@@ -638,7 +645,9 @@ impl Store {
                 // are not candidates; the most common terms (last, in
                 // token order) are dropped first.
                 let terms: Vec<String> = terms.into_iter().take(SEARCH_MAX_TERMS).collect();
-                if let Some(l) = filter.limit {
+                if let Some(l) = filter.limit
+                    && l > 0
+                {
                     search_take = search_take.min(l);
                 }
                 terms
