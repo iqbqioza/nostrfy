@@ -45,6 +45,9 @@ pub(crate) enum BlobStream {
     S3(reqwest::Response),
 }
 
+/// One legacy-migration row: (sha256, mime, size, uploaded, hex pubkey).
+type LegacyEntry = (String, String, u64, i64, String);
+
 /// Blob storage: the LMDB-persisted mapping plus the file backend.
 pub(crate) struct BlobStore {
     storage: Storage,
@@ -242,26 +245,55 @@ impl BlobStore {
     /// blobs stored before the mapping existed (local files or bucket
     /// objects). Runs in the background at startup; the marker key makes
     /// it idempotent, so later restarts skip it instantly.
+    ///
+    /// Streaming: scanned entries flow through a bounded channel in 5000-row
+    /// chunks and are committed as they arrive, so a legacy store with
+    /// hundreds of thousands of blobs never materializes the full listing
+    /// (nor a task per object) in memory.
     pub(crate) async fn auto_migrate_legacy(&self) -> Result<usize> {
         if self.db.blossom_migration_done().await {
             return Ok(0);
         }
-        let entries = match &self.storage {
-            Storage::Local(s) => s.scan_legacy().await?,
-            Storage::S3(s) => s.scan_legacy().await?,
+        // Backpressure of one chunk: the scanner waits while a slow disk
+        // commits, bounding transient memory to ~2 chunks + one page.
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        let scan = async {
+            let r = match &self.storage {
+                Storage::Local(s) => s.scan_legacy(tx).await,
+                Storage::S3(s) => s.scan_legacy(tx).await,
+            };
+            r.map(|_| ())
         };
-        let count = entries.len();
-        // The writes are chunked: a legacy store with hundreds of
-        // thousands of blobs must not hold one giant LMDB write
-        // transaction (which would block the relay's event writes for the
-        // whole duration of the migration).
-        for chunk in entries.chunks(5000) {
-            if !self.db.blossom_add_mappings(chunk.to_vec()).await {
-                // The marker is not set: the migration retries on the next
-                // startup (the failed chunk may need a bigger map).
-                return Err(crate::error::Error::Other(
-                    "blossom migration write failed; will retry on the next start".into(),
-                ));
+        tokio::pin!(scan);
+        let mut count = 0usize;
+        let mut scanning = true;
+        loop {
+            tokio::select! {
+                biased;
+                r = &mut scan, if scanning => {
+                    // The scanner finished (its sender is dropped): keep
+                    // draining already-queued chunks below.
+                    scanning = false;
+                    r?;
+                }
+                chunk = rx.recv() => {
+                    match chunk {
+                        Some(entries) => {
+                            count += entries.len();
+                            if !self.db.blossom_add_mappings(entries).await {
+                                // The marker is not set: the migration
+                                // retries on the next startup (the failed
+                                // chunk may need a bigger map).
+                                return Err(crate::error::Error::Other(
+                                    "blossom migration write failed; will retry on the next start".into(),
+                                ));
+                            }
+                        }
+                        // All senders dropped and the queue is empty.
+                        None if !scanning => break,
+                        None => {}
+                    }
+                }
             }
         }
         self.db.mark_blossom_migration().await;
@@ -501,11 +533,15 @@ impl LocalStore {
     }
 
     /// Scans `<root>/<npub>/<sha>.meta.json` for the legacy migration.
-    async fn scan_legacy(&self) -> Result<Vec<(String, String, u64, i64, String)>> {
-        let mut out = Vec::new();
+    /// Scans one legacy store for pre-mapping blobs, streaming entries in
+    /// bounded chunks: the caller commits each chunk before the next is
+    /// produced, so memory stays flat regardless of store size.
+    async fn scan_legacy(&self, tx: tokio::sync::mpsc::Sender<Vec<LegacyEntry>>) -> Result<()> {
         // Metas take precedence: a sha found via its meta is not derived
         // again from the raw blob. A set keeps this O(n) for big stores.
-        let mut via_meta: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // (Scoped per uploader directory: metas and blobs of one owner live
+        // in one directory, so cross-directory duplicates cannot occur.)
+        let mut buf: Vec<(String, String, u64, i64, String)> = Vec::new();
         let mut dirs = tokio::fs::read_dir(&self.root).await?;
         while let Some(entry) = dirs.next_entry().await? {
             let dir = entry.path();
@@ -521,6 +557,7 @@ impl LocalStore {
             let Ok(pubkey) = npub_from_dir(&dir) else {
                 continue;
             };
+            let mut via_meta: std::collections::HashSet<String> = std::collections::HashSet::new();
             // Pass 1: legacy meta files carry the full descriptor.
             let mut files = match tokio::fs::read_dir(&dir).await {
                 Ok(f) => f,
@@ -539,7 +576,7 @@ impl LocalStore {
                 if let Ok(raw) = tokio::fs::read(file.path()).await
                     && let Ok(meta) = serde_json::from_slice::<serde_json::Value>(&raw)
                 {
-                    out.push((
+                    buf.push((
                         sha.to_string(),
                         crate::server::blossom::sanitize_mime(meta["mime"].as_str().unwrap_or("")),
                         meta["size"].as_u64().unwrap_or(0),
@@ -547,6 +584,12 @@ impl LocalStore {
                         pubkey.clone(),
                     ));
                     via_meta.insert(sha.to_string());
+                    if buf.len() >= 5000 {
+                        let chunk = std::mem::take(&mut buf);
+                        if tx.send(chunk).await.is_err() {
+                            return Ok(());
+                        }
+                    }
                 }
             }
             // Pass 2: blobs without a meta (written after the metadata
@@ -576,16 +619,26 @@ impl LocalStore {
                     ),
                     Err(_) => continue,
                 };
-                out.push((
+                buf.push((
                     name,
                     "application/octet-stream".to_string(),
                     size,
                     uploaded,
                     pubkey.clone(),
                 ));
+                if buf.len() >= 5000 {
+                    let chunk = std::mem::take(&mut buf);
+                    if tx.send(chunk).await.is_err() {
+                        return Ok(());
+                    }
+                }
             }
         }
-        Ok(out)
+        if !buf.is_empty() && tx.send(buf).await.is_err() {
+            // Receiver went away (shutdown): stop early, the marker stays
+            // unset so the migration retries on the next startup.
+        }
+        Ok(())
     }
 }
 
@@ -661,69 +714,90 @@ impl S3Store {
 
     /// Lists the bucket and fetches the meta objects (bounded parallelism)
     /// for the legacy migration.
-    async fn scan_legacy(&self) -> Result<Vec<(String, String, u64, i64, String)>> {
-        let keys = self.client.list_keys("").await?;
-        // Only the legacy meta objects are fetched (small): the sizes of
-        // the blob objects come straight from the listing, so a bucket
-        // with many blobs is not downloaded during the migration.
-        let mut out = Vec::new();
-        let mut via_meta: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(16));
-        let mut tasks = tokio::task::JoinSet::new();
-        for (key, size) in keys {
-            let (npub, file) = match key.split_once('/') {
-                Some((n, f)) => (n, f),
-                None => continue,
-            };
-            let Ok(pubkey) = npub_from_dir(std::path::Path::new(npub)) else {
-                continue;
-            };
-            if let Some(sha) = file.strip_suffix(".meta.json") {
-                via_meta.insert(sha.to_string());
-                let client = self.client.clone();
-                let semaphore = std::sync::Arc::clone(&semaphore);
-                tasks.spawn(async move {
-                    let _permit = semaphore.acquire().await;
-                    let raw = client.get_object(&key).await;
-                    (key, pubkey, raw)
-                });
-                continue;
+    /// Streams one legacy bucket's pre-mapping blobs in listing-page order,
+    /// resolving each page's small meta objects with bounded concurrency
+    /// and emitting 5000-row chunks. A blob and its meta can land on
+    /// different pages; same-sha duplicates across pages rewrite the same
+    /// mapping bytes, so page-local dedup is sufficient for correctness.
+    async fn scan_legacy(&self, tx: tokio::sync::mpsc::Sender<Vec<LegacyEntry>>) -> Result<()> {
+        let mut token = String::new();
+        loop {
+            let (keys, next) = self.client.list_keys_page("", &token).await?;
+            token = next;
+            // Only the legacy meta objects are fetched (small): the sizes
+            // of the blob objects come straight from the listing, so a
+            // bucket with many blobs is not downloaded during the
+            // migration.
+            let mut out = Vec::new();
+            let mut via_meta: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(16));
+            let mut tasks = tokio::task::JoinSet::new();
+            for (key, size) in keys {
+                let (npub, file) = match key.split_once('/') {
+                    Some((n, f)) => (n, f),
+                    None => continue,
+                };
+                let Ok(pubkey) = npub_from_dir(std::path::Path::new(npub)) else {
+                    continue;
+                };
+                if let Some(sha) = file.strip_suffix(".meta.json") {
+                    via_meta.insert(sha.to_string());
+                    let client = self.client.clone();
+                    let semaphore = std::sync::Arc::clone(&semaphore);
+                    tasks.spawn(async move {
+                        let _permit = semaphore.acquire().await;
+                        let raw = client.get_object(&key).await;
+                        (key, pubkey, raw)
+                    });
+                    continue;
+                }
+                // Blobs without a meta (metadata moved to LMDB): the size
+                // comes from the listing; mime falls back to octet-stream.
+                if file.len() == 64 && hex::decode(file).is_ok() {
+                    out.push((
+                        file.to_string(),
+                        "application/octet-stream".to_string(),
+                        size,
+                        0,
+                        pubkey,
+                    ));
+                }
             }
-            // Blobs without a meta (metadata moved to LMDB): the size
-            // comes from the listing; mime falls back to octet-stream.
-            if file.len() == 64 && hex::decode(file).is_ok() {
-                out.push((
-                    file.to_string(),
-                    "application/octet-stream".to_string(),
-                    size,
-                    0,
-                    pubkey,
-                ));
+            while let Some(Ok((key, pubkey, raw))) = tasks.join_next().await {
+                let Some(sha) = key
+                    .strip_suffix(".meta.json")
+                    .and_then(|k| k.split_once('/'))
+                    .map(|(_, f)| f)
+                else {
+                    continue;
+                };
+                if let Ok(Some(raw)) = raw
+                    && let Ok(meta) = serde_json::from_slice::<serde_json::Value>(&raw)
+                {
+                    out.push((
+                        sha.to_string(),
+                        crate::server::blossom::sanitize_mime(meta["mime"].as_str().unwrap_or("")),
+                        meta["size"].as_u64().unwrap_or(0),
+                        meta["uploaded"].as_i64().unwrap_or(0),
+                        pubkey,
+                    ));
+                }
+            }
+            // The derived entries must not duplicate meta-backed ones.
+            out.retain(|(sha, _, _, _, _)| !via_meta.contains(sha));
+            // Emit in bounded chunks so one giant page cannot spike memory
+            // (S3 pages are ~1000 keys, far below the chunk size, but the
+            // bound holds regardless of server behavior).
+            for chunk in out.chunks(5000) {
+                if tx.send(chunk.to_vec()).await.is_err() {
+                    return Ok(());
+                }
+            }
+            if token.is_empty() {
+                break;
             }
         }
-        while let Some(Ok((key, pubkey, raw))) = tasks.join_next().await {
-            let Some(sha) = key
-                .strip_suffix(".meta.json")
-                .and_then(|k| k.split_once('/'))
-                .map(|(_, f)| f)
-            else {
-                continue;
-            };
-            if let Ok(Some(raw)) = raw
-                && let Ok(meta) = serde_json::from_slice::<serde_json::Value>(&raw)
-            {
-                out.push((
-                    sha.to_string(),
-                    crate::server::blossom::sanitize_mime(meta["mime"].as_str().unwrap_or("")),
-                    meta["size"].as_u64().unwrap_or(0),
-                    meta["uploaded"].as_i64().unwrap_or(0),
-                    pubkey,
-                ));
-            }
-        }
-        // The derived entries must not duplicate meta-backed ones.
-        out.retain(|(sha, _, _, _, _)| !via_meta.contains(sha));
-        Ok(out)
+        Ok(())
     }
 }
 
@@ -1314,7 +1388,12 @@ mod scan_debug {
             "npub_from_dir must accept the bech32m npub"
         );
         let s = LocalStore::new(&dir, 0).await.unwrap();
-        let entries = s.scan_legacy().await.unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        s.scan_legacy(tx).await.unwrap();
+        let mut entries = Vec::new();
+        while let Some(chunk) = rx.recv().await {
+            entries.extend(chunk);
+        }
         assert_eq!(entries.len(), 1, "scan must find the legacy meta");
         let _ = std::fs::remove_dir_all(&dir);
     }

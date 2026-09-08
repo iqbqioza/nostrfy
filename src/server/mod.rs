@@ -1140,6 +1140,14 @@ async fn reload_handler(
                                 old.database.disabled_fsync != new_config.database.disabled_fsync,
                             ),
                             (
+                                "database.max_dbs",
+                                old.database.max_dbs != new_config.database.max_dbs,
+                            ),
+                            (
+                                "database.max_readers",
+                                old.database.max_readers != new_config.database.max_readers,
+                            ),
+                            (
                                 "blossom.host",
                                 old.blossom.host != new_config.blossom.host,
                             ),
@@ -1315,6 +1323,8 @@ async fn reload_handler(
                         new_config.database.meta_index = old.database.meta_index;
                         new_config.database.reader_threads = old.database.reader_threads;
                         new_config.database.disabled_fsync = old.database.disabled_fsync;
+                        new_config.database.max_dbs = old.database.max_dbs;
+                        new_config.database.max_readers = old.database.max_readers;
                         new_config.database.path = old.database.path.clone();
                         new_config.database.purge_interval_secs = old.database.purge_interval_secs;
                         new_config.database.db_request_timeout_secs =

@@ -453,14 +453,9 @@ pub async fn api_monthly_handler(
     // (from the earliest stored event of this author and kind); an explicit
     // range must not exceed MAX_MONTHS of count queries, so one request
     // cannot pin the API reader thread behind a huge loop of scans.
-    // The concurrency permit is taken before the probe so a flood of
-    // `monthly` requests without `since` cannot bypass the 503 limiter.
-    let Some(_permit) = relay.api_limit.try_acquire() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "error": "server is busy, try again shortly" })),
-        );
-    };
+    // Permits are held per scan round-trip — never across the whole month
+    // loop — so one slow `monthly` cannot pin a concurrency slot for
+    // `MAX_MONTHS × db timeout` while other API callers get 503s.
     let now = unix_now();
     let until = params.until.unwrap_or(now);
     let no_tags_probe = excluded_tags(&params);
@@ -479,10 +474,20 @@ pub async fn api_monthly_handler(
             let mut start_ts = None;
             let mut fetch = 64usize;
             for _ in 0..4 {
+                // The concurrency permit is taken per round-trip (also
+                // covering the probe) so a flood of `monthly` requests
+                // without `since` cannot bypass the 503 limiter.
+                let Some(_permit) = relay.api_limit.try_acquire() else {
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(json!({ "error": "server is busy, try again shortly" })),
+                    );
+                };
                 let (events, _) = relay
                     .db
                     .api_query(vec![probe.clone()], fetch, now, true)
                     .await;
+                drop(_permit);
                 let has_group_events = events.iter().any(nip29::is_group_event);
                 let groups = if has_group_events {
                     Some(relay.groups.read().await)
@@ -533,6 +538,14 @@ pub async fn api_monthly_handler(
     let mut total = 0u64;
     let mut approximate = false;
     for (y, m) in months {
+        // Per-iteration permit (see above): a saturated limiter fails this
+        // request with 503 instead of holding a slot across all months.
+        let Some(_permit) = relay.api_limit.try_acquire() else {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": "server is busy, try again shortly" })),
+            );
+        };
         let start = month_start(y, m);
         let end = month_start_of_next(y, m);
         let filter: Filter = serde_json::from_value(json!({
@@ -747,12 +760,6 @@ pub async fn api_daily_handler(
     let end = month_start_of_next(year, month);
     let days_in_month = (end - start) / 86400;
 
-    let Some(_permit) = relay.api_limit.try_acquire() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "error": "server is busy, try again shortly" })),
-        );
-    };
     let count_limit = relay.config.read().await.limits.max_count;
     let no_tags = excluded_tags(&params);
     let nip78 = enabled_nip78_auth_active(&relay).await;
@@ -761,6 +768,13 @@ pub async fn api_daily_handler(
     let mut total = 0u64;
     let mut approximate = false;
     for day in 0..days_in_month {
+        // Per-iteration permit: never hold a slot across the whole month.
+        let Some(_permit) = relay.api_limit.try_acquire() else {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": "server is busy, try again shortly" })),
+            );
+        };
         let day_start = start + day * 86400;
         let filter: Filter = serde_json::from_value(json!({
             "authors": [hex_pk],
@@ -789,7 +803,6 @@ pub async fn api_daily_handler(
             "approximate": more,
         }));
     }
-    drop(_permit);
     (
         StatusCode::OK,
         Json(json!({ "days": day_counts, "total": total, "approximate": approximate })),
@@ -851,22 +864,34 @@ pub async fn api_stats_handler(
         Ok(pk) => pk,
         Err(msg) => return error_response(StatusCode::BAD_REQUEST, &msg),
     };
-    let Some(_permit) = relay.api_limit.try_acquire() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "error": "server is busy, try again shortly" })),
-        );
-    };
+    // Permits are taken per scan round-trip — never across the whole
+    // handler — so one slow `stats` cannot pin a slot through 9 scans.
+    macro_rules! permit {
+        () => {
+            match relay.api_limit.try_acquire() {
+                Some(p) => p,
+                None => {
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(json!({ "error": "server is busy, try again shortly" })),
+                    );
+                }
+            }
+        };
+    }
     let count_limit = relay.config.read().await.limits.max_count;
     let now = unix_now();
     let filter: Filter = serde_json::from_value(json!({ "authors": [hex_pk] })).expect("static");
     let no_tags = excluded_tags(&params);
     let nip78 = enabled_nip78_auth_active(&relay).await;
 
-    let (events, more) = relay
-        .db
-        .api_count(vec![filter.clone()], count_limit, now)
-        .await;
+    let (events, more) = {
+        let _permit = permit!();
+        relay
+            .db
+            .api_count(vec![filter.clone()], count_limit, now)
+            .await
+    };
     let has_group_events = events.iter().any(nip29::is_group_event);
     let groups = if has_group_events {
         Some(relay.groups.read().await)
@@ -894,6 +919,7 @@ pub async fn api_stats_handler(
     {
         let mut fetch = 64usize;
         for _ in 0..4 {
+            let _permit = permit!();
             let (first, _) = relay
                 .db
                 .api_query(vec![filter.clone()], fetch, now, true)
@@ -902,6 +928,7 @@ pub async fn api_stats_handler(
                 .db
                 .api_query(vec![filter.clone()], fetch, now, false)
                 .await;
+            drop(_permit);
             let stats_groups = relay.groups.read().await;
             if first_visible.is_none() {
                 first_visible = first
@@ -923,7 +950,6 @@ pub async fn api_stats_handler(
             fetch = (fetch * 4).min(1024);
         }
     }
-    drop(_permit);
     let first_seen = first_visible.map(|e| e.created_at);
     let last_seen = last_visible.map(|e| e.created_at);
     let first_month = first_seen.map(|ts| {
@@ -998,12 +1024,6 @@ pub async fn api_hourly_handler(
     }
     let day_start = month_start(year, month) + (day as u64 - 1) * 86400;
 
-    let Some(_permit) = relay.api_limit.try_acquire() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "error": "server is busy, try again shortly" })),
-        );
-    };
     let count_limit = relay.config.read().await.limits.max_count;
     let no_tags = excluded_tags(&params);
     let nip78 = enabled_nip78_auth_active(&relay).await;
@@ -1012,6 +1032,13 @@ pub async fn api_hourly_handler(
     let mut total = 0u64;
     let mut approximate = false;
     for h in 0..24 {
+        // Per-iteration permit: never hold a slot across all 24 hours.
+        let Some(_permit) = relay.api_limit.try_acquire() else {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": "server is busy, try again shortly" })),
+            );
+        };
         let h_start = day_start + h * 3600;
         let filter: Filter = serde_json::from_value(json!({
             "authors": [hex_pk],
@@ -1040,7 +1067,6 @@ pub async fn api_hourly_handler(
             "approximate": more,
         }));
     }
-    drop(_permit);
     (
         StatusCode::OK,
         Json(json!({ "hours": hour_counts, "total": total, "approximate": approximate })),
@@ -1868,6 +1894,39 @@ mod tests {
                 resp["approximate"], true,
                 "a capped month must flag overall approximate: {resp}"
             );
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn multi_row_handlers_fail_fast_mid_loop_when_saturated() {
+        // Permits are taken per scan round-trip, never across a whole
+        // multi-query handler: saturating the limiter must 503 even
+        // mid-loop instead of pinning a slot through 31 day-scans.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_relay().await;
+            let now = unix_now();
+            let e = signed_note(relay.secp(), "n", now, vec![]);
+            let pk = e.pubkey.clone();
+            assert_eq!(relay.db.put(e, now).await, crate::db::PutOutcome::Stored);
+            // Hold every concurrency slot for the test duration.
+            let max = relay.config.read().await.limits.max_api_concurrent;
+            let _holds: Vec<_> = (0..max)
+                .map(|_| relay.api_limit.try_acquire().unwrap())
+                .collect();
+            let (y, m) = month_of(now);
+            let (code, _) = api_daily_handler(
+                State(relay.clone()),
+                Path((pk, 1)),
+                Query(ApiParams {
+                    year: Some(y),
+                    month: Some(m),
+                    ..Default::default()
+                }),
+            )
+            .await;
+            assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
             relay.db.shutdown();
         });
     }

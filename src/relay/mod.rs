@@ -431,7 +431,9 @@ impl Relay {
 
     /// Whether `pubkey` may publish another event under
     /// `relay.max_events_per_min_per_pubkey` (a sliding 60-second window;
-    /// 0 = unlimited). The window map is bounded at 10,000 pubkeys — the
+    /// 0 = unlimited). Each window holds at most `max` timestamps, so one
+    /// key pins at most that many `u64`s. The window map is bounded at
+    /// 10,000 pubkeys — the
     /// cap never clears the whole map (a clear would reset every window
     /// and permanently disable the limit): expired windows are evicted
     /// first, and a still-full map skips tracking the new pubkey only

@@ -1060,3 +1060,49 @@ fn invite_codes_are_bounded() {
     );
     assert!(store.validate_write(&one_more).is_err());
 }
+
+#[test]
+fn group_members_are_bounded() {
+    // Without a bound an admin could spam `9000` with fresh pubkeys,
+    // growing the member map (and mirrored 39001/39002) without limit.
+    let mut store = seeded();
+    // Fill to the cap through apply (bypasses validation, like history
+    // replay).
+    for i in 0..super::MAX_MEMBERS {
+        let put = event(
+            9000,
+            ADMIN,
+            Some("g1"),
+            vec![vec![P.into(), format!("{:064x}", i), "m".into()]],
+        );
+        store.apply(&put, "", 1, false, false);
+    }
+    assert_eq!(store.group("g1").unwrap().members.len(), super::MAX_MEMBERS);
+    // A fresh member via 9000 is rejected at the cap...
+    let fresh = event(
+        9000,
+        ADMIN,
+        Some("g1"),
+        vec![vec![P.into(), "ff".repeat(32), "m".into()]],
+    );
+    assert!(store.validate_write(&fresh).is_err());
+    // ...as is a fresh JOIN, while role changes for existing members
+    // still validate.
+    let join = event(9021, USER, Some("g1"), vec![]);
+    assert!(store.validate_write(&join).unwrap_err().contains("full"));
+    let role_change = event(
+        9000,
+        ADMIN,
+        Some("g1"),
+        vec![vec![P.into(), format!("{:064x}", 0), "admin".into()]],
+    );
+    assert!(store.validate_write(&role_change).is_ok());
+    // Replay past the cap stays capped.
+    let mut huge = Vec::new();
+    for i in 0..500 {
+        huge.push(vec![P.into(), format!("{:064x}", i + 0x9000), "m".into()]);
+    }
+    let big = event(9000, ADMIN, Some("g1"), huge);
+    store.apply(&big, "", 1, false, false);
+    assert_eq!(store.group("g1").unwrap().members.len(), super::MAX_MEMBERS);
+}

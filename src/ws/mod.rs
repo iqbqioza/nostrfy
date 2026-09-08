@@ -168,14 +168,22 @@ impl Conn {
     }
 
     /// Queues a completion-critical control message (EOSE / CLOSED /
-    /// NEG-MSG / NEG-ERR) without any outgoing cap: a dropped EOSE would
+    /// NEG-MSG / NEG-ERR) bypassing the byte cap: a dropped EOSE would
     /// leave the client hanging on a completed subscription, and a dropped
     /// NEG-MSG/NEG-ERR would hang a sync — worse than a dropped live event.
     /// The messages are tiny except for NEG-MSG id lists (bounded by
-    /// `max_neg_items` and `max_req_response_bytes`), and their volume is
-    /// bounded by the REQ/NEG rate, so bypassing the caps does not
-    /// meaningfully weaken the queue's memory bound.
+    /// `max_neg_items` and `max_req_response_bytes`, plus the NEG
+    /// backpressure guard). As a last-resort OOM guard the queue length is
+    /// still capped at twice `OUT_QUEUE_LIMIT`: legitimate clients drain
+    /// far faster than control traffic arrives, so reaching it means an
+    /// attacker flooding inbound frames on a stalled socket — drops are
+    /// counted like any other queue drop.
     pub(crate) fn send_control(&mut self, value: Value) {
+        if self.outgoing.len() >= OUT_QUEUE_LIMIT * 2 {
+            self.dropped += 1;
+            self.relay.stats.bump(&self.relay.stats.buffers_dropped, 1);
+            return;
+        }
         if let Ok(text) = serde_json::to_string(&value) {
             let size = text.len();
             self.out_bytes += size;
@@ -4265,6 +4273,27 @@ mod tests {
             )
             .await;
             assert!(received.is_ok(), "live delivery resumes after CLOSE + REQ");
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn send_control_is_bounded_as_last_resort() {
+        // `send_control` bypasses the byte cap so completion-critical
+        // messages are never dropped, but the queue length still caps at
+        // twice `OUT_QUEUE_LIMIT`: 8192 tiny EOSEs queued without a drain
+        // means an attacker, not a slow reader.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            for _ in 0..OUT_QUEUE_LIMIT * 2 {
+                conn.send_control(serde_json::json!(["EOSE", "s"]));
+            }
+            assert_eq!(conn.outgoing.len(), OUT_QUEUE_LIMIT * 2);
+            let dropped_before = conn.dropped;
+            conn.send_control(serde_json::json!(["EOSE", "s"]));
+            assert_eq!(conn.outgoing.len(), OUT_QUEUE_LIMIT * 2);
+            assert_eq!(conn.dropped, dropped_before + 1);
             conn.relay.db.shutdown();
         });
     }

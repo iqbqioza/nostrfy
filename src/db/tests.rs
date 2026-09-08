@@ -488,6 +488,39 @@ fn gift_wraps_to_are_deleted() {
 }
 
 #[test]
+fn gift_wraps_with_uppercase_p_are_deleted() {
+    // The `by_tag` index stores values verbatim: an uppercase `p` value
+    // lives under a different key range, so both cases must be walked.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let recipient = "b83130de0d1386592fe7b9f407f5f1ae8f1db91d772e484b3d81df0fa2e88f24";
+        let wrap = event(
+            1059,
+            "encrypted",
+            now,
+            vec![vec!["p".into(), recipient.to_ascii_uppercase()]],
+        );
+        assert_eq!(db.put(wrap.clone(), now).await, PutOutcome::Stored);
+        let recipient_bytes = hex::decode(recipient).unwrap();
+        let removed = db
+            .delete_gift_wraps_to(recipient_bytes.try_into().unwrap())
+            .await;
+        assert_eq!(removed, 1, "an uppercase p-tagged wrap must be found");
+    });
+}
+
+#[test]
 
 // ----- database growth -----
 fn map_grows_beyond_initial_size() {

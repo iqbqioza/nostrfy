@@ -59,6 +59,11 @@ pub(crate) const MAX_PINS: usize = 100;
 /// bound repeated `9009` events would grow the set without limit.
 pub(crate) const MAX_INVITES: usize = 100;
 
+/// Maximum members per group. Without a bound an admin could spam `9000`
+/// events with fresh pubkeys, growing the member map (and every mirrored
+/// `39001`/`39002`) without limit.
+pub(crate) const MAX_MEMBERS: usize = 10_000;
+
 fn tag_value<'a>(event: &'a Event, name: &str) -> Option<&'a str> {
     event
         .tags
@@ -272,6 +277,11 @@ impl GroupStore {
             if group.is_member(pubkey) {
                 return Err("duplicate: you are already a member of this group".into());
             }
+            // Bound the member map like pins and invites: an uncapped
+            // group would let joins grow mirrored state without limit.
+            if group.members.len() >= MAX_MEMBERS {
+                return Err("restricted: the group is full".into());
+            }
             if group.settings.closed {
                 // NIP-29: `closed` means join requests are ignored — the
                 // request is rejected (final) and not stored. Admission to
@@ -340,6 +350,21 @@ impl GroupStore {
                     .count();
                 if group.invites.len().saturating_add(fresh) > MAX_INVITES {
                     return Err("restricted: too many invite codes".into());
+                }
+            }
+            // Bound the member map: count fresh pubkeys (not already
+            // members) so one 9000 cannot add unbounded members.
+            if event.kind == 9000 {
+                let fresh = event
+                    .tags
+                    .iter()
+                    .filter(|t| t.len() >= 2 && t[0] == P)
+                    .map(|t| t[1].as_str())
+                    .filter(|pk| !group.is_member(pk))
+                    .collect::<std::collections::HashSet<_>>()
+                    .len();
+                if group.members.len().saturating_add(fresh) > MAX_MEMBERS {
+                    return Err("restricted: too many group members".into());
                 }
             }
             // NIP-29: the group must retain at least one admin — a 9000
@@ -444,7 +469,11 @@ impl GroupStore {
                     if let Some(group) = self.groups.get_mut(gid) {
                         // Membership is the entry in the member map; roles
                         // (granted only via `kind:9000`) decide privileges.
-                        group.members.entry(member.clone()).or_default();
+                        // Bounded like validation (history replay bypasses
+                        // the check above, so re-check here).
+                        if group.members.len() < MAX_MEMBERS || group.is_member(&member) {
+                            group.members.entry(member.clone()).or_default();
+                        }
                     }
                     if emit {
                         out.push(build_put_user(gid, &member, &[], relay_pubkey, now));
@@ -470,6 +499,10 @@ impl GroupStore {
                     // ("the user roles must just be updated"), and a `p` tag
                     // without roles leaves the user a plain member.
                     for tag in event.tags.iter().filter(|t| t.len() >= 2 && t[0] == P) {
+                        // Bounded like validation (see above).
+                        if group.members.len() >= MAX_MEMBERS && !group.is_member(&tag[1]) {
+                            continue;
+                        }
                         let pk = tag[1].clone();
                         // An empty role element (`["p", pk, ""]`) is a
                         // malformed demotion: it must not turn into an

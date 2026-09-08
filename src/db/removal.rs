@@ -340,39 +340,44 @@ impl Store {
 
         // NIP-59 gift wraps addressed to the vanished pubkey. The by_tag
         // index stores the tag value verbatim (the 64-char hex string), not
-        // the decoded bytes.
-        let pubkey_hex = hex::encode(pubkey).into_bytes();
-        let start = tag_key(b'p', &pubkey_hex, 0, &[0u8; ID_LEN]);
-        let end = tag_key(b'p', &pubkey_hex, u64::MAX, &[0xffu8; ID_LEN]);
-        let mut last_key: Option<Vec<u8>> = None;
-        loop {
-            let lower = match &last_key {
-                Some(k) => std::ops::Bound::Excluded(k.as_slice()),
-                None => std::ops::Bound::Included(start.as_slice()),
-            };
-            let entries: Vec<(Vec<u8>, Vec<u8>)> = self
-                .by_tag
-                .range(&wtxn, &(lower, std::ops::Bound::Excluded(end.as_slice())))?
-                .filter_map(|item| {
-                    item.ok()
-                        .map(|(k, _)| (k.to_vec(), k[k.len() - ID_LEN..].to_vec()))
-                })
-                .take(REMOVAL_CHUNK)
-                .collect();
-            if entries.is_empty() {
-                break;
-            }
-            last_key = Some(entries.last().unwrap().0.clone());
-            for (_, id) in entries {
-                let Some(raw) = self.events.get(&wtxn, &id)? else {
-                    continue;
+        // the decoded bytes — so both the lowercase and the uppercase form
+        // are walked, mirroring the case-insensitive author match above.
+        for pubkey_hex in [
+            hex::encode(pubkey).into_bytes(),
+            hex::encode_upper(pubkey).into_bytes(),
+        ] {
+            let start = tag_key(b'p', &pubkey_hex, 0, &[0u8; ID_LEN]);
+            let end = tag_key(b'p', &pubkey_hex, u64::MAX, &[0xffu8; ID_LEN]);
+            let mut last_key: Option<Vec<u8>> = None;
+            loop {
+                let lower = match &last_key {
+                    Some(k) => std::ops::Bound::Excluded(k.as_slice()),
+                    None => std::ops::Bound::Included(start.as_slice()),
                 };
-                let Ok(event) = serde_json::from_slice::<Event>(raw) else {
-                    continue;
-                };
-                if event.kind == crate::nips::nip62::GIFT_WRAP_KIND {
-                    self.remove_event(&mut wtxn, &id)?;
-                    removed += 1;
+                let entries: Vec<(Vec<u8>, Vec<u8>)> = self
+                    .by_tag
+                    .range(&wtxn, &(lower, std::ops::Bound::Excluded(end.as_slice())))?
+                    .filter_map(|item| {
+                        item.ok()
+                            .map(|(k, _)| (k.to_vec(), k[k.len() - ID_LEN..].to_vec()))
+                    })
+                    .take(REMOVAL_CHUNK)
+                    .collect();
+                if entries.is_empty() {
+                    break;
+                }
+                last_key = Some(entries.last().unwrap().0.clone());
+                for (_, id) in entries {
+                    let Some(raw) = self.events.get(&wtxn, &id)? else {
+                        continue;
+                    };
+                    let Ok(event) = serde_json::from_slice::<Event>(raw) else {
+                        continue;
+                    };
+                    if event.kind == crate::nips::nip62::GIFT_WRAP_KIND {
+                        self.remove_event(&mut wtxn, &id)?;
+                        removed += 1;
+                    }
                 }
             }
         }
@@ -389,40 +394,44 @@ impl Store {
         self.disk_full_error()?;
         let mut wtxn = self.env.write_txn()?;
         // The by_tag index stores the tag value verbatim (the 64-char hex
-        // string), not the decoded bytes.
-        let pubkey_hex = hex::encode(pubkey).into_bytes();
-        let start = tag_key(b'p', &pubkey_hex, 0, &[0u8; ID_LEN]);
-        let end = tag_key(b'p', &pubkey_hex, u64::MAX, &[0xffu8; ID_LEN]);
-        let mut last_key: Option<Vec<u8>> = None;
+        // string), not the decoded bytes — walk both cases like above.
         let mut removed = 0usize;
-        loop {
-            let lower = match &last_key {
-                Some(k) => std::ops::Bound::Excluded(k.as_slice()),
-                None => std::ops::Bound::Included(start.as_slice()),
-            };
-            let entries: Vec<(Vec<u8>, Vec<u8>)> = self
-                .by_tag
-                .range(&wtxn, &(lower, std::ops::Bound::Excluded(end.as_slice())))?
-                .filter_map(|item| {
-                    item.ok()
-                        .map(|(k, _)| (k.to_vec(), k[k.len() - ID_LEN..].to_vec()))
-                })
-                .take(REMOVAL_CHUNK)
-                .collect();
-            if entries.is_empty() {
-                break;
-            }
-            last_key = Some(entries.last().unwrap().0.clone());
-            for (_, id) in entries {
-                let Some(raw) = self.events.get(&wtxn, &id)? else {
-                    continue;
+        for pubkey_hex in [
+            hex::encode(pubkey).into_bytes(),
+            hex::encode_upper(pubkey).into_bytes(),
+        ] {
+            let start = tag_key(b'p', &pubkey_hex, 0, &[0u8; ID_LEN]);
+            let end = tag_key(b'p', &pubkey_hex, u64::MAX, &[0xffu8; ID_LEN]);
+            let mut last_key: Option<Vec<u8>> = None;
+            loop {
+                let lower = match &last_key {
+                    Some(k) => std::ops::Bound::Excluded(k.as_slice()),
+                    None => std::ops::Bound::Included(start.as_slice()),
                 };
-                let Ok(event) = serde_json::from_slice::<Event>(raw) else {
-                    continue;
-                };
-                if event.kind == crate::nips::nip62::GIFT_WRAP_KIND {
-                    self.remove_event(&mut wtxn, &id)?;
-                    removed += 1;
+                let entries: Vec<(Vec<u8>, Vec<u8>)> = self
+                    .by_tag
+                    .range(&wtxn, &(lower, std::ops::Bound::Excluded(end.as_slice())))?
+                    .filter_map(|item| {
+                        item.ok()
+                            .map(|(k, _)| (k.to_vec(), k[k.len() - ID_LEN..].to_vec()))
+                    })
+                    .take(REMOVAL_CHUNK)
+                    .collect();
+                if entries.is_empty() {
+                    break;
+                }
+                last_key = Some(entries.last().unwrap().0.clone());
+                for (_, id) in entries {
+                    let Some(raw) = self.events.get(&wtxn, &id)? else {
+                        continue;
+                    };
+                    let Ok(event) = serde_json::from_slice::<Event>(raw) else {
+                        continue;
+                    };
+                    if event.kind == crate::nips::nip62::GIFT_WRAP_KIND {
+                        self.remove_event(&mut wtxn, &id)?;
+                        removed += 1;
+                    }
                 }
             }
         }
