@@ -1101,6 +1101,17 @@ impl Config {
                 "relay.enabled_nip78_auth is set but NIP-78 is not enabled; the AUTH gate is inactive"
             );
         }
+        // Without NIP-42 nobody can authenticate, so kind 1059 gift wraps
+        // lose their recipient-only gate (`giftwrap_restricted` follows the
+        // NIP-42 toggle) and are served publicly — unlike `require_auth`
+        // and `enabled_nip78_auth` above this cannot be a startup error
+        // (an open relay without AUTH is a legitimate configuration), but
+        // the operator must know the privacy consequence.
+        if !self.nip_enabled(42) {
+            log::warn!(
+                "NIP-42 is disabled: gift wraps (kind 1059) are served to anyone; enable NIP-42 to restrict them to their recipients"
+            );
+        }
         // Limits must be usable (zero would disable core functionality or
         // make the queue fail fast on the first request, or — for content
         // and tag caps — reject every EVENT and make the relay look dead).
@@ -1434,11 +1445,23 @@ where
 impl AccessControl {
     pub fn allows_pubkey(&self, pubkey: &str) -> bool {
         // A denied pubkey is always rejected — even when restrict_relay
-        // is off (the default: everyone else may publish).
-        if self.blocked_pubkeys.iter().any(|(p, _)| p == pubkey) {
+        // is off (the default: everyone else may publish). The comparison
+        // is case-insensitive: entries arrive from operators (NIP-86, CLI,
+        // command events) who may type uppercase hex, while events on the
+        // wire carry lowercase — an exact compare would fail open on deny
+        // and fail closed on allow.
+        if self
+            .blocked_pubkeys
+            .iter()
+            .any(|(p, _)| p.eq_ignore_ascii_case(pubkey))
+        {
             return false;
         }
-        !self.restrict_relay || self.allowed_pubkeys.iter().any(|(p, _)| p == pubkey)
+        !self.restrict_relay
+            || self
+                .allowed_pubkeys
+                .iter()
+                .any(|(p, _)| p.eq_ignore_ascii_case(pubkey))
     }
 
     pub fn allows_kind(&self, kind: u64) -> bool {
@@ -2436,6 +2459,23 @@ log_max_files = 2
         access.allowed_pubkeys.push((a.clone(), String::new()));
         assert!(access.allows_pubkey(&a));
         assert!(!access.allows_pubkey(&b), "denied wins even when allowed");
+    }
+
+    #[test]
+    fn allows_pubkey_ignores_hex_case() {
+        // Operators may register uppercase hex (NIP-86 accepts any hex
+        // case); events on the wire carry lowercase. Both directions must
+        // match or a deny entry fails open.
+        let mut access = AccessControl::default();
+        access
+            .blocked_pubkeys
+            .push(("BB".repeat(32), String::new()));
+        assert!(!access.allows_pubkey(&"bb".repeat(32)));
+        access.restrict_relay = true;
+        access
+            .allowed_pubkeys
+            .push(("AA".repeat(32), String::new()));
+        assert!(access.allows_pubkey(&"aa".repeat(32)));
     }
 
     #[test]

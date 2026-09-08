@@ -74,15 +74,16 @@ pub(crate) async fn livekit_token(
     // raw (percent-encoded) request path is compared — decoding the
     // `{group}` parameter would never match an id that needs encoding.
     let expected_path = uri.path().to_string();
-    let authed = crate::nips::nip98::verify(&encoded, None, relay.secp(), false, "GET", |url| {
-        crate::nips::nip98::matches_request_url(
-            url,
-            &cfg.relay_identity(),
-            &expected_path,
-            uri.query(),
-        )
-    })
-    .await;
+    let authed =
+        crate::nips::nip98::verify(&encoded, None, relay.secp(), false, None, "GET", |url| {
+            crate::nips::nip98::matches_request_url(
+                url,
+                &cfg.relay_identity(),
+                &expected_path,
+                uri.query(),
+            )
+        })
+        .await;
     match authed {
         Some(pubkey) if group_allows(&relay, &group, &pubkey).await => {
             match issue_livekit_token(&cfg, &group, &pubkey) {

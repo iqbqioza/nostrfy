@@ -116,6 +116,37 @@ pub(crate) const MAX_INDEX_KEY: usize = 511;
 /// free space is below this margin and keeps serving reads.
 pub(crate) const DISK_FREE_MARGIN: u64 = 32 * 1024 * 1024;
 
+/// Free bytes on the filesystem hosting `path`, when statvfs succeeds.
+fn path_free_space(path: &std::path::Path) -> Option<u64> {
+    let dir = if path.is_file() {
+        path.parent().unwrap_or(path)
+    } else {
+        path
+    };
+    let c_path = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()).ok()?;
+    let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: `stat` points at a valid buffer and the path is a valid
+    // NUL-terminated string.
+    if unsafe { libc::statvfs(c_path.as_ptr(), stat.as_mut_ptr()) } == 0 {
+        let stat = unsafe { stat.assume_init() };
+        Some(stat.f_bavail.saturating_mul(stat.f_frsize))
+    } else {
+        None
+    }
+}
+
+/// Refuses a write when the disk hosting `env` is too full for a safe mmap
+/// commit (a write to a full disk raises SIGBUS and kills the process).
+/// For the CLI and migration paths that own no `Store` handle.
+pub(crate) fn check_env_space(env: &Env) -> Result<()> {
+    if let Some(free) = path_free_space(env.path())
+        && free < DISK_FREE_MARGIN
+    {
+        return Err(crate::error::Error::StorageFull);
+    }
+    Ok(())
+}
+
 /// Applies `puts` in one write transaction and commits. When the commit
 /// fails because the memory map is full, the whole batch is re-applied in a
 /// fresh transaction if the map can grow (it cannot at runtime: the map is
@@ -431,22 +462,7 @@ impl Store {
     }
 
     pub(crate) fn free_space(&self) -> Option<u64> {
-        let path = self.env.path();
-        let dir = if path.is_file() {
-            path.parent().unwrap_or(path)
-        } else {
-            path
-        };
-        let c_path = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()).ok()?;
-        let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
-        // SAFETY: `stat` points at a valid buffer and the path is a valid
-        // NUL-terminated string.
-        if unsafe { libc::statvfs(c_path.as_ptr(), stat.as_mut_ptr()) } == 0 {
-            let stat = unsafe { stat.assume_init() };
-            Some(stat.f_bavail.saturating_mul(stat.f_frsize))
-        } else {
-            None
-        }
+        path_free_space(self.env.path())
     }
 
     pub(crate) fn size_on_disk(&self) -> u64 {
@@ -772,6 +788,10 @@ impl Store {
 /// their own process: without it, a CLI write before the first post-upgrade
 /// server start would silently skip the legacy entries.
 pub(crate) fn migrate_access_pubkeys(env: &Env, access: &Database<Bytes, Bytes>) -> Result<()> {
+    // Disk-full guard like every other write path: committing a migration
+    // on a full disk would SIGBUS-kill the process (server at startup, CLI
+    // before the first post-upgrade start) instead of failing cleanly.
+    check_env_space(env)?;
     let rtxn = env.read_txn()?;
     if access.get(&rtxn, b"relay_pubkeys")?.is_some() {
         return Ok(());

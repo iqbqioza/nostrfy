@@ -42,30 +42,60 @@ pub fn tokenize(text: &str) -> Vec<String> {
     words
 }
 
+/// Maximum bytes of a `search` string examined when deriving query terms.
+///
+/// The WebSocket path (`REQ`/`COUNT`/`NEG-OPEN`) has no byte cap of its own
+/// (unlike the REST API's `limits.max_api_search_bytes`), so a multi-megabyte
+/// search string would otherwise be fully allocated and tokenized on the
+/// shared reader thread before the caller truncates to `SEARCH_MAX_TERMS` —
+/// a reader-thread CPU/RAM stall from a single filter. Truncation happens at
+/// a character boundary; over-long queries silently match on their prefix,
+/// exactly like the existing term-count truncation.
+pub const MAX_SEARCH_BYTES: usize = 8_192;
+
+fn floor_char_boundary(text: &str, max_bytes: usize) -> &str {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
 /// Tokenizes for a *query*: unlike the index tokenizer, numeric-only words
 /// stay in the term list. They are not in the word index, so the index walk
 /// finds nothing for them (such searches return no results instead of
 /// matching everything). A mixed query like "nostr 2023" constrains the
 /// walk to "nostr"; the per-event match only requires one term (NIP-50:
 /// any of the terms), so "2023" does not act as an additional constraint.
-fn query_tokenize(text: &str) -> Vec<String> {
-    let mut words = Vec::new();
+///
+/// Stops once `limit` terms are collected so a pathological string cannot
+/// force the allocation of hundreds of thousands of terms before the caller
+/// truncates.
+fn query_tokenize_capped(text: &str, out: &mut Vec<String>, limit: usize) {
+    if out.len() >= limit {
+        return;
+    }
     let mut current = String::new();
     for ch in text.chars() {
         if ch.is_alphanumeric() {
             current.extend(ch.to_lowercase());
         } else if !current.is_empty() {
             if current.len() >= 2 {
-                words.push(std::mem::take(&mut current));
+                out.push(std::mem::take(&mut current));
+                if out.len() >= limit {
+                    return;
+                }
             } else {
                 current.clear();
             }
         }
     }
-    if current.len() >= 2 {
-        words.push(current);
+    if current.len() >= 2 && out.len() < limit {
+        out.push(current);
     }
-    words
 }
 
 /// Search terms derived from a filter's `search` value.
@@ -76,12 +106,24 @@ fn query_tokenize(text: &str) -> Vec<String> {
 /// that e.g. `include:spam` does not match events containing the words
 /// "include" or "spam".
 pub fn terms(search: &str) -> Vec<String> {
-    let without_extensions: String = search
-        .split_whitespace()
-        .filter(|token| !token.contains(':'))
-        .collect::<Vec<&str>>()
-        .join(" ");
-    query_tokenize(&without_extensions)
+    // Bounded from both sides before any allocation: the byte window keeps
+    // the whitespace scan cheap, and the per-token loop below stops as soon
+    // as enough terms are collected. Processing whitespace-separated tokens
+    // one at a time is equivalent to the old join-then-tokenize (the joiner
+    // space is a tokenizer delimiter too) without ever materializing the
+    // intermediate string or the full term vector.
+    let search = floor_char_boundary(search, MAX_SEARCH_BYTES);
+    let mut out = Vec::new();
+    for token in search.split_whitespace() {
+        if out.len() >= crate::db::SEARCH_MAX_TERMS {
+            break;
+        }
+        if token.contains(':') {
+            continue;
+        }
+        query_tokenize_capped(token, &mut out, crate::db::SEARCH_MAX_TERMS);
+    }
+    out
 }
 
 /// Whether any of `terms` appears in `content` as a whole word.
@@ -149,6 +191,24 @@ mod tests {
         assert_eq!(terms("a:b:c"), Vec::<String>::new());
         // Normal queries are untouched.
         assert_eq!(terms("best nostr apps"), vec!["best", "nostr", "apps"]);
+    }
+
+    #[test]
+    fn terms_are_bounded_by_bytes_and_count() {
+        // A pathological search string must not fan out: the term vector
+        // stops at SEARCH_MAX_TERMS even with far more candidates.
+        let huge = "ab ".repeat(500_000);
+        let got = terms(&huge);
+        assert_eq!(got.len(), crate::db::SEARCH_MAX_TERMS);
+        // Only the leading byte window is examined.
+        let mut long = "zz ".repeat(10_000);
+        long.push_str("uniqueword");
+        assert!(
+            !terms(&long).iter().any(|t| t == "uniqueword"),
+            "terms past the byte window must be ignored"
+        );
+        // Ordinary queries are untouched.
+        assert_eq!(terms("nostr 2023"), vec!["nostr", "2023"]);
     }
 
     #[test]

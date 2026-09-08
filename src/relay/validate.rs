@@ -338,13 +338,15 @@ impl super::Relay {
         // NIP-40: the expiration value is required to be a unix timestamp.
         // A malformed value must not silently mean "no expiration" — the
         // client asked for expiry, so the relay would keep the event
-        // forever. Rejected while NIP-40 is enabled.
+        // forever. Every `expiration` tag is inspected: checking only the
+        // first would let a second malformed tag smuggle the event past
+        // intake. Rejected while NIP-40 is enabled.
         if cfg.nip_enabled(40)
             && event
                 .tags
                 .iter()
                 .any(|t| t.first().is_some_and(|n| n == nip40::EXPIRATION_TAG))
-            && nip40::expiry(event).is_none()
+            && (nip40::expiry(event).is_none() || nip40::has_malformed_expiration(event))
         {
             return Err("invalid: malformed expiration tag".into());
         }

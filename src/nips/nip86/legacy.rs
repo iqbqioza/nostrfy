@@ -4,6 +4,7 @@
 
 use std::sync::Arc;
 
+use axum::body::Bytes;
 use axum::extract::{OriginalUri, Path as AxPath, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -65,6 +66,7 @@ async fn check_auth(
     state: &AdminState,
     method: &str,
     uri: &axum::http::Uri,
+    expected_payload_hash: Option<&str>,
 ) -> std::result::Result<String, Response> {
     let relay = &state.relay;
     let cfg = relay.config.read().await;
@@ -108,6 +110,7 @@ async fn check_auth(
             Some(&cfg.rpc.admin_pubkey),
             relay.secp(),
             true,
+            expected_payload_hash,
             method,
             url_ok,
         )
@@ -137,6 +140,32 @@ fn unauthorized(msg: &str) -> Response {
     (StatusCode::UNAUTHORIZED, Json(json!({ "error": msg }))).into_response()
 }
 
+/// Parses a JSON management body from the raw request bytes, mirroring the
+/// axum `Json` extractor's rejections (415 without a JSON content type, 422
+/// for malformed JSON) so the endpoint behavior is unchanged, while also
+/// returning the body's sha256 hex for the NIP-98 `payload` comparison
+/// (NIP-98: the tag is the sha256 of the request body — presence alone
+/// would let a captured authorization be replayed against another body).
+// The `Err` variant is an axum `Response` (a framework type that is not
+// worth boxing): the lint would not improve anything here.
+#[allow(clippy::result_large_err)]
+fn parse_json_body<T: for<'de> serde::Deserialize<'de>>(
+    headers: &HeaderMap,
+    body: &Bytes,
+) -> std::result::Result<(T, String), Response> {
+    let is_json = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|t| t.split(';').next().map(str::trim) == Some("application/json"))
+        .unwrap_or(false);
+    if !is_json {
+        return Err(StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response());
+    }
+    let value: T = serde_json::from_slice(body)
+        .map_err(|_| StatusCode::UNPROCESSABLE_ENTITY.into_response())?;
+    Ok((value, nip98::payload_sha256_hex(body)))
+}
+
 fn bad_request(msg: &str) -> Response {
     (StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))).into_response()
 }
@@ -146,7 +175,9 @@ async fn admin_info(
     State(state): State<Arc<AdminState>>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(resp) = check_auth(&headers, &state, "GET", &uri).await {
+    // Bodiless GET (see `event_status`): only the `payload` presence is
+    // required.
+    if let Err(resp) = check_auth(&headers, &state, "GET", &uri, None).await {
         return resp;
     }
     let cfg = state.relay.config.read().await;
@@ -165,7 +196,7 @@ async fn admin_stats(
     State(state): State<Arc<AdminState>>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(resp) = check_auth(&headers, &state, "GET", &uri).await {
+    if let Err(resp) = check_auth(&headers, &state, "GET", &uri, None).await {
         return resp;
     }
     Json(state.relay.stats.as_json()).into_response()
@@ -175,9 +206,13 @@ async fn block_pubkey(
     uri: OriginalUri,
     State(state): State<Arc<AdminState>>,
     headers: HeaderMap,
-    Json(body): Json<PubkeyBody>,
+    body: Bytes,
 ) -> Response {
-    let identity = match check_auth(&headers, &state, "POST", &uri).await {
+    let (body, payload_hash) = match parse_json_body::<PubkeyBody>(&headers, &body) {
+        Ok(parsed) => parsed,
+        Err(resp) => return resp,
+    };
+    let identity = match check_auth(&headers, &state, "POST", &uri, Some(&payload_hash)).await {
         Ok(identity) => identity,
         Err(resp) => return resp,
     };
@@ -187,29 +222,34 @@ async fn block_pubkey(
     {
         return bad_request("invalid pubkey");
     }
+    // Lowercase normalization, like the JSON-RPC path: uppercase hex
+    // decodes but never matches a lowercase event pubkey.
+    let pubkey = body.pubkey.to_ascii_lowercase();
     let mut access = state.relay.access.write().await;
     if !access
         .blocked_pubkeys
         .iter()
-        .any(|(p, _)| p == &body.pubkey)
+        .any(|(p, _)| p.eq_ignore_ascii_case(&pubkey))
     {
-        access
-            .blocked_pubkeys
-            .push((body.pubkey.clone(), String::new()));
+        access.blocked_pubkeys.push((pubkey.clone(), String::new()));
     }
     drop(access);
     state.relay.persist_access().await;
-    audit_legacy(&state, &identity, "block_pubkey", &body.pubkey);
-    Json(json!({ "ok": true, "blocked_pubkey": body.pubkey })).into_response()
+    audit_legacy(&state, &identity, "block_pubkey", &pubkey);
+    Json(json!({ "ok": true, "blocked_pubkey": pubkey })).into_response()
 }
 
 async fn allow_pubkey(
     uri: OriginalUri,
     State(state): State<Arc<AdminState>>,
     headers: HeaderMap,
-    Json(body): Json<PubkeyBody>,
+    body: Bytes,
 ) -> Response {
-    let identity = match check_auth(&headers, &state, "POST", &uri).await {
+    let (body, payload_hash) = match parse_json_body::<PubkeyBody>(&headers, &body) {
+        Ok(parsed) => parsed,
+        Err(resp) => return resp,
+    };
+    let identity = match check_auth(&headers, &state, "POST", &uri, Some(&payload_hash)).await {
         Ok(identity) => identity,
         Err(resp) => return resp,
     };
@@ -221,21 +261,28 @@ async fn allow_pubkey(
     {
         return bad_request("invalid pubkey");
     }
+    let pubkey = body.pubkey.to_ascii_lowercase();
     let mut access = state.relay.access.write().await;
-    access.blocked_pubkeys.retain(|(p, _)| p != &body.pubkey);
+    access
+        .blocked_pubkeys
+        .retain(|(p, _)| !p.eq_ignore_ascii_case(&pubkey));
     drop(access);
     state.relay.persist_access().await;
-    audit_legacy(&state, &identity, "allow_pubkey", &body.pubkey);
-    Json(json!({ "ok": true, "allowed_pubkey": body.pubkey })).into_response()
+    audit_legacy(&state, &identity, "allow_pubkey", &pubkey);
+    Json(json!({ "ok": true, "allowed_pubkey": pubkey })).into_response()
 }
 
 async fn block_kind(
     uri: OriginalUri,
     State(state): State<Arc<AdminState>>,
     headers: HeaderMap,
-    Json(body): Json<KindBody>,
+    body: Bytes,
 ) -> Response {
-    let identity = match check_auth(&headers, &state, "POST", &uri).await {
+    let (body, payload_hash) = match parse_json_body::<KindBody>(&headers, &body) {
+        Ok(parsed) => parsed,
+        Err(resp) => return resp,
+    };
+    let identity = match check_auth(&headers, &state, "POST", &uri, Some(&payload_hash)).await {
         Ok(identity) => identity,
         Err(resp) => return resp,
     };
@@ -253,9 +300,13 @@ async fn allow_kind(
     uri: OriginalUri,
     State(state): State<Arc<AdminState>>,
     headers: HeaderMap,
-    Json(body): Json<KindBody>,
+    body: Bytes,
 ) -> Response {
-    let identity = match check_auth(&headers, &state, "POST", &uri).await {
+    let (body, payload_hash) = match parse_json_body::<KindBody>(&headers, &body) {
+        Ok(parsed) => parsed,
+        Err(resp) => return resp,
+    };
+    let identity = match check_auth(&headers, &state, "POST", &uri, Some(&payload_hash)).await {
         Ok(identity) => identity,
         Err(resp) => return resp,
     };
@@ -273,7 +324,10 @@ async fn event_status(
     headers: HeaderMap,
     AxPath(id): AxPath<String>,
 ) -> Response {
-    if let Err(resp) = check_auth(&headers, &state, "GET", &uri).await {
+    // Bodiless GET: there is no request body for the `payload` tag to bind
+    // to, so only its presence is required (the `u` tag still binds the
+    // exact URL and the `method` tag the verb).
+    if let Err(resp) = check_auth(&headers, &state, "GET", &uri, None).await {
         return resp;
     }
     let filter: Value = json!({ "ids": [id] });
@@ -293,7 +347,10 @@ async fn shutdown(
     State(state): State<Arc<AdminState>>,
     headers: HeaderMap,
 ) -> Response {
-    let identity = match check_auth(&headers, &state, "POST", &uri).await {
+    // Bodiless POST like the GET above: no body bytes exist for the
+    // `payload` tag to bind to (and the `u` tag pins the exact endpoint),
+    // so only its presence is required.
+    let identity = match check_auth(&headers, &state, "POST", &uri, None).await {
         Ok(identity) => identity,
         Err(resp) => return resp,
     };
