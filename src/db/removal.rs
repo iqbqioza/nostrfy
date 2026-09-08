@@ -191,6 +191,7 @@ impl Store {
     }
 
     pub(crate) fn apply_unban(&self, id: &[u8]) -> Result<bool> {
+        self.disk_full_error()?;
         let mut wtxn = self.env.write_txn()?;
         let removed = self.banned.delete(&mut wtxn, id)?;
         wtxn.commit()?;
@@ -385,6 +386,7 @@ impl Store {
     /// signed by random keys, so they cannot be deleted by their recipient
     /// through the normal deletion flow.
     pub(crate) fn delete_gift_wraps_to(&self, pubkey: &[u8]) -> Result<usize> {
+        self.disk_full_error()?;
         let mut wtxn = self.env.write_txn()?;
         // The by_tag index stores the tag value verbatim (the 64-char hex
         // string), not the decoded bytes.
@@ -429,6 +431,7 @@ impl Store {
     }
 
     pub(crate) fn purge_expired(&self, now: u64) -> Result<usize> {
+        self.disk_full_error()?;
         // NIP-40 disabled: nothing is expired. Stale entries written while
         // it was enabled are removed by `remove_event` (which deletes the
         // entry regardless of the toggle), so re-enabling the feature can

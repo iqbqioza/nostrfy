@@ -820,6 +820,11 @@ pub(crate) fn spawn(
                                     let _ = reply.send(store.env.info().map_size as u64);
                                 }
                                 Msg::TouchFirstSeen { entries, reply } => {
+                                    if let Err(e) = store.disk_full_error() {
+                                        db_error(&thread_errors, &e);
+                                        let _ = reply.send(vec![(false, u64::MAX); entries.len()]);
+                                        continue;
+                                    }
                                     let mut wtxn = match store.env.write_txn() {
                                         Ok(t) => t,
                                         Err(e) => {

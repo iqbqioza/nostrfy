@@ -508,6 +508,7 @@ impl Store {
         uploaded: i64,
         pubkey: &str,
     ) -> Result<()> {
+        self.disk_full_error()?;
         let mut wtxn = self.env.write_txn()?;
         let key = format!("sha:{sha256}");
         let existing: Option<BlossomMeta> = match self.blossom.get(&wtxn, key.as_bytes())? {
@@ -538,6 +539,7 @@ impl Store {
         &self,
         entries: &[(String, String, u64, i64, String)],
     ) -> Result<()> {
+        self.disk_full_error()?;
         let mut wtxn = self.env.write_txn()?;
         for (sha256, mime, size, uploaded, pubkey) in entries {
             let key = format!("sha:{sha256}");
@@ -586,6 +588,7 @@ impl Store {
 
     /// Marks the one-time legacy migration as done.
     pub(crate) fn mark_blossom_migration(&self) -> Result<()> {
+        self.disk_full_error()?;
         let mut wtxn = self.env.write_txn()?;
         self.blossom.put(&mut wtxn, b"migrated", b"")?;
         wtxn.commit()?;
@@ -605,6 +608,7 @@ impl Store {
     /// Removes one owner from a blob's metadata and its reverse key.
     /// Returns whether the blob had this owner.
     pub(crate) fn remove_blossom_owner(&self, sha256: &str, pubkey: &str) -> Result<bool> {
+        self.disk_full_error()?;
         let mut wtxn = self.env.write_txn()?;
         let key = format!("sha:{sha256}");
         let Some(raw) = self.blossom.get(&wtxn, key.as_bytes())? else {
@@ -659,6 +663,7 @@ impl Store {
         deny: &[(String, String)],
         allow: &[(String, String)],
     ) -> Result<()> {
+        self.disk_full_error()?;
         let data = serde_json::to_vec(&serde_json::json!({ "deny": deny, "allow": allow }))?;
         let mut wtxn = self.env.write_txn()?;
         self.access.put(&mut wtxn, b"relay_pubkeys", &data)?;
@@ -670,6 +675,7 @@ impl Store {
     /// the CLI command (`nostrfy blossom allow/deny`) and the running
     /// server share one source of truth without touching the config file.
     pub(crate) fn save_blossom_allow(&self, entries: &[String]) -> Result<()> {
+        self.disk_full_error()?;
         let data = serde_json::to_vec(entries)?;
         let mut wtxn = self.env.write_txn()?;
         self.access.put(&mut wtxn, b"blossom_allow", &data)?;
