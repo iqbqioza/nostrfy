@@ -103,7 +103,6 @@ pub(crate) const FULL_SCAN_BUDGET: usize = 4_000_000;
 /// Output collector for a scan: either full events (REQ/COUNT) or
 /// `(created_at, id)` records (NIP-77 negentropy, memory-efficient).
 trait ScanCollector {
-    fn len(&self) -> usize;
     /// Whether the scan must stop: the hard collection cap is reached and
     /// no created_at boundary is being completed.
     fn full(&self) -> bool;
@@ -137,7 +136,16 @@ trait ScanCollector {
     /// ordering.
     fn sort_relevance(&mut self, terms: &[String], weights: &[f64]);
     /// Keeps only the first `take` records.
+    #[cfg(test)]
     fn truncate_to(&mut self, take: usize);
+    /// Applies per-filter limits after a relevance sort: drains the
+    /// relevance-ordered events, attributing each to the first filter with
+    /// remaining quota that matches it. Returns whether any event was
+    /// dropped (caller reports `more`). The default keeps everything.
+    fn apply_search_limits(&mut self, filters: &[Filter], max_limit: usize) -> bool {
+        let _ = (filters, max_limit);
+        false
+    }
 }
 
 struct EventCollector {
@@ -180,9 +188,6 @@ fn score(event: &Event, terms: &[String], weights: &[f64]) -> f64 {
 }
 
 impl ScanCollector for EventCollector {
-    fn len(&self) -> usize {
-        self.events.len()
-    }
     fn full(&self) -> bool {
         self.events.len() >= self.cap && self.boundary.is_none()
     }
@@ -237,8 +242,37 @@ impl ScanCollector for EventCollector {
         });
         self.events = scored.into_iter().map(|(_, event)| event).collect();
     }
+    #[cfg(test)]
     fn truncate_to(&mut self, take: usize) {
         self.events.truncate(take);
+    }
+    fn apply_search_limits(&mut self, filters: &[Filter], max_limit: usize) -> bool {
+        let mut takes: Vec<usize> = filters
+            .iter()
+            .map(|f| f.limit.unwrap_or(max_limit).min(max_limit))
+            .collect();
+        let mut kept = Vec::with_capacity(self.events.len());
+        let mut dropped = false;
+        for event in std::mem::take(&mut self.events) {
+            let mut placed = false;
+            for (f, take) in filters.iter().zip(takes.iter_mut()) {
+                if *take == 0 {
+                    continue;
+                }
+                if f.matches(&event) {
+                    *take -= 1;
+                    placed = true;
+                    break;
+                }
+            }
+            if placed {
+                kept.push(event);
+            } else {
+                dropped = true;
+            }
+        }
+        self.events = kept;
+        dropped
     }
 }
 
@@ -259,9 +293,6 @@ impl ItemCollector {
 }
 
 impl ScanCollector for ItemCollector {
-    fn len(&self) -> usize {
-        self.items.len()
-    }
     fn full(&self) -> bool {
         self.items.len() >= self.cap && self.boundary.is_none()
     }
@@ -322,10 +353,9 @@ impl ScanCollector for ItemCollector {
         } else if self.items.len() + 1 == limit {
             self.boundary = Some(event.created_at());
         }
-        let protected = event
-            .tags()
-            .iter()
-            .any(|t| t.first().map(String::as_str) == Some(crate::nips::nip70::PROTECTED_TAG));
+        let protected = event.tags().iter().any(|t| {
+            t.len() == 1 && t.first().map(String::as_str) == Some(crate::nips::nip70::PROTECTED_TAG)
+        });
         let (gid, meta) = match crate::nips::nip29::group_id_any_light(event) {
             Some(gid) => {
                 let meta = (crate::nips::nip29::GROUP_META..=crate::nips::nip29::GROUP_PINS)
@@ -372,6 +402,7 @@ impl ScanCollector for ItemCollector {
         let _ = (terms, weights);
         self.sort_key();
     }
+    #[cfg(test)]
     fn truncate_to(&mut self, take: usize) {
         self.items.truncate(take);
     }
@@ -598,7 +629,6 @@ impl Store {
                 }
             }
         }
-        let mut search_take = max_limit;
         // The document frequencies of the query's search terms are counted
         // once and shared between the index-walk exclusion (common terms
         // dropped from the walk) and the relevance weights.
@@ -612,6 +642,13 @@ impl Store {
             if out.full() {
                 more = true;
                 break;
+            }
+            // NIP-01: `limit: 0` returns nothing for that filter but keeps
+            // the subscription alive — it must neither collect nor report
+            // `more` (otherwise a leading `{"limit": 0}` filter poisons the
+            // whole REQ into a pagination loop).
+            if !count_mode && filter.limit == Some(0) {
+                continue;
             }
             let has_search = filter.has_search();
             let limit = if count_mode {
@@ -639,9 +676,6 @@ impl Store {
                 // are not candidates; the most common terms (last, in
                 // token order) are dropped first.
                 let terms: Vec<String> = terms.into_iter().take(SEARCH_MAX_TERMS).collect();
-                if let Some(l) = filter.limit {
-                    search_take = search_take.min(l);
-                }
                 terms
             } else {
                 Vec::new()
@@ -680,10 +714,8 @@ impl Store {
                 // created_at, and the limit is applied after that ordering.
                 let weights = Self::weights_from_dfs(&all_dfs);
                 out.sort_relevance(&all_terms, &weights);
-                let take = search_take.min(max_limit);
-                if out.len() > take {
+                if out.apply_search_limits(filters, max_limit) {
                     more = true;
-                    out.truncate_to(take);
                 }
             } else if ascending {
                 // NIP-01 ascending: oldest events first; on equal created_at
@@ -974,6 +1006,15 @@ impl Store {
         };
         for item in iter {
             let (key, _) = item?;
+            // Corrupt short keys (bitrot/hand edit) must loud-fail the
+            // scan, never panic the reader thread: every sibling walk
+            // guards lengths before slicing.
+            if key.len() < ID_LEN {
+                return Err(crate::error::Error::Other(format!(
+                    "corrupt index key ({} bytes)",
+                    key.len()
+                )));
+            }
             let id = &key[key.len() - ID_LEN..];
             if !consider(id)? {
                 *more = true;
@@ -1224,10 +1265,16 @@ fn consider_event<C: ScanCollector>(
         if !is_deliverable(ctx, &event, filter, terms, now)? {
             return Ok(true);
         }
+        // Only record the event as seen when it was actually collected, like
+        // the full path below: an event that hit this filter's limit must
+        // still be available to a later filter and must stop the walk with
+        // `more` instead of silently claiming completeness.
         if out.push_light(&event, id, limit) {
             seen.insert(id.to_vec());
+            return Ok(true);
+        } else {
+            return Ok(false);
         }
-        return Ok(true);
     }
     let Ok(event) = serde_json::from_slice::<Event>(raw) else {
         return Ok(true);
@@ -1403,6 +1450,31 @@ mod tests {
         c.sort_relevance(&[], &[]);
         c.truncate_to(3);
         assert_eq!(c.items.len(), 3);
+    }
+
+    #[test]
+    fn push_light_matches_strict_protected_semantics() {
+        use super::{ItemCollector, NegLight, ScanCollector};
+        let mut c = ItemCollector::new(8);
+        let strict = NegLight {
+            id: "a".repeat(64),
+            pubkey: "b".repeat(64),
+            created_at: 1,
+            kind: 1,
+            tags: vec![vec!["-".into()]],
+        };
+        assert!(c.push_light(&strict, [0x01u8; 32], 8));
+        assert!(c.items[0].protected, "exact [\"-\"] is protected");
+        let mut c = ItemCollector::new(8);
+        let loose = NegLight {
+            tags: vec![vec!["-".into(), "extra".into()]],
+            ..strict
+        };
+        assert!(c.push_light(&loose, [0x02u8; 32], 8));
+        assert!(
+            !c.items[0].protected,
+            "[\"-\", \"extra\"] is public like the full path"
+        );
     }
 
     #[test]

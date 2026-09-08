@@ -169,6 +169,12 @@ async fn upload_allowed(relay: &Relay, pubkey: &str) -> Result<(), ()> {
 /// with `blossom.host`: strips the scheme and any path, IPv6 literals keep
 /// their bracket contents (colons are part of the host), and a DNS/IPv4
 /// `:port` suffix is removed.
+///
+/// The port is intentionally ignored: `blossom.host` is a bare hostname
+/// (validated portless), and routing matches on hostname only, so a token
+/// naming `https://media.example.com:443` and one naming the bare host are
+/// the same identity. Unlike NIP-42/98 (whose relay identity carries a
+/// port), there is no configured port to compare against.
 fn auth_server_host(server: &str) -> String {
     let host_part = server
         .strip_prefix("https://")
@@ -309,6 +315,15 @@ async fn verify_auth(
 }
 
 fn error(status: StatusCode, reason: &str) -> Response {
+    // The reason also goes into the `x-reason` header, where control
+    // characters and non-ASCII bytes (possible in io/S3 error strings:
+    // filenames, XML, OS messages) would panic the response builder.
+    // Sanitize the header value; the body keeps the full text.
+    let header_reason: String = reason
+        .chars()
+        .filter(|c| c.is_ascii_graphic() || *c == ' ')
+        .take(200)
+        .collect();
     let reason = reason.to_string();
     (
         status,
@@ -316,7 +331,7 @@ fn error(status: StatusCode, reason: &str) -> Response {
             (axum::http::header::CONTENT_TYPE, "text/plain".to_string()),
             (
                 axum::http::header::HeaderName::from_static("x-reason"),
-                reason.clone(),
+                header_reason,
             ),
         ],
         reason,
@@ -469,6 +484,12 @@ async fn get_blob(
         return error(StatusCode::NOT_FOUND, "blob not found");
     };
     let size = desc.size;
+    // `size` is a `u64` from a stored (possibly corrupt) descriptor: narrow
+    // it fallibly so a corrupt entry degrades to a 404-sized empty blob on
+    // 32-bit instead of truncating the range arithmetic.
+    let Ok(size_usize) = usize::try_from(size) else {
+        return error(StatusCode::NOT_FOUND, "blob not found");
+    };
     let base_headers = [
         (axum::http::header::CONTENT_TYPE, desc.mime),
         (axum::http::header::ETAG, format!("\"{sha}\"")),
@@ -485,7 +506,7 @@ async fn get_blob(
     let range = headers
         .get(axum::http::header::RANGE)
         .and_then(|v| v.to_str().ok())
-        .map(|r| parse_range(r, size as usize));
+        .map(|r| parse_range(r, size_usize));
     let (start, end) = match range {
         Some(Err(())) => {
             // Unsatisfiable or malformed range: 416 with the required
@@ -501,19 +522,15 @@ async fn get_blob(
             return response;
         }
         Some(Ok(Some((start, end)))) => (start, end),
-        _ => (0, size.saturating_sub(1) as usize),
+        _ => (0, size_usize.saturating_sub(1)),
     };
     let len = if size == 0 {
         0
     } else {
         (end - start + 1) as u64
     };
-    match state
-        .store
-        .open_stream(&desc.pubkey, &sha, start as u64, len)
-        .await
-    {
-        Ok(Some(stream)) => {
+    match state.store.open_stream_any(&sha, start as u64, len).await {
+        Ok(Some((stream, _owner))) => {
             // A range-unaware S3-compatible backend answers a ranged GET
             // with 200 and the full object from byte 0: serve the whole
             // blob as a 200 instead of mislabeling bytes 0..len as
@@ -779,20 +796,31 @@ async fn list(
     }
     let limit = match params.get("limit") {
         Some(v) => match v.parse::<usize>() {
-            Ok(l) => Some(l),
+            // Bound the page: an unbounded `?limit=9999999` would serialize
+            // every blob of a heavy uploader into one response.
+            Ok(l) => Some(l.min(1000)),
             Err(_) => return error(StatusCode::BAD_REQUEST, "invalid limit"),
         },
-        None => None,
+        None => Some(100),
     };
     let cursor = params.get("cursor").map(String::as_str);
-    let mut blobs = state.store.list(&pubkey).await;
+    // The store walk itself is capped (`LIST_SCAN_CAP`): resolving is what
+    // costs (one metadata read per blob), and pages past the window yield
+    // an empty page like an unknown cursor below.
+    const LIST_SCAN_CAP: usize = 5000;
+    let mut blobs = state.store.list(&pubkey, LIST_SCAN_CAP).await;
     // BUD-12: sorted by `uploaded` descending; the page starts after the
-    // cursor and never includes it.
+    // cursor and never includes it. An unknown (but well-formed) cursor
+    // yields an empty page — not the first page — so a client paging with
+    // a stale cursor cannot loop over duplicates forever.
     blobs.sort_by_key(|d| std::cmp::Reverse(d.uploaded));
-    if let Some(cursor) = cursor
-        && let Some(pos) = blobs.iter().position(|d| d.sha256 == cursor)
-    {
-        blobs.drain(..=pos);
+    if let Some(cursor) = cursor {
+        match blobs.iter().position(|d| d.sha256 == cursor) {
+            Some(pos) => {
+                blobs.drain(..=pos);
+            }
+            None => blobs.clear(),
+        }
     }
     if let Some(limit) = limit {
         blobs.truncate(limit);
@@ -1495,5 +1523,81 @@ mod tests {
         assert_eq!(split_blob("short"), None);
         assert_eq!(split_blob(&format!("{}.png/x", "a".repeat(64))), None);
         assert_eq!(split_blob(&"A".repeat(64)), Some("a".repeat(64)));
+    }
+
+    #[tokio::test]
+    async fn list_caps_page_size() {
+        // `?limit=` is capped at 1000 with a default of 100: a heavy
+        // uploader cannot force a single unbounded JSON page.
+        let relay = build_blossom_relay(0).await;
+        let pk = "aa".repeat(32);
+        let state = state_of(&relay).await.expect("blossom state");
+        for i in 0..5 {
+            let sha = sha256_hex(format!("blob-{i}").as_bytes());
+            state
+                .store
+                .put(&pk, &sha, format!("blob-{i}").as_bytes(), "text/plain")
+                .await
+                .unwrap();
+        }
+        let query = |limit: Option<&str>| {
+            let mut map = std::collections::HashMap::new();
+            if let Some(l) = limit {
+                map.insert("limit".to_string(), l.to_string());
+            }
+            axum::extract::Query(map)
+        };
+        let resp = list(
+            State(relay.clone()),
+            AxPath(pk.clone()),
+            query(Some("9999999")),
+        )
+        .await;
+        let body = axum::body::to_bytes(resp.into_body(), 256 * 1024)
+            .await
+            .unwrap();
+        let items: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            items.as_array().unwrap().len() <= 1000,
+            "huge limit must be capped"
+        );
+        let resp = list(State(relay.clone()), AxPath(pk), query(None)).await;
+        let body = axum::body::to_bytes(resp.into_body(), 256 * 1024)
+            .await
+            .unwrap();
+        let items: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            items.as_array().unwrap().len() <= 100,
+            "default page must be bounded"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn list_unknown_cursor_yields_empty_page() {
+        // A well-formed but unknown cursor must not restart at page one
+        // (a stale cursor would loop duplicates forever).
+        let relay = build_blossom_relay(0).await;
+        let pk = "bb".repeat(32);
+        let state = state_of(&relay).await.expect("blossom state");
+        let sha = sha256_hex(b"one blob");
+        state
+            .store
+            .put(&pk, &sha, b"one blob", "text/plain")
+            .await
+            .unwrap();
+        let mut map = std::collections::HashMap::new();
+        map.insert("cursor".to_string(), "cc".repeat(32));
+        let resp = list(State(relay.clone()), AxPath(pk), axum::extract::Query(map)).await;
+        let body = axum::body::to_bytes(resp.into_body(), 256 * 1024)
+            .await
+            .unwrap();
+        let items: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            items.as_array().unwrap().len(),
+            0,
+            "an unknown cursor must yield an empty page"
+        );
+        relay.db.shutdown();
     }
 }

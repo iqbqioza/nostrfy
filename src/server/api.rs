@@ -434,10 +434,11 @@ pub async fn api_kind_handler(
 /// `GET /api/v1/npub1.../1/monthly` returns `{"months": [{"month": "2026-08",
 /// "count": 4}], "total": 4}` so a frontend can render "2026-08(4)". `since`
 /// and `until` bound the range (unix seconds); without them the whole period
-/// is covered, from the earliest stored event of that author and kind to
-/// now. Every month in the range is reported (zero-filled), oldest first,
-/// at most [`MAX_MONTHS`] months. A month whose count hit the collection
-/// limit is flagged `"approximate": true` (NIP-45 semantics).
+/// is covered, from the earliest *visible* stored event of that author and
+/// kind to now. Every month in the range is reported (zero-filled), oldest
+/// first, at most [`MAX_MONTHS`] months. A month whose count hit the
+/// collection limit is flagged `"approximate": true` (NIP-45 semantics), as
+/// is the top-level `"approximate"` when any month was capped.
 pub async fn api_monthly_handler(
     State(relay): State<Arc<Relay>>,
     Path((identifier, kind)): Path<(String, u64)>,
@@ -452,24 +453,65 @@ pub async fn api_monthly_handler(
     // (from the earliest stored event of this author and kind); an explicit
     // range must not exceed MAX_MONTHS of count queries, so one request
     // cannot pin the API reader thread behind a huge loop of scans.
+    // Permits are held per scan round-trip — never across the whole month
+    // loop — so one slow `monthly` cannot pin a concurrency slot for
+    // `MAX_MONTHS × db timeout` while other API callers get 503s.
     let now = unix_now();
     let until = params.until.unwrap_or(now);
+    let no_tags_probe = excluded_tags(&params);
+    let nip78_probe = enabled_nip78_auth_active(&relay).await;
     let since = match params.since {
         Some(s) => s,
         None => {
-            // The whole period: probe the oldest stored event. The probe is
-            // a single ascending scan capped at one row.
+            // The whole period: probe the oldest *visible* stored event, so
+            // a hidden earliest event cannot leak its age through the
+            // range start. The probe is a bounded ascending window scan.
             let probe: Filter = serde_json::from_value(json!({
                 "authors": [hex_pk],
                 "kinds": [kind],
             }))
             .expect("static filter");
-            let (events, _) = relay.db.api_query(vec![probe], 1, now, true).await;
-            match events.first() {
-                Some(e) => e.created_at,
+            let mut start_ts = None;
+            let mut fetch = 64usize;
+            for _ in 0..4 {
+                // The concurrency permit is taken per round-trip (also
+                // covering the probe) so a flood of `monthly` requests
+                // without `since` cannot bypass the 503 limiter.
+                let Some(_permit) = relay.api_limit.try_acquire() else {
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(json!({ "error": "server is busy, try again shortly" })),
+                    );
+                };
+                let (events, _) = relay
+                    .db
+                    .api_query(vec![probe.clone()], fetch, now, true)
+                    .await;
+                drop(_permit);
+                let has_group_events = events.iter().any(nip29::is_group_event);
+                let groups = if has_group_events {
+                    Some(relay.groups.read().await)
+                } else {
+                    None
+                };
+                start_ts = events
+                    .iter()
+                    .find(|e| api_visible(e, groups.as_deref(), &no_tags_probe, nip78_probe))
+                    .map(|e| e.created_at);
+                drop(groups);
+                if start_ts.is_some() || fetch >= 1024 {
+                    break;
+                }
+                fetch = (fetch * 4).min(1024);
+            }
+            match start_ts {
+                Some(s) => s,
                 None => {
-                    // No events at all: an empty range, reported as such.
-                    return (StatusCode::OK, Json(json!({ "months": [], "total": 0 })));
+                    // No visible events at all: an empty range, reported as such.
+                    return (
+                        StatusCode::OK,
+                        Json(json!({ "months": [], "total": 0, "approximate": false })),
+                    );
                 }
             }
         }
@@ -488,19 +530,22 @@ pub async fn api_monthly_handler(
         );
     }
 
-    let Some(_permit) = relay.api_limit.try_acquire() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "error": "server is busy, try again shortly" })),
-        );
-    };
     let count_limit = relay.config.read().await.limits.max_count;
     let no_tags = excluded_tags(&params);
     let nip78 = enabled_nip78_auth_active(&relay).await;
 
     let mut month_counts = Vec::with_capacity(months.len());
     let mut total = 0u64;
+    let mut approximate = false;
     for (y, m) in months {
+        // Per-iteration permit (see above): a saturated limiter fails this
+        // request with 503 instead of holding a slot across all months.
+        let Some(_permit) = relay.api_limit.try_acquire() else {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": "server is busy, try again shortly" })),
+            );
+        };
         let start = month_start(y, m);
         let end = month_start_of_next(y, m);
         let filter: Filter = serde_json::from_value(json!({
@@ -511,6 +556,7 @@ pub async fn api_monthly_handler(
         }))
         .expect("static filter");
         let (events, more) = relay.db.api_count(vec![filter], count_limit, now).await;
+        approximate |= more;
         // The same visibility rules as the unauthenticated API: protected
         // events, gift wraps and private/hidden group content are withheld.
         let has_group_events = events.iter().any(nip29::is_group_event);
@@ -537,6 +583,7 @@ pub async fn api_monthly_handler(
         Json(json!({
             "months": month_counts,
             "total": total,
+            "approximate": approximate,
         })),
     )
 }
@@ -713,19 +760,21 @@ pub async fn api_daily_handler(
     let end = month_start_of_next(year, month);
     let days_in_month = (end - start) / 86400;
 
-    let Some(_permit) = relay.api_limit.try_acquire() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "error": "server is busy, try again shortly" })),
-        );
-    };
     let count_limit = relay.config.read().await.limits.max_count;
     let no_tags = excluded_tags(&params);
     let nip78 = enabled_nip78_auth_active(&relay).await;
 
     let mut day_counts = Vec::with_capacity(days_in_month as usize);
     let mut total = 0u64;
+    let mut approximate = false;
     for day in 0..days_in_month {
+        // Per-iteration permit: never hold a slot across the whole month.
+        let Some(_permit) = relay.api_limit.try_acquire() else {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": "server is busy, try again shortly" })),
+            );
+        };
         let day_start = start + day * 86400;
         let filter: Filter = serde_json::from_value(json!({
             "authors": [hex_pk],
@@ -734,7 +783,8 @@ pub async fn api_daily_handler(
             "until": day_start + 86400 - 1,
         }))
         .expect("static filter");
-        let (events, _) = relay.db.api_count(vec![filter], count_limit, now).await;
+        let (events, more) = relay.db.api_count(vec![filter], count_limit, now).await;
+        approximate |= more;
         let has_group_events = events.iter().any(nip29::is_group_event);
         let groups = if has_group_events {
             Some(relay.groups.read().await)
@@ -750,12 +800,12 @@ pub async fn api_daily_handler(
         day_counts.push(json!({
             "day": format!("{year:04}-{month:02}-{:02}", day + 1),
             "count": count,
+            "approximate": more,
         }));
     }
-    drop(_permit);
     (
         StatusCode::OK,
-        Json(json!({ "days": day_counts, "total": total })),
+        Json(json!({ "days": day_counts, "total": total, "approximate": approximate })),
     )
 }
 
@@ -814,22 +864,34 @@ pub async fn api_stats_handler(
         Ok(pk) => pk,
         Err(msg) => return error_response(StatusCode::BAD_REQUEST, &msg),
     };
-    let Some(_permit) = relay.api_limit.try_acquire() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "error": "server is busy, try again shortly" })),
-        );
-    };
+    // Permits are taken per scan round-trip — never across the whole
+    // handler — so one slow `stats` cannot pin a slot through 9 scans.
+    macro_rules! permit {
+        () => {
+            match relay.api_limit.try_acquire() {
+                Some(p) => p,
+                None => {
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(json!({ "error": "server is busy, try again shortly" })),
+                    );
+                }
+            }
+        };
+    }
     let count_limit = relay.config.read().await.limits.max_count;
     let now = unix_now();
     let filter: Filter = serde_json::from_value(json!({ "authors": [hex_pk] })).expect("static");
     let no_tags = excluded_tags(&params);
     let nip78 = enabled_nip78_auth_active(&relay).await;
 
-    let (events, more) = relay
-        .db
-        .api_count(vec![filter.clone()], count_limit, now)
-        .await;
+    let (events, more) = {
+        let _permit = permit!();
+        relay
+            .db
+            .api_count(vec![filter.clone()], count_limit, now)
+            .await
+    };
     let has_group_events = events.iter().any(nip29::is_group_event);
     let groups = if has_group_events {
         Some(relay.groups.read().await)
@@ -849,25 +911,47 @@ pub async fn api_stats_handler(
 
     // The timestamps must respect the same visibility rules as `total`
     // and `kinds`: a protected/gift-wrapped/private-group event is not
-    // countable, so its activity time must not leak either. A single-row
-    // fetch is not enough — the author's newest event may be an invisible
-    // gift wrap, so fetch a window until a visible event is found.
-    let (first, _) = relay
-        .db
-        .api_query(vec![filter.clone()], 64, now, true)
-        .await;
-    let (last, _) = relay.db.api_query(vec![filter], 64, now, false).await;
-    drop(_permit);
-    let stats_groups = relay.groups.read().await;
-    let visible_first = first
-        .into_iter()
-        .find(|e| api_visible(e, Some(&stats_groups), &no_tags, nip78));
-    let visible_last = last
-        .into_iter()
-        .find(|e| api_visible(e, Some(&stats_groups), &no_tags, nip78));
-    drop(stats_groups);
-    let first_seen = visible_first.map(|e| e.created_at);
-    let last_seen = visible_last.map(|e| e.created_at);
+    // countable, so its activity time must not leak either. The author's
+    // newest event may be an invisible gift wrap, so grow the window until
+    // a visible event is found (bounded: 4 rounds up to 1024 rows).
+    let mut first_visible = None;
+    let mut last_visible = None;
+    {
+        let mut fetch = 64usize;
+        for _ in 0..4 {
+            let _permit = permit!();
+            let (first, _) = relay
+                .db
+                .api_query(vec![filter.clone()], fetch, now, true)
+                .await;
+            let (last, _) = relay
+                .db
+                .api_query(vec![filter.clone()], fetch, now, false)
+                .await;
+            drop(_permit);
+            let stats_groups = relay.groups.read().await;
+            if first_visible.is_none() {
+                first_visible = first
+                    .into_iter()
+                    .find(|e| api_visible(e, Some(&stats_groups), &no_tags, nip78));
+            }
+            if last_visible.is_none() {
+                last_visible = last
+                    .into_iter()
+                    .find(|e| api_visible(e, Some(&stats_groups), &no_tags, nip78));
+            }
+            drop(stats_groups);
+            if first_visible.is_some() && last_visible.is_some() {
+                break;
+            }
+            if fetch >= 1024 {
+                break;
+            }
+            fetch = (fetch * 4).min(1024);
+        }
+    }
+    let first_seen = first_visible.map(|e| e.created_at);
+    let last_seen = last_visible.map(|e| e.created_at);
     let first_month = first_seen.map(|ts| {
         let (y, m) = month_of(ts);
         format!("{y:04}-{m:02}")
@@ -940,19 +1024,21 @@ pub async fn api_hourly_handler(
     }
     let day_start = month_start(year, month) + (day as u64 - 1) * 86400;
 
-    let Some(_permit) = relay.api_limit.try_acquire() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "error": "server is busy, try again shortly" })),
-        );
-    };
     let count_limit = relay.config.read().await.limits.max_count;
     let no_tags = excluded_tags(&params);
     let nip78 = enabled_nip78_auth_active(&relay).await;
 
     let mut hour_counts = Vec::with_capacity(24);
     let mut total = 0u64;
+    let mut approximate = false;
     for h in 0..24 {
+        // Per-iteration permit: never hold a slot across all 24 hours.
+        let Some(_permit) = relay.api_limit.try_acquire() else {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": "server is busy, try again shortly" })),
+            );
+        };
         let h_start = day_start + h * 3600;
         let filter: Filter = serde_json::from_value(json!({
             "authors": [hex_pk],
@@ -961,7 +1047,8 @@ pub async fn api_hourly_handler(
             "until": h_start + 3600 - 1,
         }))
         .expect("static filter");
-        let (events, _) = relay.db.api_count(vec![filter], count_limit, now).await;
+        let (events, more) = relay.db.api_count(vec![filter], count_limit, now).await;
+        approximate |= more;
         let has_group_events = events.iter().any(nip29::is_group_event);
         let groups = if has_group_events {
             Some(relay.groups.read().await)
@@ -977,12 +1064,12 @@ pub async fn api_hourly_handler(
         hour_counts.push(json!({
             "hour": format!("{year:04}-{month:02}-{day:02}T{h:02}"),
             "count": count,
+            "approximate": more,
         }));
     }
-    drop(_permit);
     (
         StatusCode::OK,
-        Json(json!({ "hours": hour_counts, "total": total })),
+        Json(json!({ "hours": hour_counts, "total": total, "approximate": approximate })),
     )
 }
 
@@ -1096,7 +1183,10 @@ pub async fn api_follows_handler(
 /// The most common event kinds stored on the relay: `{"kinds": [{"kind":
 /// 1, "count": 12345}, ...], "approximate": bool}` sorted by count
 /// descending. The count walk is bounded (`approximate: true` when it was
-/// cut short).
+/// cut short). Counts are raw store totals: withheld events (protected,
+/// gift wraps, NIP-78 owner data, private groups) are included because the
+/// index walk cannot apply per-connection visibility without fetching every
+/// event; per-author `kinds`/`query` endpoints remain visibility-filtered.
 pub async fn api_relay_kinds_handler(
     State(relay): State<Arc<Relay>>,
     Query(params): Query<ApiParams>,
@@ -1127,7 +1217,7 @@ pub async fn api_relay_kinds_handler(
     kinds.truncate(limit);
     (
         StatusCode::OK,
-        Json(json!({ "kinds": kinds, "approximate": more })),
+        Json(json!({ "kinds": kinds, "approximate": more, "filtered": false })),
     )
 }
 
@@ -1135,7 +1225,8 @@ pub async fn api_relay_kinds_handler(
 ///
 /// The most active authors on the relay: `{"authors": [{"pubkey": "<hex>",
 /// "count": 123}], "approximate": bool}` sorted by count descending. The
-/// walk is bounded (`approximate: true` when it was cut short).
+/// walk is bounded (`approximate: true` when it was cut short). Like
+/// `relay/kinds`, counts are raw store totals including withheld events.
 pub async fn api_top_authors_handler(
     State(relay): State<Arc<Relay>>,
     Query(params): Query<ApiParams>,
@@ -1163,7 +1254,7 @@ pub async fn api_top_authors_handler(
     authors.truncate(limit);
     (
         StatusCode::OK,
-        Json(json!({ "authors": authors, "approximate": more })),
+        Json(json!({ "authors": authors, "approximate": more, "filtered": false })),
     )
 }
 
@@ -1314,20 +1405,53 @@ async fn query_and_respond(
         }
     }
     let nip78 = enabled_nip78_auth_active(relay).await;
-    // Pagination: fetch `limit + offset + 1` so `more` can be decided from
-    // the *visible* sequence (events hidden between pages — protected, gift
-    // wraps, private groups — must not make a client skip a page or stop
-    // early, e.g. `[V1, H, V2]` with offset=0 must still deliver V1 and V2).
+    // Pagination over the *visible* sequence: hidden rows (protected, gift
+    // wraps, private groups) are filtered after the scan, so a single
+    // `limit + offset + 1` pre-filter fetch can under-fill the page and, worse,
+    // skip visible events on the next offset (e.g. `[V1, Hx100, V2, V3]` with
+    // `limit=2` would return only `[V1]` and lose `V2`). Re-fetch with a
+    // growing window until the visible prefix covers `skip + limit`, the scan
+    // reports exhaustion, or a bounded cap is reached.
     let skip = offset.unwrap_or(0);
-    let (events, db_more) = relay
-        .db
-        .api_query(
-            filters,
-            max_limit.saturating_add(skip).saturating_add(1),
-            now,
-            ascending,
-        )
-        .await;
+    let want_visible = skip.saturating_add(max_limit).saturating_add(1);
+    // Bound total work: at most 4 rounds, each at most 4x the visible target
+    // and never more than the configured offset cap + limit (defaults keep
+    // this small; `0` means unbounded so fall back to 8x with a hard 10k).
+    let cfg_limit = relay.config.read().await.limits.max_api_offset;
+    let hard_cap = if cfg_limit > 0 {
+        cfg_limit.saturating_add(max_limit).saturating_add(1)
+    } else {
+        want_visible.saturating_mul(8).clamp(128, 10_000)
+    };
+    let mut fetch = want_visible.min(hard_cap).max(1);
+    let mut events: Vec<Event> = Vec::new();
+    let mut db_more = true;
+    for _ in 0..4 {
+        let (batch, more) = relay
+            .db
+            .api_query(filters.clone(), fetch, now, ascending)
+            .await;
+        events = batch;
+        db_more = more;
+        let has_group_events = events.iter().any(nip29::is_group_event);
+        let groups = if has_group_events {
+            Some(relay.groups.read().await)
+        } else {
+            None
+        };
+        let visible_count = events
+            .iter()
+            .filter(|e| api_visible(e, groups.as_deref(), no_tags, nip78))
+            .count();
+        drop(groups);
+        if visible_count >= want_visible || !db_more || fetch >= hard_cap {
+            break;
+        }
+        fetch = fetch.saturating_mul(4).min(hard_cap);
+        if fetch <= events.len() {
+            break;
+        }
+    }
     drop(_permit);
 
     // The REST API is unauthenticated, so it must apply the same
@@ -1571,6 +1695,16 @@ mod tests {
                 .is_ok(),
             "an npub parses (or a fabricated one fails) without panicking"
         );
+        // `nprofile1...` resolves to its profile pubkey like `npub1...`.
+        let pk_bytes = hex::decode("aa".repeat(32)).unwrap();
+        let mut tlv = vec![0u8, 32];
+        tlv.extend_from_slice(&pk_bytes);
+        let nprofile = crate::nips::nip19::bech32_encode("nprofile", &tlv).unwrap();
+        assert_eq!(
+            parse_author_identifier(&nprofile).unwrap(),
+            "aa".repeat(32),
+            "nprofile resolves to its pubkey"
+        );
         assert!(!sort_ascending(&None));
         assert!(sort_ascending(&Some("asc".into())));
         assert!(sort_ascending(&Some("ascending".into())));
@@ -1674,6 +1808,221 @@ mod tests {
             );
             assert_eq!(resp["more"], false);
 
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn daily_hourly_report_approximate_when_capped() {
+        // `api_count` cut short (`more == true`) must surface as
+        // `approximate: true` per bucket and overall, like monthly/count.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_relay().await;
+            {
+                let mut cfg = relay.config.write().await;
+                cfg.limits.max_count = 1;
+            }
+            let now = unix_now();
+            let mut first_pk = String::new();
+            for i in 0..3 {
+                let e = signed_note(relay.secp(), &format!("n{i}"), now, vec![]);
+                if i == 0 {
+                    first_pk = e.pubkey.clone();
+                }
+                assert_eq!(relay.db.put(e, now).await, crate::db::PutOutcome::Stored);
+            }
+            let (y, m) = month_of(now);
+            let (_, Json(daily)) = api_daily_handler(
+                State(relay.clone()),
+                Path((first_pk, 1)),
+                Query(ApiParams {
+                    year: Some(y),
+                    month: Some(m),
+                    ..Default::default()
+                }),
+            )
+            .await;
+            assert_eq!(
+                daily["approximate"], true,
+                "a capped day must flag approximate"
+            );
+            assert!(
+                daily["days"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|d| d["approximate"] == true),
+                "the capped bucket must flag approximate"
+            );
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn monthly_reports_overall_approximate_when_capped() {
+        // A capped month must surface as top-level `approximate: true`
+        // (like daily/hourly), so clients know `total` is truncated.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_relay().await;
+            {
+                let mut cfg = relay.config.write().await;
+                cfg.limits.max_count = 1;
+            }
+            let now = unix_now();
+            let mut first_pk = String::new();
+            for i in 0..3 {
+                let e = signed_note(relay.secp(), &format!("m{i}"), now - i as u64, vec![]);
+                if i == 0 {
+                    first_pk = e.pubkey.clone();
+                }
+                assert_eq!(relay.db.put(e, now).await, crate::db::PutOutcome::Stored);
+            }
+            let (code, Json(resp)) = api_monthly_handler(
+                State(relay.clone()),
+                Path((first_pk, 1)),
+                Query(ApiParams {
+                    since: Some(now - 370 * 86400),
+                    until: Some(now),
+                    ..Default::default()
+                }),
+            )
+            .await;
+            assert_eq!(code, StatusCode::OK);
+            assert_eq!(
+                resp["approximate"], true,
+                "a capped month must flag overall approximate: {resp}"
+            );
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn multi_row_handlers_fail_fast_mid_loop_when_saturated() {
+        // Permits are taken per scan round-trip, never across a whole
+        // multi-query handler: saturating the limiter must 503 even
+        // mid-loop instead of pinning a slot through 31 day-scans.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_relay().await;
+            let now = unix_now();
+            let e = signed_note(relay.secp(), "n", now, vec![]);
+            let pk = e.pubkey.clone();
+            assert_eq!(relay.db.put(e, now).await, crate::db::PutOutcome::Stored);
+            // Hold every concurrency slot for the test duration.
+            let max = relay.config.read().await.limits.max_api_concurrent;
+            let _holds: Vec<_> = (0..max)
+                .map(|_| relay.api_limit.try_acquire().unwrap())
+                .collect();
+            let (y, m) = month_of(now);
+            let (code, _) = api_daily_handler(
+                State(relay.clone()),
+                Path((pk, 1)),
+                Query(ApiParams {
+                    year: Some(y),
+                    month: Some(m),
+                    ..Default::default()
+                }),
+            )
+            .await;
+            assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn stats_finds_visible_activity_behind_hidden_events() {
+        // Newest/oldest 64+ events may all be invisible gift wraps: stats
+        // must look further (up to 1024) instead of reporting null times.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_relay().await;
+            let now = unix_now();
+            let pub_ev = signed_note(relay.secp(), "public", now - 1000, vec![]);
+            let pubkey = pub_ev.pubkey.clone();
+            assert_eq!(
+                relay.db.put(pub_ev, now).await,
+                crate::db::PutOutcome::Stored
+            );
+            for i in 0..70 {
+                let mut w = signed_note(relay.secp(), &format!("w{i}"), now - i, vec![]);
+                // Gift wrap to someone else: invisible to anonymous API.
+                w.kind = 1059;
+                w.tags = vec![vec!["p".into(), "bb".repeat(32)]];
+                w.id = crate::nips::nip01::compute_id(&w);
+                let _ = relay.db.put(w, now).await;
+            }
+            let (code, Json(resp)) = api_stats_handler(
+                State(relay.clone()),
+                Path(pubkey),
+                Query(ApiParams::default()),
+            )
+            .await;
+            assert_eq!(code, StatusCode::OK);
+            assert!(
+                !resp["last_seen"].is_null() || !resp["first_seen"].is_null(),
+                "visible activity must be found behind hidden wraps: {resp}"
+            );
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn monthly_rejects_overlong_ranges() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_relay().await;
+            let pk = "aa".repeat(32);
+            let (code, _) = api_monthly_handler(
+                State(relay.clone()),
+                Path((pk, 1)),
+                Query(ApiParams {
+                    since: Some(0),
+                    until: Some(u64::MAX / 2),
+                    ..Default::default()
+                }),
+            )
+            .await;
+            assert_eq!(code, StatusCode::BAD_REQUEST, ">120 months must 400");
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn monthly_probe_ignores_hidden_earliest_events() {
+        // Without `since`, the range starts at the earliest *visible*
+        // event: an older hidden event must not leak its age through
+        // extra zero months.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_relay().await;
+            let now = unix_now();
+            let mut hidden = signed_note(relay.secp(), "old secret", now - 400 * 86400, vec![]);
+            hidden.tags = vec![vec!["-".into()]];
+            hidden.id = crate::nips::nip01::compute_id(&hidden);
+            let pubkey = hidden.pubkey.clone();
+            assert_eq!(
+                relay.db.put(hidden, now).await,
+                crate::db::PutOutcome::Stored
+            );
+            let visible = signed_note(relay.secp(), "new public", now, vec![]);
+            assert_eq!(
+                relay.db.put(visible, now).await,
+                crate::db::PutOutcome::Stored
+            );
+            let (code, Json(resp)) = api_monthly_handler(
+                State(relay.clone()),
+                Path((pubkey, 1)),
+                Query(ApiParams::default()),
+            )
+            .await;
+            assert_eq!(code, StatusCode::OK);
+            let months = resp["months"].as_array().unwrap();
+            assert!(
+                !months.is_empty() && months.len() <= 2,
+                "the range must start at the visible event, not the hidden one: {resp}"
+            );
             relay.db.shutdown();
         });
     }

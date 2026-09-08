@@ -213,6 +213,14 @@ async fn allow_pubkey(
         Ok(identity) => identity,
         Err(resp) => return resp,
     };
+    // Validate like `block_pubkey` above: an invalid value would otherwise
+    // be acknowledged `ok: true` while matching nothing.
+    if hex::decode(&body.pubkey)
+        .map(|b| b.len() != 32)
+        .unwrap_or(true)
+    {
+        return bad_request("invalid pubkey");
+    }
     let mut access = state.relay.access.write().await;
     access.blocked_pubkeys.retain(|(p, _)| p != &body.pubkey);
     drop(access);

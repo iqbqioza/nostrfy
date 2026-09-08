@@ -33,20 +33,48 @@ pub(crate) const MAX_NEG_OPENS: u32 = 256;
 
 impl super::Conn {
     pub(crate) fn send_neg_err(&mut self, sub_id: &str, reason: &str) {
-        self.send_json(json!(["NEG-ERR", sub_id, reason]));
+        self.send_control(json!(["NEG-ERR", sub_id, reason]));
     }
 
     pub(crate) fn send_neg_msg(&mut self, sub_id: &str, message: &[u8]) {
-        self.send_json(json!(["NEG-MSG", sub_id, hex::encode(message)]));
+        self.send_control(json!(["NEG-MSG", sub_id, hex::encode(message)]));
+    }
+
+    /// Whether the outgoing queue is too deep for another (potentially
+    /// multi-megabyte) negentropy reply: `send_control` bypasses the queue
+    /// caps so completion-critical messages are never dropped, but an
+    /// attacker driving rapid NEG-MSG rounds on a slow reader could
+    /// otherwise accumulate gigabytes. Callers fail the round with a
+    /// retryable NEG-ERR instead, bounding queued NEG bytes to a small
+    /// multiple of the per-connection cap.
+    fn neg_backpressured(&self) -> bool {
+        self.out_queue_bytes > 0 && self.out_bytes > self.out_queue_bytes.saturating_mul(4)
     }
 
     pub(crate) async fn handle_neg_open(&mut self, rest: &[Value]) {
+        // NIP-77 errors are NEG-ERR when a subscription id can be
+        // correlated, NOTICE only when no id exists to echo.
+        let correl_id: Option<String> = rest
+            .first()
+            .and_then(value_string)
+            .filter(|s| !s.is_empty());
         if !self.relay.config.read().await.nip_enabled(77) {
-            self.send_notice("error: negentropy is not enabled on this relay");
+            if let Some(sub_id) = correl_id {
+                self.send_neg_err(&sub_id, "error: negentropy is not enabled on this relay");
+            } else {
+                self.send_notice("error: negentropy is not enabled on this relay");
+            }
             return;
         }
         if rest.len() < 3 {
-            self.send_notice("error: NEG-OPEN requires a subscription id, filter and message");
+            if let Some(sub_id) = correl_id {
+                self.send_neg_err(
+                    &sub_id,
+                    "error: NEG-OPEN requires a subscription id, filter and message",
+                );
+            } else {
+                self.send_notice("error: NEG-OPEN requires a subscription id, filter and message");
+            }
             return;
         }
         let sub_id = match value_string(&rest[0]) {
@@ -86,7 +114,10 @@ impl super::Conn {
             }
         };
         if filter.too_many_members() {
-            self.send_neg_err(&sub_id, "error: too many ids or authors in the filter");
+            self.send_neg_err(
+                &sub_id,
+                "error: too many ids, authors or kinds in the filter",
+            );
             return;
         }
         if filter.invalid_tag_values() {
@@ -144,7 +175,7 @@ impl super::Conn {
         if more || items.len() > max_items {
             // NIP-77: the maximum number of processable records may be
             // returned as the fourth element.
-            self.send_json(json!([
+            self.send_control(json!([
                 "NEG-ERR",
                 sub_id,
                 "blocked: this query is too big",
@@ -224,7 +255,7 @@ impl super::Conn {
             .saturating_add(items.len())
             > total_cap
         {
-            self.send_json(json!([
+            self.send_control(json!([
                 "NEG-ERR",
                 sub_id,
                 "blocked: too many negentropy items",
@@ -298,24 +329,52 @@ impl super::Conn {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.subscriptions_held
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if self.neg_backpressured() {
+            self.remove_neg_subscription(&sub_id);
+            self.send_neg_err(&sub_id, "blocked: overloaded, please retry");
+            return;
+        }
         self.send_neg_msg(&sub_id, &response);
     }
 
     pub(crate) async fn handle_neg_msg(&mut self, rest: &[Value]) {
         if rest.len() < 2 {
-            self.send_notice("error: NEG-MSG requires a subscription id and message");
+            // Correlate with NEG-ERR when the id is known, else NOTICE.
+            // NIP-77: after NEG-ERR the subscription is closed, so a named
+            // id is released like every other malformed continuation.
+            if let Some(sub_id) = rest
+                .first()
+                .and_then(value_string)
+                .filter(|s| !s.is_empty())
+            {
+                self.remove_neg_subscription(&sub_id);
+                self.send_neg_err(
+                    &sub_id,
+                    "error: NEG-MSG requires a subscription id and message",
+                );
+            } else {
+                self.send_notice("error: NEG-MSG requires a subscription id and message");
+            }
             return;
         }
         let Some(sub_id) = value_string(&rest[0]) else {
             self.send_notice("error: NEG-MSG subscription id must be a string");
             return;
         };
+        if sub_id.is_empty() {
+            self.send_notice("error: NEG-MSG subscription id must be a non-empty string");
+            return;
+        }
         let Some(message) = rest[1].as_str() else {
-            self.send_notice("error: NEG-MSG message must be hex");
+            // NIP-77: after NEG-ERR the subscription is closed — malformed
+            // continuations close the id they name instead of lingering open.
+            self.remove_neg_subscription(&sub_id);
+            self.send_neg_err(&sub_id, "error: NEG-MSG message must be hex");
             return;
         };
         let Ok(message) = hex::decode(message) else {
-            self.send_notice("error: NEG-MSG message must be hex");
+            self.remove_neg_subscription(&sub_id);
+            self.send_neg_err(&sub_id, "error: NEG-MSG message must be hex");
             return;
         };
         // The access lists gate in-flight syncs too: a pubkey that was
@@ -323,27 +382,26 @@ impl super::Conn {
         // (per NIP-77 a NEG-ERR closes the subscription) — no reconnect
         // needed.
         if !self.access_allows_read().await {
-            if let Some(state) = self.neg.remove(&sub_id) {
-                self.neg_total = self.neg_total.saturating_sub(state.items.len());
-                self.release_neg_stats_subscription();
-            }
+            self.remove_neg_subscription(&sub_id);
             self.send_neg_err(&sub_id, "restricted: you are not allowed to sync");
+            return;
+        }
+        let Some(_exists) = self.neg.get(&sub_id) else {
+            self.send_neg_err(&sub_id, "closed: unknown subscription");
+            return;
+        };
+        // NIP-77: "After a NEG-ERR is issued, the subscription is considered
+        // to be closed." Exhausting the round budget closes it too.
+        // Check without holding the borrow so the close can release it.
+        if self.neg.get(&sub_id).is_some_and(|s| s.rounds_left == 0) {
+            self.remove_neg_subscription(&sub_id);
+            self.send_neg_err(&sub_id, "error: too many negentropy messages");
             return;
         }
         let Some(state) = self.neg.get_mut(&sub_id) else {
             self.send_neg_err(&sub_id, "closed: unknown subscription");
             return;
         };
-        // NIP-77: "After a NEG-ERR is issued, the subscription is considered
-        // to be closed." Exhausting the round budget closes it too.
-        if state.rounds_left == 0 {
-            if let Some(state) = self.neg.remove(&sub_id) {
-                self.neg_total = self.neg_total.saturating_sub(state.items.len());
-                self.release_neg_stats_subscription();
-            }
-            self.send_neg_err(&sub_id, "error: too many negentropy messages");
-            return;
-        }
         state.rounds_left -= 1;
         match nip77::respond(&state.items, &message) {
             Ok(response) => {
@@ -359,23 +417,22 @@ impl super::Conn {
                 let wire_size = response.len() as u64 * 2;
                 let over_budget = budget > 0 && wire_size > budget;
                 if over_budget {
-                    if let Some(state) = self.neg.remove(&sub_id) {
-                        self.neg_total = self.neg_total.saturating_sub(state.items.len());
-                        self.release_neg_stats_subscription();
-                    }
+                    self.remove_neg_subscription(&sub_id);
                     self.send_neg_err(
                         &sub_id,
                         "blocked: negentropy response too large (increase limits.max_req_response_bytes)",
                     );
                     return;
                 }
+                if self.neg_backpressured() {
+                    self.remove_neg_subscription(&sub_id);
+                    self.send_neg_err(&sub_id, "blocked: overloaded, please retry");
+                    return;
+                }
                 self.send_neg_msg(&sub_id, &response)
             }
             Err(reason) => {
-                if let Some(state) = self.neg.remove(&sub_id) {
-                    self.neg_total = self.neg_total.saturating_sub(state.items.len());
-                    self.release_neg_stats_subscription();
-                }
+                self.remove_neg_subscription(&sub_id);
                 self.send_neg_err(&sub_id, &format!("error: {reason}"));
             }
         }
@@ -397,9 +454,7 @@ impl super::Conn {
             self.send_notice("error: NEG-CLOSE requires a subscription id");
             return;
         };
-        if let Some(state) = self.neg.remove(&sub_id) {
-            self.neg_total = self.neg_total.saturating_sub(state.items.len());
-            self.release_neg_stats_subscription();
-        }
+        // NIP-77 separate namespace: NEG-CLOSE releases only NEG state.
+        self.remove_neg_subscription(&sub_id);
     }
 }

@@ -58,6 +58,58 @@ const SUPPORTED_METHODS: &[&str] = &[
 /// the id lands in a stored relay event and the in-memory role map, so it
 /// must not be able to grow to the full RPC body size.
 const MAX_ROLE_ID_LEN: usize = 64;
+/// Bounds for the free-text role fields (same order as `changerelay*`):
+/// without them a single 64 KiB `createrole` would persist as a relay event
+/// and stay resident in the in-memory role map.
+const MAX_ROLE_LABEL_LEN: usize = 200;
+const MAX_ROLE_DESC_LEN: usize = 1000;
+const MAX_ROLE_COLOR_LEN: usize = 64;
+
+fn check_role_fields(label: &str, description: &str, color: &str) -> Result<(), String> {
+    if label.chars().count() > MAX_ROLE_LABEL_LEN {
+        return Err(format!(
+            "role label exceeds the maximum of {MAX_ROLE_LABEL_LEN} characters"
+        ));
+    }
+    if description.chars().count() > MAX_ROLE_DESC_LEN {
+        return Err(format!(
+            "role description exceeds the maximum of {MAX_ROLE_DESC_LEN} characters"
+        ));
+    }
+    if color.chars().count() > MAX_ROLE_COLOR_LEN {
+        return Err(format!(
+            "role color exceeds the maximum of {MAX_ROLE_COLOR_LEN} characters"
+        ));
+    }
+    Ok(())
+}
+
+/// Validates a NIP-43 role id: non-empty (after trimming), within the byte
+/// length bound, and free of control characters (it lands in a stored relay
+/// event's `d` tag and the in-memory role map). Character count is used for
+/// the length bound like the other role fields so multibyte ids cannot
+/// bypass the intent.
+fn check_role_id(id: &str) -> Result<(), String> {
+    if id.trim().is_empty() {
+        return Err("role id must not be empty".into());
+    }
+    // Compare against the trimmed form so `" admin"` and `"admin"` cannot
+    // become distinct map keys / `d` tags for the same logical role.
+    if id != id.trim() {
+        return Err("role id must not have leading or trailing whitespace".into());
+    }
+    // Byte length: the id lands in a stored event's `d` tag and the LMDB
+    // index, so multibyte ids must not bypass the bound via char count.
+    if id.len() > MAX_ROLE_ID_LEN {
+        return Err(format!(
+            "role id exceeds the maximum of {MAX_ROLE_ID_LEN} bytes"
+        ));
+    }
+    if id.chars().any(|c| c.is_control()) {
+        return Err("role id must not contain control characters".into());
+    }
+    Ok(())
+}
 
 fn rpc_ok(result: Value) -> Response {
     (StatusCode::OK, Json(json!({ "result": result }))).into_response()
@@ -301,15 +353,16 @@ pub async fn rpc_handler(
             let Some(id) = params.first().and_then(Value::as_str) else {
                 return rpc_err("invalid params");
             };
-            if id.len() > MAX_ROLE_ID_LEN {
-                return rpc_err(&format!(
-                    "role id exceeds the maximum of {MAX_ROLE_ID_LEN} characters"
-                ));
+            if let Err(msg) = check_role_id(id) {
+                return rpc_err(&msg);
             }
             let label = params.get(1).and_then(Value::as_str).unwrap_or("");
             let description = params.get(2).and_then(Value::as_str).unwrap_or("");
             let color = params.get(3).and_then(Value::as_str).unwrap_or("");
             let order = params.get(4).and_then(Value::as_i64);
+            if let Err(msg) = check_role_fields(label, description, color) {
+                return rpc_err(&msg);
+            }
             if relay
                 .create_role(id, label, description, color, order)
                 .await
@@ -326,15 +379,16 @@ pub async fn rpc_handler(
             let Some(id) = params.first().and_then(Value::as_str) else {
                 return rpc_err("invalid params");
             };
-            if id.len() > MAX_ROLE_ID_LEN {
-                return rpc_err(&format!(
-                    "role id exceeds the maximum of {MAX_ROLE_ID_LEN} characters"
-                ));
+            if let Err(msg) = check_role_id(id) {
+                return rpc_err(&msg);
             }
             let label = params.get(1).and_then(Value::as_str).unwrap_or("");
             let description = params.get(2).and_then(Value::as_str).unwrap_or("");
             let color = params.get(3).and_then(Value::as_str).unwrap_or("");
             let order = params.get(4).and_then(Value::as_i64);
+            if let Err(msg) = check_role_fields(label, description, color) {
+                return rpc_err(&msg);
+            }
             if relay.edit_role(id, label, description, color, order).await {
                 audit!(&relay, &identity, "editrole", params);
                 rpc_ok(json!(true))
@@ -348,6 +402,9 @@ pub async fn rpc_handler(
             let Some(id) = params.first().and_then(Value::as_str) else {
                 return rpc_err("invalid params");
             };
+            if let Err(msg) = check_role_id(id) {
+                return rpc_err(&msg);
+            }
             if relay.delete_role(id).await {
                 audit!(&relay, &identity, "deleterole", params);
                 rpc_ok(json!(true))
@@ -367,6 +424,9 @@ pub async fn rpc_handler(
             if !is_pubkey(pubkey) {
                 return rpc_err("invalid pubkey");
             }
+            if let Err(msg) = check_role_id(role) {
+                return rpc_err(&msg);
+            }
             if relay.assign_role(pubkey, role).await {
                 audit!(&relay, &identity, "assignrole", params);
                 rpc_ok(json!(true))
@@ -385,6 +445,9 @@ pub async fn rpc_handler(
             };
             if !is_pubkey(pubkey) {
                 return rpc_err("invalid pubkey");
+            }
+            if let Err(msg) = check_role_id(role) {
+                return rpc_err(&msg);
             }
             if relay.unassign_role(pubkey, role).await {
                 audit!(&relay, &identity, "unassignrole", params);
@@ -771,7 +834,36 @@ mod tests {
         // with the restricted error, which covers the else branches).
         let resp = rpc_call(&relay, "createrole", vec![]).await;
         assert!(rpc_err_of(resp).await.contains("params"));
-        let resp = rpc_call(&relay, "createrole", vec![json!("x".repeat(200))]).await;
+        let resp = rpc_call(&relay, "createrole", vec![json!("x".repeat(65))]).await;
+        assert!(rpc_err_of(resp).await.contains("maximum"));
+        let resp = rpc_call(&relay, "createrole", vec![json!(" admin")]).await;
+        assert!(rpc_err_of(resp).await.contains("whitespace"));
+        let resp = rpc_call(&relay, "createrole", vec![json!("")]).await;
+        assert!(rpc_err_of(resp).await.contains("empty"));
+        let resp = rpc_call(&relay, "createrole", vec![json!("   ")]).await;
+        assert!(rpc_err_of(resp).await.contains("empty"));
+        let resp = rpc_call(&relay, "deleterole", vec![json!("")]).await;
+        assert!(rpc_err_of(resp).await.contains("empty"));
+        let resp = rpc_call(
+            &relay,
+            "createrole",
+            vec![json!("r"), json!("l".repeat(201))],
+        )
+        .await;
+        assert!(rpc_err_of(resp).await.contains("maximum"));
+        let resp = rpc_call(
+            &relay,
+            "createrole",
+            vec![json!("r"), json!(""), json!("d".repeat(1001))],
+        )
+        .await;
+        assert!(rpc_err_of(resp).await.contains("maximum"));
+        let resp = rpc_call(
+            &relay,
+            "createrole",
+            vec![json!("r"), json!(""), json!(""), json!("c".repeat(65))],
+        )
+        .await;
         assert!(rpc_err_of(resp).await.contains("maximum"));
         let resp = rpc_call(&relay, "createrole", vec![json!("r1")]).await;
         assert!(rpc_err_of(resp).await.contains("restricted"));
@@ -785,6 +877,13 @@ mod tests {
         assert!(rpc_err_of(resp).await.contains("params"));
         let resp = rpc_call(&relay, "assignrole", vec![json!("zz"), json!("r1")]).await;
         assert!(rpc_err_of(resp).await.contains("pubkey"));
+        let resp = rpc_call(
+            &relay,
+            "assignrole",
+            vec![json!("aa".repeat(32)), json!("")],
+        )
+        .await;
+        assert!(rpc_err_of(resp).await.contains("empty"));
         let resp = rpc_call(
             &relay,
             "assignrole",

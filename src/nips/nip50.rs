@@ -123,8 +123,9 @@ mod tests {
     #[test]
     fn query_terms_keep_numeric_words() {
         // The query side keeps numeric words: a search for "nostr 2023"
-        // walks the index on "nostr" and rejects events lacking "2023" in
-        // the per-event match. A numeric-only query yields terms (which
+        // walks the index on "nostr" (numeric words are not indexed); the
+        // per-event match requires any one term, so "2023" does not act as
+        // an additional constraint. A numeric-only query yields terms (which
         // the index walk cannot satisfy — no results — instead of the
         // "no search" fallback that would match everything).
         assert_eq!(terms("nostr 2023"), vec!["nostr", "2023"]);

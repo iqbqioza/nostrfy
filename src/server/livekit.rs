@@ -19,9 +19,16 @@ use crate::util::unix_now;
 // ----- NIP-29 LiveKit integration -----
 
 /// `GET /.well-known/nip29/livekit` — 204 when LiveKit rooms are supported.
+/// All three credentials are required: with a URL but no key/secret every
+/// mint would 404, so capability is not advertised either (fail-closed and
+/// consistent with `livekit_token` below).
 pub(crate) async fn livekit_supported(State(relay): State<Arc<Relay>>) -> impl IntoResponse {
     let cfg = relay.config.read().await;
-    if cfg.nip_enabled(29) && !cfg.relay.livekit_url.is_empty() {
+    if cfg.nip_enabled(29)
+        && !cfg.relay.livekit_url.trim().is_empty()
+        && !cfg.relay.livekit_api_key.is_empty()
+        && !cfg.relay.livekit_api_secret.is_empty()
+    {
         StatusCode::NO_CONTENT
     } else {
         StatusCode::NOT_FOUND
@@ -37,7 +44,11 @@ pub(crate) async fn livekit_token(
     AxPath(group): AxPath<String>,
 ) -> impl IntoResponse {
     let cfg = relay.config.read().await;
+    // Gate on the URL too (mirroring `livekit_supported`): with `url == ""`
+    // a minted token carries an empty endpoint and is unusable; fail closed
+    // instead of issuing it.
     if !cfg.nip_enabled(29)
+        || cfg.relay.livekit_url.trim().is_empty()
         || cfg.relay.livekit_api_key.is_empty()
         || cfg.relay.livekit_api_secret.is_empty()
     {
@@ -99,6 +110,10 @@ async fn group_allows(relay: &Relay, group: &str, pubkey: &str) -> bool {
         // membership (the id may be a private group on another relay),
         // so no token is minted for them.
         None => false,
+        // LiveKit rooms are opt-in per group (`livekit` tag on the group
+        // metadata): a group without it never mints tokens, even when the
+        // relay has LiveKit configured globally.
+        Some(g) if !g.settings.livekit => false,
         Some(g) => !g.settings.private && !g.settings.restricted || g.is_member(pubkey),
     }
 }
@@ -268,12 +283,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn known_open_group_mints_token() {
+    async fn missing_url_refuses_token() {
+        // `livekit_url == ""` must fail closed like `livekit_supported`'s
+        // 404: a minted token with an empty endpoint is unusable.
         let relay = build_relay().await;
         relay.groups.write().await.groups.insert(
             "open".into(),
             crate::nips::nip29::Group {
                 settings: crate::nips::nip29::GroupSettings::default(),
+                ..Default::default()
+            },
+        );
+        {
+            let mut cfg = relay.config.write().await;
+            cfg.relay.livekit_url = String::new();
+        }
+        let secp = relay.secp().clone();
+        let ev = signed_token_auth(&relay, &secp, "open").await;
+        let (status, _, _) = token_status(&relay, "open", &ev).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "an empty livekit_url must not mint a token"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn known_open_group_mints_token() {
+        let relay = build_relay().await;
+        let settings = crate::nips::nip29::GroupSettings {
+            livekit: true,
+            ..Default::default()
+        };
+        relay.groups.write().await.groups.insert(
+            "open".into(),
+            crate::nips::nip29::Group {
+                settings,
                 ..Default::default()
             },
         );
@@ -291,10 +337,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn group_without_livekit_flag_mints_nothing() {
+        // LiveKit rooms are opt-in per group: without the `livekit` tag no
+        // token is minted even for an open group.
+        let relay = build_relay().await;
+        relay.groups.write().await.groups.insert(
+            "nolive".into(),
+            crate::nips::nip29::Group {
+                settings: crate::nips::nip29::GroupSettings::default(),
+                ..Default::default()
+            },
+        );
+        let secp = relay.secp().clone();
+        let ev = signed_token_auth(&relay, &secp, "nolive").await;
+        let (status, _, _) = token_status(&relay, "nolive", &ev).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "a group without the livekit flag must not mint"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
     async fn known_closed_group_refuses_non_member() {
         let relay = build_relay().await;
         let mut g = crate::nips::nip29::Group::default();
         g.settings.private = true;
+        g.settings.livekit = true;
         relay.groups.write().await.groups.insert("closed".into(), g);
         let secp = relay.secp().clone();
         let ev = signed_token_auth(&relay, &secp, "closed").await;
@@ -314,6 +384,7 @@ mod tests {
         let pubkey = XOnlyPublicKey::from_keypair(&keypair).0.to_string();
         let mut g = crate::nips::nip29::Group::default();
         g.settings.private = true;
+        g.settings.livekit = true;
         g.members.insert(pubkey.clone(), Default::default());
         relay.groups.write().await.groups.insert("closed".into(), g);
         let secp = relay.secp().clone();

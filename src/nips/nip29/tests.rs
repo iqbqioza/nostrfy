@@ -2,7 +2,7 @@
 
 use super::*;
 
-fn event(kind: u64, pubkey: &str, h: Option<&str>, tags: Vec<Vec<String>>) -> Event {
+pub(crate) fn event(kind: u64, pubkey: &str, h: Option<&str>, tags: Vec<Vec<String>>) -> Event {
     let mut tags = tags;
     if let Some(h) = h {
         tags.insert(0, vec![H.to_string(), h.to_string()]);
@@ -18,8 +18,8 @@ fn event(kind: u64, pubkey: &str, h: Option<&str>, tags: Vec<Vec<String>>) -> Ev
     }
 }
 
-const ADMIN: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-const USER: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+pub(crate) const ADMIN: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+pub(crate) const USER: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const OTHER: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 /// A second admin (distinct from ADMIN) for the last-admin guard tests.
 const ADMIN2: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
@@ -293,10 +293,12 @@ fn group_cap_counts_deleted_groups() {
         "restricted: group limit reached",
         "deleted groups must count toward the budget"
     );
-    // Re-creating the DELETED g1 is refused on other grounds.
+    // Re-creating the DELETED g1 is refused on capacity grounds here (the
+    // budget is full); with spare capacity a fresh create resurrects it
+    // (see `deleted_group_id_can_be_recreated`).
     assert_eq!(
         store.validate_write(&g1).unwrap_err(),
-        "blocked: the group has been deleted"
+        "restricted: group limit reached"
     );
 }
 
@@ -953,4 +955,154 @@ fn last_admin_cannot_be_demoted_or_removed() {
         vec![vec![P.into(), ADMIN2.into()]],
     );
     assert!(store.validate_write(&remove2).is_ok());
+}
+
+#[test]
+fn parent_side_adopt_requires_child_admin() {
+    // A parent admin must not hijack an orphan group by listing it: the
+    // author must also administer the child (the child's own 9002 remains
+    // the normal parenting path).
+    let mut store = seeded();
+    let create3 = event(CREATE_GROUP, OTHER, Some("g3"), vec![]);
+    store.apply(&create3, "", 1, false, false);
+    // ADMIN administers g1 but not g3: parent-side adoption is rejected.
+    let adopt = event(
+        9002,
+        ADMIN,
+        Some("g1"),
+        vec![vec!["child".into(), "g3".into()]],
+    );
+    assert!(
+        store.validate_write(&adopt).is_err(),
+        "adopting a group you do not administer must be rejected"
+    );
+    // Once ADMIN is also an admin of g3, the same edit validates.
+    let grant = event(
+        9000,
+        OTHER,
+        Some("g3"),
+        vec![vec![P.into(), ADMIN.into(), "mod".into()]],
+    );
+    assert!(store.validate_write(&grant).is_ok());
+    store.apply(&grant, "", 1, false, false);
+    assert!(store.validate_write(&adopt).is_ok());
+}
+
+#[test]
+fn deleted_group_id_can_be_recreated() {
+    // A fresh 9007 resurrects a deleted id (the tombstone blocks every
+    // other write but not re-creation).
+    let mut store = seeded();
+    let delete = event(DELETE_GROUP, ADMIN, Some("g1"), vec![]);
+    assert!(store.validate_write(&delete).is_ok());
+    store.apply(&delete, "", 1, false, false);
+    assert!(store.group("g1").is_none());
+    let rejoin = event(9021, USER, Some("g1"), vec![]);
+    assert!(
+        store.validate_write(&rejoin).is_err(),
+        "writes to a deleted group stay blocked"
+    );
+    let recreate = event(CREATE_GROUP, ADMIN, Some("g1"), vec![]);
+    assert!(store.validate_write(&recreate).is_ok());
+    store.apply(&recreate, "", 1, false, false);
+    assert!(
+        store.group("g1").is_some(),
+        "a fresh create must resurrect the id"
+    );
+}
+
+#[test]
+fn pin_list_is_bounded() {
+    // NIP-29 lets the relay limit pins: validation rejects oversized
+    // 9010 lists, and apply caps history replayed without validation.
+    let mut store = seeded();
+    let many: Vec<Vec<String>> = (0..150)
+        .map(|i| vec![E.into(), format!("{:064x}", i)])
+        .collect();
+    let pins = event(9010, ADMIN, Some("g1"), many.clone());
+    assert!(
+        store.validate_write(&pins).is_err(),
+        "an oversized pin list must be rejected"
+    );
+    store.apply(&pins, "", 1, false, false);
+    assert_eq!(
+        store.group("g1").unwrap().pins.len(),
+        super::MAX_PINS,
+        "replayed history must still be capped"
+    );
+}
+
+#[test]
+fn invite_codes_are_bounded() {
+    // Invite codes accumulate without consumption: validation rejects
+    // overflow and apply stops at the cap even for unvalidated history.
+    let mut store = seeded();
+    let many: Vec<Vec<String>> = (0..150)
+        .map(|i| vec!["code".into(), format!("code-{i}")])
+        .collect();
+    let invites = event(9009, ADMIN, Some("g1"), many);
+    assert!(
+        store.validate_write(&invites).is_err(),
+        "an oversized invite batch must be rejected"
+    );
+    store.apply(&invites, "", 1, false, false);
+    assert_eq!(
+        store.group("g1").unwrap().invites.len(),
+        super::MAX_INVITES,
+        "replayed history must still be capped"
+    );
+    // At the cap, one more fresh code is rejected.
+    let one_more = event(
+        9009,
+        ADMIN,
+        Some("g1"),
+        vec![vec!["code".into(), "extra".into()]],
+    );
+    assert!(store.validate_write(&one_more).is_err());
+}
+
+#[test]
+fn group_members_are_bounded() {
+    // Without a bound an admin could spam `9000` with fresh pubkeys,
+    // growing the member map (and mirrored 39001/39002) without limit.
+    let mut store = seeded();
+    // Fill to the cap through apply (bypasses validation, like history
+    // replay).
+    for i in 0..super::MAX_MEMBERS {
+        let put = event(
+            9000,
+            ADMIN,
+            Some("g1"),
+            vec![vec![P.into(), format!("{:064x}", i), "m".into()]],
+        );
+        store.apply(&put, "", 1, false, false);
+    }
+    assert_eq!(store.group("g1").unwrap().members.len(), super::MAX_MEMBERS);
+    // A fresh member via 9000 is rejected at the cap...
+    let fresh = event(
+        9000,
+        ADMIN,
+        Some("g1"),
+        vec![vec![P.into(), "ff".repeat(32), "m".into()]],
+    );
+    assert!(store.validate_write(&fresh).is_err());
+    // ...as is a fresh JOIN, while role changes for existing members
+    // still validate.
+    let join = event(9021, USER, Some("g1"), vec![]);
+    assert!(store.validate_write(&join).unwrap_err().contains("full"));
+    let role_change = event(
+        9000,
+        ADMIN,
+        Some("g1"),
+        vec![vec![P.into(), format!("{:064x}", 0), "admin".into()]],
+    );
+    assert!(store.validate_write(&role_change).is_ok());
+    // Replay past the cap stays capped.
+    let mut huge = Vec::new();
+    for i in 0..500 {
+        huge.push(vec![P.into(), format!("{:064x}", i + 0x9000), "m".into()]);
+    }
+    let big = event(9000, ADMIN, Some("g1"), huge);
+    store.apply(&big, "", 1, false, false);
+    assert_eq!(store.group("g1").unwrap().members.len(), super::MAX_MEMBERS);
 }

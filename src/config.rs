@@ -265,6 +265,12 @@ pub struct LimitsConfig {
     /// instead of queuing, so a flood of API traffic cannot stall the
     /// WebSocket subscribers (which share the same database).
     pub max_api_concurrent: usize,
+    /// REST API: maximum number of queued-but-unprocessed `/api/v1`
+    /// requests waiting for the dedicated API reader thread. Beyond this
+    /// the request fails fast with an empty result instead of piling up in
+    /// memory. Independent from the WebSocket-side queue caps, and applied
+    /// live on SIGHUP reload.
+    pub max_api_queue_msgs: usize,
     /// REST API: upper bound for the `limit` query parameter (0 = no bound).
     pub max_api_limit: usize,
     /// REST API: upper bound for the `offset` query parameter (0 = no bound).
@@ -448,6 +454,7 @@ impl Default for LimitsConfig {
             max_sub_bytes: 1 << 20,
             group_late_publish_secs: 3_600,
             max_api_concurrent: 8,
+            max_api_queue_msgs: 512,
             max_api_limit: 5_000,
             max_api_offset: 50_000,
             max_api_search_bytes: 2_048,
@@ -792,7 +799,11 @@ impl Config {
                         .iter()
                         .any(|k| self.is_kind_effectively_allowed(*k, access))
                 } else {
-                    // No associated kinds (e.g. NIP-11, NIP-86) — always advertised when enabled.
+                    // No associated kinds (e.g. NIP-11, NIP-86, or NIPs like
+                    // NIP-33 whose range cannot be enumerated against block
+                    // lists) — always advertised when enabled. A restrictive
+                    // `allowed_kinds` may therefore still advertise these;
+                    // the kind filter itself is still enforced on writes.
                     true
                 }
             })
@@ -838,9 +849,9 @@ impl Config {
             kind,
             22242 // NIP-42 AUTH
                 | 27235 // NIP-98 HTTP auth
-                | 28934 // NIP-43 JOIN
-                | 28935 // NIP-43 Invite Request
-                | 28936 // NIP-43 LEAVE
+                | crate::nips::nip43::JOIN
+                | crate::nips::nip43::INVITE
+                | crate::nips::nip43::LEAVE
                 | 24133 // NIP-46 Nostr Connect
                 | 23194 // NIP-47 wallet request
                 | 23195 // NIP-47 wallet response
@@ -859,11 +870,12 @@ impl Config {
             22 => Some(&[1111]),
             26 => None,
             29 => Some(&[
-                // Current NIP-29 kinds (the moderation table and the
-                // relay-generated metadata): 9000/9001/9002/9005/9007/
-                // 9008/9009/9010, 9021/9022 and 39000-39005.
-                9000, 9001, 9002, 9005, 9007, 9008, 9009, 9010, 9021, 9022, 39000, 39001, 39002,
-                39003, 39004, 39005,
+                // NIP-29 moderation range 9000-9020 (9003/9004/9006 and
+                // 9011-9020 are reserved but admin-gated and stored like
+                // any other moderation kind), 9021/9022 and 39000-39005.
+                9000, 9001, 9002, 9003, 9004, 9005, 9006, 9007, 9008, 9009, 9010, 9011, 9012, 9013,
+                9014, 9015, 9016, 9017, 9018, 9019, 9020, 9021, 9022, 39000, 39001, 39002, 39003,
+                39004, 39005,
             ]),
             32 => Some(&[1985]),
             33 => None, // range 30000-39999 — not checked against kind block lists
@@ -1050,6 +1062,23 @@ impl Config {
                 "relay.enabled_nips and relay.disabled_nips are both set; enabled_nips wins"
             );
         }
+        // Typo guard: an unknown NIP id is ignored with a warning (not a
+        // hard error, so a future NIP number in a shared config file never
+        // prevents startup on this version). Note this means a typo like
+        // `enabled_nips = [500]` yields an empty advertisement plus the
+        // warning — check the log if NIPs go missing unexpectedly.
+        for nip in self
+            .relay
+            .enabled_nips
+            .iter()
+            .chain(self.relay.disabled_nips.iter())
+        {
+            if !RELAY_NIPS.contains(nip) {
+                log::warn!(
+                    "relay.enabled_nips/disabled_nips contains unknown NIP-{nip}; it is ignored"
+                );
+            }
+        }
 
         // `require_auth` only takes effect when NIP-42 is enabled (the
         // AUTH message is the only way to authenticate); silently ignoring
@@ -1073,7 +1102,8 @@ impl Config {
             );
         }
         // Limits must be usable (zero would disable core functionality or
-        // make the queue fail fast on the first request).
+        // make the queue fail fast on the first request, or — for content
+        // and tag caps — reject every EVENT and make the relay look dead).
         let l = &self.limits;
         let nonzero = [
             ("limits.max_connections", l.max_connections),
@@ -1085,9 +1115,14 @@ impl Config {
             ("limits.max_neg_items", l.max_neg_items),
             ("limits.max_sub_bytes", l.max_sub_bytes),
             ("limits.max_api_concurrent", l.max_api_concurrent),
+            ("limits.max_api_queue_msgs", l.max_api_queue_msgs),
             ("limits.live_buffer", l.live_buffer),
             ("limits.live_batch_size", l.live_batch_size),
             ("limits.max_out_queue_bytes", l.max_out_queue_bytes),
+            ("limits.max_content_bytes", l.max_content_bytes),
+            ("limits.max_tags", l.max_tags),
+            ("limits.max_tag_value_bytes", l.max_tag_value_bytes),
+            ("limits.max_sub_id_len", l.max_sub_id_len),
         ];
         let db_nonzero = [
             ("database.db_buffer_size", self.database.db_buffer_size),
@@ -1162,17 +1197,62 @@ impl Config {
             ));
         }
 
-        // LiveKit configuration must be complete when enabled.
+        // LiveKit configuration must be complete when enabled (fail-closed
+        // at runtime: capability is unadvertised and minting 404s — but a
+        // typo'd URL would silently disable AV, so warn loudly here).
         if !self.relay.livekit_url.trim().is_empty()
             && (self.relay.livekit_api_key.trim().is_empty()
                 || self.relay.livekit_api_secret.trim().is_empty())
         {
             log::warn!(
                 "relay.livekit_url is set but livekit_api_key/livekit_api_secret are empty: \
-                 tokens will be signed with an empty secret and rejected by LiveKit"
+                 LiveKit rooms are disabled (capability unadvertised, tokens 404)"
+            );
+        }
+        if !self.relay.livekit_url.trim().is_empty()
+            && !self.relay.livekit_url.starts_with("wss://")
+        {
+            log::warn!(
+                "relay.livekit_url should be a wss:// URL (got {:?}): clients expect a \
+                 LiveKit WebSocket endpoint",
+                self.relay.livekit_url
             );
         }
 
+        // Absurdly large bounds are almost always typos, and they
+        // silently disable the memory protection the bound exists for
+        // (e.g. a gigabyte `max_ws_message_bytes` lets one client pin a
+        // gigabyte). Warn instead of rejecting: an operator may still mean
+        // it, but then it is a conscious choice in the log.
+        let l = &self.limits;
+        for (name, value, sane) in [
+            (
+                "limits.max_ws_message_bytes",
+                l.max_ws_message_bytes,
+                64 << 20,
+            ),
+            ("limits.max_sub_bytes", l.max_sub_bytes, 64 << 20),
+            ("limits.max_limit", l.max_limit, 100_000),
+            (
+                "blossom.max_upload_bytes",
+                self.blossom.max_upload_bytes,
+                1024 << 20,
+            ),
+        ] {
+            if value > sane {
+                log::warn!(
+                    "config.{name} = {value} is extraordinarily large; memory \
+                     protection is effectively disabled"
+                );
+            }
+        }
+        if l.max_req_response_bytes > 512 << 20 {
+            log::warn!(
+                "config.limits.max_req_response_bytes = {} is extraordinarily large; memory \
+                 protection is effectively disabled",
+                l.max_req_response_bytes
+            );
+        }
         // A very high PoW requirement makes every event infeasible to mine;
         // warn instead of silently disabling writes.
         if self.relay.require_pow >= 64 {
@@ -1224,8 +1304,17 @@ impl Config {
         }
 
         // Blossom file server: the storage backend must be known, and S3
-        // storage needs its credentials. The feature is opt-in via `host`.
+        // storage needs its credentials. The backend value is validated even
+        // while the feature is disabled (`host == ""`) so a latent typo does
+        // not surface only when the operator later enables the host via
+        // SIGHUP (when the reload would be rejected and the old config kept).
         let b = &self.blossom;
+        if !["local", "s3"].contains(&b.storage.as_str()) {
+            return Err(Error::Config(format!(
+                "blossom.storage must be \"local\" or \"s3\", got {:?}",
+                b.storage
+            )));
+        }
         if !b.host.trim().is_empty() {
             if b.max_upload_bytes == 0 {
                 return Err(Error::Config(
@@ -1238,24 +1327,29 @@ impl Config {
                         return Err(Error::Config("blossom.local_path must not be empty".into()));
                     }
                 }
-                "s3" => {
-                    if b.s3_endpoint.trim().is_empty()
-                        || b.s3_bucket.trim().is_empty()
-                        || b.s3_access_key.trim().is_empty()
-                        || b.s3_secret_key.trim().is_empty()
-                    {
-                        return Err(Error::Config(
-                            "blossom.storage = \"s3\" requires s3_endpoint, s3_bucket, \
-                             s3_access_key and s3_secret_key"
-                                .into(),
-                        ));
-                    }
+                "s3" if b.s3_endpoint.trim().is_empty()
+                    || b.s3_bucket.trim().is_empty()
+                    || b.s3_access_key.trim().is_empty()
+                    || b.s3_secret_key.trim().is_empty() =>
+                {
+                    return Err(Error::Config(
+                        "blossom.storage = \"s3\" requires s3_endpoint, s3_bucket, \
+                         s3_access_key and s3_secret_key"
+                            .into(),
+                    ));
                 }
-                other => {
-                    return Err(Error::Config(format!(
-                        "blossom.storage must be \"local\" or \"s3\", got {other:?}"
-                    )));
+                // R2-style endpoints accept an empty region (`auto`), but an
+                // AWS-style endpoint with no region signs an invalid scope
+                // and fails every request at runtime — catch the typo here.
+                "s3" if b.s3_region.trim().is_empty()
+                    && !b.s3_endpoint.contains("r2.cloudflarestorage.com") =>
+                {
+                    return Err(Error::Config(
+                        "blossom.s3_region must not be empty for non-R2 S3 endpoints".into(),
+                    ));
                 }
+                // Unreachable: validated above even when disabled.
+                _ => {}
             }
         }
         Ok(())
@@ -1617,6 +1711,7 @@ fn known_config_keys() -> &'static [(&'static str, &'static [&'static str])] {
                 "max_sub_bytes",
                 "group_late_publish_secs",
                 "max_api_concurrent",
+                "max_api_queue_msgs",
                 "max_api_limit",
                 "max_api_offset",
                 "max_api_search_bytes",
@@ -2551,6 +2646,64 @@ log_max_files = 2
             cfg.validate().is_err(),
             "max_connections must be at least 1"
         );
+        // Content/tag caps of zero would reject every EVENT.
+        for set in [
+            |c: &mut Config| c.limits.max_content_bytes = 0,
+            |c: &mut Config| c.limits.max_tags = 0,
+            |c: &mut Config| c.limits.max_tag_value_bytes = 0,
+            |c: &mut Config| c.limits.max_sub_id_len = 0,
+            |c: &mut Config| c.limits.max_api_queue_msgs = 0,
+        ] {
+            let mut cfg = Config::default();
+            set(&mut cfg);
+            assert!(cfg.validate().is_err(), "zero content/tag caps must fail");
+        }
+    }
+
+    #[test]
+    fn validation_rejects_unknown_blossom_storage_even_when_disabled() {
+        let mut cfg = Config::default();
+        cfg.blossom.host = String::new();
+        cfg.blossom.storage = "bogus".into();
+        assert!(
+            cfg.validate().is_err(),
+            "an unknown storage backend must fail even while disabled"
+        );
+    }
+
+    #[test]
+    fn validation_rejects_empty_s3_region_for_non_r2() {
+        fn s3cfg(endpoint: &str) -> Config {
+            let mut cfg = Config::default();
+            cfg.blossom.host = "media.example.com".into();
+            cfg.blossom.storage = "s3".into();
+            cfg.blossom.s3_endpoint = endpoint.into();
+            cfg.blossom.s3_region = String::new();
+            cfg.blossom.s3_bucket = "b".into();
+            cfg.blossom.s3_access_key = "k".into();
+            cfg.blossom.s3_secret_key = "s".into();
+            cfg
+        }
+        assert!(
+            s3cfg("https://s3.amazonaws.com").validate().is_err(),
+            "an empty region must fail for AWS-style endpoints"
+        );
+        assert!(
+            s3cfg("https://acct.r2.cloudflarestorage.com")
+                .validate()
+                .is_ok(),
+            "an empty region stays allowed for R2 endpoints"
+        );
+    }
+
+    #[test]
+    fn nip29_kinds_cover_the_full_moderation_range() {
+        let kinds = Config::nip_kinds(29).expect("NIP-29 has kinds");
+        for k in [
+            9000u64, 9003, 9004, 9006, 9010, 9011, 9020, 9021, 39000, 39005,
+        ] {
+            assert!(kinds.contains(&k), "NIP-29 kinds must include {k}");
+        }
     }
 
     #[test]

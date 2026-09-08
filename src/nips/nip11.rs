@@ -122,7 +122,7 @@ mod tests {
         let info = info();
         assert!(
             info.get("retention").is_none(),
-            "NIP-11 does not define a retention field; advertising one breaks strict parsers"
+            "retention is omitted to avoid breaking strict parsers (NIP-11 defines it as optional)"
         );
     }
 

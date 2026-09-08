@@ -167,13 +167,23 @@ impl Conn {
         }
     }
 
-    /// Queues a completion-critical control message (EOSE / CLOSED) without
-    /// any outgoing cap: a dropped EOSE would leave the client hanging on
-    /// a completed subscription — worse than a dropped live event. The
-    /// messages are tiny and their volume is bounded by the REQ/CLOSE
-    /// rate, so bypassing the caps does not meaningfully weaken the
-    /// queue's memory bound.
+    /// Queues a completion-critical control message (EOSE / CLOSED /
+    /// NEG-MSG / NEG-ERR) bypassing the byte cap: a dropped EOSE would
+    /// leave the client hanging on a completed subscription, and a dropped
+    /// NEG-MSG/NEG-ERR would hang a sync — worse than a dropped live event.
+    /// The messages are tiny except for NEG-MSG id lists (bounded by
+    /// `max_neg_items` and `max_req_response_bytes`, plus the NEG
+    /// backpressure guard). As a last-resort OOM guard the queue length is
+    /// still capped at twice `OUT_QUEUE_LIMIT`: legitimate clients drain
+    /// far faster than control traffic arrives, so reaching it means an
+    /// attacker flooding inbound frames on a stalled socket — drops are
+    /// counted like any other queue drop.
     pub(crate) fn send_control(&mut self, value: Value) {
+        if self.outgoing.len() >= OUT_QUEUE_LIMIT * 2 {
+            self.dropped += 1;
+            self.relay.stats.bump(&self.relay.stats.buffers_dropped, 1);
+            return;
+        }
         if let Ok(text) = serde_json::to_string(&value) {
             let size = text.len();
             self.out_bytes += size;
@@ -273,7 +283,7 @@ impl Conn {
                 self.pending_reqs.clear();
                 for id in ids {
                     self.send_closed(&id, "restricted: you are not allowed to subscribe");
-                    self.remove_subscription(&id);
+                    self.remove_req_subscription(&id);
                 }
                 break;
             }
@@ -343,7 +353,8 @@ impl Conn {
                 ]));
                 // The CLOSED ends the subscription: release it exactly
                 // like a client CLOSE (filter bytes, live slot, stats).
-                self.remove_subscription(&sub_id);
+                // REQ namespace only (NIP-77 separate namespace).
+                self.remove_req_subscription(&sub_id);
                 self.pending_reqs.pop_front();
                 continue;
             }
@@ -485,6 +496,19 @@ pub async fn handle_connection(
     peer_ip: std::net::IpAddr,
     path: String,
 ) {
+    // Read the caps before accounting: everything between `fetch_add`
+    // and the guard below is synchronous (`try_register_connection` takes
+    // no lock across an await), so a panic cannot strand the slot across
+    // an await point before the guard owns it.
+    let (max_connections, max_per_ip) = {
+        let cfg = relay.config.read().await;
+        (
+            cfg.limits.max_connections,
+            cfg.limits.max_connections_per_ip,
+        )
+    };
+    // Account the connection with add-then-check so the cap stays exact
+    // under concurrency.
     let active = relay
         .stats
         .connections_active
@@ -492,10 +516,10 @@ pub async fn handle_connection(
         + 1;
     relay.stats.bump(&relay.stats.connections_total, 1);
 
-    let max_connections = relay.config.read().await.limits.max_connections;
-    let max_per_ip = relay.config.read().await.limits.max_connections_per_ip;
     // `active` is the post-increment count (this connection included), so
-    // `>` accepts exactly `max_connections` connections.
+    // `>` accepts exactly `max_connections` connections. Short-circuit
+    // order matters: when the global cap already refuses, the per-IP slot
+    // is never taken, so only the global counter is rolled back.
     if active > max_connections as u64 || !relay.try_register_connection(&peer_ip, max_per_ip) {
         relay
             .stats
@@ -514,6 +538,18 @@ pub async fn handle_connection(
         peer_ip,
         conn_id,
         subscriptions_held: Arc::clone(&subscriptions_held),
+    };
+
+    let challenge = match nip42::generate_challenge() {
+        // RNG failure must fail the connection closed: a constant fallback
+        // challenge would let one AUTH event replay across connections.
+        // `_guard` releases the slot on return.
+        None => {
+            log::error!("RNG failure generating AUTH challenge; refusing connection");
+            let _ = socket.close().await;
+            return;
+        }
+        Some(challenge) => challenge,
     };
 
     let (mut sender, mut receiver) = socket.split();
@@ -566,7 +602,6 @@ pub async fn handle_connection(
         interval
     });
 
-    let challenge = nip42::generate_challenge();
     // Blocked-IP version captured at connect: when the NIP-86 admin
     // blocks (or unblocks) an IP, every connection re-checks the list and
     // closes if its own source IP became blocked.
@@ -1405,6 +1440,61 @@ mod tests {
             assert!(
                 ids.contains(&protected.id),
                 "authed client sees protected events"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn auth_disabled_still_answers_ok() {
+        // NIP-42: client AUTH MUST be answered with OK even when the relay
+        // has NIP-42 disabled.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            {
+                let mut w = conn.relay.config.write().await;
+                w.relay.disabled_nips.push(42);
+            }
+            let now = unix_now();
+            let auth = signed_auth(conn.relay.secp(), "test-challenge", now);
+            conn.handle_auth(&[serde_json::to_value(&auth).unwrap()])
+                .await;
+            let msgs = outgoing_json(&conn);
+            assert!(
+                msgs.iter()
+                    .any(|m| m[0] == "OK" && m[1] == auth.id && m[2] == false),
+                "disabled AUTH must still answer OK false: {msgs:?}"
+            );
+            assert!(!conn.is_authed(), "disabled AUTH must not authenticate");
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn close_and_neg_close_use_separate_namespaces() {
+        // NIP-77: CLOSE releases only REQ, NEG-CLOSE only NEG.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            conn.handle_req(&[json!("s"), json!({"kinds": [1]})]).await;
+            conn.handle_neg_open(&[json!("s"), json!({"kinds": [1]}), json!("61000000")])
+                .await;
+            assert!(conn.subs.contains_key("s"));
+            assert!(conn.neg.contains_key("s"));
+            conn.handle_close(&[json!("s")]);
+            assert!(
+                !conn.subs.contains_key("s"),
+                "CLOSE must release the REQ sub"
+            );
+            assert!(
+                conn.neg.contains_key("s"),
+                "CLOSE must leave NEG state untouched"
+            );
+            conn.handle_neg_close(&[json!("s")]);
+            assert!(
+                !conn.neg.contains_key("s"),
+                "NEG-CLOSE must release the NEG state"
             );
             conn.relay.db.shutdown();
         });
@@ -2638,6 +2728,49 @@ mod tests {
     }
 
     #[test]
+    fn req_failed_replacement_releases_the_old_subscription() {
+        // A failed re-REQ (CLOSED) must release the previous subscription
+        // held under the same id: otherwise the ghost keeps receiving live
+        // events for a client-considered-closed id.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            conn.handle_req(&[json!("ghost"), json!({"kinds": [1]})])
+                .await;
+            assert!(conn.subs.contains_key("ghost"));
+            conn.outgoing.clear();
+
+            let mut args = vec![json!("ghost")];
+            for _ in 0..25 {
+                args.push(json!({"kinds": [1]}));
+            }
+            conn.handle_req(&args).await;
+            assert!(
+                outgoing_json(&conn)
+                    .iter()
+                    .any(|m| m[0] == "CLOSED" && m[1] == "ghost"),
+                "the failed re-REQ must close the id"
+            );
+            assert!(
+                !conn.subs.contains_key("ghost"),
+                "the old subscription must be released"
+            );
+
+            // No live delivery for the closed id.
+            let now = unix_now();
+            let ev = signed_note(conn.relay.secp(), "live", now, vec![]);
+            conn.deliver_live(&ev, &serde_json::to_string(&ev).unwrap_or_default(), None);
+            assert!(
+                !outgoing_json(&conn)
+                    .iter()
+                    .any(|m| m[0] == "EVENT" && m[1] == "ghost"),
+                "a closed id must not receive live events"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
     fn text_ping_is_answered_with_pong() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -2694,6 +2827,34 @@ mod tests {
                     .iter()
                     .any(|m| m[0] == "NOTICE" || m[0] == "OK"),
                 "a malformed event must produce a diagnostic"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn deeply_nested_json_is_rejected_without_abort() {
+        // serde_json enforces a recursion limit (default 128): a deeply
+        // nested frame must fail parsing with a NOTICE, never abort the
+        // process with a stack overflow (which `catch_unwind` could not
+        // contain and which would kill every connection).
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let deep = format!("[\"REQ\",\"s\",{}]", "[".repeat(5000));
+            conn.handle_text(&deep).await;
+            assert!(
+                outgoing_json(&conn).iter().any(|m| m[0] == "NOTICE"),
+                "deep nesting must be rejected with a NOTICE: {:?}",
+                outgoing_json(&conn)
+            );
+            // The connection survives and still serves normal requests.
+            conn.outgoing.clear();
+            conn.handle_req(&[json!("alive"), json!({"kinds": [1]})])
+                .await;
+            assert!(
+                conn.subs.contains_key("alive"),
+                "the connection must stay usable after a hostile frame"
             );
             conn.relay.db.shutdown();
         });
@@ -2875,7 +3036,8 @@ mod tests {
         rt.block_on(async {
             let mut conn = build_conn().await;
 
-            // NIP-77 disabled: a notice, not a NEG-ERR.
+            // NIP-77 disabled: NEG-ERR with the id (NIP-77 error path),
+            // not a NOTICE — the client can correlate the failure.
             {
                 let mut w = conn.relay.config.write().await;
                 w.relay.disabled_nips.push(77);
@@ -2883,10 +3045,19 @@ mod tests {
             conn.handle_neg_open(&[json!("s"), json!({}), json!("61000000")])
                 .await;
             assert!(
+                outgoing_json(&conn).iter().any(|m| m[0] == "NEG-ERR"
+                    && m[1] == "s"
+                    && m[2].as_str().unwrap().contains("not enabled")),
+                "a disabled NIP-77 must yield a NEG-ERR"
+            );
+            conn.outgoing.clear();
+            // Without an id there is nothing to correlate: NOTICE.
+            conn.handle_neg_open(&[]).await;
+            assert!(
                 outgoing_json(&conn)
                     .iter()
                     .any(|m| m[0] == "NOTICE" && m[1].as_str().unwrap().contains("not enabled")),
-                "a disabled NIP-77 must yield a NOTICE"
+                "a disabled NIP-77 without id must yield a NOTICE"
             );
             conn.outgoing.clear();
             {
@@ -2894,13 +3065,13 @@ mod tests {
                 w.relay.disabled_nips.retain(|n| *n != 77);
             }
 
-            // Malformed NEG-OPEN frames.
+            // Malformed NEG-OPEN frames with an id correlate via NEG-ERR.
             conn.handle_neg_open(&[json!("s"), json!({})]).await;
             assert!(
-                outgoing_json(&conn)
-                    .iter()
-                    .any(|m| m[0] == "NOTICE" && m[1].as_str().unwrap().contains("NEG-OPEN")),
-                "a short NEG-OPEN must yield a NOTICE"
+                outgoing_json(&conn).iter().any(|m| m[0] == "NEG-ERR"
+                    && m[1] == "s"
+                    && m[2].as_str().unwrap().contains("NEG-OPEN")),
+                "a short NEG-OPEN must yield a NEG-ERR"
             );
             conn.outgoing.clear();
             conn.handle_neg_open(&[json!(""), json!({}), json!("61000000")])
@@ -3073,10 +3244,13 @@ mod tests {
             assert_eq!(stored.len(), 5, "all five events are queryable");
 
             // The per-connection item cap is enforced across concurrent
-            // subscriptions (cap = max_neg_items * 2).
+            // subscriptions (cap = max_neg_items * 2). Use a max that covers
+            // the five stored events so each query is complete (`more ==
+            // false`); a smaller max would correctly reject every query as
+            // "too big" instead of syncing a truncated set.
             {
                 let mut w = conn.relay.config.write().await;
-                w.limits.max_neg_items = 3;
+                w.limits.max_neg_items = 5;
             }
             conn.handle_neg_open(&[json!("a"), json!({"kinds": [1]}), json!("61000000")])
                 .await;
@@ -3097,7 +3271,14 @@ mod tests {
             conn.handle_neg_close(&[json!("b")]);
             conn.handle_neg_close(&[json!("c")]);
 
-            // Protected events are withheld from anonymous peers.
+            // Protected events are withheld from anonymous peers. Raise the
+            // item cap so the six stored events (five public + one hidden)
+            // fit: the query is complete and the hidden event is filtered
+            // after the scan.
+            {
+                let mut w = conn.relay.config.write().await;
+                w.limits.max_neg_items = 10;
+            }
             let mut protected = signed_note(conn.relay.secp(), "secret", now, vec![]);
             protected.tags = vec![vec!["-".into()]];
             protected.id = crate::nips::nip01::compute_id(&protected);
@@ -3120,12 +3301,19 @@ mod tests {
                 "a NEG-MSG for an unknown sub must close with NEG-ERR"
             );
             conn.outgoing.clear();
-            // Malformed NEG-MSG frames.
+            // Malformed NEG-MSG frames: with a known id they close via
+            // NEG-ERR (NIP-77), without one via NOTICE.
             conn.handle_neg_msg(&[json!("s")]).await;
             assert!(
-                outgoing_json(&conn).iter().any(|m| m[0] == "NOTICE"),
-                "a short NEG-MSG must yield a NOTICE: {:?}",
+                outgoing_json(&conn).iter().any(|m| m[0] == "NEG-ERR"
+                    && m[1] == "s"
+                    && m[2].as_str().unwrap().contains("NEG-MSG")),
+                "a short NEG-MSG must yield a NEG-ERR: {:?}",
                 outgoing_json(&conn)
+            );
+            assert!(
+                !conn.neg.contains_key("s"),
+                "a short NEG-MSG must close the subscription"
             );
             conn.outgoing.clear();
             conn.handle_neg_msg(&[json!(true), json!("61000000")]).await;
@@ -3136,10 +3324,28 @@ mod tests {
             );
             conn.outgoing.clear();
             conn.handle_neg_msg(&[json!("s"), json!(42)]).await;
-            assert!(outgoing_json(&conn).iter().any(|m| m[0] == "NOTICE"));
+            assert!(
+                outgoing_json(&conn).iter().any(|m| m[0] == "NEG-ERR"
+                    && m[1] == "s"
+                    && m[2].as_str().unwrap().contains("hex")),
+                "a non-string NEG-MSG message must yield a NEG-ERR"
+            );
+            assert!(
+                !conn.neg.contains_key("s"),
+                "a malformed NEG-MSG must close the subscription"
+            );
             conn.outgoing.clear();
             conn.handle_neg_msg(&[json!("s"), json!("zzz")]).await;
-            assert!(outgoing_json(&conn).iter().any(|m| m[0] == "NOTICE"));
+            assert!(
+                outgoing_json(&conn).iter().any(|m| m[0] == "NEG-ERR"
+                    && m[1] == "s"
+                    && m[2].as_str().unwrap().contains("hex")),
+                "a non-hex NEG-MSG message must yield a NEG-ERR"
+            );
+            assert!(
+                !conn.neg.contains_key("s"),
+                "a non-hex NEG-MSG must close the subscription"
+            );
             conn.outgoing.clear();
 
             // Exhausting the round budget closes the subscription.
@@ -3179,11 +3385,64 @@ mod tests {
             assert!(!conn.neg.contains_key("b"), "the sub must be released");
             conn.outgoing.clear();
 
+            // A saturated outgoing queue fails the round with a retryable
+            // NEG-ERR instead of accumulating unbounded NEG bytes.
+            conn.req_response_bytes = 0;
+            conn.handle_neg_open(&[json!("q"), json!({"kinds": [1]}), json!("61000000")])
+                .await;
+            conn.outgoing.clear();
+            conn.out_queue_bytes = 1;
+            conn.out_bytes = 100;
+            conn.handle_neg_msg(&[json!("q"), json!("61000000")]).await;
+            assert!(
+                outgoing_json(&conn).iter().any(|m| m[0] == "NEG-ERR"
+                    && m[1] == "q"
+                    && m[2].as_str().unwrap().contains("overloaded")),
+                "a backpressured NEG-MSG must fail retryably: {:?}",
+                outgoing_json(&conn)
+            );
+            assert!(
+                !conn.neg.contains_key("q"),
+                "a backpressured round must close the subscription"
+            );
+            conn.outgoing.clear();
+            conn.out_queue_bytes = 256 * 1024;
+            conn.out_bytes = 0;
+
             // NEG-CLOSE with a missing id yields a NOTICE.
             conn.handle_neg_close(&[]);
             assert!(outgoing_json(&conn).iter().any(|m| m[0] == "NOTICE"));
             conn.outgoing.clear();
 
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn neg_syncs_loose_protected_tag_as_public() {
+        // `["-", "extra"]` is public like the REQ path: only the exact
+        // `["-"]` tag is protected. An anonymous NEG-OPEN must include it
+        // in the sync set instead of withholding it.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let now = unix_now();
+            let mut ev = signed_note(conn.relay.secp(), "loose", now, vec![]);
+            ev.tags = vec![vec!["-".into(), "extra".into()]];
+            ev.id = crate::nips::nip01::compute_id(&ev);
+            conn.relay.db.put(ev.clone(), now).await;
+            {
+                let mut w = conn.relay.config.write().await;
+                w.limits.max_neg_items = 10;
+            }
+            conn.handle_neg_open(&[json!("loose"), json!({"kinds": [1]}), json!("61000000")])
+                .await;
+            let state = conn.neg.get("loose").expect("sync must stay open");
+            let want = ev.id_bytes().expect("test event id");
+            assert!(
+                state.items.iter().any(|(_, id)| *id == want),
+                "a [\"-\", \"extra\"] event must be synced to anonymous peers"
+            );
             conn.relay.db.shutdown();
         });
     }
@@ -3502,6 +3761,37 @@ mod tests {
                 contents,
                 vec!["v1", "v2", "v3"],
                 "the hidden event must not consume a limit slot"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn req_visible_truncate_keeps_created_at_ties() {
+        // NIP-01/NIP-67 boundary rule: events sharing the boundary
+        // `created_at` belong to the same page — the visible truncation
+        // must extend ties instead of cutting them in half.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let now = unix_now();
+            let v1 = signed_note(conn.relay.secp(), "v1", now, vec![]);
+            let v2 = signed_note(conn.relay.secp(), "v2", now, vec![]);
+            let v3 = signed_note(conn.relay.secp(), "v3", now - 1, vec![]);
+            for e in [&v1, &v2, &v3] {
+                conn.relay.db.put(e.clone(), now).await;
+            }
+            conn.handle_req(&[json!("sub"), json!({"kinds": [1], "limit": 1})])
+                .await;
+            conn.pump_pending_reqs();
+            let contents: Vec<String> = outgoing_json(&conn)
+                .iter()
+                .filter(|m| m[0] == "EVENT")
+                .map(|m| m[2]["content"].as_str().unwrap().to_string())
+                .collect();
+            assert!(
+                contents.contains(&"v1".to_string()) && contents.contains(&"v2".to_string()),
+                "same-timestamp ties must stay together: {contents:?}"
             );
             conn.relay.db.shutdown();
         });
@@ -4022,6 +4312,27 @@ mod tests {
             )
             .await;
             assert!(received.is_ok(), "live delivery resumes after CLOSE + REQ");
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn send_control_is_bounded_as_last_resort() {
+        // `send_control` bypasses the byte cap so completion-critical
+        // messages are never dropped, but the queue length still caps at
+        // twice `OUT_QUEUE_LIMIT`: 8192 tiny EOSEs queued without a drain
+        // means an attacker, not a slow reader.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            for _ in 0..OUT_QUEUE_LIMIT * 2 {
+                conn.send_control(serde_json::json!(["EOSE", "s"]));
+            }
+            assert_eq!(conn.outgoing.len(), OUT_QUEUE_LIMIT * 2);
+            let dropped_before = conn.dropped;
+            conn.send_control(serde_json::json!(["EOSE", "s"]));
+            assert_eq!(conn.outgoing.len(), OUT_QUEUE_LIMIT * 2);
+            assert_eq!(conn.dropped, dropped_before + 1);
             conn.relay.db.shutdown();
         });
     }

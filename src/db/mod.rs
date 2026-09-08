@@ -211,6 +211,26 @@ enum Msg {
         entries: Vec<String>,
         reply: oneshot::Sender<()>,
     },
+    /// Persists the NIP-29 group state snapshot (write-through on every
+    /// group mutation).
+    SaveGroups {
+        snapshot: crate::nips::nip29::GroupsSnapshot,
+        reply: oneshot::Sender<()>,
+    },
+    /// Loads the persisted NIP-29 group state snapshot.
+    LoadGroups {
+        reply: oneshot::Sender<Option<crate::nips::nip29::GroupsSnapshot>>,
+    },
+    /// Persists the NIP-43 role state snapshot (write-through on every
+    /// role mutation).
+    SaveRoles {
+        snapshot: crate::nips::nip43::RolesSnapshot,
+        reply: oneshot::Sender<()>,
+    },
+    /// Loads the persisted NIP-43 role state snapshot.
+    LoadRoles {
+        reply: oneshot::Sender<Option<crate::nips::nip43::RolesSnapshot>>,
+    },
     /// Adds an owner to a Blossom blob's persisted metadata (atomic);
     /// the reply carries whether the commit succeeded.
     BlossomAddOwner {
@@ -232,9 +252,11 @@ enum Msg {
         pubkey: String,
         reply: oneshot::Sender<bool>,
     },
-    /// Lists the blob hashes uploaded by a pubkey (reverse index).
+    /// Lists the blob hashes uploaded by a pubkey (reverse index), capped
+    /// at `limit` entries.
     BlossomList {
         pubkey: String,
+        limit: usize,
         reply: oneshot::Sender<Vec<String>>,
     },
     /// Adds many Blossom mappings in one transaction (auto-migration);
@@ -292,13 +314,18 @@ pub struct DbClient {
     /// Events inside the queued `PutBatch`/`Put` messages (the dominant
     /// memory of the queue).
     pending_events: Arc<std::sync::atomic::AtomicUsize>,
+    /// Read-only messages queued but not yet drained by the reader threads.
+    /// Counted separately from the writer queue so a REQ flood cannot
+    /// fail-fast the EVENT writes (and vice versa).
+    pending_reads: Arc<std::sync::atomic::AtomicUsize>,
     /// Queued-but-unprocessed REST API queries, counted separately so an API
     /// flood fails fast without tripping the WebSocket-side caps.
     api_pending: Arc<std::sync::atomic::AtomicUsize>,
-    /// Caps for the counters above.
+    /// Caps for the counters above (`max_api_pending` is shared so the
+    /// SIGHUP reload can adjust it live).
     max_pending_msgs: usize,
     max_pending_events: usize,
-    max_api_pending: usize,
+    max_api_pending: Arc<std::sync::atomic::AtomicUsize>,
     /// How many threads serve the WebSocket reader queue (from
     /// `database.reader_threads`); used to fan the shutdown messages out.
     reader_threads: usize,
@@ -340,6 +367,7 @@ impl DbClient {
             timeout_secs: threads.timeout_secs,
             pending_msgs: threads.pending_msgs,
             pending_events: threads.pending_events,
+            pending_reads: threads.pending_reads,
             api_pending: threads.api_pending,
             max_pending_msgs: threads.max_pending_msgs,
             max_pending_events: threads.max_pending_events,
@@ -351,6 +379,13 @@ impl DbClient {
     pub fn set_expiry_enabled(&self, enabled: bool) {
         self.expiry
             .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Adjusts the API reader queue cap live (SIGHUP reload). Values below
+    /// 1 are clamped to 1 so the API reader can always drain.
+    pub fn set_max_api_pending(&self, max: usize) {
+        self.max_api_pending
+            .store(max.max(1), std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Sends a read-only request to the dedicated reader thread. The
@@ -373,12 +408,12 @@ impl DbClient {
     ) -> R {
         let (tx, rx) = oneshot::channel();
         let msg = make(tx);
-        self.pending_msgs
+        self.pending_reads
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if self.read_tx.send(msg).is_err() {
             // The reader thread's receiver is gone: the relay is shutting
             // down or the thread died. There is no state to load.
-            self.pending_msgs
+            self.pending_reads
                 .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             log::error!("database reader is gone; cannot load persisted state");
             return R::default();
@@ -399,12 +434,14 @@ impl DbClient {
     /// Read-only request that reports failure (`None`) instead of
     /// degrading to a default value: used by the SIGHUP reloads, where
     /// an empty result would overwrite the live deny/allow lists with
-    /// nothing (fail-open).
+    /// nothing (fail-open). Like [`Self::request_read`], reader-queue
+    /// accounting is used (never the writer counters), so a write backlog
+    /// must not fail-fast the reads.
     async fn request_read_result<R: Default>(
         &self,
         make: impl FnOnce(oneshot::Sender<R>) -> Msg,
     ) -> Option<R> {
-        let rx = self.send_request(make, &self.read_tx)?;
+        let rx = self.send_request_read(make, &self.read_tx)?;
         if self.timeout_secs == 0 {
             return rx.await.ok();
         }
@@ -412,6 +449,36 @@ impl DbClient {
             .await
             .ok()
             .and_then(|r| r.ok())
+    }
+
+    /// Reader-queue variant of [`Self::send_request`]: reserves in
+    /// `pending_reads` (add-then-check with rollback) and reports
+    /// fail-fast as `None`. The reader thread releases the slot on
+    /// completion, so this path must not decrement it.
+    fn send_request_read<R>(
+        &self,
+        make: impl FnOnce(oneshot::Sender<R>) -> Msg,
+        channel: &mpsc::UnboundedSender<Msg>,
+    ) -> Option<oneshot::Receiver<R>> {
+        let (tx, rx) = oneshot::channel();
+        let reads = self
+            .pending_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(1);
+        if reads > self.max_pending_msgs {
+            self.pending_reads
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            self.errors
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return None;
+        }
+        let msg = make(tx);
+        if channel.send(msg).is_err() {
+            self.pending_reads
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            return None;
+        }
+        Some(rx)
     }
 
     /// Sends a write request to the writer thread and waits for the reply
@@ -441,51 +508,97 @@ impl DbClient {
     }
 
     /// Like [`Self::send_request`], but with `check_writer` the fail-fast
-    /// gate also inspects the writer-queue counters (`pending_msgs` /
+    /// gate inspects only the writer-queue counters (`pending_msgs` /
     /// `pending_events`). Read-only requests on the dedicated reader
-    /// channel pass `false`: the whole point of the separate reader threads
-    /// is that reads keep working while the writer is stalled, so a
-    /// write-backlog must not fail-fast the reads.
+    /// channel pass `false`: they are counted in `pending_reads` (never in
+    /// the writer counters), so a read flood cannot fail-fast the writes
+    /// and a write backlog must not fail-fast the reads. Accounting uses
+    /// add-then-check with rollback so concurrent bursts cannot overshoot
+    /// the caps without bound (check-then-add had a TOCTOU window).
     fn send_request_checked<R>(
         &self,
         make: impl FnOnce(oneshot::Sender<R>) -> Msg,
         channel: &mpsc::UnboundedSender<Msg>,
         check_writer: bool,
     ) -> Option<oneshot::Receiver<R>> {
-        let writer_stalled = check_writer
-            && (self.pending_msgs.load(std::sync::atomic::Ordering::Relaxed)
-                >= self.max_pending_msgs
-                || self
-                    .pending_events
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                    >= self.max_pending_events);
-        if writer_stalled {
-            // Surface the overload in the stats (db_errors).
-            self.errors
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return None;
-        }
         let (tx, rx) = oneshot::channel();
         let msg = make(tx);
-        self.pending_msgs
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if let Msg::PutBatch { events, .. } = &msg {
-            self.pending_events
-                .fetch_add(events.len(), std::sync::atomic::Ordering::Relaxed);
-        } else if let Msg::Put { .. } = &msg {
-            self.pending_events
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let is_write = matches!(msg, Msg::Put { .. } | Msg::PutBatch { .. });
+        let write_events = match &msg {
+            Msg::PutBatch { events, .. } => events.len(),
+            Msg::Put { .. } => 1,
+            _ => 0,
+        };
+        if check_writer || is_write {
+            // Writer path (and any gated path): reserve first, then enforce.
+            let msgs = self
+                .pending_msgs
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                .saturating_add(1);
+            let events = if write_events > 0 {
+                self.pending_events
+                    .fetch_add(write_events, std::sync::atomic::Ordering::Relaxed)
+                    .saturating_add(write_events)
+            } else {
+                self.pending_events
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            };
+            if msgs > self.max_pending_msgs || events > self.max_pending_events {
+                self.pending_msgs
+                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                if write_events > 0 {
+                    self.pending_events
+                        .fetch_sub(write_events, std::sync::atomic::Ordering::Relaxed);
+                }
+                self.errors
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return None;
+            }
+        } else {
+            // Reader path: separate counter with the same message cap so a
+            // REQ flood fails fast instead of growing unbounded and (via the
+            // old shared counter) blocking the writes.
+            let reads = self
+                .pending_reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                .saturating_add(1);
+            if reads > self.max_pending_msgs {
+                self.pending_reads
+                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                self.errors
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return None;
+            }
         }
         if let Err(err) = channel.send(msg) {
             let msg = err.0;
-            self.pending_msgs
-                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-            if let Msg::PutBatch { events, .. } = &msg {
-                self.pending_events
-                    .fetch_sub(events.len(), std::sync::atomic::Ordering::Relaxed);
-            } else if let Msg::Put { .. } = &msg {
-                self.pending_events
-                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            // Release the same counter that was reserved above: `Put` /
+            // `PutBatch` always reserve the writer counters, while every
+            // other message reserves whichever counter its channel path
+            // used (writer counters when gated, reader counters otherwise).
+            // Mismatching them here would leak one counter and underflow
+            // the other into a permanent fail-fast.
+            match &msg {
+                Msg::PutBatch { events, .. } => {
+                    self.pending_msgs
+                        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    self.pending_events
+                        .fetch_sub(events.len(), std::sync::atomic::Ordering::Relaxed);
+                }
+                Msg::Put { .. } => {
+                    self.pending_msgs
+                        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    self.pending_events
+                        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                _ if check_writer => {
+                    self.pending_msgs
+                        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                _ => {
+                    self.pending_reads
+                        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                }
             }
             return None;
         }
@@ -592,7 +705,8 @@ impl DbClient {
     /// `/api/v1` traffic never blocks WebSocket queries. Applies its own
     /// queue cap: when the API reader's queue is deep, the request fails
     /// fast with an empty result instead of piling up behind WebSocket
-    /// work.
+    /// work. Admission reserves first (add-then-check with rollback) so
+    /// concurrent bursts cannot overshoot the cap without bound.
     pub async fn api_query(
         &self,
         filters: Vec<Filter>,
@@ -600,14 +714,10 @@ impl DbClient {
         now: u64,
         ascending: bool,
     ) -> (Vec<Event>, bool) {
-        if self.api_pending.load(std::sync::atomic::Ordering::Relaxed) >= self.max_api_pending {
-            self.errors
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if !self.api_reserve() {
             return (Vec::new(), false);
         }
         let (tx, rx) = oneshot::channel();
-        self.api_pending
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let msg = Msg::Query {
             filters,
             limit,
@@ -647,14 +757,10 @@ impl DbClient {
         limit: usize,
         now: u64,
     ) -> (Vec<Event>, bool) {
-        if self.api_pending.load(std::sync::atomic::Ordering::Relaxed) >= self.max_api_pending {
-            self.errors
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if !self.api_reserve() {
             return (Vec::new(), false);
         }
         let (tx, rx) = oneshot::channel();
-        self.api_pending
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let msg = Msg::Count {
             filters,
             limit,
@@ -779,16 +885,66 @@ impl DbClient {
         .await
     }
 
-    /// Relay-wide per-kind event counts (REST API).
+    /// Relay-wide per-kind event counts (REST API). Served by the dedicated
+    /// API reader thread so heavy aggregate walks never stall WebSocket
+    /// REQ/COUNT/NEG queries on the shared reader.
     pub async fn kind_counts(&self, max_keys: usize) -> (Vec<(u64, u64)>, bool) {
-        self.request_read(|reply| Msg::KindCounts { max_keys, reply })
+        self.api_request(|reply| Msg::KindCounts { max_keys, reply })
             .await
     }
 
-    /// Relay-wide per-author event counts (REST API).
+    /// Relay-wide per-author event counts (REST API). Same isolation as
+    /// [`Self::kind_counts`].
     pub async fn author_counts(&self, max_keys: usize) -> (AuthorCounts, bool) {
-        self.request_read(|reply| Msg::AuthorCounts { max_keys, reply })
+        self.api_request(|reply| Msg::AuthorCounts { max_keys, reply })
             .await
+    }
+
+    /// Generic REST-API reader request with the API queue cap and timeout.
+    /// Admission uses [`Self::api_reserve`] (add-then-check with rollback).
+    async fn api_request<R: Default>(&self, make: impl FnOnce(oneshot::Sender<R>) -> Msg) -> R {
+        if !self.api_reserve() {
+            return R::default();
+        }
+        let (tx, rx) = oneshot::channel();
+        let msg = make(tx);
+        if self.api_read_tx.send(msg).is_err() {
+            self.api_pending
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            return R::default();
+        }
+        // The API reader thread decrements `api_pending` on completion
+        // (including its panic path), so this path must not decrement again.
+        if self.timeout_secs == 0 {
+            rx.await.unwrap_or_default()
+        } else {
+            tokio::time::timeout(std::time::Duration::from_secs(self.timeout_secs), rx)
+                .await
+                .map(|r| r.unwrap_or_default())
+                .unwrap_or_default()
+        }
+    }
+
+    /// Reserves one API-reader queue slot (add-then-check with rollback).
+    /// Returns `false` when the queue is deep (fail-fast, counted in stats).
+    /// The API reader thread releases the slot on completion.
+    fn api_reserve(&self) -> bool {
+        let pending = self
+            .api_pending
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(1);
+        if pending
+            > self
+                .max_api_pending
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            self.api_pending
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            self.errors
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return false;
+        }
+        true
     }
 
     pub async fn apply_deletion(
@@ -916,6 +1072,41 @@ impl DbClient {
             .await;
     }
 
+    /// Persists the NIP-29 group state snapshot (write-through: call after
+    /// every group mutation). Fire-and-forget like the other saves: the
+    /// writer always replies, and a failed commit only logs (the next
+    /// mutation retries the full snapshot).
+    pub async fn save_groups(&self, snapshot: crate::nips::nip29::GroupsSnapshot) {
+        let _ = self
+            .request_write(|reply| Msg::SaveGroups { snapshot, reply })
+            .await;
+    }
+
+    /// Loads the persisted NIP-29 group state snapshot at startup.
+    /// Returns `None` when no snapshot was ever written (pre-persistence
+    /// database) or the load failed: the caller runs the replay migration
+    /// instead of starting empty (fail-closed).
+    pub async fn load_groups(&self) -> Option<crate::nips::nip29::GroupsSnapshot> {
+        self.request_read_blocking(|reply| Msg::LoadGroups { reply })
+            .await
+    }
+
+    /// Persists the NIP-43 role state snapshot (write-through: call after
+    /// every role mutation). Same fire-and-forget semantics as
+    /// [`Self::save_groups`].
+    pub async fn save_roles(&self, snapshot: crate::nips::nip43::RolesSnapshot) {
+        let _ = self
+            .request_write(|reply| Msg::SaveRoles { snapshot, reply })
+            .await;
+    }
+
+    /// Loads the persisted NIP-43 role state snapshot at startup (see
+    /// [`Self::load_groups`]).
+    pub async fn load_roles(&self) -> Option<crate::nips::nip43::RolesSnapshot> {
+        self.request_read_blocking(|reply| Msg::LoadRoles { reply })
+            .await
+    }
+
     /// Loads the persisted access control lists, if any.
     /// Loads the persisted access control at startup: waits for the reader
     /// (no timeout, no fail-fast) so a slow database cannot silently
@@ -1000,10 +1191,12 @@ impl DbClient {
         .await
     }
 
-    /// Lists the blob hashes uploaded by a pubkey.
-    pub async fn blossom_list(&self, pubkey: &str) -> Vec<String> {
+    /// Lists the blob hashes uploaded by a pubkey, capped at `limit`
+    /// entries (see `Store::list_blossom_shas`).
+    pub async fn blossom_list(&self, pubkey: &str, limit: usize) -> Vec<String> {
         self.request_read(|reply| Msg::BlossomList {
             pubkey: pubkey.to_string(),
+            limit,
             reply,
         })
         .await

@@ -16,6 +16,16 @@ use crate::nips::nip09;
 /// so entries the caller leaves in place cannot loop forever.
 const REMOVAL_CHUNK: usize = 4096;
 
+/// Compares two hex pubkeys/ids on decoded bytes (case-insensitive like
+/// the scan's hex decode), falling back to exact match when either side
+/// is not valid hex.
+fn pubkeys_equal(a: &str, b: &str) -> bool {
+    match (hex::decode(a), hex::decode(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
+}
+
 impl Store {
     /// Applies a deletion request.
     ///
@@ -56,12 +66,14 @@ impl Store {
             // NIP-09: only events authored by the request's pubkey are
             // deleted, and deletion requests cannot be deleted. NIP-26:
             // the delegator may also delete events published by a
-            // delegatee on their behalf.
+            // delegatee on their behalf. Compared on decoded bytes
+            // (case-insensitive like the scan), so an uppercase hex
+            // request still matches its lowercase targets.
             if event.kind == nip09::DELETION_KIND {
                 continue;
             }
             if let Some(pubkey) = request_pubkey
-                && event.pubkey != pubkey
+                && !pubkeys_equal(&event.pubkey, pubkey)
                 && !delegated_by(&event, pubkey)
             {
                 continue;
@@ -86,10 +98,16 @@ impl Store {
         // addressable events published up to the deletion request.
         for address in addresses {
             // Only the author of the addressable event may delete it.
-            if let Some(pubkey) = request_pubkey
-                && address.pubkey != pubkey
-            {
-                continue;
+            // Compare decoded bytes (case-insensitive like the scan's hex
+            // decode) so an uppercase `a` value still matches the author.
+            if let Some(pubkey) = request_pubkey {
+                let same = hex::decode(&address.pubkey)
+                    .ok()
+                    .zip(hex::decode(pubkey).ok())
+                    .is_some_and(|(a, b)| a == b);
+                if !same {
+                    continue;
+                }
             }
             let Ok(pubkey) = hex::decode(&address.pubkey) else {
                 continue;
@@ -173,6 +191,7 @@ impl Store {
     }
 
     pub(crate) fn apply_unban(&self, id: &[u8]) -> Result<bool> {
+        self.disk_full_error()?;
         let mut wtxn = self.env.write_txn()?;
         let removed = self.banned.delete(&mut wtxn, id)?;
         wtxn.commit()?;
@@ -223,18 +242,31 @@ impl Store {
     /// order (pubkey-major), examining at most `max_keys` entries. `more`
     /// is true when the walk was cut short. Returns `(pubkey, count)` pairs
     /// in ascending pubkey order.
+    ///
+    /// Each event counts once: NIP-26 delegated events carry a second index
+    /// entry under the delegator, which is skipped when the event id was
+    /// already counted (attributed to the first pubkey in walk order).
     pub(crate) fn author_counts(&self, max_keys: usize) -> Result<(crate::db::AuthorCounts, bool)> {
         let rtxn = self.env.read_txn()?;
         let mut counts: crate::db::AuthorCounts = Vec::new();
+        let mut seen: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
         let mut examined = 0usize;
         let mut more = false;
         for item in self.by_pubkey.iter(&rtxn)? {
             let (key, _) = item?;
             if key.len() >= ID_LEN {
                 let pubkey = key[..ID_LEN].to_vec();
-                match counts.last_mut() {
-                    Some((p, c)) if *p == pubkey => *c += 1,
-                    _ => counts.push((pubkey, 1)),
+                let id: Option<[u8; 32]> = key
+                    .get(ID_LEN + CREATED_LEN..ID_LEN + CREATED_LEN + ID_LEN)
+                    .and_then(|s| s.try_into().ok());
+                // Skip the NIP-26 delegator duplicate of an already-counted
+                // event (same id under a second pubkey).
+                let duplicate = id.is_some_and(|id| !seen.insert(id));
+                if !duplicate {
+                    match counts.last_mut() {
+                        Some((p, c)) if *p == pubkey => *c += 1,
+                        _ => counts.push((pubkey, 1)),
+                    }
                 }
             }
             examined += 1;
@@ -293,7 +325,9 @@ impl Store {
                 // must survive a delegator's request to vanish. Their
                 // delegator-side index entry is dropped nevertheless, so the
                 // vanished identity's feed is not revived by the delegation.
-                if event.pubkey != pubkey_hex {
+                // Compared case-insensitively: history stored with an
+                // uppercase author hex must vanish like lowercase history.
+                if !pubkeys_equal(&event.pubkey, &pubkey_hex) {
                     if crate::nips::nip26::delegation(&event).is_some() {
                         self.by_pubkey.delete(&mut wtxn, &key)?;
                     }
@@ -306,39 +340,44 @@ impl Store {
 
         // NIP-59 gift wraps addressed to the vanished pubkey. The by_tag
         // index stores the tag value verbatim (the 64-char hex string), not
-        // the decoded bytes.
-        let pubkey_hex = hex::encode(pubkey).into_bytes();
-        let start = tag_key(b'p', &pubkey_hex, 0, &[0u8; ID_LEN]);
-        let end = tag_key(b'p', &pubkey_hex, u64::MAX, &[0xffu8; ID_LEN]);
-        let mut last_key: Option<Vec<u8>> = None;
-        loop {
-            let lower = match &last_key {
-                Some(k) => std::ops::Bound::Excluded(k.as_slice()),
-                None => std::ops::Bound::Included(start.as_slice()),
-            };
-            let entries: Vec<(Vec<u8>, Vec<u8>)> = self
-                .by_tag
-                .range(&wtxn, &(lower, std::ops::Bound::Excluded(end.as_slice())))?
-                .filter_map(|item| {
-                    item.ok()
-                        .map(|(k, _)| (k.to_vec(), k[k.len() - ID_LEN..].to_vec()))
-                })
-                .take(REMOVAL_CHUNK)
-                .collect();
-            if entries.is_empty() {
-                break;
-            }
-            last_key = Some(entries.last().unwrap().0.clone());
-            for (_, id) in entries {
-                let Some(raw) = self.events.get(&wtxn, &id)? else {
-                    continue;
+        // the decoded bytes — so both the lowercase and the uppercase form
+        // are walked, mirroring the case-insensitive author match above.
+        for pubkey_hex in [
+            hex::encode(pubkey).into_bytes(),
+            hex::encode_upper(pubkey).into_bytes(),
+        ] {
+            let start = tag_key(b'p', &pubkey_hex, 0, &[0u8; ID_LEN]);
+            let end = tag_key(b'p', &pubkey_hex, u64::MAX, &[0xffu8; ID_LEN]);
+            let mut last_key: Option<Vec<u8>> = None;
+            loop {
+                let lower = match &last_key {
+                    Some(k) => std::ops::Bound::Excluded(k.as_slice()),
+                    None => std::ops::Bound::Included(start.as_slice()),
                 };
-                let Ok(event) = serde_json::from_slice::<Event>(raw) else {
-                    continue;
-                };
-                if event.kind == crate::nips::nip62::GIFT_WRAP_KIND {
-                    self.remove_event(&mut wtxn, &id)?;
-                    removed += 1;
+                let entries: Vec<(Vec<u8>, Vec<u8>)> = self
+                    .by_tag
+                    .range(&wtxn, &(lower, std::ops::Bound::Excluded(end.as_slice())))?
+                    .filter_map(|item| {
+                        item.ok()
+                            .map(|(k, _)| (k.to_vec(), k[k.len() - ID_LEN..].to_vec()))
+                    })
+                    .take(REMOVAL_CHUNK)
+                    .collect();
+                if entries.is_empty() {
+                    break;
+                }
+                last_key = Some(entries.last().unwrap().0.clone());
+                for (_, id) in entries {
+                    let Some(raw) = self.events.get(&wtxn, &id)? else {
+                        continue;
+                    };
+                    let Ok(event) = serde_json::from_slice::<Event>(raw) else {
+                        continue;
+                    };
+                    if event.kind == crate::nips::nip62::GIFT_WRAP_KIND {
+                        self.remove_event(&mut wtxn, &id)?;
+                        removed += 1;
+                    }
                 }
             }
         }
@@ -352,42 +391,47 @@ impl Store {
     /// signed by random keys, so they cannot be deleted by their recipient
     /// through the normal deletion flow.
     pub(crate) fn delete_gift_wraps_to(&self, pubkey: &[u8]) -> Result<usize> {
+        self.disk_full_error()?;
         let mut wtxn = self.env.write_txn()?;
         // The by_tag index stores the tag value verbatim (the 64-char hex
-        // string), not the decoded bytes.
-        let pubkey_hex = hex::encode(pubkey).into_bytes();
-        let start = tag_key(b'p', &pubkey_hex, 0, &[0u8; ID_LEN]);
-        let end = tag_key(b'p', &pubkey_hex, u64::MAX, &[0xffu8; ID_LEN]);
-        let mut last_key: Option<Vec<u8>> = None;
+        // string), not the decoded bytes — walk both cases like above.
         let mut removed = 0usize;
-        loop {
-            let lower = match &last_key {
-                Some(k) => std::ops::Bound::Excluded(k.as_slice()),
-                None => std::ops::Bound::Included(start.as_slice()),
-            };
-            let entries: Vec<(Vec<u8>, Vec<u8>)> = self
-                .by_tag
-                .range(&wtxn, &(lower, std::ops::Bound::Excluded(end.as_slice())))?
-                .filter_map(|item| {
-                    item.ok()
-                        .map(|(k, _)| (k.to_vec(), k[k.len() - ID_LEN..].to_vec()))
-                })
-                .take(REMOVAL_CHUNK)
-                .collect();
-            if entries.is_empty() {
-                break;
-            }
-            last_key = Some(entries.last().unwrap().0.clone());
-            for (_, id) in entries {
-                let Some(raw) = self.events.get(&wtxn, &id)? else {
-                    continue;
+        for pubkey_hex in [
+            hex::encode(pubkey).into_bytes(),
+            hex::encode_upper(pubkey).into_bytes(),
+        ] {
+            let start = tag_key(b'p', &pubkey_hex, 0, &[0u8; ID_LEN]);
+            let end = tag_key(b'p', &pubkey_hex, u64::MAX, &[0xffu8; ID_LEN]);
+            let mut last_key: Option<Vec<u8>> = None;
+            loop {
+                let lower = match &last_key {
+                    Some(k) => std::ops::Bound::Excluded(k.as_slice()),
+                    None => std::ops::Bound::Included(start.as_slice()),
                 };
-                let Ok(event) = serde_json::from_slice::<Event>(raw) else {
-                    continue;
-                };
-                if event.kind == crate::nips::nip62::GIFT_WRAP_KIND {
-                    self.remove_event(&mut wtxn, &id)?;
-                    removed += 1;
+                let entries: Vec<(Vec<u8>, Vec<u8>)> = self
+                    .by_tag
+                    .range(&wtxn, &(lower, std::ops::Bound::Excluded(end.as_slice())))?
+                    .filter_map(|item| {
+                        item.ok()
+                            .map(|(k, _)| (k.to_vec(), k[k.len() - ID_LEN..].to_vec()))
+                    })
+                    .take(REMOVAL_CHUNK)
+                    .collect();
+                if entries.is_empty() {
+                    break;
+                }
+                last_key = Some(entries.last().unwrap().0.clone());
+                for (_, id) in entries {
+                    let Some(raw) = self.events.get(&wtxn, &id)? else {
+                        continue;
+                    };
+                    let Ok(event) = serde_json::from_slice::<Event>(raw) else {
+                        continue;
+                    };
+                    if event.kind == crate::nips::nip62::GIFT_WRAP_KIND {
+                        self.remove_event(&mut wtxn, &id)?;
+                        removed += 1;
+                    }
                 }
             }
         }
@@ -396,6 +440,7 @@ impl Store {
     }
 
     pub(crate) fn purge_expired(&self, now: u64) -> Result<usize> {
+        self.disk_full_error()?;
         // NIP-40 disabled: nothing is expired. Stale entries written while
         // it was enabled are removed by `remove_event` (which deletes the
         // entry regardless of the toggle), so re-enabling the feature can

@@ -488,6 +488,39 @@ fn gift_wraps_to_are_deleted() {
 }
 
 #[test]
+fn gift_wraps_with_uppercase_p_are_deleted() {
+    // The `by_tag` index stores values verbatim: an uppercase `p` value
+    // lives under a different key range, so both cases must be walked.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let recipient = "b83130de0d1386592fe7b9f407f5f1ae8f1db91d772e484b3d81df0fa2e88f24";
+        let wrap = event(
+            1059,
+            "encrypted",
+            now,
+            vec![vec!["p".into(), recipient.to_ascii_uppercase()]],
+        );
+        assert_eq!(db.put(wrap.clone(), now).await, PutOutcome::Stored);
+        let recipient_bytes = hex::decode(recipient).unwrap();
+        let removed = db
+            .delete_gift_wraps_to(recipient_bytes.try_into().unwrap())
+            .await;
+        assert_eq!(removed, 1, "an uppercase p-tagged wrap must be found");
+    });
+}
+
+#[test]
 
 // ----- database growth -----
 fn map_grows_beyond_initial_size() {
@@ -651,11 +684,11 @@ fn store_blossom_mapping_lifecycle() {
     let meta = store.load_blossom_mapping(&sha).unwrap().unwrap();
     assert_eq!(meta.owners.len(), 2, "both owners merge into the mapping");
     assert_eq!(
-        store.list_blossom_shas(&alice).unwrap(),
+        store.list_blossom_shas(&alice, 10_000).unwrap(),
         vec![sha.clone()],
         "the reverse index lists the blob for the owner"
     );
-    assert_eq!(store.list_blossom_shas(&bob).unwrap().len(), 2);
+    assert_eq!(store.list_blossom_shas(&bob, 10_000).unwrap().len(), 2);
     // Unknown blob / unknown owner return false.
     assert!(
         !store
@@ -672,7 +705,12 @@ fn store_blossom_mapping_lifecycle() {
     assert!(!store.remove_blossom_owner(&sha, &alice).unwrap());
     assert!(store.remove_blossom_owner(&sha, &bob).unwrap());
     assert!(store.load_blossom_mapping(&sha).unwrap().is_none());
-    assert!(store.list_blossom_shas(&bob).unwrap().contains(&sha2));
+    assert!(
+        store
+            .list_blossom_shas(&bob, 10_000)
+            .unwrap()
+            .contains(&sha2)
+    );
     // A corrupt metadata blob reports None (both loads and removals).
     {
         let mut wtxn = store.env.write_txn().unwrap();
@@ -964,6 +1002,17 @@ fn multi_filter_req_survives_an_early_limit() {
         .unwrap();
         let (res, _) = db.query(f, 500, now).await;
         assert_eq!(res.len(), 2, "the second filter must still be evaluated");
+
+        // A lone `limit: 0` filter returns nothing with `more == false`
+        // (NIP-01: no stored events, subscription stays open — not a
+        // truncated page that would send clients into a pagination loop).
+        let f: Vec<Filter> = serde_json::from_value(serde_json::json!([
+            {"limit": 0}
+        ]))
+        .unwrap();
+        let (res, more) = db.query(f, 500, now).await;
+        assert!(res.is_empty());
+        assert!(!more, "limit: 0 must report finish, not more");
     });
 }
 
@@ -1595,6 +1644,45 @@ fn search_results_are_relevance_ordered() {
 }
 
 #[test]
+fn multi_filter_search_limits_apply_per_filter() {
+    // Pure-search REQs with differing per-filter limits: each filter keeps
+    // its own quota in relevance order (a small limit must not starve a
+    // larger one).
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let a1 = event(1, "alpha one", now, vec![]);
+        let a2 = event(1, "alpha two", now - 1, vec![]);
+        let b1 = event(1, "beta one", now - 2, vec![]);
+        for e in [&a1, &a2, &b1] {
+            assert_eq!(db.put(e.clone(), now).await, PutOutcome::Stored);
+        }
+        let f: Vec<Filter> = serde_json::from_value(serde_json::json!([
+            {"search": "alpha", "limit": 1},
+            {"search": "beta", "limit": 2},
+        ]))
+        .unwrap();
+        let (res, _) = db.query(f, 500, now).await;
+        let contents: Vec<&str> = res.iter().map(|e| e.content.as_str()).collect();
+        assert!(
+            contents.contains(&"beta one"),
+            "the larger second-filter quota must survive: {contents:?}"
+        );
+        assert_eq!(res.len(), 2, "quotas are 1 + 1 matched: {contents:?}");
+    });
+}
+
+#[test]
 fn search_ranks_rare_terms_higher() {
     // NIP-50 with IDF weighting: a note matching the rarer term ranks above
     // a newer note matching only the common term.
@@ -1925,6 +2013,131 @@ fn reader_requests_survive_a_writer_backlog() {
             )
             .await;
         assert_eq!(res.len(), 1, "reads must not fail-fast on a write backlog");
+        db.shutdown();
+    });
+}
+
+#[test]
+fn reported_reads_survive_a_writer_backlog() {
+    // `request_read_result` (REQ/COUNT/NEG reporting paths) must use the
+    // reader-queue accounting: a saturated writer queue must neither
+    // fail-fast them nor leak the writer counter on completion.
+    let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0, 128, 4, 8).unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let now = unix_now();
+        db.put(event(1, "stored", now, vec![]), now).await;
+        // The put's reply can arrive before the writer drain releases its
+        // accounting (reply-then-drop ordering): wait for the counters to
+        // settle before fabricating the backlog, or the late release races
+        // the fabricated values (flaky on slow/heavily loaded schedulers).
+        // A bounded wait with a loud failure: never settling would itself
+        // signal a real accounting leak.
+        let start = std::time::Instant::now();
+        loop {
+            let settled = db.pending_msgs.load(std::sync::atomic::Ordering::Relaxed) == 0
+                && db.pending_events.load(std::sync::atomic::Ordering::Relaxed) == 0;
+            if settled {
+                break;
+            }
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(10),
+                "writer accounting never settled after put"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        db.pending_msgs
+            .store(4, std::sync::atomic::Ordering::Relaxed);
+        db.pending_events
+            .store(8, std::sync::atomic::Ordering::Relaxed);
+        let res = db
+            .query_req_reported(
+                vec![serde_json::from_value(serde_json::json!({"kinds": [1]})).unwrap()],
+                10,
+                now,
+            )
+            .await;
+        assert!(
+            res.is_some(),
+            "reporting reads must not fail-fast on a write backlog"
+        );
+        assert_eq!(res.unwrap().0.len(), 1);
+        // The writer counter is untouched by the reporting read (no leak).
+        assert_eq!(
+            db.pending_msgs.load(std::sync::atomic::Ordering::Relaxed),
+            4,
+            "reporting reads must not touch the writer counter"
+        );
+        db.pending_msgs
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        db.pending_events
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        db.shutdown();
+    });
+}
+
+#[test]
+fn removal_of_overlong_tag_index_skips_without_poisoning() {
+    // Put skips over-long index keys instead of aborting; removal must
+    // mirror that, or deleting one pathological event would poison the
+    // whole write batch (`Invalid(database error)` for everyone).
+    let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0, 128, 4, 8).unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let now = unix_now();
+        let big = "v".repeat(600);
+        let ev = event(1, "big", now, vec![vec!["t".into(), big]]);
+        assert_eq!(db.put(ev.clone(), now).await, PutOutcome::Stored);
+        assert_eq!(
+            db.apply_deletion(vec![ev.id.clone()], vec![], None, now)
+                .await,
+            1,
+            "deleting an event with an over-long tag value must succeed"
+        );
+        let ev2 = event(1, "after", now, vec![]);
+        assert_eq!(
+            db.put(ev2.clone(), now).await,
+            PutOutcome::Stored,
+            "the batch must not be poisoned by the removal"
+        );
+        db.shutdown();
+    });
+}
+
+#[test]
+fn read_flood_does_not_fail_fast_writes() {
+    // Reads are counted separately (`pending_reads`): a REQ flood must not
+    // trip the writer fail-fast gate.
+    let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0, 128, 4, 8).unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let now = unix_now();
+        db.pending_reads
+            .store(1000, std::sync::atomic::Ordering::Relaxed);
+        let out = db.put(event(1, "w", now, vec![]), now).await;
+        assert!(
+            matches!(out, PutOutcome::Stored),
+            "writes must survive a read backlog: {out:?}"
+        );
+        db.shutdown();
+    });
+}
+
+#[test]
+fn kind_and_author_counts_serve_through_the_api_reader() {
+    let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0, 128, 4, 8).unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let now = unix_now();
+        db.put(event(1, "a", now, vec![]), now).await;
+        db.put(event(7, "b", now, vec![]), now).await;
+        let (kinds, _) = db.kind_counts(100).await;
+        assert!(
+            kinds.iter().any(|(k, c)| *k == 1 && *c >= 1),
+            "kind counts must include stored events: {kinds:?}"
+        );
+        let (authors, _) = db.author_counts(100).await;
+        assert!(!authors.is_empty(), "author counts must be served");
         db.shutdown();
     });
 }
@@ -2694,5 +2907,51 @@ fn event_meta_rebuilds_from_stored_events() {
         let (kind, created, _, _) = crate::db::store::decode_meta(raw).unwrap();
         assert_eq!(kind, 1);
         assert_eq!(created, now);
+    });
+}
+
+#[test]
+fn group_and_role_snapshots_survive_restart() {
+    // NIP-29/43 state must survive restarts without replaying history:
+    // persist a snapshot, then load + restore it into fresh stores.
+    let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0, 128, 4, 8).unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        // No snapshot on a fresh database: the caller must migrate.
+        assert!(db.load_groups().await.is_none());
+        assert!(db.load_roles().await.is_none());
+
+        let mut groups = crate::nips::nip29::GroupStore::with_cap(100);
+        let now = unix_now();
+        let create = crate::nips::nip29::tests::event(
+            crate::nips::nip29::CREATE_GROUP,
+            crate::nips::nip29::tests::ADMIN,
+            Some("g1"),
+            vec![],
+        );
+        groups.apply(&create, "relay", now, false, false);
+        db.save_groups(groups.snapshot()).await;
+        let mut restored = crate::nips::nip29::GroupStore::with_cap(7);
+        restored.restore(db.load_groups().await.expect("snapshot"));
+        assert!(restored.group("g1").is_some(), "groups must restore");
+        // The capacity cap comes from the config, not the snapshot.
+        assert!(
+            restored
+                .group("g1")
+                .unwrap()
+                .is_admin(crate::nips::nip29::tests::ADMIN)
+        );
+
+        let mut roles = crate::nips::nip43::RoleStore::default();
+        roles.create("mod", "Mod", "", "", None);
+        roles.assign(crate::nips::nip29::tests::USER, "mod");
+        db.save_roles(roles.snapshot()).await;
+        let mut restored_roles = crate::nips::nip43::RoleStore::default();
+        restored_roles.restore(db.load_roles().await.expect("snapshot"));
+        assert!(
+            restored_roles.is_member_of(crate::nips::nip29::tests::USER),
+            "roles must restore"
+        );
+        db.shutdown();
     });
 }

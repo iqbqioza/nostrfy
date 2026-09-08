@@ -46,10 +46,13 @@ pub(crate) struct DbThreads {
     pub(crate) timeout_secs: u64,
     pub(crate) pending_msgs: Arc<std::sync::atomic::AtomicUsize>,
     pub(crate) pending_events: Arc<std::sync::atomic::AtomicUsize>,
+    pub(crate) pending_reads: Arc<std::sync::atomic::AtomicUsize>,
     pub(crate) api_pending: Arc<std::sync::atomic::AtomicUsize>,
     pub(crate) max_pending_msgs: usize,
     pub(crate) max_pending_events: usize,
-    pub(crate) max_api_pending: usize,
+    /// Independent cap for the API reader queue (adjustable live via
+    /// [`super::DbClient::set_max_api_pending`], e.g. on SIGHUP reload).
+    pub(crate) max_api_pending: Arc<std::sync::atomic::AtomicUsize>,
     pub(crate) reader_threads: usize,
 }
 
@@ -212,6 +215,34 @@ fn handle_read_msg(store: &Store, errors: &Arc<std::sync::atomic::AtomicU64>, ms
             let _ = reply.send(lists);
             false
         }
+        Msg::LoadGroups { reply } => {
+            // `Ok(None)` means no snapshot was ever written (pre-persistence
+            // database): the caller runs the replay migration. An `Err`
+            // also yields `None`, and the caller treats it the same way —
+            // but logs the failure so a corrupt snapshot is visible.
+            // (A corrupt snapshot replays history, which is fail-closed:
+            // tombstones rebuild from surviving events.)
+            let snap = match store.load_groups() {
+                Ok(snap) => snap,
+                Err(e) => {
+                    db_error(errors, &e);
+                    None
+                }
+            };
+            let _ = reply.send(snap);
+            false
+        }
+        Msg::LoadRoles { reply } => {
+            let snap = match store.load_roles() {
+                Ok(snap) => snap,
+                Err(e) => {
+                    db_error(errors, &e);
+                    None
+                }
+            };
+            let _ = reply.send(snap);
+            false
+        }
         Msg::BlossomLoad { sha256, reply } => {
             let meta = match store.load_blossom_mapping(&sha256) {
                 Ok(meta) => meta,
@@ -223,8 +254,12 @@ fn handle_read_msg(store: &Store, errors: &Arc<std::sync::atomic::AtomicU64>, ms
             let _ = reply.send(meta);
             false
         }
-        Msg::BlossomList { pubkey, reply } => {
-            let shas = match store.list_blossom_shas(&pubkey) {
+        Msg::BlossomList {
+            pubkey,
+            limit,
+            reply,
+        } => {
+            let shas = match store.list_blossom_shas(&pubkey, limit) {
                 Ok(shas) => shas,
                 Err(e) => {
                     db_error(errors, &e);
@@ -297,9 +332,11 @@ pub(crate) fn spawn(
     let thread_errors = Arc::clone(&errors);
     let pending_msgs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let pending_events = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let pending_reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let thread_pending_msgs = Arc::clone(&pending_msgs);
     let thread_pending_events = Arc::clone(&pending_events);
-    let read_pending = Arc::clone(&pending_msgs);
+    let thread_pending_reads = Arc::clone(&pending_reads);
+    let read_pending = Arc::clone(&pending_reads);
     let api_pending = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let api_thread_pending = Arc::clone(&api_pending);
     // Dedicated reader threads: serve Query/Count/NEG and the small
@@ -319,9 +356,18 @@ pub(crate) fn spawn(
             let read_pending = Arc::clone(&read_pending);
             std::thread::spawn(move || {
                 'reader: loop {
-                    let Some(msg) = read_rx.lock().unwrap().blocking_recv() else {
+                    let Some(msg) = read_rx
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .blocking_recv()
+                    else {
                         break;
                     };
+                    // `Msg::Shutdown` is never counted: a panic while
+                    // handling it must not decrement either (that would
+                    // wrap the counter to `usize::MAX` and fail-fast every
+                    // later read forever).
+                    let is_shutdown = matches!(msg, Msg::Shutdown);
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         let shutdown = handle_read_msg(&read_store, &read_errors, msg);
                         // `Msg::Shutdown` is sent directly (never through
@@ -338,7 +384,9 @@ pub(crate) fn spawn(
                         Ok(false) => {}
                         Err(_) => {
                             log::error!("reader thread recovered from a panic");
-                            read_pending.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                            if !is_shutdown {
+                                read_pending.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                            }
                         }
                     }
                 }
@@ -357,6 +405,9 @@ pub(crate) fn spawn(
                 let Some(msg) = api_read_rx.blocking_recv() else {
                     break;
                 };
+                // See the reader thread above: never decrement for an
+                // uncounted `Shutdown`.
+                let is_shutdown = matches!(msg, Msg::Shutdown);
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let shutdown = handle_read_msg(&api_store, &api_errors, msg);
                     // `Msg::Shutdown` is not counted (see the reader thread).
@@ -370,7 +421,9 @@ pub(crate) fn spawn(
                     Ok(false) => {}
                     Err(_) => {
                         log::error!("api reader thread recovered from a panic");
-                        api_thread_pending.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                        if !is_shutdown {
+                            api_thread_pending.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                        }
                     }
                 }
             }
@@ -499,8 +552,12 @@ pub(crate) fn spawn(
                                     };
                                     let _ = reply.send(meta);
                                 }
-                                Msg::BlossomList { pubkey, reply } => {
-                                    let shas = match store.list_blossom_shas(&pubkey) {
+                                Msg::BlossomList {
+                                    pubkey,
+                                    limit,
+                                    reply,
+                                } => {
+                                    let shas = match store.list_blossom_shas(&pubkey, limit) {
                                         Ok(shas) => shas,
                                         Err(e) => {
                                             db_error(&thread_errors, &e);
@@ -528,6 +585,26 @@ pub(crate) fn spawn(
                                         }
                                     };
                                     let _ = reply.send(lists);
+                                }
+                                Msg::LoadGroups { reply } => {
+                                    let snap = match store.load_groups() {
+                                        Ok(snap) => snap,
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            None
+                                        }
+                                    };
+                                    let _ = reply.send(snap);
+                                }
+                                Msg::LoadRoles { reply } => {
+                                    let snap = match store.load_roles() {
+                                        Ok(snap) => snap,
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            None
+                                        }
+                                    };
+                                    let _ = reply.send(snap);
                                 }
                                 Msg::Query {
                                     filters,
@@ -729,6 +806,18 @@ pub(crate) fn spawn(
                                     }
                                     let _ = reply.send(());
                                 }
+                                Msg::SaveGroups { snapshot, reply } => {
+                                    if let Err(e) = store.save_groups(&snapshot) {
+                                        db_error(&thread_errors, &e);
+                                    }
+                                    let _ = reply.send(());
+                                }
+                                Msg::SaveRoles { snapshot, reply } => {
+                                    if let Err(e) = store.save_roles(&snapshot) {
+                                        db_error(&thread_errors, &e);
+                                    }
+                                    let _ = reply.send(());
+                                }
                                 Msg::BlossomAddOwner {
                                     sha256,
                                     mime,
@@ -803,6 +892,11 @@ pub(crate) fn spawn(
                                     let _ = reply.send(store.env.info().map_size as u64);
                                 }
                                 Msg::TouchFirstSeen { entries, reply } => {
+                                    if let Err(e) = store.disk_full_error() {
+                                        db_error(&thread_errors, &e);
+                                        let _ = reply.send(vec![(false, u64::MAX); entries.len()]);
+                                        continue;
+                                    }
                                     let mut wtxn = match store.env.write_txn() {
                                         Ok(t) => t,
                                         Err(e) => {
@@ -881,10 +975,11 @@ pub(crate) fn spawn(
         timeout_secs: request_timeout_secs,
         pending_msgs,
         pending_events,
+        pending_reads: thread_pending_reads,
         api_pending,
         max_pending_msgs: max_pending_msgs.max(1),
         max_pending_events: max_pending_events.max(1),
-        max_api_pending: max_pending_msgs.max(1),
+        max_api_pending: Arc::new(std::sync::atomic::AtomicUsize::new(max_pending_msgs.max(1))),
         reader_threads,
     })
 }

@@ -6,7 +6,7 @@
 
 pub(crate) mod events;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 use events::{
     apply_settings, build_admins_event, build_members_event, build_meta_event, build_pins_event,
@@ -28,6 +28,12 @@ use crate::util::unix_now;
 pub const GROUP_META: u64 = 39000;
 pub const GROUP_ADMINS: u64 = 39001;
 pub const GROUP_MEMBERS: u64 = 39002;
+/// Reserved group metadata kinds (no builder emits them yet): treated as
+/// relay-signed metadata for forward compatibility.
+#[allow(dead_code)]
+pub const GROUP_ROLES: u64 = 39003;
+#[allow(dead_code)]
+pub const GROUP_PARTICIPANTS: u64 = 39004;
 pub const GROUP_PINS: u64 = 39005;
 pub const MOD_MIN: u64 = 9000;
 pub const MOD_MAX: u64 = 9020;
@@ -42,6 +48,21 @@ const P: &str = "p";
 const E: &str = "e";
 const A: &str = "a";
 const CODE: &str = "code";
+
+/// Maximum pinned events per group (`kind:9010` list / mirrored `39005`).
+/// NIP-29 lets the relay limit pins; without a bound one moderation event
+/// could pin unbounded in-memory and stored state.
+pub(crate) const MAX_PINS: usize = 100;
+
+/// Maximum invite codes per group (`kind:9009` accumulations). Codes are
+/// never consumed and vanish does not track their authors, so without a
+/// bound repeated `9009` events would grow the set without limit.
+pub(crate) const MAX_INVITES: usize = 100;
+
+/// Maximum members per group. Without a bound an admin could spam `9000`
+/// events with fresh pubkeys, growing the member map (and every mirrored
+/// `39001`/`39002`) without limit.
+pub(crate) const MAX_MEMBERS: usize = 10_000;
 
 fn tag_value<'a>(event: &'a Event, name: &str) -> Option<&'a str> {
     event
@@ -133,7 +154,7 @@ pub fn delete_targets(event: &Event) -> Vec<String> {
     tag_values(event, E).map(str::to_string).collect()
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct GroupSettings {
     pub private: bool,
     pub restricted: bool,
@@ -148,7 +169,7 @@ pub struct GroupSettings {
     pub livekit: bool,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Group {
     /// pubkey -> set of roles.
     pub members: HashMap<String, HashSet<String>>,
@@ -197,12 +218,40 @@ pub struct GroupStore {
     max_groups: usize,
 }
 
+/// The persistable NIP-29 group state: everything [`GroupStore`] holds
+/// except the capacity cap (which comes from the config on every start).
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+pub(crate) struct GroupsSnapshot {
+    pub groups: HashMap<String, Group>,
+    pub deleted: HashSet<String>,
+    pub ghost: HashSet<String>,
+}
+
 impl GroupStore {
     pub fn with_cap(max_groups: usize) -> GroupStore {
         GroupStore {
             max_groups,
             ..Default::default()
         }
+    }
+
+    /// Persisted snapshot of the group state (see the `GROUP` table): the
+    /// live groups plus the delete/ghost markers. `max_groups` is config,
+    /// not state, and is never persisted.
+    pub(crate) fn snapshot(&self) -> GroupsSnapshot {
+        GroupsSnapshot {
+            groups: self.groups.clone(),
+            deleted: self.deleted.clone(),
+            ghost: self.ghost.clone(),
+        }
+    }
+
+    /// Restores state persisted by [`Self::snapshot`], keeping the current
+    /// capacity cap.
+    pub(crate) fn restore(&mut self, snap: GroupsSnapshot) {
+        self.groups = snap.groups;
+        self.deleted = snap.deleted;
+        self.ghost = snap.ghost;
     }
 
     /// Whether another group may be created. The deleted markers count
@@ -224,6 +273,16 @@ impl GroupStore {
             return Ok(());
         };
         if self.deleted.contains(gid) {
+            // A deleted id stays closed except for a fresh create: the
+            // tombstone blocks every other write, but legitimate re-creation
+            // with the same id must remain possible (the create clears the
+            // marker in `apply`). Without this an id could never be reused.
+            if event.kind == CREATE_GROUP {
+                if self.at_capacity() {
+                    return Err("restricted: group limit reached".into());
+                }
+                return Ok(());
+            }
             return Err("blocked: the group has been deleted".into());
         }
         let Some(group) = self.groups.get(gid) else {
@@ -245,6 +304,11 @@ impl GroupStore {
         if event.kind == JOIN {
             if group.is_member(pubkey) {
                 return Err("duplicate: you are already a member of this group".into());
+            }
+            // Bound the member map like pins and invites: an uncapped
+            // group would let joins grow mirrored state without limit.
+            if group.members.len() >= MAX_MEMBERS {
+                return Err("restricted: the group is full".into());
             }
             if group.settings.closed {
                 // NIP-29: `closed` means join requests are ignored — the
@@ -291,6 +355,45 @@ impl GroupStore {
             }
             if event.kind == 9002 {
                 validate_edit_metadata(self, gid, group, event)?;
+            }
+            // NIP-29 allows the relay to limit pins: bound the 9010 list
+            // so one event cannot pin unbounded state (the apply side caps
+            // too, for history replayed without validation).
+            if event.kind == 9010
+                && event
+                    .tags
+                    .iter()
+                    .filter(|t| t.len() >= 2 && (t[0] == E || t[0] == A))
+                    .count()
+                    > MAX_PINS
+            {
+                return Err("restricted: too many pinned events".into());
+            }
+            // Invite codes accumulate without consumption: bound the 9009
+            // additions so repeated events cannot grow the set without
+            // limit (the apply side stops inserting at the same bound).
+            if event.kind == 9009 {
+                let fresh = tag_values(event, CODE)
+                    .filter(|c| !group.has_invite(c))
+                    .count();
+                if group.invites.len().saturating_add(fresh) > MAX_INVITES {
+                    return Err("restricted: too many invite codes".into());
+                }
+            }
+            // Bound the member map: count fresh pubkeys (not already
+            // members) so one 9000 cannot add unbounded members.
+            if event.kind == 9000 {
+                let fresh = event
+                    .tags
+                    .iter()
+                    .filter(|t| t.len() >= 2 && t[0] == P)
+                    .map(|t| t[1].as_str())
+                    .filter(|pk| !group.is_member(pk))
+                    .collect::<std::collections::HashSet<_>>()
+                    .len();
+                if group.members.len().saturating_add(fresh) > MAX_MEMBERS {
+                    return Err("restricted: too many group members".into());
+                }
             }
             // NIP-29: the group must retain at least one admin — a 9000
             // without roles could silently demote the last admin, and a
@@ -394,7 +497,11 @@ impl GroupStore {
                     if let Some(group) = self.groups.get_mut(gid) {
                         // Membership is the entry in the member map; roles
                         // (granted only via `kind:9000`) decide privileges.
-                        group.members.entry(member.clone()).or_default();
+                        // Bounded like validation (history replay bypasses
+                        // the check above, so re-check here).
+                        if group.members.len() < MAX_MEMBERS || group.is_member(&member) {
+                            group.members.entry(member.clone()).or_default();
+                        }
                     }
                     if emit {
                         out.push(build_put_user(gid, &member, &[], relay_pubkey, now));
@@ -420,6 +527,10 @@ impl GroupStore {
                     // ("the user roles must just be updated"), and a `p` tag
                     // without roles leaves the user a plain member.
                     for tag in event.tags.iter().filter(|t| t.len() >= 2 && t[0] == P) {
+                        // Bounded like validation (see above).
+                        if group.members.len() >= MAX_MEMBERS && !group.is_member(&tag[1]) {
+                            continue;
+                        }
                         let pk = tag[1].clone();
                         // An empty role element (`["p", pk, ""]`) is a
                         // malformed demotion: it must not turn into an
@@ -451,8 +562,13 @@ impl GroupStore {
                         Some(group) => {
                             apply_settings(group, event);
                             let children_before = group.children.clone();
-                            group.children =
-                                tag_values(event, "child").map(str::to_string).collect();
+                            // Deduplicate while preserving order: a repeated
+                            // `child` tag must not list the same child twice.
+                            let mut seen = HashSet::new();
+                            group.children = tag_values(event, "child")
+                                .map(str::to_string)
+                                .filter(|c| seen.insert(c.clone()))
+                                .collect();
                             let before = group.parent.clone();
                             let after = tag_value(event, "parent").map(str::to_string);
                             (before, after, children_before)
@@ -581,6 +697,14 @@ impl GroupStore {
             }
             CREATE_GROUP => {
                 if !self.groups.contains_key(gid) && (ignore_capacity || !self.at_capacity()) {
+                    // A fresh create resurrects the id: clear a previous
+                    // delete tombstone (and ghost marker) so the id is
+                    // reusable. Note the tombstone itself is memory-only;
+                    // if the `9008` event is later lost (author vanish,
+                    // expiry, NIP-09 deletion), the next rebuild replays
+                    // surviving history and the group returns — events are
+                    // the source of truth, and an admin can re-delete.
+                    self.deleted.remove(gid);
                     self.unghost(gid);
                     let mut group = Group::default();
                     group
@@ -636,17 +760,25 @@ impl GroupStore {
             9009 => {
                 if let Some(group) = self.groups.get_mut(gid) {
                     for code in tag_values(event, CODE) {
+                        // Bounded like validation (history replay bypasses
+                        // the check above, so stop inserting at the cap).
+                        if group.invites.len() >= MAX_INVITES {
+                            break;
+                        }
                         group.invites.insert(code.to_string());
                     }
                 }
             }
             9010 => {
+                // Bounded like validation (history replay bypasses the
+                // check above, so cap here too).
                 if let Some(group) = self.groups.get_mut(gid) {
                     group.pins = event
                         .tags
                         .iter()
                         .filter(|t| t.len() >= 2 && (t[0] == E || t[0] == A))
                         .map(|t| (t[0].clone(), t[1].clone()))
+                        .take(MAX_PINS)
                         .collect();
                 }
                 if emit {
@@ -1011,6 +1143,22 @@ fn validate_edit_metadata(
         .all(|c| children.contains(c.as_str()))
     {
         return Err("restricted: missing child tags in metadata edit".into());
+    }
+    // Adopting a new child through the parent's list requires authority
+    // over the child too: otherwise a foreign admin could hijack an
+    // orphan group by listing it (each group's own 39001 is authoritative
+    // for its scope). Reordering already-linked children stays parent-only.
+    // Unknown ids (no group yet) are still listable as placeholders.
+    for child in tag_values(event, "child") {
+        if _group.children.iter().any(|c| c == child) {
+            continue;
+        }
+        if let Some(child_group) = store.groups.get(child)
+            && child_group.parent.as_deref() != Some(gid)
+            && !child_group.is_admin(event.pubkey.as_str())
+        {
+            return Err("restricted: you are not an admin of the child group".into());
+        }
     }
     Ok(())
 }

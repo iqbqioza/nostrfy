@@ -76,8 +76,10 @@ pub struct Filter {
 }
 
 impl Filter {
-    /// Whether the filter exceeds the [`MAX_FILTER_MEMBERS`] bound on `ids`
-    /// or `authors`, which would make the in-memory match quadratic.
+    /// Whether the filter exceeds the [`MAX_FILTER_MEMBERS`] bound on
+    /// `ids`, `authors` or `kinds`, which would make the in-memory match
+    /// quadratic (`kinds.contains` is linear per live event per
+    /// subscription, and the scan fans out per kind).
     pub fn too_many_members(&self) -> bool {
         self.ids
             .as_ref()
@@ -86,20 +88,49 @@ impl Filter {
                 .authors
                 .as_ref()
                 .is_some_and(|v| v.len() > MAX_FILTER_MEMBERS)
+            || self
+                .kinds
+                .as_ref()
+                .is_some_and(|v| v.len() > MAX_FILTER_MEMBERS)
+    }
+
+    /// Case-insensitive hex equality: stored events are lowercase hex while
+    /// filters may carry uppercase hex. The historical scan decodes hex
+    /// (case-insensitive), so the live match must compare the same way or a
+    /// filter like `{"authors": ["AA.."]}` hits history but misses live.
+    fn hex_eq(a: &str, b: &str) -> bool {
+        a.len() == b.len()
+            && a.bytes()
+                .zip(b.bytes())
+                .all(|(x, y)| x.eq_ignore_ascii_case(&y))
+    }
+
+    /// Case-insensitive prefix check for `ids` prefixes (same reason).
+    fn hex_starts_with(haystack: &str, needle: &str) -> bool {
+        haystack.len() >= needle.len()
+            && haystack
+                .bytes()
+                .zip(needle.bytes())
+                .all(|(x, y)| x.eq_ignore_ascii_case(&y))
     }
 
     /// Performs an in-memory match (used for live events and final checks).
     pub fn matches<E: EventFields>(&self, ev: &E) -> bool {
         if let Some(ids) = &self.ids {
-            // NIP-01: `ids` entries may be full ids or prefixes. Only
+            // `ids` entries may be full ids or prefixes: strict NIP-01
+            // requires exact 64-char lowercase hex, but prefixes are an
+            // ecosystem-wide convention, so they are accepted here. Only
             // even-length, non-empty prefixes are matched, mirroring the
             // historical scan (which decodes hex) so live and stored results
             // agree; an empty or odd-length entry matches nothing.
+            // Comparison is ASCII case-insensitive like the scan's hex
+            // decode, so uppercase filters agree on both paths.
             let id_str = ev.id();
             let matches = ids.iter().any(|id| {
                 !id.is_empty()
                     && id.len() % 2 == 0
-                    && (id == id_str || (id.len() < id_str.len() && id_str.starts_with(id)))
+                    && (Self::hex_eq(id, id_str)
+                        || (id.len() < id_str.len() && Self::hex_starts_with(id_str, id)))
             });
             if !matches {
                 return false;
@@ -110,13 +141,15 @@ impl Filter {
         // Only a well-formed delegation (`delegation` tags have exactly 4
         // elements, see `nip26::delegation`) counts: a malformed tag of
         // any other length must not let an attacker's event match filters
-        // on somebody else's pubkey.
+        // on somebody else's pubkey. Pubkey comparison is case-insensitive
+        // for the same stored/live agreement reason as `ids` above.
         if let Some(authors) = &self.authors
-            && !authors.iter().any(|a| a == ev.pubkey())
-            && !ev
-                .tags()
-                .iter()
-                .any(|t| t.len() == 4 && t[0] == "delegation" && authors.iter().any(|a| a == &t[1]))
+            && !authors.iter().any(|a| Self::hex_eq(a, ev.pubkey()))
+            && !ev.tags().iter().any(|t| {
+                t.len() == 4
+                    && t[0] == "delegation"
+                    && authors.iter().any(|a| Self::hex_eq(a, &t[1]))
+            })
         {
             return false;
         }
@@ -163,6 +196,10 @@ impl Filter {
             if !name.starts_with('#') {
                 return true;
             }
+            // Note: tag values compare exactly (case-sensitive), unlike
+            // `ids`/`authors` which decode hex case-insensitively. An
+            // uppercase `#e`/`#p` value therefore matches nothing on either
+            // path — consistent, but clients should send lowercase hex.
             let tag_name = name.strip_prefix('#').unwrap_or(name);
             tag_values(value).any(|v| {
                 ev.tags()
@@ -241,7 +278,10 @@ pub(crate) fn rewrite_inbox_outbox(value: &mut Value) -> Result<(), String> {
         for item in items {
             let valid_hex = item.len() == 64 && item.chars().all(|c| c.is_ascii_hexdigit());
             let hex_pk = if valid_hex {
-                item.to_string()
+                // Normalize to lowercase: the stored index is byte-based
+                // (case-insensitive) while the live match is string-based, so
+                // an uppercase filter would hit history but miss live events.
+                item.to_ascii_lowercase()
             } else if let Ok(crate::nips::nip19::Nip19Entity::Pubkey(pk)) =
                 crate::nips::nip19::parse_nip19(&item)
             {
@@ -252,6 +292,13 @@ pub(crate) fn rewrite_inbox_outbox(value: &mut Value) -> Result<(), String> {
             pubkeys.push(hex_pk);
         }
         let entry = map.entry(dst.to_string()).or_insert_with(|| json!([]));
+        // A single-string `#p`/`authors` is valid NIP-01 (`tag_values` and
+        // `invalid_tag_values` accept it): promote it to an array instead of
+        // rejecting the subscription.
+        if entry.is_string() {
+            let s = entry.as_str().unwrap_or_default().to_string();
+            *entry = json!([s]);
+        }
         if let Some(arr) = entry.as_array_mut() {
             for pk in pubkeys {
                 if !arr.iter().any(|v| v == &json!(pk)) {
@@ -416,6 +463,19 @@ mod tests {
     }
 
     #[test]
+    fn ids_and_authors_match_uppercase_like_the_scan() {
+        // The stored scan decodes hex (case-insensitive): the live match
+        // must agree, so uppercase filters hit both paths.
+        let e = ev(1, vec![]);
+        let upper_id = e.id.to_ascii_uppercase();
+        let f: Filter = serde_json::from_value(serde_json::json!({"ids": [upper_id]})).unwrap();
+        assert!(f.matches(&e), "uppercase ids must match live");
+        let upper_pk = e.pubkey.to_ascii_uppercase();
+        let f: Filter = serde_json::from_value(serde_json::json!({"authors": [upper_pk]})).unwrap();
+        assert!(f.matches(&e), "uppercase authors must match live");
+    }
+
+    #[test]
     fn too_many_members_flagged() {
         let mut f = Filter::default();
         assert!(!f.too_many_members());
@@ -426,6 +486,9 @@ mod tests {
         f.ids = None;
         f.authors = Some(vec!["a".repeat(64); MAX_FILTER_MEMBERS + 1]);
         assert!(f.too_many_members());
+        f.authors = None;
+        f.kinds = Some(vec![1; MAX_FILTER_MEMBERS + 1]);
+        assert!(f.too_many_members(), "oversized kinds must be rejected too");
     }
 
     #[test]
@@ -476,6 +539,23 @@ mod tests {
             3,
             "inbox values merge with existing #p"
         );
+    }
+
+    #[test]
+    fn inbox_merges_with_single_string_tag_and_lowercases() {
+        // A single-string `#p` is valid NIP-01: promote, don't reject.
+        let pk = "aa".repeat(32);
+        let mut v = serde_json::json!({"inbox": pk, "#p": "bb".repeat(32)});
+        rewrite_inbox_outbox(&mut v).unwrap();
+        let arr = v["#p"].as_array().expect("promoted to array");
+        assert_eq!(arr.len(), 2, "single-string #p merges with inbox");
+
+        // Uppercase hex is normalized so live (string) and stored (byte)
+        // matches agree.
+        let upper = "AA".repeat(32);
+        let mut v = serde_json::json!({"inbox": upper});
+        rewrite_inbox_outbox(&mut v).unwrap();
+        assert_eq!(v, serde_json::json!({"#p": ["aa".repeat(32)]}));
     }
 
     #[test]

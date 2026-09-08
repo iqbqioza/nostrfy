@@ -180,7 +180,11 @@ async fn build_router(
     if cfg.server.metrics_enabled {
         app = app.route("/metrics", get(metrics_handler));
     }
-    if cfg.nip_enabled(29) && !cfg.relay.livekit_url.is_empty() {
+    if cfg.nip_enabled(29)
+        && !cfg.relay.livekit_url.trim().is_empty()
+        && !cfg.relay.livekit_api_key.is_empty()
+        && !cfg.relay.livekit_api_secret.is_empty()
+    {
         app = app
             .route("/.well-known/nip29/livekit", get(livekit_supported))
             .route("/.well-known/nip29/livekit/{group}", get(livekit_token));
@@ -298,9 +302,21 @@ pub async fn run_server(config_path: PathBuf, config: Config, db: DbClient) -> R
     // changes (relay name/description/icon) can be persisted to disk.
     *relay.config_path.write().await = Some(config_path.clone());
 
-    // Rebuild the NIP-29 group state from the stored moderation events.
+    // Restore the NIP-29 group state from the persisted snapshot. Only
+    // when no snapshot was ever written (pre-persistence database) fall
+    // back to replaying the stored moderation events, then persist the
+    // result so later restarts skip the replay.
     if relay.config.read().await.nip_enabled(29) {
-        relay.groups.write().await.rebuild(&relay.db).await;
+        match relay.db.load_groups().await {
+            Some(snap) => {
+                relay.groups.write().await.restore(snap);
+                info!("NIP-29 group state restored from the database snapshot");
+            }
+            None => {
+                relay.groups.write().await.rebuild(&relay.db).await;
+                relay.persist_groups().await;
+            }
+        }
         if relay.has_relay_key() {
             info!(
                 "NIP-29 groups enabled (relay key {})",
@@ -309,15 +325,24 @@ pub async fn run_server(config_path: PathBuf, config: Config, db: DbClient) -> R
         }
     }
 
-    // Rebuild the NIP-43 role store from the stored role definitions and
-    // membership lists.
+    // Same lifecycle for the NIP-43 role store: snapshot first, replay
+    // migration only when nothing was ever persisted.
     if relay.config.read().await.nip_enabled(43) {
-        relay
-            .roles
-            .write()
-            .await
-            .rebuild(&relay.db, &relay.relay_pubkey().unwrap_or_default())
-            .await;
+        match relay.db.load_roles().await {
+            Some(snap) => {
+                relay.roles.write().await.restore(snap);
+                info!("NIP-43 role state restored from the database snapshot");
+            }
+            None => {
+                relay
+                    .roles
+                    .write()
+                    .await
+                    .rebuild(&relay.db, &relay.relay_pubkey().unwrap_or_default())
+                    .await;
+                relay.persist_roles().await;
+            }
+        }
     }
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -365,23 +390,56 @@ pub async fn run_server(config_path: PathBuf, config: Config, db: DbClient) -> R
         }));
     }
 
-    tasks.push(tokio::spawn(stats_writer(
-        relay.clone(),
-        shutdown_rx.clone(),
-    )));
-    tasks.push(tokio::spawn(purge_loop(relay.clone(), shutdown_rx.clone())));
-    tasks.push(tokio::spawn(nip66_publisher(
-        relay.clone(),
-        shutdown_rx.clone(),
-    )));
-    tasks.push(tokio::spawn(signal_handler(shutdown_tx.clone())));
-    tasks.push(tokio::spawn(reload_handler(
-        config_path,
-        relay.clone(),
-        relay.db.clone(),
-        relay.api_limit.clone(),
-        shutdown_rx.clone(),
-    )));
+    // Supervisor: a background task that exits before shutdown would
+    // silently lose its function (expiry purge, stats, discovery, SIGHUP).
+    // Today that is unreachable (DB helpers return defaults, never panic),
+    // but a future panic must be loud instead of silent.
+    for (name, handle) in [
+        (
+            "stats_writer",
+            tokio::spawn(stats_writer(relay.clone(), shutdown_rx.clone())),
+        ),
+        (
+            "purge_loop",
+            tokio::spawn(purge_loop(relay.clone(), shutdown_rx.clone())),
+        ),
+        (
+            "nip66_publisher",
+            tokio::spawn(nip66_publisher(relay.clone(), shutdown_rx.clone())),
+        ),
+        (
+            "signal_handler",
+            tokio::spawn(signal_handler(shutdown_tx.clone())),
+        ),
+        (
+            "reload_handler",
+            tokio::spawn(reload_handler(
+                config_path,
+                relay.clone(),
+                relay.db.clone(),
+                relay.api_limit.clone(),
+                shutdown_rx.clone(),
+            )),
+        ),
+    ] {
+        let shutdown = shutdown_rx.clone();
+        tasks.push(tokio::spawn(async move {
+            match handle.await {
+                Ok(()) => {
+                    if !*shutdown.borrow() {
+                        error!(
+                            "background task {name} exited unexpectedly; its function is lost until restart"
+                        );
+                    }
+                }
+                Err(e) => {
+                    error!(
+                        "background task {name} panicked: {e}; its function is lost until restart"
+                    );
+                }
+            }
+        }));
+    }
 
     let (header_timeout, max_connections, per_sec_per_ip, recv_buf_kb) = {
         let cfg = relay.config.read().await;
@@ -939,6 +997,22 @@ async fn serve_limited(
                     }),
                 );
                 conn_tasks.push(tokio::spawn(async move {
+                    // Guard the accept-layer connection count: a panic in the
+                    // serve path must still release the slot, otherwise the
+                    // `>= max_connections` check above would refuse every new
+                    // connection forever (the WS layer already uses
+                    // `ConnectionGuard` for the same reason).
+                    struct ActiveGuard {
+                        active: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+                    }
+                    impl Drop for ActiveGuard {
+                        fn drop(&mut self) {
+                            self.active.fetch_sub(1, Ordering::Relaxed);
+                        }
+                    }
+                    let _guard = ActiveGuard {
+                        active: Arc::clone(&active),
+                    };
                     let mut builder = hyper_util::server::conn::auto::Builder::new(
                         hyper_util::rt::TokioExecutor::new(),
                     );
@@ -966,7 +1040,7 @@ async fn serve_limited(
                             let _ = conn.as_mut().await;
                         }
                     }
-                    active.fetch_sub(1, Ordering::Relaxed);
+                    // Released by `_guard` on every exit path including panic.
                 }));
                 // Bound the handle vector: prune the finished tasks once
                 // it grows past 1024 entries (amortized constant work per
@@ -1048,6 +1122,7 @@ async fn reload_handler(
                         }
                         db.set_expiry_enabled(new_config.nip_enabled(40));
                         api_limit.set_max(new_config.limits.max_api_concurrent);
+                        db.set_max_api_pending(new_config.limits.max_api_queue_msgs);
                         // The relay's signing key is fixed at startup: a
                         // reloaded private_key is not applied (NIP-29/NIP-43
                         // keep signing and NIP-11 `self` keeps advertising
@@ -1117,6 +1192,14 @@ async fn reload_handler(
                             (
                                 "database.disabled_fsync",
                                 old.database.disabled_fsync != new_config.database.disabled_fsync,
+                            ),
+                            (
+                                "database.max_dbs",
+                                old.database.max_dbs != new_config.database.max_dbs,
+                            ),
+                            (
+                                "database.max_readers",
+                                old.database.max_readers != new_config.database.max_readers,
                             ),
                             (
                                 "blossom.host",
@@ -1227,6 +1310,18 @@ async fn reload_handler(
                                 old.rpc.max_admin_body_bytes
                                     != new_config.rpc.max_admin_body_bytes,
                             ),
+                            (
+                                "relay.max_groups",
+                                old.relay.max_groups != new_config.relay.max_groups,
+                            ),
+                            (
+                                "daemon.log_file",
+                                old.daemon.log_file != new_config.daemon.log_file,
+                            ),
+                            (
+                                "daemon.pid_file",
+                                old.daemon.pid_file != new_config.daemon.pid_file,
+                            ),
                         ];
                         for (name, changed) in static_routes {
                             if changed {
@@ -1236,6 +1331,93 @@ async fn reload_handler(
                                 );
                             }
                         }
+                        // The kind/IP access lists are runtime-managed via NIP-86
+                        // and persisted in the database: editing them in the
+                        // config file has no effect after the first run (the
+                        // persisted state wins). Warn so the operator uses the
+                        // management API instead of wondering why the file is
+                        // ignored. `restrict_relay` is config-owned and applies.
+                        if old.access.blocked_kinds != new_config.access.blocked_kinds
+                            || old.access.allowed_kinds != new_config.access.allowed_kinds
+                            || old.access.blocked_ips != new_config.access.blocked_ips
+                        {
+                            warn!(
+                                "access.blocked_kinds/allowed_kinds/blocked_ips changed in the \
+                                 reloaded config but access lists are runtime-managed (NIP-86) \
+                                 and persisted in the database; the file change is ignored"
+                            );
+                        }
+                        // Settings fixed at startup must not diverge from the
+                        // wire: overwriting them in memory while the router,
+                        // database and threads still run the old values would
+                        // leave `config.read()` lying about actual behavior.
+                        // Keep the running values so the in-memory config
+                        // always describes what the relay does.
+                        new_config.server.api_host = old.server.api_host.clone();
+                        new_config.server.host = old.server.host.clone();
+                        new_config.server.port = old.server.port;
+                        new_config.server.ws_paths = old.server.ws_paths.clone();
+                        new_config.server.metrics_enabled = old.server.metrics_enabled;
+                        new_config.rpc.management_port = old.rpc.management_port;
+                        new_config.rpc.management_host = old.rpc.management_host.clone();
+                        new_config.rpc.max_admin_body_bytes = old.rpc.max_admin_body_bytes;
+                        new_config.relay.private_key = old.relay.private_key.clone();
+                        new_config.relay.livekit_url = old.relay.livekit_url.clone();
+                        new_config.relay.livekit_api_key = old.relay.livekit_api_key.clone();
+                        new_config.relay.livekit_api_secret = old.relay.livekit_api_secret.clone();
+                        // NIP toggles shape routing and stored behavior: keep
+                        // them restart-required so a reload cannot half-apply
+                        // (dynamic gates would flip while routes stay old).
+                        new_config.relay.enabled_nips = old.relay.enabled_nips.clone();
+                        new_config.relay.disabled_nips = old.relay.disabled_nips.clone();
+                        new_config.relay.max_groups = old.relay.max_groups;
+                        new_config.database.map_size = old.database.map_size;
+                        new_config.database.max_map_size = old.database.max_map_size;
+                        new_config.database.search_index = old.database.search_index;
+                        new_config.database.meta_index = old.database.meta_index;
+                        new_config.database.reader_threads = old.database.reader_threads;
+                        new_config.database.disabled_fsync = old.database.disabled_fsync;
+                        new_config.database.max_dbs = old.database.max_dbs;
+                        new_config.database.max_readers = old.database.max_readers;
+                        new_config.database.path = old.database.path.clone();
+                        new_config.database.purge_interval_secs = old.database.purge_interval_secs;
+                        new_config.database.db_request_timeout_secs =
+                            old.database.db_request_timeout_secs;
+                        new_config.database.max_db_queue_msgs = old.database.max_db_queue_msgs;
+                        new_config.database.max_db_queue_events =
+                            old.database.max_db_queue_events;
+                        new_config.database.max_indexed_words = old.database.max_indexed_words;
+                        new_config.blossom.host = old.blossom.host.clone();
+                        new_config.blossom.storage = old.blossom.storage.clone();
+                        new_config.blossom.min_free_bytes = old.blossom.min_free_bytes;
+                        new_config.blossom.local_path = old.blossom.local_path.clone();
+                        new_config.blossom.max_upload_bytes = old.blossom.max_upload_bytes;
+                        new_config.blossom.s3_endpoint = old.blossom.s3_endpoint.clone();
+                        new_config.blossom.s3_region = old.blossom.s3_region.clone();
+                        new_config.blossom.s3_bucket = old.blossom.s3_bucket.clone();
+                        new_config.blossom.s3_access_key = old.blossom.s3_access_key.clone();
+                        new_config.blossom.s3_secret_key = old.blossom.s3_secret_key.clone();
+                        new_config.daemon.max_log_size_bytes = old.daemon.max_log_size_bytes;
+                        new_config.daemon.max_log_files = old.daemon.max_log_files;
+                        new_config.daemon.stats_interval_secs = old.daemon.stats_interval_secs;
+                        new_config.daemon.log_file = old.daemon.log_file.clone();
+                        new_config.daemon.pid_file = old.daemon.pid_file.clone();
+                        new_config.limits.live_buffer = old.limits.live_buffer;
+                        new_config.limits.live_batch_size = old.limits.live_batch_size;
+                        new_config.limits.live_batch_interval_ms =
+                            old.limits.live_batch_interval_ms;
+                        new_config.limits.max_connections = old.limits.max_connections;
+                        new_config.limits.http_read_timeout_secs =
+                            old.limits.http_read_timeout_secs;
+                        new_config.limits.max_connections_per_sec_per_ip =
+                            old.limits.max_connections_per_sec_per_ip;
+                        new_config.limits.socket_recv_buffer_kb = old.limits.socket_recv_buffer_kb;
+                        // The kind/IP access lists are runtime-managed
+                        // (persisted in the database); only `restrict_relay`
+                        // is config-owned.
+                        new_config.access.blocked_kinds = old.access.blocked_kinds.clone();
+                        new_config.access.allowed_kinds = old.access.allowed_kinds.clone();
+                        new_config.access.blocked_ips = old.access.blocked_ips.clone();
                         drop(old);
                         *config.write().await = new_config;
                         // Bump the config version: connections refresh

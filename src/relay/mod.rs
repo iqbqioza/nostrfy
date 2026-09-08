@@ -68,8 +68,10 @@ pub struct Relay {
     /// a single host cannot consume the whole connection budget.
     per_ip_connections: std::sync::Mutex<HashMap<String, usize>>,
     /// Per-pubkey sliding window of accepted event timestamps
-    /// (`relay.max_events_per_min_per_pubkey`). Bounded: the map is
-    /// cleared when it reaches its cap instead of growing.
+    /// (`relay.max_events_per_min_per_pubkey`). Bounded: at most 10k
+    /// pubkeys are tracked — a full map never clears (tracked windows are
+    /// preserved); fresh pubkeys alone are fail-open until old windows
+    /// expire.
     publish_rate: std::sync::Mutex<HashMap<String, std::collections::VecDeque<u64>>>,
     /// Bumped whenever the blocked-IP list changes (NIP-86 blockip/
     /// unblockip): connections compare this against the value captured at
@@ -120,9 +122,13 @@ pub(crate) struct StampClock {
 }
 
 impl StampClock {
-    fn new() -> Self {
+    /// Starts the clock from a previously issued stamp (restart recovery):
+    /// later stamps stay greater than everything issued before the restart,
+    /// so stored relay-generated events can never outrank fresh state.
+    /// Pass `0` on a fresh start.
+    fn new_with_last(last: u64) -> Self {
         StampClock {
-            last: AtomicU64::new(0),
+            last: AtomicU64::new(last),
         }
     }
 
@@ -248,6 +254,32 @@ impl Relay {
             .as_ref()
             .map(|keypair| XOnlyPublicKey::from_keypair(keypair).0.to_string());
         let api_max_concurrent = config.read().await.limits.max_api_concurrent;
+        // Bootstrap the relay-event stamp clock from the newest stored
+        // relay-generated replaceable: without this a burst-then-restart in
+        // the same second could stamp fresh state below a pre-restart event,
+        // letting stale metadata win the NIP-01 replacement tie-break.
+        // Startup-only, one bounded query; a miss simply starts at 0.
+        let stamp_last = match &relay_pubkey {
+            Some(pk) => {
+                let filter = crate::filter::Filter {
+                    authors: Some(vec![pk.clone()]),
+                    kinds: Some(vec![
+                        nip29::GROUP_META,
+                        nip29::GROUP_ADMINS,
+                        nip29::GROUP_MEMBERS,
+                        nip29::GROUP_ROLES,
+                        nip29::GROUP_PARTICIPANTS,
+                        nip29::GROUP_PINS,
+                        nip43::ROLE_DEFINITION,
+                        nip43::MEMBERSHIP_LIST,
+                    ]),
+                    ..Default::default()
+                };
+                let (events, _) = db.query(vec![filter], 1, unix_now()).await;
+                events.into_iter().map(|e| e.created_at).max().unwrap_or(0)
+            }
+            None => 0,
+        };
         // Seed the access control: the persisted runtime state wins, so NIP-86
         // bans/allowlists survive restarts; the config `access` section seeds
         // the very first run only (when no runtime state exists yet). The
@@ -314,7 +346,7 @@ impl Relay {
             relay_pubkey,
             secp,
             config_path: Arc::new(tokio::sync::RwLock::new(None)),
-            stamps: StampClock::new(),
+            stamps: StampClock::new_with_last(stamp_last),
             blossom: Arc::new(tokio::sync::RwLock::new(None)),
             blossom_allow: Arc::new(tokio::sync::RwLock::new(blossom_allow)),
             audit: crate::audit::AuditLog::default(),
@@ -388,15 +420,31 @@ impl Relay {
                         Some((event, json)) => {
                             batch.push((event, json));
                             if batch.len() >= batch_size {
-                                flush(&mut batch);
+                                // A panic in candidate lookup must not kill
+                                // the bus (which would silently stop all live
+                                // delivery once the channel fills): contain it
+                                // and keep serving.
+                                let r = std::panic::catch_unwind(
+                                    std::panic::AssertUnwindSafe(|| flush(&mut batch)),
+                                );
+                                if r.is_err() {
+                                    log::error!("live bus recovered from a panic");
+                                    batch.clear();
+                                }
                             }
                         }
                         None => {
-                            flush(&mut batch);
+                            let _ = std::panic::catch_unwind(
+                                std::panic::AssertUnwindSafe(|| flush(&mut batch)),
+                            );
                             return;
                         }
                     },
-                    _ = interval.tick() => flush(&mut batch),
+                    _ = interval.tick() => {
+                        let _ = std::panic::catch_unwind(
+                            std::panic::AssertUnwindSafe(|| flush(&mut batch)),
+                        );
+                    }
                 }
             }
         });
@@ -413,7 +461,9 @@ impl Relay {
 
     /// Whether `pubkey` may publish another event under
     /// `relay.max_events_per_min_per_pubkey` (a sliding 60-second window;
-    /// 0 = unlimited). The window map is bounded at 10,000 pubkeys — the
+    /// 0 = unlimited). Each window holds at most `max` timestamps, so one
+    /// key pins at most that many `u64`s. The window map is bounded at
+    /// 10,000 pubkeys — the
     /// cap never clears the whole map (a clear would reset every window
     /// and permanently disable the limit): expired windows are evicted
     /// first, and a still-full map skips tracking the new pubkey only
@@ -968,24 +1018,52 @@ impl Relay {
         self.broadcast(event);
     }
 
+    /// Persists the live NIP-29 group state (write-through: call after
+    /// every mutation so restarts restore without replaying history).
+    /// Fire-and-forget: a failed commit only logs (the next mutation
+    /// retries the full snapshot).
+    pub(crate) async fn persist_groups(&self) {
+        let snapshot = self.groups.read().await.snapshot();
+        self.db.save_groups(snapshot).await;
+    }
+
+    /// Persists the live NIP-43 role state (same lifecycle as
+    /// [`Self::persist_groups`]).
+    pub(crate) async fn persist_roles(&self) {
+        let snapshot = self.roles.read().await.snapshot();
+        self.db.save_roles(snapshot).await;
+    }
+
     /// NIP-62: deletes every event by `pubkey` and removes the pubkey from
     /// every NIP-29 group (its moderation events were deleted along with
     /// everything else).
+    ///
+    /// Membership/admin removal is immediate (`members` holds roles, so one
+    /// `remove` strips both). Settings/invites/pins/parent-links authored
+    /// solely by the vanished key converge on the next restart (the rebuild
+    /// replays only surviving events); until then the live view is a
+    /// transient superset, never a resurrection of the vanished content.
     async fn vanish_pubkey(&self, pubkey: [u8; 32], until_created: u64) {
         let pubkey_hex = hex::encode(pubkey);
         let removed = self.db.apply_vanish(pubkey, until_created).await;
         self.stats.bump(&self.stats.events_deleted, removed as u64);
         if self.config.read().await.nip_enabled(29) {
-            let mut groups = self.groups.write().await;
-            for group in groups.groups.values_mut() {
-                group.members.remove(&pubkey_hex);
+            {
+                let mut groups = self.groups.write().await;
+                for group in groups.groups.values_mut() {
+                    group.members.remove(&pubkey_hex);
+                }
             }
+            self.persist_groups().await;
         }
         // NIP-43 role assignments hold pubkeys too: a vanished author
         // must not keep its roles.
         if self.config.read().await.nip_enabled(43) {
-            let mut roles = self.roles.write().await;
-            roles.assignments.remove(&pubkey_hex);
+            {
+                let mut roles = self.roles.write().await;
+                roles.assignments.remove(&pubkey_hex);
+            }
+            self.persist_roles().await;
         }
     }
 
@@ -1009,6 +1087,9 @@ impl Relay {
             self.has_relay_key(),
             false,
         );
+        // Write-through persistence: restarts restore from the snapshot
+        // instead of replaying history.
+        self.persist_groups().await;
 
         if event.kind == 9005 {
             // Group moderation delete-event: admins may delete events, but
@@ -1567,7 +1648,7 @@ mod tests {
 
     #[test]
     fn stamp_clock_is_strictly_monotonic() {
-        let clock = StampClock::new();
+        let clock = StampClock::new_with_last(0);
         let a = clock.stamp(100);
         let b = clock.stamp(50);
         let c = clock.stamp(1000);
@@ -1576,6 +1657,90 @@ mod tests {
         assert!(b > a, "a lower floor must not lower the stamp");
         assert!(c > b && c >= 1000);
         assert!(d > c, "a zero floor must not lower the stamp");
+    }
+
+    #[test]
+    fn stamp_clock_resumes_above_bootstrapped_last() {
+        // Restart recovery: stamps issued after bootstrapping from the
+        // newest stored relay event must exceed every pre-restart stamp.
+        let clock = StampClock::new_with_last(1_700_000_000);
+        let a = clock.stamp(1_700_000_000);
+        assert!(
+            a > 1_700_000_000,
+            "a post-restart stamp must exceed the bootstrapped last: {a}"
+        );
+        assert!(clock.stamp(a) > a);
+    }
+
+    #[test]
+    fn relay_bootstraps_stamps_from_stored_relay_events() {
+        // End-to-end restart recovery: a relay-signed replaceable stored
+        // before (re)construction must be outranked by fresh stamps.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = std::env::temp_dir()
+                .join("nostrfy-stamp-bootstrap")
+                .join(format!("{:x}-{id}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            let mut cfg = crate::config::Config::default();
+            cfg.database.path = path;
+            cfg.database.map_size = 16 * 1024 * 1024;
+            cfg.database.max_map_size = 256 * 1024 * 1024;
+            let db = crate::db::DbClient::open(
+                &cfg.database,
+                true,
+                std::sync::Arc::new(Default::default()),
+                0,
+                128,
+                4096,
+                262144,
+            )
+            .unwrap();
+            let secp = secp256k1::Secp256k1::new();
+            let keypair =
+                secp256k1::Keypair::from_seckey_slice(&secp, &[11u8; 32]).expect("test key");
+            let pubkey = secp256k1::XOnlyPublicKey::from_keypair(&keypair)
+                .0
+                .to_string();
+            let secret = hex::encode([11u8; 32]);
+            let stamped = 1_700_000_000u64;
+            let mut ev = crate::event::Event {
+                id: String::new(),
+                pubkey: pubkey.clone(),
+                created_at: stamped,
+                kind: crate::nips::nip29::GROUP_META,
+                tags: vec![vec!["d".to_string(), "g".to_string()]],
+                content: String::new(),
+                sig: String::new(),
+            };
+            ev.id = crate::nips::nip01::compute_id(&ev);
+            let raw = ev.id_bytes().expect("test id");
+            ev.sig = secp.sign_schnorr_no_aux_rand(&raw, &keypair).to_string();
+            assert!(matches!(
+                db.put(ev, stamped).await,
+                crate::db::PutOutcome::Stored
+            ));
+            let config = std::sync::Arc::new(tokio::sync::RwLock::new(cfg));
+            let relay = Relay::new(
+                config,
+                db,
+                crate::stats::Stats::new(),
+                &secret,
+                crate::relay::LiveBusConfig {
+                    buffer: 1024,
+                    batch_interval_ms: 10,
+                    batch_size: 64,
+                },
+            )
+            .await;
+            assert!(
+                relay.stamp_floor(stamped) > stamped,
+                "fresh stamps must outrank the stored relay event"
+            );
+            relay.db.shutdown();
+        });
     }
 
     #[test]
@@ -1618,6 +1783,22 @@ mod tests {
         // A *mixed-case* string (uppercase prefix, lowercase data) is
         // invalid bech32 and must not be flagged.
         assert!(!contains_secret_key(&format!("NSEC1{}", &key[5..])));
+
+        // A multi-byte boundary must not panic: a 63-byte window ending
+        // inside a multi-byte character is skipped, not sliced.
+        let boundary = format!("{}😀{}ab", "a".repeat(60), key);
+        assert!(contains_secret_key(&boundary));
+        let split_emoji = format!("{}😀{}", "a".repeat(60), "b".repeat(60));
+        assert!(!contains_secret_key(&split_emoji));
+
+        // A bech32m-valid look-alike is not a spendable nsec key (real nsec
+        // is legacy bech32) and must not mute the event.
+        let m_key = crate::nips::nip19::bech32m_encode("nsec", &[0x42u8; 32]).unwrap();
+        assert_ne!(m_key, key, "bech32m encoding differs from bech32");
+        assert!(
+            !contains_secret_key(&m_key),
+            "a bech32m-only nsec look-alike must not be flagged"
+        );
     }
 
     /// Ingestion throughput benchmark through the real write path:

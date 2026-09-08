@@ -222,14 +222,16 @@ impl S3Client {
             ("x-amz-date".to_string(), amz_date.to_string()),
         ];
         if let Some(ct) = content_type {
-            headers.push(("content-type".to_string(), ct.trim().to_ascii_lowercase()));
+            // SigV4 signs header values verbatim (trimmed): lowercasing a
+            // mixed-case MIME (`Text/Plain`) would mismatch the sent value.
+            headers.push(("content-type".to_string(), ct.trim().to_string()));
         }
         for (name, value) in extra_headers {
-            // The name must be lowercased too: S3 canonicalizes the
-            // received headers (HTTP names are case-insensitive and the
-            // client sends them lowercase), so a signed "Range" would
-            // never match the sent "range" — every ranged GET would 403.
-            headers.push((name.to_ascii_lowercase(), value.trim().to_ascii_lowercase()));
+            // Only the name is lowercased: S3 canonicalizes the received
+            // header names (HTTP names are case-insensitive and the client
+            // sends them lowercase), but values are verbatim. Lowercasing a
+            // value would break the signature for mixed-case values.
+            headers.push((name.to_ascii_lowercase(), value.trim().to_string()));
         }
         headers.sort_by(|a, b| a.0.cmp(&b.0));
         let mut canonical_headers = String::new();
@@ -341,43 +343,60 @@ impl S3Client {
     /// `ListObjectsV2` for a prefix; returns (key, size). Used by the
     /// one-time automatic migration, which needs the blob sizes without
     /// downloading the objects.
+    #[allow(dead_code)]
     pub(crate) async fn list_keys(&self, prefix: &str) -> Result<Vec<(String, u64)>> {
         let mut keys = Vec::new();
         let mut token = String::new();
         loop {
-            let query = format!(
-                "list-type=2&prefix={}{}",
-                percent_encode(prefix),
-                if token.is_empty() {
-                    String::new()
-                } else {
-                    format!("&continuation-token={}", percent_encode(&token))
-                }
-            );
-            let (status, bytes) = self.send("GET", "", &query, None, None, &[]).await?;
-            if !status.is_success() {
-                return Err(crate::error::Error::Other(format!(
-                    "s3 list failed: {status}"
-                )));
-            }
-            let xml = String::from_utf8_lossy(&bytes);
-            for block in xml.split("<Contents>").skip(1) {
-                let Some(end) = block.find("</Contents>") else {
-                    break;
-                };
-                let block = &block[..end];
-                let key = extract_tag(block, "Key");
-                if !key.is_empty() {
-                    let size = extract_tag(block, "Size").trim().parse().unwrap_or(0);
-                    keys.push((key.to_string(), size));
-                }
-            }
-            token = xml_unescape(extract_tag(&xml, "NextContinuationToken").trim());
+            let (page, next) = self.list_keys_page(prefix, &token).await?;
+            keys.extend(page);
+            token = next;
             if token.is_empty() {
                 break;
             }
         }
         Ok(keys)
+    }
+
+    /// One `ListObjectsV2` page: returns the page's (key, size) pairs plus
+    /// the continuation token (empty when the listing is complete). Split
+    /// out so the migration can commit page by page instead of
+    /// materializing million-key buckets before writing anything.
+    pub(crate) async fn list_keys_page(
+        &self,
+        prefix: &str,
+        token: &str,
+    ) -> Result<(Vec<(String, u64)>, String)> {
+        let query = format!(
+            "list-type=2&prefix={}{}",
+            percent_encode(prefix),
+            if token.is_empty() {
+                String::new()
+            } else {
+                format!("&continuation-token={}", percent_encode(token))
+            }
+        );
+        let (status, bytes) = self.send("GET", "", &query, None, None, &[]).await?;
+        if !status.is_success() {
+            return Err(crate::error::Error::Other(format!(
+                "s3 list failed: {status}"
+            )));
+        }
+        let xml = String::from_utf8_lossy(&bytes);
+        let mut keys = Vec::new();
+        for block in xml.split("<Contents>").skip(1) {
+            let Some(end) = block.find("</Contents>") else {
+                break;
+            };
+            let block = &block[..end];
+            let key = extract_tag(block, "Key");
+            if !key.is_empty() {
+                let size = extract_tag(block, "Size").trim().parse().unwrap_or(0);
+                keys.push((key.to_string(), size));
+            }
+        }
+        let token = xml_unescape(extract_tag(&xml, "NextContinuationToken").trim());
+        Ok((keys, token))
     }
 }
 

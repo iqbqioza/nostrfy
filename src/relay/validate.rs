@@ -104,7 +104,9 @@ impl super::Relay {
         // The spec requires the relay to honor the request "regardless of
         // the user's status", so it is detected *before* the access-control
         // checks: a blocked or restricted pubkey must still be able to
-        // vanish.
+        // vanish. Note: `validate_base` (signatures, PoW when configured)
+        // still runs first — "status" covers allow/block state, not proof
+        // of authorship or anti-spam proof-of-work.
         if cfg.nip_enabled(62)
             && nip62::is_vanish(event)
             && nip62::targets_us(event, &cfg.relay_identity())
@@ -215,6 +217,10 @@ impl super::Relay {
                     }
                 }
                 // NIP-29 `previous` timeline references must exist.
+                // The recommendation (at least 3 refs from the last 50,
+                // 4-byte prefixes) is intentionally not enforced: zero refs
+                // are legal per spec, and any hex length is accepted so
+                // clients sending longer prefixes keep working.
                 let mut unknown: Option<&str> = None;
                 for prefix in nip29::previous_tags(event) {
                     let Ok(prefix) = hex::decode(&prefix) else {
@@ -292,7 +298,9 @@ impl super::Relay {
         }
         // NIP-09: a deletion request is defined as having a list of one or
         // more `e` or `a` tags. A kind-5 event with no targets has no
-        // effect and would only accumulate as meaningless history.
+        // effect and would only accumulate as meaningless history, so it is
+        // rejected (stricter than the letter of the spec, which only
+        // defines the shape — documented here).
         if cfg.nip_enabled(9)
             && event.kind == nip09::DELETION_KIND
             && !event
@@ -472,8 +480,8 @@ impl super::Relay {
             crate::nips::nip42::AUTH_KIND
                 | crate::nips::nip98::AUTH_KIND
                 | crate::nips::nip43::JOIN
+                | crate::nips::nip43::INVITE
                 | crate::nips::nip43::LEAVE
-                | 28935 // NIP-43 Invite Request
                 | 24133 // NIP-46 Nostr Connect
                 | 23194 // NIP-47 wallet request
                 | 23195 // NIP-47 wallet response
@@ -502,7 +510,11 @@ pub(crate) fn contains_secret_key(text: &str) -> bool {
     let win = NSEC_PREFIX.len() + NSEC_BODY_LEN;
     let mut i = 0;
     while i + win <= bytes.len() {
+        // Both window edges must lie on character boundaries: slicing in the
+        // middle of a multi-byte character would panic and turn a crafted
+        // UTF-8 event into a connection-task abort (DoS).
         if text.is_char_boundary(i)
+            && text.is_char_boundary(i + win)
             && bytes[i..i + NSEC_PREFIX.len()]
                 .iter()
                 .zip(NSEC_PREFIX)
@@ -989,9 +1001,9 @@ mod tests {
             for kind in [
                 22242, // NIP-42 AUTH
                 27235, // NIP-98 HTTP auth
-                28934, // NIP-43 JOIN
-                28935, // NIP-43 Invite Request
-                28936, // NIP-43 LEAVE
+                crate::nips::nip43::JOIN,
+                crate::nips::nip43::INVITE,
+                crate::nips::nip43::LEAVE,
                 24133, // NIP-46 Nostr Connect
                 23194, // NIP-47 wallet request
                 23195, // NIP-47 wallet response

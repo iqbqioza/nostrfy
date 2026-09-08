@@ -20,11 +20,16 @@ pub const MEMBERSHIP_LIST: u64 = 13534;
 pub const ADD_USER: u64 = 8000;
 pub const REMOVE_USER: u64 = 8001;
 pub const JOIN: u64 = 28934;
+/// NIP-43 invite request: reserved ephemeral kind. This relay never issues
+/// invite codes, so these events carry no relay state change — they are
+/// accepted as generic ephemeral events (forwarded live, never stored),
+/// like any other unhandled ephemeral kind.
+pub const INVITE: u64 = 28935;
 pub const LEAVE: u64 = 28936;
 /// Tag on a `kind:33534` tombstone marking a role as deleted.
 pub const DELETED_TAG: &str = "deleted";
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Role {
     pub label: String,
     pub description: String,
@@ -39,12 +44,33 @@ pub struct RoleStore {
     pub assignments: HashMap<String, Vec<String>>,
 }
 
+/// The persistable NIP-43 role state (see the `ROLE` table).
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+pub(crate) struct RolesSnapshot {
+    pub roles: HashMap<String, Role>,
+    pub assignments: HashMap<String, Vec<String>>,
+}
+
 impl RoleStore {
     /// Whether `pubkey` holds at least one role assignment.
     pub fn is_member_of(&self, pubkey: &str) -> bool {
         self.assignments
             .get(pubkey)
             .is_some_and(|roles| !roles.is_empty())
+    }
+
+    /// Persisted snapshot of the role state (see the `ROLE` table).
+    pub(crate) fn snapshot(&self) -> RolesSnapshot {
+        RolesSnapshot {
+            roles: self.roles.clone(),
+            assignments: self.assignments.clone(),
+        }
+    }
+
+    /// Restores state persisted by [`Self::snapshot`].
+    pub(crate) fn restore(&mut self, snap: RolesSnapshot) {
+        self.roles = snap.roles;
+        self.assignments = snap.assignments;
     }
 
     pub fn create(

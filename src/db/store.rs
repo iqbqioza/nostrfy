@@ -86,6 +86,12 @@ pub(crate) const ACCESS: &str = "access";
 /// sha256 → blob metadata (mime/size/uploaded/owners) plus the per-owner
 /// reverse index, persisted so Blossom lookups need no in-memory index.
 pub(crate) const BLOSSOM: &str = "blossom";
+/// NIP-29 group state snapshot (`groups:snapshot`), persisted so restarts
+/// restore groups without replaying the full moderation history.
+pub(crate) const GROUPS: &str = "groups";
+/// NIP-43 role state snapshot (`roles:snapshot`), persisted for the same
+/// reason as [`GROUPS`].
+pub(crate) const ROLES: &str = "roles";
 pub(crate) const CREATED_LEN: usize = 8;
 pub(crate) const ID_LEN: usize = 32;
 pub(crate) const TAG_VALUE_MAX: usize = 1024;
@@ -273,6 +279,13 @@ pub(crate) struct Store {
     /// under a single fixed key so they survive restarts.
     pub(crate) access: Database<Bytes, Bytes>,
     pub(crate) blossom: Database<Bytes, Bytes>,
+    /// Serialized NIP-29 group state snapshot (see
+    /// [`crate::nips::nip29::GroupsSnapshot`]), written on every group
+    /// mutation so restarts restore groups without replaying history.
+    pub(crate) groups: Database<Bytes, Bytes>,
+    /// Serialized NIP-43 role state snapshot (see
+    /// [`crate::nips::nip43::RolesSnapshot`]), same lifecycle as [`Self::groups`].
+    pub(crate) roles: Database<Bytes, Bytes>,
     /// NIP-40 expiration handling is only active when the NIP is enabled.
     /// Shared with the relay so that a config reload can toggle it at runtime.
     pub(crate) expiry_enabled: Arc<std::sync::atomic::AtomicBool>,
@@ -354,14 +367,15 @@ impl Store {
         let first_seen = env.create_database::<Bytes, Bytes>(&mut wtxn, Some(FIRST_SEEN))?;
         let access = env.create_database::<Bytes, Bytes>(&mut wtxn, Some(ACCESS))?;
         let blossom = env.create_database::<Bytes, Bytes>(&mut wtxn, Some(BLOSSOM))?;
+        let groups = env.create_database::<Bytes, Bytes>(&mut wtxn, Some(GROUPS))?;
+        let roles = env.create_database::<Bytes, Bytes>(&mut wtxn, Some(ROLES))?;
         wtxn.commit()?;
         log::info!(
             "database ready at {} ({} tables, map {} MiB)",
             cfg.path.display(),
-            14,
+            16,
             map_size / (1024 * 1024)
         );
-
         Ok(Store {
             env,
             events,
@@ -380,6 +394,8 @@ impl Store {
             first_seen,
             access,
             blossom,
+            groups,
+            roles,
             expiry_enabled,
             max_indexed_words: max_indexed_words.max(1),
             map_max_size,
@@ -427,7 +443,7 @@ impl Store {
         // NUL-terminated string.
         if unsafe { libc::statvfs(c_path.as_ptr(), stat.as_mut_ptr()) } == 0 {
             let stat = unsafe { stat.assume_init() };
-            Some(stat.f_bavail * stat.f_frsize)
+            Some(stat.f_bavail.saturating_mul(stat.f_frsize))
         } else {
             None
         }
@@ -459,6 +475,8 @@ impl Store {
             first_seen: self.first_seen,
             access: self.access,
             blossom: self.blossom,
+            groups: self.groups,
+            roles: self.roles,
             expiry_enabled: Arc::clone(&self.expiry_enabled),
             max_indexed_words: self.max_indexed_words,
             map_max_size: self.map_max_size,
@@ -475,6 +493,50 @@ impl Store {
         self.access.put(&mut wtxn, b"access", &data)?;
         wtxn.commit()?;
         Ok(())
+    }
+
+    /// Persists the NIP-29 group state snapshot under a single fixed key.
+    /// Written on every group mutation (join/leave/moderation/vanish), so
+    /// restarts restore groups without replaying the full history.
+    pub(crate) fn save_groups(&self, snap: &crate::nips::nip29::GroupsSnapshot) -> Result<()> {
+        self.disk_full_error()?;
+        let data = serde_json::to_vec(snap)?;
+        let mut wtxn = self.env.write_txn()?;
+        self.groups.put(&mut wtxn, b"groups:snapshot", &data)?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    /// Loads the persisted NIP-29 group state snapshot, if any. `None`
+    /// means no snapshot was ever written (pre-persistence database): the
+    /// caller runs the event-replay migration instead.
+    pub(crate) fn load_groups(&self) -> Result<Option<crate::nips::nip29::GroupsSnapshot>> {
+        let rtxn = self.env.read_txn()?;
+        let Some(raw) = self.groups.get(&rtxn, b"groups:snapshot")? else {
+            return Ok(None);
+        };
+        Ok(Some(serde_json::from_slice(raw)?))
+    }
+
+    /// Persists the NIP-43 role state snapshot under a single fixed key.
+    /// Same lifecycle as [`Self::save_groups`].
+    pub(crate) fn save_roles(&self, snap: &crate::nips::nip43::RolesSnapshot) -> Result<()> {
+        self.disk_full_error()?;
+        let data = serde_json::to_vec(snap)?;
+        let mut wtxn = self.env.write_txn()?;
+        self.roles.put(&mut wtxn, b"roles:snapshot", &data)?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    /// Loads the persisted NIP-43 role state snapshot, if any (see
+    /// [`Self::load_groups`]).
+    pub(crate) fn load_roles(&self) -> Result<Option<crate::nips::nip43::RolesSnapshot>> {
+        let rtxn = self.env.read_txn()?;
+        let Some(raw) = self.roles.get(&rtxn, b"roles:snapshot")? else {
+            return Ok(None);
+        };
+        Ok(Some(serde_json::from_slice(raw)?))
     }
 
     /// Loads the persisted access control lists, if any.
@@ -508,6 +570,7 @@ impl Store {
         uploaded: i64,
         pubkey: &str,
     ) -> Result<()> {
+        self.disk_full_error()?;
         let mut wtxn = self.env.write_txn()?;
         let key = format!("sha:{sha256}");
         let existing: Option<BlossomMeta> = match self.blossom.get(&wtxn, key.as_bytes())? {
@@ -538,6 +601,7 @@ impl Store {
         &self,
         entries: &[(String, String, u64, i64, String)],
     ) -> Result<()> {
+        self.disk_full_error()?;
         let mut wtxn = self.env.write_txn()?;
         for (sha256, mime, size, uploaded, pubkey) in entries {
             let key = format!("sha:{sha256}");
@@ -586,6 +650,7 @@ impl Store {
 
     /// Marks the one-time legacy migration as done.
     pub(crate) fn mark_blossom_migration(&self) -> Result<()> {
+        self.disk_full_error()?;
         let mut wtxn = self.env.write_txn()?;
         self.blossom.put(&mut wtxn, b"migrated", b"")?;
         wtxn.commit()?;
@@ -605,6 +670,7 @@ impl Store {
     /// Removes one owner from a blob's metadata and its reverse key.
     /// Returns whether the blob had this owner.
     pub(crate) fn remove_blossom_owner(&self, sha256: &str, pubkey: &str) -> Result<bool> {
+        self.disk_full_error()?;
         let mut wtxn = self.env.write_txn()?;
         let key = format!("sha:{sha256}");
         let Some(raw) = self.blossom.get(&wtxn, key.as_bytes())? else {
@@ -629,13 +695,19 @@ impl Store {
         Ok(true)
     }
 
-    /// Every blob hash uploaded by a pubkey (hex), via the reverse index.
-    pub(crate) fn list_blossom_shas(&self, pubkey: &str) -> Result<Vec<String>> {
+    /// Blob hashes uploaded by a pubkey (hex), via the reverse index,
+    /// capped at `limit` entries: `GET /list` pages through cursors, so an
+    /// unbounded walk for a heavy uploader would materialize hundreds of
+    /// thousands of entries per request.
+    pub(crate) fn list_blossom_shas(&self, pubkey: &str, limit: usize) -> Result<Vec<String>> {
         let rtxn = self.env.read_txn()?;
         let prefix = format!("own:{pubkey}:");
         let mut out = Vec::new();
         let mut iter = self.blossom.prefix_iter(&rtxn, prefix.as_bytes())?;
-        while let Some((key, _)) = iter.next().transpose()? {
+        while out.len() < limit {
+            let Some((key, _)) = iter.next().transpose()? else {
+                break;
+            };
             let key = String::from_utf8_lossy(key);
             if let Some(sha) = key.strip_prefix(&prefix) {
                 out.push(sha.to_string());
@@ -653,6 +725,7 @@ impl Store {
         deny: &[(String, String)],
         allow: &[(String, String)],
     ) -> Result<()> {
+        self.disk_full_error()?;
         let data = serde_json::to_vec(&serde_json::json!({ "deny": deny, "allow": allow }))?;
         let mut wtxn = self.env.write_txn()?;
         self.access.put(&mut wtxn, b"relay_pubkeys", &data)?;
@@ -664,6 +737,7 @@ impl Store {
     /// the CLI command (`nostrfy blossom allow/deny`) and the running
     /// server share one source of truth without touching the config file.
     pub(crate) fn save_blossom_allow(&self, entries: &[String]) -> Result<()> {
+        self.disk_full_error()?;
         let data = serde_json::to_vec(entries)?;
         let mut wtxn = self.env.write_txn()?;
         self.access.put(&mut wtxn, b"blossom_allow", &data)?;
@@ -915,7 +989,9 @@ impl Store {
             // tags. The stored event keeps its full `d` tag.
             let rkey = replaceable_key(event.kind, &pubkey, &dtag_key_safe(&dtag));
             let old = self.replaceable.get(wtxn, &rkey)?;
-            let had_old = old.is_some();
+            let had_old = old
+                .as_ref()
+                .is_some_and(|o| o.len() >= CREATED_LEN + ID_LEN);
             if let Some(old) = old
                 && old.len() >= CREATED_LEN + ID_LEN
             {
@@ -1002,9 +1078,15 @@ impl Store {
                     let Ok(event) = serde_json::from_slice::<Event>(raw) else {
                         continue;
                     };
+                    // A non-32-byte hex pubkey (legacy corruption) must be
+                    // skipped: `encode_meta` slices `[..32]` below and would
+                    // panic the startup rebuild otherwise.
                     let Ok(pubkey) = hex::decode(&event.pubkey) else {
                         continue;
                     };
+                    if pubkey.len() != ID_LEN {
+                        continue;
+                    }
                     let expiry = crate::nips::nip40::expiry(&event).unwrap_or(0);
                     out.push((
                         id.to_vec(),
@@ -1148,10 +1230,13 @@ impl Store {
         for tag in &event.tags {
             if indexable_tag(tag) {
                 for value in &tag[1..] {
-                    self.by_tag.delete(
-                        wtxn,
-                        &tag_key(tag[0].as_bytes()[0], value.as_bytes(), event.created_at, id),
-                    )?;
+                    // Mirror the put path: over-long keys were skipped at
+                    // index time, so deleting them would hit MDB_BAD_VALSIZE
+                    // and abort the whole write batch.
+                    let key = tag_key(tag[0].as_bytes()[0], value.as_bytes(), event.created_at, id);
+                    if key.len() <= MAX_INDEX_KEY {
+                        self.by_tag.delete(wtxn, &key)?;
+                    }
                 }
             }
         }
@@ -1167,7 +1252,11 @@ impl Store {
                 .iter()
                 .take(self.max_indexed_words)
             {
-                by_word.delete(wtxn, &word_key(word, event.created_at, id))?;
+                // Mirror the put path for the same reason as tags above.
+                let key = word_key(word, event.created_at, id);
+                if key.len() <= MAX_INDEX_KEY {
+                    by_word.delete(wtxn, &key)?;
+                }
             }
         }
         Ok(())
@@ -1265,10 +1354,11 @@ pub(crate) fn is_replaceable(event: &Event) -> bool {
 }
 
 /// Returns `true` when the event was published under a NIP-26 delegation
-/// granted by `delegator`.
+/// granted by `delegator`. Compared case-insensitively like every other
+/// hex comparison, so an uppercase filter still matches.
 pub(crate) fn delegated_by(event: &Event, delegator: &str) -> bool {
     event
         .tags
         .iter()
-        .any(|t| t.len() == 4 && t[0] == "delegation" && t[1] == delegator)
+        .any(|t| t.len() == 4 && t[0] == "delegation" && t[1].eq_ignore_ascii_case(delegator))
 }

@@ -293,11 +293,11 @@ impl super::Conn {
         let eose_hint = cfg.nip_enabled(67);
         drop(cfg);
         if sub_id.is_empty() {
-            self.send_closed(sub_id, "invalid: subscription id must not be empty");
+            self.reject_req(sub_id, "invalid: subscription id must not be empty");
             return;
         }
         if sub_id.len() > max_sub_id_len {
-            self.send_closed(sub_id, "invalid: subscription id too long");
+            self.reject_req(sub_id, "invalid: subscription id too long");
             return;
         }
 
@@ -308,38 +308,41 @@ impl super::Conn {
             // value makes the whole subscription invalid like any other
             // malformed filter field.
             if crate::filter::rewrite_inbox_outbox(&mut f).is_err() {
-                self.send_closed(sub_id, "invalid: invalid filter");
+                self.reject_req(sub_id, "invalid: invalid filter");
                 return;
             }
             match serde_json::from_value::<Filter>(f) {
                 Ok(filter) => filters.push(filter),
                 Err(_) => {
-                    self.send_closed(sub_id, "invalid: invalid filter");
+                    self.reject_req(sub_id, "invalid: invalid filter");
                     return;
                 }
             }
         }
         if filters.is_empty() {
-            self.send_closed(sub_id, "invalid: REQ requires at least one filter");
+            self.reject_req(sub_id, "invalid: REQ requires at least one filter");
             return;
         }
         if filters.len() > max_filters {
-            self.send_closed(sub_id, "invalid: too many filters");
+            self.reject_req(sub_id, "invalid: too many filters");
             return;
         }
         if filters.iter().any(|f| f.too_many_members()) {
-            self.send_closed(sub_id, "invalid: too many ids or authors in a filter");
+            self.reject_req(
+                sub_id,
+                "invalid: too many ids, authors or kinds in a filter",
+            );
             return;
         }
         if filters.iter().any(|f| f.invalid_tag_values()) {
-            self.send_closed(sub_id, "invalid: tag constraint values must be strings");
+            self.reject_req(sub_id, "invalid: tag constraint values must be strings");
             return;
         }
 
         let search_disabled = filters.iter().any(|f| f.has_search()) && !search_enabled;
 
         if require_auth && !self.is_authed() {
-            self.send_closed(
+            self.reject_req(
                 sub_id,
                 "auth-required: please authenticate before subscribing",
             );
@@ -352,14 +355,14 @@ impl super::Conn {
         // (or NIP-86) apply to this connection immediately — the list is
         // read fresh per message, no reconnect needed.
         if !self.access_allows_read().await {
-            self.send_closed(sub_id, "restricted: you are not allowed to subscribe");
+            self.reject_req(sub_id, "restricted: you are not allowed to subscribe");
             return;
         }
         // NIP-01: re-REQ with an existing id replaces the subscription, so it
         // must not count against the cap — only genuinely new subscriptions
         // are limited.
         if !self.subs.contains_key(sub_id) && self.subs.len() >= max_subscriptions {
-            self.send_closed(sub_id, "error: too many subscriptions");
+            self.reject_req(sub_id, "error: too many subscriptions");
             return;
         }
 
@@ -381,14 +384,14 @@ impl super::Conn {
                     .map(|s| s.len())
                     .unwrap_or_default()
             })
-            .sum();
+            .fold(0usize, |acc, n| acc.saturating_add(n));
         let replacing = self.subs.get(sub_id).map(|(_, bytes, _)| *bytes);
         let next_total = self
             .sub_bytes
             .saturating_sub(replacing.unwrap_or(0))
             .saturating_add(sub_bytes);
         if next_total > sub_bytes_limit {
-            self.send_closed(sub_id, "error: too many subscriptions");
+            self.reject_req(sub_id, "error: too many subscriptions");
             return;
         }
         self.sub_bytes = next_total;
@@ -426,10 +429,13 @@ impl super::Conn {
         // the limit slots; the visible results are then truncated back to
         // the requested per-filter limits (their sum, since the scan unions
         // the filters).
+        // `max_limit` itself is operator-configured without an upper bound,
+        // so the sum saturates instead of overflowing (a wrap would truncate
+        // the page and confuse pagination).
         let original_total: usize = stored
             .iter()
             .map(|f| f.limit.unwrap_or(max_limit).min(max_limit))
-            .sum();
+            .fold(0usize, |acc, n| acc.saturating_add(n));
         let Some((events, more)) = self
             .relay
             .db
@@ -440,9 +446,9 @@ impl super::Conn {
             // timeline: close the subscription with a clear reason so the
             // client can retry. The subscription (which was registered
             // before the query) must be released too — a CLOSED sub must
-            // not keep receiving live events.
+            // not keep receiving live events. REQ namespace only.
             let sub_id = sub_id.to_string();
-            self.remove_subscription(&sub_id);
+            self.remove_req_subscription(&sub_id);
             self.send_closed(&sub_id, "error: database timeout, please retry");
             return;
         };
@@ -469,7 +475,25 @@ impl super::Conn {
             }
         }
         let truncated = to_send.len() > original_total;
-        to_send.truncate(original_total);
+        // NIP-01/NIP-67 boundary rule: events sharing the boundary
+        // `created_at` belong to the same page. The scan already continues
+        // ties past its limit; extend the visible truncation the same way so
+        // a tie split by withheld events is not cut in half here.
+        // Note: `truncated || more` below is computed pre-visibility-filter
+        // (like the scan's `more`), so a fully-withheld page can still
+        // report `more`. That is conservative on purpose: it prompts the
+        // client to authenticate (see the `auth` hint) instead of wrongly
+        // claiming completeness.
+        if truncated && original_total > 0 {
+            let boundary = to_send[original_total - 1].created_at;
+            let mut end = original_total;
+            while end < to_send.len() && to_send[end].created_at == boundary {
+                end += 1;
+            }
+            to_send.truncate(end);
+        } else {
+            to_send.truncate(original_total);
+        }
         // The response is queued for the pump instead of being pushed into
         // the outgoing queue all at once: the connection loop moves it into
         // the capped queue in bounded chunks as the socket drains, so a
@@ -490,8 +514,18 @@ impl super::Conn {
             self.send_notice("error: CLOSE requires a subscription id");
             return;
         };
-        // `remove_subscription` re-syncs the live index.
-        self.remove_subscription(sub_id);
+        // NIP-77: REQ and NEG-OPEN live in separate namespaces, so CLOSE
+        // releases only the REQ subscription (`NEG-CLOSE` releases NEG).
+        self.remove_req_subscription(sub_id);
+    }
+
+    /// Rejects a REQ with CLOSED, releasing any previous subscription held
+    /// under the same id first. NIP-01 treats CLOSED as terminal: without the
+    /// removal a failed re-REQ would leave a ghost subscription that keeps
+    /// receiving live events for a client-considered-closed id.
+    fn reject_req(&mut self, sub_id: &str, reason: &str) {
+        self.remove_req_subscription(sub_id);
+        self.send_closed(sub_id, reason);
     }
 
     /// Re-derives the connection's entries in the live subscription
@@ -513,9 +547,10 @@ impl super::Conn {
         index.register(self.conn_id, &components);
     }
 
-    /// Releases a subscription (and any negentropy state held under the
-    /// same id): its filter bytes, its live slot and its negentropy items.
-    pub(crate) fn remove_subscription(&mut self, sub_id: &str) {
+    /// Releases a REQ subscription only (NIP-77 separate namespace):
+    /// its filter bytes and its live slot. NEG state under the same id is
+    /// left untouched (`NEG-CLOSE` releases NEG).
+    pub(crate) fn remove_req_subscription(&mut self, sub_id: &str) {
         if let Some((_, bytes, _)) = self.subs.remove(sub_id) {
             self.sub_bytes = self.sub_bytes.saturating_sub(bytes);
             self.relay
@@ -525,21 +560,30 @@ impl super::Conn {
             self.subscriptions_held
                 .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         }
-        // NIP-77: a CLOSE on a subscription id also ends any negentropy
-        // state held under the same id (even when no REQ subscription with
-        // that id exists — a NEG-OPEN-only id must still be closable),
-        // releasing its items from the connection's memory accounting and
-        // its subscription slot.
+        self.sync_live_index();
+    }
+
+    /// Releases negentropy state only (NIP-77 separate namespace).
+    pub(crate) fn remove_neg_subscription(&mut self, sub_id: &str) {
         if let Some(state) = self.neg.remove(sub_id) {
             self.neg_total = self.neg_total.saturating_sub(state.items.len());
             self.release_neg_stats_subscription();
         }
-        self.sync_live_index();
     }
 
     pub(crate) async fn handle_auth(&mut self, rest: &[Value]) {
         if !self.relay.config.read().await.nip_enabled(42) {
-            self.send_notice("error: authentication is not enabled on this relay");
+            // NIP-42: client AUTH messages MUST be answered with OK, even
+            // when the relay does not support authentication. Correlate with
+            // the event id when one is present; otherwise fall back to NOTICE.
+            if let Some(event) = rest
+                .first()
+                .and_then(|v| serde_json::from_value::<Event>(v.clone()).ok())
+            {
+                self.send_control(nip42::ok(&event.id, false));
+            } else {
+                self.send_notice("error: authentication is not enabled on this relay");
+            }
             return;
         }
         if rest.is_empty() {
@@ -636,7 +680,10 @@ impl super::Conn {
             return;
         }
         if filters.iter().any(|f| f.too_many_members()) {
-            self.send_closed(sub_id, "invalid: too many ids or authors in a filter");
+            self.send_closed(
+                sub_id,
+                "invalid: too many ids, authors or kinds in a filter",
+            );
             return;
         }
         if filters.iter().any(|f| f.invalid_tag_values()) {
