@@ -18,7 +18,10 @@ pub const METHOD_TAG: &str = "method";
 
 /// Verifies an encoded NIP-98 event. When `expected_pubkey` is given the
 /// event must be authored by it; when `require_payload` is set the event
-/// must carry a `payload` tag (NIP-86 requires it); the `u` tag value is
+/// must carry a `payload` tag (NIP-86 requires it); when
+/// `expected_payload_hash` is given the tag value must additionally equal
+/// the sha256 hex of the request body — presence alone would let a captured
+/// authorization be replayed against a different body. The `u` tag value is
 /// checked with `url_matches` and the `method` tag must equal the HTTP
 /// method of the request (NIP-98 requirement 4).
 pub async fn verify(
@@ -26,6 +29,7 @@ pub async fn verify(
     expected_pubkey: Option<&str>,
     secp: &Secp256k1<secp256k1::All>,
     require_payload: bool,
+    expected_payload_hash: Option<&str>,
     method: &str,
     url_matches: impl Fn(&str) -> bool,
 ) -> Option<String> {
@@ -60,11 +64,12 @@ pub async fn verify(
         return None;
     }
     if require_payload {
-        let has_payload = event
-            .tags
-            .iter()
-            .any(|t| t.len() >= 2 && t[0] == PAYLOAD_TAG);
-        if !has_payload {
+        let payload_ok = event.tags.iter().any(|t| {
+            t.len() >= 2
+                && t[0] == PAYLOAD_TAG
+                && expected_payload_hash.is_none_or(|want| t[1].eq_ignore_ascii_case(want))
+        });
+        if !payload_ok {
             return None;
         }
     }
@@ -72,6 +77,13 @@ pub async fn verify(
         return None;
     }
     Some(event.pubkey)
+}
+
+/// sha256 hex of HTTP request bytes, for the NIP-98 `payload` tag
+/// comparison (NIP-98: the tag is the sha256 of the request body).
+pub fn payload_sha256_hex(data: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(data))
 }
 
 /// NIP-98: the `u` tag MUST be the absolute request URL. The scheme is
@@ -187,14 +199,14 @@ mod tests {
             // Correct method and url: accepted.
             let ev = signed_event(Some("POST"), "https://relay.example.com/", now);
             assert!(
-                verify(&encode(&ev), None, &secp, false, "POST", |u| u
+                verify(&encode(&ev), None, &secp, false, None, "POST", |u| u
                     == "https://relay.example.com/",)
                 .await
                 .is_some()
             );
             // Wrong method: rejected (NIP-98 requirement 4).
             assert!(
-                verify(&encode(&ev), None, &secp, false, "GET", |u| u
+                verify(&encode(&ev), None, &secp, false, None, "GET", |u| u
                     == "https://relay.example.com/",)
                 .await
                 .is_none()
@@ -202,8 +214,57 @@ mod tests {
             // Missing method tag: rejected.
             let bare = signed_event(None, "https://relay.example.com/", now);
             assert!(
-                verify(&encode(&bare), None, &secp, false, "POST", |u| u
+                verify(&encode(&bare), None, &secp, false, None, "POST", |u| u
                     == "https://relay.example.com/",)
+                .await
+                .is_none()
+            );
+        });
+    }
+
+    #[test]
+    fn payload_tag_must_match_body_hash() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let secp = Secp256k1::new();
+        let now = unix_now();
+        let body = br#"{"method":"banpubkey","params":[]}"#;
+        let want = payload_sha256_hex(body);
+        let mut ev = signed_event(Some("POST"), "https://relay.example.com/", now);
+        ev.tags.push(vec![PAYLOAD_TAG.into(), want.clone()]);
+        // Re-sign after adding the tag (the id commits to the tags).
+        ev.id = compute_id(&ev);
+        let id = ev.id_bytes().unwrap();
+        let keypair = Keypair::from_seckey_slice(&secp, &[5u8; 32]).unwrap();
+        ev.sig = secp.sign_schnorr_no_aux_rand(&id, &keypair).to_string();
+        let encoded = encode(&ev);
+        rt.block_on(async {
+            // Matching hash: accepted.
+            assert!(
+                verify(&encoded, None, &secp, true, Some(&want), "POST", |u| u
+                    == "https://relay.example.com/",)
+                .await
+                .is_some()
+            );
+            // A captured authorization replayed against another body: rejected.
+            let other = payload_sha256_hex(br#"{"method":"allowpubkey","params":[]}"#);
+            assert!(
+                verify(&encoded, None, &secp, true, Some(&other), "POST", |u| u
+                    == "https://relay.example.com/",)
+                .await
+                .is_none()
+            );
+            // Missing tag when required: rejected.
+            let bare = signed_event(Some("POST"), "https://relay.example.com/", now);
+            assert!(
+                verify(
+                    &encode(&bare),
+                    None,
+                    &secp,
+                    true,
+                    Some(&want),
+                    "POST",
+                    |u| u == "https://relay.example.com/",
+                )
                 .await
                 .is_none()
             );

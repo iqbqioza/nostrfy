@@ -924,6 +924,9 @@ fn load_blossom_allow(cfg: &Config) -> Result<Vec<String>> {
 /// Persists the Blossom upload allowlist (hex pubkeys).
 fn save_blossom_allow(cfg: &Config, entries: &[String]) -> Result<()> {
     let env = open_db_env(cfg)?;
+    // Disk-full guard like the server write paths: an mmap commit on a
+    // full disk raises SIGBUS instead of failing cleanly.
+    crate::db::store::check_env_space(&env)?;
     let mut wtxn = env.write_txn()?;
     let access =
         env.create_database::<heed::types::Bytes, heed::types::Bytes>(&mut wtxn, Some("access"))?;
@@ -972,6 +975,8 @@ fn save_relay_pubkeys(
     allow: &[(String, String)],
 ) -> Result<()> {
     let env = open_db_env(cfg)?;
+    // Same disk-full guard as `save_blossom_allow` above.
+    crate::db::store::check_env_space(&env)?;
     let mut wtxn = env.write_txn()?;
     let access =
         env.create_database::<heed::types::Bytes, heed::types::Bytes>(&mut wtxn, Some("access"))?;

@@ -163,7 +163,7 @@ pub async fn rpc_handler(
         )
             .into_response();
     }
-    let Some(identity) = rpc_authenticated(&relay, &headers, &uri).await else {
+    let Some(identity) = rpc_authenticated(&relay, &headers, &uri, &body).await else {
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({ "error": "unauthorized" })),
@@ -200,9 +200,18 @@ pub async fn rpc_handler(
             if !is_pubkey(pubkey) {
                 return rpc_err("invalid pubkey");
             }
+            // Normalize to lowercase hex: `hex::decode` accepts uppercase,
+            // but events carry lowercase pubkeys and the access checks
+            // compare case-insensitively — storing the canonical form keeps
+            // the lists (and their persisted JSON) unambiguous.
+            let pubkey = pubkey.to_ascii_lowercase();
             {
                 let mut access = relay.access.write().await;
-                if !access.blocked_pubkeys.iter().any(|(p, _)| p == pubkey) {
+                if !access
+                    .blocked_pubkeys
+                    .iter()
+                    .any(|(p, _)| p.eq_ignore_ascii_case(&pubkey))
+                {
                     access
                         .blocked_pubkeys
                         .push((pubkey.to_string(), reason.to_string()));
@@ -218,7 +227,9 @@ pub async fn rpc_handler(
             };
             {
                 let mut access = relay.access.write().await;
-                access.blocked_pubkeys.retain(|(p, _)| p != pubkey);
+                access
+                    .blocked_pubkeys
+                    .retain(|(p, _)| !p.eq_ignore_ascii_case(pubkey));
             }
             relay.persist_access().await;
             audit!(&relay, &identity, "unbanpubkey", params);
@@ -243,12 +254,20 @@ pub async fn rpc_handler(
             if !is_pubkey(pubkey) {
                 return rpc_err("invalid pubkey");
             }
+            // Same lowercase normalization as `banpubkey` above.
+            let pubkey = pubkey.to_ascii_lowercase();
             {
                 let mut access = relay.access.write().await;
                 // NIP-86: allowing a pubkey also un-bans it (matching the
                 // legacy endpoint), so `banpubkey` can be reverted.
-                access.blocked_pubkeys.retain(|(p, _)| p != pubkey);
-                if !access.allowed_pubkeys.iter().any(|(p, _)| p == pubkey) {
+                access
+                    .blocked_pubkeys
+                    .retain(|(p, _)| !p.eq_ignore_ascii_case(&pubkey));
+                if !access
+                    .allowed_pubkeys
+                    .iter()
+                    .any(|(p, _)| p.eq_ignore_ascii_case(&pubkey))
+                {
                     access
                         .allowed_pubkeys
                         .push((pubkey.to_string(), reason.to_string()));
@@ -264,7 +283,9 @@ pub async fn rpc_handler(
             };
             {
                 let mut access = relay.access.write().await;
-                access.allowed_pubkeys.retain(|(p, _)| p != pubkey);
+                access
+                    .allowed_pubkeys
+                    .retain(|(p, _)| !p.eq_ignore_ascii_case(pubkey));
             }
             relay.persist_access().await;
             audit!(&relay, &identity, "unallowpubkey", params);
@@ -606,6 +627,7 @@ async fn rpc_authenticated(
     relay: &Relay,
     headers: &HeaderMap,
     uri: &axum::http::Uri,
+    body: &str,
 ) -> Option<String> {
     let cfg = relay.config.read().await;
     if !cfg.rpc.management_token.is_empty()
@@ -627,6 +649,7 @@ async fn rpc_authenticated(
             Some(&cfg.rpc.admin_pubkey),
             relay.secp(),
             true,
+            Some(&nip98::payload_sha256_hex(body.as_bytes())),
             "POST",
             |url| nip98::matches_request_url(url, &cfg.relay_identity(), uri.path(), uri.query()),
         )

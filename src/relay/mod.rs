@@ -786,11 +786,23 @@ impl Relay {
             // amplify into thousands of database requests. Dedup with a set
             // so that a batch full of distinct `previous` tags (up to
             // max_tags per event) cannot turn the dedup itself quadratic.
+            // The collection is additionally capped: without a bound a
+            // single batch (EVENT_BATCH * 32 events x max_tags references)
+            // could pin megabytes of prefixes and force millions of LMDB
+            // range probes inside one read transaction, stalling the
+            // reader. References past the cap are treated as unknown, so
+            // the affected events fail closed instead of stalling the relay.
+            const MAX_PREVIOUS_PREFIXES: usize = 1024;
             let mut prefixes: Vec<Vec<u8>> = Vec::new();
             let mut seen_prefixes: std::collections::HashSet<Vec<u8>> =
                 std::collections::HashSet::new();
-            for event in &events {
+            let mut previous_capped = false;
+            'collect: for event in &events {
                 for prefix in nip29::previous_tags(event) {
+                    if prefixes.len() >= MAX_PREVIOUS_PREFIXES {
+                        previous_capped = true;
+                        break 'collect;
+                    }
                     let Ok(prefix) = hex::decode(&prefix) else {
                         continue;
                     };
@@ -798,6 +810,12 @@ impl Relay {
                         prefixes.push(prefix);
                     }
                 }
+            }
+            if previous_capped {
+                log::warn!(
+                    "capped previous-tag references at {MAX_PREVIOUS_PREFIXES} for a batch of {} events",
+                    events.len()
+                );
             }
             let mut known: std::collections::HashSet<Vec<u8>> = if prefixes.is_empty() {
                 std::collections::HashSet::new()

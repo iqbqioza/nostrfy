@@ -212,9 +212,9 @@ impl super::Conn {
                     if self.giftwrap_restricted
                         && item.wrap_recipients.is_some()
                         && !self.authed_pubkeys.iter().any(|pk| {
-                            item.wrap_recipients
-                                .as_ref()
-                                .is_some_and(|recips| recips.iter().any(|r| r == pk))
+                            item.wrap_recipients.as_ref().is_some_and(|recips| {
+                                recips.iter().any(|r| r.eq_ignore_ascii_case(pk))
+                            })
                         })
                     {
                         return false;

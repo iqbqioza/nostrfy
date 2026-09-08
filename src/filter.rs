@@ -143,6 +143,10 @@ impl Filter {
         // any other length must not let an attacker's event match filters
         // on somebody else's pubkey. Pubkey comparison is case-insensitive
         // for the same stored/live agreement reason as `ids` above.
+        // Note: the tag's signature and conditions are NOT re-verified here
+        // (trusted input — every caller feeds events that passed
+        // `nip26::verify` at intake before store/broadcast); future callers
+        // with unvalidated events must verify first.
         if let Some(authors) = &self.authors
             && !authors.iter().any(|a| Self::hex_eq(a, ev.pubkey()))
             && !ev.tags().iter().any(|t| {

@@ -814,9 +814,12 @@ impl super::Conn {
             // lists, so the lists cannot apply to them: they always read.
             return true;
         }
-        self.authed_pubkeys
-            .iter()
-            .any(|pk| !access.blocked_pubkeys.iter().any(|(p, _)| p == pk))
+        self.authed_pubkeys.iter().any(|pk| {
+            !access
+                .blocked_pubkeys
+                .iter()
+                .any(|(p, _)| p.eq_ignore_ascii_case(pk))
+        })
     }
 
     /// Whether any authenticated pubkey is an operator identity: the
@@ -852,10 +855,17 @@ impl super::Conn {
     pub(crate) fn gift_wrap_visible(&self, event: &Event) -> bool {
         !self.giftwrap_restricted
             || event.kind != crate::nips::nip62::GIFT_WRAP_KIND
-            || event
-                .tags
-                .iter()
-                .any(|t| t.len() >= 2 && t[0] == "p" && self.authed_pubkeys.contains(&t[1]))
+            || event.tags.iter().any(|t| {
+                t.len() >= 2
+                    && t[0] == "p"
+                    && self
+                        .authed_pubkeys
+                        .iter()
+                        // Case-insensitive like the vanish purge (which
+                        // walks both cases): an uppercase `p` wrap is stored
+                        // verbatim and must still reach its recipient.
+                        .any(|pk| pk.eq_ignore_ascii_case(&t[1]))
+            })
     }
     /// Whether a NIP-78 application-specific event may be served on this
     /// connection: only to the authenticated owner (the event author's
