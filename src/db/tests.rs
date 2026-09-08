@@ -2030,14 +2030,21 @@ fn reported_reads_survive_a_writer_backlog() {
         // The put's reply can arrive before the writer drain releases its
         // accounting (reply-then-drop ordering): wait for the counters to
         // settle before fabricating the backlog, or the late release races
-        // the fabricated values (flaky on slow schedulers).
-        for _ in 0..200 {
+        // the fabricated values (flaky on slow/heavily loaded schedulers).
+        // A bounded wait with a loud failure: never settling would itself
+        // signal a real accounting leak.
+        let start = std::time::Instant::now();
+        loop {
             let settled = db.pending_msgs.load(std::sync::atomic::Ordering::Relaxed) == 0
                 && db.pending_events.load(std::sync::atomic::Ordering::Relaxed) == 0;
             if settled {
                 break;
             }
-            tokio::task::yield_now().await;
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(10),
+                "writer accounting never settled after put"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
         db.pending_msgs
             .store(4, std::sync::atomic::Ordering::Relaxed);
