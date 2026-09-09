@@ -1952,8 +1952,9 @@ mod tests {
             )
         };
         assert_eq!(ret, 0, "getsockopt must succeed");
-        assert_eq!(
-            val, 1,
+        // Nonzero means set (Linux reports 1, FreeBSD reports 4).
+        assert_ne!(
+            val, 0,
             "SO_REUSEADDR must be set so restarts survive TIME_WAIT sockets"
         );
     }
