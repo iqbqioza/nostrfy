@@ -135,6 +135,15 @@ async fn bind_listener(addr: &(String, u16), label: &str) -> Result<TcpListener>
                 } else {
                     tokio::net::TcpSocket::new_v6()?
                 };
+                // SO_REUSEADDR is mandatory, not optional: without it a
+                // restart fails with EADDRINUSE while any TIME_WAIT socket
+                // for the port exists (constant traffic = always), and the
+                // accepted connections inherit the flag — so a listener
+                // without it *also* poisons the next restart even after
+                // this is fixed (both sides need the flag; the stale
+                // TIME_WAITs age out in ~60 s). `TcpListener::bind` (mio)
+                // sets this implicitly; `TcpSocket` does not.
+                socket.set_reuseaddr(true)?;
                 socket.bind(sock_addr)?;
                 socket.listen(LISTEN_BACKLOG)
             })();
@@ -1917,6 +1926,37 @@ mod tests {
             "the active connection must be closed on shutdown"
         );
         handle.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bind_listener_sets_reuseaddr() {
+        // Regression: the backlog change briefly moved binding to a raw
+        // `TcpSocket` without SO_REUSEADDR, so every restart failed with
+        // EADDRINUSE while TIME_WAITs existed (constant traffic = always).
+        let listener = bind_listener(&("127.0.0.1".to_string(), 0), "test")
+            .await
+            .expect("bind on an ephemeral port");
+        let fd = std::os::unix::io::AsRawFd::as_raw_fd(&listener);
+        let mut val: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: `fd` is a live socket owned by `listener`; `val`/`len`
+        // point at valid local memory for the duration of the call.
+        let ret = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_REUSEADDR,
+                (&mut val as *mut libc::c_int).cast::<libc::c_void>(),
+                &mut len,
+            )
+        };
+        assert_eq!(ret, 0, "getsockopt must succeed");
+        // Nonzero means set (Linux reports 1, FreeBSD reports 4).
+        assert_ne!(
+            val, 0,
+            "SO_REUSEADDR must be set so restarts survive TIME_WAIT sockets"
+        );
     }
 
     #[test]
