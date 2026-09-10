@@ -792,8 +792,22 @@ impl Config {
                 .filter(|num| !self.relay.disabled_nips.contains(num))
                 .collect::<Vec<_>>()
         };
+        // NIPs whose relay-side behaviour needs the relay's own key (NIP-29
+        // group metadata, NIP-43 role/membership events, NIP-66 discovery
+        // publication) are not advertised without it; NIP-86 is not
+        // advertised without management credentials (every RPC call would be
+        // refused).
+        let relay_has_key = !self.relay.private_key.trim().is_empty();
+        let rpc_usable = !self.rpc.management_token.trim().is_empty()
+            || !self.rpc.admin_pubkey.trim().is_empty();
         base.into_iter()
             .filter(|nip| {
+                if !relay_has_key && matches!(nip, 29 | 43 | 66) {
+                    return false;
+                }
+                if !rpc_usable && *nip == 86 {
+                    return false;
+                }
                 if let Some(kinds) = Self::nip_kinds(*nip) {
                     kinds
                         .iter()
@@ -2207,7 +2221,12 @@ log_max_files = 2
 
     #[test]
     fn only_relay_nips_are_advertised() {
-        let cfg = Config::default();
+        // The key/credential-dependent NIPs (29/43/66/86) have their own
+        // prerequisite test; configure them here so this test focuses on
+        // the kind filters.
+        let mut cfg = Config::default();
+        cfg.relay.private_key = "11".repeat(32);
+        cfg.rpc.management_token = "token".to_string();
         let access = AccessControl::default();
         let nips = cfg.effective_supported_nips(&access);
         // Relay-side NIPs are advertised.
@@ -2275,7 +2294,8 @@ log_max_files = 2
 
         // Blocking only ONE of a NIP's many kinds keeps it advertised
         // (any accepted kind keeps the NIP).
-        let cfg = Config::default();
+        let mut cfg = Config::default();
+        cfg.relay.private_key = "11".repeat(32);
         let access = AccessControl {
             blocked_kinds: vec![9000], // one NIP-29 group kind
             ..Default::default()
@@ -2301,7 +2321,8 @@ log_max_files = 2
         );
 
         // Allowing only a subset still advertises the NIP (any accepted kind).
-        let cfg = Config::default();
+        let mut cfg = Config::default();
+        cfg.relay.private_key = "11".repeat(32);
         let access = AccessControl {
             allowed_kinds: vec![1, 9000, 28936, 24242, 22242],
             ..Default::default()
@@ -2321,7 +2342,10 @@ log_max_files = 2
 
     #[test]
     fn advertised_client_nips_track_their_kinds() {
-        let cfg = Config::default();
+        // A relay key keeps NIP-66 (key-dependent) advertised so its kind
+        // filter is actually exercised below.
+        let mut cfg = Config::default();
+        cfg.relay.private_key = "11".repeat(32);
         // Each advertised client-side NIP is dropped when all its kinds are
         // blocked.
         for (nip, kinds) in [

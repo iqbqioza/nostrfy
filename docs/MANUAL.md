@@ -528,7 +528,8 @@ The NIP-11 `supported_nips` list is not static: a NIP is dropped from it when ev
 - **`blocked_kinds`** — blocking all kinds of a NIP hides it (e.g. blocking kind `5` hides NIP-09). Blocking only some kinds keeps the NIP (e.g. blocking `9000` but not `9001` keeps NIP-29).
 - **`allowed_kinds`** — a NIP's kind is only accepted when listed; a NIP whose kinds are all unlisted is hidden.
 - **`reject_ephemeral`** — ephemeral kinds that are not in the NIP-mandated exempt list (`22242`, `27235`, `28934`/`28935`/`28936`, `24133`, `23194`/`23195`, `24242`, `21059`) are rejected, so NIPs relying on them are hidden.
-- NIPs without dedicated kinds (11, 13, 26, 33, 40, 45, 50, 67, 70, 77, 86) are always advertised when enabled.
+- **Prerequisites** — NIP-29, NIP-43 and NIP-66 rely on relay-signed events (group metadata, role/membership lists, the relay's own discovery event) and are hidden without `relay.private_key`; NIP-86 is hidden unless `rpc.management_token` or `rpc.admin_pubkey` is configured (otherwise every management call is refused).
+- NIPs without dedicated kinds (11, 13, 26, 33, 40, 45, 50, 67, 70, 77) are always advertised when enabled.
 
 Changes made at runtime — NIP-86 `allowkind`/`disallowkind`, or a `SIGHUP` reload of `reject_ephemeral` — are reflected in the next NIP-11 fetch. `enabled_nips`/`disabled_nips` still require a restart.
 
