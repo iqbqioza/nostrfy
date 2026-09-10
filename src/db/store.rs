@@ -879,10 +879,12 @@ pub(crate) fn tag_range(name: u8, value: &[u8], since: u64, until: u64) -> (Vec<
     start.extend_from_slice(&since.to_be_bytes());
     start.extend_from_slice(&[0u8; ID_LEN]);
 
+    // Exclusive `(until + 1, 0..)`: covers every event with
+    // `created_at <= until`, including the maximal id at exactly `until`.
     let mut end = Vec::with_capacity(prefix_len + CREATED_LEN + ID_LEN);
     end.extend_from_slice(&start[..prefix_len]);
-    end.extend_from_slice(&until.to_be_bytes());
-    end.extend_from_slice(&[0xffu8; ID_LEN]);
+    end.extend_from_slice(&until.saturating_add(1).to_be_bytes());
+    end.extend_from_slice(&[0u8; ID_LEN]);
     (start, end)
 }
 

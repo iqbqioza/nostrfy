@@ -1105,11 +1105,88 @@ fn overlong_index_components_do_not_poison_the_batch() {
         let f: Filter = serde_json::from_value(serde_json::json!({"kinds": [1]})).unwrap();
         let (res, _) = db.query(vec![f], 500, now).await;
         assert_eq!(res.len(), 3);
-        // The long tag value is not indexed, so a filter for it matches nothing.
+        // The long tag value is not indexed, but the scan falls back to the
+        // time-range match, so the filter still finds the event.
         let f: Filter = serde_json::from_value(serde_json::json!({"#t": [long_tag]})).unwrap();
         let (res, _) = db.query(vec![f], 500, now).await;
-        assert!(res.is_empty());
+        assert_eq!(
+            res.len(),
+            1,
+            "an over-long tag value must match via the scan fallback"
+        );
+        assert_eq!(res[0].id, e_long_tag.id);
     });
+}
+
+#[test]
+fn non_alphanumeric_tag_names_fall_back_to_the_scan() {
+    // Only single-letter ASCII-alphanumeric tag names are indexed; `#_` (and
+    // other non-alphanumeric names) must still match through the time-range
+    // scan so stored results agree with live delivery.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let ev = event(
+            1,
+            "underscore tag",
+            now,
+            vec![vec!["_".into(), "v".into()]],
+        );
+        assert_eq!(db.put(ev.clone(), now).await, PutOutcome::Stored);
+        let f: Filter = serde_json::from_value(serde_json::json!({"#_": ["v"]})).unwrap();
+        let (res, _) = db.query(vec![f], 500, now).await;
+        assert_eq!(
+            res.len(),
+            1,
+            "a non-indexed tag name must be found by the scan"
+        );
+        assert_eq!(res[0].id, ev.id);
+    });
+    db.shutdown();
+}
+
+#[test]
+fn until_bound_includes_the_maximal_id() {
+    // An event with `created_at == until` and the maximal id (`ff..ff`) sits
+    // exactly on the old exclusive upper bound and used to be dropped.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let mut ev = event(1, "max id at until", now, vec![]);
+        ev.id = "ff".repeat(32);
+        assert_eq!(db.put(ev.clone(), now).await, PutOutcome::Stored);
+        let f: Filter =
+            serde_json::from_value(serde_json::json!({"until": now})).unwrap();
+        let (res, _) = db.query(vec![f], 500, now).await;
+        assert_eq!(res.len(), 1, "the maximal id at `until` must be included");
+        assert_eq!(res[0].id, ev.id);
+        // One second earlier excludes it.
+        let f: Filter =
+            serde_json::from_value(serde_json::json!({"until": now - 1})).unwrap();
+        let (res, _) = db.query(vec![f], 500, now).await;
+        assert!(res.is_empty(), "the event is newer than the bound");
+    });
+    db.shutdown();
 }
 
 #[test]

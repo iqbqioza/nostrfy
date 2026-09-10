@@ -979,7 +979,7 @@ impl Store {
                     // their full content so a term past the index cap is
                     // still found (NIP-50 searches the whole content).
                     let start = word_key(WORD_OVERFLOW, since, &[0u8; ID_LEN]);
-                    let end = word_key(WORD_OVERFLOW, until, &[0xffu8; ID_LEN]);
+                    let end = word_key(WORD_OVERFLOW, until.saturating_add(1), &[0u8; ID_LEN]);
                     if !self.walk_created_range(
                         rtxn,
                         by_word,
@@ -1007,7 +1007,10 @@ impl Store {
                 }
                 ranges.push((
                     pubkey_key(&pk, since, &[0u8; ID_LEN]),
-                    pubkey_key(&pk, until, &[0xffu8; ID_LEN]),
+                    // Exclusive bound `(until + 1, 0..)` covers every event
+                    // with `created_at <= until`, including the maximal id
+                    // (`ff..ff`) at exactly `until`.
+                    pubkey_key(&pk, until.saturating_add(1), &[0u8; ID_LEN]),
                 ));
             }
             if !ranges.is_empty()
@@ -1033,37 +1036,48 @@ impl Store {
             let tag_name = name.strip_prefix('#').unwrap_or(name);
             if tag_name.len() == 1 {
                 let name_byte = tag_name.as_bytes()[0];
+                // Only ASCII-alphanumeric single-letter names are indexed
+                // (put skips the rest), and a value longer than the index-key
+                // limit is never indexed either. Anything the index cannot
+                // represent falls through to the time-range scan below, where
+                // the in-memory `Filter::matches` applies (so stored results
+                // agree with live delivery).
                 let mut ranges: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+                let mut fully_indexed = name_byte.is_ascii_alphanumeric();
+                let mut has_value = false;
                 for value in crate::filter::tag_values(values) {
+                    has_value = true;
                     // A value beyond the index-key limit was never indexed
-                    // (put skips it): a range boundary past LMDB's key
-                    // limit would error the whole query.
+                    // (put skips it): a range boundary past LMDB's key limit
+                    // would error the whole query anyway.
                     if value.len() > TAG_INDEX_VALUE_MAX {
+                        fully_indexed = false;
                         continue;
                     }
                     ranges.push(tag_range(name_byte, value.as_bytes(), since, until));
                 }
-                if !ranges.is_empty()
-                    && !self.walk_merged(
+                if fully_indexed {
+                    if !has_value {
+                        // A tag attribute with no string values (e.g. a
+                        // numeric `{"#a": 123}`) matches nothing: the final
+                        // in-memory match requires every attribute.
+                        return Ok(out.full());
+                    }
+                    if !self.walk_merged(
                         rtxn,
                         self.by_tag,
                         &ranges,
                         ascending,
                         &mut consider,
                         more,
-                    )?
-                {
-                    return Ok(false);
+                    )? {
+                        return Ok(false);
+                    }
+                    return Ok(out.full());
                 }
-                // A tag attribute with no string values (e.g. a numeric
-                // `{"#a": 123}`) matches nothing: the final in-memory
-                // `Filter::matches` requires every tag attribute to match,
-                // so an empty value set yields zero results — consistent
-                // with this index path.
-                return Ok(out.full());
             }
-            // Multi-letter tag names are not indexed (NIP-01 only requires
-            // single-letter tags to be indexed): fall through to the
+            // Multi-letter or non-alphanumeric tag names, and values too long
+            // to index, are not in the tag index: fall through to the
             // time-range scan, where the final in-memory match enforces the
             // tag filter.
         }
@@ -1073,7 +1087,10 @@ impl Store {
             for kind in kinds {
                 ranges.push((
                     kind_key(*kind, since, &[0u8; ID_LEN]),
-                    kind_key(*kind, until, &[0xffu8; ID_LEN]),
+                    // Exclusive `(until + 1, 0..)`: includes every event with
+                    // `created_at <= until`, including the maximal id at
+                    // exactly `until`.
+                    kind_key(*kind, until.saturating_add(1), &[0u8; ID_LEN]),
                 ));
             }
             if !ranges.is_empty()
@@ -1085,7 +1102,9 @@ impl Store {
         }
 
         let start = created_key(since, &[0u8; ID_LEN]);
-        let end = created_key(until, &[0xffu8; ID_LEN]);
+        // Exclusive `(until + 1, 0..)`: includes every event with
+        // `created_at <= until`, including the maximal id at exactly `until`.
+        let end = created_key(until.saturating_add(1), &[0u8; ID_LEN]);
         // A per-filter limit/budget stop only ends this filter's walk, like
         // every other index path: the remaining filters still contribute
         // results. (Returning `true` here used to drop the rest of a
