@@ -3009,6 +3009,53 @@ fn search_finds_big_events() {
 }
 
 #[test]
+fn search_finds_words_past_the_index_cap() {
+    // NIP-50 searches the whole content, but the word index only stores the
+    // first `max_indexed_words` tokens; an event whose matching word comes
+    // later must still be found (long events carry an overflow marker that
+    // the scan walks with a full-content check).
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        2, // max_indexed_words: only "early" and "fills" are indexed
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let ev = event(1, "early fills the cap late", now, vec![]);
+        assert_eq!(db.put(ev.clone(), now).await, PutOutcome::Stored);
+        // A word past the index cap is found via the overflow walk.
+        let f: Filter = serde_json::from_value(serde_json::json!({"search": "late"})).unwrap();
+        let (res, _) = db.query(vec![f], 500, now).await;
+        assert_eq!(
+            res.len(),
+            1,
+            "a word past the index cap must still be found"
+        );
+        assert_eq!(res[0].id, ev.id);
+        // The indexed prefix still works.
+        let f: Filter = serde_json::from_value(serde_json::json!({"search": "early"})).unwrap();
+        let (res, _) = db.query(vec![f], 500, now).await;
+        assert_eq!(res.len(), 1);
+        // Removal drops the overflow marker too.
+        db.apply_deletion(vec![ev.id.clone()], vec![], Some(ev.pubkey.clone()), now)
+            .await;
+        let f: Filter = serde_json::from_value(serde_json::json!({"search": "late"})).unwrap();
+        let (res, _) = db.query(vec![f], 500, now).await;
+        assert!(
+            res.is_empty(),
+            "the overflow index entry must be removed with the event"
+        );
+    });
+    db.shutdown();
+}
+
+#[test]
 fn startup_loads_bypass_fail_fast_and_timeout() {
     // The startup loads must not silently degrade to empty when the
     // queue is (momentarily) full or the reader is slow: an empty deny

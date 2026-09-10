@@ -11,8 +11,8 @@ use heed::types::Bytes;
 use heed::{Database, RoTxn};
 
 use super::store::{
-    ID_LEN, Store, TAG_INDEX_VALUE_MAX, WORD_INDEX_MAX, created_key, kind_key, pubkey_key,
-    tag_range,
+    ID_LEN, Store, TAG_INDEX_VALUE_MAX, WORD_INDEX_MAX, WORD_OVERFLOW, created_key, kind_key,
+    pubkey_key, tag_range, word_key,
 };
 use crate::error::Result;
 use crate::event::Event;
@@ -901,6 +901,9 @@ impl Store {
             return Ok(out.full());
         }
 
+        let since = filter.since.unwrap_or(0);
+        let until = filter.until.unwrap_or(u64::MAX);
+
         if filter.has_search() && !terms.is_empty() {
             // With the word index available, scan the index of every term
             // and union the candidates in one merged walk (a note matching
@@ -970,13 +973,28 @@ impl Store {
                     if !self.walk_merged(rtxn, by_word, &ranges, ascending, &mut consider, more)? {
                         return Ok(false);
                     }
+                    // The word index only stores the first
+                    // `max_indexed_words` tokens of each event; long events
+                    // also carry an overflow marker, and this walk checks
+                    // their full content so a term past the index cap is
+                    // still found (NIP-50 searches the whole content).
+                    let start = word_key(WORD_OVERFLOW, since, &[0u8; ID_LEN]);
+                    let end = word_key(WORD_OVERFLOW, until, &[0xffu8; ID_LEN]);
+                    if !self.walk_created_range(
+                        rtxn,
+                        by_word,
+                        &start,
+                        &end,
+                        ascending,
+                        &mut consider,
+                        more,
+                    )? {
+                        return Ok(false);
+                    }
                     return Ok(out.full());
                 }
             }
         }
-
-        let since = filter.since.unwrap_or(0);
-        let until = filter.until.unwrap_or(u64::MAX);
 
         if let Some(authors) = &filter.authors {
             let mut ranges: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(authors.len());

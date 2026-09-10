@@ -893,6 +893,14 @@ pub(crate) fn word_key(word: &str, created: u64, id: &[u8]) -> Vec<u8> {
     key
 }
 
+/// Sentinel word marking an event whose content has more tokens than
+/// `max_indexed_words`. The word index stores only the first N tokens, so
+/// long events also get this marker and the search scan walks those records
+/// (checking the full content per event) to find words past the cap. The
+/// sentinel contains a NUL byte, which `tokenize` can never produce (its
+/// words are alphanumeric), so it cannot collide with a real term.
+pub(crate) const WORD_OVERFLOW: &str = "\u{0}overflow";
+
 pub(crate) fn replaceable_key(kind: u64, pubkey: &[u8], dtag: &str) -> Vec<u8> {
     let mut key = Vec::with_capacity(CREATED_LEN + ID_LEN + 4 + dtag.len());
     key.extend_from_slice(&kind.to_be_bytes());
@@ -1231,13 +1239,21 @@ impl Store {
             self.expiry.put(wtxn, &created_key(exp, id), b"")?;
         }
         if let Some(by_word) = self.by_word {
-            for word in nip50::tokenize(&event.content)
-                .iter()
-                .take(self.max_indexed_words)
-            {
+            let words = nip50::tokenize(&event.content);
+            let overflow = words.len() > self.max_indexed_words;
+            for word in words.iter().take(self.max_indexed_words) {
                 let key = word_key(word, created, id);
                 // Skip rather than error: an over-long word would abort the
                 // whole write batch (see MAX_INDEX_KEY).
+                if key.len() <= MAX_INDEX_KEY {
+                    by_word.put(wtxn, &key, b"")?;
+                }
+            }
+            // Long events also carry the overflow marker so the search scan
+            // can check their full content (NIP-50 searches the whole
+            // content, but the index only stores the first N tokens).
+            if overflow {
+                let key = word_key(WORD_OVERFLOW, created, id);
                 if key.len() <= MAX_INDEX_KEY {
                     by_word.put(wtxn, &key, b"")?;
                 }
@@ -1310,12 +1326,17 @@ impl Store {
             self.expiry.delete(wtxn, &created_key(exp, id))?;
         }
         if let Some(by_word) = self.by_word {
-            for word in nip50::tokenize(&event.content)
-                .iter()
-                .take(self.max_indexed_words)
-            {
+            let words = nip50::tokenize(&event.content);
+            let overflow = words.len() > self.max_indexed_words;
+            for word in words.iter().take(self.max_indexed_words) {
                 // Mirror the put path for the same reason as tags above.
                 let key = word_key(word, event.created_at, id);
+                if key.len() <= MAX_INDEX_KEY {
+                    by_word.delete(wtxn, &key)?;
+                }
+            }
+            if overflow {
+                let key = word_key(WORD_OVERFLOW, event.created_at, id);
                 if key.len() <= MAX_INDEX_KEY {
                     by_word.delete(wtxn, &key)?;
                 }
