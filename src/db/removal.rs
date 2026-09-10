@@ -2,8 +2,8 @@
 //! vanish and the NIP-40 expiration purge.
 
 use super::store::{
-    CREATED_LEN, ID_LEN, Store, created_key, delegated_by, dtag_key_safe, pubkey_key,
-    replaceable_key, tag_key,
+    CREATED_LEN, ID_LEN, Store, created_key, delegated_by, deleted_address_key, dtag_key_safe,
+    pubkey_key, replaceable_key, tag_key,
 };
 use crate::error::Result;
 use crate::event::Event;
@@ -115,6 +115,18 @@ impl Store {
             if pubkey.len() != ID_LEN {
                 continue;
             }
+            // NIP-09: tombstone the address up to the request's created_at,
+            // so a later re-publication of an older version cannot resurrect
+            // it (the per-id tombstones below only cover the versions that
+            // exist right now). Merge with an existing tombstone by keeping
+            // the furthest cut.
+            let akey = deleted_address_key(address.kind, &pubkey, &address.d);
+            let cut = match self.deleted.get(&wtxn, &akey)? {
+                Some(old) if old.len() >= CREATED_LEN => request_created
+                    .max(u64::from_be_bytes(old[..CREATED_LEN].try_into().unwrap())),
+                _ => request_created,
+            };
+            self.deleted.put(&mut wtxn, &akey, &cut.to_be_bytes())?;
             let start = replaceable_key(address.kind, &pubkey, "");
             let end = replaceable_key(address.kind.saturating_add(1), &pubkey, "");
             let mut last_key: Option<Vec<u8>> = None;

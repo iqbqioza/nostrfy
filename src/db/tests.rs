@@ -213,6 +213,58 @@ fn deletion_by_address_and_author() {
 }
 
 #[test]
+fn deleted_address_rejects_older_republication() {
+    // NIP-09: an `a`-tag deletion must stop the relay from publishing older
+    // versions of the address afterwards ("stop publishing any referenced
+    // events"). The per-id tombstones only cover the versions present at
+    // deletion time; the address tombstone covers any later older version.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let pk = "0000000000000000000000000000000000000000000000000000000000000000";
+        let d = vec![vec!["d".to_string(), "post-1".to_string()]];
+        let v1 = event(30023, "v1", now - 10, d.clone());
+        assert_eq!(db.put(v1.clone(), now).await, PutOutcome::Stored);
+        let address = crate::nips::nip09::Address {
+            kind: 30023,
+            pubkey: pk.into(),
+            d: "post-1".into(),
+        };
+        assert_eq!(
+            db.apply_deletion(vec![], vec![address], Some(pk.into()), now)
+                .await,
+            1
+        );
+
+        // The deleted version stays deleted...
+        assert_eq!(
+            db.put(v1.clone(), now).await,
+            PutOutcome::PreviouslyDeleted
+        );
+        // ...and so does any other version timestamped up to the request.
+        let older = event(30023, "older", now - 20, d.clone());
+        assert_eq!(db.put(older, now).await, PutOutcome::PreviouslyDeleted);
+        let equal = event(30023, "equal", now, d.clone());
+        assert_eq!(db.put(equal, now).await, PutOutcome::PreviouslyDeleted);
+        // A version timestamped after the request is admitted: the deletion
+        // only covers history up to its own created_at.
+        let newer = event(30023, "newer", now + 10, d);
+        assert_eq!(db.put(newer, now).await, PutOutcome::Stored);
+    });
+    db.shutdown();
+}
+
+#[test]
 fn deletion_by_address_with_empty_d() {
     // NIP-09 `a`-tag deletion of a *replaceable* event (kind 0/3, empty `d`)
     // must work: the replaceable slot key is kind(8)+pubkey(32)+dlen(4)+d(0)
@@ -1335,6 +1387,62 @@ fn vanish_keeps_delegatee_events_of_a_delegator() {
         let (res, _) = db.query(vec![f], 10, now).await;
         assert!(res.is_empty());
     });
+}
+
+#[test]
+fn vanished_recipient_gift_wraps_are_rejected_on_republish() {
+    // NIP-62: "Relays MUST ensure that the deleted events cannot be
+    // re-broadcasted into the relay." Gift wraps addressed to the vanished
+    // pubkey are signed by random keys, so the author check cannot catch
+    // them; the recipient's p tag must.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let recipient = "aa".repeat(32);
+        assert_eq!(
+            db.apply_vanish(
+                hex::decode(&recipient).unwrap().try_into().unwrap(),
+                u64::MAX
+            )
+            .await,
+            0
+        );
+        let wrap = |content: &str, wrapper: &str, p: &str| {
+            let mut e = event(1059, content, now, vec![vec!["p".into(), p.to_string()]]);
+            e.pubkey = wrapper.to_string();
+            e.id = nip01::compute_id(&e);
+            e
+        };
+        let blocked = wrap("wrap", &"bb".repeat(32), &recipient);
+        assert!(
+            matches!(
+                db.put(blocked, now).await,
+                PutOutcome::Invalid(reason) if reason.contains("vanish")
+            ),
+            "a wrap to a vanished recipient must not be re-accepted"
+        );
+        // An uppercase p tag value decodes to the same recipient.
+        let upper = wrap(
+            "wrap-upper",
+            &"bb".repeat(32),
+            &recipient.to_ascii_uppercase(),
+        );
+        assert!(matches!(db.put(upper, now).await, PutOutcome::Invalid(_)));
+        // A wrap to someone else is still accepted.
+        let other = wrap("wrap-other", &"bb".repeat(32), &"cc".repeat(32));
+        assert_eq!(db.put(other, now).await, PutOutcome::Stored);
+    });
+    db.shutdown();
 }
 
 #[test]

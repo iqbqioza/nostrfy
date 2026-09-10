@@ -931,6 +931,18 @@ fn dtag_fingerprint(value: &str) -> String {
     let digest = Sha256::digest(value.as_bytes());
     hex::encode(&digest[..4])
 }
+
+/// Tombstone key for an `a`-tag (address) deletion, stored in the
+/// [`DELETED`] table. Event ids are exactly 32 bytes, so the one-byte prefix
+/// keeps the two key spaces disjoint; the `d` tag is normalized with
+/// [`dtag_key_safe`] exactly like the replaceable slot key it mirrors.
+pub(crate) fn deleted_address_key(kind: u64, pubkey: &[u8], dtag: &str) -> Vec<u8> {
+    let safe = dtag_key_safe(dtag);
+    let mut key = Vec::with_capacity(1 + CREATED_LEN + ID_LEN + 4 + safe.len());
+    key.push(b'a');
+    key.extend_from_slice(&replaceable_key(kind, pubkey, &safe));
+    key
+}
 impl Store {
     // ----- event persistence -----
 
@@ -970,6 +982,25 @@ impl Store {
                 "blocked: the delegator has requested to vanish".into(),
             ));
         }
+        // NIP-62: "Relays MUST ensure that the deleted events cannot be
+        // re-broadcasted into the relay." Gift wraps addressed to a vanished
+        // pubkey are signed by random keys, so the author checks above cannot
+        // catch them: reject any kind:1059 whose `p` tag names a vanished
+        // recipient.
+        if event.kind == crate::nips::nip62::GIFT_WRAP_KIND {
+            for tag in &event.tags {
+                if tag.len() >= 2
+                    && tag[0] == "p"
+                    && let Ok(recipient) = hex::decode(&tag[1])
+                    && recipient.len() == ID_LEN
+                    && self.vanish.get(wtxn, &recipient)?.is_some()
+                {
+                    return Ok(PutOutcome::Invalid(
+                        "blocked: the recipient has requested to vanish".into(),
+                    ));
+                }
+            }
+        }
         if self.banned.get(wtxn, &id)?.is_some() {
             return Ok(PutOutcome::Invalid("blocked: event has been banned".into()));
         }
@@ -1008,6 +1039,20 @@ impl Store {
             // write batch, and realistic addressable events use short `d`
             // tags. The stored event keeps its full `d` tag.
             let rkey = replaceable_key(event.kind, &pubkey, &dtag_key_safe(&dtag));
+            // NIP-09: an `a`-tag deletion tombstones the whole address up to
+            // the request's created_at, so a later re-publication of an older
+            // (or equal-timestamped) version stays deleted. Newer versions
+            // are allowed: the request only covers history up to its own
+            // timestamp.
+            if let Some(tomb) = self
+                .deleted
+                .get(wtxn, &deleted_address_key(event.kind, &pubkey, &dtag))?
+                && tomb.len() >= CREATED_LEN
+                && event.created_at
+                    <= u64::from_be_bytes(tomb[..CREATED_LEN].try_into().unwrap())
+            {
+                return Ok(PutOutcome::PreviouslyDeleted);
+            }
             let old = self.replaceable.get(wtxn, &rkey)?;
             let had_old = old
                 .as_ref()
