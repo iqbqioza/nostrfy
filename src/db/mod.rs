@@ -143,6 +143,12 @@ enum Msg {
         group: Option<String>,
         reply: oneshot::Sender<usize>,
     },
+    /// NIP-29 `kind:9008`: purge every stored event of a deleted group, so a
+    /// later re-creation of the id cannot expose the old history.
+    GroupPurge {
+        group: String,
+        reply: oneshot::Sender<usize>,
+    },
     Vanish {
         pubkey: Vec<u8>,
         /// NIP-62: events up to this created_at (the request's `.created_at`)
@@ -968,6 +974,13 @@ impl DbClient {
             reply,
         })
         .await
+    }
+
+    /// NIP-29 `kind:9008`: purges every stored event tagged with the deleted
+    /// group id.
+    pub async fn group_purge(&self, group: String) -> usize {
+        self.request_write(|reply| Msg::GroupPurge { group, reply })
+            .await
     }
 
     /// Every vanished pubkey (raw 32-byte keys). Startup-only use.

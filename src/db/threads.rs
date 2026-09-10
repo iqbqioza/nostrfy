@@ -699,6 +699,16 @@ pub(crate) fn spawn(
                                     };
                                     let _ = reply.send(n);
                                 }
+                                Msg::GroupPurge { group, reply } => {
+                                    let n = match store.purge_group(&group) {
+                                        Ok(n) => n,
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            0
+                                        }
+                                    };
+                                    let _ = reply.send(n);
+                                }
                                 Msg::Vanish {
                                     pubkey,
                                     until_created,

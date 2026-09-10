@@ -1130,6 +1130,16 @@ impl Relay {
             }
         }
 
+        if event.kind == nip29::DELETE_GROUP
+            && let Some(gid) = nip29::group_id(event)
+        {
+            // NIP-29: purge the deleted group's stored events. A fresh
+            // create on the same id installs a public group, which would
+            // otherwise expose the old (possibly private) history.
+            let removed = self.db.group_purge(gid.to_string()).await;
+            self.stats.bump(&self.stats.events_deleted, removed as u64);
+        }
+
         for mut ev in generated {
             if !self.store_relay_event(&mut ev).await {
                 // The in-memory group state moved on, but the stored
@@ -1667,6 +1677,57 @@ mod tests {
                 "the vanish reply must carry the event's real id: {:?}",
                 results
             );
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn deleting_a_group_purges_its_stored_events() {
+        // NIP-29: a deleted group's stored events are purged, so re-creating
+        // the id (which installs a public group) cannot expose the old
+        // possibly-private history.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_relay().await;
+            let now = crate::util::unix_now();
+            let secp = secp256k1::Secp256k1::new();
+            let keypair = secp256k1::Keypair::from_seckey_slice(&secp, &[4u8; 32]).unwrap();
+            let pubkey = secp256k1::XOnlyPublicKey::from_keypair(&keypair).0.to_string();
+            let signed = |kind: u64, content: &str| {
+                let mut e = crate::event::Event {
+                    id: String::new(),
+                    pubkey: pubkey.clone(),
+                    created_at: now,
+                    kind,
+                    tags: vec![vec!["h".into(), "g1".into()]],
+                    content: content.into(),
+                    sig: String::new(),
+                };
+                e.id = crate::nips::nip01::compute_id(&e);
+                let id = e.id_bytes().unwrap();
+                e.sig = secp.sign_schnorr_no_aux_rand(&id, &keypair).to_string();
+                e
+            };
+            // A stored group message (direct DB put: the purge is the target).
+            let msg = signed(1, "secret group message");
+            assert_eq!(
+                relay.db.put(msg, now).await,
+                crate::db::PutOutcome::Stored
+            );
+            let create = signed(crate::nips::nip29::CREATE_GROUP, "");
+            assert!(matches!(
+                relay.accept_event(create, &[], None).await.0,
+                crate::db::PutOutcome::Stored
+            ));
+            let delete = signed(crate::nips::nip29::DELETE_GROUP, "");
+            assert!(matches!(
+                relay.accept_event(delete, &[], None).await.0,
+                crate::db::PutOutcome::Stored
+            ));
+            let f: crate::filter::Filter =
+                serde_json::from_value(serde_json::json!({"#h": ["g1"]})).unwrap();
+            let (res, _) = relay.db.query(vec![f], 10, now).await;
+            assert!(res.is_empty(), "the deleted group's events must be purged");
             relay.db.shutdown();
         });
     }

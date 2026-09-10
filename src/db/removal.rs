@@ -222,6 +222,46 @@ impl Store {
         }
         Ok(out)
     }
+    /// NIP-29: deletes every stored event tagged with the deleted group
+    /// `gid` (the `h` tag). A fresh create on the same id installs a public
+    /// group, so without the purge the old (possibly private) history would
+    /// suddenly be served under the new settings.
+    pub(crate) fn purge_group(&self, gid: &str) -> Result<usize> {
+        self.disk_full_error()?;
+        let mut wtxn = self.env.write_txn()?;
+        let start = tag_key(b'h', gid.as_bytes(), 0, &[0u8; ID_LEN]);
+        let end = tag_key(b'h', gid.as_bytes(), u64::MAX, &[0xffu8; ID_LEN]);
+        let mut last_key: Option<Vec<u8>> = None;
+        let mut removed = 0usize;
+        loop {
+            let lower = match &last_key {
+                Some(k) => std::ops::Bound::Excluded(k.as_slice()),
+                None => std::ops::Bound::Included(start.as_slice()),
+            };
+            let entries: Vec<(Vec<u8>, Vec<u8>)> = self
+                .by_tag
+                .range(&wtxn, &(lower, std::ops::Bound::Excluded(end.as_slice())))?
+                .filter_map(|item| {
+                    item.ok()
+                        .map(|(k, _)| (k.to_vec(), k[k.len() - ID_LEN..].to_vec()))
+                })
+                .take(REMOVAL_CHUNK)
+                .collect();
+            if entries.is_empty() {
+                break;
+            }
+            last_key = Some(entries.last().unwrap().0.clone());
+            for (_, id) in entries {
+                if self.events.get(&wtxn, &id)?.is_some() {
+                    self.remove_event(&mut wtxn, &id)?;
+                    removed += 1;
+                }
+            }
+        }
+        wtxn.commit()?;
+        Ok(removed)
+    }
+
     /// NIP-62: deletes every event authored by `pubkey` (including NIP-09
     /// deletion requests and NIP-59 gift wraps that p-tag it) and records the
     /// pubkey so that no future event from it is accepted.

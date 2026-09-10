@@ -552,7 +552,7 @@ nostrfy supports NIP-29 (relay-based groups): closed chat spaces where only memb
 | `kind:9000` / `9001` | Add member (with roles) / remove member |
 | `kind:9002` | Edit metadata (name, description, public/private, ...) |
 | `kind:9005` | Delete event (moderation) |
-| `kind:9008` | Delete group |
+| `kind:9008` | Delete group (its stored events are purged) |
 | `kind:9009` | Create invite code |
 | `kind:9010` | Update pin list |
 | `kind:9021` / `9022` | Join request / leave request |

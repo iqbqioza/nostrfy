@@ -713,11 +713,10 @@ impl GroupStore {
                 if !self.groups.contains_key(gid) && (ignore_capacity || !self.at_capacity()) {
                     // A fresh create resurrects the id: clear a previous
                     // delete tombstone (and ghost marker) so the id is
-                    // reusable. Note the tombstone itself is memory-only;
-                    // if the `9008` event is later lost (author vanish,
-                    // expiry, NIP-09 deletion), the next rebuild replays
-                    // surviving history and the group returns — events are
-                    // the source of truth, and an admin can re-delete.
+                    // reusable. The deleted group's events were purged by
+                    // the relay when the `9008` was applied, so re-creation
+                    // starts from an empty history (no old private content
+                    // can surface under the new, default-public settings).
                     self.deleted.remove(gid);
                     self.unghost(gid);
                     let mut group = Group::default();

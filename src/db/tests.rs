@@ -1190,6 +1190,51 @@ fn until_bound_includes_the_maximal_id() {
 }
 
 #[test]
+fn group_purge_removes_only_that_groups_events() {
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let g1 = event(
+            1,
+            "g1 message",
+            now,
+            vec![vec!["h".into(), "group-1".into()]],
+        );
+        let g2 = event(
+            1,
+            "g2 message",
+            now - 1,
+            vec![vec!["h".into(), "group-2".into()]],
+        );
+        let plain = event(1, "no group", now - 2, vec![]);
+        for e in [&g1, &g2, &plain] {
+            assert_eq!(db.put(e.clone(), now).await, PutOutcome::Stored);
+        }
+        assert_eq!(db.group_purge("group-1".into()).await, 1);
+        let f: Filter = serde_json::from_value(serde_json::json!({"#h": ["group-1"]})).unwrap();
+        let (res, _) = db.query(vec![f], 500, now).await;
+        assert!(res.is_empty(), "the purged group must have no events");
+        let f: Filter = serde_json::from_value(serde_json::json!({"#h": ["group-2"]})).unwrap();
+        let (res, _) = db.query(vec![f], 500, now).await;
+        assert_eq!(res.len(), 1, "other groups are untouched");
+        let f: Filter = serde_json::from_value(serde_json::json!({"kinds": [1]})).unwrap();
+        let (res, _) = db.query(vec![f], 500, now).await;
+        assert_eq!(res.len(), 2, "the other group and the plain event survive");
+    });
+    db.shutdown();
+}
+
+#[test]
 fn multi_filter_req_survives_an_early_limit() {
     // A first filter that hits its limit immediately (e.g. `limit: 0`) must
     // not abort the rest of the multi-filter REQ: `[{"limit":0},{"kinds":[1]}]`
