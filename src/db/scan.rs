@@ -108,9 +108,12 @@ trait ScanCollector {
     fn full(&self) -> bool;
     /// The hard collection cap of this collector.
     fn cap(&self) -> usize;
-    /// Starts the per-filter limit accounting over (the boundary timestamp
-    /// belongs to one filter's limit, not the next one's).
-    fn reset_boundary(&mut self);
+    /// Starts a filter's limit accounting over: the created_at boundary
+    /// belongs to one filter's limit, not the next one's, and a collector
+    /// that tracks per-filter quotas selects the counter for `index`.
+    fn begin_filter(&mut self, index: usize) {
+        let _ = index;
+    }
     /// Pushes a matched event; returns `false` when the per-filter limit is
     /// reached and the event is strictly older than the boundary timestamp,
     /// so the scan stops. Events at the boundary timestamp are still
@@ -158,17 +161,37 @@ struct EventCollector {
     /// created_at of the event that filled a per-filter limit; events at
     /// the same timestamp keep being collected (see [`ScanCollector::push`]).
     boundary: Option<u64>,
+    /// Accepted events per filter, indexed by the filter's position in the
+    /// REQ. NIP-01 applies `limit` to each filter independently, so a
+    /// filter's quota must not be consumed by an earlier filter's matches.
+    counts: Vec<usize>,
+    /// The filter currently being scanned (`counts` index).
+    filter: usize,
 }
 
 impl EventCollector {
-    fn new(cap: usize, boundary_ok: bool) -> Self {
+    fn new(cap: usize, boundary_ok: bool, filters: usize) -> Self {
         EventCollector {
             events: Vec::new(),
             cap,
             boundary_ok,
             boundary: None,
+            counts: vec![0; filters],
+            filter: 0,
         }
     }
+}
+
+/// The per-filter collection cap: the filter's requested `limit` (bounded by
+/// `max_limit`), over-fetched by `hidden_slack` for the connection-level
+/// visibility rules. Kept in sync with [`ScanCollector::push`]'s `limit`.
+fn filter_collect_cap(filter: &Filter, max_limit: usize, hidden_slack: usize) -> usize {
+    filter
+        .limit
+        .unwrap_or(max_limit)
+        .min(max_limit)
+        .saturating_mul(hidden_slack.saturating_add(1))
+        .min(max_limit)
 }
 
 /// The NIP-50 relevance score of an event: the sum of the weights of the
@@ -194,11 +217,13 @@ impl ScanCollector for EventCollector {
     fn cap(&self) -> usize {
         self.cap
     }
-    fn reset_boundary(&mut self) {
+    fn begin_filter(&mut self, index: usize) {
+        self.filter = index;
         self.boundary = None;
     }
     fn push(&mut self, event: Event, _id: [u8; 32], limit: usize) -> bool {
-        if self.events.len() >= limit {
+        let count = self.counts[self.filter];
+        if count >= limit {
             if !self.boundary_ok {
                 return false;
             }
@@ -206,9 +231,10 @@ impl ScanCollector for EventCollector {
                 Some(b) if b == event.created_at => {}
                 _ => return false,
             }
-        } else if self.events.len() + 1 == limit {
+        } else if count + 1 == limit {
             self.boundary = Some(event.created_at);
         }
+        self.counts[self.filter] += 1;
         self.events.push(event);
         true
     }
@@ -299,7 +325,7 @@ impl ScanCollector for ItemCollector {
     fn cap(&self) -> usize {
         self.cap
     }
-    fn reset_boundary(&mut self) {
+    fn begin_filter(&mut self, _index: usize) {
         self.boundary = None;
     }
     fn push(&mut self, event: Event, id: [u8; 32], limit: usize) -> bool {
@@ -507,21 +533,46 @@ impl Store {
         hidden_slack: usize,
     ) -> Result<(Vec<Event>, bool)> {
         let has_search = filters.iter().any(Filter::has_search);
-        // NIP-50: relevance ordering needs more candidates than the response
-        // limit, so the scan gathers up to the search budget.
-        let collect_cap = if has_search {
-            max_limit
-                .saturating_mul(SEARCH_BUDGET_MULTIPLIER)
-                .min(SEARCH_BUDGET_MAX)
-        } else {
-            max_limit
-        };
         let kind = if count_mode {
             ScanKind::Count
         } else {
             ScanKind::Query
         };
-        let mut out = EventCollector::new(collect_cap, !count_mode);
+        // NIP-50: relevance ordering needs more candidates than the response
+        // limit, so the scan gathers up to the search budget. Per-filter
+        // quotas are tracked by the collector; the global cap only bounds
+        // total memory, so a plain REQ sums its per-filter caps (a later
+        // filter must not be starved by an earlier one's matches). COUNT
+        // keeps the old single-budget bound: it only needs enough candidates
+        // to make the count exact or report it as approximate.
+        let collect_cap = if has_search {
+            max_limit
+                .saturating_mul(SEARCH_BUDGET_MULTIPLIER)
+                .min(SEARCH_BUDGET_MAX)
+        } else if count_mode {
+            max_limit
+        } else {
+            let caps = filters.iter().fold(0usize, |acc, filter| {
+                acc.saturating_add(filter_collect_cap(filter, max_limit, hidden_slack))
+            });
+            if filters.len() == 1 {
+                // A single filter needs only its own quota. Internal
+                // full-history rebuilds (`query_full`) pass a large
+                // `max_limit` and must not be cut off by the search budget.
+                caps
+            } else {
+                // Multiple filters: bound the total memory like a search
+                // REQ while letting every filter keep its own quota up to
+                // that bound, so a later filter is never starved by an
+                // earlier one's matches.
+                caps.min(
+                    max_limit
+                        .saturating_mul(SEARCH_BUDGET_MULTIPLIER)
+                        .min(SEARCH_BUDGET_MAX),
+                )
+            }
+        };
+        let mut out = EventCollector::new(collect_cap, !count_mode, filters.len());
         let more = self.scan_collect(
             filters,
             now,
@@ -638,17 +689,22 @@ impl Store {
             self.term_dfs(&rtxn, &all_terms)
         };
 
-        for filter in filters {
-            if out.full() {
-                more = true;
-                break;
-            }
+        for (index, filter) in filters.iter().enumerate() {
             // NIP-01: `limit: 0` returns nothing for that filter but keeps
             // the subscription alive — it must neither collect nor report
             // `more` (otherwise a leading `{"limit": 0}` filter poisons the
             // whole REQ into a pagination loop).
             if !count_mode && filter.limit == Some(0) {
                 continue;
+            }
+            // NIP-01 applies `limit` to each filter independently: starting
+            // one resets its created_at boundary and selects its own quota
+            // counter, so an earlier filter filling its limit cannot starve
+            // a later one.
+            out.begin_filter(index);
+            if out.full() {
+                more = true;
+                break;
             }
             let has_search = filter.has_search();
             let limit = if count_mode {
@@ -659,14 +715,12 @@ impl Store {
                 // collection budget.
                 out.cap()
             } else {
-                let base = filter.limit.unwrap_or(max_limit).min(max_limit);
                 // Hidden-event slack: events withheld by the connection's
                 // visibility rules (NIP-70/59/29) must not consume the
-                // per-filter limit slots, so a REQ over-fetches a little
+                // per-filter limit slots, so a REQ over-fetches each filter
                 // and the connection truncates the visible results back to
                 // the requested limits.
-                base.saturating_mul(hidden_slack.saturating_add(1))
-                    .min(max_limit)
+                filter_collect_cap(filter, max_limit, hidden_slack)
             };
             let terms = if has_search {
                 let terms = nip50::terms(filter.search.as_deref().unwrap_or(""));
@@ -680,7 +734,6 @@ impl Store {
             } else {
                 Vec::new()
             };
-            out.reset_boundary();
             let scan = FilterScan {
                 filter,
                 terms: &terms,
@@ -703,7 +756,13 @@ impl Store {
                 &all_dfs,
                 &all_terms,
             )?;
-            if stop {
+            // A stopped walk is the global collection cap (nothing more can
+            // be held), the shared work budget, or this filter's quota
+            // filling. Only the cap drops the remaining filters: a
+            // quota-filled filter is done (`more` was already set by the
+            // walk) and later filters still contribute their own quotas.
+            if stop || out.full() {
+                more = true;
                 break;
             }
         }
@@ -1410,7 +1469,7 @@ mod tests {
             !c.push_light(&light2, [0xFFu8; 32], 2),
             "light limit reached"
         );
-        c.reset_boundary();
+        c.begin_filter(0);
         // A fresh collector (its own limit) for the per-kind tagging checks.
         let mut c = ItemCollector::new(8);
         // Gift wraps record their p-tag recipients; group metadata records

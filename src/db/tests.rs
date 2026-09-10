@@ -1052,6 +1052,53 @@ fn multi_filter_req_survives_an_early_limit() {
 }
 
 #[test]
+fn multi_filter_limits_are_per_filter() {
+    // NIP-01: each filter of a REQ has its own `limit`, and the response is
+    // the union of what each filter returns. An earlier filter filling its
+    // quota must not consume (or abort) a later filter's quota; the union is
+    // ordered by created_at, not by filter order.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let k1_old = event(1, "kind 1 old", now - 10, vec![]);
+        let k1_new = event(1, "kind 1 new", now, vec![]);
+        let k7 = event(7, "kind 7", now - 5, vec![]);
+        for ev in [&k1_old, &k1_new, &k7] {
+            assert_eq!(db.put(ev.clone(), now).await, PutOutcome::Stored);
+        }
+
+        let f: Vec<Filter> = serde_json::from_value(serde_json::json!([
+            {"kinds": [1], "limit": 1},
+            {"kinds": [7], "limit": 1}
+        ]))
+        .unwrap();
+        let (res, _) = db.query(f, 500, now).await;
+        assert_eq!(
+            res.len(),
+            2,
+            "the second filter must contribute despite the first filter's limit"
+        );
+        let ids: Vec<String> = res.iter().map(|e| e.id.clone()).collect();
+        assert!(ids.contains(&k1_new.id), "the newest kind-1 event wins");
+        assert!(!ids.contains(&k1_old.id), "the older kind-1 event is over quota");
+        assert!(ids.contains(&k7.id), "the kind-7 filter keeps its quota");
+        assert_eq!(res[0].id, k1_new.id, "the union is newest-first");
+        assert_eq!(res[1].id, k7.id);
+    });
+    db.shutdown();
+}
+
+#[test]
 fn ids_filter_supports_prefixes() {
     // NIP-01: `ids` entries may be event-id prefixes.
     let db = DbClient::open(
@@ -2658,13 +2705,13 @@ fn mixed_search_and_plain_filters_return_the_union() {
         let (res, _) = db.query(f, 500, now).await;
         // The old code truncated the whole response to the search filters'
         // limits, dropping every plain-filter result (only the hit would
-        // come back). The plain filter must now contribute its own events
-        // (the per-filter created_at boundary may cut the second plain
-        // event: it shares no timestamp with the limit-filling one).
-        assert_eq!(res.len(), 2, "search hit plus one plain event");
+        // come back). Each filter now has its own quota: the search filter
+        // contributes the hit and the plain filter its two events.
+        assert_eq!(res.len(), 3, "search hit plus the plain events");
         let ids: Vec<String> = res.iter().map(|e| e.id.clone()).collect();
         assert!(ids.contains(&hit.id));
         assert!(ids.contains(&plain1.id));
+        assert!(ids.contains(&plain2.id));
     });
 }
 
