@@ -2385,21 +2385,25 @@ fn read_flood_does_not_fail_fast_writes() {
 }
 
 #[test]
-fn kind_and_author_counts_serve_through_the_api_reader() {
+fn aggregate_sample_serves_through_the_api_reader() {
     let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0, 128, 4, 8).unwrap();
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
         let now = unix_now();
         db.put(event(1, "a", now, vec![]), now).await;
         db.put(event(7, "b", now, vec![]), now).await;
-        let (kinds, _) = db.kind_counts(100).await;
+        let (items, _) = db.api_neg_sample(100, now).await.expect("sample");
         assert!(
-            kinds.iter().any(|(k, c)| *k == 1 && *c >= 1),
-            "kind counts must include stored events: {kinds:?}"
+            items.iter().any(|i| i.kind == 1) && items.iter().any(|i| i.kind == 7),
+            "the sample must include the stored events"
         );
-        let (authors, _) = db.author_counts(100).await;
-        assert!(!authors.is_empty(), "author counts must be served");
+        assert!(
+            items.iter().any(|i| i.pubkey.starts_with("0000")),
+            "sample records carry the author pubkey"
+        );
         db.shutdown();
+        // After shutdown the API reader is gone: None, never a hang.
+        assert!(db.api_neg_sample(10, now).await.is_none());
     });
 }
 

@@ -160,25 +160,15 @@ fn handle_read_msg(store: &Store, errors: &Arc<std::sync::atomic::AtomicU64>, ms
             let _ = reply.send(banned);
             false
         }
-        Msg::KindCounts { max_keys, reply } => {
-            let out = match store.kind_counts(max_keys) {
-                Ok(out) => out,
-                Err(e) => {
-                    db_error(errors, &e);
-                    (Vec::new(), false)
-                }
-            };
-            let _ = reply.send(out);
-            false
-        }
-        Msg::AuthorCounts { max_keys, reply } => {
-            let out = match store.author_counts(max_keys) {
-                Ok(out) => out,
-                Err(e) => {
-                    db_error(errors, &e);
-                    (Vec::new(), false)
-                }
-            };
+        Msg::AggregateSample { limit, now, reply } => {
+            let out =
+                match store.scan_neg(&crate::filter::Filter::default(), now, limit, SCAN_BUDGET) {
+                    Ok(out) => Some(out),
+                    Err(e) => {
+                        db_error(errors, &e);
+                        None
+                    }
+                };
             let _ = reply.send(out);
             false
         }
@@ -671,22 +661,17 @@ pub(crate) fn spawn(
                                     };
                                     let _ = reply.send(out);
                                 }
-                                Msg::KindCounts { max_keys, reply } => {
-                                    let out = match store.kind_counts(max_keys) {
-                                        Ok(out) => out,
+                                Msg::AggregateSample { limit, now, reply } => {
+                                    let out = match store.scan_neg(
+                                        &crate::filter::Filter::default(),
+                                        now,
+                                        limit,
+                                        SCAN_BUDGET,
+                                    ) {
+                                        Ok(out) => Some(out),
                                         Err(e) => {
                                             db_error(&thread_errors, &e);
-                                            (Vec::new(), false)
-                                        }
-                                    };
-                                    let _ = reply.send(out);
-                                }
-                                Msg::AuthorCounts { max_keys, reply } => {
-                                    let out = match store.author_counts(max_keys) {
-                                        Ok(out) => out,
-                                        Err(e) => {
-                                            db_error(&thread_errors, &e);
-                                            (Vec::new(), false)
+                                            None
                                         }
                                     };
                                     let _ = reply.send(out);

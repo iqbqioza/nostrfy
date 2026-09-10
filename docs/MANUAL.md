@@ -400,11 +400,11 @@ curl "http://127.0.0.1:8080/api/v1/npub180cvv07tjdrrgpa0j7j7tmnyl2yr6yr7l8j4s3ev
 - `GET /api/v1/{npub1...}/{kind}/hourly?year=&month=&day=` — 24 per-hour counts for one day, zero-filled.
 - `GET /api/v1/ids/{hex}/related` — replies (`#e`) and quotes (`#q`) referencing the event.
 - `GET /api/v1/{npub1...}/follows` — the author's latest kind-3 follow list.
-- `GET /api/v1/relay/kinds` — the most common kinds on the relay (bounded walk, `approximate` flag).
+- `GET /api/v1/relay/kinds` — the most common kinds on the relay (bounded, visibility-filtered sample; `approximate` flag).
 
 ### Top authors / relay lists
 
-- `GET /api/v1/relay/top-authors` — the most active authors on the relay (bounded walk, `approximate` flag).
+- `GET /api/v1/relay/top-authors` — the most active authors on the relay (bounded, visibility-filtered sample; `approximate` flag).
 - `GET /api/v1/{npub1...}/relays` — the author's latest NIP-65 relay list (kind 10002).
 
 ### Monthly counts

@@ -27,6 +27,9 @@ use crate::nips::nip50;
 pub(crate) struct NegItem {
     pub created: u64,
     pub id: [u8; 32],
+    /// Event kind, so relay-wide aggregate endpoints can count kinds from
+    /// the lightweight records without loading the full events.
+    pub kind: u64,
     /// Author pubkey (hex), so the connection layer can serve NIP-78
     /// application-specific events only to their authenticated owner.
     pub pubkey: String,
@@ -361,6 +364,7 @@ impl ScanCollector for ItemCollector {
         self.items.push(NegItem {
             created: event.created_at,
             id,
+            kind: event.kind,
             pubkey: event.pubkey.clone(),
             protected,
             app_specific: crate::nips::nip78::is_app_specific(&event),
@@ -405,6 +409,7 @@ impl ScanCollector for ItemCollector {
         self.items.push(NegItem {
             created: event.created_at(),
             id,
+            kind: event.kind(),
             pubkey: event.pubkey().to_string(),
             protected,
             app_specific: crate::nips::nip78::is_app_specific_kind(event.kind()),

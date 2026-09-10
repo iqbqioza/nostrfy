@@ -3,6 +3,7 @@
 //! Provides a read-only JSON API for querying stored events by npub1,
 //! nevent1, or naddr1 identifiers.  Only `GET` is supported.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::Json;
@@ -1178,15 +1179,52 @@ pub async fn api_follows_handler(
     .await
 }
 
+/// Bound on the number of newest events the relay-wide aggregate endpoints
+/// sample. The counts come from lightweight records (no content) filtered
+/// with the anonymous-connection visibility rules, so hidden events cannot
+/// leak their kind/author metadata; the bound also keeps one request from
+/// walking the whole store.
+const AGGREGATE_SAMPLE: usize = 20_000;
+
+/// Anonymous visibility of a lightweight aggregate record: the same
+/// NIP-70/NIP-59/NIP-78/NIP-29 rules as [`api_visible`], evaluated without
+/// loading the event content.
+fn aggregate_visible(
+    item: &crate::db::NegItem,
+    groups: &nip29::GroupStore,
+    nip78: bool,
+) -> bool {
+    // NIP-70: protected events are never served to anonymous readers.
+    if item.protected {
+        return false;
+    }
+    // NIP-59: gift wraps are withheld from anonymous readers (`Some` only
+    // for kind 1059).
+    if item.wrap_recipients.is_some() {
+        return false;
+    }
+    // NIP-78: application-specific events are owner-only while the AUTH
+    // gate is active.
+    if nip78 && item.app_specific {
+        return false;
+    }
+    // NIP-29: private/hidden group content is withheld from non-members.
+    if let Some(gid) = &item.gid
+        && !groups.visible_gid(gid, item.meta, None)
+    {
+        return false;
+    }
+    true
+}
+
 /// `GET /api/v1/relay/kinds`
 ///
 /// The most common event kinds stored on the relay: `{"kinds": [{"kind":
 /// 1, "count": 12345}, ...], "approximate": bool}` sorted by count
-/// descending. The count walk is bounded (`approximate: true` when it was
-/// cut short). Counts are raw store totals: withheld events (protected,
-/// gift wraps, NIP-78 owner data, private groups) are included because the
-/// index walk cannot apply per-connection visibility without fetching every
-/// event; per-author `kinds`/`query` endpoints remain visibility-filtered.
+/// descending. Counts are computed over a bounded sample of the newest
+/// events, filtered with the anonymous-connection visibility rules, so
+/// protected, gift-wrap, owner-only and private-group events never leak
+/// their kind metadata. `approximate` is true when the sample was cut short.
 pub async fn api_relay_kinds_handler(
     State(relay): State<Arc<Relay>>,
     Query(params): Query<ApiParams>,
@@ -1197,13 +1235,25 @@ pub async fn api_relay_kinds_handler(
             Json(json!({ "error": "server is busy, try again shortly" })),
         );
     };
-    let limit = params.limit.unwrap_or(20).min(100);
-    // The walk examines at most half a million index entries (bounded work
-    // on the dedicated API reader thread); `approximate` reports whether it
-    // was cut short.
-    const MAX_KEYS: usize = 500_000;
-    let (counts, more) = relay.db.kind_counts(MAX_KEYS).await;
+    let now = unix_now();
+    let Some((items, more)) = relay.db.api_neg_sample(AGGREGATE_SAMPLE, now).await else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "database timeout, please retry" })),
+        );
+    };
+    let nip78 = enabled_nip78_auth_active(&relay).await;
+    let mut counts: HashMap<u64, u64> = HashMap::new();
+    {
+        let groups = relay.groups.read().await;
+        for item in &items {
+            if aggregate_visible(item, &groups, nip78) {
+                *counts.entry(item.kind).or_default() += 1;
+            }
+        }
+    }
     drop(_permit);
+    let limit = params.limit.unwrap_or(20).min(100);
     let mut kinds: Vec<Value> = counts
         .into_iter()
         .map(|(kind, count)| json!({ "kind": kind, "count": count }))
@@ -1217,16 +1267,17 @@ pub async fn api_relay_kinds_handler(
     kinds.truncate(limit);
     (
         StatusCode::OK,
-        Json(json!({ "kinds": kinds, "approximate": more, "filtered": false })),
+        Json(json!({ "kinds": kinds, "approximate": more, "filtered": true })),
     )
 }
 
 /// `GET /api/v1/relay/top-authors`
 ///
 /// The most active authors on the relay: `{"authors": [{"pubkey": "<hex>",
-/// "count": 123}], "approximate": bool}` sorted by count descending. The
-/// walk is bounded (`approximate: true` when it was cut short). Like
-/// `relay/kinds`, counts are raw store totals including withheld events.
+/// "count": 123}], "approximate": bool}` sorted by count descending. Like
+/// `relay/kinds`, the counts come from the bounded, visibility-filtered
+/// sample, so hidden events never expose their authors. `approximate` is
+/// true when the sample was cut short.
 pub async fn api_top_authors_handler(
     State(relay): State<Arc<Relay>>,
     Query(params): Query<ApiParams>,
@@ -1237,13 +1288,28 @@ pub async fn api_top_authors_handler(
             Json(json!({ "error": "server is busy, try again shortly" })),
         );
     };
-    let limit = params.limit.unwrap_or(20).min(100);
-    const MAX_KEYS: usize = 500_000;
-    let (counts, more) = relay.db.author_counts(MAX_KEYS).await;
+    let now = unix_now();
+    let Some((items, more)) = relay.db.api_neg_sample(AGGREGATE_SAMPLE, now).await else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "database timeout, please retry" })),
+        );
+    };
+    let nip78 = enabled_nip78_auth_active(&relay).await;
+    let mut counts: HashMap<&str, u64> = HashMap::new();
+    {
+        let groups = relay.groups.read().await;
+        for item in &items {
+            if aggregate_visible(item, &groups, nip78) {
+                *counts.entry(item.pubkey.as_str()).or_default() += 1;
+            }
+        }
+    }
     drop(_permit);
+    let limit = params.limit.unwrap_or(20).min(100);
     let mut authors: Vec<Value> = counts
         .into_iter()
-        .map(|(pubkey, count)| json!({ "pubkey": hex::encode(pubkey), "count": count }))
+        .map(|(pubkey, count)| json!({ "pubkey": pubkey, "count": count }))
         .collect();
     authors.sort_by(|a, b| {
         b["count"]
@@ -1254,7 +1320,7 @@ pub async fn api_top_authors_handler(
     authors.truncate(limit);
     (
         StatusCode::OK,
-        Json(json!({ "authors": authors, "approximate": more, "filtered": false })),
+        Json(json!({ "authors": authors, "approximate": more, "filtered": true })),
     )
 }
 
@@ -2486,6 +2552,57 @@ mod tests {
                 "the single author is listed with its event count"
             );
 
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn relay_aggregates_exclude_withheld_events() {
+        // The relay-wide aggregates must apply the anonymous visibility
+        // rules: protected events, gift wraps, owner-only NIP-78 data and
+        // private-group content must not leak their kind or author metadata.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_relay().await;
+            let now = unix_now();
+            let visible = signed_note(relay.secp(), "visible", now, vec![]);
+            // NIP-70 protected event: hidden from anonymous readers.
+            let mut protected = signed_note(relay.secp(), "secret", now - 1, vec![]);
+            protected.tags = vec![vec![crate::nips::nip70::PROTECTED_TAG.into()]];
+            protected.id = crate::nips::nip01::compute_id(&protected);
+            // NIP-59 gift wrap: hidden from anonymous readers.
+            let mut wrap = signed_note(relay.secp(), "wrap", now - 2, vec![]);
+            wrap.kind = crate::nips::nip62::GIFT_WRAP_KIND;
+            wrap.tags = vec![vec!["p".into(), "aa".repeat(32)]];
+            wrap.id = crate::nips::nip01::compute_id(&wrap);
+            for e in [&visible, &protected, &wrap] {
+                assert_eq!(
+                    relay.db.put(e.clone(), now).await,
+                    crate::db::PutOutcome::Stored
+                );
+            }
+
+            let (_, Json(resp)) =
+                api_relay_kinds_handler(State(relay.clone()), Query(ApiParams::default())).await;
+            let kinds = resp["kinds"].as_array().unwrap();
+            let kind1 = kinds.iter().find(|k| k["kind"] == 1).expect("kind 1");
+            assert_eq!(
+                kind1["count"], 1,
+                "the protected kind-1 event must not count: {kinds:?}"
+            );
+            assert!(
+                !kinds.iter().any(|k| k["kind"] == 1059),
+                "gift wraps must not appear in the kinds aggregate: {kinds:?}"
+            );
+
+            let (_, Json(resp)) =
+                api_top_authors_handler(State(relay.clone()), Query(ApiParams::default())).await;
+            let authors = resp["authors"].as_array().unwrap();
+            assert_eq!(authors.len(), 1, "only the visible author is listed");
+            assert_eq!(
+                authors[0]["count"], 1,
+                "protected and wrapped events must not count toward the author"
+            );
             relay.db.shutdown();
         });
     }
