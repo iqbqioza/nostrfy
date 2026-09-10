@@ -204,11 +204,14 @@ impl Filter {
             // `ids`/`authors` which decode hex case-insensitively. An
             // uppercase `#e`/`#p` value therefore matches nothing on either
             // path — consistent, but clients should send lowercase hex.
+            // NIP-01: only the first value of a tag is indexed (`tag[1]`);
+            // further elements are metadata (relay hints, markers) and never
+            // match a filter on their own.
             let tag_name = name.strip_prefix('#').unwrap_or(name);
             tag_values(value).any(|v| {
                 ev.tags()
                     .iter()
-                    .any(|t| t.len() >= 2 && t[0] == tag_name && t[1..].iter().any(|x| x == v))
+                    .any(|t| t.len() >= 2 && t[0] == tag_name && t.get(1).is_some_and(|x| x == v))
             })
         })
     }
@@ -386,28 +389,38 @@ mod tests {
     }
 
     #[test]
-    fn tag_match_any_value_in_common() {
-        // NIP-01: a `#` constraint matches when at least one of the
-        // filter's values equals at least one of the event tag's values.
-        // Both the first and the second value of a same-name tag pair
-        // must match — the live path compares every value, like the stored
-        // tag index (see the `all_values_of_a_single_letter_tag_are_indexed`
-        // db test).
+    fn tag_match_uses_only_the_first_tag_value() {
+        // NIP-01: "Only the first value in any given tag is indexed." The
+        // elements after the first are metadata (relay hints, markers), so a
+        // filter value equal to `tag[2]` matches nothing on either path (see
+        // the `only_first_value_of_a_single_letter_tag_is_indexed` db test).
         let e = ev(1, vec![vec!["e".into(), "aa".repeat(32), "bb".repeat(32)]]);
         let f: Filter =
             serde_json::from_value(serde_json::json!({"#e": ["aa".repeat(32)]})).unwrap();
         assert!(f.matches(&e), "the first tag value must match");
         let f: Filter =
             serde_json::from_value(serde_json::json!({"#e": ["bb".repeat(32)]})).unwrap();
-        assert!(f.matches(&e), "the second tag value must match");
+        assert!(!f.matches(&e), "the second tag value must not match");
         let f: Filter =
             serde_json::from_value(serde_json::json!({"#e": ["cc".repeat(32)]})).unwrap();
         assert!(!f.matches(&e), "a value present in no tag must not match");
-        // The filter value can match any one of several values too.
+        // The filter value can match any one of several values (the first
+        // value of any same-name tag).
         let f: Filter =
-            serde_json::from_value(serde_json::json!({"#e": ["cc".repeat(32), "bb".repeat(32)]}))
+            serde_json::from_value(serde_json::json!({"#e": ["cc".repeat(32), "aa".repeat(32)]}))
                 .unwrap();
         assert!(f.matches(&e));
+        // Several same-name tags: every tag contributes its own first value.
+        let multi = ev(
+            1,
+            vec![
+                vec!["e".into(), "aa".repeat(32), "bb".repeat(32)],
+                vec!["e".into(), "dd".repeat(32)],
+            ],
+        );
+        let f: Filter =
+            serde_json::from_value(serde_json::json!({"#e": ["dd".repeat(32)]})).unwrap();
+        assert!(f.matches(&multi), "the second tag's first value must match");
     }
 
     #[test]

@@ -725,11 +725,11 @@ fn store_blossom_mapping_lifecycle() {
 }
 
 #[test]
-fn all_values_of_a_single_letter_tag_are_indexed() {
-    // NIP-01: the filter match is "at least one item in common" over all
-    // tag values, so a stored query for the SECOND value of a same-name
-    // tag pair must find the event exactly like the live path does. Only
-    // single-letter names are indexed (the spec's indexing convention).
+fn only_first_value_of_a_single_letter_tag_is_indexed() {
+    // NIP-01: "Only the first value in any given tag is indexed." A filter
+    // matching the second value of a same-name tag must not find the event,
+    // matching the live path (`Filter::matches`). Only single-letter names
+    // are indexed (the spec's indexing convention).
     let db = DbClient::open(
         &config(),
         true,
@@ -750,28 +750,63 @@ fn all_values_of_a_single_letter_tag_are_indexed() {
             vec![vec!["e".into(), "aa".repeat(32), "bb".repeat(32)]],
         );
         assert_eq!(db.put(ev.clone(), now).await, PutOutcome::Stored);
-        for value in ["aa".repeat(32).as_str(), "bb".repeat(32).as_str()] {
-            let f: Filter =
-                serde_json::from_value(serde_json::json!({ "kinds": [1], "#e": [value] })).unwrap();
-            let (res, _) = db.query(vec![f], 500, now).await;
-            assert_eq!(
-                res.len(),
-                1,
-                "the event must be found via every value of the tag"
-            );
-            assert_eq!(res[0].id, ev.id);
-        }
-        // Removing the event removes every value's index entry: a later
-        // query for the second value returns nothing.
-        db.apply_deletion(vec![ev.id.clone()], vec![], Some(ev.pubkey.clone()), now)
-            .await;
+        let f: Filter =
+            serde_json::from_value(serde_json::json!({ "kinds": [1], "#e": ["aa".repeat(32)] }))
+                .unwrap();
+        let (res, _) = db.query(vec![f], 500, now).await;
+        assert_eq!(res.len(), 1, "the first tag value must be indexed");
+        assert_eq!(res[0].id, ev.id);
         let f: Filter =
             serde_json::from_value(serde_json::json!({ "kinds": [1], "#e": ["bb".repeat(32)] }))
                 .unwrap();
         let (res, _) = db.query(vec![f], 500, now).await;
         assert!(
             res.is_empty(),
-            "deleted events must not be served via any tag value"
+            "the second tag value must not be indexed"
+        );
+
+        // Several same-name tags: every tag contributes its own first value.
+        let multi = event(
+            1,
+            "two tags",
+            now,
+            vec![
+                vec!["e".into(), "cc".repeat(32), "dd".repeat(32)],
+                vec!["e".into(), "ee".repeat(32)],
+            ],
+        );
+        assert_eq!(db.put(multi.clone(), now).await, PutOutcome::Stored);
+        for value in ["cc".repeat(32), "ee".repeat(32)] {
+            let f: Filter =
+                serde_json::from_value(serde_json::json!({ "kinds": [1], "#e": [value] }))
+                    .unwrap();
+            let (res, _) = db.query(vec![f], 500, now).await;
+            assert_eq!(
+                res.len(),
+                1,
+                "each same-name tag's first value must be indexed"
+            );
+        }
+        let f: Filter =
+            serde_json::from_value(serde_json::json!({ "kinds": [1], "#e": ["dd".repeat(32)] }))
+                .unwrap();
+        let (res, _) = db.query(vec![f], 500, now).await;
+        assert!(
+            res.is_empty(),
+            "a trailing tag value must not be indexed"
+        );
+
+        // Removing the event removes the index entries: a later query for
+        // the first value returns nothing.
+        db.apply_deletion(vec![ev.id.clone()], vec![], Some(ev.pubkey.clone()), now)
+            .await;
+        let f: Filter =
+            serde_json::from_value(serde_json::json!({ "kinds": [1], "#e": ["aa".repeat(32)] }))
+                .unwrap();
+        let (res, _) = db.query(vec![f], 500, now).await;
+        assert!(
+            res.is_empty(),
+            "deleted events must not be served via their tag index"
         );
     });
     db.shutdown();

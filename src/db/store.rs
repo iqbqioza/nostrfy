@@ -1166,17 +1166,15 @@ impl Store {
         }
         for tag in &event.tags {
             if indexable_tag(tag) {
-                // Index every value of a single-letter tag: NIP-01 says the
-                // "at least one item in common" match applies to all tag
-                // values, so a stored query for the second value must find
-                // the event exactly like the live path does.
-                for value in &tag[1..] {
-                    let key = tag_key(tag[0].as_bytes()[0], value.as_bytes(), created, id);
-                    // Skip rather than error: an over-long key would abort
-                    // the whole write batch (see MAX_INDEX_KEY).
-                    if key.len() <= MAX_INDEX_KEY {
-                        self.by_tag.put(wtxn, &key, b"")?;
-                    }
+                // NIP-01: only the first value in any given tag is indexed.
+                // An event may carry several same-name tags; each of them
+                // contributes its own first value (see `Filter::matches`).
+                let value = &tag[1];
+                let key = tag_key(tag[0].as_bytes()[0], value.as_bytes(), created, id);
+                // Skip rather than error: an over-long key would abort
+                // the whole write batch (see MAX_INDEX_KEY).
+                if key.len() <= MAX_INDEX_KEY {
+                    self.by_tag.put(wtxn, &key, b"")?;
                 }
             }
         }
@@ -1249,14 +1247,13 @@ impl Store {
         }
         for tag in &event.tags {
             if indexable_tag(tag) {
-                for value in &tag[1..] {
-                    // Mirror the put path: over-long keys were skipped at
-                    // index time, so deleting them would hit MDB_BAD_VALSIZE
-                    // and abort the whole write batch.
-                    let key = tag_key(tag[0].as_bytes()[0], value.as_bytes(), event.created_at, id);
-                    if key.len() <= MAX_INDEX_KEY {
-                        self.by_tag.delete(wtxn, &key)?;
-                    }
+                // Mirror the put path: only the first tag value was indexed,
+                // and over-long keys were skipped at index time (deleting
+                // them would hit MDB_BAD_VALSIZE and abort the write batch).
+                let value = &tag[1];
+                let key = tag_key(tag[0].as_bytes()[0], value.as_bytes(), event.created_at, id);
+                if key.len() <= MAX_INDEX_KEY {
+                    self.by_tag.delete(wtxn, &key)?;
                 }
             }
         }
