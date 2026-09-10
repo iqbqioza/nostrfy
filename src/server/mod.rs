@@ -641,9 +641,10 @@ async fn blossom_root_info(
     let info = json!({
         "name": format!("{name} (media)"),
         // File-related NIPs this server implements: 94 (file-metadata
-        // events are stored and served), 96 (HTTP file storage) and
-        // 98 (HTTP auth, used for the uploads).
-        "supported_nips": [94, 96, 98],
+        // events are stored and served) and 98 (HTTP auth, used for the
+        // uploads). NIP-96 (HTTP file storage) is a different protocol and
+        // is not implemented: the file server speaks Blossom/BUD.
+        "supported_nips": [94, 98],
         "supported_file_hashes": ["sha256"],
         "tos_url": null,
         "payment_required": false,
@@ -1777,8 +1778,8 @@ mod tests {
         assert_eq!(json["name"], "example relay (media)");
         assert_eq!(
             json["supported_nips"],
-            serde_json::json!([94, 96, 98]),
-            "file-related NIPs are advertised"
+            serde_json::json!([94, 98]),
+            "file-related NIPs are advertised (NIP-96 is not implemented)"
         );
         assert_eq!(json["upload_url"], "https://media.example.com/upload");
         assert_eq!(json["supported_file_hashes"], serde_json::json!(["sha256"]));

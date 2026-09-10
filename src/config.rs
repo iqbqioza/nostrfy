@@ -20,9 +20,10 @@ pub const DEFAULT_CONFIG: &str = "nostrfy.toml";
 /// (kind 10133) is served but cannot be advertised: it is a `draft` with no
 /// integer identifier and NIP-11's `supported_nips` is an array of integer
 /// identifiers. File storage is covered too: NIP-94 (file metadata) is
-/// stored and served like any other event, and NIP-96 (Blossom) is served
-/// by the dedicated `[blossom]` file server; only NIP-95 (plain HTTP file
-/// storage) is not implemented. NIP-33 was merged into NIP-01 but remains
+/// stored and served like any other event, and Blossom (BUD-01/02, NIP-B7)
+/// is served by the dedicated `[blossom]` file server; NIP-95 (plain HTTP
+/// file storage) and NIP-96 (HTTP file storage integration) are not
+/// implemented. NIP-33 was merged into NIP-01 but remains
 /// advertised for clients that check it.
 pub const RELAY_NIPS: &[u16] = &[
     1, 9, 11, 13, 17, 22, 26, 29, 32, 33, 34, 40, 42, 43, 45, 46, 47, 50, 57, 59, 62, 65, 66, 67,
