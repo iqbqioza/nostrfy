@@ -3267,3 +3267,15 @@ fn group_and_role_snapshots_survive_restart() {
         db.shutdown();
     });
 }
+
+#[test]
+fn sixteen_max_dbs_still_opens_with_the_word_index() {
+    // 17 named tables are created (16 plus the word index); an operator
+    // value of 16 must not fail at startup (the clamp raises it to 17).
+    let mut cfg = config();
+    cfg.max_dbs = 16;
+    assert!(cfg.search_index);
+    let db = DbClient::open(&cfg, true, Arc::new(Default::default()), 0, 128, 4096, 262144)
+        .expect("17 tables must fit via the clamp");
+    db.shutdown();
+}

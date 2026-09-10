@@ -359,7 +359,8 @@ impl Store {
         let map_size = map_max_size as usize;
         let env = unsafe {
             EnvOpenOptions::new()
-                .max_dbs(cfg.max_dbs.max(16))
+                // 16 named tables, plus the word index when search is on.
+                .max_dbs(cfg.max_dbs.max(17))
                 .max_readers(cfg.max_readers.max(8))
                 .map_size(map_size)
                 .open(&cfg.path)?
@@ -401,10 +402,11 @@ impl Store {
         let groups = env.create_database::<Bytes, Bytes>(&mut wtxn, Some(GROUPS))?;
         let roles = env.create_database::<Bytes, Bytes>(&mut wtxn, Some(ROLES))?;
         wtxn.commit()?;
+        let tables = if by_word.is_some() { 17 } else { 16 };
         log::info!(
             "database ready at {} ({} tables, map {} MiB)",
             cfg.path.display(),
-            16,
+            tables,
             map_size / (1024 * 1024)
         );
         Ok(Store {

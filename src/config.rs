@@ -645,6 +645,20 @@ fn apply_legacy_aliases(raw: &str, cfg: &mut Config) {
         return;
     };
     for (old_section, old_key, new_section, new_key) in LEGACY_ALIASES {
+        // An explicitly set current key wins over the deprecated alias: a
+        // config mid-migration must not have the old value silently override
+        // the new one.
+        if table
+            .get(*new_section)
+            .and_then(toml::Value::as_table)
+            .is_some_and(|section| section.contains_key(*new_key))
+        {
+            log::warn!(
+                "config key [{old_section}].{old_key} is deprecated and ignored because \
+                 [{new_section}].{new_key} is set"
+            );
+            continue;
+        }
         let Some(section) = table.get(*old_section).and_then(toml::Value::as_table) else {
             continue;
         };
@@ -1149,6 +1163,7 @@ impl Config {
             ("limits.max_tags", l.max_tags),
             ("limits.max_tag_value_bytes", l.max_tag_value_bytes),
             ("limits.max_sub_id_len", l.max_sub_id_len),
+            ("rpc.max_admin_body_bytes", self.rpc.max_admin_body_bytes),
         ];
         let db_nonzero = [
             ("database.db_buffer_size", self.database.db_buffer_size),
@@ -2019,6 +2034,29 @@ log_max_files = 2
     }
 
     #[test]
+    fn current_keys_win_over_legacy_aliases() {
+        // A partly migrated config must not have the deprecated key override
+        // the current one.
+        let raw = r#"
+[limits]
+count_limit = 5
+max_count = 2000
+max_admin_body_bytes = 1024
+[server]
+require_auth = true
+[relay]
+require_auth = false
+[rpc]
+max_admin_body_bytes = 2048
+"#;
+        let mut cfg: Config = toml::from_str(raw).unwrap();
+        apply_legacy_aliases(raw, &mut cfg);
+        assert_eq!(cfg.limits.max_count, 2000, "the current key must win");
+        assert!(!cfg.relay.require_auth, "the current key must win");
+        assert_eq!(cfg.rpc.max_admin_body_bytes, 2048);
+    }
+
+    #[test]
     fn legacy_aliases_do_not_wrap_invalid_values() {
         // The old serde field types rejected a negative or overflowing
         // value at load time; an alias must not silently wrap one into a
@@ -2734,6 +2772,7 @@ log_max_files = 2
             |c: &mut Config| c.limits.max_tag_value_bytes = 0,
             |c: &mut Config| c.limits.max_sub_id_len = 0,
             |c: &mut Config| c.limits.max_api_queue_msgs = 0,
+            |c: &mut Config| c.rpc.max_admin_body_bytes = 0,
         ] {
             let mut cfg = Config::default();
             set(&mut cfg);
