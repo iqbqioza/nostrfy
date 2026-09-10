@@ -1883,6 +1883,47 @@ fn expiry_enabled_toggles_at_runtime() {
 }
 
 #[test]
+fn events_stored_while_nip40_was_disabled_are_purged_on_reenable() {
+    // The expiry index is maintained even while NIP-40 is disabled, so an
+    // event accepted during that window becomes purgeable when the feature
+    // is re-enabled (it used to stay stored forever).
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        db.set_expiry_enabled(false);
+        let ev = event(
+            1,
+            "stored while disabled",
+            now,
+            vec![vec!["expiration".into(), (now - 5).to_string()]],
+        );
+        assert_eq!(db.put(ev.clone(), now).await, PutOutcome::Stored);
+        // Re-enabling makes the stored event expired; the purge reclaims it.
+        db.set_expiry_enabled(true);
+        assert_eq!(
+            db.purge_expired(now).await,
+            1,
+            "the event stored while disabled must be purged"
+        );
+        let f: Filter =
+            serde_json::from_value(serde_json::json!({"ids": [ev.id]})).unwrap();
+        let (res, _) = db.query(vec![f], 10, now).await;
+        assert!(res.is_empty());
+    });
+    db.shutdown();
+}
+
+#[test]
 
 // ----- filters, search and ordering -----
 fn multiletter_tag_filters_match() {

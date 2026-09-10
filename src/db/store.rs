@@ -1235,11 +1235,11 @@ impl Store {
                 }
             }
         }
-        if self
-            .expiry_enabled
-            .load(std::sync::atomic::Ordering::Relaxed)
-            && let Some(exp) = nip40::expiry(event)
-        {
+        // The expiry index is maintained regardless of the NIP-40 toggle:
+        // events stored while the feature was disabled must become
+        // purgeable when it is re-enabled. The entries are tiny and are
+        // removed with the event by `remove_event`.
+        if let Some(exp) = nip40::expiry(event) {
             self.expiry.put(wtxn, &created_key(exp, id), b"")?;
         }
         if let Some(by_word) = self.by_word {

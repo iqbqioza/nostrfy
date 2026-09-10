@@ -468,10 +468,15 @@ impl Store {
                 break;
             }
             last_key = Some(entries.last().unwrap().0.clone());
-            for (_, id) in entries {
+            for (key, id) in entries {
                 if self.events.get(&wtxn, &id)?.is_some() {
                     self.remove_event(&mut wtxn, &id)?;
                     removed += 1;
+                } else {
+                    // The event is already gone (removed outside the normal
+                    // path or corrupt data): drop the orphaned expiry key
+                    // too, or every purge would re-examine it forever.
+                    self.expiry.delete(&mut wtxn, &key)?;
                 }
             }
         }
