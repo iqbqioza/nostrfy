@@ -1713,12 +1713,22 @@ fn delegated_events_match_delegator_queries() {
         let delegatee = "b".repeat(64);
         let mut delegated = event(1, "delegated", now, vec![]);
         delegated.pubkey = delegatee.clone();
-        delegated.tags = vec![vec![
-            "delegation".into(),
-            delegator.clone(),
-            "kind=1".into(),
-            "00".repeat(64),
-        ]];
+        delegated.tags = vec![
+            vec![
+                "delegation".into(),
+                delegator.clone(),
+                "kind=1".into(),
+                "00".repeat(64),
+            ],
+            // Only the first well-formed delegation tag is honored, so this
+            // second one must not index the event under another delegator.
+            vec![
+                "delegation".into(),
+                "c".repeat(64),
+                "kind=1".into(),
+                "00".repeat(64),
+            ],
+        ];
         delegated.id = nip01::compute_id(&delegated);
         let own = event(1, "own", now, vec![]);
 
@@ -1735,6 +1745,14 @@ fn delegated_events_match_delegator_queries() {
             serde_json::from_value(serde_json::json!({"authors": [delegatee]})).unwrap();
         let (res, _) = db.query(vec![f], 500, now).await;
         assert_eq!(res.len(), 1);
+        // The forged second delegation tag is inert.
+        let f: Filter =
+            serde_json::from_value(serde_json::json!({"authors": ["c".repeat(64)]})).unwrap();
+        let (res, _) = db.query(vec![f], 500, now).await;
+        assert!(
+            res.is_empty(),
+            "a second delegation tag must not be indexed"
+        );
     });
 }
 

@@ -383,7 +383,13 @@ impl super::Relay {
             return Err("invalid: sig must be lowercase hex".into());
         }
 
-        if cfg.nip_enabled(26) && !nip26::verify(event, self.secp()) {
+        // NIP-26: a delegation tag is honored by the query/index paths
+        // unconditionally, so it must be verified unconditionally too — not
+        // only while NIP-26 is advertised. Gating the check on the toggle let
+        // a forged `delegation` tag index the event under an arbitrary
+        // delegator's pubkey (author-feed impersonation). `verify` checks the
+        // first well-formed delegation tag, the only one the read paths use.
+        if !nip26::verify(event, self.secp()) {
             return Err("invalid: delegation failed".into());
         }
 
@@ -1374,7 +1380,9 @@ mod tests {
                 .await;
             assert!(matches!(out, super::Precheck::Reject(m) if m.contains("signature")));
 
-            // A bad delegation is rejected when NIP-26 is enabled.
+            // A bad delegation is rejected unconditionally: the query/index
+            // paths honor the delegation tag whether or not NIP-26 is
+            // advertised, so an unverified tag must never be stored.
             let ev = signed(
                 1,
                 vec![vec![
@@ -1388,6 +1396,16 @@ mod tests {
                 .precheck(&cfg, &access, &ev, now, &[], None, None)
                 .await;
             assert!(matches!(out, super::Precheck::Reject(m) if m.contains("delegation")));
+            // The same holds with NIP-26 disabled (not advertised).
+            let mut cfg_no26 = (*cfg).clone();
+            cfg_no26.relay.disabled_nips.push(26);
+            let out = relay
+                .precheck(&cfg_no26, &access, &ev, now, &[], None, None)
+                .await;
+            assert!(
+                matches!(out, super::Precheck::Reject(m) if m.contains("delegation")),
+                "a forged delegation must be rejected even with NIP-26 disabled"
+            );
 
             // Uppercase pubkey: without a verified verdict the signature
             // fails first; with the verdict the pubkey check itself runs.

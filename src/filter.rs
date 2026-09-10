@@ -136,26 +136,31 @@ impl Filter {
                 return false;
             }
         }
-        // NIP-26: events published under a valid delegation tag match filters
-        // on the delegator's pubkey as well as on the event's own author.
-        // Only a well-formed delegation (`delegation` tags have exactly 4
-        // elements, see `nip26::delegation`) counts: a malformed tag of
-        // any other length must not let an attacker's event match filters
-        // on somebody else's pubkey. Pubkey comparison is case-insensitive
-        // for the same stored/live agreement reason as `ids` above.
+        // NIP-26: an event published under a valid delegation tag matches
+        // filters on the delegator's pubkey as well as on the event's own
+        // author. Only the first well-formed delegation tag is honored (the
+        // one `nip26::verify` validated at intake): a second tag is inert and
+        // must not let the event match another pubkey's feed, and a malformed
+        // tag of any other length is skipped like `nip26::delegation` does.
+        // Pubkey comparison is case-insensitive for the same stored/live
+        // agreement reason as `ids` above.
         // Note: the tag's signature and conditions are NOT re-verified here
         // (trusted input — every caller feeds events that passed
         // `nip26::verify` at intake before store/broadcast); future callers
         // with unvalidated events must verify first.
         if let Some(authors) = &self.authors
             && !authors.iter().any(|a| Self::hex_eq(a, ev.pubkey()))
-            && !ev.tags().iter().any(|t| {
-                t.len() == 4
-                    && t[0] == "delegation"
-                    && authors.iter().any(|a| Self::hex_eq(a, &t[1]))
-            })
         {
-            return false;
+            let delegated = ev
+                .tags()
+                .iter()
+                .find(|t| t.len() == 4 && t[0] == "delegation")
+                .map(|t| t[1].as_str());
+            if !delegated.is_some_and(|delegator| {
+                authors.iter().any(|a| Self::hex_eq(a, delegator))
+            }) {
+                return false;
+            }
         }
         if let Some(kinds) = &self.kinds
             && !kinds.contains(&ev.kind())
@@ -593,6 +598,32 @@ mod tests {
         assert!(!f.matches(&e));
         f.authors = Some(vec!["aa".repeat(32)]);
         assert!(f.matches(&e), "the delegator named in the tag matches");
+        // Only the first well-formed delegation tag is honored: a second tag
+        // must not let the event match another pubkey's feed.
+        let e = ev(
+            1,
+            vec![
+                vec![
+                    "delegation".into(),
+                    "aa".repeat(32),
+                    "sig".into(),
+                    "kind".into(),
+                ],
+                vec![
+                    "delegation".into(),
+                    "cc".repeat(32),
+                    "sig".into(),
+                    "kind".into(),
+                ],
+            ],
+        );
+        f.authors = Some(vec!["cc".repeat(32)]);
+        assert!(
+            !f.matches(&e),
+            "a forged second delegation tag must not match"
+        );
+        f.authors = Some(vec!["aa".repeat(32)]);
+        assert!(f.matches(&e), "the first delegation tag still matches");
     }
 
     #[test]
