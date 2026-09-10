@@ -608,6 +608,59 @@ fn ids_filter_checks_every_id_regardless_of_limit() {
 }
 
 #[test]
+fn ids_filter_limit_returns_the_newest() {
+    // NIP-01: `limit: n` selects the last n events ordered by `created_at`,
+    // not the first n entries of the `ids` array. The events database is
+    // keyed by id, so the ids path must sort its candidates by created_at
+    // before the limit cuts them. A later filter also keeps its own quota
+    // after the ids filter fills up.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let old = event(1, "old", now - 10, vec![]);
+        let new = event(1, "new", now, vec![]);
+        for ev in [&old, &new] {
+            assert_eq!(db.put(ev.clone(), now).await, PutOutcome::Stored);
+        }
+        // The older id comes first in the filter: the newer event must win.
+        let f: Filter = serde_json::from_value(serde_json::json!({
+            "ids": [old.id, new.id],
+            "limit": 1
+        }))
+        .unwrap();
+        let (res, _) = db.query(vec![f], 500, now).await;
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].id, new.id, "the newest id must win the limit");
+
+        // The ids filter's quota does not abort a later filter.
+        let k7 = event(7, "kind 7", now - 5, vec![]);
+        assert_eq!(db.put(k7.clone(), now).await, PutOutcome::Stored);
+        let f: Vec<Filter> = serde_json::from_value(serde_json::json!([
+            {"ids": [old.id, new.id], "limit": 1},
+            {"kinds": [7], "limit": 1}
+        ]))
+        .unwrap();
+        let (res, _) = db.query(f, 500, now).await;
+        let ids: Vec<String> = res.iter().map(|e| e.id.clone()).collect();
+        assert_eq!(res.len(), 2);
+        assert!(ids.contains(&new.id));
+        assert!(ids.contains(&k7.id));
+        assert!(!ids.contains(&old.id), "the older id is over quota");
+    });
+    db.shutdown();
+}
+
+#[test]
 fn nip28_channel_queries_use_e_tag_index() {
     // NIP-28 channel messages reference their channel with an `e` tag; the
     // generic tag index must serve `{"#e": [channel_id]}` queries.

@@ -829,28 +829,68 @@ impl Store {
         };
 
         if let Some(ids) = &filter.ids {
-            // Every id is checked (each maps to at most one event): the
-            // collection limit only bounds the results, not the number of
-            // ids examined, so `{"ids": [A, B], "limit": 1}` must still find
-            // B when A does not exist. The work budget bounds the walk.
-            for id in ids {
-                if let Ok(id) = hex::decode(id) {
-                    if id.len() == ID_LEN {
-                        if !consider(&id)? {
-                            *more = true;
-                            return Ok(false);
+            // NIP-01: `limit: n` returns the last n events ordered by
+            // `created_at`. The events database is keyed by id, so walking
+            // `ids` in filter order says nothing about chronology. Gather
+            // the candidates first, then replay them newest-first so the
+            // per-filter boundary cuts the same way as a chronological index
+            // walk. Every id is still checked (each maps to at most one
+            // event): `{"ids": [A, B], "limit": 1}` must find B even when A
+            // is older.
+            let mut candidates: Vec<(u64, Vec<u8>)> = Vec::new();
+            'gather: for id in ids {
+                let Ok(decoded) = hex::decode(id) else {
+                    continue;
+                };
+                if decoded.len() == ID_LEN {
+                    // The exact-id set is bounded by the filter member cap
+                    // (`MAX_FILTER_MEMBERS`); the budget guard is defensive.
+                    if candidates.len() >= budget {
+                        *more = true;
+                        break;
+                    }
+                    let Some(raw) = self.events.get(rtxn, &decoded)? else {
+                        continue;
+                    };
+                    if let Some(created) = candidate_created_at(&ctx, &decoded, raw)? {
+                        candidates.push((created, decoded));
+                    }
+                } else if !decoded.is_empty() {
+                    // NIP-01: `ids` entries may be event-id *prefixes*.
+                    // A prefix selects a range, so the gather is the only
+                    // unbounded walk: cap it at the shared work budget and
+                    // report `more` when it is cut short.
+                    let start = prefix_start(&decoded);
+                    let end = prefix_end(&decoded);
+                    let range = (
+                        std::ops::Bound::Included(start.as_slice()),
+                        std::ops::Bound::Included(end.as_slice()),
+                    );
+                    for item in self.events.range(rtxn, &range)? {
+                        let (key, raw) = item?;
+                        // Corrupt short keys (bitrot/hand edit) must
+                        // loud-fail the scan, never panic the reader thread.
+                        if key.len() != ID_LEN {
+                            return Err(crate::error::Error::Other(format!(
+                                "corrupt event key ({} bytes)",
+                                key.len()
+                            )));
                         }
-                    } else if !id.is_empty() {
-                        // NIP-01: `ids` entries may be event-id *prefixes*.
-                        // Walk the events range of that prefix (bounded by
-                        // the work budget); the collection limit and the
-                        // final created_at sort apply as usual.
-                        let start = prefix_start(&id);
-                        let end = prefix_end(&id);
-                        if !self.walk_events_prefix(rtxn, &start, &end, &mut consider, more)? {
-                            return Ok(false);
+                        if candidates.len() >= budget {
+                            *more = true;
+                            break 'gather;
+                        }
+                        if let Some(created) = candidate_created_at(&ctx, key, raw)? {
+                            candidates.push((created, key.to_vec()));
                         }
                     }
+                }
+            }
+            candidates.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+            for (_, id) in candidates {
+                if !consider(&id)? {
+                    *more = true;
+                    return Ok(false);
                 }
             }
             return Ok(out.full());
@@ -1083,33 +1123,6 @@ impl Store {
         Ok(true)
     }
 
-    /// Walks the `events` database over the id range `[start, end]` (an
-    /// id-prefix range from NIP-01 `ids` filters), handing every full id key
-    /// to `consider`. The range is inclusive on both ends so the maximum id
-    /// with the prefix is covered.
-    fn walk_events_prefix(
-        &self,
-        rtxn: &RoTxn,
-        start: &[u8],
-        end: &[u8],
-        mut consider: impl FnMut(&[u8]) -> Result<bool>,
-        more: &mut bool,
-    ) -> Result<bool> {
-        let range = (
-            std::ops::Bound::Included(start),
-            std::ops::Bound::Included(end),
-        );
-        let iter = self.events.range(rtxn, &range)?;
-        for item in iter {
-            let (key, _) = item?;
-            if !consider(key)? {
-                *more = true;
-                return Ok(false);
-            }
-        }
-        Ok(true)
-    }
-
     /// Walks several index ranges in parallel, handing ids to `consider` in
     /// global `(created_at, id)` descending order. A per-filter limit thus
     /// applies to the union of every range (NIP-01: "the last n events
@@ -1252,6 +1265,26 @@ impl crate::filter::EventFields for NegLight {
     fn content(&self) -> &str {
         ""
     }
+}
+
+/// The `created_at` sort key of a candidate event, from the metadata header
+/// when present (fast path) or from the stored event JSON otherwise. `None`
+/// means the stored value could not be parsed (corruption); the candidate is
+/// skipped like [`consider_event`] skips it.
+fn candidate_created_at(
+    ctx: &ScanContext<'_>,
+    id: &[u8],
+    raw: &[u8],
+) -> Result<Option<u64>> {
+    if let Some(meta) = ctx.event_meta
+        && let Some(header) = meta.get(ctx.rtxn, id)?
+        && let Some((_, created, _, _)) = crate::db::store::decode_meta(header)
+    {
+        return Ok(Some(created));
+    }
+    Ok(serde_json::from_slice::<Event>(raw)
+        .ok()
+        .map(|event| event.created_at))
 }
 
 #[allow(clippy::too_many_arguments)]
