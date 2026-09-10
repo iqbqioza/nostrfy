@@ -386,6 +386,45 @@ fn restricted_groups() {
 }
 
 #[test]
+fn multiple_h_tags_are_rejected() {
+    // NIP-29: the `h` tag carries the group id. Accepting two `h` tags would
+    // let an event be validated against the first (e.g. an open group) while
+    // the stored tag index and subscriptions match the second (e.g. a
+    // restricted group), surfacing it in that group's feed.
+    let mut store = seeded();
+    // A second, unrestricted group as the "validated" face.
+    store.apply(
+        &event(CREATE_GROUP, ADMIN, Some("g2"), vec![]),
+        "",
+        1,
+        false,
+        false,
+    );
+    // Make g1 restricted: a lone write by USER to g1 must be rejected.
+    store.apply(
+        &event(9002, ADMIN, Some("g1"), vec![vec!["restricted".into()]]),
+        "",
+        1,
+        false,
+        false,
+    );
+    let mut multi = event(1, USER, Some("g2"), vec![]);
+    multi.tags.push(vec![H.to_string(), "g1".to_string()]);
+    let err = store.validate_write(&multi).unwrap_err();
+    assert!(
+        err.contains("only one h tag"),
+        "a second h tag must be rejected: {err}"
+    );
+    // The same event with only the restricted group's h tag is rejected by
+    // the restriction rule (not the tag-count rule).
+    let single = event(1, USER, Some("g1"), vec![]);
+    assert!(
+        store.validate_write(&single).unwrap_err().contains("members"),
+        "the restricted group still gates non-members"
+    );
+}
+
+#[test]
 fn invite_code_admits() {
     let mut store = seeded();
     let invite = event(

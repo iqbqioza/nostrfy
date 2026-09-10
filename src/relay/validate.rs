@@ -1478,6 +1478,24 @@ mod tests {
                 .await;
             assert!(matches!(out, super::Precheck::Reject(m) if m.contains("h tag")));
 
+            // An event with several h tags is rejected: the first tag would
+            // be validated while the stored tag index and subscriptions match
+            // any of them.
+            let multi = h(
+                1,
+                vec![
+                    vec!["h".to_string(), "g".into()],
+                    vec!["h".to_string(), "other".into()],
+                ],
+            );
+            let out = relay
+                .precheck(&cfg, &access, &multi, now, &[], None, None)
+                .await;
+            assert!(
+                matches!(out, super::Precheck::Reject(m) if m.contains("only one h tag")),
+                "a multi-h event must be rejected"
+            );
+
             // Group metadata not signed by the relay is rejected.
             let meta = gh(39000, vec![vec!["d".into(), "g".into()]]);
             let out = relay

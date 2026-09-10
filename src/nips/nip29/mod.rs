@@ -269,6 +269,20 @@ impl GroupStore {
     /// string for the `OK` message on rejection. Access control is based on
     /// the event's author (`event.pubkey`), not on connection authentication.
     pub fn validate_write(&self, event: &Event) -> Result<(), String> {
+        // NIP-29: the event's `h` tag carries *the* group id. Multiple `h`
+        // tags are ambiguous and dangerous: the checks below use the first
+        // one while the stored tag index and subscriptions match any of
+        // them, so an event validated against an open group could surface in
+        // a restricted group's feed. Reject them outright.
+        if event
+            .tags
+            .iter()
+            .filter(|t| t.first().is_some_and(|name| name == H))
+            .count()
+            > 1
+        {
+            return Err("invalid: group events must carry only one h tag".into());
+        }
         let Some(gid) = group_id(event) else {
             return Ok(());
         };
