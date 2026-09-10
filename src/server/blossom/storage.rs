@@ -586,17 +586,24 @@ impl LocalStore {
                 let Some(sha) = name.strip_suffix(".meta.json") else {
                     continue;
                 };
+                // A stray `*.meta.json` whose stem is not a 64-hex sha must
+                // not create a bogus mapping (data pollution). The hash is
+                // normalized so an uppercase legacy name stays reachable.
+                if sha.len() != 64 || hex::decode(sha).is_err() {
+                    continue;
+                }
+                let sha = sha.to_ascii_lowercase();
                 if let Ok(raw) = tokio::fs::read(file.path()).await
                     && let Ok(meta) = serde_json::from_slice::<serde_json::Value>(&raw)
                 {
                     buf.push((
-                        sha.to_string(),
+                        sha.clone(),
                         crate::server::blossom::sanitize_mime(meta["mime"].as_str().unwrap_or("")),
                         meta["size"].as_u64().unwrap_or(0),
                         meta["uploaded"].as_i64().unwrap_or(0),
                         pubkey.clone(),
                     ));
-                    via_meta.insert(sha.to_string());
+                    via_meta.insert(sha);
                     if buf.len() >= 5000 {
                         let chunk = std::mem::take(&mut buf);
                         if tx.send(chunk).await.is_err() {
@@ -754,7 +761,14 @@ impl S3Store {
                     continue;
                 };
                 if let Some(sha) = file.strip_suffix(".meta.json") {
-                    via_meta.insert(sha.to_string());
+                    // Only a 64-hex stem names a blob; a stray object must
+                    // not create a bogus mapping (normalized so an uppercase
+                    // legacy name stays reachable).
+                    if sha.len() != 64 || hex::decode(sha).is_err() {
+                        continue;
+                    }
+                    let sha = sha.to_ascii_lowercase();
+                    via_meta.insert(sha);
                     let client = self.client.clone();
                     let semaphore = std::sync::Arc::clone(&semaphore);
                     tasks.spawn(async move {
@@ -784,11 +798,15 @@ impl S3Store {
                 else {
                     continue;
                 };
+                if sha.len() != 64 || hex::decode(sha).is_err() {
+                    continue;
+                }
+                let sha = sha.to_ascii_lowercase();
                 if let Ok(Some(raw)) = raw
                     && let Ok(meta) = serde_json::from_slice::<serde_json::Value>(&raw)
                 {
                     out.push((
-                        sha.to_string(),
+                        sha,
                         crate::server::blossom::sanitize_mime(meta["mime"].as_str().unwrap_or("")),
                         meta["size"].as_u64().unwrap_or(0),
                         meta["uploaded"].as_i64().unwrap_or(0),
@@ -1408,6 +1426,43 @@ mod scan_debug {
             entries.extend(chunk);
         }
         assert_eq!(entries.len(), 1, "scan must find the legacy meta");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn scan_legacy_ignores_invalid_meta_names() {
+        let dir = std::env::temp_dir().join(format!(
+            "nostrfy-blossom-scan-meta-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let npub = npub_of(&"02".repeat(32));
+        let npub_dir = dir.join(&npub);
+        std::fs::create_dir_all(&npub_dir).unwrap();
+        // Stray meta names (not a 64-hex hash) must not create mappings.
+        for name in ["garbage.meta.json", "short.meta.json", "zz.meta.json"] {
+            std::fs::write(npub_dir.join(name), br#"{"size":1}"#).unwrap();
+        }
+        // A valid but uppercase hash is normalized to lowercase.
+        let upper = "AB".repeat(32);
+        std::fs::write(
+            npub_dir.join(format!("{upper}.meta.json")),
+            br#"{"size":1,"mime":"image/png","uploaded":1}"#,
+        )
+        .unwrap();
+        let s = LocalStore::new(&dir, 0).await.unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        s.scan_legacy(tx).await.unwrap();
+        let mut entries = Vec::new();
+        while let Some(chunk) = rx.recv().await {
+            entries.extend(chunk);
+        }
+        assert_eq!(
+            entries.len(),
+            1,
+            "only the well-formed meta is emitted: {entries:?}"
+        );
+        assert_eq!(entries[0].0, "ab".repeat(32), "the hash is normalized");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
