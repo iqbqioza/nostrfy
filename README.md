@@ -249,7 +249,7 @@ restrict_uploads = false            # true = only allow-listed pubkeys may uploa
 | Endpoint | Description |
 | --- | --- |
 | `GET /` | Blossom server info (on the Blossom host) |
-| `GET` / `HEAD` `/<sha256>[.ext]` | Fetch / probe a blob (`GET` supports RFC 7233 byte ranges) |
+| `GET` / `HEAD` `/<sha256>[.ext]` | Fetch / probe a blob (`GET` supports RFC 7233 byte ranges; `HEAD` mirrors GET, ranges and missing-file 404 included) |
 | `PUT /upload` | Upload a blob (kind-24242 auth; `t=upload` + `x` + `expiration` tags) |
 | `HEAD /upload` | BUD-06 pre-flight — would the upload be accepted? (`X-SHA-256` / `X-Content-Type` / `X-Content-Length` headers) |
 | `PUT /media` | BUD-05 media upload (stored verbatim — no optimization) |

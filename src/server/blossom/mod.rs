@@ -603,8 +603,15 @@ async fn get_blob(
     }
 }
 
-/// `HEAD /<sha256>` — blob headers without the body.
-async fn head_blob(State(relay): State<Arc<Relay>>, AxPath(blob): AxPath<String>) -> Response {
+/// `HEAD /<sha256>` — blob headers without the body, mirroring GET: the
+/// backing file/object must resolve (a mapping whose blob is gone is a
+/// 404, exactly like GET), and a single satisfiable Range yields 206 with
+/// `Content-Range` and a ranged `Content-Length`.
+async fn head_blob(
+    State(relay): State<Arc<Relay>>,
+    headers: HeaderMap,
+    AxPath(blob): AxPath<String>,
+) -> Response {
     let Some(state) = state_of(&relay).await else {
         return error(StatusCode::SERVICE_UNAVAILABLE, "blossom not initialized");
     };
@@ -614,16 +621,88 @@ async fn head_blob(State(relay): State<Arc<Relay>>, AxPath(blob): AxPath<String>
     let Some(desc) = state.store.find(&sha).await else {
         return error(StatusCode::NOT_FOUND, "blob not found");
     };
-    (
-        StatusCode::OK,
+    let size = desc.size;
+    let Ok(size_usize) = usize::try_from(size) else {
+        return error(StatusCode::NOT_FOUND, "blob not found");
+    };
+    let range = headers
+        .get(axum::http::header::RANGE)
+        .and_then(|v| v.to_str().ok())
+        .map(|r| parse_range(r, size_usize));
+    let (start, end) = match range {
+        Some(Err(())) => {
+            let mut response = error(
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                "requested byte range is not satisfiable",
+            );
+            response.headers_mut().insert(
+                axum::http::header::CONTENT_RANGE,
+                format!("bytes */{size}").parse().unwrap(),
+            );
+            return response;
+        }
+        Some(Ok(Some((start, end)))) => (start, end),
+        _ => (0, size_usize.saturating_sub(1)),
+    };
+    let len = if size == 0 {
+        0
+    } else {
+        (end - start + 1) as u64
+    };
+    // Resolve the backing object exactly like GET: a mapping without a
+    // readable blob must 404, and the backend's range support decides
+    // whether a Range yields 206 or a full 200.
+    let honored = match state.store.open_stream_any(&sha, start as u64, len).await {
+        Ok(Some((stream, _owner))) => match stream {
+            storage::BlobStream::Local(_) => true,
+            storage::BlobStream::S3(resp) => {
+                resp.status() == reqwest::StatusCode::PARTIAL_CONTENT
+            }
+        },
+        Ok(None) => return error(StatusCode::NOT_FOUND, "blob not found"),
+        Err(e) => {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("storage error: {e}"),
+            );
+        }
+    };
+    let ranged = matches!(range, Some(Ok(Some(_))));
+    let status = if ranged && honored {
+        StatusCode::PARTIAL_CONTENT
+    } else {
+        StatusCode::OK
+    };
+    // An S3 backend that ignored the range serves the whole blob (like GET);
+    // Content-Length must describe what GET would actually send.
+    let served_len = if ranged && honored { len } else { size };
+    let mut response = (
+        status,
         [
             (axum::http::header::CONTENT_TYPE, desc.mime),
-            (axum::http::header::CONTENT_LENGTH, desc.size.to_string()),
+            (
+                axum::http::header::CONTENT_LENGTH,
+                served_len.to_string(),
+            ),
             (axum::http::header::ETAG, format!("\"{sha}\"")),
+            (
+                axum::http::header::CACHE_CONTROL,
+                "public, max-age=31536000, immutable".to_string(),
+            ),
             (axum::http::header::ACCEPT_RANGES, "bytes".to_string()),
         ],
     )
-        .into_response()
+        .into_response();
+    if ranged
+        && honored
+        && let Some(Ok(Some((start, end)))) = range
+    {
+        response.headers_mut().insert(
+            axum::http::header::CONTENT_RANGE,
+            format!("bytes {start}-{end}/{size}").parse().unwrap(),
+        );
+    }
+    response
 }
 
 /// `PUT /upload` — upload a blob (BUD-02). Returns 201 + the descriptor.
@@ -1568,6 +1647,60 @@ mod tests {
         assert_eq!(split_blob("short"), None);
         assert_eq!(split_blob(&format!("{}.png/x", "a".repeat(64))), None);
         assert_eq!(split_blob(&"A".repeat(64)), Some("a".repeat(64)));
+    }
+
+    #[tokio::test]
+    async fn head_matches_get_for_ranges_and_missing_files() {
+        let relay = build_blossom_relay(0).await;
+        let state = state_of(&relay).await.expect("blossom state");
+        let pk = "aa".repeat(32);
+        let data: Vec<u8> = (0..10_000u32).map(|i| (i % 251) as u8).collect();
+        let sha = sha256_hex(&data);
+        state
+            .store
+            .put(&pk, &sha, &data, "application/octet-stream")
+            .await
+            .unwrap();
+
+        // A single satisfiable Range yields 206 + Content-Range, like GET.
+        let mut headers = HeaderMap::new();
+        headers.insert(axum::http::header::RANGE, "bytes=100-199".parse().unwrap());
+        let resp = head_blob(State(relay.clone()), headers, AxPath(sha.clone())).await;
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(resp.headers()[axum::http::header::CONTENT_LENGTH], "100");
+        assert_eq!(
+            resp.headers()[axum::http::header::CONTENT_RANGE],
+            format!("bytes 100-199/{}", data.len())
+        );
+        // An unsatisfiable range is a 416 with `Content-Range: bytes */`.
+        let mut headers = HeaderMap::new();
+        headers.insert(axum::http::header::RANGE, "bytes=999999-".parse().unwrap());
+        let resp = head_blob(State(relay.clone()), headers, AxPath(sha.clone())).await;
+        assert_eq!(resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(
+            resp.headers()[axum::http::header::CONTENT_RANGE],
+            format!("bytes */{}", data.len())
+        );
+
+        // The backing file disappears while the LMDB mapping remains:
+        // HEAD must 404 exactly like GET (a mapping alone is not a blob).
+        let local_path = relay.config.read().await.blossom.local_path.clone();
+        let npub =
+            crate::nips::nip19::bech32_encode("npub", &hex::decode(&pk).unwrap()).unwrap();
+        std::fs::remove_file(local_path.join(npub).join(&sha)).unwrap();
+        let resp = get_blob(State(relay.clone()), HeaderMap::new(), AxPath(sha.clone())).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "GET 404s once the backing file is gone"
+        );
+        let resp = head_blob(State(relay.clone()), HeaderMap::new(), AxPath(sha)).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "HEAD must agree with GET for a missing backing file"
+        );
+        relay.db.shutdown();
     }
 
     #[tokio::test]
