@@ -137,10 +137,12 @@ impl StampClock {
     }
 
     /// Returns a timestamp strictly greater than every previously issued
-    /// stamp and at least `floor`. Issued stamps cap at `u64::MAX - 1`
-    /// (the last unique value: `min(u64::MAX - 2)` before the increment),
-    /// so the issued value can never collide with a previous one within
-    /// the reachable range.
+    /// stamp and at least `floor`, while values remain. The increment is
+    /// capped at `u64::MAX - 1` so it never overflows. Once that cap is
+    /// reached (unreachable in practice at one stamp per second) the clock
+    /// saturates and keeps returning the cap: strict monotonicity is
+    /// impossible beyond the last usable timestamp, but the clock never
+    /// regresses and never returns `u64::MAX`.
     pub(crate) fn stamp(&self, floor: u64) -> u64 {
         let mut cur = self.last.load(Ordering::Relaxed);
         loop {
@@ -1743,6 +1745,19 @@ mod tests {
         assert!(b > a, "a lower floor must not lower the stamp");
         assert!(c > b && c >= 1000);
         assert!(d > c, "a zero floor must not lower the stamp");
+    }
+
+    #[test]
+    fn stamp_clock_saturates_without_regressing() {
+        // At the cap strict monotonicity is impossible (no larger value
+        // exists), but the clock must stay at the last usable stamp and
+        // never regress or return the reserved `u64::MAX`.
+        let clock = StampClock::new_with_last(u64::MAX - 1);
+        let a = clock.stamp(u64::MAX);
+        assert_eq!(a, u64::MAX - 1, "the cap is the last usable stamp");
+        let b = clock.stamp(u64::MAX);
+        assert_eq!(b, u64::MAX - 1, "saturated stamps stay at the cap");
+        assert_ne!(b, u64::MAX, "u64::MAX is never issued");
     }
 
     #[test]
