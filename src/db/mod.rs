@@ -44,7 +44,7 @@ pub enum PutOutcome {
     /// NIP-01: kinds 20000-29999 are ephemeral and must not be stored
     /// (NIP-59 requires kind 21059 in particular to never be stored).
     /// The event is delivered live to subscribers and acknowledged with
-    /// an `OK` carrying the `mute:` prefix.
+    /// `OK true` (accepted, empty message).
     Ephemeral,
     Invalid(String),
 }

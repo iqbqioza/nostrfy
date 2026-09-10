@@ -2638,7 +2638,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let now = unix_now();
-            // Default config: ephemeral forwarded (mute).
+            // Default config: ephemeral forwarded (accepted, not stored).
             let mut conn = build_conn().await;
             let ephemeral = signed_note_seeded(conn.relay.secp(), 1, "ephemeral", now, vec![]);
             let mut ev = ephemeral.clone();
@@ -2658,9 +2658,10 @@ mod tests {
             let msgs = outgoing_json(&conn);
             let ok = msgs.iter().find(|m| m[0] == "OK" && m[1] == ev.id).unwrap();
             assert_eq!(ok[2], true, "ephemeral must be forwarded when not rejected");
-            assert!(
-                ok[3].as_str().unwrap_or("").contains("mute"),
-                "ephemeral OK carries mute prefix"
+            assert_eq!(
+                ok[3].as_str().unwrap_or(""),
+                "",
+                "an accepted ephemeral must not carry the `mute:` prefix"
             );
             conn.relay.db.shutdown();
 

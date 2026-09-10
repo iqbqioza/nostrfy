@@ -266,8 +266,11 @@ impl super::Conn {
                 }
                 crate::db::PutOutcome::Ephemeral => {
                     // NIP-01: ephemeral kinds are delivered live but never
-                    // stored; the NIP-01 `mute:` prefix acknowledges this.
-                    self.send_ok(&id, true, "mute: ephemeral event not stored");
+                    // stored. The event was accepted (forwarded to the
+                    // current subscribers), so the OK is `true` with the
+                    // empty message the spec allows; `mute:` means "ignored"
+                    // and would contradict the acceptance.
+                    self.send_ok(&id, true, "");
                 }
                 crate::db::PutOutcome::Duplicate(msg) => {
                     self.send_ok(&id, true, &msg);
