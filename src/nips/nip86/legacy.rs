@@ -124,7 +124,7 @@ async fn check_auth(
         );
         let url_ok =
             |tag: &str| nip98::matches_request_url(tag, &mgmt_identity, uri.path(), uri.query());
-        if let Some(pubkey) = nip98::verify(
+        if let Some(verified) = nip98::verify(
             auth,
             Some(&cfg.rpc.admin_pubkey),
             relay.secp(),
@@ -134,8 +134,9 @@ async fn check_auth(
             url_ok,
         )
         .await
+            && relay.nip98_replay.accept(&verified.id, unix_now())
         {
-            return Ok(pubkey);
+            return Ok(verified.pubkey);
         }
         return Err(unauthorized("invalid NIP-98 auth"));
     }

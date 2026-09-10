@@ -333,14 +333,9 @@ Common causes:
 ---
 
 
-### 4-9. NIP-98 auth events are accepted with a different scheme or port
+### 4-9. NIP-98 auth events are rejected for a different scheme or port
 
-The NIP-98 spec says the `u` tag must be *exactly* the same as the absolute request URL. nostrfy deliberately tolerates two differences:
-
-- **scheme**: `wss://` / `https://` (and `ws://` / `http://`, including the `nostr+` variants) are treated as equivalent — this keeps NIP-98 auth working behind TLS-terminating proxies, which see `http` on their side while the client signs `https`
-- **default ports**: a `u` tag without a port is accepted when the relay listens on port 80 or 443
-
-The host, path and query must still match exactly, so the tolerance cannot be used to authorize a different resource.
+The NIP-98 spec says the `u` tag must be *exactly* the same as the absolute request URL, so nostrfy derives the expected URL from `relay.public_url`: its authority plus the HTTP scheme mapped from the WebSocket scheme (`wss://` -> `https://`, `ws://` -> `http://`, `nostr+` stripped). Without `public_url` the relay expects the plain `http://host:port` it serves. A tag with another scheme, a different/omitted port, or a different path or query is rejected — set `relay.public_url` to the public address clients sign. Each auth event is also **single-use**: replaying the same `Authorization` header within its 60-second validity window is refused.
 
 ---
 

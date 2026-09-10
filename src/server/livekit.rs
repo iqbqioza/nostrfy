@@ -85,8 +85,13 @@ pub(crate) async fn livekit_token(
         })
         .await;
     match authed {
-        Some(pubkey) if group_allows(&relay, &group, &pubkey).await => {
-            match issue_livekit_token(&cfg, &group, &pubkey) {
+        Some(verified)
+            if relay
+                .nip98_replay
+                .accept(&verified.id, unix_now())
+                && group_allows(&relay, &group, &verified.pubkey).await =>
+        {
+            match issue_livekit_token(&cfg, &group, &verified.pubkey) {
                 Ok(token) => {
                     let url = cfg.relay.livekit_url.clone();
                     (StatusCode::OK, Json(json!({ "token": token, "url": url })))
@@ -175,6 +180,9 @@ mod tests {
         cfg.relay.livekit_api_key = "test-key".into();
         cfg.relay.livekit_api_secret = "test-secret".into();
         cfg.relay.livekit_url = "wss://livekit.example.com".into();
+        // The NIP-98 URL check derives the HTTP origin from `public_url`
+        // (wss -> https), so the test's signed URL is deterministic.
+        cfg.relay.public_url = "wss://relay.example.com".into();
         let db = crate::db::DbClient::open(
             &cfg.database,
             true,

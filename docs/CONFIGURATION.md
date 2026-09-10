@@ -150,7 +150,7 @@ The changes take effect immediately and are persisted (same lists as `nostrfy re
 
 - **`name` / `description` / `icon` / `pubkey` / `contact`** are served to every client in the NIP-11 document (`GET /`). Empty string fields are omitted from the document. Runtime changes via NIP-86 are **persisted into this config file**, so a later SIGHUP reload keeps them.
 - **`private_key`**: without it, no 39001/39002 group snapshots are generated. Generate with `nostrfy genkey`; changing requires `restart`.
-- **`public_url`**: matching tolerates different schemes (`wss`/`ws`/`https`/`http`) and paths, and is case-insensitive. When the relay binds `0.0.0.0` or `127.0.0.1` and `public_url` is empty, a loud warning explains that NIP-42/62/98 URL checks will fail.
+- **`public_url`**: NIP-42/62 `relay`-tag matching tolerates different schemes (`wss`/`ws`/`https`/`http`) and paths, and is case-insensitive. NIP-98 `u`-tag matching is stricter: the tag must equal the relay's canonical HTTP URL exactly (the `public_url` authority with `wss` -> `https` / `ws` -> `http`, plus the exact path and query); each auth event is single-use within its 60-second window. When the relay binds `0.0.0.0` or `127.0.0.1` and `public_url` is empty, a loud warning explains that NIP-42/62/98 URL checks will fail.
 - **`livekit_url` + `livekit_api_key` + `livekit_api_secret`**: all three are needed together; a URL without credentials logs a warning (tokens would be signed with an empty secret).
 - **`enabled_nips` / `disabled_nips`**: `enabled_nips` wins over `disabled_nips`. Both affect the NIP-11 `supported_nips` list and the relay's behavior gates (NIP-29 groups, NIP-50 search, NIP-40 expiry, ...).
 - **The NIP-11 `supported_nips` list is dynamic**: besides `enabled_nips`/`disabled_nips`, a NIP is dropped when every kind it defines is blocked — by `blocked_kinds`, by `allowed_kinds` (a NIP's kind is only accepted if it is listed), or by `reject_ephemeral` (a NIP whose kinds are all ephemeral and not in the exempt list is hidden). NIP-29/43/66 are hidden without `relay.private_key` (their relay-signed events cannot be produced), and NIP-86 is hidden without `rpc.management_token` or `rpc.admin_pubkey`. Kinds without an owning NIP are not affected. Runtime access changes (NIP-86 `allowkind`/`disallowkind`) and `SIGHUP` reloads are reflected in the next NIP-11 fetch; `enabled_nips`/`disabled_nips` still require a restart.
@@ -201,7 +201,7 @@ The changes take effect immediately and are persisted (same lists as `nostrfy re
 
 **`management_token`** — The bearer token that authenticates management calls (`Authorization: Bearer <token>`). Compared in constant time. Empty = token authentication is disabled.
 
-**`admin_pubkey`** — The administrator's public key for NIP-98 authentication: management calls must carry a valid NIP-98 auth event (kind 27235, with a `payload` tag, a `u` tag matching the relay URL, signed by this key). Empty = NIP-98 authentication is disabled.
+**`admin_pubkey`** — The administrator's public key for NIP-98 authentication: management calls must carry a valid NIP-98 auth event (kind 27235, with a `payload` tag, a `u` tag matching the relay URL exactly, signed by this key). Empty = NIP-98 authentication is disabled. Each auth event is single-use within its 60-second window.
 
 **`metrics_enabled`** — When `true`, serves Prometheus-formatted metrics at `/metrics` (no authentication). Fixed at startup — requires a `restart`.
 

@@ -105,6 +105,10 @@ pub struct Relay {
     pub blossom_allow: Arc<tokio::sync::RwLock<Vec<String>>>,
     /// Rate-limited audit trail of the management operations (NIP-86).
     pub audit: crate::audit::AuditLog,
+    /// NIP-98 replay guard: every HTTP auth event authorizes exactly one
+    /// management request (a captured header must not be reusable within
+    /// its 60-second window).
+    pub nip98_replay: crate::nips::nip98::ReplayGuard,
 }
 
 /// Issues strictly increasing timestamps for relay-generated events.
@@ -350,6 +354,7 @@ impl Relay {
             blossom: Arc::new(tokio::sync::RwLock::new(None)),
             blossom_allow: Arc::new(tokio::sync::RwLock::new(blossom_allow)),
             audit: crate::audit::AuditLog::default(),
+            nip98_replay: Default::default(),
         }
     }
 

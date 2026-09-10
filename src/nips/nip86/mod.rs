@@ -657,7 +657,7 @@ async fn rpc_authenticated(
             .get(header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("Nostr "))
-        && let Some(pubkey) = nip98::verify(
+        && let Some(verified) = nip98::verify(
             auth,
             Some(&cfg.rpc.admin_pubkey),
             relay.secp(),
@@ -667,8 +667,11 @@ async fn rpc_authenticated(
             |url| nip98::matches_request_url(url, &cfg.relay_identity(), uri.path(), uri.query()),
         )
         .await
+        && relay
+            .nip98_replay
+            .accept(&verified.id, crate::util::unix_now())
     {
-        return Some(pubkey);
+        return Some(verified.pubkey);
     }
     None
 }

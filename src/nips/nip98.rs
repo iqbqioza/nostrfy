@@ -32,7 +32,7 @@ pub async fn verify(
     expected_payload_hash: Option<&str>,
     method: &str,
     url_matches: impl Fn(&str) -> bool,
-) -> Option<String> {
+) -> Option<Verified> {
     let raw = base64::engine::general_purpose::STANDARD
         .decode(encoded)
         .ok()?;
@@ -41,7 +41,7 @@ pub async fn verify(
         return None;
     }
     if let Some(expected) = expected_pubkey
-        && event.pubkey != expected
+        && !event.pubkey.eq_ignore_ascii_case(expected)
     {
         return None;
     }
@@ -76,7 +76,10 @@ pub async fn verify(
     if nip01::verify(&event, secp).is_err() {
         return None;
     }
-    Some(event.pubkey)
+    Some(Verified {
+        pubkey: event.pubkey,
+        id: event.id,
+    })
 }
 
 /// sha256 hex of HTTP request bytes, for the NIP-98 `payload` tag
@@ -86,74 +89,65 @@ pub fn payload_sha256_hex(data: &[u8]) -> String {
     hex::encode(Sha256::digest(data))
 }
 
-/// NIP-98: the `u` tag MUST be the absolute request URL. The scheme is
-/// normalized (`wss`/`https` and `ws`/`http`, including the `nostr+`
-/// variants) so that clients behind TLS-terminating proxies that sign
-/// with the `wss` form still work; the host, port, path and query must
-/// match exactly.
+/// A verified NIP-98 authorization: the author pubkey and the auth event id
+/// (the caller records the id in its replay guard).
+pub struct Verified {
+    pub pubkey: String,
+    pub id: String,
+}
+
+/// NIP-98 replay guard: "the `u` tag MUST be exactly the same as the
+/// absolute request URL" only authorizes one request, so a captured
+/// `Authorization` header must not be reusable. Entries expire with the
+/// 60-second auth window; a hard cap bounds memory even under an
+/// authenticated event flood (fail closed at the cap).
+pub struct ReplayGuard {
+    seen: std::sync::Mutex<std::collections::HashMap<String, u64>>,
+}
+
+impl Default for ReplayGuard {
+    fn default() -> Self {
+        ReplayGuard {
+            seen: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+}
+
+impl ReplayGuard {
+    /// Maximum authorizations tracked within one window.
+    const MAX_ENTRIES: usize = 4096;
+
+    /// Records `id` (valid until `now + 60`); returns `false` when it was
+    /// already used (a replay) or the guard is full.
+    pub fn accept(&self, id: &str, now: u64) -> bool {
+        let mut seen = self.seen.lock().unwrap_or_else(|p| p.into_inner());
+        seen.retain(|_, expiry| *expiry > now);
+        if seen.contains_key(id) || seen.len() >= Self::MAX_ENTRIES {
+            return false;
+        }
+        seen.insert(id.to_string(), now.saturating_add(60));
+        true
+    }
+}
+
+/// NIP-98: "The `u` tag MUST be exactly the same as the absolute request
+/// URL (including query parameters)." The expected URL is the relay's
+/// canonical HTTP origin (`relay.public_url` mapped to `https`/`http`, or
+/// the bound `http://host:port` when unset) plus the exact request path and
+/// query; the comparison is byte-for-byte.
 pub fn matches_request_url(
     tag: &str,
     identity: &crate::nips::nip62::RelayIdentity<'_>,
     request_path: &str,
     request_query: Option<&str>,
 ) -> bool {
-    // `nostr+https`/`nostr+http` sign with the same TLS semantics as
-    // `https`/`http` (the `nostr+` prefix is a relay-information marker),
-    // so their default port follows the underlying scheme.
-    let scheme = tag
-        .split_once("://")
-        .map(|(s, _)| s.to_ascii_lowercase())
-        .map(|s| s.strip_prefix("nostr+").unwrap_or(&s).to_string());
-    let Some(rest) = tag
-        .strip_prefix("wss://")
-        .or_else(|| tag.strip_prefix("https://"))
-        .or_else(|| tag.strip_prefix("nostr+https://"))
-        .or_else(|| tag.strip_prefix("ws://"))
-        .or_else(|| tag.strip_prefix("http://"))
-        .or_else(|| tag.strip_prefix("nostr+http://"))
-    else {
-        return false;
-    };
-    let (authority, path) = match rest.split_once('/') {
-        Some((a, p)) => (a, format!("/{p}")),
-        // A bare host is equivalent to the "/" path.
-        None => (rest, "/".to_string()),
-    };
-    let (tag_path, tag_query) = match path.split_once('?') {
-        Some((p, q)) => (p, Some(q)),
-        None => (path.as_str(), None),
-    };
-    if tag_path != request_path || tag_query.unwrap_or("") != request_query.unwrap_or("") {
-        return false;
+    let mut expected = identity.http_origin();
+    expected.push_str(request_path);
+    if let Some(query) = request_query {
+        expected.push('?');
+        expected.push_str(query);
     }
-    authority_matches(authority, scheme.as_deref(), identity)
-}
-
-fn authority_matches(
-    authority: &str,
-    scheme: Option<&str>,
-    identity: &crate::nips::nip62::RelayIdentity<'_>,
-) -> bool {
-    let our_authority = crate::nips::nip62::authority_of(identity);
-    let (our_host, our_port) = crate::nips::nip62::split_host_port(&our_authority);
-    let (tag_host, tag_port) = crate::nips::nip62::split_host_port(authority);
-    if !tag_host.eq_ignore_ascii_case(our_host) {
-        return false;
-    }
-    match (tag_port, our_port) {
-        (Some(tp), Some(op)) => tp == op,
-        // An omitted port means the default port of the scheme (the same
-        // rule as the NIP-62/NIP-42 relay-tag matching).
-        (None, Some(op)) => {
-            crate::nips::nip62::scheme_default_port(scheme).is_none_or(|dp| dp == op)
-        }
-        // Mirror case: a tag with the scheme's default port matches a
-        // portless relay identity (`wss://host:443` ≡ portless `wss://host`).
-        (Some(tp), None) => {
-            crate::nips::nip62::scheme_default_port(scheme).is_none_or(|dp| dp == tp)
-        }
-        (None, None) => true,
-    }
+    tag == expected
 }
 
 #[cfg(test)]
@@ -274,80 +268,95 @@ mod tests {
     #[test]
     fn request_url_matches_exactly() {
         let identity = RelayIdentity::new("relay.example.com", 8080, "");
-        // Exact match.
+        // Exact match against the plain-HTTP origin of a directly served
+        // relay.
         assert!(matches_request_url(
+            "http://relay.example.com:8080/ws",
+            &identity,
+            "/ws",
+            None
+        ));
+        // NIP-98 requires the exact absolute URL: other schemes are not
+        // interchangeable.
+        for other in [
             "https://relay.example.com:8080/ws",
-            &identity,
-            "/ws",
-            None
-        ));
-        // Scheme normalization: wss and http are accepted too.
-        assert!(matches_request_url(
             "wss://relay.example.com:8080/ws",
-            &identity,
-            "/ws",
-            None
-        ));
-        assert!(matches_request_url(
             "nostr+https://relay.example.com:8080/ws",
-            &identity,
-            "/ws",
-            None
-        ));
+            "ws://relay.example.com:8080/ws",
+        ] {
+            assert!(
+                !matches_request_url(other, &identity, "/ws", None),
+                "{other} must not match an http request"
+            );
+        }
         // The query must match exactly, including parameter order.
         assert!(matches_request_url(
-            "https://relay.example.com:8080/ws?a=1&b=2",
+            "http://relay.example.com:8080/ws?a=1&b=2",
             &identity,
             "/ws",
             Some("a=1&b=2")
         ));
         assert!(!matches_request_url(
-            "https://relay.example.com:8080/ws?a=1&b=2",
+            "http://relay.example.com:8080/ws?a=1&b=2",
             &identity,
             "/ws",
             Some("b=2&a=1")
         ));
         // A query on one side but not the other is a mismatch.
         assert!(!matches_request_url(
-            "https://relay.example.com:8080/ws?a=1",
+            "http://relay.example.com:8080/ws?a=1",
             &identity,
             "/ws",
             None
         ));
         assert!(!matches_request_url(
-            "https://relay.example.com:8080/ws",
+            "http://relay.example.com:8080/ws",
             &identity,
             "/ws",
             Some("a=1")
         ));
-        // The path must match exactly.
+        // The path must match exactly (including the trailing slash).
         assert!(!matches_request_url(
-            "https://relay.example.com:8080/ws/",
+            "http://relay.example.com:8080/ws/",
             &identity,
             "/ws",
             None
         ));
         assert!(!matches_request_url(
-            "https://relay.example.com:8080/other",
+            "http://relay.example.com:8080/other",
             &identity,
             "/ws",
+            None
+        ));
+        // A bare authority is not the "/" URL: the trailing slash is part
+        // of the absolute request URL.
+        assert!(!matches_request_url(
+            "http://relay.example.com:8080",
+            &identity,
+            "/",
+            None
+        ));
+        assert!(matches_request_url(
+            "http://relay.example.com:8080/",
+            &identity,
+            "/",
             None
         ));
         // Host and port must match; a non-default port may not be omitted.
         assert!(!matches_request_url(
-            "https://evil.example.com:8080/ws",
+            "http://evil.example.com:8080/ws",
             &identity,
             "/ws",
             None
         ));
         assert!(!matches_request_url(
-            "https://relay.example.com:9999/ws",
+            "http://relay.example.com:9999/ws",
             &identity,
             "/ws",
             None
         ));
         assert!(!matches_request_url(
-            "https://relay.example.com/ws",
+            "http://relay.example.com/ws",
             &identity,
             "/ws",
             None
@@ -359,45 +368,65 @@ mod tests {
             "/ws",
             None
         ));
-        // A bare host matches the "/" path.
-        assert!(matches_request_url(
-            "https://relay.example.com:8080",
-            &identity,
-            "/",
-            None
-        ));
     }
 
     #[test]
-    fn request_url_default_port_and_public_url() {
-        // Default ports may be omitted from the tag.
+    fn request_url_public_url_and_ports() {
+        // With no public_url the relay is plain HTTP and the bound port is
+        // part of the expected URL.
         let identity = RelayIdentity::new("relay.example.com", 443, "");
         assert!(matches_request_url(
-            "wss://relay.example.com/ws",
+            "http://relay.example.com:443/ws",
             &identity,
             "/ws",
             None
         ));
-        let identity = RelayIdentity::new("relay.example.com", 80, "");
-        assert!(matches_request_url(
-            "ws://relay.example.com/",
+        assert!(!matches_request_url(
+            "https://relay.example.com/ws",
             &identity,
-            "/",
+            "/ws",
             None
         ));
-        // public_url overrides the configured host:port.
+        // public_url overrides the authority; the WebSocket scheme maps to
+        // the HTTP scheme (`wss` -> `https`, `ws` -> `http`).
         let identity = RelayIdentity::new("127.0.0.1", 8080, "wss://public.example.net");
         assert!(matches_request_url(
+            "https://public.example.net/ws",
+            &identity,
+            "/ws",
+            None
+        ));
+        assert!(!matches_request_url(
             "wss://public.example.net/ws",
             &identity,
             "/ws",
             None
         ));
         assert!(!matches_request_url(
-            "wss://public.example.net:8443/ws",
+            "https://public.example.net:8443/ws",
             &identity,
             "/ws",
             None
         ));
+        // A plain `ws://` public URL maps to `http`.
+        let identity = RelayIdentity::new("127.0.0.1", 8080, "ws://public.example.net");
+        assert!(matches_request_url(
+            "http://public.example.net/ws",
+            &identity,
+            "/ws",
+            None
+        ));
+    }
+
+    #[test]
+    fn replay_guard_rejects_reuse_within_the_window() {
+        let guard = ReplayGuard::default();
+        assert!(guard.accept("aa", 1_000));
+        assert!(!guard.accept("aa", 1_000), "the same id is a replay");
+        assert!(!guard.accept("aa", 1_059), "still within the window");
+        // After the 60-second window the entry expires.
+        assert!(guard.accept("aa", 1_061));
+        // Distinct ids are independent.
+        assert!(guard.accept("bb", 1_061));
     }
 }
