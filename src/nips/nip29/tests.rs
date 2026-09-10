@@ -1035,9 +1035,9 @@ fn last_admin_cannot_be_demoted_or_removed() {
     // Removing the last admin with 9001: refused.
     let remove_last = event(9001, ADMIN, Some("g1"), vec![vec![P.into(), ADMIN.into()]]);
     assert!(store.validate_write(&remove_last).is_err());
-    // The last admin leaving: refused.
-    let leave = event(9022, ADMIN, Some("g1"), vec![]);
-    assert!(store.validate_write(&leave).is_err());
+    // The last admin's LEAVE is covered by
+    // `only_the_last_admin_cannot_leave`: the group must retain an admin, so
+    // the guard cannot be bypassed there.
     // Removing a non-last admin is fine.
     let grant2 = event(
         9000,
@@ -1053,6 +1053,62 @@ fn last_admin_cannot_be_demoted_or_removed() {
         vec![vec![P.into(), ADMIN2.into()]],
     );
     assert!(store.validate_write(&remove2).is_ok());
+}
+
+#[test]
+fn only_the_last_admin_cannot_leave() {
+    // An admin may leave while another admin remains; the last admin cannot
+    // leave (the group must never be orphaned) and must delete the group or
+    // grant another admin first. Plain members always leave.
+    let mut store = seeded();
+    // OTHER is a plain member: leave is honored.
+    let member_leave = event(LEAVE, OTHER, Some("g1"), vec![]);
+    assert!(store.validate_write(&member_leave).is_ok());
+    // ADMIN is the only admin: leave is rejected with guidance.
+    let admin_leave = event(LEAVE, ADMIN, Some("g1"), vec![]);
+    assert!(
+        store
+            .validate_write(&admin_leave)
+            .unwrap_err()
+            .contains("last admin cannot leave"),
+        "the sole admin cannot leave"
+    );
+    // With a second admin, ADMIN may leave.
+    let grant = event(
+        9000,
+        ADMIN,
+        Some("g1"),
+        vec![vec![P.into(), ADMIN2.into(), "mod".into()]],
+    );
+    assert!(store.validate_write(&grant).is_ok());
+    store.apply(&grant, "", 2, false, false);
+    assert!(
+        store.validate_write(&admin_leave).is_ok(),
+        "an admin may leave while another admin remains"
+    );
+}
+
+#[test]
+fn admin_escape_hatch_is_group_deletion() {
+    // Admins cannot leave, but deleting the group is the safe escape: even
+    // the only admin may send a 9008, which removes the group (and its
+    // events are purged by the relay).
+    let mut store = seeded();
+    let leave = event(LEAVE, ADMIN, Some("g1"), vec![]);
+    assert!(
+        store.validate_write(&leave).is_err(),
+        "the sole admin cannot leave"
+    );
+    let delete = event(DELETE_GROUP, ADMIN, Some("g1"), vec![]);
+    assert!(
+        store.validate_write(&delete).is_ok(),
+        "the sole admin must be able to delete the group"
+    );
+    store.apply(&delete, "", 2, false, false);
+    assert!(store.group("g1").is_none(), "the group is removed");
+    // The id is tombstoned too: a plain write is blocked until a 9007.
+    let write = event(1, USER, Some("g1"), vec![]);
+    assert!(store.validate_write(&write).is_err());
 }
 
 #[test]

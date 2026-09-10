@@ -351,14 +351,21 @@ impl GroupStore {
         }
 
         if event.kind == LEAVE {
-            // NIP-29: leaving must not remove the group's last admin
-            // (nobody could then manage the group).
+            // NIP-29: a plain member's leave is always honored. An admin may
+            // leave only while another admin remains; the last admin cannot
+            // leave (the group must never be left without an admin) and must
+            // delete the group (9008) instead, which purges its events.
+            let is_admin = group.is_admin(pubkey);
             let retains_admin = group
                 .members
                 .iter()
                 .any(|(pk, roles)| !roles.is_empty() && pk != &event.pubkey);
-            if !retains_admin {
-                return Err("restricted: the group must retain at least one admin".into());
+            if is_admin && !retains_admin {
+                return Err(
+                    "restricted: the last admin cannot leave; delete the group (kind:9008) \
+                     or grant another admin first"
+                        .into(),
+                );
             }
             return Ok(());
         }
@@ -411,8 +418,10 @@ impl GroupStore {
             }
             // NIP-29: the group must retain at least one admin — a 9000
             // without roles could silently demote the last admin, and a
-            // 9001/LEAVE could remove them, leaving the group unmanageable
-            // (nobody could then issue 9000/9001/9002 again).
+            // 9001 could remove them, leaving the group unmanageable
+            // (nobody could then issue 9000/9001/9002 again). The last admin
+            // cannot LEAVE either (see above): deleting the group is the
+            // escape hatch.
             let admin_removed: HashSet<String> = match event.kind {
                 9000 => event
                     .tags
