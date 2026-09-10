@@ -304,14 +304,28 @@ async fn verify_auth(
         .or_else(|_| base64::engine::general_purpose::STANDARD.decode(encoded))
         .ok()?;
     let event: crate::event::Event = serde_json::from_slice(&raw).ok()?;
-    validate_auth_event(
+    let pubkey = validate_auth_event(
         relay.secp(),
         &event,
         &state.host,
         verb,
         expected_sha,
         unix_now(),
-    )
+    )?;
+    // NIP-86 `banpubkey` applies to authenticated actions on every
+    // endpoint: a blocked pubkey must not upload, delete or list Blossom
+    // blobs either (the WebSocket publish/read paths already enforce it).
+    let blocked = relay
+        .access
+        .read()
+        .await
+        .blocked_pubkeys
+        .iter()
+        .any(|(pk, _)| pk.eq_ignore_ascii_case(&pubkey));
+    if blocked {
+        return None;
+    }
+    Some(pubkey)
 }
 
 fn error(status: StatusCode, reason: &str) -> Response {
@@ -1642,6 +1656,33 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn banned_pubkey_cannot_use_blossom() {
+        // NIP-86 `banpubkey` must deny authenticated Blossom actions too,
+        // not only WebSocket publishing/reading.
+        let relay = build_blossom_relay(0).await;
+        let (headers, pk) = auth_headers(relay.secp(), "list");
+        relay
+            .access
+            .write()
+            .await
+            .blocked_pubkeys
+            .push((pk.clone(), "spam".into()));
+        let resp = list(
+            State(relay.clone()),
+            headers,
+            AxPath(pk),
+            axum::extract::Query(std::collections::HashMap::new()),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "a banned pubkey's Blossom token must be refused"
+        );
         relay.db.shutdown();
     }
 
