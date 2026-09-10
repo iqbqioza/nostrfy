@@ -408,6 +408,17 @@ impl super::Relay {
             return Err("invalid: authentication events cannot be published".into());
         }
 
+        // NIP-43: a `kind:28935` invite request "MUST be signed by the pubkey
+        // specified in the `self` field of the relay's NIP 11 document". This
+        // relay never generates claims, so a client-signed 28935 is bogus and
+        // must not be broadcast to subscribers that could mistake it for a
+        // relay-issued claim. Unconditional like the NIP-42 AUTH rule above.
+        if event.kind == nip43::INVITE
+            && Some(event.pubkey.as_str()) != self.relay_pubkey().as_deref()
+        {
+            return Err("blocked: invite responses must be published by the relay".into());
+        }
+
         // NIP-43: role definitions, membership lists and add/remove user
         // events MUST be signed by the relay's own key ("the pubkey
         // specified in the `self` field of the relay's NIP-11 document");
@@ -1477,6 +1488,18 @@ mod tests {
                 .precheck(&cfg, &access, &join, now, &[], None, None)
                 .await;
             assert!(matches!(out, super::Precheck::Reject(m) if m.contains("h tag")));
+
+            // A client-signed NIP-43 invite response is rejected: kind 28935
+            // "MUST be signed by the pubkey specified in the `self` field"
+            // and this relay never generates claims.
+            let invite = h(crate::nips::nip43::INVITE, vec![]);
+            let out = relay
+                .precheck(&cfg, &access, &invite, now, &[], None, None)
+                .await;
+            assert!(
+                matches!(out, super::Precheck::Reject(m) if m.contains("invite")),
+                "a foreign invite response must be rejected"
+            );
 
             // An event with several h tags is rejected: the first tag would
             // be validated while the stored tag index and subscriptions match

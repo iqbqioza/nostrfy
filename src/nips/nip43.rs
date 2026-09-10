@@ -20,10 +20,10 @@ pub const MEMBERSHIP_LIST: u64 = 13534;
 pub const ADD_USER: u64 = 8000;
 pub const REMOVE_USER: u64 = 8001;
 pub const JOIN: u64 = 28934;
-/// NIP-43 invite request: reserved ephemeral kind. This relay never issues
-/// invite codes, so these events carry no relay state change — they are
-/// accepted as generic ephemeral events (forwarded live, never stored),
-/// like any other unhandled ephemeral kind.
+/// NIP-43 invite request (`kind:28935`): a reserved ephemeral kind that MUST
+/// be signed by the relay's own key (the NIP-11 `self` pubkey). This relay
+/// never generates claims, so client-signed 28935 events are rejected at
+/// intake (see `Relay::validate_base`).
 pub const INVITE: u64 = 28935;
 pub const LEAVE: u64 = 28936;
 /// Tag on a `kind:33534` tombstone marking a role as deleted.
