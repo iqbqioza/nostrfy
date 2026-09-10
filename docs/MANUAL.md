@@ -619,7 +619,7 @@ s3_access_key = "..."
 s3_secret_key = "..."
 ```
 
-Point `media.example.com` (and only that hostname) at the same port in your reverse proxy, then restart (`nostrfy restart`). `GET /` on that host answers with the Blossom server info document.
+Point `media.example.com` (and only that hostname) at the same port in your reverse proxy, then restart (`nostrfy restart`). `GET /` on that host answers with the Blossom server info document. With `storage = "s3"` the endpoint must be HTTPS (SigV4 credentials are sent on every request); plain `http://` is rejected unless the host is loopback (`127.0.0.1` / `localhost` / `[::1]`, e.g. a local MinIO for testing).
 
 ### 11.2 Storage layout
 

@@ -1377,6 +1377,22 @@ impl Config {
                 // Unreachable: validated above even when disabled.
                 _ => {}
             }
+            // SigV4 puts the credentials in every request: sending them over
+            // plaintext exposes them to any network observer. Loopback is
+            // exempt so a local MinIO can still be used for testing.
+            if b.storage == "s3" {
+                let endpoint = b.s3_endpoint.trim().to_ascii_lowercase();
+                let loopback = endpoint.starts_with("http://127.0.0.1")
+                    || endpoint.starts_with("http://localhost")
+                    || endpoint.starts_with("http://[::1]");
+                if !endpoint.starts_with("https://") && !loopback {
+                    return Err(Error::Config(format!(
+                        "blossom.s3_endpoint must use https:// (plain http is only allowed \
+                         for loopback hosts); got {:?}",
+                        b.s3_endpoint
+                    )));
+                }
+            }
         }
         Ok(())
     }
@@ -2758,6 +2774,37 @@ log_max_files = 2
                 .validate()
                 .is_ok(),
             "an empty region stays allowed for R2 endpoints"
+        );
+    }
+
+    #[test]
+    fn validation_rejects_plaintext_s3_endpoints() {
+        fn s3cfg(endpoint: &str) -> Config {
+            let mut cfg = Config::default();
+            cfg.blossom.host = "media.example.com".into();
+            cfg.blossom.storage = "s3".into();
+            cfg.blossom.s3_endpoint = endpoint.into();
+            cfg.blossom.s3_region = "us-east-1".into();
+            cfg.blossom.s3_bucket = "b".into();
+            cfg.blossom.s3_access_key = "k".into();
+            cfg.blossom.s3_secret_key = "s".into();
+            cfg
+        }
+        assert!(
+            s3cfg("http://s3.example.com").validate().is_err(),
+            "plaintext S3 endpoints must be rejected"
+        );
+        assert!(
+            s3cfg("https://s3.example.com").validate().is_ok(),
+            "https endpoints are fine"
+        );
+        assert!(
+            s3cfg("http://127.0.0.1:9000").validate().is_ok(),
+            "loopback stays usable for a local MinIO"
+        );
+        assert!(
+            s3cfg("http://localhost:9000").validate().is_ok(),
+            "localhost stays usable for a local MinIO"
         );
     }
 

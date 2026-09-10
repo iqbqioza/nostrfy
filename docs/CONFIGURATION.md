@@ -513,7 +513,7 @@ nostrfy relay list                # show both lists and restrict_relay
 
 **`min_free_bytes`** — Local-storage disk-full guard. Before writing a blob, the relay checks the free space on the filesystem hosting `local_path` (the same `statvfs` check the LMDB writer uses) and refuses the upload with `507 Insufficient Storage` while the free space is below this margin — a full disk would otherwise fail the LMDB writer and risk SIGBUS on memory-map writes. `0` disables the check. The S3 backend has no local disk, so the guard only applies to `storage = "local"`.
 
-**S3 keys** — With `storage = "s3"`, `s3_endpoint`, `s3_bucket`, `s3_access_key` and `s3_secret_key` are required. The endpoint must be the *path-style* form (`https://s3.amazonaws.com` or `https://<account>.r2.cloudflarestorage.com`); the request signing follows AWS Signature Version 4.
+**S3 keys** — With `storage = "s3"`, `s3_endpoint`, `s3_bucket`, `s3_access_key` and `s3_secret_key` are required. The endpoint must be the *path-style* HTTPS form (`https://s3.amazonaws.com` or `https://<account>.r2.cloudflarestorage.com`); the request signing follows AWS Signature Version 4. Plain `http://` is rejected because SigV4 credentials would travel in cleartext — only loopback hosts (`127.0.0.1`, `localhost`, `[::1]`) may use `http://`, so a local MinIO remains usable for testing.
 
 **`restrict_uploads`** — When `true`, `PUT /upload` accepts only the pubkeys on the Blossom upload allowlist (everyone else gets `403`). The allowlist itself is **not** part of the config file: it lives in the relay database (LMDB), is loaded at startup and managed at runtime with:
 
