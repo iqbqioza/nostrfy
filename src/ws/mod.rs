@@ -4494,6 +4494,56 @@ mod tests {
     }
 
     #[test]
+    fn malformed_event_and_auth_still_get_ok() {
+        // NIP-01/NIP-42: EVENT and AUTH messages must be answered with OK
+        // even when the payload is malformed, as long as an id can be
+        // correlated.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let id = "ab".repeat(32);
+            conn.handle_text(&format!(
+                r#"["EVENT", {{"id":"{id}","created_at":-1}}]"#
+            ))
+            .await;
+            let msgs = outgoing_json(&conn);
+            let ok = msgs
+                .iter()
+                .find(|m| m[0] == "OK" && m[1] == id)
+                .expect("a malformed EVENT with an id must get an OK");
+            assert_eq!(ok[2], false);
+            assert!(
+                ok[3].as_str().unwrap_or("").starts_with("invalid:"),
+                "the OK must carry a machine-readable reason: {ok:?}"
+            );
+
+            // Without an id there is nothing to correlate: NOTICE.
+            conn.outgoing.clear();
+            conn.out_bytes = 0;
+            conn.handle_text(r#"["EVENT", {"created_at":-1}]"#).await;
+            let msgs = outgoing_json(&conn);
+            assert!(msgs.iter().any(|m| m[0] == "NOTICE"));
+            assert!(!msgs.iter().any(|m| m[0] == "OK"));
+
+            // A malformed AUTH with an id likewise gets OK false.
+            conn.outgoing.clear();
+            conn.out_bytes = 0;
+            conn.handle_text(&format!(
+                r#"["AUTH", {{"id":"{id}","created_at":-1}}]"#
+            ))
+            .await;
+            let msgs = outgoing_json(&conn);
+            let ok = msgs
+                .iter()
+                .find(|m| m[0] == "OK" && m[1] == id)
+                .expect("a malformed AUTH with an id must get an OK");
+            assert_eq!(ok[2], false);
+
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
     fn deletion_without_targets_is_rejected() {
         // NIP-09: a deletion request (kind 5) is defined as having one or
         // more `e`/`a` tags; one without targets is rejected.

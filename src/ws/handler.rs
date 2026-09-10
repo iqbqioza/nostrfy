@@ -227,14 +227,21 @@ impl super::Conn {
 
     /// Queues an EVENT message for batched acceptance (generic path).
     pub(crate) async fn queue_event(&mut self, rest: &[Value]) {
-        if rest.is_empty() {
+        let Some(value) = rest.first() else {
             self.send_notice("error: EVENT requires an event object");
             return;
-        }
-        let event: Event = match serde_json::from_value(rest[0].clone()) {
+        };
+        let event: Event = match serde_json::from_value(value.clone()) {
             Ok(event) => event,
             Err(_) => {
-                self.send_notice("error: invalid event object");
+                // NIP-01: every EVENT gets an OK. Correlate with the id when
+                // the malformed object still carries one, so the client can
+                // match the refusal to its publish.
+                if let Some(id) = value.get("id").and_then(Value::as_str) {
+                    self.send_ok(id, false, "invalid: malformed event");
+                } else {
+                    self.send_notice("error: invalid event object");
+                }
                 return;
             }
         };
@@ -586,31 +593,30 @@ impl super::Conn {
     }
 
     pub(crate) async fn handle_auth(&mut self, rest: &[Value]) {
-        if !self.relay.config.read().await.nip_enabled(42) {
-            // NIP-42: client AUTH messages MUST be answered with OK, even
-            // when the relay does not support authentication. Correlate with
-            // the event id when one is present; otherwise fall back to NOTICE.
-            if let Some(event) = rest
-                .first()
-                .and_then(|v| serde_json::from_value::<Event>(v.clone()).ok())
-            {
-                self.send_control(nip42::ok(&event.id, false));
-            } else {
-                self.send_notice("error: authentication is not enabled on this relay");
-            }
-            return;
-        }
-        if rest.is_empty() {
+        let Some(value) = rest.first() else {
             self.send_notice("error: AUTH requires an event object");
             return;
-        }
-        let event: Event = match serde_json::from_value(rest[0].clone()) {
+        };
+        let event: Event = match serde_json::from_value(value.clone()) {
             Ok(event) => event,
             Err(_) => {
-                self.send_notice("error: invalid auth event");
+                // NIP-42: AUTH messages MUST be answered with OK, like any
+                // EVENT. Correlate with the id when the malformed event
+                // still carries one.
+                if let Some(id) = value.get("id").and_then(Value::as_str) {
+                    self.send_control(nip42::ok(id, false));
+                } else {
+                    self.send_notice("error: invalid auth event");
+                }
                 return;
             }
         };
+        if !self.relay.config.read().await.nip_enabled(42) {
+            // NIP-42: client AUTH messages MUST be answered with OK, even
+            // when the relay does not support authentication.
+            self.send_control(nip42::ok(&event.id, false));
+            return;
+        }
         let id = event.id.clone();
         let accepted = {
             let cfg = self.relay.config.read().await;
