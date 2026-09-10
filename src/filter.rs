@@ -1,7 +1,5 @@
 //! NIP-01 subscription filters and the in-memory match.
 
-use std::collections::BTreeMap;
-
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -66,7 +64,11 @@ pub struct Filter {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub search: Option<String>,
     #[serde(flatten)]
-    pub tags: BTreeMap<String, Value>,
+    /// Tag constraints (`#`-prefixed keys) plus any unknown filter fields.
+    /// A `serde_json::Map` preserves the client's JSON attribute order
+    /// (`preserve_order`), which NIP-45's HLL offset derivation needs: it
+    /// is defined over the *first* tag attribute in the filter.
+    pub tags: serde_json::Map<String, Value>,
     /// Cached tokenized search terms (the `search` string is immutable
     /// after parsing, so the terms are computed once per filter and shared
     /// across the filter's clones; the live delivery path matches every
@@ -667,5 +669,15 @@ mod tests {
         let mut v = serde_json::json!({"kinds": [1]});
         rewrite_inbox_outbox(&mut v).unwrap();
         assert_eq!(v, serde_json::json!({"kinds": [1]}));
+    }
+
+    #[test]
+    fn tag_attribute_order_is_preserved() {
+        // NIP-45 derives the HLL offset from the *first* tag attribute, so
+        // the parsed filter must keep the client's JSON attribute order.
+        let f: Filter =
+            serde_json::from_value(serde_json::json!({"#b": ["x"], "#a": ["y"]})).unwrap();
+        let keys: Vec<&str> = f.tags.keys().map(String::as_str).collect();
+        assert_eq!(keys, vec!["#b", "#a"]);
     }
 }

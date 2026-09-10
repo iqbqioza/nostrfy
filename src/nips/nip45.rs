@@ -31,11 +31,24 @@ pub fn count_response(
 }
 
 /// Computes the HyperLogLog register set (256 bytes, hex-encoded, 512 hex
-/// chars) over the pubkeys of `events`, using the deterministic offset
-/// derived from the first `#` tag of the first filter. Returns `None` when
-/// the filter is not HLL-eligible (no tag attribute).
+/// chars) over the pubkeys of `events`. NIP-45 defines the offset per
+/// filter, so a single HLL over an OR'd union is only well-defined when
+/// every filter is HLL-eligible with the same offset (the canonical
+/// single-target queries); otherwise `None` is returned and the response
+/// omits `hll`.
 pub fn hll(filters: &[Filter], events: &[Event]) -> Option<String> {
-    let offset = hll_offset(filters.first()?)?;
+    let mut offset: Option<usize> = None;
+    for filter in filters {
+        // A filter without a tag attribute is not HLL-eligible (the spec
+        // leaves that case undefined), so the union is not either.
+        let candidate = hll_offset(filter)?;
+        match offset {
+            None => offset = Some(candidate),
+            Some(existing) if existing == candidate => {}
+            Some(_) => return None,
+        }
+    }
+    let offset = offset?;
     let mut registers = [0u8; 256];
     for event in events {
         let Some(pubkey) = event.pubkey_bytes() else {
@@ -65,27 +78,32 @@ pub fn hll(filters: &[Filter], events: &[Event]) -> Option<String> {
 /// the offset, or the registers would differ from other relays' for the
 /// same query.
 fn hll_offset(filter: &Filter) -> Option<usize> {
+    // "Take the first tag attribute in the filter": `Filter::tags`
+    // preserves the client's JSON attribute order (`preserve_order`), so
+    // this is the document-order first `#` key.
     let (_, value) = filter.tags.iter().find(|(n, _)| n.starts_with('#'))?;
     let value = crate::filter::tag_values(value).next()?;
     let hex_string = if value.len() == 64 && hex::decode(value).is_ok() {
         value.to_string()
-    } else if let Some((_kind, pubkey, _d)) = split_address(value) {
-        if pubkey.len() == 64 && hex::decode(pubkey).is_ok() {
-            pubkey.to_string()
-        } else {
-            return None;
-        }
+    } else if let Some(pubkey) = address_pubkey(value) {
+        pubkey.to_string()
     } else {
+        // Includes malformed addresses (non-numeric kind, non-hex pubkey):
+        // the spec hashes anything that is not a valid id/pubkey/address.
         hex::encode(sha256(value.as_bytes()))
     };
     let nibble = hex_nibble(*hex_string.as_bytes().get(32)?)?;
     Some(nibble as usize + 8)
 }
 
-fn split_address(value: &str) -> Option<(&str, &str, &str)> {
+/// The `<pubkey>` of a well-formed `<kind>:<pubkey>:<d>` address (the kind
+/// must be numeric and the pubkey 64 hex chars); `None` for anything else,
+/// which the caller then hashes as a whole.
+fn address_pubkey(value: &str) -> Option<&str> {
     let (kind, rest) = value.split_once(':')?;
-    let (pubkey, d) = rest.split_once(':')?;
-    Some((kind, pubkey, d))
+    kind.parse::<u64>().ok()?;
+    let (pubkey, _d) = rest.split_once(':')?;
+    (pubkey.len() == 64 && hex::decode(pubkey).is_ok()).then_some(pubkey)
 }
 
 fn hex_nibble(byte: u8) -> Option<u8> {
@@ -142,9 +160,49 @@ mod tests {
         // Non-hex values are sha256-hashed.
         let f = filter_with_tag("hello world");
         assert!(hll_offset(&f).is_some_and(|o| (8..=23).contains(&o)));
+        // A malformed address (non-numeric kind) is not an address: the
+        // whole value is hashed like any other string.
+        let f = filter_with_tag(&format!("notakind:{pubkey}:post-1"));
+        assert!(hll_offset(&f).is_some_and(|o| (8..=23).contains(&o)));
         // Filters without a tag attribute are not eligible.
         let f: Filter = serde_json::from_value(serde_json::json!({"kinds": [7]})).unwrap();
         assert!(hll_offset(&f).is_none());
+    }
+
+    #[test]
+    fn hll_offset_uses_the_first_tag_attribute_in_order() {
+        // NIP-45: the offset comes from the *first* tag attribute in the
+        // filter, in the client's JSON order.
+        let mut a = "a".repeat(64);
+        a.replace_range(32..33, "c"); // c = 12 -> offset 20
+        let mut b = "b".repeat(64);
+        b.replace_range(32..33, "f"); // f = 15 -> offset 23
+        let f: Filter =
+            serde_json::from_value(serde_json::json!({"#b": [b], "#a": [a]})).unwrap();
+        assert_eq!(hll_offset(&f), Some(23), "the first # attribute must win");
+    }
+
+    #[test]
+    fn hll_requires_one_common_offset() {
+        // One HLL over an OR'd union is only defined when every filter is
+        // eligible with the same offset; otherwise the response omits it.
+        let mut a = "a".repeat(64);
+        a.replace_range(32..33, "c"); // offset 20
+        let mut b = "b".repeat(64);
+        b.replace_range(32..33, "f"); // offset 23
+        let same1 = filter_with_tag(&a);
+        let same2 = filter_with_tag(&a);
+        assert!(hll(&[same1.clone(), same2], &[]).is_some());
+        let other = filter_with_tag(&b);
+        assert!(
+            hll(&[same1.clone(), other], &[]).is_none(),
+            "different offsets cannot share one register set"
+        );
+        let untagged: Filter = serde_json::from_value(serde_json::json!({"kinds": [1]})).unwrap();
+        assert!(
+            hll(&[same1, untagged], &[]).is_none(),
+            "an ineligible filter makes the union ineligible"
+        );
     }
 
     #[test]

@@ -1107,7 +1107,7 @@ pub async fn api_related_handler(
     };
     let mut replies = apply_params(
         Filter {
-            tags: std::collections::BTreeMap::from([("#e".to_string(), e_target)]),
+            tags: serde_json::Map::from_iter([("#e".to_string(), e_target)]),
             ..Default::default()
         },
         &params,
@@ -1123,7 +1123,7 @@ pub async fn api_related_handler(
         replies,
         apply_params(
             Filter {
-                tags: std::collections::BTreeMap::from([("#q".to_string(), json!(hex_id.clone()))]),
+                tags: serde_json::Map::from_iter([("#q".to_string(), json!(hex_id.clone()))]),
                 ..Default::default()
             },
             &params,
@@ -1819,7 +1819,7 @@ mod tests {
         };
         let mut f = apply_params(
             Filter {
-                tags: std::collections::BTreeMap::from([("#e".to_string(), json!("target-id"))]),
+                tags: serde_json::Map::from_iter([("#e".to_string(), json!("target-id"))]),
                 ..Default::default()
             },
             &params,
