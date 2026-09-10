@@ -4495,6 +4495,53 @@ mod tests {
     }
 
     #[test]
+    fn refused_count_releases_the_same_id_req_subscription() {
+        // NIP-01/NIP-45: CLOSED is terminal for a subscription id. A COUNT
+        // refused with CLOSED for an id that is also an active REQ
+        // subscription must release that subscription, or the client would
+        // consider it closed while the relay kept delivering live events.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            // Open a REQ subscription "x".
+            conn.handle_req(&[json!("x"), json!({"kinds": [1]})])
+                .await;
+            conn.pump_pending_reqs();
+            assert!(conn.subs.contains_key("x"), "the REQ subscription is open");
+            // Disable COUNT and refuse a COUNT with the same id.
+            conn.relay
+                .config
+                .write()
+                .await
+                .relay
+                .disabled_nips
+                .push(45);
+            conn.handle_count(&[json!("x"), json!({"kinds": [1]})])
+                .await;
+            let msgs = outgoing_json(&conn);
+            assert!(
+                msgs.iter().any(|m| m[0] == "CLOSED" && m[1] == "x"),
+                "the refusal must be a CLOSED"
+            );
+            assert!(
+                !conn.subs.contains_key("x"),
+                "the same-id REQ subscription must be released with the CLOSED"
+            );
+            // The live index no longer wakes the connection for "x".
+            assert!(
+                conn.relay
+                    .sub_index
+                    .read()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .candidates(&signed_note(conn.relay.secp(), "after", unix_now(), vec![]))
+                    .is_empty(),
+                "a closed subscription must not receive live events"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
     fn malformed_event_and_auth_still_get_ok() {
         // NIP-01/NIP-42: EVENT and AUTH messages must be answered with OK
         // even when the payload is malformed, as long as an id can be

@@ -651,6 +651,16 @@ impl super::Conn {
         self.send_control(nip42::ok(&id, accepted));
     }
 
+    /// Refuses a COUNT request: NIP-45 requires a CLOSED message, and
+    /// CLOSED is terminal for the subscription id on the wire. A REQ
+    /// subscription of the same id must therefore be released too, or the
+    /// client would consider it closed while the relay kept delivering live
+    /// events for it. REQ namespace only (NIP-77 uses NEG-CLOSE).
+    fn reject_count(&mut self, sub_id: &str, reason: &str) {
+        self.send_closed(sub_id, reason);
+        self.remove_req_subscription(sub_id);
+    }
+
     pub(crate) async fn handle_count(&mut self, rest: &[Value]) {
         if rest.len() < 2 {
             self.send_notice("error: COUNT requires a subscription id and filters");
@@ -661,56 +671,56 @@ impl super::Conn {
             return;
         };
         if sub_id.is_empty() {
-            self.send_closed(sub_id, "invalid: subscription id must not be empty");
+            self.reject_count(sub_id, "invalid: subscription id must not be empty");
             return;
         }
         let max_sub_id_len = self.relay.config.read().await.limits.max_sub_id_len;
         if sub_id.len() > max_sub_id_len {
-            self.send_closed(sub_id, "invalid: subscription id too long");
+            self.reject_count(sub_id, "invalid: subscription id too long");
             return;
         }
         // NIP-45: refusals must be answered with a CLOSED message.
         if !self.relay.config.read().await.nip_enabled(45) {
-            self.send_closed(sub_id, "error: counting is not enabled on this relay");
+            self.reject_count(sub_id, "error: counting is not enabled on this relay");
             return;
         }
         if self.relay.config.read().await.relay.require_auth && !self.is_authed() {
-            self.send_closed(sub_id, "auth-required: please authenticate before counting");
+            self.reject_count(sub_id, "auth-required: please authenticate before counting");
             return;
         }
         if !self.access_allows_read().await {
-            self.send_closed(sub_id, "restricted: you are not allowed to count");
+            self.reject_count(sub_id, "restricted: you are not allowed to count");
             return;
         }
         let mut filters = Vec::new();
         for f in &rest[1..] {
             let mut f = f.clone();
             if crate::filter::rewrite_inbox_outbox(&mut f).is_err() {
-                self.send_closed(sub_id, "invalid: invalid filter");
+                self.reject_count(sub_id, "invalid: invalid filter");
                 return;
             }
             match serde_json::from_value::<Filter>(f) {
                 Ok(filter) => filters.push(filter),
                 Err(_) => {
-                    self.send_closed(sub_id, "invalid: invalid filter");
+                    self.reject_count(sub_id, "invalid: invalid filter");
                     return;
                 }
             }
         }
         // NIP-45: COUNT requires at least one filter.
         if filters.is_empty() {
-            self.send_closed(sub_id, "invalid: COUNT requires at least one filter");
+            self.reject_count(sub_id, "invalid: COUNT requires at least one filter");
             return;
         }
         if filters.iter().any(|f| f.too_many_members()) {
-            self.send_closed(
+            self.reject_count(
                 sub_id,
                 "invalid: too many ids, authors or kinds in a filter",
             );
             return;
         }
         if filters.iter().any(|f| f.invalid_tag_values()) {
-            self.send_closed(sub_id, "invalid: tag constraint values must be strings");
+            self.reject_count(sub_id, "invalid: tag constraint values must be strings");
             return;
         }
         // Cap the filter count like REQ: without it each filter would get its
@@ -718,7 +728,7 @@ impl super::Conn {
         // ~28k filters × 200k candidate examinations on the shared reader
         // thread (~1400x the full-scan budget).
         if filters.len() > self.relay.config.read().await.limits.max_filters {
-            self.send_closed(sub_id, "invalid: too many filters");
+            self.reject_count(sub_id, "invalid: too many filters");
             return;
         }
         let count_limit = self.relay.config.read().await.limits.max_count;
@@ -739,7 +749,7 @@ impl super::Conn {
             .await
         else {
             // A timed-out count must not be reported as zero.
-            self.send_closed(sub_id, "error: database timeout, please retry");
+            self.reject_count(sub_id, "error: database timeout, please retry");
             return;
         };
         // NIP-70/59/29: COUNT applies the same visibility rules as REQ, so
