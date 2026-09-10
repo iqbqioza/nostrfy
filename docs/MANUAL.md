@@ -638,7 +638,7 @@ Both backends use the `bucket/{npub1xxx}/{file}` hierarchy: every upload is stor
 | `HEAD` | `/upload` | kind 24242 (`t=upload`, `x=<sha256>`, `expiration`) | BUD-06 pre-flight — would the upload be accepted? Uses `X-SHA-256` / `X-Content-Length` / `X-Content-Type` headers (400 malformed / 411 missing length / 413 too large) |
 | `PUT` | `/media` | kind 24242 (`t=media`, `x=<sha256>`, `expiration`) | BUD-05 media upload (stored verbatim — no optimization); returns 201 + the descriptor |
 | `HEAD` | `/media` | kind 24242 (`t=media`, `x=<sha256>`, `expiration`) | BUD-05 pre-flight — would the upload be accepted? Uses `X-SHA-256` / `X-Content-Length` / `X-Content-Type` headers (400 malformed / 411 missing length / 413 too large) |
-| `GET` | `/list/<pubkey>` | — | Blobs uploaded by a pubkey (hex), sorted by `uploaded` descending; supports `cursor` (the sha256 of the last entry of the previous page) and `limit` |
+| `GET` | `/list/<pubkey>` | kind 24242 (`t=list`, `expiration`) | Blobs uploaded by the requesting pubkey (hex, must match the token's author), sorted by `uploaded` descending; supports `cursor` (the sha256 of the last entry of the previous page) and `limit` |
 | `DELETE` | `/<sha256>` | kind 24242 (`t=delete`, `x=<sha256>`, `expiration`) | Delete a blob (uploader only) |
 
 - `PUT /upload` returns **201** when the blob was newly stored and **200** when it already exists (BUD-02).
@@ -646,7 +646,7 @@ Both backends use the `bucket/{npub1xxx}/{file}` hierarchy: every upload is stor
 - The optional `X-SHA-256` request header is verified against the actual bytes: a mismatch returns **409** (BUD-02).
 - The CORS pre-flight accepts the BUD-05/06 headers (`X-SHA-256`, `X-Content-Type`, `X-Content-Length`), so browser clients like nostter can upload to `/media`.
 
-Uploads and deletes authenticate with a Nostr auth event (kind 24242, `server` tag naming the Blossom host), sent as `Authorization: Nostr <base64>`. Per BUD-11 the token must carry an `expiration` tag set to a unix timestamp in the future, the `t` verb matching the endpoint (`upload` / `delete`), and — for upload and delete — an `x` tag with the blob's sha256.
+Uploads, deletes and listings authenticate with a Nostr auth event (kind 24242, `server` tag naming the Blossom host), sent as `Authorization: Nostr <base64>`. Per BUD-11 the token must carry an `expiration` tag set to a unix timestamp in the future, the `t` verb matching the endpoint (`upload` / `media` / `delete` / `list`), and — for upload and delete — an `x` tag with the blob's sha256. The `/list` inventory is owner-only: the token must be issued by the listed pubkey.
 
 The descriptor `url` includes the MIME-derived extension (e.g. `https://media.example.com/<sha256>.png`; unknown types get `.bin`), like the Blossom spec's examples. The extension is advisory: the file is served by its hash alone, and `/<sha256>.<ext>` (any extension) resolves to the same blob.
 
@@ -662,8 +662,8 @@ curl -X PUT -H "Authorization: Nostr <auth>" -H "Content-Type: image/png" --data
 # Fetch
 curl https://media.example.com/<sha256>
 
-# List the uploads of a pubkey
-curl https://media.example.com/list/<pubkey-hex>
+# List your own uploads (auth event with t=list; the path pubkey must be yours)
+curl -H "Authorization: Nostr <auth>" https://media.example.com/list/<pubkey-hex>
 
 # Delete (auth event with t=delete and x=<sha256>)
 curl -X DELETE -H "Authorization: Nostr <auth>" https://media.example.com/<sha256>

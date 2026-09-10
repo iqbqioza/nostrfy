@@ -777,17 +777,30 @@ async fn head_preflight(relay: Arc<Relay>, headers: HeaderMap, verb: &str) -> Re
 /// `GET /list/<pubkey>` — blobs uploaded by a pubkey (hex), sorted by
 /// `uploaded` descending, with BUD-12 cursor-based pagination
 /// (`cursor` = the sha256 of the last entry of the previous page,
-/// `limit` = the maximum number of results).
+/// `limit` = the maximum number of results). The inventory is private:
+/// BUD-11 assigns this endpoint the `t=list` verb and the token must be
+/// issued by the listed pubkey itself.
 async fn list(
     State(relay): State<Arc<Relay>>,
+    headers: HeaderMap,
     AxPath(pubkey): AxPath<String>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
     let Some(state) = state_of(&relay).await else {
         return error(StatusCode::SERVICE_UNAVAILABLE, "blossom not initialized");
     };
+    // BUD-11: `/list/<pubkey>` uses the `t=list` verb. A user's blob
+    // inventory is private to that user, so the token must be issued by the
+    // listed pubkey.
+    let Some(auth_pubkey) = verify_auth(&relay, &state, &headers, "list", None).await else {
+        return error(StatusCode::UNAUTHORIZED, "invalid or missing authorization");
+    };
     if !is_pubkey(&pubkey) {
         return error(StatusCode::BAD_REQUEST, "invalid pubkey");
+    }
+    let pubkey = pubkey.to_ascii_lowercase();
+    if !auth_pubkey.eq_ignore_ascii_case(&pubkey) {
+        return error(StatusCode::FORBIDDEN, "only the owner may list their blobs");
     }
     // BUD-12: malformed query parameters are a 400, not silently ignored
     // (an ignored `cursor` would return an unbounded page).
@@ -1044,6 +1057,24 @@ mod tests {
         let id = ev.id_bytes().unwrap();
         ev.sig = secp.sign_schnorr_no_aux_rand(&id, &keypair).to_string();
         ev
+    }
+
+    /// A valid Blossom `Authorization: Nostr <token>` header for `verb`,
+    /// returning the header map and the author's hex pubkey.
+    fn auth_headers(
+        secp: &Secp256k1<secp256k1::All>,
+        verb: &str,
+    ) -> (HeaderMap, String) {
+        let now = unix_now();
+        let ev = auth_event(secp, now, verb, Some(now + 600), None, None);
+        let token = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&ev).unwrap());
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Nostr {token}").parse().unwrap(),
+        );
+        (headers, ev.pubkey)
     }
 
     #[tokio::test]
@@ -1530,7 +1561,7 @@ mod tests {
         // `?limit=` is capped at 1000 with a default of 100: a heavy
         // uploader cannot force a single unbounded JSON page.
         let relay = build_blossom_relay(0).await;
-        let pk = "aa".repeat(32);
+        let (headers, pk) = auth_headers(relay.secp(), "list");
         let state = state_of(&relay).await.expect("blossom state");
         for i in 0..5 {
             let sha = sha256_hex(format!("blob-{i}").as_bytes());
@@ -1549,6 +1580,7 @@ mod tests {
         };
         let resp = list(
             State(relay.clone()),
+            headers.clone(),
             AxPath(pk.clone()),
             query(Some("9999999")),
         )
@@ -1561,7 +1593,7 @@ mod tests {
             items.as_array().unwrap().len() <= 1000,
             "huge limit must be capped"
         );
-        let resp = list(State(relay.clone()), AxPath(pk), query(None)).await;
+        let resp = list(State(relay.clone()), headers, AxPath(pk), query(None)).await;
         let body = axum::body::to_bytes(resp.into_body(), 256 * 1024)
             .await
             .unwrap();
@@ -1574,11 +1606,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_requires_owner_auth() {
+        // BUD-11/BUD-12: a user's blob inventory is private; an anonymous
+        // request or a token for a different pubkey must not list it.
+        let relay = build_blossom_relay(0).await;
+        let other = "aa".repeat(32);
+        // No Authorization header: 401.
+        let resp = list(
+            State(relay.clone()),
+            HeaderMap::new(),
+            AxPath(other.clone()),
+            axum::extract::Query(std::collections::HashMap::new()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        // A valid token for a *different* pubkey: 403.
+        let (headers, pk) = auth_headers(relay.secp(), "list");
+        assert_ne!(pk, other);
+        let resp = list(
+            State(relay.clone()),
+            headers,
+            AxPath(other),
+            axum::extract::Query(std::collections::HashMap::new()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        // The owner's token works, including an uppercase spelling of the
+        // same pubkey (hex is case-insensitive).
+        let (headers, pk) = auth_headers(relay.secp(), "list");
+        let resp = list(
+            State(relay.clone()),
+            headers,
+            AxPath(pk.to_ascii_uppercase()),
+            axum::extract::Query(std::collections::HashMap::new()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
     async fn list_unknown_cursor_yields_empty_page() {
         // A well-formed but unknown cursor must not restart at page one
         // (a stale cursor would loop duplicates forever).
         let relay = build_blossom_relay(0).await;
-        let pk = "bb".repeat(32);
+        let (headers, pk) = auth_headers(relay.secp(), "list");
         let state = state_of(&relay).await.expect("blossom state");
         let sha = sha256_hex(b"one blob");
         state
@@ -1588,7 +1660,13 @@ mod tests {
             .unwrap();
         let mut map = std::collections::HashMap::new();
         map.insert("cursor".to_string(), "cc".repeat(32));
-        let resp = list(State(relay.clone()), AxPath(pk), axum::extract::Query(map)).await;
+        let resp = list(
+            State(relay.clone()),
+            headers,
+            AxPath(pk),
+            axum::extract::Query(map),
+        )
+        .await;
         let body = axum::body::to_bytes(resp.into_body(), 256 * 1024)
             .await
             .unwrap();

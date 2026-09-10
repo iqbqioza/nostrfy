@@ -254,7 +254,7 @@ restrict_uploads = false            # true = only allow-listed pubkeys may uploa
 | `HEAD /upload` | BUD-06 pre-flight — would the upload be accepted? (`X-SHA-256` / `X-Content-Type` / `X-Content-Length` headers) |
 | `PUT /media` | BUD-05 media upload (stored verbatim — no optimization) |
 | `HEAD /media` | BUD-05 pre-flight (same headers as `HEAD /upload`) |
-| `GET /list/<pubkey>` | Blobs uploaded by a pubkey |
+| `GET /list/<pubkey>` | Blobs uploaded by a pubkey (owner-only `t=list` auth) |
 | `DELETE /<sha256>` | Delete a blob (uploader only; `t=delete` + `x` tags) |
 
 The upload allowlist is managed in the relay database (LMDB), independent from the relay's own allow/deny lists:
