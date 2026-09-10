@@ -164,6 +164,12 @@ struct EventCollector {
     /// created_at of the event that filled a per-filter limit; events at
     /// the same timestamp keep being collected (see [`ScanCollector::push`]).
     boundary: Option<u64>,
+    /// Hard stop including the same-created_at tie continuation: a per-filter
+    /// boundary may exceed its limit to keep a tie in one page, but never
+    /// beyond twice the collection cap. Without this a flood of events
+    /// sharing one timestamp (up to the candidate budget) would be
+    /// materialized for a `limit: 1` query.
+    tie_cap: usize,
     /// Accepted events per filter, indexed by the filter's position in the
     /// REQ. NIP-01 applies `limit` to each filter independently, so a
     /// filter's quota must not be consumed by an earlier filter's matches.
@@ -179,6 +185,7 @@ impl EventCollector {
             cap,
             boundary_ok,
             boundary: None,
+            tie_cap: cap.saturating_mul(2),
             counts: vec![0; filters],
             filter: 0,
         }
@@ -215,7 +222,8 @@ fn score(event: &Event, terms: &[String], weights: &[f64]) -> f64 {
 
 impl ScanCollector for EventCollector {
     fn full(&self) -> bool {
-        self.events.len() >= self.cap && self.boundary.is_none()
+        // The tie continuation may exceed `cap`, but only up to `tie_cap`.
+        self.events.len() >= self.tie_cap
     }
     fn cap(&self) -> usize {
         self.cap

@@ -2131,6 +2131,41 @@ fn created_at_ties_are_not_split_across_pages() {
 }
 
 #[test]
+fn tie_continuation_is_bounded() {
+    // A flood of events sharing one created_at must not defeat the collector
+    // cap: a `limit: 1` query stops at a small multiple of the cap and
+    // reports `more` instead of materializing every tie.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        for i in 0..200 {
+            let e = event(1, &format!("tie-{i}"), now, vec![]);
+            assert_eq!(db.put(e, now).await, PutOutcome::Stored);
+        }
+        let f: Filter =
+            serde_json::from_value(serde_json::json!({"kinds": [1], "limit": 1})).unwrap();
+        let (res, more) = db.query(vec![f], 500, now).await;
+        assert!(
+            res.len() <= 2,
+            "the tie group must be bounded by the collector cap: {}",
+            res.len()
+        );
+        assert!(more, "a cut tie group must report `more`");
+    });
+    db.shutdown();
+}
+
+#[test]
 fn multi_author_limit_applies_to_the_union() {
     // NIP-01: `{"authors": [A, B], "limit": n}` returns the n newest
     // events by either author; the limit must not be consumed by the
