@@ -166,7 +166,10 @@ impl BlobStore {
 
     /// Opens a blob by hash, trying every owner in upload order. The first
     /// owner's file may be gone (crash/manual delete) while a later owner's
-    /// copy is intact: opening only `owners[0]` would 404 a retrievable blob.
+    /// copy is intact: opening only `owners[0]` would 404 a retrievable
+    /// blob. A storage error for one owner (S3 5xx, local I/O error) is
+    /// logged and skipped for the same reason; it is only returned when no
+    /// owner could be opened.
     /// Returns the stream and the owner whose file was opened.
     pub(crate) async fn open_stream_any(
         &self,
@@ -177,12 +180,22 @@ impl BlobStore {
         let Some(meta) = self.db.blossom_load(sha256).await else {
             return Ok(None);
         };
+        let mut last_error: Option<crate::error::Error> = None;
         for owner in &meta.owners {
-            if let Some(stream) = self.open_stream(owner, sha256, start, len).await? {
-                return Ok(Some((stream, owner.clone())));
+            match self.open_stream(owner, sha256, start, len).await {
+                Ok(Some(stream)) => return Ok(Some((stream, owner.clone()))),
+                // Missing under this owner: try the next copy.
+                Ok(None) => {}
+                Err(e) => {
+                    log::warn!("blossom: opening {sha256} for owner {owner} failed: {e}");
+                    last_error = Some(e);
+                }
             }
         }
-        Ok(None)
+        match last_error {
+            Some(e) => Err(e),
+            None => Ok(None),
+        }
     }
 
     /// Whether `pubkey` has uploaded this blob.

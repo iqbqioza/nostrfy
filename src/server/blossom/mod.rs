@@ -1799,6 +1799,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn open_stream_any_falls_back_past_a_broken_owner() {
+        // A storage error for the first owner must not hide a retrievable
+        // copy under a later owner (only a missing file used to fall back).
+        let relay = build_blossom_relay(0).await;
+        let state = state_of(&relay).await.expect("blossom state");
+        let owner0 = "aa".repeat(32);
+        let owner1 = "bb".repeat(32);
+        let data = b"shared bytes";
+        let sha = sha256_hex(data);
+        state
+            .store
+            .put(&owner0, &sha, data, "text/plain")
+            .await
+            .unwrap();
+        state
+            .store
+            .put(&owner1, &sha, data, "text/plain")
+            .await
+            .unwrap();
+        let local_path = relay.config.read().await.blossom.local_path.clone();
+        let dir_of = |pk: &str| {
+            let npub =
+                crate::nips::nip19::bech32_encode("npub", &hex::decode(pk).unwrap()).unwrap();
+            local_path.join(npub)
+        };
+        // Break owner0's directory (a regular file cannot contain the blob).
+        std::fs::remove_dir_all(dir_of(&owner0)).unwrap();
+        std::fs::write(dir_of(&owner0), b"not a directory").unwrap();
+        let (stream, owner) = state
+            .store
+            .open_stream_any(&sha, 0, data.len() as u64)
+            .await
+            .expect("a later working owner must not be masked by an earlier error")
+            .expect("the later copy resolves");
+        assert_eq!(owner, owner1);
+        drop(stream);
+        // When every owner fails, the storage error is reported.
+        std::fs::remove_dir_all(dir_of(&owner1)).unwrap();
+        std::fs::write(dir_of(&owner1), b"not a directory").unwrap();
+        assert!(
+            state.store.open_stream_any(&sha, 0, 4).await.is_err(),
+            "an error is returned when no owner can be opened"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
     async fn list_caps_page_size() {
         // `?limit=` is capped at 1000 with a default of 100: a heavy
         // uploader cannot force a single unbounded JSON page.
