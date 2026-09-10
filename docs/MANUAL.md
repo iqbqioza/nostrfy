@@ -586,7 +586,7 @@ With a LiveKit server configured, groups can have audio/video chat rooms.
 
 1. Set `relay.livekit_url`, `relay.livekit_api_key`, and `relay.livekit_api_secret`
 2. Add the `livekit` tag to the group's metadata (via an admin's 9002 edit)
-3. Clients fetch a JWT from `/.well-known/nip29/livekit/<group-id>` with NIP-98 auth
+3. Clients fetch a JWT from `/.well-known/nip29/livekit/<group-id>` with NIP-98 auth (a pubkey banned with NIP-86 `banpubkey` is refused)
 
 ```bash
 # Support check (204 means enabled)

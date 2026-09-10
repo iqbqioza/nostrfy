@@ -110,6 +110,18 @@ pub(crate) async fn livekit_token(
 }
 
 async fn group_allows(relay: &Relay, group: &str, pubkey: &str) -> bool {
+    // NIP-86 `banpubkey` applies to token minting too: a banned pubkey is
+    // refused on every authenticated service, LiveKit included.
+    if relay
+        .access
+        .read()
+        .await
+        .blocked_pubkeys
+        .iter()
+        .any(|(pk, _)| pk.eq_ignore_ascii_case(pubkey))
+    {
+        return false;
+    }
     let groups = relay.groups.read().await;
     match groups.group(group) {
         // Unknown groups are not hosted here: the relay cannot judge
@@ -402,6 +414,37 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "a member may mint a token");
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(json["token"].as_str().is_some_and(|t| !t.is_empty()));
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn banned_pubkey_cannot_mint_token() {
+        // NIP-86 `banpubkey` applies to LiveKit token minting too.
+        let relay = build_relay().await;
+        relay.groups.write().await.groups.insert(
+            "open".into(),
+            crate::nips::nip29::Group {
+                settings: crate::nips::nip29::GroupSettings {
+                    livekit: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let secp = relay.secp().clone();
+        let ev = signed_token_auth(&relay, &secp, "open").await;
+        relay
+            .access
+            .write()
+            .await
+            .blocked_pubkeys
+            .push((ev.pubkey.clone(), "spam".into()));
+        let (status, _, _) = token_status(&relay, "open", &ev).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "a banned pubkey must not mint a LiveKit token"
+        );
         relay.db.shutdown();
     }
 
