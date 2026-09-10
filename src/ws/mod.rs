@@ -102,6 +102,9 @@ pub struct Conn {
     /// Events received but not yet accepted; flushed in batches so the
     /// database commit cost is amortized over many events.
     pub(crate) pending_events: Vec<Event>,
+    /// Wire bytes of the events held in `pending_events`, so a burst of
+    /// maximum-size frames cannot accumulate before the batch is flushed.
+    pub(crate) pending_bytes: usize,
     /// Live-event receiver, created when the first REQ subscribes (before
     /// the query runs, so no stored event can fall into the gap between the
     /// query and the subscription) and dropped when the last subscription
@@ -216,6 +219,15 @@ impl Conn {
 
     pub(crate) fn send_ok(&mut self, id: &str, accepted: bool, message: &str) {
         self.send_json(json!(["OK", id, accepted, message]));
+    }
+
+    /// Whether the pending EVENT batch must be flushed before reading more
+    /// frames: the documented count ([`EVENT_BATCH`], sharing one database
+    /// commit) or the byte budget (one full frame, `max_msg_size`) is
+    /// reached. Without the byte bound a burst of maximum-size frames
+    /// accumulated up to the whole window before validation.
+    pub(crate) fn pending_batch_full(&self, max_msg_size: usize) -> bool {
+        self.pending_events.len() >= EVENT_BATCH || self.pending_bytes >= max_msg_size
     }
 
     /// Queues a REQ response for the pump. Responses are processed in
@@ -691,6 +703,7 @@ pub async fn handle_connection(
         challenge,
         authed_pubkeys: Vec::new(),
         pending_events: Vec::new(),
+        pending_bytes: 0,
         expiry_enabled,
         giftwrap_restricted,
         nip78_restricted,
@@ -884,6 +897,13 @@ pub async fn handle_connection(
                     last_activity = std::time::Instant::now();
                     if conn.handle_frame(frame, max_msg_size).await {
                         too_large = true;
+                        break;
+                    }
+                    // The pending batch is bounded by count and bytes: flush
+                    // it through the post-window path instead of reading the
+                    // rest of the window (which let a flood of maximum-size
+                    // frames pile up parsed events before validation).
+                    if conn.pending_batch_full(max_msg_size) {
                         break;
                     }
                     // Slide the window: the next frame extends the batch
@@ -1214,6 +1234,7 @@ mod tests {
             challenge: "test-challenge".into(),
             authed_pubkeys: Vec::new(),
             pending_events: Vec::new(),
+            pending_bytes: 0,
             expiry_enabled,
             giftwrap_restricted,
             nip78_restricted,
@@ -4419,6 +4440,55 @@ mod tests {
                 conn.pending_reqs.is_empty(),
                 "the response must be finished"
             );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn pending_event_batch_is_bounded_by_count_and_bytes() {
+        // A flood of maximum-size frames must not accumulate parsed events
+        // up to the whole window cap: the batch is flushed at EVENT_BATCH
+        // events or one full frame's bytes, whichever comes first.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let now = unix_now();
+            let max_msg = 1 << 20;
+            assert!(!conn.pending_batch_full(max_msg));
+            // Bytes: one full-size frame trips the bound.
+            let ev = signed_note(conn.relay.secp(), "big", now, vec![]);
+            conn.queue_event_sized(ev, max_msg).await;
+            assert_eq!(conn.pending_bytes, max_msg);
+            assert!(
+                conn.pending_batch_full(max_msg),
+                "the byte bound must trip"
+            );
+            conn.flush_pending_events().await;
+            assert!(conn.pending_events.is_empty());
+            assert_eq!(conn.pending_bytes, 0, "the byte counter resets on flush");
+            assert!(!conn.pending_batch_full(max_msg));
+            // Count: EVENT_BATCH small events trip the bound.
+            for i in 0..EVENT_BATCH - 1 {
+                let ev = signed_note(
+                    conn.relay.secp(),
+                    &format!("small-{i}"),
+                    now - i as u64,
+                    vec![],
+                );
+                conn.queue_event_sized(ev, 64).await;
+            }
+            assert!(
+                !conn.pending_batch_full(max_msg),
+                "below the count bound the batch stays open"
+            );
+            let ev = signed_note(conn.relay.secp(), "last", now, vec![]);
+            conn.queue_event_sized(ev, 64).await;
+            assert!(
+                conn.pending_batch_full(max_msg),
+                "the count bound must trip"
+            );
+            conn.flush_pending_events().await;
+            assert_eq!(conn.pending_bytes, 0);
             conn.relay.db.shutdown();
         });
     }

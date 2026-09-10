@@ -38,7 +38,7 @@ impl super::Conn {
         if kind == "EVENT"
             && let Ok((_, event)) = serde_json::from_str::<(String, Event)>(text)
         {
-            return self.queue_event_value(event).await;
+            return self.queue_event_sized(event, text.len()).await;
         }
         let Ok(value) = serde_json::from_str::<Value>(text) else {
             self.send_notice("error: invalid json");
@@ -99,8 +99,9 @@ impl super::Conn {
         }
     }
 
-    /// Queues an already-parsed event for batched acceptance.
-    pub(crate) async fn queue_event_value(&mut self, event: Event) {
+    /// Queues an already-parsed event for batched acceptance, counting the
+    /// frame's wire size against the per-connection pending-byte budget.
+    pub(crate) async fn queue_event_sized(&mut self, event: Event, size: usize) {
         self.events_received_local += 1;
         // Path-specific write policy (nostrfy): `/inbox` and `/outbox` are
         // restricted endpoints — see `write_policy_reason`.
@@ -109,11 +110,20 @@ impl super::Conn {
             self.send_ok(&event.id, false, &reason);
             return;
         }
+        self.pending_bytes = self.pending_bytes.saturating_add(size);
         // The connection loop queues the batch at the end of its sliding
         // window (and resolves it on a spawned task while reading keeps
         // going); a mid-window synchronous flush here would serialize the
         // connection on every commit.
         self.pending_events.push(event);
+    }
+
+    /// Queues an already-parsed event for batched acceptance when the wire
+    /// size is not known (tests and the generic `queue_event` path): the
+    /// event's serialized size is a close upper bound of the frame.
+    pub(crate) async fn queue_event_value(&mut self, event: Event) {
+        let size = serde_json::to_string(&event).map(|s| s.len()).unwrap_or(0);
+        self.queue_event_sized(event, size).await;
     }
 
     /// The write policy of the endpoint this connection is on:
@@ -237,6 +247,7 @@ impl super::Conn {
             return;
         }
         let events = std::mem::take(&mut self.pending_events);
+        self.pending_bytes = 0;
         let outcomes = self
             .relay
             .accept_events_batch(events, &self.authed_pubkeys)
