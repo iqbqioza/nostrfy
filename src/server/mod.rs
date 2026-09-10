@@ -612,16 +612,22 @@ async fn reject_ws_upgrade(request: Request, next: Next) -> Response {
 }
 
 /// The Blossom server-info document (BUD-01) when the request Host names
-/// the configured Blossom host; `None` otherwise. Used by the shared root
-/// route and by the dedicated root route of the `inbox-outbox` mode, so
-/// the info document stays available on the Blossom host whatever the
-/// WebSocket path selection is. Takes the Host header value (not the whole
-/// request) so the future never borrows the request across the await.
+/// the configured Blossom host and the storage backend initialized;
+/// `None` otherwise. Used by the shared root route and by the dedicated
+/// root route of the `inbox-outbox` mode, so the info document stays
+/// available on the Blossom host whatever the WebSocket path selection is.
+/// Takes the Host header value (not the whole request) so the future never
+/// borrows the request across the await.
 async fn blossom_root_info(
     relay: Arc<Relay>,
     host_header: Option<&str>,
     is_websocket: bool,
 ) -> Option<Response> {
+    // Without a live Blossom state (storage initialization failed) the
+    // info document must not advertise endpoints that are not mounted.
+    if relay.blossom.read().await.is_none() {
+        return None;
+    }
     let cfg = relay.config.read().await;
     if cfg.blossom.host.trim().is_empty()
         || !blossom::host_is_blossom(&cfg.blossom.host, host_header)
@@ -1524,11 +1530,13 @@ mod tests {
         let mut cfg = crate::config::Config::default();
         cfg.relay.name = "example relay".into();
         cfg.blossom.host = "media.example.com".into();
+        cfg.blossom.storage = "local".into();
         cfg.database.map_size = 16 * 1024 * 1024;
         cfg.database.max_map_size = 256 * 1024 * 1024;
         cfg.database.path = std::env::temp_dir()
             .join("nostrfy-server-test")
             .join(format!("{:x}-{id}", std::process::id()));
+        cfg.blossom.local_path = cfg.database.path.join("blobs");
         let _ = std::fs::remove_dir_all(&cfg.database.path);
         let db = crate::db::DbClient::open(
             &cfg.database,
@@ -1541,20 +1549,23 @@ mod tests {
         )
         .unwrap();
         let config = Arc::new(tokio::sync::RwLock::new(cfg));
-        Arc::new(
-            Relay::new(
-                config,
-                db,
-                crate::stats::Stats::new(),
-                "",
-                crate::relay::LiveBusConfig {
-                    buffer: 1024,
-                    batch_interval_ms: 10,
-                    batch_size: 64,
-                },
-            )
-            .await,
+        let relay = Relay::new(
+            config,
+            db,
+            crate::stats::Stats::new(),
+            "",
+            crate::relay::LiveBusConfig {
+                buffer: 1024,
+                batch_interval_ms: 10,
+                batch_size: 64,
+            },
         )
+        .await;
+        // The Blossom handlers (and the root info document) require a live
+        // storage state, exactly like `run_server`.
+        let state = blossom::build_state(&relay.config.read().await.clone(), &relay).await;
+        *relay.blossom.write().await = state;
+        Arc::new(relay)
     }
 
     #[tokio::test]
@@ -1764,6 +1775,26 @@ mod tests {
             >("198.51.100.8:1234".parse().unwrap()));
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn blossom_root_info_requires_live_storage() {
+        let relay = blossom_relay().await;
+        // With live storage the info document is served.
+        assert!(
+            blossom_root_info(relay.clone(), Some("media.example.com"), false)
+                .await
+                .is_some()
+        );
+        // Storage initialization failed: no info document (and therefore no
+        // advertisement of endpoints that are not mounted).
+        *relay.blossom.write().await = None;
+        assert!(
+            blossom_root_info(relay.clone(), Some("media.example.com"), false)
+                .await
+                .is_none()
+        );
         relay.db.shutdown();
     }
 
