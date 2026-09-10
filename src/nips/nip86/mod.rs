@@ -143,10 +143,7 @@ pub async fn rpc_handler(
     // NIP-86 `blockip` also applies to this endpoint: a blocked peer must
     // not reach the management RPC (the WebSocket handler already refuses
     // its connections).
-    if relay.access.read().await.blocked_ips.iter().any(|(b, _)| {
-        b.parse::<std::net::IpAddr>()
-            .is_ok_and(|b| b == crate::util::normalize_ip(peer.ip()))
-    }) {
+    if crate::util::ip_blocked(&relay.access.read().await.blocked_ips, peer.ip()) {
         return StatusCode::FORBIDDEN.into_response();
     }
     // The spec requires the JSON-RPC content type (parameters such as
@@ -486,12 +483,16 @@ pub async fn rpc_handler(
             ) else {
                 return rpc_err("invalid params");
             };
-            if ip.parse::<std::net::IpAddr>().is_err() {
+            let Ok(ip) = ip.parse::<std::net::IpAddr>() else {
                 return rpc_err("invalid ip address");
-            }
+            };
+            // Normalize so a dual-stack `::ffff:a.b.c.d` block and a plain
+            // IPv4 block refer to the same peer (and an equivalent-spelling
+            // entry is not duplicated).
+            let ip = crate::util::normalize_ip(ip);
             {
                 let mut access = relay.access.write().await;
-                if !access.blocked_ips.iter().any(|(i, _)| i == ip) {
+                if !crate::util::ip_blocked(&access.blocked_ips, ip) {
                     access
                         .blocked_ips
                         .push((ip.to_string(), reason.to_string()));
@@ -507,9 +508,21 @@ pub async fn rpc_handler(
             let Some(ip) = params.first().and_then(Value::as_str) else {
                 return rpc_err("invalid params");
             };
+            let Ok(ip) = ip.parse::<std::net::IpAddr>() else {
+                return rpc_err("invalid ip address");
+            };
+            let ip = crate::util::normalize_ip(ip);
             {
                 let mut access = relay.access.write().await;
-                access.blocked_ips.retain(|(i, _)| i != ip);
+                // Remove equivalently-spelled entries too (`::1` versus
+                // `0:0:0:0:0:0:0:1`, v4-mapped versus IPv4).
+                access.blocked_ips.retain(|(entry, _)| {
+                    entry
+                        .parse::<std::net::IpAddr>()
+                        .map(crate::util::normalize_ip)
+                        .map(|b| b != ip)
+                        .unwrap_or(true)
+                });
             }
             relay.persist_access().await;
             // Re-connect checks: unblocking also bumps the version so
@@ -935,8 +948,64 @@ mod tests {
         assert!(rpc_err_of(resp).await.contains("params"));
         let resp = rpc_call(&relay, "unblockip", vec![json!("127.0.0.1")]).await;
         assert!(rpc_ok_of(resp).await);
+        let resp = rpc_call(&relay, "unblockip", vec![json!("not-an-ip")]).await;
+        assert!(rpc_err_of(resp).await.contains("ip address"));
         let resp = rpc_call(&relay, "listblockedips", vec![]).await;
         assert_eq!(resp.status(), StatusCode::OK);
+
+        // blockip normalizes v4-mapped IPv6 to IPv4, unblockip accepts any
+        // equivalent spelling, and equivalent entries are not duplicated.
+        let resp = rpc_call(
+            &relay,
+            "blockip",
+            vec![json!("::ffff:127.0.0.9"), json!("mapped")],
+        )
+        .await;
+        assert!(rpc_ok_of(resp).await);
+        assert!(
+            relay
+                .access
+                .read()
+                .await
+                .blocked_ips
+                .iter()
+                .any(|(i, r)| i == "127.0.0.9" && r == "mapped"),
+            "the v4-mapped address must be stored normalized"
+        );
+        let resp = rpc_call(&relay, "unblockip", vec![json!("127.0.0.9")]).await;
+        assert!(rpc_ok_of(resp).await);
+        assert!(
+            !relay
+                .access
+                .read()
+                .await
+                .blocked_ips
+                .iter()
+                .any(|(i, _)| i == "127.0.0.9"),
+            "the equivalent spelling must remove the entry"
+        );
+        let resp = rpc_call(
+            &relay,
+            "blockip",
+            vec![json!("0:0:0:0:0:0:0:9"), json!("expanded")],
+        )
+        .await;
+        assert!(rpc_ok_of(resp).await);
+        let resp = rpc_call(&relay, "blockip", vec![json!("::9"), json!("again")]).await;
+        assert!(rpc_ok_of(resp).await);
+        assert_eq!(
+            relay
+                .access
+                .read()
+                .await
+                .blocked_ips
+                .iter()
+                .filter(|(i, _)| i == "::9")
+                .count(),
+            1,
+            "equivalent spellings must not duplicate the entry"
+        );
+        let _ = rpc_call(&relay, "unblockip", vec![json!("::9")]).await;
 
         // banevent / allowevent / listbannedevents.
         let id = "ab".repeat(32);

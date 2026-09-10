@@ -258,6 +258,27 @@ async fn build_router(
             async move { host_split(&api_host, &blossom_host, req, next).await }
         }));
     }
+    // NIP-86 `blockip` applies to every route on this listener (API,
+    // Blossom, health/metrics/stats, NIP-11 and the WebSocket/RPC
+    // endpoint), not only the WebSocket handler. The peer address is
+    // injected as `ConnectInfo` by `serve_limited`.
+    let blocked_relay = relay.clone();
+    app = app.layer(axum::middleware::from_fn(
+        move |req: Request, next: Next| {
+            let relay = blocked_relay.clone();
+            async move {
+                if let Some(ip) = req
+                    .extensions()
+                    .get::<axum::extract::connect_info::ConnectInfo<std::net::SocketAddr>>()
+                    .map(|info| info.0.ip())
+                    && crate::util::ip_blocked(&relay.access.read().await.blocked_ips, ip)
+                {
+                    return StatusCode::FORBIDDEN.into_response();
+                }
+                next.run(req).await
+            }
+        },
+    ));
     app.layer(axum::middleware::from_fn(cors_middleware))
         .with_state(relay.clone())
 }
@@ -424,7 +445,9 @@ pub async fn run_server(config_path: PathBuf, config: Config, db: DbClient) -> R
                 listener.tap_io(|stream| {
                     let _ = stream.set_nodelay(true);
                 }),
-                mgmt_app,
+                // The legacy admin routes enforce `blockip` too, which needs
+                // the peer address as `ConnectInfo`.
+                mgmt_app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
             )
             .with_graceful_shutdown(await_shutdown(rx))
             .await
@@ -685,17 +708,7 @@ async fn ws_handler(State(relay): State<Arc<Relay>>, request: Request) -> Respon
         .extensions()
         .get::<axum::extract::connect_info::ConnectInfo<std::net::SocketAddr>>()
         .map(|info| info.0.ip())
-        && relay
-            .access
-            .read()
-            .await
-            .blocked_ips
-            .iter()
-            .any(|(blocked, _)| {
-                blocked
-                    .parse::<std::net::IpAddr>()
-                    .is_ok_and(|b| b == crate::util::normalize_ip(ip))
-            })
+        && crate::util::ip_blocked(&relay.access.read().await.blocked_ips, ip)
     {
         return StatusCode::FORBIDDEN.into_response();
     }
@@ -1704,6 +1717,52 @@ mod tests {
             .unwrap();
         let response = root_inbox_outbox(State(relay.clone()), request).await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn blockip_applies_to_every_main_route() {
+        let relay = blossom_relay().await;
+        // Block the v4-mapped spelling: the plain IPv4 peer must be refused
+        // on every route, not only the WebSocket handler.
+        relay
+            .access
+            .write()
+            .await
+            .blocked_ips
+            .push(("::ffff:198.51.100.7".into(), String::new()));
+        let app = build_router(&relay, None).await;
+        for uri in ["/health", "/api/v1/count", "/relay/stats"] {
+            let mut request = Request::builder()
+                .method(Method::GET)
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap();
+            request
+                .extensions_mut()
+                .insert(axum::extract::connect_info::ConnectInfo::<
+                    std::net::SocketAddr,
+                >("198.51.100.7:1234".parse().unwrap()));
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::FORBIDDEN,
+                "{uri} must be refused for a blocked peer"
+            );
+        }
+        // A different peer passes the middleware and reaches the route.
+        let mut request = Request::builder()
+            .method(Method::GET)
+            .uri("/health")
+            .body(Body::empty())
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(axum::extract::connect_info::ConnectInfo::<
+                std::net::SocketAddr,
+            >("198.51.100.8:1234".parse().unwrap()));
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
         relay.db.shutdown();
     }
 

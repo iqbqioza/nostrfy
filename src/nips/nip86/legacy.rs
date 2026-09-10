@@ -41,6 +41,9 @@ pub(crate) fn router(
     shutdown_tx: watch::Sender<bool>,
     max_admin_body: usize,
 ) -> Router {
+    // NIP-86 `blockip` covers the legacy management routes too: a blocked
+    // peer must not reach them even with valid credentials.
+    let blocked_relay = Arc::clone(&relay);
     Router::new()
         .route("/admin/info", get(admin_info))
         .route("/admin/stats", get(admin_stats))
@@ -51,6 +54,22 @@ pub(crate) fn router(
         .route("/admin/status/{id}", get(event_status))
         .route("/admin/shutdown", post(shutdown))
         .layer(axum::extract::DefaultBodyLimit::max(max_admin_body))
+        .layer(axum::middleware::from_fn(
+            move |req: axum::extract::Request, next: axum::middleware::Next| {
+                let relay = Arc::clone(&blocked_relay);
+                async move {
+                    if let Some(ip) = req
+                        .extensions()
+                        .get::<axum::extract::connect_info::ConnectInfo<std::net::SocketAddr>>()
+                        .map(|info| info.0.ip())
+                        && crate::util::ip_blocked(&relay.access.read().await.blocked_ips, ip)
+                    {
+                        return StatusCode::FORBIDDEN.into_response();
+                    }
+                    next.run(req).await
+                }
+            },
+        ))
         .layer(axum::middleware::from_fn(crate::server::cors_middleware))
         .with_state(Arc::new(AdminState {
             relay,
