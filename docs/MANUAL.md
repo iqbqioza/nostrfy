@@ -644,6 +644,7 @@ Both backends use the `bucket/{npub1xxx}/{file}` hierarchy: every upload is stor
 - `PUT /upload` returns **201** when the blob was newly stored and **200** when it already exists (BUD-02).
 - Authorization tokens are accepted in the spec's **Base64url (no padding)** form and in the padded standard form (BUD-11).
 - The optional `X-SHA-256` request header is verified against the actual bytes: a mismatch returns **409** (BUD-02).
+- User-uploaded bytes are served with `X-Content-Type-Options: nosniff`; active document types (HTML/SVG/XML/JavaScript) additionally get `Content-Disposition: attachment` and `Content-Security-Policy: default-src 'none'; sandbox`, so the media origin cannot be used for stored XSS. (An SVG used as an `<img>` subresource is unaffected.)
 - The CORS pre-flight accepts the BUD-05/06 headers (`X-SHA-256`, `X-Content-Type`, `X-Content-Length`), so browser clients like nostter can upload to `/media`.
 
 Uploads, deletes and listings authenticate with a Nostr auth event (kind 24242, `server` tag naming the Blossom host), sent as `Authorization: Nostr <base64>`. Per BUD-11 the token must carry an `expiration` tag set to a unix timestamp in the future, the `t` verb matching the endpoint (`upload` / `media` / `delete` / `list`), and — for upload and delete — an `x` tag with the blob's sha256. The `/list` inventory is owner-only: the token must be issued by the listed pubkey. A pubkey banned with NIP-86 `banpubkey` is refused on every Blossom endpoint as well.

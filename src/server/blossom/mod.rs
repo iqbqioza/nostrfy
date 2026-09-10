@@ -480,6 +480,45 @@ impl futures_util::Stream for S3Chunks {
     }
 }
 
+/// Whether `mime` is an active document type that a browser would execute
+/// if navigated to directly (HTML, SVG, XML, JavaScript). `sanitize_mime`
+/// lowercases and strips parameters, so exact matches are enough.
+fn is_active_content(mime: &str) -> bool {
+    matches!(
+        mime,
+        "text/html"
+            | "application/xhtml+xml"
+            | "image/svg+xml"
+            | "text/xml"
+            | "application/xml"
+            | "application/javascript"
+            | "text/javascript"
+            | "application/x-javascript"
+    )
+}
+
+/// Anti-XSS hardening for user-uploaded bytes served from the Blossom
+/// origin: browsers must never sniff a benign MIME into an active one, and
+/// active document types are forced to download with a sandboxed policy.
+/// (An SVG served as an `<img>` subresource is unaffected by
+/// `Content-Disposition`; only direct navigation downloads it.)
+fn harden_blob_response(response: &mut Response, mime: &str) {
+    response.headers_mut().insert(
+        axum::http::header::HeaderName::from_static("x-content-type-options"),
+        axum::http::header::HeaderValue::from_static("nosniff"),
+    );
+    if is_active_content(mime) {
+        response.headers_mut().insert(
+            axum::http::header::CONTENT_DISPOSITION,
+            axum::http::header::HeaderValue::from_static("attachment"),
+        );
+        response.headers_mut().insert(
+            axum::http::header::HeaderName::from_static("content-security-policy"),
+            axum::http::header::HeaderValue::from_static("default-src 'none'; sandbox"),
+        );
+    }
+}
+
 /// `GET /<sha256>` — serve the blob, streamed from the storage backend
 /// (with RFC 7233 single-range support): a large blob is never loaded
 /// into memory in full.
@@ -505,7 +544,7 @@ async fn get_blob(
         return error(StatusCode::NOT_FOUND, "blob not found");
     };
     let base_headers = [
-        (axum::http::header::CONTENT_TYPE, desc.mime),
+        (axum::http::header::CONTENT_TYPE, desc.mime.clone()),
         (axum::http::header::ETAG, format!("\"{sha}\"")),
         (
             axum::http::header::CACHE_CONTROL,
@@ -593,6 +632,7 @@ async fn get_blob(
                 axum::http::header::CONTENT_LENGTH,
                 served_len.to_string().parse().unwrap(),
             );
+            harden_blob_response(&mut response, &desc.mime);
             response
         }
         Ok(None) => error(StatusCode::NOT_FOUND, "blob not found"),
@@ -679,7 +719,7 @@ async fn head_blob(
     let mut response = (
         status,
         [
-            (axum::http::header::CONTENT_TYPE, desc.mime),
+            (axum::http::header::CONTENT_TYPE, desc.mime.clone()),
             (
                 axum::http::header::CONTENT_LENGTH,
                 served_len.to_string(),
@@ -702,6 +742,7 @@ async fn head_blob(
             format!("bytes {start}-{end}/{size}").parse().unwrap(),
         );
     }
+    harden_blob_response(&mut response, &desc.mime);
     response
 }
 
@@ -1699,6 +1740,60 @@ mod tests {
             resp.status(),
             StatusCode::NOT_FOUND,
             "HEAD must agree with GET for a missing backing file"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn blob_responses_are_hardened_against_sniffing() {
+        // BUD-01: user-uploaded bytes are served from the Blossom origin, so
+        // responses never allow MIME sniffing, and active document types are
+        // forced to download under a sandboxed policy.
+        let relay = build_blossom_relay(0).await;
+        let state = state_of(&relay).await.expect("blossom state");
+        let pk = "aa".repeat(32);
+        let png = b"not really a png";
+        let png_sha = sha256_hex(png);
+        state
+            .store
+            .put(&pk, &png_sha, png, "image/png")
+            .await
+            .unwrap();
+        let html = b"<script>alert(1)</script>";
+        let html_sha = sha256_hex(html);
+        state
+            .store
+            .put(&pk, &html_sha, html, "text/html")
+            .await
+            .unwrap();
+
+        let nosniff = axum::http::header::HeaderName::from_static("x-content-type-options");
+        let csp = axum::http::header::HeaderName::from_static("content-security-policy");
+        // Safe media: nosniff, but no forced download.
+        let resp = get_blob(State(relay.clone()), HeaderMap::new(), AxPath(png_sha)).await;
+        assert_eq!(resp.headers().get(&nosniff).unwrap(), "nosniff");
+        assert!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_DISPOSITION)
+                .is_none()
+        );
+        // Active document: nosniff + attachment + sandboxed CSP.
+        let resp = get_blob(State(relay.clone()), HeaderMap::new(), AxPath(html_sha.clone())).await;
+        assert_eq!(resp.headers().get(&nosniff).unwrap(), "nosniff");
+        assert_eq!(
+            resp.headers()[axum::http::header::CONTENT_DISPOSITION],
+            "attachment"
+        );
+        assert_eq!(
+            resp.headers().get(&csp).unwrap(),
+            "default-src 'none'; sandbox"
+        );
+        // HEAD carries the same hardening.
+        let resp = head_blob(State(relay.clone()), HeaderMap::new(), AxPath(html_sha)).await;
+        assert_eq!(resp.headers().get(&nosniff).unwrap(), "nosniff");
+        assert_eq!(
+            resp.headers()[axum::http::header::CONTENT_DISPOSITION],
+            "attachment"
         );
         relay.db.shutdown();
     }
