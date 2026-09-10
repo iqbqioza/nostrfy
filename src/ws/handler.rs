@@ -620,6 +620,15 @@ impl super::Conn {
             self.send_control(nip42::ok(&event.id, false));
             return;
         }
+        // NIP-01: event hex fields are lowercase. An uppercase pubkey would
+        // verify (its id and signature cover the original string) but then
+        // never match the exact-case author comparisons (NIP-70, /outbox,
+        // NIP-78), so reject it up front instead of authenticating a key the
+        // relay cannot actually use.
+        if event.pubkey != event.pubkey.to_ascii_lowercase() {
+            self.send_control(nip42::ok(&event.id, false));
+            return;
+        }
         let id = event.id.clone();
         let accepted = {
             let cfg = self.relay.config.read().await;

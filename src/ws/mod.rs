@@ -4657,6 +4657,38 @@ mod tests {
     }
 
     #[test]
+    fn uppercase_auth_pubkey_is_rejected() {
+        // NIP-01: hex fields are lowercase. An uppercase AUTH pubkey would
+        // verify but never match the exact-case author checks, so it must be
+        // refused instead of stored as an authenticated key.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let now = unix_now();
+            let mut auth = signed_auth(conn.relay.secp(), "test-challenge", now);
+            auth.pubkey = auth.pubkey.to_ascii_uppercase();
+            auth.id = crate::nips::nip01::compute_id(&auth);
+            let keypair = Keypair::from_seckey_slice(conn.relay.secp(), &[2u8; 32]).unwrap();
+            let id = auth.id_bytes().unwrap();
+            auth.sig = conn
+                .relay
+                .secp()
+                .sign_schnorr_no_aux_rand(&id, &keypair)
+                .to_string();
+            conn.handle_auth(&[serde_json::to_value(&auth).unwrap()])
+                .await;
+            let msgs = outgoing_json(&conn);
+            let ok = msgs
+                .iter()
+                .find(|m| m[0] == "OK" && m[1] == auth.id)
+                .expect("AUTH must be answered with OK");
+            assert_eq!(ok[2], false, "uppercase pubkeys must be rejected");
+            assert!(!conn.is_authed(), "no key must be recorded");
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
     fn deletion_without_targets_is_rejected() {
         // NIP-09: a deletion request (kind 5) is defined as having one or
         // more `e`/`a` tags; one without targets is rejected.
