@@ -3659,6 +3659,39 @@ mod tests {
     }
 
     #[test]
+    fn exhausted_neg_open_budget_skips_the_database_query() {
+        // The connection-wide NEG-OPEN cap is checked before the large
+        // database query: an exhausted budget answers "connection limit"
+        // instead of spending the scan and then reporting a different
+        // refusal.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let now = unix_now();
+            // More events than a tiny item cap, so the scan would answer
+            // "too big" if it ran.
+            conn.relay.config.write().await.limits.max_neg_items = 1;
+            for i in 0..3 {
+                let ev = signed_note(conn.relay.secp(), &format!("e{i}"), now - i, vec![]);
+                conn.relay.db.put(ev, now).await;
+            }
+            conn.neg_opens_total = super::negentropy::MAX_NEG_OPENS;
+            conn.handle_neg_open(&[json!("s"), json!({"kinds": [1]}), json!("61000000")])
+                .await;
+            let msgs = outgoing_json(&conn);
+            let err = msgs
+                .iter()
+                .find(|m| m[0] == "NEG-ERR")
+                .expect("the open must be refused");
+            assert!(
+                err[2].as_str().unwrap().contains("connection limit"),
+                "the budget check must run before the database query: {err:?}"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
     fn neg_open_counts_towards_active_subscriptions() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -3691,10 +3724,12 @@ mod tests {
     }
 
     #[test]
-    fn neg_open_replacement_keeps_old_state_on_failed_replace() {
-        // A failed NEG-OPEN replacement (invalid initial message) must not
-        // close the peer's existing subscription: the response is computed
-        // before the old state is removed.
+    fn neg_open_failed_replace_closes_the_old_subscription() {
+        // NIP-77: "If a NEG-OPEN is issued for a currently open subscription
+        // ID, the existing subscription is first closed", and "after a
+        // NEG-ERR is issued, the subscription is considered to be closed".
+        // A failed replacement therefore closes the id instead of leaving
+        // the old state running.
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let mut conn = build_conn().await;
@@ -3711,26 +3746,28 @@ mod tests {
                 before + 1,
                 "the first open holds a slot"
             );
+            assert!(conn.neg.contains_key("s"), "the first open is live");
             // A syntactically valid hex message that fails to parse:
             // version byte followed by an out-of-order bound.
             let bad = hex::encode([0x61u8, 0x02, 0x00, 0x01]);
             conn.handle_neg_open(&[json!("s"), json!({"kinds": [1]}), json!(bad)])
                 .await;
-            assert_eq!(
-                stats
-                    .subscriptions_active
-                    .load(std::sync::atomic::Ordering::Relaxed),
-                before + 1,
-                "a failed replacement must not release the old subscription"
+            assert!(
+                conn.outgoing
+                    .iter()
+                    .any(|m| m.to_text().is_ok_and(|t| t.contains("NEG-ERR"))),
+                "the failed replacement must send a NEG-ERR"
             );
-            // The old subscription still works.
-            conn.handle_neg_close(&[json!("s")]);
+            assert!(
+                !conn.neg.contains_key("s"),
+                "a NEG-ERR closes the subscription: the old state is released"
+            );
             assert_eq!(
                 stats
                     .subscriptions_active
                     .load(std::sync::atomic::Ordering::Relaxed),
                 before,
-                "closing releases the slot"
+                "the closed id's subscription slot is released"
             );
             conn.relay.db.shutdown();
         });
@@ -3742,8 +3779,8 @@ mod tests {
         rt.block_on(async {
             let mut conn = build_conn().await;
             // A small response budget: any mode-2 answer over it is
-            // rejected with NEG-ERR while the (empty) old subscription is
-            // kept.
+            // rejected with NEG-ERR, which closes the (here non-existent)
+            // subscription.
             // Any initial answer is at least the version byte plus a
             // bound, so a 1-byte budget rejects everything.
             conn.req_response_bytes = 1;
@@ -3796,23 +3833,34 @@ mod tests {
     }
 
     #[test]
-    fn neg_open_item_cap_keeps_old_subscription() {
+    fn neg_open_item_cap_closes_the_old_subscription() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let mut conn = build_conn().await;
-            conn.relay.config.write().await.limits.max_neg_items = 2;
+            let now = unix_now();
+            // Open "s" against an empty database: it succeeds and holds
+            // state.
             conn.handle_neg_open(&[json!("s"), json!({"kinds": [1]}), json!("61000000")])
                 .await;
             assert_eq!(conn.neg.len(), 1, "the first open succeeds");
-            // A replacement with more items than the cap is rejected and
-            // the old subscription survives.
-            let too_many = hex::encode([0x61u8, 0x02, 0x00, 0x00, 0x03, 0x00]);
-            conn.handle_neg_open(&[json!("s"), json!({"kinds": [1]}), json!(too_many)])
+            conn.relay.config.write().await.limits.max_neg_items = 2;
+            // Store more matching events than the cap, then replace "s":
+            // the over-cap NEG-ERR closes the id (NIP-77).
+            for i in 0..3 {
+                let ev = signed_note(conn.relay.secp(), &format!("e{i}"), now - i, vec![]);
+                conn.relay.db.put(ev, now).await;
+            }
+            conn.handle_neg_open(&[json!("s"), json!({"kinds": [1]}), json!("61000000")])
                 .await;
-            assert_eq!(
-                conn.neg.len(),
-                1,
-                "the over-cap open must not remove the old subscription"
+            assert!(
+                outgoing_json(&conn).iter().any(|m| {
+                    m[0] == "NEG-ERR" && m[2].as_str().unwrap().contains("too big")
+                }),
+                "the over-cap query must be refused"
+            );
+            assert!(
+                conn.neg.is_empty(),
+                "the NEG-ERR must close the old subscription"
             );
             conn.relay.db.shutdown();
         });
