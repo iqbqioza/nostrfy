@@ -41,6 +41,16 @@ pub(crate) struct PendingReq {
     /// Serialized bytes of the EVENT messages queued so far (against
     /// `limits.max_req_response_bytes`).
     pub(crate) sent_bytes: u64,
+    /// Live EVENT messages that matched this subscription while its stored
+    /// response was still pumping. NIP-01 defines EOSE as the boundary
+    /// between stored and real-time events, so these wait here until the
+    /// stored events and the EOSE have been queued.
+    pub(crate) live: std::collections::VecDeque<String>,
+    /// Serialized bytes held in `live`, against the outgoing byte cap.
+    pub(crate) live_bytes: usize,
+    /// Whether the EOSE (and any AUTH challenge before it) has been queued;
+    /// afterwards the pump only drains `live`.
+    pub(crate) eose_sent: bool,
 }
 
 /// Upper bound on queued REQ responses per connection: beyond this the
@@ -226,7 +236,7 @@ impl Conn {
             // "more" hint instead of claiming a complete result (the
             // subscription itself stays open).
             dropped.truncated_or_more = true;
-            self.finish_pending_req(dropped);
+            self.finish_pending_req(&dropped);
         }
         self.pending_reqs.push_back(pending);
     }
@@ -235,7 +245,7 @@ impl Conn {
     /// response. EOSE/CLOSED are tiny, so they take the uncapped path —
     /// the byte cap exists for large payloads, and a dropped EOSE would
     /// leave the client hanging on a completed subscription.
-    fn finish_pending_req(&mut self, pending: PendingReq) {
+    fn finish_pending_req(&mut self, pending: &PendingReq) {
         let eose = if pending.eose_hint {
             // NIP-67: `"auth"` advertises stored events that match the
             // filters but are withheld pending AUTH (protected events,
@@ -358,14 +368,55 @@ impl Conn {
                 self.pending_reqs.pop_front();
                 continue;
             }
-            if front.events.is_empty() {
-                let pending = self.pending_reqs.pop_front().unwrap();
-                self.finish_pending_req(pending);
+            if !front.events.is_empty() {
+                // The queue is full or the count cap is reached: the next
+                // loop iteration resumes the pump after the drain.
+                break;
+            }
+            // All stored events are queued. Send the EOSE (with any AUTH
+            // challenge ahead of it) before draining the live events that
+            // arrived while the response was pumping: NIP-01 defines EOSE
+            // as the boundary between stored and real-time events.
+            let mut pending = self.pending_reqs.pop_front().expect("front exists");
+            if !pending.eose_sent {
+                pending.eose_sent = true;
+                self.finish_pending_req(&pending);
+            }
+            self.drain_pending_live(&mut pending);
+            if pending.live.is_empty() {
                 continue;
             }
-            // The queue is full or the count cap is reached: the next
-            // loop iteration resumes the pump after the drain.
+            // The queue filled up again with live events: keep the entry so
+            // the next pump (after the socket drains) resumes in order.
+            self.pending_reqs.push_front(pending);
             break;
+        }
+    }
+
+    /// Moves the live events held for a pumped-out REQ response into the
+    /// capped outgoing queue. The caller keeps the entry while a non-empty
+    /// backlog remains, so the next pump (after the socket drains) resumes
+    /// exactly where this one stopped.
+    fn drain_pending_live(&mut self, pending: &mut PendingReq) {
+        while self.outgoing.len() < OUT_QUEUE_LIMIT {
+            let Some(text) = pending.live.front() else {
+                return;
+            };
+            let size = text.len();
+            // The same byte-cap rule as the stored events: the first message
+            // may exceed the cap so a single event is never lost.
+            if self.out_queue_bytes > 0
+                && self.out_bytes > 0
+                && self.out_bytes.saturating_add(size) > self.out_queue_bytes
+            {
+                return;
+            }
+            let text = pending.live.pop_front().expect("front checked");
+            pending.live_bytes = pending.live_bytes.saturating_sub(size);
+            self.out_bytes += size;
+            self.out_msgs += 1;
+            self.out_bytes_total += size as u64;
+            self.outgoing.push_back(Message::Text(text.into()));
         }
     }
 
@@ -2388,6 +2439,10 @@ mod tests {
             owner
                 .handle_req(&[json!("sub"), json!({"kinds": [30078]})])
                 .await;
+            // The stored response (here empty) is pumped before any live
+            // event: pulling it through the pump mirrors the connection loop
+            // and leaves the subscription in its EOSE-sent state.
+            owner.pump_pending_reqs();
             relay.broadcast(ev.clone());
             let received = tokio::time::timeout(
                 std::time::Duration::from_secs(2),
@@ -2868,6 +2923,10 @@ mod tests {
             let now = unix_now();
             conn.handle_req(&[json!("sub"), json!({"kinds": [30002]})])
                 .await;
+            // Finish the stored response first: a live event delivered while
+            // the response is pumping waits for its EOSE (by design), so the
+            // shared-JSON wrapping is asserted after the pump.
+            conn.pump_pending_reqs();
             // The sub id JSON is cached at REQ time.
             let cached = conn.subs.get("sub").map(|(_, _, j)| j.clone()).unwrap();
             assert_eq!(cached, "\"sub\"");
@@ -2999,6 +3058,11 @@ mod tests {
             conn.handle_req(&[json!("sub"), json!({"kinds": [30001]})])
                 .await;
             assert!(conn.live.is_some(), "REQ must subscribe to live events");
+            // Finish the (empty) stored response before the live event: a
+            // live event delivered while a response is pumping is held for
+            // its EOSE, so the queue assertion needs the subscription in its
+            // EOSE-sent state.
+            conn.pump_pending_reqs();
 
             let mut ev = signed_note(conn.relay.secp(), "live-check", now, vec![]);
             ev.kind = 30001;
@@ -3863,6 +3927,97 @@ mod tests {
     }
 
     #[test]
+    fn live_events_wait_for_the_pending_eose() {
+        // NIP-01: EOSE marks the end of stored events and the beginning of
+        // the real-time stream. A live event that arrives while a stored
+        // response is still pumping must be queued after the EOSE, never
+        // ahead of the remaining stored events.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            // One stored event per pump, so the live event arrives while the
+            // response is still being drained.
+            conn.out_queue_bytes = 1024;
+            let now = unix_now();
+            conn.subs
+                .insert("s".into(), (vec![Filter::default()], 0, "\"s\"".into()));
+            let mut events = std::collections::VecDeque::new();
+            for i in 0..3 {
+                events.push_back(signed_note(
+                    conn.relay.secp(),
+                    &format!("stored-{i}-{}", "x".repeat(2_000)),
+                    now - i,
+                    vec![],
+                ));
+            }
+            conn.enqueue_pending_req(PendingReq {
+                sub_id: "s".into(),
+                events,
+                eose_hint: false,
+                truncated_or_more: false,
+                auth_hint: false,
+                sent_bytes: 0,
+                live: Default::default(),
+                live_bytes: 0,
+                eose_sent: false,
+            });
+            // A live event for the same subscription arrives mid-response:
+            // it must be held for the post-EOSE stream.
+            let live = signed_note(conn.relay.secp(), "live", now, vec![]);
+            let live_json = serde_json::to_string(&live).unwrap();
+            conn.deliver_live(&live, &live_json, None);
+            assert!(
+                !outgoing_json(&conn)
+                    .iter()
+                    .any(|m| m[0] == "EVENT" && m[2]["content"] == "live"),
+                "the live event must not overtake the stored response"
+            );
+
+            // Drain the queue chunk by chunk, collecting the message order.
+            let mut order = Vec::new();
+            for _ in 0..20 {
+                conn.pump_pending_reqs();
+                order.extend(outgoing_json(&conn));
+                conn.outgoing.clear();
+                conn.out_bytes = 0;
+                if conn.pending_reqs.is_empty() {
+                    break;
+                }
+            }
+            assert!(
+                conn.pending_reqs.is_empty(),
+                "the response must finish within the drain loop"
+            );
+            let stored = |m: &Value| {
+                m[0] == "EVENT"
+                    && m[2]["content"]
+                        .as_str()
+                        .is_some_and(|c| c.starts_with("stored-"))
+            };
+            let eose = order
+                .iter()
+                .position(|m| m[0] == "EOSE" && m[1] == "s")
+                .expect("the EOSE must be queued");
+            let last_stored = order.iter().rposition(stored).expect("stored events");
+            let live_pos = order
+                .iter()
+                .position(|m| m[0] == "EVENT" && m[2]["content"] == "live")
+                .expect("the live event must be queued");
+            assert_eq!(
+                order.iter().filter(|m| stored(m)).count(),
+                3,
+                "all stored events must be delivered"
+            );
+            assert!(
+                last_stored < eose,
+                "every stored event must precede the EOSE"
+            );
+            assert!(live_pos > eose, "the live event must follow the EOSE");
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
     fn pump_closes_oversized_responses() {
         // `max_req_response_bytes`: a response exceeding the budget is
         // closed with `CLOSED ... response too large`; the events already
@@ -3892,6 +4047,9 @@ mod tests {
                 truncated_or_more: false,
                 auth_hint: false,
                 sent_bytes: 0,
+                live: Default::default(),
+                live_bytes: 0,
+                eose_sent: false,
             });
             conn.pump_pending_reqs();
             let msgs = outgoing_json(&conn);
@@ -3931,6 +4089,9 @@ mod tests {
                 truncated_or_more: false,
                 auth_hint: false,
                 sent_bytes: 0,
+                live: Default::default(),
+                live_bytes: 0,
+                eose_sent: false,
             });
             conn.pump_pending_reqs();
             let msgs = outgoing_json(&conn);
@@ -3969,6 +4130,9 @@ mod tests {
                     truncated_or_more: false,
                     auth_hint: false,
                     sent_bytes: 0,
+                    live: Default::default(),
+                    live_bytes: 0,
+                    eose_sent: false,
                 });
             }
             assert_eq!(
@@ -4030,6 +4194,9 @@ mod tests {
                 truncated_or_more: false,
                 auth_hint: true,
                 sent_bytes: 0,
+                live: Default::default(),
+                live_bytes: 0,
+                eose_sent: false,
             });
             conn.pump_pending_reqs();
             let msgs = outgoing_json(&conn);
@@ -4141,6 +4308,9 @@ mod tests {
                 truncated_or_more: false,
                 auth_hint: false,
                 sent_bytes: 0,
+                live: Default::default(),
+                live_bytes: 0,
+                eose_sent: false,
             });
             conn.pump_pending_reqs();
             assert!(
@@ -4164,6 +4334,9 @@ mod tests {
                 truncated_or_more: false,
                 auth_hint: false,
                 sent_bytes: 0,
+                live: Default::default(),
+                live_bytes: 0,
+                eose_sent: false,
             });
             let mut second = std::collections::VecDeque::new();
             second.push_back(signed_note(conn.relay.secp(), "new", now - 1, vec![]));
@@ -4174,6 +4347,9 @@ mod tests {
                 truncated_or_more: false,
                 auth_hint: false,
                 sent_bytes: 0,
+                live: Default::default(),
+                live_bytes: 0,
+                eose_sent: false,
             });
             assert_eq!(conn.pending_reqs.len(), 1, "the stale response is dropped");
             conn.pump_pending_reqs();
@@ -4224,6 +4400,9 @@ mod tests {
                 truncated_or_more: false,
                 auth_hint: false,
                 sent_bytes: 0,
+                live: Default::default(),
+                live_bytes: 0,
+                eose_sent: false,
             });
             conn.pump_pending_reqs();
             let msgs = outgoing_json(&conn);

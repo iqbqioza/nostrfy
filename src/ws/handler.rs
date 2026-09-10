@@ -506,6 +506,9 @@ impl super::Conn {
             truncated_or_more: truncated || more,
             auth_hint: auth_hidden,
             sent_bytes: 0,
+            live: Default::default(),
+            live_bytes: 0,
+            eose_sent: false,
         });
     }
 
@@ -975,7 +978,27 @@ impl super::Conn {
             out.push(',');
             out.push_str(event_json);
             out.push(']');
-            self.send(Message::Text(std::mem::take(&mut out).into()));
+            // NIP-01: EOSE is the boundary between a subscription's stored
+            // events and its real-time stream. While the subscription's
+            // stored response is still pumping, hold the live event in the
+            // pending response so it is queued after the EOSE; sending it
+            // directly would let it overtake the remaining stored events.
+            if let Some(idx) = self.pending_reqs.iter().position(|p| p.sub_id == sub_id) {
+                let size = out.len();
+                let pending = &mut self.pending_reqs[idx];
+                let over = pending.live.len() >= super::OUT_QUEUE_LIMIT
+                    || (self.out_queue_bytes > 0
+                        && pending.live_bytes.saturating_add(size) > self.out_queue_bytes);
+                if over {
+                    self.dropped += 1;
+                    self.relay.stats.bump(&self.relay.stats.buffers_dropped, 1);
+                } else {
+                    pending.live_bytes += size;
+                    pending.live.push_back(std::mem::take(&mut out));
+                }
+            } else {
+                self.send(Message::Text(std::mem::take(&mut out).into()));
+            }
         }
     }
 }
