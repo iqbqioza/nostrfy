@@ -446,6 +446,13 @@ impl Conn {
             self.send_json(nip42::auth_message(&self.challenge));
         }
     }
+
+    /// Whether this connection's source IP is blocked (NIP-86 `blockip`).
+    /// Called when the blocked-IP list changes, so a read-only subscriber
+    /// that never sends a frame is disconnected like any other.
+    pub(crate) async fn source_ip_blocked(&self, peer_ip: std::net::IpAddr) -> bool {
+        crate::util::ip_blocked(&self.relay.access.read().await.blocked_ips, peer_ip)
+    }
 }
 
 pub(crate) fn value_string(value: &Value) -> Option<String> {
@@ -665,12 +672,10 @@ pub async fn handle_connection(
         interval
     });
 
-    // Blocked-IP version captured at connect: when the NIP-86 admin
-    // blocks (or unblocks) an IP, every connection re-checks the list and
-    // closes if its own source IP became blocked.
-    let mut blocks_version = relay
-        .ip_blocks_version
-        .load(std::sync::atomic::Ordering::Relaxed);
+    // NIP-86 blockip: watch the blocked-IP list changes so this connection
+    // is dropped when its source IP becomes blocked, even if it only
+    // receives live events and never sends a frame.
+    let mut ip_blocks_rx = relay.ip_blocks_tx.subscribe();
 
     let idle_jitter = Duration::from_millis(conn_id % 2000);
     let idle_sleep: Option<tokio::time::Sleep> =
@@ -820,29 +825,6 @@ pub async fn handle_connection(
                     Ok(Message::Close(_)) => break,
                     Ok(frame) => {
                         last_activity = std::time::Instant::now();
-                        // Re-check the blocked-IP list when it changed since
-                        // connect: a newly blocked IP's existing connections
-                        // are dropped (a version bump also re-checks after
-                        // an unblock; the list is then empty).
-                        let version =
-                            conn.relay.ip_blocks_version.load(std::sync::atomic::Ordering::Relaxed);
-                        if version != blocks_version {
-                            blocks_version = version;
-                            let blocked = conn
-                                .relay
-                                .access
-                                .read()
-                                .await
-                                .blocked_ips
-                                .iter()
-                                .any(|(b, _)| {
-                                    b.parse::<std::net::IpAddr>()
-                                        .is_ok_and(|b| b == crate::util::normalize_ip(peer_ip))
-                                });
-                            if blocked {
-                                break;
-                            }
-                        }
                         if conn.handle_frame(frame, max_msg_size).await {
                             break;
                         }
@@ -943,6 +925,14 @@ pub async fn handle_connection(
                 // must reach the peer for its send path to unblock: wake
                 // the top-of-loop drain promptly instead of waiting for
                 // the next inbound frame.
+            }
+            changed = ip_blocks_rx.changed() => {
+                // NIP-86 blockip: wake on every blocked-IP list change so a
+                // read-only subscriber (no inbound frames) is dropped too.
+                // An `Err` means the relay (and its sender) is gone.
+                if changed.is_err() || conn.source_ip_blocked(peer_ip).await {
+                    break;
+                }
             }
             live_batch = live_fut => {
                 match live_batch {
@@ -4584,6 +4574,33 @@ mod tests {
                     .candidates(&signed_note(conn.relay.secp(), "after", unix_now(), vec![]))
                     .is_empty(),
                 "a closed subscription must not receive live events"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn source_ip_blocked_and_change_notification() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let conn = build_conn().await;
+            let peer: std::net::IpAddr = "198.51.100.7".parse().unwrap();
+            assert!(!conn.source_ip_blocked(peer).await);
+            // A v4-mapped entry must match the plain IPv4 peer.
+            conn.relay
+                .access
+                .write()
+                .await
+                .blocked_ips
+                .push(("::ffff:198.51.100.7".into(), String::new()));
+            assert!(conn.source_ip_blocked(peer).await);
+            // Every mutation wakes the connection's watcher immediately,
+            // which is what disconnects read-only subscribers.
+            let mut rx = conn.relay.ip_blocks_tx.subscribe();
+            conn.relay.note_ip_blocks_changed();
+            assert!(
+                rx.changed().await.is_ok(),
+                "the block change must wake the connection watcher"
             );
             conn.relay.db.shutdown();
         });

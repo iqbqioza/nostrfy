@@ -73,11 +73,11 @@ pub struct Relay {
     /// preserved); fresh pubkeys alone are fail-open until old windows
     /// expire.
     publish_rate: std::sync::Mutex<HashMap<String, std::collections::VecDeque<u64>>>,
-    /// Bumped whenever the blocked-IP list changes (NIP-86 blockip/
-    /// unblockip): connections compare this against the value captured at
-    /// connect and re-check the list (and close) when it changed, so a
-    /// newly blocked IP's existing connections are dropped too.
-    pub ip_blocks_version: AtomicU64,
+    /// NIP-86 blockip/unblockip: every list change notifies each
+    /// connection's watcher, so established read-only subscribers (which
+    /// never send a frame) are disconnected too — a version counter could
+    /// only be observed on an inbound frame.
+    pub ip_blocks_tx: tokio::sync::watch::Sender<u64>,
     /// Bumped on every SIGHUP config reload: connections cache the NIP-40/
     /// NIP-42 flags against this version and refresh them only when it
     /// changes, so the hot live path never takes the shared config lock.
@@ -340,7 +340,7 @@ impl Relay {
             api_limit: ApiLimiter::new(api_max_concurrent),
             per_ip_connections: std::sync::Mutex::new(HashMap::new()),
             publish_rate: std::sync::Mutex::new(HashMap::new()),
-            ip_blocks_version: AtomicU64::new(0),
+            ip_blocks_tx: tokio::sync::watch::channel(0).0,
             config_version: AtomicU64::new(0),
             key,
             relay_pubkey,
@@ -600,10 +600,12 @@ impl Relay {
         self.key.is_some()
     }
 
-    /// Bumps the blocked-IP version so every connection re-checks the list
-    /// (and closes when its source IP is now blocked).
+    /// Notifies every connection that the blocked-IP list changed, so each
+    /// re-checks its source IP (and closes when it is now blocked).
     pub fn note_ip_blocks_changed(&self) {
-        self.ip_blocks_version.fetch_add(1, Ordering::Relaxed);
+        self.ip_blocks_tx.send_modify(|version| {
+            *version = version.wrapping_add(1);
+        });
     }
 
     /// Persists a runtime change of one `[relay]` config field (e.g. the
