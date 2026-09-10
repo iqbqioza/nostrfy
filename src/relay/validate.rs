@@ -1123,6 +1123,16 @@ mod tests {
             // malformed too.
             let bare = signed(1, vec![vec!["expiration".into()]]);
             assert!(relay.validate_base(&cfg, &bare, now, &[], None).is_err());
+            // A bare tag alongside a valid one is malformed as well: the
+            // valid sibling must not mask the missing value.
+            let mixed = signed(
+                1,
+                vec![
+                    vec!["expiration".into(), (now + 100).to_string()],
+                    vec!["expiration".into()],
+                ],
+            );
+            assert!(relay.validate_base(&cfg, &mixed, now, &[], None).is_err());
             // A well-formed value passes.
             let good = signed(1, vec![vec!["expiration".into(), (now + 100).to_string()]]);
             assert!(relay.validate_base(&cfg, &good, now, &[], None).is_ok());
