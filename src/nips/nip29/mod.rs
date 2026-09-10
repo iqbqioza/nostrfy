@@ -626,20 +626,30 @@ impl GroupStore {
                     if old_parent.as_deref() == Some(gid) {
                         continue;
                     }
-                    // Only a child that does not already belong to another
-                    // parent gets its back-pointer assigned here: changing
-                    // an existing child's parent is the child's own 9002's
-                    // decision (the parent's admin must not re-parent a
-                    // group they do not administer).
-                    if old_parent.is_some() {
-                        continue;
+                    // A child that currently belongs to another parent is
+                    // moved, not just listed: validation required the author
+                    // to administer the child too, and NIP-29 keeps both
+                    // sides of the link consistent ("and vice-versa"). The
+                    // old parent's list is updated and republished as well.
+                    if let Some(old) = old_parent.as_ref()
+                        && let Some(old_group) = self.groups.get_mut(old)
+                    {
+                        old_group.children.retain(|c| c != child);
                     }
                     if let Some(child_group) = self.groups.get_mut(child) {
                         child_group.parent = Some(gid.to_string());
                     }
-                    // The child's metadata changed (its parent tag):
-                    // republish it so peers see the new link.
+                    // The child's metadata changed (its parent tag): republish
+                    // it so peers see the new link.
                     if emit {
+                        if let Some(old) = &old_parent {
+                            out.push(build_meta_event(
+                                old,
+                                self.groups.get(old),
+                                relay_pubkey,
+                                now,
+                            ));
+                        }
                         out.push(build_meta_event(
                             child,
                             self.groups.get(child),

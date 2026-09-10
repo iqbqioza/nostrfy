@@ -241,6 +241,65 @@ fn apply_covers_parent_child_roles_pins_and_delete() {
 }
 
 #[test]
+fn parent_side_adoption_moves_the_child_from_its_old_parent() {
+    // NIP-29: the parent's `child` list and the child's `parent` tag are two
+    // sides of one link. An admin of both may adopt a child through the
+    // parent's 9002; the old parent's list must be updated too, or the two
+    // directions disagree (a one-way link).
+    let mut store = GroupStore::default();
+    let now = 1_600_000_000;
+    for gid in ["g1", "g2", "g3"] {
+        store.apply(
+            &event(CREATE_GROUP, ADMIN, Some(gid), vec![]),
+            "relay",
+            now,
+            false,
+            false,
+        );
+    }
+    // g3 declares g2 as its parent (the child side).
+    let under_g2 = event(
+        9002,
+        ADMIN,
+        Some("g3"),
+        vec![vec!["parent".into(), "g2".into()]],
+    );
+    store.apply(&under_g2, "relay", now, false, false);
+    assert_eq!(store.group("g3").unwrap().parent.as_deref(), Some("g2"));
+    assert!(
+        store
+            .group("g2")
+            .unwrap()
+            .children
+            .contains(&"g3".to_string())
+    );
+    // g1's admin adopts g3 through the parent side.
+    let adopt = event(
+        9002,
+        ADMIN,
+        Some("g1"),
+        vec![vec!["child".into(), "g3".into()]],
+    );
+    store.apply(&adopt, "relay", now, false, false);
+    assert_eq!(store.group("g3").unwrap().parent.as_deref(), Some("g1"));
+    assert!(
+        store
+            .group("g1")
+            .unwrap()
+            .children
+            .contains(&"g3".to_string())
+    );
+    assert!(
+        !store
+            .group("g2")
+            .unwrap()
+            .children
+            .contains(&"g3".to_string()),
+        "the old parent's child list must be cleared"
+    );
+}
+
+#[test]
 fn vanish_rebuild_recreates_membership_of_private_groups() {
     // ...
 }
