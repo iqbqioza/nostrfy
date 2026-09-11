@@ -87,9 +87,7 @@ fn join_verdicts<'scope>(
         .flat_map(|(i, handle)| match handle.join() {
             Ok(verdicts) => verdicts,
             Err(_) => {
-                log::error!(
-                    "signature verification thread {i} panicked; rejecting its events"
-                );
+                log::error!("signature verification thread {i} panicked; rejecting its events");
                 vec![false; chunk_lens.get(i).copied().unwrap_or(0)]
             }
         })

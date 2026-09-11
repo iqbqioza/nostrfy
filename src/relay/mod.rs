@@ -1694,7 +1694,9 @@ mod tests {
             let now = crate::util::unix_now();
             let secp = secp256k1::Secp256k1::new();
             let keypair = secp256k1::Keypair::from_seckey_slice(&secp, &[4u8; 32]).unwrap();
-            let pubkey = secp256k1::XOnlyPublicKey::from_keypair(&keypair).0.to_string();
+            let pubkey = secp256k1::XOnlyPublicKey::from_keypair(&keypair)
+                .0
+                .to_string();
             let signed = |kind: u64, content: &str| {
                 let mut e = crate::event::Event {
                     id: String::new(),
@@ -1712,10 +1714,7 @@ mod tests {
             };
             // A stored group message (direct DB put: the purge is the target).
             let msg = signed(1, "secret group message");
-            assert_eq!(
-                relay.db.put(msg, now).await,
-                crate::db::PutOutcome::Stored
-            );
+            assert_eq!(relay.db.put(msg, now).await, crate::db::PutOutcome::Stored);
             let create = signed(crate::nips::nip29::CREATE_GROUP, "");
             assert!(matches!(
                 relay.accept_event(create, &[], None).await.0,

@@ -158,9 +158,9 @@ impl Filter {
                 .iter()
                 .find(|t| t.len() == 4 && t[0] == "delegation")
                 .map(|t| t[1].as_str());
-            if !delegated.is_some_and(|delegator| {
-                authors.iter().any(|a| Self::hex_eq(a, delegator))
-            }) {
+            if !delegated
+                .is_some_and(|delegator| authors.iter().any(|a| Self::hex_eq(a, delegator)))
+            {
                 return false;
             }
         }

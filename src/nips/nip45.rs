@@ -177,8 +177,7 @@ mod tests {
         a.replace_range(32..33, "c"); // c = 12 -> offset 20
         let mut b = "b".repeat(64);
         b.replace_range(32..33, "f"); // f = 15 -> offset 23
-        let f: Filter =
-            serde_json::from_value(serde_json::json!({"#b": [b], "#a": [a]})).unwrap();
+        let f: Filter = serde_json::from_value(serde_json::json!({"#b": [b], "#a": [a]})).unwrap();
         assert_eq!(hll_offset(&f), Some(23), "the first # attribute must win");
     }
 

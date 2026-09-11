@@ -1321,11 +1321,7 @@ impl crate::filter::EventFields for NegLight {
 /// when present (fast path) or from the stored event JSON otherwise. `None`
 /// means the stored value could not be parsed (corruption); the candidate is
 /// skipped like [`consider_event`] skips it.
-fn candidate_created_at(
-    ctx: &ScanContext<'_>,
-    id: &[u8],
-    raw: &[u8],
-) -> Result<Option<u64>> {
+fn candidate_created_at(ctx: &ScanContext<'_>, id: &[u8], raw: &[u8]) -> Result<Option<u64>> {
     if let Some(meta) = ctx.event_meta
         && let Some(header) = meta.get(ctx.rtxn, id)?
         && let Some((_, created, _, _)) = crate::db::store::decode_meta(header)

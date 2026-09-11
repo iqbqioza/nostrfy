@@ -1060,8 +1060,7 @@ impl Store {
                 .deleted
                 .get(wtxn, &deleted_address_key(event.kind, &pubkey, &dtag))?
                 && tomb.len() >= CREATED_LEN
-                && event.created_at
-                    <= u64::from_be_bytes(tomb[..CREATED_LEN].try_into().unwrap())
+                && event.created_at <= u64::from_be_bytes(tomb[..CREATED_LEN].try_into().unwrap())
             {
                 return Ok(PutOutcome::PreviouslyDeleted);
             }

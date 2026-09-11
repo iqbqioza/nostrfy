@@ -86,9 +86,7 @@ pub(crate) async fn livekit_token(
         .await;
     match authed {
         Some(verified)
-            if relay
-                .nip98_replay
-                .accept(&verified.id, unix_now())
+            if relay.nip98_replay.accept(&verified.id, unix_now())
                 && group_allows(&relay, &group, &verified.pubkey).await =>
         {
             match issue_livekit_token(&cfg, &group, &verified.pubkey) {

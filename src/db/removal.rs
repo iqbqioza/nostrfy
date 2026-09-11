@@ -122,8 +122,9 @@ impl Store {
             // the furthest cut.
             let akey = deleted_address_key(address.kind, &pubkey, &address.d);
             let cut = match self.deleted.get(&wtxn, &akey)? {
-                Some(old) if old.len() >= CREATED_LEN => request_created
-                    .max(u64::from_be_bytes(old[..CREATED_LEN].try_into().unwrap())),
+                Some(old) if old.len() >= CREATED_LEN => {
+                    request_created.max(u64::from_be_bytes(old[..CREATED_LEN].try_into().unwrap()))
+                }
                 _ => request_created,
             };
             self.deleted.put(&mut wtxn, &akey, &cut.to_be_bytes())?;

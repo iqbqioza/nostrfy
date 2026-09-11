@@ -1310,11 +1310,7 @@ const AGGREGATE_SAMPLE: usize = 20_000;
 /// Anonymous visibility of a lightweight aggregate record: the same
 /// NIP-70/NIP-59/NIP-78/NIP-29 rules as [`api_visible`], evaluated without
 /// loading the event content.
-fn aggregate_visible(
-    item: &crate::db::NegItem,
-    groups: &nip29::GroupStore,
-    nip78: bool,
-) -> bool {
+fn aggregate_visible(item: &crate::db::NegItem, groups: &nip29::GroupStore, nip78: bool) -> bool {
     // NIP-70: protected events are never served to anonymous readers.
     if item.protected {
         return false;

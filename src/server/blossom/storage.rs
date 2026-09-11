@@ -1431,10 +1431,8 @@ mod scan_debug {
 
     #[tokio::test]
     async fn scan_legacy_ignores_invalid_meta_names() {
-        let dir = std::env::temp_dir().join(format!(
-            "nostrfy-blossom-scan-meta-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("nostrfy-blossom-scan-meta-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let npub = npub_of(&"02".repeat(32));
         let npub_dir = dir.join(&npub);

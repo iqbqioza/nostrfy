@@ -695,9 +695,7 @@ async fn head_blob(
     let honored = match state.store.open_stream_any(&sha, start as u64, len).await {
         Ok(Some((stream, _owner))) => match stream {
             storage::BlobStream::Local(_) => true,
-            storage::BlobStream::S3(resp) => {
-                resp.status() == reqwest::StatusCode::PARTIAL_CONTENT
-            }
+            storage::BlobStream::S3(resp) => resp.status() == reqwest::StatusCode::PARTIAL_CONTENT,
         },
         Ok(None) => return error(StatusCode::NOT_FOUND, "blob not found"),
         Err(e) => {
@@ -720,10 +718,7 @@ async fn head_blob(
         status,
         [
             (axum::http::header::CONTENT_TYPE, desc.mime.clone()),
-            (
-                axum::http::header::CONTENT_LENGTH,
-                served_len.to_string(),
-            ),
+            (axum::http::header::CONTENT_LENGTH, served_len.to_string()),
             (axum::http::header::ETAG, format!("\"{sha}\"")),
             (
                 axum::http::header::CACHE_CONTROL,
@@ -1195,10 +1190,7 @@ mod tests {
 
     /// A valid Blossom `Authorization: Nostr <token>` header for `verb`,
     /// returning the header map and the author's hex pubkey.
-    fn auth_headers(
-        secp: &Secp256k1<secp256k1::All>,
-        verb: &str,
-    ) -> (HeaderMap, String) {
+    fn auth_headers(secp: &Secp256k1<secp256k1::All>, verb: &str) -> (HeaderMap, String) {
         let now = unix_now();
         let ev = auth_event(secp, now, verb, Some(now + 600), None, None);
         let token = base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -1726,8 +1718,7 @@ mod tests {
         // The backing file disappears while the LMDB mapping remains:
         // HEAD must 404 exactly like GET (a mapping alone is not a blob).
         let local_path = relay.config.read().await.blossom.local_path.clone();
-        let npub =
-            crate::nips::nip19::bech32_encode("npub", &hex::decode(&pk).unwrap()).unwrap();
+        let npub = crate::nips::nip19::bech32_encode("npub", &hex::decode(&pk).unwrap()).unwrap();
         std::fs::remove_file(local_path.join(npub).join(&sha)).unwrap();
         let resp = get_blob(State(relay.clone()), HeaderMap::new(), AxPath(sha.clone())).await;
         assert_eq!(
@@ -1778,7 +1769,12 @@ mod tests {
                 .is_none()
         );
         // Active document: nosniff + attachment + sandboxed CSP.
-        let resp = get_blob(State(relay.clone()), HeaderMap::new(), AxPath(html_sha.clone())).await;
+        let resp = get_blob(
+            State(relay.clone()),
+            HeaderMap::new(),
+            AxPath(html_sha.clone()),
+        )
+        .await;
         assert_eq!(resp.headers().get(&nosniff).unwrap(), "nosniff");
         assert_eq!(
             resp.headers()[axum::http::header::CONTENT_DISPOSITION],

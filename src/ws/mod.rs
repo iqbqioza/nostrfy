@@ -3874,9 +3874,9 @@ mod tests {
             conn.handle_neg_open(&[json!("s"), json!({"kinds": [1]}), json!("61000000")])
                 .await;
             assert!(
-                outgoing_json(&conn).iter().any(|m| {
-                    m[0] == "NEG-ERR" && m[2].as_str().unwrap().contains("too big")
-                }),
+                outgoing_json(&conn)
+                    .iter()
+                    .any(|m| { m[0] == "NEG-ERR" && m[2].as_str().unwrap().contains("too big") }),
                 "the over-cap query must be refused"
             );
             assert!(
@@ -4613,10 +4613,7 @@ mod tests {
             let ev = signed_note(conn.relay.secp(), "big", now, vec![]);
             conn.queue_event_sized(ev, max_msg).await;
             assert_eq!(conn.pending_bytes, max_msg);
-            assert!(
-                conn.pending_batch_full(max_msg),
-                "the byte bound must trip"
-            );
+            assert!(conn.pending_batch_full(max_msg), "the byte bound must trip");
             conn.flush_pending_events().await;
             assert!(conn.pending_events.is_empty());
             assert_eq!(conn.pending_bytes, 0, "the byte counter resets on flush");
@@ -4657,18 +4654,11 @@ mod tests {
         rt.block_on(async {
             let mut conn = build_conn().await;
             // Open a REQ subscription "x".
-            conn.handle_req(&[json!("x"), json!({"kinds": [1]})])
-                .await;
+            conn.handle_req(&[json!("x"), json!({"kinds": [1]})]).await;
             conn.pump_pending_reqs();
             assert!(conn.subs.contains_key("x"), "the REQ subscription is open");
             // Disable COUNT and refuse a COUNT with the same id.
-            conn.relay
-                .config
-                .write()
-                .await
-                .relay
-                .disabled_nips
-                .push(45);
+            conn.relay.config.write().await.relay.disabled_nips.push(45);
             conn.handle_count(&[json!("x"), json!({"kinds": [1]})])
                 .await;
             let msgs = outgoing_json(&conn);
@@ -4730,10 +4720,8 @@ mod tests {
         rt.block_on(async {
             let mut conn = build_conn().await;
             let id = "ab".repeat(32);
-            conn.handle_text(&format!(
-                r#"["EVENT", {{"id":"{id}","created_at":-1}}]"#
-            ))
-            .await;
+            conn.handle_text(&format!(r#"["EVENT", {{"id":"{id}","created_at":-1}}]"#))
+                .await;
             let msgs = outgoing_json(&conn);
             let ok = msgs
                 .iter()
@@ -4756,10 +4744,8 @@ mod tests {
             // A malformed AUTH with an id likewise gets OK false.
             conn.outgoing.clear();
             conn.out_bytes = 0;
-            conn.handle_text(&format!(
-                r#"["AUTH", {{"id":"{id}","created_at":-1}}]"#
-            ))
-            .await;
+            conn.handle_text(&format!(r#"["AUTH", {{"id":"{id}","created_at":-1}}]"#))
+                .await;
             let msgs = outgoing_json(&conn);
             let ok = msgs
                 .iter()

@@ -478,7 +478,10 @@ fn multiple_h_tags_are_rejected() {
     // the restriction rule (not the tag-count rule).
     let single = event(1, USER, Some("g1"), vec![]);
     assert!(
-        store.validate_write(&single).unwrap_err().contains("members"),
+        store
+            .validate_write(&single)
+            .unwrap_err()
+            .contains("members"),
         "the restricted group still gates non-members"
     );
 }

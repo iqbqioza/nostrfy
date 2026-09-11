@@ -247,10 +247,7 @@ fn deleted_address_rejects_older_republication() {
         );
 
         // The deleted version stays deleted...
-        assert_eq!(
-            db.put(v1.clone(), now).await,
-            PutOutcome::PreviouslyDeleted
-        );
+        assert_eq!(db.put(v1.clone(), now).await, PutOutcome::PreviouslyDeleted);
         // ...and so does any other version timestamped up to the request.
         let older = event(30023, "older", now - 20, d.clone());
         assert_eq!(db.put(older, now).await, PutOutcome::PreviouslyDeleted);
@@ -865,10 +862,7 @@ fn only_first_value_of_a_single_letter_tag_is_indexed() {
             serde_json::from_value(serde_json::json!({ "kinds": [1], "#e": ["bb".repeat(32)] }))
                 .unwrap();
         let (res, _) = db.query(vec![f], 500, now).await;
-        assert!(
-            res.is_empty(),
-            "the second tag value must not be indexed"
-        );
+        assert!(res.is_empty(), "the second tag value must not be indexed");
 
         // Several same-name tags: every tag contributes its own first value.
         let multi = event(
@@ -883,8 +877,7 @@ fn only_first_value_of_a_single_letter_tag_is_indexed() {
         assert_eq!(db.put(multi.clone(), now).await, PutOutcome::Stored);
         for value in ["cc".repeat(32), "ee".repeat(32)] {
             let f: Filter =
-                serde_json::from_value(serde_json::json!({ "kinds": [1], "#e": [value] }))
-                    .unwrap();
+                serde_json::from_value(serde_json::json!({ "kinds": [1], "#e": [value] })).unwrap();
             let (res, _) = db.query(vec![f], 500, now).await;
             assert_eq!(
                 res.len(),
@@ -896,10 +889,7 @@ fn only_first_value_of_a_single_letter_tag_is_indexed() {
             serde_json::from_value(serde_json::json!({ "kinds": [1], "#e": ["dd".repeat(32)] }))
                 .unwrap();
         let (res, _) = db.query(vec![f], 500, now).await;
-        assert!(
-            res.is_empty(),
-            "a trailing tag value must not be indexed"
-        );
+        assert!(res.is_empty(), "a trailing tag value must not be indexed");
 
         // Removing the event removes the index entries: a later query for
         // the first value returns nothing.
@@ -1136,12 +1126,7 @@ fn non_alphanumeric_tag_names_fall_back_to_the_scan() {
     let now = unix_now();
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
-        let ev = event(
-            1,
-            "underscore tag",
-            now,
-            vec![vec!["_".into(), "v".into()]],
-        );
+        let ev = event(1, "underscore tag", now, vec![vec!["_".into(), "v".into()]]);
         assert_eq!(db.put(ev.clone(), now).await, PutOutcome::Stored);
         let f: Filter = serde_json::from_value(serde_json::json!({"#_": ["v"]})).unwrap();
         let (res, _) = db.query(vec![f], 500, now).await;
@@ -1175,14 +1160,12 @@ fn until_bound_includes_the_maximal_id() {
         let mut ev = event(1, "max id at until", now, vec![]);
         ev.id = "ff".repeat(32);
         assert_eq!(db.put(ev.clone(), now).await, PutOutcome::Stored);
-        let f: Filter =
-            serde_json::from_value(serde_json::json!({"until": now})).unwrap();
+        let f: Filter = serde_json::from_value(serde_json::json!({"until": now})).unwrap();
         let (res, _) = db.query(vec![f], 500, now).await;
         assert_eq!(res.len(), 1, "the maximal id at `until` must be included");
         assert_eq!(res[0].id, ev.id);
         // One second earlier excludes it.
-        let f: Filter =
-            serde_json::from_value(serde_json::json!({"until": now - 1})).unwrap();
+        let f: Filter = serde_json::from_value(serde_json::json!({"until": now - 1})).unwrap();
         let (res, _) = db.query(vec![f], 500, now).await;
         assert!(res.is_empty(), "the event is newer than the bound");
     });
@@ -1317,7 +1300,10 @@ fn multi_filter_limits_are_per_filter() {
         );
         let ids: Vec<String> = res.iter().map(|e| e.id.clone()).collect();
         assert!(ids.contains(&k1_new.id), "the newest kind-1 event wins");
-        assert!(!ids.contains(&k1_old.id), "the older kind-1 event is over quota");
+        assert!(
+            !ids.contains(&k1_old.id),
+            "the older kind-1 event is over quota"
+        );
         assert!(ids.contains(&k7.id), "the kind-7 filter keeps its quota");
         assert_eq!(res[0].id, k1_new.id, "the union is newest-first");
         assert_eq!(res[1].id, k7.id);
@@ -1915,8 +1901,7 @@ fn events_stored_while_nip40_was_disabled_are_purged_on_reenable() {
             1,
             "the event stored while disabled must be purged"
         );
-        let f: Filter =
-            serde_json::from_value(serde_json::json!({"ids": [ev.id]})).unwrap();
+        let f: Filter = serde_json::from_value(serde_json::json!({"ids": [ev.id]})).unwrap();
         let (res, _) = db.query(vec![f], 10, now).await;
         assert!(res.is_empty());
     });
@@ -3473,7 +3458,15 @@ fn sixteen_max_dbs_still_opens_with_the_word_index() {
     let mut cfg = config();
     cfg.max_dbs = 16;
     assert!(cfg.search_index);
-    let db = DbClient::open(&cfg, true, Arc::new(Default::default()), 0, 128, 4096, 262144)
-        .expect("17 tables must fit via the clamp");
+    let db = DbClient::open(
+        &cfg,
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .expect("17 tables must fit via the clamp");
     db.shutdown();
 }
