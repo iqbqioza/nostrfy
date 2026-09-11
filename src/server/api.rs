@@ -20,7 +20,7 @@ use crate::nips::{nip29, nip62, nip70, nip78};
 use crate::relay::Relay;
 use crate::util::unix_now;
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default)]
 pub struct ApiParams {
     pub limit: Option<usize>,
     pub since: Option<u64>,
@@ -43,9 +43,7 @@ pub struct ApiParams {
     /// Generic query filters (`/api/v1/query` and `/api/v1/count`):
     /// accepted as a single value, comma-separated values, or repeated
     /// parameters (`authors=a&authors=b`).
-    #[serde(default, deserialize_with = "de_string_list")]
     pub authors: Vec<String>,
-    #[serde(default, deserialize_with = "de_u64_list")]
     pub kinds: Vec<u64>,
     /// Daily and hourly counts: the date to report. `year` (default: the
     /// current year), `month` 1-12 (default: the current month) and `day`
@@ -56,6 +54,74 @@ pub struct ApiParams {
     pub day: Option<u32>,
 }
 
+/// Manual `Deserialize` instead of `#[derive(Deserialize)]`: an
+/// `application/x-www-form-urlencoded` query may repeat a key
+/// (`authors=a&authors=b`), and the derive's struct visitor rejects the
+/// duplicate (`duplicate field 'authors'`) before the field's own
+/// deserializer can merge the values. This visitor accumulates repeated
+/// `authors`/`kinds` values and lets a repeated scalar key overwrite the
+/// earlier one. Value syntax is unchanged: a string (`authors` split on
+/// commas) or an array of strings, `kinds` entries parsing as unsigned
+/// integers, scalars parsed by their field types.
+impl<'de> Deserialize<'de> for ApiParams {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct ApiParamsVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for ApiParamsVisitor {
+            type Value = ApiParams;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("API query parameters")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<ApiParams, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut params = ApiParams::default();
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "limit" => params.limit = Some(map.next_value()?),
+                        "since" => params.since = Some(map.next_value()?),
+                        "until" => params.until = Some(map.next_value()?),
+                        "search" => params.search = Some(map.next_value()?),
+                        "e" => params.e = Some(map.next_value()?),
+                        "p" => params.p = Some(map.next_value()?),
+                        "t" => params.t = Some(map.next_value()?),
+                        "d" => params.d = Some(map.next_value()?),
+                        "sort" => params.sort = Some(map.next_value()?),
+                        "offset" => params.offset = Some(map.next_value()?),
+                        "no_p" => params.no_p = Some(map.next_value()?),
+                        "no_e" => params.no_e = Some(map.next_value()?),
+                        "no_t" => params.no_t = Some(map.next_value()?),
+                        "no_d" => params.no_d = Some(map.next_value()?),
+                        "year" => params.year = Some(map.next_value()?),
+                        "month" => params.month = Some(map.next_value()?),
+                        "day" => params.day = Some(map.next_value()?),
+                        "authors" => {
+                            let value: StringList = map.next_value()?;
+                            params.authors.extend(value.0);
+                        }
+                        "kinds" => {
+                            let value: U64List = map.next_value()?;
+                            params.kinds.extend(value.0);
+                        }
+                        _ => {
+                            let _ = map.next_value::<serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(params)
+            }
+        }
+
+        deserializer.deserialize_map(ApiParamsVisitor)
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct ApiResponse {
     pub events: Vec<Value>,
@@ -63,47 +129,98 @@ pub struct ApiResponse {
     pub more: bool,
 }
 
-/// Deserializes a list parameter that may arrive as a single value, a
-/// comma-separated value, or a repeated parameter.
-fn de_string_list<'de, D>(de: D) -> Result<Vec<String>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = serde_json::Value::deserialize(de)?;
-    let parts: Vec<&str> = match &value {
-        Value::String(s) => s.split(',').collect(),
-        Value::Array(items) => items
-            .iter()
-            .map(|i| {
-                i.as_str()
-                    .ok_or_else(|| serde::de::Error::custom("expected a string"))
-            })
-            .collect::<Result<Vec<_>, _>>()?,
-        _ => {
-            return Err(serde::de::Error::custom(
-                "expected a string or array of strings",
-            ));
+/// A comma-separated string or an array of strings, for `authors`.
+struct StringList(Vec<String>);
+
+impl<'de> Deserialize<'de> for StringList {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct ListVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for ListVisitor {
+            type Value = StringList;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a string or an array of strings")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<StringList, E> {
+                Ok(StringList(
+                    value
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|p| !p.is_empty())
+                        .map(str::to_string)
+                        .collect(),
+                ))
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<StringList, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let mut out = Vec::new();
+                while let Some(value) = seq.next_element::<String>()? {
+                    let value = value.trim();
+                    if !value.is_empty() {
+                        out.push(value.to_string());
+                    }
+                }
+                Ok(StringList(out))
+            }
         }
-    };
-    Ok(parts
-        .into_iter()
-        .map(|p| p.trim().to_string())
-        .filter(|p| !p.is_empty())
-        .collect())
+
+        deserializer.deserialize_any(ListVisitor)
+    }
 }
 
-/// Like [`de_string_list`] but for unsigned integers.
-fn de_u64_list<'de, D>(de: D) -> Result<Vec<u64>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    de_string_list(de)?
-        .into_iter()
-        .map(|s| {
-            s.parse::<u64>()
-                .map_err(|_| serde::de::Error::custom("expected an unsigned integer"))
-        })
-        .collect()
+/// An unsigned integer, a comma-separated string of them, or an array, for
+/// `kinds`.
+struct U64List(Vec<u64>);
+
+impl<'de> Deserialize<'de> for U64List {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct ListVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for ListVisitor {
+            type Value = U64List;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("an unsigned integer, a comma-separated string of them, or an array")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<U64List, E> {
+                let parsed = value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|p| !p.is_empty())
+                    .map(|p| {
+                        p.parse::<u64>()
+                            .map_err(|_| E::custom("expected an unsigned integer"))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(U64List(parsed))
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<U64List, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let mut out = Vec::new();
+                while let Some(value) = seq.next_element::<u64>()? {
+                    out.push(value);
+                }
+                Ok(U64List(out))
+            }
+        }
+
+        deserializer.deserialize_any(ListVisitor)
+    }
 }
 
 fn error_response(status: StatusCode, message: &str) -> (StatusCode, Json<Value>) {
@@ -1566,6 +1683,35 @@ mod tests {
     use super::*;
     use secp256k1::{Keypair, Secp256k1, XOnlyPublicKey};
     use tokio::sync::RwLock;
+
+    #[test]
+    fn repeated_query_params_are_merged() {
+        fn from_query(qs: &str) -> ApiParams {
+            let uri: axum::http::Uri = format!("/x?{qs}").parse().unwrap();
+            axum::extract::Query::<ApiParams>::try_from_uri(&uri)
+                .unwrap_or_else(|e| panic!("{qs}: {e}"))
+                .0
+        }
+        // Repeated keys merge (the documented form the derived visitor
+        // rejected with `duplicate field`).
+        let p = from_query("authors=a&authors=b&kinds=1&kinds=2");
+        assert_eq!(p.authors, vec!["a", "b"]);
+        assert_eq!(p.kinds, vec![1, 2]);
+        // Mixed single/comma/repeated forms merge too.
+        let p = from_query("authors=a,b&authors=c&kinds=1,2&kinds=3");
+        assert_eq!(p.authors, vec!["a", "b", "c"]);
+        assert_eq!(p.kinds, vec![1, 2, 3]);
+        // Scalars parse and unknown keys are ignored.
+        let p = from_query("limit=10&since=5&no_e=true&foo=bar");
+        assert_eq!(p.limit, Some(10));
+        assert_eq!(p.since, Some(5));
+        assert_eq!(p.no_e, Some(true));
+        // Invalid values stay rejected.
+        let uri = axum::http::Uri::from_static("/x?kinds=1,x");
+        assert!(axum::extract::Query::<ApiParams>::try_from_uri(&uri).is_err());
+        let uri = axum::http::Uri::from_static("/x?limit=abc");
+        assert!(axum::extract::Query::<ApiParams>::try_from_uri(&uri).is_err());
+    }
 
     use crate::db::DbClient;
     use crate::nips::nip01::sign;
