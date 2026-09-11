@@ -19,7 +19,7 @@
 > **Bitcoin (SegWit):** bc1qttlc8m9gsh24xxqys26gaz2mtgfzw7s7770am6
 
 > [!TIP]
-> This project's relay is running live at **wss://relay.damustr.com**.
+> This project's relays are running live at **wss://relay.damustr.com** and **wss://relay.nostrfy.org**.
 
 **All in one Nostr relay server engine written in Rust. Blazing fast by Design. Lean by Nature. Powerful by Default.**
 
