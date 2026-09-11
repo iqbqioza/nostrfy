@@ -381,8 +381,10 @@ impl super::Conn {
         }
         // NIP-01: re-REQ with an existing id replaces the subscription, so it
         // must not count against the cap — only genuinely new subscriptions
-        // are limited.
-        if !self.subs.contains_key(sub_id) && self.subs.len() >= max_subscriptions {
+        // are limited. The cap is shared with NEG-OPEN subscriptions (both
+        // are active subscriptions), so the combined count is checked.
+        if !self.subs.contains_key(sub_id) && self.subs.len() + self.neg.len() >= max_subscriptions
+        {
             self.reject_req(sub_id, "error: too many subscriptions");
             return;
         }

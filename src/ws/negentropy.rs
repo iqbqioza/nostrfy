@@ -160,8 +160,10 @@ impl super::Conn {
         let max_subs = self.relay.config.read().await.limits.max_subscriptions;
         // NIP-77: a NEG-OPEN for an already open id replaces it, so it
         // must not count against the cap — only new subscriptions are
-        // limited.
-        if !self.neg.contains_key(&sub_id) && self.neg.len() >= max_subs {
+        // limited. The cap is shared with REQ subscriptions (both are
+        // active subscriptions and both are counted in NIP-11's
+        // `max_subscriptions`), so the combined count is checked.
+        if !self.neg.contains_key(&sub_id) && self.neg.len() + self.subs.len() >= max_subs {
             self.neg_err(&sub_id, "error: too many subscriptions");
             return;
         }
