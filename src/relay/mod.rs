@@ -278,6 +278,13 @@ impl Relay {
                         nip29::GROUP_PINS,
                         nip43::ROLE_DEFINITION,
                         nip43::MEMBERSHIP_LIST,
+                        // The relay's own NIP-66 discovery event is
+                        // relay-signed and addressable too: without it a
+                        // restart in the same second (or after generated
+                        // stamps ran ahead of the wall clock) leaves the
+                        // fresh publish on the losing side of the id
+                        // tie-break until the next 12h refresh.
+                        crate::nips::nip66::DISCOVERY,
                     ]),
                     ..Default::default()
                 };
@@ -1951,6 +1958,83 @@ mod tests {
             assert!(
                 relay.stamp_floor(stamped) > stamped,
                 "fresh stamps must outrank the stored relay event"
+            );
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn relay_bootstraps_stamps_from_the_discovery_event() {
+        // NIP-66: the relay's own 30166 is relay-signed and addressable, so
+        // the stamp clock must bootstrap from it too. Otherwise a restart
+        // with no groups or roles starts the clock at 0 and a same-second
+        // re-publish can lose the NIP-01 tie-break, leaving the stale
+        // discovery event served until the next 12h refresh.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = std::env::temp_dir()
+                .join("nostrfy-stamp-bootstrap-nip66")
+                .join(format!("{:x}-{id}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            let mut cfg = crate::config::Config::default();
+            cfg.database.path = path;
+            cfg.database.map_size = 16 * 1024 * 1024;
+            cfg.database.max_map_size = 256 * 1024 * 1024;
+            let db = crate::db::DbClient::open(
+                &cfg.database,
+                true,
+                std::sync::Arc::new(Default::default()),
+                0,
+                128,
+                4096,
+                262144,
+            )
+            .unwrap();
+            let secp = secp256k1::Secp256k1::new();
+            let keypair =
+                secp256k1::Keypair::from_seckey_slice(&secp, &[11u8; 32]).expect("test key");
+            let pubkey = secp256k1::XOnlyPublicKey::from_keypair(&keypair)
+                .0
+                .to_string();
+            let secret = hex::encode([11u8; 32]);
+            let stamped = 1_700_000_000u64;
+            let mut ev = crate::event::Event {
+                id: String::new(),
+                pubkey: pubkey.clone(),
+                created_at: stamped,
+                kind: crate::nips::nip66::DISCOVERY,
+                tags: vec![
+                    vec!["d".to_string(), "wss://relay.example.com/".to_string()],
+                    vec!["-".to_string()],
+                ],
+                content: String::new(),
+                sig: String::new(),
+            };
+            ev.id = crate::nips::nip01::compute_id(&ev);
+            let raw = ev.id_bytes().expect("test id");
+            ev.sig = secp.sign_schnorr_no_aux_rand(&raw, &keypair).to_string();
+            assert!(matches!(
+                db.put(ev, stamped).await,
+                crate::db::PutOutcome::Stored
+            ));
+            let config = std::sync::Arc::new(tokio::sync::RwLock::new(cfg));
+            let relay = Relay::new(
+                config,
+                db,
+                crate::stats::Stats::new(),
+                &secret,
+                crate::relay::LiveBusConfig {
+                    buffer: 1024,
+                    batch_interval_ms: 10,
+                    batch_size: 64,
+                },
+            )
+            .await;
+            assert!(
+                relay.stamp_floor(stamped) > stamped,
+                "fresh stamps must outrank the stored discovery event"
             );
             relay.db.shutdown();
         });
