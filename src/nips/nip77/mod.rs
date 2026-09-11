@@ -116,7 +116,22 @@ pub fn respond(items: &[Item], client_message: &[u8]) -> anyhow::Result<Vec<u8>>
         // support (a single byte).
         return Ok(vec![PROTOCOL_VERSION]);
     }
-    let ranges = parse_message(client_message)?;
+    let mut ranges = parse_message(client_message)?;
+    // NIP-77: every message covers the complete timestamp/ID space. A
+    // message whose final explicit range does not reach infinity implicitly
+    // appends a Skip range to infinity.
+    if ranges
+        .last()
+        .is_none_or(|range| range.upper.ts != u64::MAX)
+    {
+        ranges.push(Range {
+            upper: Bound {
+                ts: u64::MAX,
+                prefix: Vec::new(),
+            },
+            mode: Mode::Skip,
+        });
+    }
     // A single message must not scan unbounded fingerprint/bisection
     // work: thousands of ranges over a 100k-item set would burn seconds
     // of CPU per frame (the client controls the number of ranges it
@@ -298,6 +313,24 @@ mod tests {
         let items = sort_items(vec![item(1, 1), item(2, 2)]);
         let resp = respond(&items, &hello).unwrap();
         assert_eq!(resp, vec![PROTOCOL_VERSION, 0x00, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn appends_implicit_skip_to_infinity() {
+        let mut message = vec![PROTOCOL_VERSION];
+        let mut buf = [0u8; 10];
+        let n = write_varint(&mut buf, 1); // upper timestamp 0
+        message.extend_from_slice(&buf[..n]);
+        let n = write_varint(&mut buf, 0); // empty ID prefix
+        message.extend_from_slice(&buf[..n]);
+        let n = write_varint(&mut buf, 0); // Skip
+        message.extend_from_slice(&buf[..n]);
+
+        let response = respond(&[item(1, 1)], &message).unwrap();
+        assert_eq!(
+            response,
+            vec![PROTOCOL_VERSION, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00]
+        );
     }
 
     #[test]
