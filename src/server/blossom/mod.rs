@@ -784,7 +784,7 @@ async fn put_blob(relay: Arc<Relay>, headers: HeaderMap, body: Body, verb: &str)
     };
     let (path, size, sha) = match spool_upload(body, max_upload).await {
         Ok(value) => value,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     // BUD-02/05: the optional `X-SHA-256` header declares the expected hash
     // of the request body — a provided value that does not match the actual
@@ -872,7 +872,7 @@ async fn put_blob(relay: Arc<Relay>, headers: HeaderMap, body: Body, verb: &str)
 async fn spool_upload(
     body: Body,
     max_upload: usize,
-) -> Result<(std::path::PathBuf, u64, String), Response> {
+) -> Result<(std::path::PathBuf, u64, String), Box<Response>> {
     use futures_util::StreamExt;
     use sha2::{Digest, Sha256};
     use tokio::io::AsyncWriteExt;
@@ -892,10 +892,10 @@ async fn spool_upload(
     {
         Ok(file) => file,
         Err(e) => {
-            return Err(error(
+            return Err(Box::new(error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 &format!("temporary upload failed: {e}"),
-            ));
+            )));
         }
     };
     let mut stream = body.into_data_stream();
@@ -906,35 +906,35 @@ async fn spool_upload(
             Ok(chunk) => chunk,
             Err(e) => {
                 let _ = tokio::fs::remove_file(&path).await;
-                return Err(error(
+                return Err(Box::new(error(
                     StatusCode::BAD_REQUEST,
                     &format!("upload body failed: {e}"),
-                ));
+                )));
             }
         };
         size = size.saturating_add(chunk.len() as u64);
         if size > max_upload as u64 {
             let _ = tokio::fs::remove_file(&path).await;
-            return Err(error(
+            return Err(Box::new(error(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "upload exceeds the configured size limit",
-            ));
+            )));
         }
         hash.update(&chunk);
         if let Err(e) = file.write_all(&chunk).await {
             let _ = tokio::fs::remove_file(&path).await;
-            return Err(error(
+            return Err(Box::new(error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 &format!("temporary upload failed: {e}"),
-            ));
+            )));
         }
     }
     if let Err(e) = file.flush().await {
         let _ = tokio::fs::remove_file(&path).await;
-        return Err(error(
+        return Err(Box::new(error(
             StatusCode::INTERNAL_SERVER_ERROR,
             &format!("temporary upload failed: {e}"),
-        ));
+        )));
     }
     Ok((path, size, hex::encode(hash.finalize())))
 }
