@@ -248,7 +248,14 @@ impl Conn {
             // "more" hint instead of claiming a complete result (the
             // subscription itself stays open).
             dropped.truncated_or_more = true;
-            self.finish_pending_req(&dropped);
+            // Only a response whose EOSE has not gone out needs the closing
+            // EOSE. A response that already ended (EOSE sent, live events
+            // still buffered) must not get a second EOSE, and a CLOSEd
+            // subscription must not receive anything further (the pump
+            // applies the same guard before its EOSE).
+            if !dropped.eose_sent && self.subs.contains_key(&dropped.sub_id) {
+                self.finish_pending_req(&dropped);
+            }
         }
         self.pending_reqs.push_back(pending);
     }
@@ -4232,6 +4239,90 @@ mod tests {
                 all.iter()
                     .any(|m| m[0] == "EOSE" && m[1] == "s1" && m[2] == json!(["finish"])),
                 "the hint variant must be sent when eose_hint is on"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn pending_req_cutoff_does_not_resend_eose() {
+        // A pending response whose EOSE was already sent (its buffered live
+        // events still queued) must not receive a second EOSE when the
+        // pending queue overflows, and a CLOSEd subscription must not
+        // receive an EOSE at all.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            conn.subs
+                .insert("s0".into(), (Vec::new(), 0, "\"s0\"".into()));
+            let mut live = std::collections::VecDeque::new();
+            live.push_back("[\"EVENT\",\"s0\",{}]".to_string());
+            conn.enqueue_pending_req(PendingReq {
+                sub_id: "s0".into(),
+                events: Default::default(),
+                eose_hint: true,
+                truncated_or_more: false,
+                auth_hint: false,
+                sent_bytes: 0,
+                live,
+                live_bytes: 0,
+                eose_sent: true,
+            });
+            for i in 1..=MAX_PENDING_REQS {
+                conn.subs
+                    .insert(format!("s{i}"), (Vec::new(), 0, String::new()));
+                conn.enqueue_pending_req(PendingReq {
+                    sub_id: format!("s{i}"),
+                    events: Default::default(),
+                    eose_hint: true,
+                    truncated_or_more: false,
+                    auth_hint: false,
+                    sent_bytes: 0,
+                    live: Default::default(),
+                    live_bytes: 0,
+                    eose_sent: false,
+                });
+            }
+            assert!(
+                !outgoing_json(&conn)
+                    .iter()
+                    .any(|m| m[0] == "EOSE" && m[1] == "s0"),
+                "a response whose EOSE was already sent must not get a second EOSE"
+            );
+
+            // The same cutoff for a CLOSEd subscription stays silent.
+            conn.pending_reqs.clear();
+            conn.outgoing.clear();
+            conn.out_bytes = 0;
+            conn.enqueue_pending_req(PendingReq {
+                sub_id: "gone".into(),
+                events: Default::default(),
+                eose_hint: true,
+                truncated_or_more: false,
+                auth_hint: false,
+                sent_bytes: 0,
+                live: Default::default(),
+                live_bytes: 0,
+                eose_sent: false,
+            });
+            for i in 0..MAX_PENDING_REQS {
+                conn.enqueue_pending_req(PendingReq {
+                    sub_id: format!("t{i}"),
+                    events: Default::default(),
+                    eose_hint: true,
+                    truncated_or_more: false,
+                    auth_hint: false,
+                    sent_bytes: 0,
+                    live: Default::default(),
+                    live_bytes: 0,
+                    eose_sent: false,
+                });
+            }
+            assert!(
+                !outgoing_json(&conn)
+                    .iter()
+                    .any(|m| m[0] == "EOSE" && m[1] == "gone"),
+                "a CLOSEd subscription must not receive an EOSE"
             );
             conn.relay.db.shutdown();
         });
