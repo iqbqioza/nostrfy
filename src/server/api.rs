@@ -664,13 +664,17 @@ pub async fn api_monthly_handler(
                 Json(json!({ "error": "server is busy, try again shortly" })),
             );
         };
-        let start = month_start(y, m);
-        let end = month_start_of_next(y, m);
+        // NIP-01 `since`/`until` bound the counts too, not just the month
+        // list: intersect each month window with the requested range, or an
+        // event before `since` in the first month (after `until` in the
+        // last) would be counted.
+        let start = month_start(y, m).max(since);
+        let end = month_start_of_next(y, m).saturating_sub(1).min(until);
         let filter: Filter = serde_json::from_value(json!({
             "authors": [hex_pk],
             "kinds": [kind],
             "since": start,
-            "until": end.saturating_sub(1),
+            "until": end,
         }))
         .expect("static filter");
         let (events, more) = relay.db.api_count(vec![filter], count_limit, now).await;
@@ -2240,6 +2244,56 @@ mod tests {
     }
 
     #[test]
+    fn monthly_respects_since_and_until_inside_months() {
+        // `since`/`until` bound the reported counts, not just the month
+        // list: an event before `since` in the first month (or after
+        // `until` in the last) must not be counted.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_relay().await;
+            let base = 1_700_000_000u64; // 2023-11-14
+            let (y, m) = month_of(base);
+            let start = month_start(y, m);
+            let pk = {
+                let ev = signed_note(relay.secp(), "before", start + 86400, vec![]);
+                let pk = ev.pubkey.clone();
+                assert_eq!(
+                    relay.db.put(ev, unix_now()).await,
+                    crate::db::PutOutcome::Stored
+                );
+                pk
+            };
+            for (content, at) in [
+                ("inside", start + 10 * 86400),
+                ("after", start + 20 * 86400),
+            ] {
+                let ev = signed_note(relay.secp(), content, at, vec![]);
+                assert_eq!(
+                    relay.db.put(ev, unix_now()).await,
+                    crate::db::PutOutcome::Stored
+                );
+            }
+            let (code, Json(resp)) = api_monthly_handler(
+                State(relay.clone()),
+                Path((pk, 1)),
+                Query(ApiParams {
+                    since: Some(start + 5 * 86400),
+                    until: Some(start + 15 * 86400),
+                    ..Default::default()
+                }),
+            )
+            .await;
+            assert_eq!(code, StatusCode::OK);
+            assert_eq!(
+                resp["total"], 1,
+                "only the event inside [since, until] may count: {resp}"
+            );
+            assert_eq!(resp["months"][0]["count"], 1, "{resp}");
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
     fn generic_query_count_kinds_daily_id_and_profile() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -2822,7 +2876,7 @@ mod tests {
                 Path((npub.clone(), 1u64)),
                 Query(ApiParams {
                     since: Some(aug1 - 31 * 86400),
-                    until: Some(aug1 + 60),
+                    until: Some(aug1 + 200),
                     ..Default::default()
                 }),
             )
