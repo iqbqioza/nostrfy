@@ -3656,6 +3656,30 @@ mod tests {
     }
 
     #[test]
+    fn failed_neg_opens_consume_the_connection_budget() {
+        // A NEG-OPEN that runs the database scan and then fails (here: the
+        // response exceeds the per-connection byte budget) must still spend
+        // the connection-wide open budget, or a client could run scans
+        // unbounded by always failing the open after the scan.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            conn.req_response_bytes = 1;
+            conn.handle_neg_open(&[json!("s"), json!({}), json!("61000000")])
+                .await;
+            assert!(
+                outgoing_json(&conn).iter().any(|m| m[0] == "NEG-ERR"),
+                "the oversized response must be refused"
+            );
+            assert_eq!(
+                conn.neg_opens_total, 1,
+                "a refused open must still spend the connection budget"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
     fn exhausted_neg_open_budget_skips_the_database_query() {
         // The connection-wide NEG-OPEN cap is checked before the large
         // database query: an exhausted budget answers "connection limit"

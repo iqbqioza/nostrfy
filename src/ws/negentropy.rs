@@ -177,6 +177,12 @@ impl super::Conn {
             );
             return;
         }
+        // Spend the budget before the scan: an open that fails later (a
+        // codec error, a response over the byte budget, a full item cap)
+        // has already driven the database query, so it must count too —
+        // otherwise a client could run the scan unbounded by re-opening
+        // with an initial message that always fails.
+        self.neg_opens_total += 1;
         let now = unix_now();
         // The negentropy query only needs (created_at, id) records, so it
         // never materializes every matching full event in memory.
@@ -308,7 +314,6 @@ impl super::Conn {
             );
             return;
         }
-        self.neg_opens_total += 1;
         if let Some(old) = self.neg.remove(&sub_id) {
             self.neg_total = self.neg_total.saturating_sub(old.items.len());
             // Release the subscription slot of the replaced negentropy
