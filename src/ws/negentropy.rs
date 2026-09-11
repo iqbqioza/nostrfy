@@ -298,8 +298,8 @@ impl super::Conn {
         // the id half-replaced.
         let response = match nip77::respond(&items, &initial) {
             Ok(response) => response,
-            Err(reason) => {
-                self.neg_err(&sub_id, &format!("error: {reason}"));
+            Err(e) => {
+                self.neg_err(&sub_id, &format!("error: {e}"));
                 return;
             }
         };
@@ -439,8 +439,8 @@ impl super::Conn {
                 }
                 self.send_neg_msg(&sub_id, &response)
             }
-            Err(reason) => {
-                self.neg_err(&sub_id, &format!("error: {reason}"));
+            Err(e) => {
+                self.neg_err(&sub_id, &format!("error: {e}"));
             }
         }
     }

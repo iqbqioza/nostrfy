@@ -57,16 +57,9 @@ impl Default for PutOutcome {
 
 /// Records a database failure: bumps the error counter and logs a clear
 /// operator-facing message, especially when the LMDB map size is exhausted.
-pub(crate) fn db_error(errors: &Arc<std::sync::atomic::AtomicU64>, e: &crate::error::Error) {
+pub(crate) fn db_error(errors: &Arc<std::sync::atomic::AtomicU64>, e: &anyhow::Error) {
     errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if matches!(
-        e,
-        crate::error::Error::Heed(heed::Error::Mdb(heed::MdbError::MapFull))
-    ) {
-        log::error!("database map is full: increase database.max_map_size in nostrfy.toml");
-    } else {
-        log::error!("database error: {e}");
-    }
+    log::error!("database error: {e}");
 }
 
 enum Msg {

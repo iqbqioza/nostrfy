@@ -4,6 +4,7 @@
 
 use std::sync::Arc;
 
+use anyhow::{Result, anyhow};
 use axum::body::Bytes;
 use axum::extract::{OriginalUri, Path as AxPath, State};
 use axum::http::{HeaderMap, StatusCode, header};
@@ -77,16 +78,13 @@ pub(crate) fn router(
         }))
 }
 
-// The `Err` variant is an axum `Response` (a framework type that is not
-// worth boxing): the lint would not improve anything here.
-#[allow(clippy::result_large_err)]
 async fn check_auth(
     headers: &HeaderMap,
     state: &AdminState,
     method: &str,
     uri: &axum::http::Uri,
     expected_payload_hash: Option<&str>,
-) -> std::result::Result<String, Response> {
+) -> Result<String> {
     let relay = &state.relay;
     let cfg = relay.config.read().await;
 
@@ -111,7 +109,7 @@ async fn check_auth(
             .get(header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("Nostr "))
-            .ok_or_else(|| unauthorized("missing NIP-98 auth"))?;
+            .ok_or_else(|| anyhow!("missing NIP-98 auth"))?;
         // NIP-98: the `u` tag must be the absolute request URL (host, path
         // and query all match), matching the JSON-RPC path. The legacy
         // management API is served on the *management* host:port, not the
@@ -138,10 +136,10 @@ async fn check_auth(
         {
             return Ok(verified.pubkey);
         }
-        return Err(unauthorized("invalid NIP-98 auth"));
+        return Err(anyhow!("invalid NIP-98 auth"));
     }
 
-    Err(unauthorized(if token_configured {
+    Err(anyhow!(if token_configured {
         "invalid bearer token"
     } else {
         "management API disabled: set rpc.management_token or rpc.admin_pubkey"
@@ -156,6 +154,10 @@ fn audit_legacy(state: &AdminState, identity: &str, action: &str, detail: &str) 
         .log(format!("{action} {detail} by {identity}"));
 }
 
+fn auth_error_response(error: anyhow::Error) -> Response {
+    unauthorized(&error.to_string())
+}
+
 fn unauthorized(msg: &str) -> Response {
     (StatusCode::UNAUTHORIZED, Json(json!({ "error": msg }))).into_response()
 }
@@ -166,24 +168,21 @@ fn unauthorized(msg: &str) -> Response {
 /// returning the body's sha256 hex for the NIP-98 `payload` comparison
 /// (NIP-98: the tag is the sha256 of the request body — presence alone
 /// would let a captured authorization be replayed against another body).
-// The `Err` variant is an axum `Response` (a framework type that is not
-// worth boxing): the lint would not improve anything here.
-#[allow(clippy::result_large_err)]
-fn parse_json_body<T: for<'de> serde::Deserialize<'de>>(
-    headers: &HeaderMap,
-    body: &Bytes,
-) -> std::result::Result<(T, String), Response> {
-    let is_json = headers
+fn is_json_content_type(headers: &HeaderMap) -> bool {
+    headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .map(|t| t.split(';').next().map(str::trim) == Some("application/json"))
-        .unwrap_or(false);
-    if !is_json {
-        return Err(StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response());
-    }
-    let value: T = serde_json::from_slice(body)
-        .map_err(|_| StatusCode::UNPROCESSABLE_ENTITY.into_response())?;
+        .unwrap_or(false)
+}
+
+fn parse_json_body<T: for<'de> serde::Deserialize<'de>>(body: &Bytes) -> Result<(T, String)> {
+    let value: T = serde_json::from_slice(body)?;
     Ok((value, nip98::payload_sha256_hex(body)))
+}
+
+fn invalid_json() -> Response {
+    StatusCode::UNPROCESSABLE_ENTITY.into_response()
 }
 
 fn bad_request(msg: &str) -> Response {
@@ -197,8 +196,8 @@ async fn admin_info(
 ) -> Response {
     // Bodiless GET (see `event_status`): only the `payload` presence is
     // required.
-    if let Err(resp) = check_auth(&headers, &state, "GET", &uri, None).await {
-        return resp;
+    if let Err(error) = check_auth(&headers, &state, "GET", &uri, None).await {
+        return auth_error_response(error);
     }
     let cfg = state.relay.config.read().await;
     let access = state.relay.access.read().await;
@@ -216,8 +215,8 @@ async fn admin_stats(
     State(state): State<Arc<AdminState>>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(resp) = check_auth(&headers, &state, "GET", &uri, None).await {
-        return resp;
+    if let Err(error) = check_auth(&headers, &state, "GET", &uri, None).await {
+        return auth_error_response(error);
     }
     Json(state.relay.stats.as_json()).into_response()
 }
@@ -228,13 +227,16 @@ async fn block_pubkey(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let (body, payload_hash) = match parse_json_body::<PubkeyBody>(&headers, &body) {
+    if !is_json_content_type(&headers) {
+        return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response();
+    }
+    let (body, payload_hash) = match parse_json_body::<PubkeyBody>(&body) {
         Ok(parsed) => parsed,
-        Err(resp) => return resp,
+        Err(_) => return invalid_json(),
     };
     let identity = match check_auth(&headers, &state, "POST", &uri, Some(&payload_hash)).await {
         Ok(identity) => identity,
-        Err(resp) => return resp,
+        Err(error) => return auth_error_response(error),
     };
     if hex::decode(&body.pubkey)
         .map(|b| b.len() != 32)
@@ -265,13 +267,16 @@ async fn allow_pubkey(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let (body, payload_hash) = match parse_json_body::<PubkeyBody>(&headers, &body) {
+    if !is_json_content_type(&headers) {
+        return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response();
+    }
+    let (body, payload_hash) = match parse_json_body::<PubkeyBody>(&body) {
         Ok(parsed) => parsed,
-        Err(resp) => return resp,
+        Err(_) => return invalid_json(),
     };
     let identity = match check_auth(&headers, &state, "POST", &uri, Some(&payload_hash)).await {
         Ok(identity) => identity,
-        Err(resp) => return resp,
+        Err(error) => return auth_error_response(error),
     };
     // Validate like `block_pubkey` above: an invalid value would otherwise
     // be acknowledged `ok: true` while matching nothing.
@@ -298,13 +303,16 @@ async fn block_kind(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let (body, payload_hash) = match parse_json_body::<KindBody>(&headers, &body) {
+    if !is_json_content_type(&headers) {
+        return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response();
+    }
+    let (body, payload_hash) = match parse_json_body::<KindBody>(&body) {
         Ok(parsed) => parsed,
-        Err(resp) => return resp,
+        Err(_) => return invalid_json(),
     };
     let identity = match check_auth(&headers, &state, "POST", &uri, Some(&payload_hash)).await {
         Ok(identity) => identity,
-        Err(resp) => return resp,
+        Err(error) => return auth_error_response(error),
     };
     let mut access = state.relay.access.write().await;
     if !access.blocked_kinds.contains(&body.kind) {
@@ -322,13 +330,16 @@ async fn allow_kind(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let (body, payload_hash) = match parse_json_body::<KindBody>(&headers, &body) {
+    if !is_json_content_type(&headers) {
+        return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response();
+    }
+    let (body, payload_hash) = match parse_json_body::<KindBody>(&body) {
         Ok(parsed) => parsed,
-        Err(resp) => return resp,
+        Err(_) => return invalid_json(),
     };
     let identity = match check_auth(&headers, &state, "POST", &uri, Some(&payload_hash)).await {
         Ok(identity) => identity,
-        Err(resp) => return resp,
+        Err(error) => return auth_error_response(error),
     };
     let mut access = state.relay.access.write().await;
     access.blocked_kinds.retain(|k| k != &body.kind);
@@ -347,8 +358,8 @@ async fn event_status(
     // Bodiless GET: there is no request body for the `payload` tag to bind
     // to, so only its presence is required (the `u` tag still binds the
     // exact URL and the `method` tag the verb).
-    if let Err(resp) = check_auth(&headers, &state, "GET", &uri, None).await {
-        return resp;
+    if let Err(error) = check_auth(&headers, &state, "GET", &uri, None).await {
+        return auth_error_response(error);
     }
     let filter: Value = json!({ "ids": [id] });
     let (event, _) = state
@@ -372,7 +383,7 @@ async fn shutdown(
     // so only its presence is required.
     let identity = match check_auth(&headers, &state, "POST", &uri, None).await {
         Ok(identity) => identity,
-        Err(resp) => return resp,
+        Err(error) => return auth_error_response(error),
     };
     audit_legacy(&state, &identity, "shutdown", "");
     let _ = state.shutdown.send(true);

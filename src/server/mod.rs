@@ -30,7 +30,7 @@ use tower::util::ServiceExt;
 
 use crate::config::Config;
 use crate::db::DbClient;
-use crate::error::{Error, Result};
+use crate::error::{Result, config_err};
 use crate::nips::nip11::{relay_info, stats_handler};
 use crate::nips::nip86;
 use crate::relay::Relay;
@@ -122,14 +122,13 @@ const LISTEN_BACKLOG: u32 = 4096;
 /// Binds a TCP listener on `addr` and logs the given label with the
 /// address, turning a bind failure into a configuration error.
 async fn bind_listener(addr: &(String, u16), label: &str) -> Result<TcpListener> {
-    let bound: std::io::Result<TcpListener> = async {
+    let bound: anyhow::Result<TcpListener> = async {
         // Try every resolved address like `TcpListener::bind` does, so a
         // hostname resolving to both families keeps working.
         let mut bound = None;
-        let mut last_err =
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "no address resolved");
+        let mut last_err = anyhow::anyhow!("no address resolved");
         for sock_addr in tokio::net::lookup_host((addr.0.as_str(), addr.1)).await? {
-            let attempt = (|| {
+            let attempt = (|| -> anyhow::Result<_> {
                 let socket = if sock_addr.is_ipv4() {
                     tokio::net::TcpSocket::new_v4()?
                 } else {
@@ -145,7 +144,7 @@ async fn bind_listener(addr: &(String, u16), label: &str) -> Result<TcpListener>
                 // sets this implicitly; `TcpSocket` does not.
                 socket.set_reuseaddr(true)?;
                 socket.bind(sock_addr)?;
-                socket.listen(LISTEN_BACKLOG)
+                Ok(socket.listen(LISTEN_BACKLOG)?)
             })();
             match attempt {
                 Ok(listener) => {
@@ -166,7 +165,7 @@ async fn bind_listener(addr: &(String, u16), label: &str) -> Result<TcpListener>
         Err(e) => {
             let msg = format!("cannot bind to {}:{}: {e}", addr.0, addr.1);
             log::error!("{msg}");
-            return Err(Error::Config(msg));
+            return Err(config_err(msg));
         }
     };
     info!("{label}{}:{}", addr.0, addr.1);

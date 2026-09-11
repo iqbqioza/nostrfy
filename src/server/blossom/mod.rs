@@ -20,6 +20,7 @@
 
 use std::sync::Arc;
 
+use anyhow::anyhow;
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path as AxPath, Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -149,7 +150,7 @@ fn split_blob(segment: &str) -> Option<String> {
 /// Whether `pubkey` (hex) may upload: unrestricted, or present in
 /// `blossom.allow_pubkeys` (npub1... or hex). Read from the live config so
 /// `nostrfy blossom allow/deny` + a SIGHUP applies without a restart.
-async fn upload_allowed(relay: &Relay, pubkey: &str) -> Result<(), ()> {
+async fn upload_allowed(relay: &Relay, pubkey: &str) -> anyhow::Result<()> {
     let cfg = relay.config.read().await;
     if !cfg.blossom.restrict_uploads {
         return Ok(());
@@ -162,7 +163,13 @@ async fn upload_allowed(relay: &Relay, pubkey: &str) -> Result<(), ()> {
         .await
         .iter()
         .any(|entry| entry == pubkey);
-    if allowed { Ok(()) } else { Err(()) }
+    if allowed {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "uploads are restricted to the configured allowlist"
+        ))
+    }
 }
 
 /// Normalizes the `server` tag of a Blossom auth event for comparison
@@ -358,9 +365,9 @@ fn error(status: StatusCode, reason: &str) -> Response {
 /// Returns `Ok(None)` when the range should be ignored (a multi-range
 /// header, or a unit other than `bytes` — RFC 7233 allows the server to
 /// ignore the header), `Ok(Some((start, end)))` for a satisfiable single
-/// range (inclusive end, clamped to the blob size) and `Err(())` for an
+/// range (inclusive end, clamped to the blob size) and an error for an
 /// unsatisfiable or malformed range (416 with `Content-Range: bytes */`).
-fn parse_range(header: &str, size: usize) -> Result<Option<(usize, usize)>, ()> {
+fn parse_range(header: &str, size: usize) -> anyhow::Result<Option<(usize, usize)>> {
     let Some(spec) = header
         .trim()
         .strip_prefix("bytes=")
@@ -374,28 +381,26 @@ fn parse_range(header: &str, size: usize) -> Result<Option<(usize, usize)>, ()> 
     let (start, end) = match spec.split_once('-') {
         Some((start, end)) if !start.is_empty() => {
             // `bytes=start-end` / `bytes=start-`
-            let start: usize = start.parse().map_err(|_| ())?;
+            let start: usize = start.parse()?;
             let end = if end.is_empty() {
                 size.saturating_sub(1)
             } else {
-                end.parse::<usize>()
-                    .map_err(|_| ())?
-                    .min(size.saturating_sub(1))
+                end.parse::<usize>()?.min(size.saturating_sub(1))
             };
             (start, end)
         }
         Some((_, suffix)) => {
             // `bytes=-suffix`: the last `suffix` bytes
-            let suffix: usize = suffix.parse().map_err(|_| ())?;
+            let suffix: usize = suffix.parse()?;
             if suffix == 0 {
-                return Err(());
+                return Err(anyhow::anyhow!("empty range suffix"));
             }
             (size.saturating_sub(suffix), size.saturating_sub(1))
         }
-        None => return Err(()),
+        None => return Err(anyhow::anyhow!("invalid byte range")),
     };
     if start >= size || end < start {
-        return Err(());
+        return Err(anyhow::anyhow!("range is outside blob size"));
     }
     Ok(Some((start, end)))
 }
@@ -561,7 +566,7 @@ async fn get_blob(
         .and_then(|v| v.to_str().ok())
         .map(|r| parse_range(r, size_usize));
     let (start, end) = match range {
-        Some(Err(())) => {
+        Some(Err(_)) => {
             // Unsatisfiable or malformed range: 416 with the required
             // `Content-Range: bytes */<size>`.
             let mut response = error(
@@ -670,7 +675,7 @@ async fn head_blob(
         .and_then(|v| v.to_str().ok())
         .map(|r| parse_range(r, size_usize));
     let (start, end) = match range {
-        Some(Err(())) => {
+        Some(Err(_)) => {
             let mut response = error(
                 StatusCode::RANGE_NOT_SATISFIABLE,
                 "requested byte range is not satisfiable",
@@ -795,6 +800,9 @@ async fn put_blob(relay: Arc<Relay>, headers: HeaderMap, body: Bytes, verb: &str
             "uploads are restricted to the configured allowlist",
         );
     }
+    if state.store.check_space().is_err() {
+        return error(StatusCode::INSUFFICIENT_STORAGE, "storage is full");
+    }
     let mime = sanitize_mime(
         headers
             .get(axum::http::header::CONTENT_TYPE)
@@ -824,9 +832,6 @@ async fn put_blob(relay: Arc<Relay>, headers: HeaderMap, body: Bytes, verb: &str
                 .unwrap(),
             )
                 .into_response()
-        }
-        Err(crate::error::Error::StorageFull) => {
-            error(StatusCode::INSUFFICIENT_STORAGE, "storage is full")
         }
         Err(e) => error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -897,7 +902,7 @@ async fn head_preflight(relay: Arc<Relay>, headers: HeaderMap, verb: &str) -> Re
     }
     // The preflight must reflect the PUT outcome: a full disk would
     // refuse the upload with 507, so the preflight does too.
-    if let Err(crate::error::Error::StorageFull) = state.store.check_space() {
+    if state.store.check_space().is_err() {
         return error(StatusCode::INSUFFICIENT_STORAGE, "storage is full");
     }
     StatusCode::OK.into_response()
@@ -1587,21 +1592,21 @@ mod tests {
     #[test]
     fn byte_ranges_follow_rfc7233() {
         // Satisfiable ranges (end is inclusive and clamped).
-        assert_eq!(parse_range("bytes=0-4", 10), Ok(Some((0, 4))));
-        assert_eq!(parse_range("bytes=5-", 10), Ok(Some((5, 9))));
-        assert_eq!(parse_range("bytes=-3", 10), Ok(Some((7, 9))));
-        assert_eq!(parse_range("bytes=0-99", 10), Ok(Some((0, 9))));
-        assert_eq!(parse_range("bytes=5-5", 10), Ok(Some((5, 5))));
+        assert_eq!(parse_range("bytes=0-4", 10).unwrap(), Some((0, 4)));
+        assert_eq!(parse_range("bytes=5-", 10).unwrap(), Some((5, 9)));
+        assert_eq!(parse_range("bytes=-3", 10).unwrap(), Some((7, 9)));
+        assert_eq!(parse_range("bytes=0-99", 10).unwrap(), Some((0, 9)));
+        assert_eq!(parse_range("bytes=5-5", 10).unwrap(), Some((5, 5)));
         // Unsatisfiable or malformed ranges.
-        assert_eq!(parse_range("bytes=10-", 10), Err(()));
-        assert_eq!(parse_range("bytes=8-4", 10), Err(()));
-        assert_eq!(parse_range("bytes=-0", 10), Err(()));
-        assert_eq!(parse_range("bytes=abc", 10), Err(()));
-        assert_eq!(parse_range("bytes=0-", 0), Err(()));
+        assert!(parse_range("bytes=10-", 10).is_err());
+        assert!(parse_range("bytes=8-4", 10).is_err());
+        assert!(parse_range("bytes=-0", 10).is_err());
+        assert!(parse_range("bytes=abc", 10).is_err());
+        assert!(parse_range("bytes=0-", 0).is_err());
         // Multi-ranges and non-byte units are ignored (full response).
-        assert_eq!(parse_range("bytes=0-4,6-8", 10), Ok(None));
-        assert_eq!(parse_range("items=0-4", 10), Ok(None));
-        assert_eq!(parse_range("", 10), Ok(None));
+        assert_eq!(parse_range("bytes=0-4,6-8", 10).unwrap(), None);
+        assert_eq!(parse_range("items=0-4", 10).unwrap(), None);
+        assert_eq!(parse_range("", 10).unwrap(), None);
     }
 
     #[test]

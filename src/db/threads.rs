@@ -13,6 +13,8 @@ use super::store::WriteBatch;
 use super::store::{Store, flush_everything};
 use super::{Msg, PutOutcome, db_error};
 use crate::db::scan::SCAN_BUDGET;
+use anyhow::anyhow;
+
 use crate::error::Result;
 
 /// Releases the writer thread's queued-work accounting for one drain. The
@@ -829,9 +831,7 @@ pub(crate) fn spawn(
                                     if !ok {
                                         db_error(
                                             &thread_errors,
-                                            &crate::error::Error::Other(
-                                                "blossom mapping write failed".into(),
-                                            ),
+                                            &anyhow!("blossom mapping write failed"),
                                         );
                                     }
                                     let _ = reply.send(ok);
@@ -856,9 +856,7 @@ pub(crate) fn spawn(
                                     if !ok {
                                         db_error(
                                             &thread_errors,
-                                            &crate::error::Error::Other(
-                                                "blossom migration batch failed".into(),
-                                            ),
+                                            &anyhow!("blossom migration batch failed"),
                                         );
                                     }
                                     let _ = reply.send(ok);

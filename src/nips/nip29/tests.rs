@@ -324,7 +324,7 @@ fn group_cap_rejects_creates_over_the_limit() {
     assert!(store.validate_write(&g2).is_ok());
     store.apply(&g2, "", 1, false, false);
     assert_eq!(
-        store.validate_write(&g3).unwrap_err(),
+        store.validate_write(&g3).unwrap_err().to_string(),
         "restricted: group limit reached",
         "a create beyond the cap must be rejected"
     );
@@ -348,7 +348,7 @@ fn group_cap_counts_deleted_groups() {
     store.apply(&del1, "", 2, false, false);
     // g1 is gone but its marker still counts: a new create is rejected.
     assert_eq!(
-        store.validate_write(&g3).unwrap_err(),
+        store.validate_write(&g3).unwrap_err().to_string(),
         "restricted: group limit reached",
         "deleted groups must count toward the budget"
     );
@@ -356,7 +356,7 @@ fn group_cap_counts_deleted_groups() {
     // budget is full); with spare capacity a fresh create resurrects it
     // (see `deleted_group_id_can_be_recreated`).
     assert_eq!(
-        store.validate_write(&g1).unwrap_err(),
+        store.validate_write(&g1).unwrap_err().to_string(),
         "restricted: group limit reached"
     );
 }
@@ -435,7 +435,7 @@ fn restricted_groups() {
     // A duplicate join request is rejected with the `duplicate:` prefix.
     let join = event(JOIN, USER, Some("g1"), vec![]);
     assert_eq!(
-        store.validate_write(&join).unwrap_err(),
+        store.validate_write(&join).unwrap_err().to_string(),
         "duplicate: you are already a member of this group"
     );
     // Removing the user restores the restriction.
@@ -469,7 +469,7 @@ fn multiple_h_tags_are_rejected() {
     );
     let mut multi = event(1, USER, Some("g2"), vec![]);
     multi.tags.push(vec![H.to_string(), "g1".to_string()]);
-    let err = store.validate_write(&multi).unwrap_err();
+    let err = store.validate_write(&multi).unwrap_err().to_string();
     assert!(
         err.contains("only one h tag"),
         "a second h tag must be rejected: {err}"
@@ -481,6 +481,7 @@ fn multiple_h_tags_are_rejected() {
         store
             .validate_write(&single)
             .unwrap_err()
+            .to_string()
             .contains("members"),
         "the restricted group still gates non-members"
     );
@@ -539,7 +540,7 @@ fn invalid_invite_code_is_final() {
         vec![vec![CODE.into(), "wrong".into()]],
     );
     assert_eq!(
-        store.validate_write(&join).unwrap_err(),
+        store.validate_write(&join).unwrap_err().to_string(),
         "restricted: invalid invite code (final decision)"
     );
     let join = event(
@@ -952,7 +953,7 @@ fn join_to_unknown_group_is_rejected() {
     let store = GroupStore::default();
     let join = event(JOIN, USER, Some("ghost"), vec![]);
     assert_eq!(
-        store.validate_write(&join).unwrap_err(),
+        store.validate_write(&join).unwrap_err().to_string(),
         "restricted: unknown group"
     );
     let create = event(CREATE_GROUP, USER, Some("ghost"), vec![]);
@@ -995,7 +996,10 @@ fn livekit_tag_and_single_parent() {
         ],
     );
     assert_eq!(
-        store.validate_write(&double_parent).unwrap_err(),
+        store
+            .validate_write(&double_parent)
+            .unwrap_err()
+            .to_string(),
         "restricted: at most one parent tag is allowed"
     );
 }
@@ -1274,7 +1278,13 @@ fn group_members_are_bounded() {
     // ...as is a fresh JOIN, while role changes for existing members
     // still validate.
     let join = event(9021, USER, Some("g1"), vec![]);
-    assert!(store.validate_write(&join).unwrap_err().contains("full"));
+    assert!(
+        store
+            .validate_write(&join)
+            .unwrap_err()
+            .to_string()
+            .contains("full")
+    );
     let role_change = event(
         9000,
         ADMIN,

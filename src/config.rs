@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::{Error, Result};
+use crate::error::{Result, config_err};
 
 pub const DEFAULT_CONFIG: &str = "nostrfy.toml";
 
@@ -750,9 +750,9 @@ fn apply_legacy_aliases(raw: &str, cfg: &mut Config) -> Vec<String> {
 impl Config {
     pub fn load(path: &Path) -> Result<Config> {
         let raw = std::fs::read_to_string(path)
-            .map_err(|e| Error::Config(format!("cannot read {}: {e}", path.display())))?;
+            .map_err(|e| config_err(format!("cannot read {}: {e}", path.display())))?;
         let mut cfg: Config = toml::from_str(&raw)
-            .map_err(|e| Error::Config(format!("invalid {}: {e}", path.display())))?;
+            .map_err(|e| config_err(format!("invalid {}: {e}", path.display())))?;
         apply_legacy_aliases(&raw, &mut cfg)
             .into_iter()
             .for_each(|warning| log::warn!("{warning}"));
@@ -762,14 +762,14 @@ impl Config {
 
     pub fn write_default(path: &Path) -> Result<()> {
         if path.exists() {
-            return Err(Error::Config(format!(
+            return Err(config_err(format!(
                 "{} already exists, refusing to overwrite",
                 path.display()
             )));
         }
         let cfg = Config::default();
         let toml = toml::to_string_pretty(&cfg)
-            .map_err(|e| Error::Config(format!("cannot serialize config: {e}")))?;
+            .map_err(|e| config_err(format!("cannot serialize config: {e}")))?;
         std::fs::write(path, toml)?;
         // The file will hold secrets later (the relay private key, S3
         // keys, the management token): create it 0600 so the operator's
@@ -981,7 +981,7 @@ impl Config {
             }
             match hex::decode(value) {
                 Ok(b) if b.len() == 32 => Ok(()),
-                _ => Err(Error::Config(format!(
+                _ => Err(config_err(format!(
                     "{what} must be 64 hex characters (32 bytes), got {value:?}"
                 ))),
             }
@@ -992,45 +992,42 @@ impl Config {
         // Secret key: must be a valid secp256k1 secret key when set.
         if !self.relay.private_key.is_empty() {
             let bytes = hex::decode(&self.relay.private_key)
-                .map_err(|_| Error::Config("relay.private_key must be 64 hex characters".into()))?;
+                .map_err(|_| config_err("relay.private_key must be 64 hex characters"))?;
             if bytes.len() != 32 {
-                return Err(Error::Config("relay.private_key must be 32 bytes".into()));
+                return Err(config_err("relay.private_key must be 32 bytes"));
             }
-            secp256k1::SecretKey::from_slice(&bytes).map_err(|_| {
-                Error::Config("relay.private_key is not a valid secp256k1 secret key".into())
-            })?;
+            secp256k1::SecretKey::from_slice(&bytes)
+                .map_err(|_| config_err("relay.private_key is not a valid secp256k1 secret key"))?;
         }
 
         // Ports.
         if self.server.port == 0 {
-            return Err(Error::Config(
-                "server.port must be between 1 and 65535".into(),
-            ));
+            return Err(config_err("server.port must be between 1 and 65535"));
         }
         // WebSocket path selection.
         if !matches!(self.server.ws_paths.trim(), "root" | "inbox-outbox" | "all") {
-            return Err(Error::Config(format!(
+            return Err(config_err(format!(
                 "server.ws_paths must be \"root\", \"inbox-outbox\" or \"all\", got {:?}",
                 self.server.ws_paths
             )));
         }
         // Inbox write policy.
         if !matches!(self.server.inbox_write_policy.trim(), "any" | "relay") {
-            return Err(Error::Config(format!(
+            return Err(config_err(format!(
                 "server.inbox_write_policy must be \"any\" or \"relay\", got {:?}",
                 self.server.inbox_write_policy
             )));
         }
         // Outbox write policy.
         if !matches!(self.server.outbox_write_policy.trim(), "any" | "relay") {
-            return Err(Error::Config(format!(
+            return Err(config_err(format!(
                 "server.outbox_write_policy must be \"any\" or \"relay\", got {:?}",
                 self.server.outbox_write_policy
             )));
         }
         if self.rpc.management_port > 0 && self.rpc.management_port == self.server.port {
-            return Err(Error::Config(
-                "rpc.management_port must differ from server.port".into(),
+            return Err(config_err(
+                "rpc.management_port must differ from server.port",
             ));
         }
         // Host split hostnames must be bare hostnames: a scheme, path or
@@ -1045,7 +1042,7 @@ impl Config {
                 // treats it as non-empty, and the split routes would be
                 // blocked on every host (the whole API silently 404s).
                 if !value.is_empty() {
-                    return Err(Error::Config(format!(
+                    return Err(config_err(format!(
                         "{name} must be a bare hostname or empty, got {value:?}"
                     )));
                 }
@@ -1061,7 +1058,7 @@ impl Config {
                 c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':' | '[' | ']')
             });
             if value.contains('/') || !valid_chars || bare_host_has_port(value.trim()) {
-                return Err(Error::Config(format!(
+                return Err(config_err(format!(
                     "{name} must be a bare hostname (no scheme, port, path or whitespace), got {value:?}"
                 )));
             }
@@ -1078,15 +1075,15 @@ impl Config {
                 .trim_matches(['[', ']'])
                 .eq_ignore_ascii_case(self.blossom.host.trim().trim_matches(['[', ']']))
         {
-            return Err(Error::Config(
-                "server.api_host and blossom.host must be different hostnames".into(),
+            return Err(config_err(
+                "server.api_host and blossom.host must be different hostnames",
             ));
         }
 
         // Blocked IPs must parse as IP addresses.
         for (ip, _) in &self.access.blocked_ips {
             ip.parse::<std::net::IpAddr>().map_err(|_| {
-                Error::Config(format!(
+                config_err(format!(
                     "access.blocked_ips contains an invalid IP address: {ip:?}"
                 ))
             })?;
@@ -1094,8 +1091,8 @@ impl Config {
 
         // Database layout.
         if self.database.map_size > self.database.max_map_size {
-            return Err(Error::Config(
-                "database.map_size must not exceed database.max_map_size".into(),
+            return Err(config_err(
+                "database.map_size must not exceed database.max_map_size",
             ));
         }
 
@@ -1127,16 +1124,16 @@ impl Config {
         // AUTH message is the only way to authenticate); silently ignoring
         // it would leave a supposedly auth-required relay wide open.
         if self.relay.require_auth && !self.nip_enabled(42) {
-            return Err(Error::Config(
-                "relay.require_auth requires NIP-42 to be enabled (add 42 to relay.enabled_nips or remove 42 from relay.disabled_nips)".into(),
+            return Err(config_err(
+                "relay.require_auth requires NIP-42 to be enabled (add 42 to relay.enabled_nips or remove 42 from relay.disabled_nips)",
             ));
         }
         // `enabled_nip78_auth` has the same footgun: with NIP-42 disabled nobody
         // can authenticate, so every kind 78/30078 event would be rejected
         // at publish and never served.
         if self.relay.enabled_nip78_auth && !self.nip_enabled(42) {
-            return Err(Error::Config(
-                "relay.enabled_nip78_auth requires NIP-42 to be enabled (add 42 to relay.enabled_nips or remove 42 from relay.disabled_nips)".into(),
+            return Err(config_err(
+                "relay.enabled_nip78_auth requires NIP-42 to be enabled (add 42 to relay.enabled_nips or remove 42 from relay.disabled_nips)",
             ));
         }
         if self.relay.enabled_nip78_auth && !self.nip_enabled(78) {
@@ -1198,23 +1195,23 @@ impl Config {
             ),
         ];
         if self.limits.socket_recv_buffer_kb > 4096 {
-            return Err(Error::Config(
-                "limits.socket_recv_buffer_kb must be at most 4096".into(),
+            return Err(config_err(
+                "limits.socket_recv_buffer_kb must be at most 4096",
             ));
         }
         if !(1..=64).contains(&self.database.reader_threads) {
-            return Err(Error::Config(
-                "database.reader_threads must be between 1 and 64".into(),
+            return Err(config_err(
+                "database.reader_threads must be between 1 and 64",
             ));
         }
         for (name, value) in db_nonzero {
             if value == 0 {
-                return Err(Error::Config(format!("{name} must be at least 1 (got 0)")));
+                return Err(config_err(format!("{name} must be at least 1 (got 0)")));
             }
         }
         for (name, value) in nonzero {
             if value == 0 {
-                return Err(Error::Config(format!("{name} must be at least 1 (got 0)")));
+                return Err(config_err(format!("{name} must be at least 1 (got 0)")));
             }
         }
 
@@ -1243,14 +1240,14 @@ impl Config {
         // Paths must be non-empty: an empty database path would silently open
         // the LMDB environment inside the config file's directory.
         if self.database.path.as_os_str().is_empty() {
-            return Err(Error::Config("database.path must not be empty".into()));
+            return Err(config_err("database.path must not be empty"));
         }
         if self.daemon.pid_file.as_os_str().is_empty()
             || self.daemon.log_file.as_os_str().is_empty()
             || self.daemon.stats_file.as_os_str().is_empty()
         {
-            return Err(Error::Config(
-                "daemon.pid_file, daemon.log_file and daemon.stats_file must not be empty".into(),
+            return Err(config_err(
+                "daemon.pid_file, daemon.log_file and daemon.stats_file must not be empty",
             ));
         }
 
@@ -1367,21 +1364,19 @@ impl Config {
         // SIGHUP (when the reload would be rejected and the old config kept).
         let b = &self.blossom;
         if !["local", "s3"].contains(&b.storage.as_str()) {
-            return Err(Error::Config(format!(
+            return Err(config_err(format!(
                 "blossom.storage must be \"local\" or \"s3\", got {:?}",
                 b.storage
             )));
         }
         if !b.host.trim().is_empty() {
             if b.max_upload_bytes == 0 {
-                return Err(Error::Config(
-                    "blossom.max_upload_bytes must be at least 1".into(),
-                ));
+                return Err(config_err("blossom.max_upload_bytes must be at least 1"));
             }
             match b.storage.as_str() {
                 "local" => {
                     if b.local_path.as_os_str().is_empty() {
-                        return Err(Error::Config("blossom.local_path must not be empty".into()));
+                        return Err(config_err("blossom.local_path must not be empty"));
                     }
                 }
                 "s3" if b.s3_endpoint.trim().is_empty()
@@ -1389,10 +1384,9 @@ impl Config {
                     || b.s3_access_key.trim().is_empty()
                     || b.s3_secret_key.trim().is_empty() =>
                 {
-                    return Err(Error::Config(
+                    return Err(config_err(
                         "blossom.storage = \"s3\" requires s3_endpoint, s3_bucket, \
-                         s3_access_key and s3_secret_key"
-                            .into(),
+                         s3_access_key and s3_secret_key",
                     ));
                 }
                 // R2-style endpoints accept an empty region (`auto`), but an
@@ -1401,8 +1395,8 @@ impl Config {
                 "s3" if b.s3_region.trim().is_empty()
                     && !b.s3_endpoint.contains("r2.cloudflarestorage.com") =>
                 {
-                    return Err(Error::Config(
-                        "blossom.s3_region must not be empty for non-R2 S3 endpoints".into(),
+                    return Err(config_err(
+                        "blossom.s3_region must not be empty for non-R2 S3 endpoints",
                     ));
                 }
                 // Unreachable: validated above even when disabled.
@@ -1417,7 +1411,7 @@ impl Config {
                     || endpoint.starts_with("http://localhost")
                     || endpoint.starts_with("http://[::1]");
                 if !endpoint.starts_with("https://") && !loopback {
-                    return Err(Error::Config(format!(
+                    return Err(config_err(format!(
                         "blossom.s3_endpoint must use https:// (plain http is only allowed \
                          for loopback hosts); got {:?}",
                         b.s3_endpoint
@@ -1667,7 +1661,7 @@ fn stricter_mode(captured: u32, current: u32) -> u32 {
     captured & current
 }
 
-pub(crate) fn write_text_atomic(path: &Path, text: &str) -> std::io::Result<()> {
+pub(crate) fn write_text_atomic(path: &Path, text: &str) -> anyhow::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let tmp = path.with_extension("tmp");

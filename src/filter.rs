@@ -1,5 +1,6 @@
 //! NIP-01 subscription filters and the in-memory match.
 
+use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -268,7 +269,7 @@ pub(crate) fn tag_values(value: &Value) -> impl Iterator<Item = &str> {
 /// `#p`/`authors` entries are merged. The keys make the inbox/outbox
 /// routing model expressible in a single subscription while remaining
 /// plain NIP-01 filters on the wire.
-pub(crate) fn rewrite_inbox_outbox(value: &mut Value) -> Result<(), String> {
+pub(crate) fn rewrite_inbox_outbox(value: &mut Value) -> Result<()> {
     let Value::Object(map) = value else {
         return Ok(());
     };
@@ -283,10 +284,10 @@ pub(crate) fn rewrite_inbox_outbox(value: &mut Value) -> Result<(), String> {
                 .map(|v| {
                     v.as_str()
                         .map(str::to_string)
-                        .ok_or_else(|| format!("invalid {key} filter value"))
+                        .ok_or_else(|| anyhow!("invalid {key} filter value"))
                 })
-                .collect::<Result<Vec<_>, _>>()?,
-            _ => return Err(format!("invalid {key} filter value")),
+                .collect::<Result<Vec<_>>>()?,
+            _ => return Err(anyhow!("invalid {key} filter value")),
         };
         let mut pubkeys = Vec::new();
         for item in items {
@@ -301,7 +302,7 @@ pub(crate) fn rewrite_inbox_outbox(value: &mut Value) -> Result<(), String> {
             {
                 hex::encode(pk)
             } else {
-                return Err(format!("invalid {key} pubkey"));
+                return Err(anyhow!("invalid {key} pubkey"));
             };
             pubkeys.push(hex_pk);
         }
@@ -320,7 +321,7 @@ pub(crate) fn rewrite_inbox_outbox(value: &mut Value) -> Result<(), String> {
                 }
             }
         } else {
-            return Err(format!("invalid existing {dst} filter value"));
+            return Err(anyhow!("invalid existing {dst} filter value"));
         }
     }
     Ok(())

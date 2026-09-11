@@ -12,6 +12,7 @@ pub(crate) use legacy::router;
 
 use std::sync::Arc;
 
+use anyhow::anyhow;
 use axum::Json;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, header};
@@ -65,19 +66,19 @@ const MAX_ROLE_LABEL_LEN: usize = 200;
 const MAX_ROLE_DESC_LEN: usize = 1000;
 const MAX_ROLE_COLOR_LEN: usize = 64;
 
-fn check_role_fields(label: &str, description: &str, color: &str) -> Result<(), String> {
+fn check_role_fields(label: &str, description: &str, color: &str) -> anyhow::Result<()> {
     if label.chars().count() > MAX_ROLE_LABEL_LEN {
-        return Err(format!(
+        return Err(anyhow!(
             "role label exceeds the maximum of {MAX_ROLE_LABEL_LEN} characters"
         ));
     }
     if description.chars().count() > MAX_ROLE_DESC_LEN {
-        return Err(format!(
+        return Err(anyhow!(
             "role description exceeds the maximum of {MAX_ROLE_DESC_LEN} characters"
         ));
     }
     if color.chars().count() > MAX_ROLE_COLOR_LEN {
-        return Err(format!(
+        return Err(anyhow!(
             "role color exceeds the maximum of {MAX_ROLE_COLOR_LEN} characters"
         ));
     }
@@ -89,24 +90,26 @@ fn check_role_fields(label: &str, description: &str, color: &str) -> Result<(), 
 /// event's `d` tag and the in-memory role map). Character count is used for
 /// the length bound like the other role fields so multibyte ids cannot
 /// bypass the intent.
-fn check_role_id(id: &str) -> Result<(), String> {
+fn check_role_id(id: &str) -> anyhow::Result<()> {
     if id.trim().is_empty() {
-        return Err("role id must not be empty".into());
+        return Err(anyhow!("role id must not be empty"));
     }
     // Compare against the trimmed form so `" admin"` and `"admin"` cannot
     // become distinct map keys / `d` tags for the same logical role.
     if id != id.trim() {
-        return Err("role id must not have leading or trailing whitespace".into());
+        return Err(anyhow!(
+            "role id must not have leading or trailing whitespace"
+        ));
     }
     // Byte length: the id lands in a stored event's `d` tag and the LMDB
     // index, so multibyte ids must not bypass the bound via char count.
     if id.len() > MAX_ROLE_ID_LEN {
-        return Err(format!(
+        return Err(anyhow!(
             "role id exceeds the maximum of {MAX_ROLE_ID_LEN} bytes"
         ));
     }
     if id.chars().any(|c| c.is_control()) {
-        return Err("role id must not contain control characters".into());
+        return Err(anyhow!("role id must not contain control characters"));
     }
     Ok(())
 }
@@ -371,15 +374,15 @@ pub async fn rpc_handler(
             let Some(id) = params.first().and_then(Value::as_str) else {
                 return rpc_err("invalid params");
             };
-            if let Err(msg) = check_role_id(id) {
-                return rpc_err(&msg);
+            if let Err(e) = check_role_id(id) {
+                return rpc_err(&e.to_string());
             }
             let label = params.get(1).and_then(Value::as_str).unwrap_or("");
             let description = params.get(2).and_then(Value::as_str).unwrap_or("");
             let color = params.get(3).and_then(Value::as_str).unwrap_or("");
             let order = params.get(4).and_then(Value::as_i64);
-            if let Err(msg) = check_role_fields(label, description, color) {
-                return rpc_err(&msg);
+            if let Err(e) = check_role_fields(label, description, color) {
+                return rpc_err(&e.to_string());
             }
             if relay
                 .create_role(id, label, description, color, order)
@@ -397,15 +400,15 @@ pub async fn rpc_handler(
             let Some(id) = params.first().and_then(Value::as_str) else {
                 return rpc_err("invalid params");
             };
-            if let Err(msg) = check_role_id(id) {
-                return rpc_err(&msg);
+            if let Err(e) = check_role_id(id) {
+                return rpc_err(&e.to_string());
             }
             let label = params.get(1).and_then(Value::as_str).unwrap_or("");
             let description = params.get(2).and_then(Value::as_str).unwrap_or("");
             let color = params.get(3).and_then(Value::as_str).unwrap_or("");
             let order = params.get(4).and_then(Value::as_i64);
-            if let Err(msg) = check_role_fields(label, description, color) {
-                return rpc_err(&msg);
+            if let Err(e) = check_role_fields(label, description, color) {
+                return rpc_err(&e.to_string());
             }
             if relay.edit_role(id, label, description, color, order).await {
                 audit!(&relay, &identity, "editrole", params);
@@ -420,8 +423,8 @@ pub async fn rpc_handler(
             let Some(id) = params.first().and_then(Value::as_str) else {
                 return rpc_err("invalid params");
             };
-            if let Err(msg) = check_role_id(id) {
-                return rpc_err(&msg);
+            if let Err(e) = check_role_id(id) {
+                return rpc_err(&e.to_string());
             }
             if relay.delete_role(id).await {
                 audit!(&relay, &identity, "deleterole", params);
@@ -448,8 +451,8 @@ pub async fn rpc_handler(
             // success while matching no event (and would be echoed in the
             // relay's membership list in the wrong case).
             let pubkey = pubkey.to_ascii_lowercase();
-            if let Err(msg) = check_role_id(role) {
-                return rpc_err(&msg);
+            if let Err(e) = check_role_id(role) {
+                return rpc_err(&e.to_string());
             }
             if relay.assign_role(&pubkey, role).await {
                 audit!(&relay, &identity, "assignrole", params);
@@ -472,8 +475,8 @@ pub async fn rpc_handler(
             }
             // Same lowercase normalization as `assignrole` above.
             let pubkey = pubkey.to_ascii_lowercase();
-            if let Err(msg) = check_role_id(role) {
-                return rpc_err(&msg);
+            if let Err(e) = check_role_id(role) {
+                return rpc_err(&e.to_string());
             }
             if relay.unassign_role(&pubkey, role).await {
                 audit!(&relay, &identity, "unassignrole", params);

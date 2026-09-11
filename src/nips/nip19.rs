@@ -4,7 +4,7 @@
 //! binary representations.  The bech32m codec is implemented from scratch
 //! to avoid adding an external dependency.
 
-use std::fmt;
+use anyhow::{Result, anyhow};
 
 // ---------------------------------------------------------------------------
 // bech32 / bech32m codec  (BIP-173 / BIP-350)
@@ -122,11 +122,11 @@ fn create_checksum_m(hrp: &[u8], data: &[u8]) -> Vec<u8> {
 }
 
 /// Decode a bech32/bech32m string into HRP and 5-bit data.
-fn bech32_decode(input: &str) -> Result<(String, Vec<u8>, bool), Bech32Error> {
+fn bech32_decode(input: &str) -> Result<(String, Vec<u8>, bool)> {
     // NIP-19: bech32-formatted strings SHOULD be limited to 5000 characters
     // — beyond that the string is a DoS vector, not a NIP-19 entity.
     if input.chars().count() > 5000 {
-        return Err(Bech32Error::TooLong);
+        return Err(anyhow!("bech32 string exceeds the 5000-character limit"));
     }
     // Must be lowercase or uppercase, not mixed.
     let input_lower = input.to_lowercase();
@@ -134,21 +134,23 @@ fn bech32_decode(input: &str) -> Result<(String, Vec<u8>, bool), Bech32Error> {
     // BIP-173: all-uppercase input is valid — decode it as its lowercase
     // form (the charset, separator and checksum are case-insensitive).
     if input != input_lower && input != input_upper {
-        return Err(Bech32Error::InvalidChar('?'));
+        return Err(anyhow!("invalid bech32 character '?'"));
     }
     let normalized: &str = &input_lower;
 
     // Find the last '1' separator.
-    let sep_pos = normalized.rfind('1').ok_or(Bech32Error::MissingSeparator)?;
+    let sep_pos = normalized
+        .rfind('1')
+        .ok_or_else(|| anyhow!("missing bech32 separator '1'"))?;
 
     let hrp = &normalized[..sep_pos];
     if hrp.is_empty() {
-        return Err(Bech32Error::EmptyHrp);
+        return Err(anyhow!("empty human-readable part"));
     }
 
     let data_part = &normalized[sep_pos + 1..];
     if data_part.is_empty() {
-        return Err(Bech32Error::EmptyData);
+        return Err(anyhow!("empty data part"));
     }
 
     // Validate characters. BIP-173 requires ASCII only: a non-ASCII char
@@ -156,7 +158,7 @@ fn bech32_decode(input: &str) -> Result<(String, Vec<u8>, bool), Bech32Error> {
     // charset check as a look-alike).
     for ch in data_part.chars() {
         if !ch.is_ascii() || !CHARSET.contains(&(ch as u8)) {
-            return Err(Bech32Error::InvalidChar(ch));
+            return Err(anyhow!("invalid bech32 character '{ch}'"));
         }
     }
 
@@ -166,13 +168,13 @@ fn bech32_decode(input: &str) -> Result<(String, Vec<u8>, bool), Bech32Error> {
         .collect();
 
     if data_5bit.len() < 6 {
-        return Err(Bech32Error::InvalidChecksum);
+        return Err(anyhow!("invalid bech32m checksum"));
     }
 
     // Verify checksum; prefer bech32m.
     let is_bech32m = match verify_checksum(hrp.as_bytes(), &data_5bit) {
         Some(v) => v,
-        None => return Err(Bech32Error::InvalidChecksum),
+        None => return Err(anyhow!("invalid bech32m checksum")),
     };
 
     let payload = &data_5bit[..data_5bit.len() - 6];
@@ -180,12 +182,7 @@ fn bech32_decode(input: &str) -> Result<(String, Vec<u8>, bool), Bech32Error> {
 }
 
 /// Expand 5-bit groups into 8-bit bytes (BIP-173 convert_bits).
-fn convert_bits(
-    data: &[u8],
-    from_bits: u32,
-    to_bits: u32,
-    pad: bool,
-) -> Result<Vec<u8>, Bech32Error> {
+fn convert_bits(data: &[u8], from_bits: u32, to_bits: u32, pad: bool) -> Result<Vec<u8>> {
     let mut acc: u32 = 0;
     let mut bits: u32 = 0;
     let mut out = Vec::new();
@@ -193,7 +190,7 @@ fn convert_bits(
 
     for &value in data {
         if (value as u32 >> from_bits) != 0 {
-            return Err(Bech32Error::InvalidData);
+            return Err(anyhow!("invalid data in bech32 encoding"));
         }
         acc = (acc << from_bits) | value as u32;
         bits += from_bits;
@@ -207,7 +204,7 @@ fn convert_bits(
             out.push(((acc << (to_bits - bits)) & maxv) as u8);
         }
     } else if bits >= from_bits || ((acc << (to_bits - bits)) & maxv) != 0 {
-        return Err(Bech32Error::InvalidData);
+        return Err(anyhow!("invalid data in bech32 encoding"));
     }
     Ok(out)
 }
@@ -239,45 +236,6 @@ pub enum Nip19Entity {
     },
 }
 
-#[derive(Debug, Clone)]
-pub enum Bech32Error {
-    MissingSeparator,
-    /// NIP-19: the string exceeds the 5000-character limit.
-    TooLong,
-    EmptyHrp,
-    EmptyData,
-    InvalidChar(char),
-    InvalidChecksum,
-    InvalidData,
-    InvalidLength {
-        expected: usize,
-        got: usize,
-    },
-    UnknownPrefix(String),
-    InvalidTlv,
-}
-
-impl fmt::Display for Bech32Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::MissingSeparator => write!(f, "missing bech32 separator '1'"),
-            Self::EmptyHrp => write!(f, "empty human-readable part"),
-            Self::EmptyData => write!(f, "empty data part"),
-            Self::InvalidChar(c) => write!(f, "invalid bech32 character '{c}'"),
-            Self::TooLong => write!(f, "bech32 string exceeds the 5000-character limit"),
-            Self::InvalidChecksum => write!(f, "invalid bech32m checksum"),
-            Self::InvalidData => write!(f, "invalid data in bech32 encoding"),
-            Self::InvalidLength { expected, got } => {
-                write!(f, "invalid length: expected {expected}, got {got}")
-            }
-            Self::UnknownPrefix(p) => write!(f, "unknown NIP-19 prefix '{p}'"),
-            Self::InvalidTlv => write!(f, "invalid TLV structure"),
-        }
-    }
-}
-
-impl std::error::Error for Bech32Error {}
-
 // ---------------------------------------------------------------------------
 // NIP-19 TLV parsing
 // ---------------------------------------------------------------------------
@@ -291,12 +249,12 @@ const TLV_RELAY: u8 = 1;
 const TLV_AUTHOR: u8 = 2;
 const TLV_KIND: u8 = 3;
 
-fn parse_tlv(data: &[u8]) -> Result<Vec<(u8, Vec<u8>)>, Bech32Error> {
+fn parse_tlv(data: &[u8]) -> Result<Vec<(u8, Vec<u8>)>> {
     let mut items = Vec::new();
     let mut pos = 0;
     while pos < data.len() {
         if pos + 2 > data.len() {
-            return Err(Bech32Error::InvalidTlv);
+            return Err(anyhow!("invalid TLV structure"));
         }
         let tlv_type = data[pos];
         // NIP-19: `T` and `L` are one byte each. A two-byte length made
@@ -304,7 +262,7 @@ fn parse_tlv(data: &[u8]) -> Result<Vec<(u8, Vec<u8>)>, Bech32Error> {
         let len = data[pos + 1] as usize;
         pos += 2;
         if pos + len > data.len() {
-            return Err(Bech32Error::InvalidTlv);
+            return Err(anyhow!("invalid TLV structure"));
         }
         items.push((tlv_type, data[pos..pos + len].to_vec()));
         pos += len;
@@ -313,17 +271,14 @@ fn parse_tlv(data: &[u8]) -> Result<Vec<(u8, Vec<u8>)>, Bech32Error> {
 }
 
 /// Parse a NIP-19 bech32m string into an entity.
-pub fn parse_nip19(input: &str) -> Result<Nip19Entity, Bech32Error> {
+pub fn parse_nip19(input: &str) -> Result<Nip19Entity> {
     let (hrp, data_5bit, _is_bech32m) = bech32_decode(input)?;
     let data = convert_bits(&data_5bit, 5, 8, false)?;
 
     match hrp.as_str() {
         "npub" => {
             if data.len() != 32 {
-                return Err(Bech32Error::InvalidLength {
-                    expected: 32,
-                    got: data.len(),
-                });
+                return Err(anyhow!("invalid length: expected 32, got {}", data.len()));
             }
             let mut pk = [0u8; 32];
             pk.copy_from_slice(&data);
@@ -331,10 +286,7 @@ pub fn parse_nip19(input: &str) -> Result<Nip19Entity, Bech32Error> {
         }
         "note" => {
             if data.len() != 32 {
-                return Err(Bech32Error::InvalidLength {
-                    expected: 32,
-                    got: data.len(),
-                });
+                return Err(anyhow!("invalid length: expected 32, got {}", data.len()));
             }
             let mut id = [0u8; 32];
             id.copy_from_slice(&data);
@@ -370,7 +322,7 @@ pub fn parse_nip19(input: &str) -> Result<Nip19Entity, Bech32Error> {
                     _ => {}
                 }
             }
-            let id = id.ok_or(Bech32Error::InvalidTlv)?;
+            let id = id.ok_or_else(|| anyhow!("invalid TLV structure"))?;
             Ok(Nip19Entity::Event {
                 id,
                 relays,
@@ -400,7 +352,7 @@ pub fn parse_nip19(input: &str) -> Result<Nip19Entity, Bech32Error> {
                         // resolve to the `d=""` address (a different event).
                         match std::str::from_utf8(value) {
                             Ok(s) => d_tag = Some(s.to_string()),
-                            Err(_) => return Err(Bech32Error::InvalidTlv),
+                            Err(_) => return Err(anyhow!("invalid TLV structure")),
                         }
                     }
                     TLV_RELAY => {
@@ -411,8 +363,8 @@ pub fn parse_nip19(input: &str) -> Result<Nip19Entity, Bech32Error> {
                     _ => {}
                 }
             }
-            let kind = kind.ok_or(Bech32Error::InvalidTlv)?;
-            let pubkey = pubkey.ok_or(Bech32Error::InvalidTlv)?;
+            let kind = kind.ok_or_else(|| anyhow!("invalid TLV structure"))?;
+            let pubkey = pubkey.ok_or_else(|| anyhow!("invalid TLV structure"))?;
             let d_tag = d_tag.unwrap_or_default();
             Ok(Nip19Entity::Addr {
                 kind,
@@ -434,16 +386,16 @@ pub fn parse_nip19(input: &str) -> Result<Nip19Entity, Bech32Error> {
                     pubkey = Some(buf);
                 }
             }
-            let pubkey = pubkey.ok_or(Bech32Error::InvalidTlv)?;
+            let pubkey = pubkey.ok_or_else(|| anyhow!("invalid TLV structure"))?;
             Ok(Nip19Entity::Pubkey(pubkey))
         }
-        other => Err(Bech32Error::UnknownPrefix(other.to_string())),
+        other => Err(anyhow!("unknown NIP-19 prefix '{other}'")),
     }
 }
 
 /// Encode 8-bit bytes into bech32 with the given HRP (the NIP-19
 /// canonical form: legacy bech32 constant).
-pub(crate) fn bech32_encode(hrp: &str, data: &[u8]) -> Result<String, Bech32Error> {
+pub(crate) fn bech32_encode(hrp: &str, data: &[u8]) -> Result<String> {
     let data_5bit = convert_bits(data, 8, 5, true)?;
     let checksum = create_checksum(hrp.as_bytes(), &data_5bit);
     let mut combined = data_5bit;
@@ -458,7 +410,7 @@ pub(crate) fn bech32_encode(hrp: &str, data: &[u8]) -> Result<String, Bech32Erro
 /// Encode into bech32m — kept only for the Blossom storage paths that
 /// used it before the encoder became canonical (the legacy directory
 /// names must still be reproducible for the migration fallback).
-pub(crate) fn bech32m_encode(hrp: &str, data: &[u8]) -> Result<String, Bech32Error> {
+pub(crate) fn bech32m_encode(hrp: &str, data: &[u8]) -> Result<String> {
     let data_5bit = convert_bits(data, 8, 5, true)?;
     let checksum = create_checksum_m(hrp.as_bytes(), &data_5bit);
     let mut combined = data_5bit;
@@ -513,9 +465,10 @@ mod tests {
         while long.chars().count() < 6000 {
             long.push('q');
         }
-        assert!(
-            matches!(parse_nip19(&long), Err(Bech32Error::TooLong)),
-            "a >5000-character string must be rejected with TooLong"
+        let err = parse_nip19(&long).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "bech32 string exceeds the 5000-character limit"
         );
         // The boundary itself is accepted for parsing (and then fails the
         // checksum, which is the correct next error for a fabricated string).
@@ -523,8 +476,9 @@ mod tests {
         while edge.chars().count() < 5000 {
             edge.push('q');
         }
-        assert!(
-            !matches!(parse_nip19(&edge), Err(Bech32Error::TooLong)),
+        assert_ne!(
+            parse_nip19(&edge).unwrap_err().to_string(),
+            "bech32 string exceeds the 5000-character limit",
             "exactly 5000 characters is still within the limit"
         );
     }
@@ -615,10 +569,9 @@ mod tests {
         let encoded = bech32_encode("nsec", &data).unwrap();
         assert!(encoded.starts_with("nsec1"));
         let result = parse_nip19(&encoded);
-        assert!(
-            matches!(result, Err(Bech32Error::UnknownPrefix(ref p)) if p == "nsec"),
-            "expected UnknownPrefix(\"nsec\"), got {:?}",
-            result
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "unknown NIP-19 prefix 'nsec'"
         );
     }
 

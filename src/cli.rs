@@ -9,7 +9,9 @@ use daemonize::Daemonize;
 use log::{error, info};
 
 use crate::config::{Config, DEFAULT_CONFIG};
-use crate::error::{Error, Result};
+use anyhow::anyhow;
+
+use crate::error::{Result, config_err};
 use crate::server::run_server;
 
 #[derive(Debug, Parser)]
@@ -123,7 +125,7 @@ impl Cli {
                 let cfg = self.load_config()?;
                 cfg.validate()?;
                 if let Some(pid) = running_pid(&cfg.daemon.pid_file) {
-                    return Err(Error::Config(format!(
+                    return Err(config_err(format!(
                         "already running (pid {pid}); use 'nostrfy stop' or 'nostrfy restart'"
                     )));
                 }
@@ -146,7 +148,7 @@ impl Cli {
         // whose stderr is already pointed at /dev/null.
         cfg.validate()?;
         if let Some(pid) = running_pid(&cfg.daemon.pid_file) {
-            return Err(Error::Config(format!(
+            return Err(config_err(format!(
                 "already running (pid {pid}); use 'nostrfy stop' or 'nostrfy restart'"
             )));
         }
@@ -184,7 +186,7 @@ impl Cli {
         // inherited descriptors do not keep the file open across rotations.
         if let Some(dir) = cfg.daemon.log_file.parent() {
             std::fs::create_dir_all(dir).map_err(|e| {
-                Error::Config(format!(
+                config_err(format!(
                     "cannot create log directory {}: {e}",
                     dir.display()
                 ))
@@ -196,7 +198,7 @@ impl Cli {
             cfg.daemon.max_log_files,
         )
         .map_err(|e| {
-            Error::Config(format!(
+            config_err(format!(
                 "cannot open {}: {e}",
                 cfg.daemon.log_file.display()
             ))
@@ -205,7 +207,7 @@ impl Cli {
             .read(true)
             .write(true)
             .open("/dev/null")
-            .map_err(|e| Error::Config(format!("cannot open /dev/null: {e}")))?;
+            .map_err(|e| config_err(format!("cannot open /dev/null: {e}")))?;
 
         let daemon = Daemonize::new()
             .pid_file(&cfg.daemon.pid_file)
@@ -220,7 +222,7 @@ impl Cli {
             // foreground `nostrfy start`/`restart` returns with a clear
             // message instead of silently.
             daemonize::Outcome::Parent(result) => {
-                result.map_err(|e| Error::Config(format!("failed to daemonize: {e}")))?;
+                result.map_err(|e| config_err(format!("failed to daemonize: {e}")))?;
                 match wait_for_pid_file(&cfg.daemon.pid_file) {
                     Some(pid) => print_line(&format!("nostrfy started (pid {pid})")),
                     None => print_line("nostrfy started"),
@@ -230,7 +232,7 @@ impl Cli {
             }
             // Only the daemon child reaches this point.
             daemonize::Outcome::Child(result) => {
-                result.map_err(|e| Error::Config(format!("failed to daemonize: {e}")))?;
+                result.map_err(|e| config_err(format!("failed to daemonize: {e}")))?;
                 self.daemonized = true;
                 info!(
                     "daemon started (pid {}), log: {}",
@@ -254,15 +256,13 @@ impl Cli {
         // SAFETY: `kill` only touches the targeted process id.
         let ret = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
         if ret != 0 {
-            return Err(Error::Other(format!(
+            return Err(anyhow!(format!(
                 "cannot signal pid {pid}: {}",
                 std::io::Error::last_os_error()
             )));
         }
         if !wait_for_stop(&self.load_config()?.daemon.pid_file) {
-            return Err(Error::Other(format!(
-                "daemon (pid {pid}) did not stop in time"
-            )));
+            return Err(anyhow!(format!("daemon (pid {pid}) did not stop in time")));
         }
         print_line("nostrfy stopped");
         Ok(())
@@ -271,9 +271,7 @@ impl Cli {
     fn stats(&self) -> Result<()> {
         let cfg = self.load_config()?;
         if !cfg.daemon.stats_file.exists() {
-            return Err(Error::Config(
-                "nostrfy is not running (no stats file)".into(),
-            ));
+            return Err(config_err("nostrfy is not running (no stats file)"));
         }
         let raw = std::fs::read_to_string(&cfg.daemon.stats_file)?;
         let value: serde_json::Value = serde_json::from_str(&raw)?;
@@ -287,7 +285,7 @@ impl Cli {
     /// daemon is reloaded via SIGHUP so changes apply without a restart.
     fn blossom_allowlist(&self, action: &BlossomAction) -> Result<()> {
         if !self.config.exists() {
-            return Err(Error::Config(format!(
+            return Err(config_err(format!(
                 "{} not found; run 'nostrfy init' first",
                 self.config.display()
             )));
@@ -296,7 +294,7 @@ impl Cli {
         if let BlossomAction::Allow { pubkey } | BlossomAction::Deny { pubkey } = action
             && !is_pubkey_or_npub(pubkey)
         {
-            return Err(Error::Config(format!(
+            return Err(config_err(format!(
                 "{pubkey:?} is not an npub1... or 64-hex pubkey"
             )));
         }
@@ -363,7 +361,7 @@ impl Cli {
     /// immediately.
     fn relay_access(&self, action: &RelayAction) -> Result<()> {
         if !self.config.exists() {
-            return Err(Error::Config(format!(
+            return Err(config_err(format!(
                 "{} not found; run 'nostrfy init' first",
                 self.config.display()
             )));
@@ -372,7 +370,7 @@ impl Cli {
         if let RelayAction::Allow { pubkey } | RelayAction::Deny { pubkey } = action
             && !is_pubkey_or_npub(pubkey)
         {
-            return Err(Error::Config(format!(
+            return Err(config_err(format!(
                 "{pubkey:?} is not an npub1... or 64-hex pubkey"
             )));
         }
@@ -479,7 +477,7 @@ impl Cli {
 
         let current = env!("CARGO_PKG_VERSION");
         let Some(asset) = upgrade_asset_name(std::env::consts::OS, std::env::consts::ARCH) else {
-            return Err(Error::Config(format!(
+            return Err(config_err(format!(
                 "upgrade is not supported on {}-{}; install manually from \
                  https://github.com/{REPO}/releases",
                 std::env::consts::OS,
@@ -515,10 +513,10 @@ impl Cli {
         } else {
             print_line(&format!("reinstalling nostrfy {target}"));
         }
-        let exe = std::env::current_exe().map_err(Error::Io)?;
+        let exe = std::env::current_exe()?;
         let dir = exe
             .parent()
-            .ok_or_else(|| Error::Other("cannot locate the binary's directory".into()))?;
+            .ok_or_else(|| anyhow!("cannot locate the binary's directory"))?;
         // Best-effort cleanup of temp files left behind by a hard-killed
         // previous upgrade (same pattern, any pid).
         if let Ok(entries) = std::fs::read_dir(dir) {
@@ -546,9 +544,9 @@ impl Cli {
                 .get(&url)
                 .set("User-Agent", "nostrfy-upgrade")
                 .call()
-                .map_err(|e| Error::Other(format!("download failed: {e}")))?;
+                .map_err(|e| anyhow!(format!("download failed: {e}")))?;
             if response.status() != 200 {
-                return Err(Error::Other(format!(
+                return Err(anyhow!(format!(
                     "download failed: HTTP {}",
                     response.status()
                 )));
@@ -560,7 +558,7 @@ impl Cli {
                 .write(true)
                 .create_new(true)
                 .open(&tmp)
-                .map_err(|e| Error::Other(format!("cannot create {}: {e}", tmp.display())))?;
+                .map_err(|e| anyhow!(format!("cannot create {}: {e}", tmp.display())))?;
             // Stream with a hard byte cap: the trait-object reader cannot
             // be `take()`d, and a huge (or hostile) response must not be
             // buffered or written out unbounded.
@@ -568,15 +566,15 @@ impl Cli {
             let mut copied: u64 = 0;
             use std::io::{Read, Write};
             loop {
-                let n = reader.read(&mut buf).map_err(Error::Io)?;
+                let n = reader.read(&mut buf)?;
                 if n == 0 {
                     break;
                 }
                 copied += n as u64;
                 if copied > MAX_ASSET_BYTES {
-                    return Err(Error::Other("the downloaded binary is too large".into()));
+                    return Err(anyhow!("the downloaded binary is too large"));
                 }
-                out.write_all(&buf[..n]).map_err(Error::Io)?;
+                out.write_all(&buf[..n])?;
             }
             // The release pipeline publishes <asset>.sha256 next to the
             // binary (install.sh verifies it the same way): verify the
@@ -585,40 +583,39 @@ impl Cli {
                 .get(&format!("{url}.sha256"))
                 .set("User-Agent", "nostrfy-upgrade")
                 .call()
-                .map_err(|e| Error::Other(format!("cannot fetch the checksum: {e}")))?
+                .map_err(|e| anyhow!(format!("cannot fetch the checksum: {e}")))?
                 .into_string()
-                .map_err(|e| Error::Other(format!("invalid checksum response: {e}")))?;
+                .map_err(|e| anyhow!(format!("invalid checksum response: {e}")))?;
             let expected = checksum
                 .split_whitespace()
                 .next()
                 .and_then(|h| hex::decode(h).ok())
                 .filter(|b| b.len() == 32)
-                .ok_or_else(|| Error::Other("the published checksum is not a sha256".into()))?;
-            out.sync_all().map_err(Error::Io)?;
+                .ok_or_else(|| anyhow!("the published checksum is not a sha256"))?;
+            out.sync_all()?;
             drop(out);
             let actual = {
                 use sha2::Digest;
                 let mut hasher = sha2::Sha256::new();
-                let mut f = std::fs::File::open(&tmp).map_err(Error::Io)?;
-                std::io::copy(&mut f, &mut hasher).map_err(Error::Io)?;
+                let mut f = std::fs::File::open(&tmp)?;
+                std::io::copy(&mut f, &mut hasher)?;
                 hasher.finalize().to_vec()
             };
             if actual != expected {
-                return Err(Error::Other(
+                return Err(anyhow!(
                     "sha256 of the downloaded binary does not match the published checksum; \
                      keeping the current binary"
-                        .into(),
                 ));
             }
             // Make it executable and prove it runs before replacing the
             // live binary.
-            let mut perms = std::fs::metadata(&tmp).map_err(Error::Io)?.permissions();
+            let mut perms = std::fs::metadata(&tmp)?.permissions();
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
                 perms.set_mode(0o755);
             }
-            std::fs::set_permissions(&tmp, perms).map_err(Error::Io)?;
+            std::fs::set_permissions(&tmp, perms)?;
             // The probe runs with a hard deadline: a downloaded binary that hangs
             // must not hang the CLI, and the child process is killed on
             // timeout instead of being left orphaned.
@@ -627,10 +624,10 @@ impl Cli {
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .spawn()
-                .map_err(|e| Error::Other(format!("downloaded binary does not run: {e}")))?;
+                .map_err(|e| anyhow!(format!("downloaded binary does not run: {e}")))?;
             let deadline = std::time::Instant::now() + Duration::from_secs(30);
             let probe_ok = loop {
-                match child.try_wait().map_err(Error::Io)? {
+                match child.try_wait()? {
                     Some(status) => break status.success(),
                     None => {
                         if std::time::Instant::now() >= deadline {
@@ -643,13 +640,12 @@ impl Cli {
                 }
             };
             if !probe_ok {
-                return Err(Error::Other(
+                return Err(anyhow!(
                     "downloaded binary failed or timed out in its version check; \
                      keeping the current binary"
-                        .into(),
                 ));
             };
-            std::fs::rename(&tmp, &exe).map_err(Error::Io)?;
+            std::fs::rename(&tmp, &exe)?;
             // fsync the directory so the rename survives a power loss, not
             // just a process crash.
             if let Ok(d) = std::fs::File::open(dir) {
@@ -684,7 +680,7 @@ impl Cli {
     /// to confirm the overwrite (y/N).
     fn genkey(&self) -> Result<()> {
         if !self.config.exists() {
-            return Err(Error::Config(format!(
+            return Err(config_err(format!(
                 "{} not found; run 'nostrfy init' first",
                 self.config.display()
             )));
@@ -699,7 +695,7 @@ impl Cli {
                 prefix
             ));
             let mut answer = String::new();
-            std::io::stdin().read_line(&mut answer).map_err(Error::Io)?;
+            std::io::stdin().read_line(&mut answer)?;
             if !answer.trim().eq_ignore_ascii_case("y") {
                 print_line("aborted: relay.private_key unchanged");
                 return Ok(());
@@ -781,14 +777,8 @@ fn wait_for_pid_file(path: &Path) -> Option<u32> {
 }
 
 fn init_config(path: &Path) -> Result<()> {
-    match Config::write_default(path) {
-        Ok(()) => print_line(&format!("wrote {}", path.display())),
-        Err(Error::Config(msg)) => {
-            error!("{msg}");
-            std::process::exit(1);
-        }
-        Err(e) => return Err(e),
-    }
+    Config::write_default(path)?;
+    print_line(&format!("wrote {}", path.display()));
     Ok(())
 }
 
@@ -840,14 +830,14 @@ fn latest_release_version(repo: &str) -> Result<String> {
         .get(&url)
         .set("User-Agent", "nostrfy-upgrade")
         .call()
-        .map_err(|e| Error::Other(format!("cannot query the latest release: {e}")))?;
+        .map_err(|e| anyhow!(format!("cannot query the latest release: {e}")))?;
     let value: serde_json::Value = serde_json::from_reader(response.into_reader())
-        .map_err(|e| Error::Other(format!("invalid release response: {e}")))?;
+        .map_err(|e| anyhow!(format!("invalid release response: {e}")))?;
     value
         .get("tag_name")
         .and_then(serde_json::Value::as_str)
         .map(|t| t.trim_start_matches('v').to_string())
-        .ok_or_else(|| Error::Other("the release response has no tag_name".into()))
+        .ok_or_else(|| anyhow!("the release response has no tag_name"))
 }
 
 /// Generates a random secp256k1 secret key as lowercase hex (64 chars),
@@ -856,12 +846,12 @@ fn generate_secret_key_hex() -> Result<String> {
     for _ in 0..8 {
         let mut bytes = [0u8; 32];
         getrandom::getrandom(&mut bytes)
-            .map_err(|e| Error::Other(format!("cannot read random bytes: {e}")))?;
+            .map_err(|e| anyhow!(format!("cannot read random bytes: {e}")))?;
         if let Ok(secret) = secp256k1::SecretKey::from_slice(&bytes) {
             return Ok(hex::encode(secret.secret_bytes()));
         }
     }
-    Err(Error::Other("failed to generate a valid secret key".into()))
+    Err(anyhow!("failed to generate a valid secret key"))
 }
 
 /// Replaces (or inserts) the `relay.private_key` value in a config file's

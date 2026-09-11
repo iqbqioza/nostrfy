@@ -142,7 +142,7 @@ pub(crate) fn check_env_space(env: &Env) -> Result<()> {
     if let Some(free) = path_free_space(env.path())
         && free < DISK_FREE_MARGIN
     {
-        return Err(crate::error::Error::StorageFull);
+        return Err(crate::error::storage_full());
     }
     Ok(())
 }
@@ -458,7 +458,7 @@ impl Store {
         if let Some(free) = self.free_space()
             && free < DISK_FREE_MARGIN
         {
-            return Err(crate::error::Error::StorageFull);
+            return Err(crate::error::storage_full());
         }
         Ok(())
     }
