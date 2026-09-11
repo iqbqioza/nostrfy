@@ -21,7 +21,7 @@
 use std::sync::Arc;
 
 use anyhow::anyhow;
-use axum::body::Bytes;
+use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Path as AxPath, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -43,6 +43,10 @@ pub(crate) struct BlossomState {
     pub store: BlobStore,
     /// The configured blossom hostname (used for the `server` auth tag).
     pub host: String,
+    /// Shared in-flight upload budget. Upload bodies are spooled to a
+    /// temporary file, so this bounds disk-backed work and prevents a burst
+    /// of maximum-sized requests from creating unbounded concurrent work.
+    pub upload_budget: Arc<tokio::sync::Semaphore>,
 }
 
 /// The routes, mounted by `build_router` only when `blossom.host` is set.
@@ -747,7 +751,7 @@ async fn head_blob(
 }
 
 /// `PUT /upload` — upload a blob (BUD-02). Returns 201 + the descriptor.
-async fn upload(State(relay): State<Arc<Relay>>, headers: HeaderMap, body: Bytes) -> Response {
+async fn upload(State(relay): State<Arc<Relay>>, headers: HeaderMap, body: Body) -> Response {
     put_blob(relay, headers, body, "upload").await
 }
 
@@ -755,22 +759,32 @@ async fn upload(State(relay): State<Arc<Relay>>, headers: HeaderMap, body: Bytes
 /// exact bytes received (optimization is a SHOULD, not a MUST); the
 /// endpoint exists so clients that treat it as a trusted processing
 /// server (e.g. nostter) can upload without changes.
-async fn upload_media(
-    State(relay): State<Arc<Relay>>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
+async fn upload_media(State(relay): State<Arc<Relay>>, headers: HeaderMap, body: Body) -> Response {
     put_blob(relay, headers, body, "media").await
 }
 
 /// Shared PUT logic for `/upload` (BUD-02) and `/media` (BUD-05).
-async fn put_blob(relay: Arc<Relay>, headers: HeaderMap, body: Bytes, verb: &str) -> Response {
+async fn put_blob(relay: Arc<Relay>, headers: HeaderMap, body: Body, verb: &str) -> Response {
     let Some(state) = state_of(&relay).await else {
         return error(StatusCode::SERVICE_UNAVAILABLE, "blossom not initialized");
     };
-    let sha = {
-        use sha2::{Digest, Sha256};
-        hex::encode(Sha256::digest(&body))
+    let max_upload = relay.config.read().await.blossom.max_upload_bytes;
+    let permits = match state
+        .upload_budget
+        .clone()
+        .try_acquire_many_owned(max_upload.min(u32::MAX as usize) as u32)
+    {
+        Ok(permit) => permit,
+        Err(_) => {
+            return error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "too many uploads in progress",
+            );
+        }
+    };
+    let (path, size, sha) = match spool_upload(body, max_upload).await {
+        Ok(value) => value,
+        Err(response) => return response,
     };
     // BUD-02/05: the optional `X-SHA-256` header declares the expected hash
     // of the request body — a provided value that does not match the actual
@@ -778,9 +792,11 @@ async fn put_blob(relay: Arc<Relay>, headers: HeaderMap, body: Bytes, verb: &str
     if let Some(declared) = headers.get("x-sha-256").and_then(|v| v.to_str().ok()) {
         let declared = declared.trim().to_ascii_lowercase();
         if declared.len() != 64 || hex::decode(&declared).is_err() {
+            let _ = tokio::fs::remove_file(&path).await;
             return error(StatusCode::BAD_REQUEST, "malformed X-SHA-256 header");
         }
         if declared != sha {
+            let _ = tokio::fs::remove_file(&path).await;
             return error(
                 StatusCode::CONFLICT,
                 "the X-SHA-256 header does not match the request body",
@@ -790,17 +806,20 @@ async fn put_blob(relay: Arc<Relay>, headers: HeaderMap, body: Bytes, verb: &str
     // BUD-11: upload/media tokens MUST carry an `x` tag matching the blob
     // hash (the token is scoped to exactly the bytes being uploaded).
     let Some(pubkey) = verify_auth(&relay, &state, &headers, verb, Some(&sha)).await else {
+        let _ = tokio::fs::remove_file(&path).await;
         return error(StatusCode::UNAUTHORIZED, "invalid or missing authorization");
     };
     // Upload allowlist: when restrict_uploads is on, only the listed
     // pubkeys (npub1... or hex) may upload.
     if upload_allowed(&relay, &pubkey).await.is_err() {
+        let _ = tokio::fs::remove_file(&path).await;
         return error(
             StatusCode::FORBIDDEN,
             "uploads are restricted to the configured allowlist",
         );
     }
     if state.store.check_space().is_err() {
+        let _ = tokio::fs::remove_file(&path).await;
         return error(StatusCode::INSUFFICIENT_STORAGE, "storage is full");
     }
     let mime = sanitize_mime(
@@ -811,7 +830,13 @@ async fn put_blob(relay: Arc<Relay>, headers: HeaderMap, body: Bytes, verb: &str
     );
     // BUD-02/05: 201 for a newly stored blob, 200 when it already exists.
     let existed = state.store.find(&sha).await.is_some();
-    match state.store.put(&pubkey, &sha, &body, &mime).await {
+    let result = state
+        .store
+        .put_file(&pubkey, &sha, &path, size, &mime)
+        .await;
+    let _ = tokio::fs::remove_file(&path).await;
+    drop(permits);
+    match result {
         Ok(desc) => {
             let url = format!("https://{}/{sha}{}", state.host, ext_of(&desc.mime));
             let status = if existed {
@@ -833,11 +858,85 @@ async fn put_blob(relay: Arc<Relay>, headers: HeaderMap, body: Bytes, verb: &str
             )
                 .into_response()
         }
+
         Err(e) => error(
             StatusCode::INTERNAL_SERVER_ERROR,
             &format!("storage error: {e}"),
         ),
     }
+}
+
+/// Spools an upload to disk while hashing it. The request body is never
+/// materialized in one `Bytes` allocation, and the size limit is enforced
+/// while reading rather than after the extractor has buffered the body.
+async fn spool_upload(
+    body: Body,
+    max_upload: usize,
+) -> Result<(std::path::PathBuf, u64, String), Response> {
+    use futures_util::StreamExt;
+    use sha2::{Digest, Sha256};
+    use tokio::io::AsyncWriteExt;
+
+    static TEMP_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut path = std::env::temp_dir();
+    path.push(format!(
+        "nostrfy-blossom-{}-{}",
+        std::process::id(),
+        TEMP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let mut file = match tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .await
+    {
+        Ok(file) => file,
+        Err(e) => {
+            return Err(error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("temporary upload failed: {e}"),
+            ));
+        }
+    };
+    let mut stream = body.into_data_stream();
+    let mut hash = Sha256::new();
+    let mut size = 0u64;
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(e) => {
+                let _ = tokio::fs::remove_file(&path).await;
+                return Err(error(
+                    StatusCode::BAD_REQUEST,
+                    &format!("upload body failed: {e}"),
+                ));
+            }
+        };
+        size = size.saturating_add(chunk.len() as u64);
+        if size > max_upload as u64 {
+            let _ = tokio::fs::remove_file(&path).await;
+            return Err(error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "upload exceeds the configured size limit",
+            ));
+        }
+        hash.update(&chunk);
+        if let Err(e) = file.write_all(&chunk).await {
+            let _ = tokio::fs::remove_file(&path).await;
+            return Err(error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("temporary upload failed: {e}"),
+            ));
+        }
+    }
+    if let Err(e) = file.flush().await {
+        let _ = tokio::fs::remove_file(&path).await;
+        return Err(error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("temporary upload failed: {e}"),
+        ));
+    }
+    Ok((path, size, hex::encode(hash.finalize())))
 }
 
 /// `HEAD /upload` — BUD-06 pre-flight: whether a `PUT /upload` would be
@@ -1062,6 +1161,9 @@ pub(crate) async fn build_state(cfg: &Config, _relay: &Relay) -> Option<Arc<Blos
             let state = Arc::new(BlossomState {
                 store,
                 host: cfg.blossom.host.clone(),
+                upload_budget: Arc::new(tokio::sync::Semaphore::new(
+                    cfg.blossom.max_upload_bytes.saturating_mul(4).max(1),
+                )),
             });
             // One-time automatic migration of legacy blobs (storage files
             // that predate the LMDB mapping), in the background so the
@@ -1408,7 +1510,7 @@ mod tests {
         let resp = upload(
             State(relay.clone()),
             headers,
-            axum::body::Bytes::from_static(data),
+            axum::body::Bytes::from_static(data).into(),
         )
         .await;
         assert_eq!(

@@ -263,12 +263,67 @@ impl S3Client {
         )
     }
 
+    #[cfg(test)]
     pub(crate) async fn put_object(&self, key: &str, bytes: &[u8], mime: &str) -> Result<()> {
         let (status, _) = self
             .send("PUT", key, "", Some(bytes), Some(mime), &[])
             .await?;
         if !status.is_success() {
             return Err(anyhow!(format!("s3 put failed: {status}")));
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn put_object_file(
+        &self,
+        key: &str,
+        path: &std::path::Path,
+        size: u64,
+        mime: &str,
+    ) -> Result<()> {
+        use tokio::io::AsyncReadExt;
+
+        let file = tokio::fs::File::open(path).await?;
+        let stream = futures_util::stream::unfold(file, |mut file| async move {
+            let mut chunk = vec![0u8; 64 * 1024];
+            match file.read(&mut chunk).await {
+                Ok(0) => None,
+                Ok(n) => {
+                    chunk.truncate(n);
+                    Some((Ok::<bytes::Bytes, std::io::Error>(chunk.into()), file))
+                }
+                Err(e) => Some((Err(e), file)),
+            }
+        });
+        let url = self.url(key);
+        let now = crate::util::unix_now();
+        let amz_date = amz_datetime(now);
+        let date = &amz_date[..8];
+        let payload_hash = "UNSIGNED-PAYLOAD";
+        let authorization = self.sign(
+            "PUT",
+            key,
+            "",
+            payload_hash,
+            &amz_date,
+            date,
+            Some(mime),
+            &[("Content-Length", &size.to_string())],
+        );
+        let response = self
+            .http_stream
+            .put(url)
+            .header("x-amz-date", &amz_date)
+            .header("x-amz-content-sha256", payload_hash)
+            .header("Authorization", authorization)
+            .header("Content-Type", mime)
+            .header("Content-Length", size)
+            .body(reqwest::Body::wrap_stream(stream))
+            .send()
+            .await
+            .map_err(|e| anyhow!(format!("s3 request failed: {e}")))?;
+        if !response.status().is_success() {
+            return Err(anyhow!(format!("s3 put failed: {}", response.status())));
         }
         Ok(())
     }
