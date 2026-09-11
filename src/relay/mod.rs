@@ -73,6 +73,11 @@ pub struct Relay {
     /// preserved); fresh pubkeys alone are fail-open until old windows
     /// expire.
     publish_rate: std::sync::Mutex<HashMap<String, std::collections::VecDeque<u64>>>,
+    /// Serializes `persist_access`: two concurrent NIP-86 mutations must
+    /// not capture snapshots in one order and queue their writes in the
+    /// other, or the older snapshot lands last and loses the newer entry
+    /// (a ban silently disappearing on the next restart).
+    persist_access_lock: tokio::sync::Mutex<()>,
     /// NIP-86 blockip/unblockip: every list change notifies each
     /// connection's watcher, so established read-only subscribers (which
     /// never send a frame) are disconnected too — a version counter could
@@ -353,6 +358,7 @@ impl Relay {
             api_limit: ApiLimiter::new(api_max_concurrent),
             per_ip_connections: std::sync::Mutex::new(HashMap::new()),
             publish_rate: std::sync::Mutex::new(HashMap::new()),
+            persist_access_lock: tokio::sync::Mutex::new(()),
             ip_blocks_tx: tokio::sync::watch::channel(0).0,
             config_version: AtomicU64::new(0),
             key,
@@ -529,7 +535,13 @@ impl Relay {
     /// Persists the current access control lists to the database so NIP-86
     /// runtime bans/allowlists survive restarts. Callers must release the
     /// `access` write lock before awaiting this.
+    ///
+    /// The snapshot and both writes are serialized: without the lock two
+    /// concurrent mutations could read snapshots in one order (older first)
+    /// but queue their writes in the other, so the stale lists are the last
+    /// ones committed and the newer entry is lost after a restart.
     pub async fn persist_access(&self) {
+        let _guard = self.persist_access_lock.lock().await;
         let access = self.access.read().await.clone();
         let deny = access.blocked_pubkeys.clone();
         let allow = access.allowed_pubkeys.clone();
@@ -1651,6 +1663,57 @@ mod tests {
             1,
             "the persisted deny list must be applied"
         );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn concurrent_access_persists_keep_every_entry() {
+        // Two concurrent mutations must not capture snapshots in one order
+        // and queue their writes in the other: the older snapshot would be
+        // committed last and drop the newer entry from the persisted lists
+        // (a ban silently vanishing on the next restart). `persist_access`
+        // serializes the snapshot and both writes.
+        let relay = build_relay().await;
+        for i in 0..32u32 {
+            let a = format!("a{i:020x}");
+            let b = format!("b{i:020x}");
+            let ra = relay.clone();
+            let rb = relay.clone();
+            let (a2, b2) = (a.clone(), b.clone());
+            let ta = tokio::spawn(async move {
+                ra.access
+                    .write()
+                    .await
+                    .blocked_pubkeys
+                    .push((a2, String::new()));
+                ra.persist_access().await;
+            });
+            let tb = tokio::spawn(async move {
+                rb.access
+                    .write()
+                    .await
+                    .blocked_pubkeys
+                    .push((b2, String::new()));
+                rb.persist_access().await;
+            });
+            ta.await.unwrap();
+            tb.await.unwrap();
+            let (deny, _) = relay
+                .db
+                .load_relay_pubkeys()
+                .await
+                .expect("the access lists must load");
+            assert!(
+                deny.iter().any(|(p, _)| p == &a),
+                "iteration {i} lost {a}: {} entries persisted",
+                deny.len()
+            );
+            assert!(
+                deny.iter().any(|(p, _)| p == &b),
+                "iteration {i} lost {b}: {} entries persisted",
+                deny.len()
+            );
+        }
         relay.db.shutdown();
     }
 
