@@ -1158,7 +1158,9 @@ impl Config {
             ("limits.max_api_queue_msgs", l.max_api_queue_msgs),
             ("limits.live_buffer", l.live_buffer),
             ("limits.live_batch_size", l.live_batch_size),
-            ("limits.max_out_queue_bytes", l.max_out_queue_bytes),
+            // `limits.max_out_queue_bytes` is intentionally absent: 0 means
+            // "unlimited" at runtime (the queue cap checks `> 0`) and in the
+            // docs, so it is a valid configuration.
             ("limits.max_content_bytes", l.max_content_bytes),
             ("limits.max_tags", l.max_tags),
             ("limits.max_tag_value_bytes", l.max_tag_value_bytes),
@@ -2778,6 +2780,14 @@ max_admin_body_bytes = 2048
             set(&mut cfg);
             assert!(cfg.validate().is_err(), "zero content/tag caps must fail");
         }
+        // `max_out_queue_bytes` is the exception: 0 is documented (and
+        // implemented) as "unlimited", so it must validate.
+        let mut cfg = Config::default();
+        cfg.limits.max_out_queue_bytes = 0;
+        assert!(
+            cfg.validate().is_ok(),
+            "max_out_queue_bytes = 0 must mean unlimited, not a validation error"
+        );
     }
 
     #[test]
