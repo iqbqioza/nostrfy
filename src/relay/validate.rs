@@ -199,7 +199,16 @@ impl super::Relay {
                 }
                 let reason = {
                     let groups = self.groups.read().await;
-                    groups.validate_write(event).err()
+                    // Moderation events may also come from the relay's own
+                    // key (NIP-29: "the relay master key or ... group
+                    // admins"), so the operator can recover an admin-less
+                    // group.
+                    match self.relay_pubkey() {
+                        Some(relay_pk) => groups
+                            .validate_write_for_relay(event, Some(&relay_pk))
+                            .err(),
+                        None => groups.validate_write(event).err(),
+                    }
                 };
                 if let Some(reason) = reason {
                     return Precheck::Reject(reason);

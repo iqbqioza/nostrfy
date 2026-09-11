@@ -269,6 +269,27 @@ impl GroupStore {
     /// string for the `OK` message on rejection. Access control is based on
     /// the event's author (`event.pubkey`), not on connection authentication.
     pub fn validate_write(&self, event: &Event) -> Result<(), String> {
+        self.validate_write_inner(event, None)
+    }
+
+    /// Like [`Self::validate_write`], but treats the relay's own key as the
+    /// group master key. NIP-29 expects moderation events from "the relay
+    /// master key or by group admins", so an operator can recover a group
+    /// whose admins all left by signing the moderation event with
+    /// `relay.private_key` (the NIP-11 `self` key).
+    pub fn validate_write_for_relay(
+        &self,
+        event: &Event,
+        relay_pubkey: Option<&str>,
+    ) -> Result<(), String> {
+        self.validate_write_inner(event, relay_pubkey)
+    }
+
+    fn validate_write_inner(
+        &self,
+        event: &Event,
+        relay_pubkey: Option<&str>,
+    ) -> Result<(), String> {
         // NIP-29: the event's `h` tag carries *the* group id. Multiple `h`
         // tags are ambiguous and dangerous: the checks below use the first
         // one while the stored tag index and subscriptions match any of
@@ -314,6 +335,10 @@ impl GroupStore {
             return Err("restricted: unknown group".into());
         };
         let pubkey = event.pubkey.as_str();
+        // The relay's own key is the group master key for moderation events
+        // (see `validate_write_for_relay`): it is accepted even when no
+        // group admin remains.
+        let relay_signed = relay_pubkey.is_some_and(|pk| pk.eq_ignore_ascii_case(pubkey));
 
         if event.kind == JOIN {
             if group.is_member(pubkey) {
@@ -351,27 +376,16 @@ impl GroupStore {
         }
 
         if event.kind == LEAVE {
-            // NIP-29: a plain member's leave is always honored. An admin may
-            // leave only while another admin remains; the last admin cannot
-            // leave (the group must never be left without an admin) and must
-            // delete the group (9008) instead, which purges its events.
-            let is_admin = group.is_admin(pubkey);
-            let retains_admin = group
-                .members
-                .iter()
-                .any(|(pk, roles)| !roles.is_empty() && pk != &event.pubkey);
-            if is_admin && !retains_admin {
-                return Err(
-                    "restricted: the last admin cannot leave; delete the group (kind:9008) \
-                     or grant another admin first"
-                        .into(),
-                );
-            }
+            // NIP-29: "Any user can send one of these events to the relay in
+            // order to be automatically removed from the group." There is no
+            // admin exception: even the group's last admin may leave. The
+            // group then has no admins and can only be managed by the relay's
+            // own key.
             return Ok(());
         }
 
         if (MOD_MIN..=MOD_MAX).contains(&event.kind) {
-            if !group.is_admin(pubkey) {
+            if !relay_signed && !group.is_admin(pubkey) {
                 return Err("restricted: you are not an admin of this group".into());
             }
             if event.kind == 9002 {
@@ -419,9 +433,9 @@ impl GroupStore {
             // NIP-29: the group must retain at least one admin — a 9000
             // without roles could silently demote the last admin, and a
             // 9001 could remove them, leaving the group unmanageable
-            // (nobody could then issue 9000/9001/9002 again). The last admin
-            // cannot LEAVE either (see above): deleting the group is the
-            // escape hatch.
+            // (nobody could then issue 9000/9001/9002 again). A member's own
+            // LEAVE is exempt (NIP-29: any user may leave), so an admin-less
+            // group is possible; the relay's own key can still manage it.
             let admin_removed: HashSet<String> = match event.kind {
                 9000 => event
                     .tags

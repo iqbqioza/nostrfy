@@ -557,7 +557,7 @@ nostrfy supports NIP-29 (relay-based groups): closed chat spaces where only memb
 | `kind:9010` | Update pin list |
 | `kind:9021` / `9022` | Join request / leave request |
 
-> **Admin leave policy**: an admin may leave with `kind:9022` only while another admin remains. The last admin cannot leave (the relay answers `restricted: the last admin cannot leave`): they must grant another admin first, or delete the group with `kind:9008` — the safe escape hatch, which removes the group and purges its stored events. Plain members can always leave.
+> **Leave policy (NIP-29)**: any member — including the group's last admin — may leave with `kind:9022` and is automatically removed; the spec defines no admin exception. If the last admin leaves, the group has no admins left. To avoid that, grant another admin first, or delete the group with `kind:9008` (which removes the group and purges its stored events). To recover an admin-less group, sign a moderation event (e.g. `kind:9000` adding an admin) with the relay's own key (`relay.private_key`, the NIP-11 `self` pubkey): the relay accepts moderation from its master key — see [TROUBLESHOOTING 4-6](TROUBLESHOOTING.md#4-6-accidentally-left-a-group-or-the-group-has-no-admins).
 
 From these moderation events, the relay generates the following **relay-signed snapshots** (used by clients for display):
 
