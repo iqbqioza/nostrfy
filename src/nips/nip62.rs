@@ -27,6 +27,28 @@ impl<'a> RelayIdentity<'a> {
             public_url,
         }
     }
+
+    /// The relay's canonical HTTP origin for NIP-98 URL matching: the
+    /// `public_url`'s scheme mapped to HTTP (`wss` -> `https`, `ws` ->
+    /// `http`, `nostr+` stripped) and its authority, or `http://host:port`
+    /// when no `public_url` is set (the server speaks plain HTTP directly).
+    pub(crate) fn http_origin(&self) -> String {
+        if self.public_url.trim().is_empty() {
+            return format!("http://{}", authority_of(self));
+        }
+        let scheme = self
+            .public_url
+            .split_once("://")
+            .map(|(s, _)| s.to_ascii_lowercase())
+            .map(|s| s.strip_prefix("nostr+").unwrap_or(&s).to_string());
+        let http = match scheme.as_deref() {
+            Some("ws") | Some("http") => "http",
+            // `wss`/`https` and any unknown scheme: the WebSocket public URL
+            // is TLS-terminated, so HTTP auth uses `https`.
+            _ => "https",
+        };
+        format!("{http}://{}", authority_of(self))
+    }
 }
 
 pub const VANISH_KIND: u64 = 62;

@@ -53,11 +53,11 @@ Author identifiers (`{npub1...}`) may also be given as a **64-hex pubkey** (case
 
 `GET /api/v1/{npub1...}/follows` — the author's latest follow list (kind 3, NIP-02; replaceable, so the newest event is the current list).
 
-`GET /api/v1/relay/kinds?limit=` — the most common kinds stored on the relay, sorted by count descending (`{"kinds": [{"kind": 1, "count": 12345}], "approximate": bool}`). The count walk examines at most 500,000 index entries; `approximate: true` when it was cut short.
+`GET /api/v1/relay/kinds?limit=` — the most common kinds stored on the relay, sorted by count descending (`{"kinds": [{"kind": 1, "count": 12345}], "approximate": bool}`). Counts are computed over a bounded sample of the newest events, filtered with the anonymous-connection visibility rules (protected, gift-wrap, owner-only and private-group events are excluded); `approximate: true` when the sample was cut short.
 
 ### Top authors and relay lists
 
-`GET /api/v1/relay/top-authors?limit=` — the most active authors on the relay, sorted by count descending (`{"authors": [{"pubkey": "<hex>", "count": 123}], "approximate": bool}`). The walk examines at most 500,000 index entries; `approximate: true` when it was cut short.
+`GET /api/v1/relay/top-authors?limit=` — the most active authors on the relay, sorted by count descending (`{"authors": [{"pubkey": "<hex>", "count": 123}], "approximate": bool}`). Like `relay/kinds`, counts come from the bounded, visibility-filtered sample; `approximate: true` when it was cut short.
 
 `GET /api/v1/{npub1...}/relays` — the author's latest NIP-65 relay list (kind 10002, replaceable — the newest event is the current list; the `r` tags carry the relay URLs).
 

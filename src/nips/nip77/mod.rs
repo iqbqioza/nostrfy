@@ -231,7 +231,11 @@ fn split_bound(a: &Item, b: &Item) -> Bound {
             .count();
     Bound {
         ts: b.0,
-        prefix: b.1[..=common].to_vec(),
+        // The prefix is the common bytes plus one (`common.min(31) + 1` ≤
+        // 32). Production data is deduplicated by event id, but `respond`
+        // is public: an identical adjacent pair would otherwise index
+        // `b.1[..=32]` out of bounds and panic.
+        prefix: b.1[..common.min(31) + 1].to_vec(),
     }
 }
 
@@ -243,6 +247,18 @@ mod tests {
         let mut bytes = [0u8; 32];
         bytes[31] = id;
         (ts, bytes)
+    }
+
+    #[test]
+    fn split_bound_tolerates_identical_items() {
+        // Production data is deduplicated by event id, but `respond` is
+        // public: an identical adjacent pair must not panic (the prefix is
+        // capped at 32 bytes).
+        let a = item(5, 7);
+        let b = item(5, 7);
+        let bound = split_bound(&a, &b);
+        assert_eq!(bound.ts, 5);
+        assert_eq!(bound.prefix.len(), 32, "the prefix is capped");
     }
 
     #[test]

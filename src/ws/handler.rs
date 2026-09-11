@@ -38,7 +38,7 @@ impl super::Conn {
         if kind == "EVENT"
             && let Ok((_, event)) = serde_json::from_str::<(String, Event)>(text)
         {
-            return self.queue_event_value(event).await;
+            return self.queue_event_sized(event, text.len()).await;
         }
         let Ok(value) = serde_json::from_str::<Value>(text) else {
             self.send_notice("error: invalid json");
@@ -99,8 +99,9 @@ impl super::Conn {
         }
     }
 
-    /// Queues an already-parsed event for batched acceptance.
-    pub(crate) async fn queue_event_value(&mut self, event: Event) {
+    /// Queues an already-parsed event for batched acceptance, counting the
+    /// frame's wire size against the per-connection pending-byte budget.
+    pub(crate) async fn queue_event_sized(&mut self, event: Event, size: usize) {
         self.events_received_local += 1;
         // Path-specific write policy (nostrfy): `/inbox` and `/outbox` are
         // restricted endpoints — see `write_policy_reason`.
@@ -109,11 +110,20 @@ impl super::Conn {
             self.send_ok(&event.id, false, &reason);
             return;
         }
+        self.pending_bytes = self.pending_bytes.saturating_add(size);
         // The connection loop queues the batch at the end of its sliding
         // window (and resolves it on a spawned task while reading keeps
         // going); a mid-window synchronous flush here would serialize the
         // connection on every commit.
         self.pending_events.push(event);
+    }
+
+    /// Queues an already-parsed event for batched acceptance when the wire
+    /// size is not known (tests and the generic `queue_event` path): the
+    /// event's serialized size is a close upper bound of the frame.
+    pub(crate) async fn queue_event_value(&mut self, event: Event) {
+        let size = serde_json::to_string(&event).map(|s| s.len()).unwrap_or(0);
+        self.queue_event_sized(event, size).await;
     }
 
     /// The write policy of the endpoint this connection is on:
@@ -217,14 +227,21 @@ impl super::Conn {
 
     /// Queues an EVENT message for batched acceptance (generic path).
     pub(crate) async fn queue_event(&mut self, rest: &[Value]) {
-        if rest.is_empty() {
+        let Some(value) = rest.first() else {
             self.send_notice("error: EVENT requires an event object");
             return;
-        }
-        let event: Event = match serde_json::from_value(rest[0].clone()) {
+        };
+        let event: Event = match serde_json::from_value(value.clone()) {
             Ok(event) => event,
             Err(_) => {
-                self.send_notice("error: invalid event object");
+                // NIP-01: every EVENT gets an OK. Correlate with the id when
+                // the malformed object still carries one, so the client can
+                // match the refusal to its publish.
+                if let Some(id) = value.get("id").and_then(Value::as_str) {
+                    self.send_ok(id, false, "invalid: malformed event");
+                } else {
+                    self.send_notice("error: invalid event object");
+                }
                 return;
             }
         };
@@ -237,6 +254,7 @@ impl super::Conn {
             return;
         }
         let events = std::mem::take(&mut self.pending_events);
+        self.pending_bytes = 0;
         let outcomes = self
             .relay
             .accept_events_batch(events, &self.authed_pubkeys)
@@ -248,8 +266,11 @@ impl super::Conn {
                 }
                 crate::db::PutOutcome::Ephemeral => {
                     // NIP-01: ephemeral kinds are delivered live but never
-                    // stored; the NIP-01 `mute:` prefix acknowledges this.
-                    self.send_ok(&id, true, "mute: ephemeral event not stored");
+                    // stored. The event was accepted (forwarded to the
+                    // current subscribers), so the OK is `true` with the
+                    // empty message the spec allows; `mute:` means "ignored"
+                    // and would contradict the acceptance.
+                    self.send_ok(&id, true, "");
                 }
                 crate::db::PutOutcome::Duplicate(msg) => {
                     self.send_ok(&id, true, &msg);
@@ -506,6 +527,9 @@ impl super::Conn {
             truncated_or_more: truncated || more,
             auth_hint: auth_hidden,
             sent_bytes: 0,
+            live: Default::default(),
+            live_bytes: 0,
+            eose_sent: false,
         });
     }
 
@@ -572,31 +596,39 @@ impl super::Conn {
     }
 
     pub(crate) async fn handle_auth(&mut self, rest: &[Value]) {
-        if !self.relay.config.read().await.nip_enabled(42) {
-            // NIP-42: client AUTH messages MUST be answered with OK, even
-            // when the relay does not support authentication. Correlate with
-            // the event id when one is present; otherwise fall back to NOTICE.
-            if let Some(event) = rest
-                .first()
-                .and_then(|v| serde_json::from_value::<Event>(v.clone()).ok())
-            {
-                self.send_control(nip42::ok(&event.id, false));
-            } else {
-                self.send_notice("error: authentication is not enabled on this relay");
-            }
-            return;
-        }
-        if rest.is_empty() {
+        let Some(value) = rest.first() else {
             self.send_notice("error: AUTH requires an event object");
             return;
-        }
-        let event: Event = match serde_json::from_value(rest[0].clone()) {
+        };
+        let event: Event = match serde_json::from_value(value.clone()) {
             Ok(event) => event,
             Err(_) => {
-                self.send_notice("error: invalid auth event");
+                // NIP-42: AUTH messages MUST be answered with OK, like any
+                // EVENT. Correlate with the id when the malformed event
+                // still carries one.
+                if let Some(id) = value.get("id").and_then(Value::as_str) {
+                    self.send_control(nip42::ok(id, false));
+                } else {
+                    self.send_notice("error: invalid auth event");
+                }
                 return;
             }
         };
+        if !self.relay.config.read().await.nip_enabled(42) {
+            // NIP-42: client AUTH messages MUST be answered with OK, even
+            // when the relay does not support authentication.
+            self.send_control(nip42::ok(&event.id, false));
+            return;
+        }
+        // NIP-01: event hex fields are lowercase. An uppercase pubkey would
+        // verify (its id and signature cover the original string) but then
+        // never match the exact-case author comparisons (NIP-70, /outbox,
+        // NIP-78), so reject it up front instead of authenticating a key the
+        // relay cannot actually use.
+        if event.pubkey != event.pubkey.to_ascii_lowercase() {
+            self.send_control(nip42::ok(&event.id, false));
+            return;
+        }
         let id = event.id.clone();
         let accepted = {
             let cfg = self.relay.config.read().await;
@@ -628,6 +660,16 @@ impl super::Conn {
         self.send_control(nip42::ok(&id, accepted));
     }
 
+    /// Refuses a COUNT request: NIP-45 requires a CLOSED message, and
+    /// CLOSED is terminal for the subscription id on the wire. A REQ
+    /// subscription of the same id must therefore be released too, or the
+    /// client would consider it closed while the relay kept delivering live
+    /// events for it. REQ namespace only (NIP-77 uses NEG-CLOSE).
+    fn reject_count(&mut self, sub_id: &str, reason: &str) {
+        self.send_closed(sub_id, reason);
+        self.remove_req_subscription(sub_id);
+    }
+
     pub(crate) async fn handle_count(&mut self, rest: &[Value]) {
         if rest.len() < 2 {
             self.send_notice("error: COUNT requires a subscription id and filters");
@@ -638,56 +680,56 @@ impl super::Conn {
             return;
         };
         if sub_id.is_empty() {
-            self.send_closed(sub_id, "invalid: subscription id must not be empty");
+            self.reject_count(sub_id, "invalid: subscription id must not be empty");
             return;
         }
         let max_sub_id_len = self.relay.config.read().await.limits.max_sub_id_len;
         if sub_id.len() > max_sub_id_len {
-            self.send_closed(sub_id, "invalid: subscription id too long");
+            self.reject_count(sub_id, "invalid: subscription id too long");
             return;
         }
         // NIP-45: refusals must be answered with a CLOSED message.
         if !self.relay.config.read().await.nip_enabled(45) {
-            self.send_closed(sub_id, "error: counting is not enabled on this relay");
+            self.reject_count(sub_id, "error: counting is not enabled on this relay");
             return;
         }
         if self.relay.config.read().await.relay.require_auth && !self.is_authed() {
-            self.send_closed(sub_id, "auth-required: please authenticate before counting");
+            self.reject_count(sub_id, "auth-required: please authenticate before counting");
             return;
         }
         if !self.access_allows_read().await {
-            self.send_closed(sub_id, "restricted: you are not allowed to count");
+            self.reject_count(sub_id, "restricted: you are not allowed to count");
             return;
         }
         let mut filters = Vec::new();
         for f in &rest[1..] {
             let mut f = f.clone();
             if crate::filter::rewrite_inbox_outbox(&mut f).is_err() {
-                self.send_closed(sub_id, "invalid: invalid filter");
+                self.reject_count(sub_id, "invalid: invalid filter");
                 return;
             }
             match serde_json::from_value::<Filter>(f) {
                 Ok(filter) => filters.push(filter),
                 Err(_) => {
-                    self.send_closed(sub_id, "invalid: invalid filter");
+                    self.reject_count(sub_id, "invalid: invalid filter");
                     return;
                 }
             }
         }
         // NIP-45: COUNT requires at least one filter.
         if filters.is_empty() {
-            self.send_closed(sub_id, "invalid: COUNT requires at least one filter");
+            self.reject_count(sub_id, "invalid: COUNT requires at least one filter");
             return;
         }
         if filters.iter().any(|f| f.too_many_members()) {
-            self.send_closed(
+            self.reject_count(
                 sub_id,
                 "invalid: too many ids, authors or kinds in a filter",
             );
             return;
         }
         if filters.iter().any(|f| f.invalid_tag_values()) {
-            self.send_closed(sub_id, "invalid: tag constraint values must be strings");
+            self.reject_count(sub_id, "invalid: tag constraint values must be strings");
             return;
         }
         // Cap the filter count like REQ: without it each filter would get its
@@ -695,7 +737,7 @@ impl super::Conn {
         // ~28k filters × 200k candidate examinations on the shared reader
         // thread (~1400x the full-scan budget).
         if filters.len() > self.relay.config.read().await.limits.max_filters {
-            self.send_closed(sub_id, "invalid: too many filters");
+            self.reject_count(sub_id, "invalid: too many filters");
             return;
         }
         let count_limit = self.relay.config.read().await.limits.max_count;
@@ -716,7 +758,7 @@ impl super::Conn {
             .await
         else {
             // A timed-out count must not be reported as zero.
-            self.send_closed(sub_id, "error: database timeout, please retry");
+            self.reject_count(sub_id, "error: database timeout, please retry");
             return;
         };
         // NIP-70/59/29: COUNT applies the same visibility rules as REQ, so
@@ -975,7 +1017,27 @@ impl super::Conn {
             out.push(',');
             out.push_str(event_json);
             out.push(']');
-            self.send(Message::Text(std::mem::take(&mut out).into()));
+            // NIP-01: EOSE is the boundary between a subscription's stored
+            // events and its real-time stream. While the subscription's
+            // stored response is still pumping, hold the live event in the
+            // pending response so it is queued after the EOSE; sending it
+            // directly would let it overtake the remaining stored events.
+            if let Some(idx) = self.pending_reqs.iter().position(|p| p.sub_id == sub_id) {
+                let size = out.len();
+                let pending = &mut self.pending_reqs[idx];
+                let over = pending.live.len() >= super::OUT_QUEUE_LIMIT
+                    || (self.out_queue_bytes > 0
+                        && pending.live_bytes.saturating_add(size) > self.out_queue_bytes);
+                if over {
+                    self.dropped += 1;
+                    self.relay.stats.bump(&self.relay.stats.buffers_dropped, 1);
+                } else {
+                    pending.live_bytes += size;
+                    pending.live.push_back(std::mem::take(&mut out));
+                }
+            } else {
+                self.send(Message::Text(std::mem::take(&mut out).into()));
+            }
         }
     }
 }

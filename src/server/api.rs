@@ -3,6 +3,7 @@
 //! Provides a read-only JSON API for querying stored events by npub1,
 //! nevent1, or naddr1 identifiers.  Only `GET` is supported.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::Json;
@@ -19,7 +20,7 @@ use crate::nips::{nip29, nip62, nip70, nip78};
 use crate::relay::Relay;
 use crate::util::unix_now;
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default)]
 pub struct ApiParams {
     pub limit: Option<usize>,
     pub since: Option<u64>,
@@ -42,9 +43,7 @@ pub struct ApiParams {
     /// Generic query filters (`/api/v1/query` and `/api/v1/count`):
     /// accepted as a single value, comma-separated values, or repeated
     /// parameters (`authors=a&authors=b`).
-    #[serde(default, deserialize_with = "de_string_list")]
     pub authors: Vec<String>,
-    #[serde(default, deserialize_with = "de_u64_list")]
     pub kinds: Vec<u64>,
     /// Daily and hourly counts: the date to report. `year` (default: the
     /// current year), `month` 1-12 (default: the current month) and `day`
@@ -55,6 +54,74 @@ pub struct ApiParams {
     pub day: Option<u32>,
 }
 
+/// Manual `Deserialize` instead of `#[derive(Deserialize)]`: an
+/// `application/x-www-form-urlencoded` query may repeat a key
+/// (`authors=a&authors=b`), and the derive's struct visitor rejects the
+/// duplicate (`duplicate field 'authors'`) before the field's own
+/// deserializer can merge the values. This visitor accumulates repeated
+/// `authors`/`kinds` values and lets a repeated scalar key overwrite the
+/// earlier one. Value syntax is unchanged: a string (`authors` split on
+/// commas) or an array of strings, `kinds` entries parsing as unsigned
+/// integers, scalars parsed by their field types.
+impl<'de> Deserialize<'de> for ApiParams {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct ApiParamsVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for ApiParamsVisitor {
+            type Value = ApiParams;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("API query parameters")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<ApiParams, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut params = ApiParams::default();
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "limit" => params.limit = Some(map.next_value()?),
+                        "since" => params.since = Some(map.next_value()?),
+                        "until" => params.until = Some(map.next_value()?),
+                        "search" => params.search = Some(map.next_value()?),
+                        "e" => params.e = Some(map.next_value()?),
+                        "p" => params.p = Some(map.next_value()?),
+                        "t" => params.t = Some(map.next_value()?),
+                        "d" => params.d = Some(map.next_value()?),
+                        "sort" => params.sort = Some(map.next_value()?),
+                        "offset" => params.offset = Some(map.next_value()?),
+                        "no_p" => params.no_p = Some(map.next_value()?),
+                        "no_e" => params.no_e = Some(map.next_value()?),
+                        "no_t" => params.no_t = Some(map.next_value()?),
+                        "no_d" => params.no_d = Some(map.next_value()?),
+                        "year" => params.year = Some(map.next_value()?),
+                        "month" => params.month = Some(map.next_value()?),
+                        "day" => params.day = Some(map.next_value()?),
+                        "authors" => {
+                            let value: StringList = map.next_value()?;
+                            params.authors.extend(value.0);
+                        }
+                        "kinds" => {
+                            let value: U64List = map.next_value()?;
+                            params.kinds.extend(value.0);
+                        }
+                        _ => {
+                            let _ = map.next_value::<serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(params)
+            }
+        }
+
+        deserializer.deserialize_map(ApiParamsVisitor)
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct ApiResponse {
     pub events: Vec<Value>,
@@ -62,47 +129,98 @@ pub struct ApiResponse {
     pub more: bool,
 }
 
-/// Deserializes a list parameter that may arrive as a single value, a
-/// comma-separated value, or a repeated parameter.
-fn de_string_list<'de, D>(de: D) -> Result<Vec<String>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = serde_json::Value::deserialize(de)?;
-    let parts: Vec<&str> = match &value {
-        Value::String(s) => s.split(',').collect(),
-        Value::Array(items) => items
-            .iter()
-            .map(|i| {
-                i.as_str()
-                    .ok_or_else(|| serde::de::Error::custom("expected a string"))
-            })
-            .collect::<Result<Vec<_>, _>>()?,
-        _ => {
-            return Err(serde::de::Error::custom(
-                "expected a string or array of strings",
-            ));
+/// A comma-separated string or an array of strings, for `authors`.
+struct StringList(Vec<String>);
+
+impl<'de> Deserialize<'de> for StringList {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct ListVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for ListVisitor {
+            type Value = StringList;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a string or an array of strings")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<StringList, E> {
+                Ok(StringList(
+                    value
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|p| !p.is_empty())
+                        .map(str::to_string)
+                        .collect(),
+                ))
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<StringList, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let mut out = Vec::new();
+                while let Some(value) = seq.next_element::<String>()? {
+                    let value = value.trim();
+                    if !value.is_empty() {
+                        out.push(value.to_string());
+                    }
+                }
+                Ok(StringList(out))
+            }
         }
-    };
-    Ok(parts
-        .into_iter()
-        .map(|p| p.trim().to_string())
-        .filter(|p| !p.is_empty())
-        .collect())
+
+        deserializer.deserialize_any(ListVisitor)
+    }
 }
 
-/// Like [`de_string_list`] but for unsigned integers.
-fn de_u64_list<'de, D>(de: D) -> Result<Vec<u64>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    de_string_list(de)?
-        .into_iter()
-        .map(|s| {
-            s.parse::<u64>()
-                .map_err(|_| serde::de::Error::custom("expected an unsigned integer"))
-        })
-        .collect()
+/// An unsigned integer, a comma-separated string of them, or an array, for
+/// `kinds`.
+struct U64List(Vec<u64>);
+
+impl<'de> Deserialize<'de> for U64List {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct ListVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for ListVisitor {
+            type Value = U64List;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("an unsigned integer, a comma-separated string of them, or an array")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<U64List, E> {
+                let parsed = value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|p| !p.is_empty())
+                    .map(|p| {
+                        p.parse::<u64>()
+                            .map_err(|_| E::custom("expected an unsigned integer"))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(U64List(parsed))
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<U64List, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let mut out = Vec::new();
+                while let Some(value) = seq.next_element::<u64>()? {
+                    out.push(value);
+                }
+                Ok(U64List(out))
+            }
+        }
+
+        deserializer.deserialize_any(ListVisitor)
+    }
 }
 
 fn error_response(status: StatusCode, message: &str) -> (StatusCode, Json<Value>) {
@@ -546,13 +664,17 @@ pub async fn api_monthly_handler(
                 Json(json!({ "error": "server is busy, try again shortly" })),
             );
         };
-        let start = month_start(y, m);
-        let end = month_start_of_next(y, m);
+        // NIP-01 `since`/`until` bound the counts too, not just the month
+        // list: intersect each month window with the requested range, or an
+        // event before `since` in the first month (after `until` in the
+        // last) would be counted.
+        let start = month_start(y, m).max(since);
+        let end = month_start_of_next(y, m).saturating_sub(1).min(until);
         let filter: Filter = serde_json::from_value(json!({
             "authors": [hex_pk],
             "kinds": [kind],
             "since": start,
-            "until": end.saturating_sub(1),
+            "until": end,
         }))
         .expect("static filter");
         let (events, more) = relay.db.api_count(vec![filter], count_limit, now).await;
@@ -1106,7 +1228,7 @@ pub async fn api_related_handler(
     };
     let mut replies = apply_params(
         Filter {
-            tags: std::collections::BTreeMap::from([("#e".to_string(), e_target)]),
+            tags: serde_json::Map::from_iter([("#e".to_string(), e_target)]),
             ..Default::default()
         },
         &params,
@@ -1122,7 +1244,7 @@ pub async fn api_related_handler(
         replies,
         apply_params(
             Filter {
-                tags: std::collections::BTreeMap::from([("#q".to_string(), json!(hex_id.clone()))]),
+                tags: serde_json::Map::from_iter([("#q".to_string(), json!(hex_id.clone()))]),
                 ..Default::default()
             },
             &params,
@@ -1178,15 +1300,48 @@ pub async fn api_follows_handler(
     .await
 }
 
+/// Bound on the number of newest events the relay-wide aggregate endpoints
+/// sample. The counts come from lightweight records (no content) filtered
+/// with the anonymous-connection visibility rules, so hidden events cannot
+/// leak their kind/author metadata; the bound also keeps one request from
+/// walking the whole store.
+const AGGREGATE_SAMPLE: usize = 20_000;
+
+/// Anonymous visibility of a lightweight aggregate record: the same
+/// NIP-70/NIP-59/NIP-78/NIP-29 rules as [`api_visible`], evaluated without
+/// loading the event content.
+fn aggregate_visible(item: &crate::db::NegItem, groups: &nip29::GroupStore, nip78: bool) -> bool {
+    // NIP-70: protected events are never served to anonymous readers.
+    if item.protected {
+        return false;
+    }
+    // NIP-59: gift wraps are withheld from anonymous readers (`Some` only
+    // for kind 1059).
+    if item.wrap_recipients.is_some() {
+        return false;
+    }
+    // NIP-78: application-specific events are owner-only while the AUTH
+    // gate is active.
+    if nip78 && item.app_specific {
+        return false;
+    }
+    // NIP-29: private/hidden group content is withheld from non-members.
+    if let Some(gid) = &item.gid
+        && !groups.visible_gid(gid, item.meta, None)
+    {
+        return false;
+    }
+    true
+}
+
 /// `GET /api/v1/relay/kinds`
 ///
 /// The most common event kinds stored on the relay: `{"kinds": [{"kind":
 /// 1, "count": 12345}, ...], "approximate": bool}` sorted by count
-/// descending. The count walk is bounded (`approximate: true` when it was
-/// cut short). Counts are raw store totals: withheld events (protected,
-/// gift wraps, NIP-78 owner data, private groups) are included because the
-/// index walk cannot apply per-connection visibility without fetching every
-/// event; per-author `kinds`/`query` endpoints remain visibility-filtered.
+/// descending. Counts are computed over a bounded sample of the newest
+/// events, filtered with the anonymous-connection visibility rules, so
+/// protected, gift-wrap, owner-only and private-group events never leak
+/// their kind metadata. `approximate` is true when the sample was cut short.
 pub async fn api_relay_kinds_handler(
     State(relay): State<Arc<Relay>>,
     Query(params): Query<ApiParams>,
@@ -1197,13 +1352,25 @@ pub async fn api_relay_kinds_handler(
             Json(json!({ "error": "server is busy, try again shortly" })),
         );
     };
-    let limit = params.limit.unwrap_or(20).min(100);
-    // The walk examines at most half a million index entries (bounded work
-    // on the dedicated API reader thread); `approximate` reports whether it
-    // was cut short.
-    const MAX_KEYS: usize = 500_000;
-    let (counts, more) = relay.db.kind_counts(MAX_KEYS).await;
+    let now = unix_now();
+    let Some((items, more)) = relay.db.api_neg_sample(AGGREGATE_SAMPLE, now).await else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "database timeout, please retry" })),
+        );
+    };
+    let nip78 = enabled_nip78_auth_active(&relay).await;
+    let mut counts: HashMap<u64, u64> = HashMap::new();
+    {
+        let groups = relay.groups.read().await;
+        for item in &items {
+            if aggregate_visible(item, &groups, nip78) {
+                *counts.entry(item.kind).or_default() += 1;
+            }
+        }
+    }
     drop(_permit);
+    let limit = params.limit.unwrap_or(20).min(100);
     let mut kinds: Vec<Value> = counts
         .into_iter()
         .map(|(kind, count)| json!({ "kind": kind, "count": count }))
@@ -1217,16 +1384,17 @@ pub async fn api_relay_kinds_handler(
     kinds.truncate(limit);
     (
         StatusCode::OK,
-        Json(json!({ "kinds": kinds, "approximate": more, "filtered": false })),
+        Json(json!({ "kinds": kinds, "approximate": more, "filtered": true })),
     )
 }
 
 /// `GET /api/v1/relay/top-authors`
 ///
 /// The most active authors on the relay: `{"authors": [{"pubkey": "<hex>",
-/// "count": 123}], "approximate": bool}` sorted by count descending. The
-/// walk is bounded (`approximate: true` when it was cut short). Like
-/// `relay/kinds`, counts are raw store totals including withheld events.
+/// "count": 123}], "approximate": bool}` sorted by count descending. Like
+/// `relay/kinds`, the counts come from the bounded, visibility-filtered
+/// sample, so hidden events never expose their authors. `approximate` is
+/// true when the sample was cut short.
 pub async fn api_top_authors_handler(
     State(relay): State<Arc<Relay>>,
     Query(params): Query<ApiParams>,
@@ -1237,13 +1405,28 @@ pub async fn api_top_authors_handler(
             Json(json!({ "error": "server is busy, try again shortly" })),
         );
     };
-    let limit = params.limit.unwrap_or(20).min(100);
-    const MAX_KEYS: usize = 500_000;
-    let (counts, more) = relay.db.author_counts(MAX_KEYS).await;
+    let now = unix_now();
+    let Some((items, more)) = relay.db.api_neg_sample(AGGREGATE_SAMPLE, now).await else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "database timeout, please retry" })),
+        );
+    };
+    let nip78 = enabled_nip78_auth_active(&relay).await;
+    let mut counts: HashMap<&str, u64> = HashMap::new();
+    {
+        let groups = relay.groups.read().await;
+        for item in &items {
+            if aggregate_visible(item, &groups, nip78) {
+                *counts.entry(item.pubkey.as_str()).or_default() += 1;
+            }
+        }
+    }
     drop(_permit);
+    let limit = params.limit.unwrap_or(20).min(100);
     let mut authors: Vec<Value> = counts
         .into_iter()
-        .map(|(pubkey, count)| json!({ "pubkey": hex::encode(pubkey), "count": count }))
+        .map(|(pubkey, count)| json!({ "pubkey": pubkey, "count": count }))
         .collect();
     authors.sort_by(|a, b| {
         b["count"]
@@ -1254,7 +1437,7 @@ pub async fn api_top_authors_handler(
     authors.truncate(limit);
     (
         StatusCode::OK,
-        Json(json!({ "authors": authors, "approximate": more, "filtered": false })),
+        Json(json!({ "authors": authors, "approximate": more, "filtered": true })),
     )
 }
 
@@ -1500,6 +1683,35 @@ mod tests {
     use super::*;
     use secp256k1::{Keypair, Secp256k1, XOnlyPublicKey};
     use tokio::sync::RwLock;
+
+    #[test]
+    fn repeated_query_params_are_merged() {
+        fn from_query(qs: &str) -> ApiParams {
+            let uri: axum::http::Uri = format!("/x?{qs}").parse().unwrap();
+            axum::extract::Query::<ApiParams>::try_from_uri(&uri)
+                .unwrap_or_else(|e| panic!("{qs}: {e}"))
+                .0
+        }
+        // Repeated keys merge (the documented form the derived visitor
+        // rejected with `duplicate field`).
+        let p = from_query("authors=a&authors=b&kinds=1&kinds=2");
+        assert_eq!(p.authors, vec!["a", "b"]);
+        assert_eq!(p.kinds, vec![1, 2]);
+        // Mixed single/comma/repeated forms merge too.
+        let p = from_query("authors=a,b&authors=c&kinds=1,2&kinds=3");
+        assert_eq!(p.authors, vec!["a", "b", "c"]);
+        assert_eq!(p.kinds, vec![1, 2, 3]);
+        // Scalars parse and unknown keys are ignored.
+        let p = from_query("limit=10&since=5&no_e=true&foo=bar");
+        assert_eq!(p.limit, Some(10));
+        assert_eq!(p.since, Some(5));
+        assert_eq!(p.no_e, Some(true));
+        // Invalid values stay rejected.
+        let uri = axum::http::Uri::from_static("/x?kinds=1,x");
+        assert!(axum::extract::Query::<ApiParams>::try_from_uri(&uri).is_err());
+        let uri = axum::http::Uri::from_static("/x?limit=abc");
+        assert!(axum::extract::Query::<ApiParams>::try_from_uri(&uri).is_err());
+    }
 
     use crate::db::DbClient;
     use crate::nips::nip01::sign;
@@ -1753,7 +1965,7 @@ mod tests {
         };
         let mut f = apply_params(
             Filter {
-                tags: std::collections::BTreeMap::from([("#e".to_string(), json!("target-id"))]),
+                tags: serde_json::Map::from_iter([("#e".to_string(), json!("target-id"))]),
                 ..Default::default()
             },
             &params,
@@ -2023,6 +2235,56 @@ mod tests {
                 !months.is_empty() && months.len() <= 2,
                 "the range must start at the visible event, not the hidden one: {resp}"
             );
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn monthly_respects_since_and_until_inside_months() {
+        // `since`/`until` bound the reported counts, not just the month
+        // list: an event before `since` in the first month (or after
+        // `until` in the last) must not be counted.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_relay().await;
+            let base = 1_700_000_000u64; // 2023-11-14
+            let (y, m) = month_of(base);
+            let start = month_start(y, m);
+            let pk = {
+                let ev = signed_note(relay.secp(), "before", start + 86400, vec![]);
+                let pk = ev.pubkey.clone();
+                assert_eq!(
+                    relay.db.put(ev, unix_now()).await,
+                    crate::db::PutOutcome::Stored
+                );
+                pk
+            };
+            for (content, at) in [
+                ("inside", start + 10 * 86400),
+                ("after", start + 20 * 86400),
+            ] {
+                let ev = signed_note(relay.secp(), content, at, vec![]);
+                assert_eq!(
+                    relay.db.put(ev, unix_now()).await,
+                    crate::db::PutOutcome::Stored
+                );
+            }
+            let (code, Json(resp)) = api_monthly_handler(
+                State(relay.clone()),
+                Path((pk, 1)),
+                Query(ApiParams {
+                    since: Some(start + 5 * 86400),
+                    until: Some(start + 15 * 86400),
+                    ..Default::default()
+                }),
+            )
+            .await;
+            assert_eq!(code, StatusCode::OK);
+            assert_eq!(
+                resp["total"], 1,
+                "only the event inside [since, until] may count: {resp}"
+            );
+            assert_eq!(resp["months"][0]["count"], 1, "{resp}");
             relay.db.shutdown();
         });
     }
@@ -2491,6 +2753,57 @@ mod tests {
     }
 
     #[test]
+    fn relay_aggregates_exclude_withheld_events() {
+        // The relay-wide aggregates must apply the anonymous visibility
+        // rules: protected events, gift wraps, owner-only NIP-78 data and
+        // private-group content must not leak their kind or author metadata.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_relay().await;
+            let now = unix_now();
+            let visible = signed_note(relay.secp(), "visible", now, vec![]);
+            // NIP-70 protected event: hidden from anonymous readers.
+            let mut protected = signed_note(relay.secp(), "secret", now - 1, vec![]);
+            protected.tags = vec![vec![crate::nips::nip70::PROTECTED_TAG.into()]];
+            protected.id = crate::nips::nip01::compute_id(&protected);
+            // NIP-59 gift wrap: hidden from anonymous readers.
+            let mut wrap = signed_note(relay.secp(), "wrap", now - 2, vec![]);
+            wrap.kind = crate::nips::nip62::GIFT_WRAP_KIND;
+            wrap.tags = vec![vec!["p".into(), "aa".repeat(32)]];
+            wrap.id = crate::nips::nip01::compute_id(&wrap);
+            for e in [&visible, &protected, &wrap] {
+                assert_eq!(
+                    relay.db.put(e.clone(), now).await,
+                    crate::db::PutOutcome::Stored
+                );
+            }
+
+            let (_, Json(resp)) =
+                api_relay_kinds_handler(State(relay.clone()), Query(ApiParams::default())).await;
+            let kinds = resp["kinds"].as_array().unwrap();
+            let kind1 = kinds.iter().find(|k| k["kind"] == 1).expect("kind 1");
+            assert_eq!(
+                kind1["count"], 1,
+                "the protected kind-1 event must not count: {kinds:?}"
+            );
+            assert!(
+                !kinds.iter().any(|k| k["kind"] == 1059),
+                "gift wraps must not appear in the kinds aggregate: {kinds:?}"
+            );
+
+            let (_, Json(resp)) =
+                api_top_authors_handler(State(relay.clone()), Query(ApiParams::default())).await;
+            let authors = resp["authors"].as_array().unwrap();
+            assert_eq!(authors.len(), 1, "only the visible author is listed");
+            assert_eq!(
+                authors[0]["count"], 1,
+                "protected and wrapped events must not count toward the author"
+            );
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
     fn month_arithmetic_roundtrips() {
         // 2026-08-01T00:00:00Z
         assert_eq!(month_start(2026, 8), 1_785_542_400);
@@ -2559,7 +2872,7 @@ mod tests {
                 Path((npub.clone(), 1u64)),
                 Query(ApiParams {
                     since: Some(aug1 - 31 * 86400),
-                    until: Some(aug1 + 60),
+                    until: Some(aug1 + 200),
                     ..Default::default()
                 }),
             )

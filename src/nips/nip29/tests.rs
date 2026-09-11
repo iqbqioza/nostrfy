@@ -241,6 +241,65 @@ fn apply_covers_parent_child_roles_pins_and_delete() {
 }
 
 #[test]
+fn parent_side_adoption_moves_the_child_from_its_old_parent() {
+    // NIP-29: the parent's `child` list and the child's `parent` tag are two
+    // sides of one link. An admin of both may adopt a child through the
+    // parent's 9002; the old parent's list must be updated too, or the two
+    // directions disagree (a one-way link).
+    let mut store = GroupStore::default();
+    let now = 1_600_000_000;
+    for gid in ["g1", "g2", "g3"] {
+        store.apply(
+            &event(CREATE_GROUP, ADMIN, Some(gid), vec![]),
+            "relay",
+            now,
+            false,
+            false,
+        );
+    }
+    // g3 declares g2 as its parent (the child side).
+    let under_g2 = event(
+        9002,
+        ADMIN,
+        Some("g3"),
+        vec![vec!["parent".into(), "g2".into()]],
+    );
+    store.apply(&under_g2, "relay", now, false, false);
+    assert_eq!(store.group("g3").unwrap().parent.as_deref(), Some("g2"));
+    assert!(
+        store
+            .group("g2")
+            .unwrap()
+            .children
+            .contains(&"g3".to_string())
+    );
+    // g1's admin adopts g3 through the parent side.
+    let adopt = event(
+        9002,
+        ADMIN,
+        Some("g1"),
+        vec![vec!["child".into(), "g3".into()]],
+    );
+    store.apply(&adopt, "relay", now, false, false);
+    assert_eq!(store.group("g3").unwrap().parent.as_deref(), Some("g1"));
+    assert!(
+        store
+            .group("g1")
+            .unwrap()
+            .children
+            .contains(&"g3".to_string())
+    );
+    assert!(
+        !store
+            .group("g2")
+            .unwrap()
+            .children
+            .contains(&"g3".to_string()),
+        "the old parent's child list must be cleared"
+    );
+}
+
+#[test]
 fn vanish_rebuild_recreates_membership_of_private_groups() {
     // ...
 }
@@ -383,6 +442,48 @@ fn restricted_groups() {
     let remove = event(9001, ADMIN, Some("g1"), vec![vec![P.into(), USER.into()]]);
     store.apply(&remove, "", 1, false, false);
     assert!(store.validate_write(&msg_by_user).is_err());
+}
+
+#[test]
+fn multiple_h_tags_are_rejected() {
+    // NIP-29: the `h` tag carries the group id. Accepting two `h` tags would
+    // let an event be validated against the first (e.g. an open group) while
+    // the stored tag index and subscriptions match the second (e.g. a
+    // restricted group), surfacing it in that group's feed.
+    let mut store = seeded();
+    // A second, unrestricted group as the "validated" face.
+    store.apply(
+        &event(CREATE_GROUP, ADMIN, Some("g2"), vec![]),
+        "",
+        1,
+        false,
+        false,
+    );
+    // Make g1 restricted: a lone write by USER to g1 must be rejected.
+    store.apply(
+        &event(9002, ADMIN, Some("g1"), vec![vec!["restricted".into()]]),
+        "",
+        1,
+        false,
+        false,
+    );
+    let mut multi = event(1, USER, Some("g2"), vec![]);
+    multi.tags.push(vec![H.to_string(), "g1".to_string()]);
+    let err = store.validate_write(&multi).unwrap_err();
+    assert!(
+        err.contains("only one h tag"),
+        "a second h tag must be rejected: {err}"
+    );
+    // The same event with only the restricted group's h tag is rejected by
+    // the restriction rule (not the tag-count rule).
+    let single = event(1, USER, Some("g1"), vec![]);
+    assert!(
+        store
+            .validate_write(&single)
+            .unwrap_err()
+            .contains("members"),
+        "the restricted group still gates non-members"
+    );
 }
 
 #[test]
@@ -937,9 +1038,8 @@ fn last_admin_cannot_be_demoted_or_removed() {
     // Removing the last admin with 9001: refused.
     let remove_last = event(9001, ADMIN, Some("g1"), vec![vec![P.into(), ADMIN.into()]]);
     assert!(store.validate_write(&remove_last).is_err());
-    // The last admin leaving: refused.
-    let leave = event(9022, ADMIN, Some("g1"), vec![]);
-    assert!(store.validate_write(&leave).is_err());
+    // A LEAVE is exempt from the retain-an-admin guard (NIP-29: any user
+    // may leave); see `any_member_can_leave_even_the_last_admin`.
     // Removing a non-last admin is fine.
     let grant2 = event(
         9000,
@@ -955,6 +1055,91 @@ fn last_admin_cannot_be_demoted_or_removed() {
         vec![vec![P.into(), ADMIN2.into()]],
     );
     assert!(store.validate_write(&remove2).is_ok());
+}
+
+#[test]
+fn any_member_can_leave_even_the_last_admin() {
+    // NIP-29: "Any user can send one of these events to the relay in order
+    // to be automatically removed from the group." There is no admin
+    // exception, so the last admin's LEAVE is honored; the group then has
+    // no admins (only the relay's own key can manage it).
+    let mut store = seeded();
+    let member_leave = event(LEAVE, OTHER, Some("g1"), vec![]);
+    assert!(store.validate_write(&member_leave).is_ok());
+    let admin_leave = event(LEAVE, ADMIN, Some("g1"), vec![]);
+    assert!(
+        store.validate_write(&admin_leave).is_ok(),
+        "the last admin's LEAVE must be honored"
+    );
+    store.apply(&admin_leave, "", 2, false, false);
+    assert!(!store.group("g1").unwrap().is_member(ADMIN));
+    assert!(!store.group("g1").unwrap().is_admin(ADMIN));
+    // With no admins left, no member can issue moderation events.
+    let demote = event(9000, USER, Some("g1"), vec![vec![P.into(), OTHER.into()]]);
+    assert!(store.validate_write(&demote).is_err());
+}
+
+#[test]
+fn deleting_a_group_removes_it_and_purges_its_events() {
+    // Group deletion (9008) remains the way to remove a group entirely; the
+    // relay purges its stored events.
+    let mut store = seeded();
+    let delete = event(DELETE_GROUP, ADMIN, Some("g1"), vec![]);
+    assert!(
+        store.validate_write(&delete).is_ok(),
+        "an admin can delete the group"
+    );
+    store.apply(&delete, "", 2, false, false);
+    assert!(store.group("g1").is_none(), "the group is removed");
+    // The id is tombstoned too: a plain write is blocked until a 9007.
+    let write = event(1, USER, Some("g1"), vec![]);
+    assert!(store.validate_write(&write).is_err());
+}
+
+#[test]
+fn relay_key_can_restore_an_adminless_group() {
+    // NIP-29 moderation events may come from the relay master key. After the
+    // last admin leaves, the operator can restore an admin by signing a 9000
+    // with `relay.private_key` (the NIP-11 `self` key).
+    let relay_pk = "ff".repeat(64);
+    let other_pk = "ee".repeat(64);
+    let mut store = seeded();
+    let leave = event(LEAVE, ADMIN, Some("g1"), vec![]);
+    assert!(store.validate_write(&leave).is_ok());
+    store.apply(&leave, "", 2, false, false);
+    assert!(!store.group("g1").unwrap().is_admin(ADMIN));
+    // A regular key cannot manage the group, with or without the relay-key
+    // path...
+    let grant_other = event(
+        9000,
+        &other_pk,
+        Some("g1"),
+        vec![vec![P.into(), OTHER.into(), "mod".into()]],
+    );
+    assert!(store.validate_write(&grant_other).is_err());
+    assert!(
+        store
+            .validate_write_for_relay(&grant_other, Some(&relay_pk))
+            .is_err(),
+        "a non-relay key must not get the master-key exemption"
+    );
+    // ...but the relay key can.
+    let grant_relay = event(
+        9000,
+        &relay_pk,
+        Some("g1"),
+        vec![vec![P.into(), OTHER.into(), "mod".into()]],
+    );
+    assert!(
+        store
+            .validate_write_for_relay(&grant_relay, Some(&relay_pk))
+            .is_ok(),
+        "the relay master key may restore an admin"
+    );
+    assert!(
+        store.validate_write(&grant_relay).is_err(),
+        "without the relay-key path the relay key is just another pubkey"
+    );
 }
 
 #[test]

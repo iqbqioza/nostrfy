@@ -454,7 +454,7 @@ max_upload_bytes = 20971520
 min_free_bytes = 33554432
 
 # S3-compatible storage settings (used when storage = "s3"):
-s3_endpoint = ""                 # e.g. "https://<account>.r2.cloudflarestorage.com"
+s3_endpoint = ""                 # https:// required (http:// only for loopback: 127.0.0.1/localhost/[::1])
 s3_region = ""                   # R2 uses "auto"; AWS uses e.g. "us-east-1"
 s3_bucket = ""                   # the "bucket" of bucket/{npub1}/{file}
 s3_access_key = ""

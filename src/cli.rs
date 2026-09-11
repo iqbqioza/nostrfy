@@ -896,7 +896,8 @@ fn open_db_env(cfg: &Config) -> Result<heed::Env> {
     // process exits.
     let env = unsafe {
         heed::EnvOpenOptions::new()
-            .max_dbs(cfg.database.max_dbs.max(16))
+            // 16 named tables, plus the word index when search is on.
+            .max_dbs(cfg.database.max_dbs.max(17))
             .max_readers(cfg.database.max_readers.max(8))
             .map_size(map_size as usize)
             .open(&cfg.database.path)?

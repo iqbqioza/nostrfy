@@ -151,22 +151,22 @@ impl SubscriptionIndex {
             out.extend(set.iter().copied());
         }
         // NIP-26: an event published under a valid delegation tag matches
-        // filters on the delegator's pubkey too (see `Filter::matches`),
-        // so those connections must be woken as well. Only well-formed
-        // delegation tags (exactly 4 elements, see `nip26::delegation`)
-        // count: a malformed tag of any other length must not wake the
-        // delegator's subscriptions.
-        for tag in &event.tags {
-            if tag.len() == 4
-                && tag[0] == "delegation"
-                && let Ok(bytes) = hex::decode(&tag[1])
-                && bytes.len() == 32
-            {
-                let mut delegator = [0u8; 32];
-                delegator.copy_from_slice(&bytes);
-                if let Some(set) = self.authors.get(&delegator) {
-                    out.extend(set.iter().copied());
-                }
+        // filters on the delegator's pubkey too (see `Filter::matches`), so
+        // those connections must be woken as well. Only the first well-formed
+        // delegation tag (exactly 4 elements, see `nip26::delegation`)
+        // counts: a malformed tag of any other length, or a second tag after
+        // the honored one, must not wake the delegator's subscriptions.
+        if let Some(tag) = event
+            .tags
+            .iter()
+            .find(|tag| tag.len() == 4 && tag[0] == "delegation")
+            && let Ok(bytes) = hex::decode(&tag[1])
+            && bytes.len() == 32
+        {
+            let mut delegator = [0u8; 32];
+            delegator.copy_from_slice(&bytes);
+            if let Some(set) = self.authors.get(&delegator) {
+                out.extend(set.iter().copied());
             }
         }
         // The index stores every `#`-prefixed tag constraint, single-letter
@@ -285,6 +285,30 @@ mod tests {
         );
         e.pubkey = "bb".repeat(32);
         assert!(index.candidates(&e).is_empty());
+        // Only the first well-formed delegation tag is honored: a second tag
+        // naming the subscribed delegator must not wake it.
+        let mut e = ev(
+            1,
+            vec![
+                vec![
+                    "delegation".into(),
+                    "cc".repeat(32),
+                    "kind=1".into(),
+                    "sig".into(),
+                ],
+                vec![
+                    "delegation".into(),
+                    "aa".repeat(32),
+                    "kind=1".into(),
+                    "sig".into(),
+                ],
+            ],
+        );
+        e.pubkey = "bb".repeat(32);
+        assert!(
+            index.candidates(&e).is_empty(),
+            "a second delegation tag must stay inert"
+        );
     }
 
     #[test]

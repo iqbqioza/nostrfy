@@ -73,11 +73,11 @@ pub struct Relay {
     /// preserved); fresh pubkeys alone are fail-open until old windows
     /// expire.
     publish_rate: std::sync::Mutex<HashMap<String, std::collections::VecDeque<u64>>>,
-    /// Bumped whenever the blocked-IP list changes (NIP-86 blockip/
-    /// unblockip): connections compare this against the value captured at
-    /// connect and re-check the list (and close) when it changed, so a
-    /// newly blocked IP's existing connections are dropped too.
-    pub ip_blocks_version: AtomicU64,
+    /// NIP-86 blockip/unblockip: every list change notifies each
+    /// connection's watcher, so established read-only subscribers (which
+    /// never send a frame) are disconnected too — a version counter could
+    /// only be observed on an inbound frame.
+    pub ip_blocks_tx: tokio::sync::watch::Sender<u64>,
     /// Bumped on every SIGHUP config reload: connections cache the NIP-40/
     /// NIP-42 flags against this version and refresh them only when it
     /// changes, so the hot live path never takes the shared config lock.
@@ -105,6 +105,10 @@ pub struct Relay {
     pub blossom_allow: Arc<tokio::sync::RwLock<Vec<String>>>,
     /// Rate-limited audit trail of the management operations (NIP-86).
     pub audit: crate::audit::AuditLog,
+    /// NIP-98 replay guard: every HTTP auth event authorizes exactly one
+    /// management request (a captured header must not be reusable within
+    /// its 60-second window).
+    pub nip98_replay: crate::nips::nip98::ReplayGuard,
 }
 
 /// Issues strictly increasing timestamps for relay-generated events.
@@ -133,10 +137,12 @@ impl StampClock {
     }
 
     /// Returns a timestamp strictly greater than every previously issued
-    /// stamp and at least `floor`. Issued stamps cap at `u64::MAX - 1`
-    /// (the last unique value: `min(u64::MAX - 2)` before the increment),
-    /// so the issued value can never collide with a previous one within
-    /// the reachable range.
+    /// stamp and at least `floor`, while values remain. The increment is
+    /// capped at `u64::MAX - 1` so it never overflows. Once that cap is
+    /// reached (unreachable in practice at one stamp per second) the clock
+    /// saturates and keeps returning the cap: strict monotonicity is
+    /// impossible beyond the last usable timestamp, but the clock never
+    /// regresses and never returns `u64::MAX`.
     pub(crate) fn stamp(&self, floor: u64) -> u64 {
         let mut cur = self.last.load(Ordering::Relaxed);
         loop {
@@ -340,7 +346,7 @@ impl Relay {
             api_limit: ApiLimiter::new(api_max_concurrent),
             per_ip_connections: std::sync::Mutex::new(HashMap::new()),
             publish_rate: std::sync::Mutex::new(HashMap::new()),
-            ip_blocks_version: AtomicU64::new(0),
+            ip_blocks_tx: tokio::sync::watch::channel(0).0,
             config_version: AtomicU64::new(0),
             key,
             relay_pubkey,
@@ -350,6 +356,7 @@ impl Relay {
             blossom: Arc::new(tokio::sync::RwLock::new(None)),
             blossom_allow: Arc::new(tokio::sync::RwLock::new(blossom_allow)),
             audit: crate::audit::AuditLog::default(),
+            nip98_replay: Default::default(),
         }
     }
 
@@ -600,10 +607,12 @@ impl Relay {
         self.key.is_some()
     }
 
-    /// Bumps the blocked-IP version so every connection re-checks the list
-    /// (and closes when its source IP is now blocked).
+    /// Notifies every connection that the blocked-IP list changed, so each
+    /// re-checks its source IP (and closes when it is now blocked).
     pub fn note_ip_blocks_changed(&self) {
-        self.ip_blocks_version.fetch_add(1, Ordering::Relaxed);
+        self.ip_blocks_tx.send_modify(|version| {
+            *version = version.wrapping_add(1);
+        });
     }
 
     /// Persists a runtime change of one `[relay]` config field (e.g. the
@@ -1121,6 +1130,16 @@ impl Relay {
                     .await;
                 self.stats.bump(&self.stats.events_deleted, removed as u64);
             }
+        }
+
+        if event.kind == nip29::DELETE_GROUP
+            && let Some(gid) = nip29::group_id(event)
+        {
+            // NIP-29: purge the deleted group's stored events. A fresh
+            // create on the same id installs a public group, which would
+            // otherwise expose the old (possibly private) history.
+            let removed = self.db.group_purge(gid.to_string()).await;
+            self.stats.bump(&self.stats.events_deleted, removed as u64);
         }
 
         for mut ev in generated {
@@ -1665,6 +1684,56 @@ mod tests {
     }
 
     #[test]
+    fn deleting_a_group_purges_its_stored_events() {
+        // NIP-29: a deleted group's stored events are purged, so re-creating
+        // the id (which installs a public group) cannot expose the old
+        // possibly-private history.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_relay().await;
+            let now = crate::util::unix_now();
+            let secp = secp256k1::Secp256k1::new();
+            let keypair = secp256k1::Keypair::from_seckey_slice(&secp, &[4u8; 32]).unwrap();
+            let pubkey = secp256k1::XOnlyPublicKey::from_keypair(&keypair)
+                .0
+                .to_string();
+            let signed = |kind: u64, content: &str| {
+                let mut e = crate::event::Event {
+                    id: String::new(),
+                    pubkey: pubkey.clone(),
+                    created_at: now,
+                    kind,
+                    tags: vec![vec!["h".into(), "g1".into()]],
+                    content: content.into(),
+                    sig: String::new(),
+                };
+                e.id = crate::nips::nip01::compute_id(&e);
+                let id = e.id_bytes().unwrap();
+                e.sig = secp.sign_schnorr_no_aux_rand(&id, &keypair).to_string();
+                e
+            };
+            // A stored group message (direct DB put: the purge is the target).
+            let msg = signed(1, "secret group message");
+            assert_eq!(relay.db.put(msg, now).await, crate::db::PutOutcome::Stored);
+            let create = signed(crate::nips::nip29::CREATE_GROUP, "");
+            assert!(matches!(
+                relay.accept_event(create, &[], None).await.0,
+                crate::db::PutOutcome::Stored
+            ));
+            let delete = signed(crate::nips::nip29::DELETE_GROUP, "");
+            assert!(matches!(
+                relay.accept_event(delete, &[], None).await.0,
+                crate::db::PutOutcome::Stored
+            ));
+            let f: crate::filter::Filter =
+                serde_json::from_value(serde_json::json!({"#h": ["g1"]})).unwrap();
+            let (res, _) = relay.db.query(vec![f], 10, now).await;
+            assert!(res.is_empty(), "the deleted group's events must be purged");
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
     fn stamp_clock_is_strictly_monotonic() {
         let clock = StampClock::new_with_last(0);
         let a = clock.stamp(100);
@@ -1675,6 +1744,19 @@ mod tests {
         assert!(b > a, "a lower floor must not lower the stamp");
         assert!(c > b && c >= 1000);
         assert!(d > c, "a zero floor must not lower the stamp");
+    }
+
+    #[test]
+    fn stamp_clock_saturates_without_regressing() {
+        // At the cap strict monotonicity is impossible (no larger value
+        // exists), but the clock must stay at the last usable stamp and
+        // never regress or return the reserved `u64::MAX`.
+        let clock = StampClock::new_with_last(u64::MAX - 1);
+        let a = clock.stamp(u64::MAX);
+        assert_eq!(a, u64::MAX - 1, "the cap is the last usable stamp");
+        let b = clock.stamp(u64::MAX);
+        assert_eq!(b, u64::MAX - 1, "saturated stamps stay at the cap");
+        assert_ne!(b, u64::MAX, "u64::MAX is never issued");
     }
 
     #[test]

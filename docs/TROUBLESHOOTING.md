@@ -189,7 +189,7 @@ When using Cloudflare Tunnel:
 
 ### 2-8. A NIP is missing from the NIP-11 `supported_nips` list
 
-**Cause**: The advertised list is dynamic — a NIP is hidden when all the kinds it defines are rejected: they are all in `blocked_kinds`, none of them is in `allowed_kinds`, or they are ephemeral kinds rejected by `reject_ephemeral` (only the exempt kinds `22242`, `27235`, `28934`/`28935`/`28936`, `24133`, `23194`/`23195`, `24242`, `21059` are forwarded). Runtime access changes via NIP-86 (`allowkind`/`disallowkind`) apply immediately; NIPs without dedicated kinds (11, 13, 26, 33, 40, 45, 50, 67, 70, 77, 86) are always advertised when enabled.
+**Cause**: The advertised list is dynamic — a NIP is hidden when all the kinds it defines are rejected: they are all in `blocked_kinds`, none of them is in `allowed_kinds`, or they are ephemeral kinds rejected by `reject_ephemeral` (only the exempt kinds `22242`, `27235`, `28934`/`28935`/`28936`, `24133`, `23194`/`23195`, `24242`, `21059` are forwarded). NIP-29/43/66 additionally require `relay.private_key` (their relay-signed events cannot be produced without it) and NIP-86 requires `rpc.management_token` or `rpc.admin_pubkey`. Runtime access changes via NIP-86 (`allowkind`/`disallowkind`) apply immediately; NIPs without dedicated kinds (11, 13, 26, 33, 40, 45, 50, 67, 70, 77) are always advertised when enabled.
 
 **Fix**: Check the active access lists — NIP-86 `listallowedkinds` shows the kind allowlist (use `disallowkind` to add a kind to the blocklist, `allowkind` to remove it), and `GET /` shows the effective `supported_nips` immediately. Remove the blocking kind or the `reject_ephemeral` setting, then `SIGHUP` or re-issue the NIP-86 call.
 
@@ -306,13 +306,29 @@ nostrfy search matches **whole words**. Note that:
 
 **Fix**: Ask an admin for an invite code (9009) and join with a `code` tag.
 
-### 4-6. Protected events are rejected with `auth-required`
+### 4-6. Accidentally left a group, or the group has no admins
+
+**Cause**: NIP-29 leave requests (kind 9022) are honored for any member — including the group's last admin, who leaves no admins behind. With no admin, nobody can send moderation events (9000/9001/9002/9008) anymore.
+
+**Fix**: Sign a moderation event with the relay's own key (`relay.private_key`, the pubkey advertised as NIP-11 `self`). Per NIP-29, moderation events may come from "the relay master key or ... group admins", so the relay accepts group moderation signed by its own key even when the group has no admins. For example, restore an admin with a `kind:9000`:
+
+```json
+{
+  "kind": 9000,
+  "pubkey": "<relay self pubkey>",
+  "tags": [["h", "<group-id>"], ["p", "<member-hex>", "admin"]]
+}
+```
+
+Sign and publish it with the relay key (e.g. via `nak`, `nostrfy`'s private key, or any client configured with that key). Alternatively, delete the group with a relay-signed `kind:9008` (its stored events are purged) and re-create it with `kind:9007`. This recovery needs `relay.private_key` to be configured: if it is empty, the relay has no master key and cannot sign moderation events.
+
+### 4-7. Protected events are rejected with `auth-required`
 
 **Cause**: NIP-70 protected events (with a `-` tag) may only be published by the authenticated author **on the same connection**.
 
 **Fix**: Enable NIP-42 auth in the client before publishing.
 
-### 4-7. AUTH (NIP-42) returns `false`
+### 4-8. AUTH (NIP-42) returns `false`
 
 Common causes:
 
@@ -320,7 +336,7 @@ Common causes:
 2. Stale challenge — you sent AUTH on a different connection, or reused an old challenge
 3. The client clock is off — the AUTH event's `created_at` must be within ±10 minutes of now
 
-### 4-8. NIP-86 management API returns `401 unauthorized`
+### 4-9. NIP-86 management API returns `401 unauthorized`
 
 **Cause**: Missing or wrong credentials.
 
@@ -333,14 +349,9 @@ Common causes:
 ---
 
 
-### 4-9. NIP-98 auth events are accepted with a different scheme or port
+### 4-10. NIP-98 auth events are rejected for a different scheme or port
 
-The NIP-98 spec says the `u` tag must be *exactly* the same as the absolute request URL. nostrfy deliberately tolerates two differences:
-
-- **scheme**: `wss://` / `https://` (and `ws://` / `http://`, including the `nostr+` variants) are treated as equivalent — this keeps NIP-98 auth working behind TLS-terminating proxies, which see `http` on their side while the client signs `https`
-- **default ports**: a `u` tag without a port is accepted when the relay listens on port 80 or 443
-
-The host, path and query must still match exactly, so the tolerance cannot be used to authorize a different resource.
+The NIP-98 spec says the `u` tag must be *exactly* the same as the absolute request URL, so nostrfy derives the expected URL from `relay.public_url`: its authority plus the HTTP scheme mapped from the WebSocket scheme (`wss://` -> `https://`, `ws://` -> `http://`, `nostr+` stripped). Without `public_url` the relay expects the plain `http://host:port` it serves. A tag with another scheme, a different/omitted port, or a different path or query is rejected — set `relay.public_url` to the public address clients sign. Each auth event is also **single-use**: replaying the same `Authorization` header within its 60-second validity window is refused.
 
 ---
 

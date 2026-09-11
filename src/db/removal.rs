@@ -2,8 +2,8 @@
 //! vanish and the NIP-40 expiration purge.
 
 use super::store::{
-    CREATED_LEN, ID_LEN, Store, created_key, delegated_by, dtag_key_safe, pubkey_key,
-    replaceable_key, tag_key,
+    CREATED_LEN, ID_LEN, Store, created_key, delegated_by, deleted_address_key, dtag_key_safe,
+    pubkey_key, replaceable_key, tag_key,
 };
 use crate::error::Result;
 use crate::event::Event;
@@ -115,6 +115,19 @@ impl Store {
             if pubkey.len() != ID_LEN {
                 continue;
             }
+            // NIP-09: tombstone the address up to the request's created_at,
+            // so a later re-publication of an older version cannot resurrect
+            // it (the per-id tombstones below only cover the versions that
+            // exist right now). Merge with an existing tombstone by keeping
+            // the furthest cut.
+            let akey = deleted_address_key(address.kind, &pubkey, &address.d);
+            let cut = match self.deleted.get(&wtxn, &akey)? {
+                Some(old) if old.len() >= CREATED_LEN => {
+                    request_created.max(u64::from_be_bytes(old[..CREATED_LEN].try_into().unwrap()))
+                }
+                _ => request_created,
+            };
+            self.deleted.put(&mut wtxn, &akey, &cut.to_be_bytes())?;
             let start = replaceable_key(address.kind, &pubkey, "");
             let end = replaceable_key(address.kind.saturating_add(1), &pubkey, "");
             let mut last_key: Option<Vec<u8>> = None;
@@ -210,72 +223,44 @@ impl Store {
         }
         Ok(out)
     }
-    /// Counts events per kind by walking the `by_kind` index in key order
-    /// (kind-major: every event of kind 0 first, then kind 1, ...), examining
-    /// at most `max_keys` entries. `more` is true when the walk was cut short
-    /// (the counts then cover the lowest-numbered kinds only). Returns
-    /// `(kind, count)` pairs in ascending kind order.
-    pub(crate) fn kind_counts(&self, max_keys: usize) -> Result<(Vec<(u64, u64)>, bool)> {
-        let rtxn = self.env.read_txn()?;
-        let mut counts: Vec<(u64, u64)> = Vec::new();
-        let mut examined = 0usize;
-        let mut more = false;
-        for item in self.by_kind.iter(&rtxn)? {
-            let (key, _) = item?;
-            if key.len() >= 8 {
-                let kind = u64::from_be_bytes(key[..8].try_into().expect("8-byte kind prefix"));
-                match counts.last_mut() {
-                    Some((k, c)) if *k == kind => *c += 1,
-                    _ => counts.push((kind, 1)),
-                }
-            }
-            examined += 1;
-            if examined >= max_keys {
-                more = true;
+    /// NIP-29: deletes every stored event tagged with the deleted group
+    /// `gid` (the `h` tag). A fresh create on the same id installs a public
+    /// group, so without the purge the old (possibly private) history would
+    /// suddenly be served under the new settings.
+    pub(crate) fn purge_group(&self, gid: &str) -> Result<usize> {
+        self.disk_full_error()?;
+        let mut wtxn = self.env.write_txn()?;
+        let start = tag_key(b'h', gid.as_bytes(), 0, &[0u8; ID_LEN]);
+        let end = tag_key(b'h', gid.as_bytes(), u64::MAX, &[0xffu8; ID_LEN]);
+        let mut last_key: Option<Vec<u8>> = None;
+        let mut removed = 0usize;
+        loop {
+            let lower = match &last_key {
+                Some(k) => std::ops::Bound::Excluded(k.as_slice()),
+                None => std::ops::Bound::Included(start.as_slice()),
+            };
+            let entries: Vec<(Vec<u8>, Vec<u8>)> = self
+                .by_tag
+                .range(&wtxn, &(lower, std::ops::Bound::Excluded(end.as_slice())))?
+                .filter_map(|item| {
+                    item.ok()
+                        .map(|(k, _)| (k.to_vec(), k[k.len() - ID_LEN..].to_vec()))
+                })
+                .take(REMOVAL_CHUNK)
+                .collect();
+            if entries.is_empty() {
                 break;
             }
-        }
-        Ok((counts, more))
-    }
-
-    /// Counts events per author by walking the `by_pubkey` index in key
-    /// order (pubkey-major), examining at most `max_keys` entries. `more`
-    /// is true when the walk was cut short. Returns `(pubkey, count)` pairs
-    /// in ascending pubkey order.
-    ///
-    /// Each event counts once: NIP-26 delegated events carry a second index
-    /// entry under the delegator, which is skipped when the event id was
-    /// already counted (attributed to the first pubkey in walk order).
-    pub(crate) fn author_counts(&self, max_keys: usize) -> Result<(crate::db::AuthorCounts, bool)> {
-        let rtxn = self.env.read_txn()?;
-        let mut counts: crate::db::AuthorCounts = Vec::new();
-        let mut seen: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
-        let mut examined = 0usize;
-        let mut more = false;
-        for item in self.by_pubkey.iter(&rtxn)? {
-            let (key, _) = item?;
-            if key.len() >= ID_LEN {
-                let pubkey = key[..ID_LEN].to_vec();
-                let id: Option<[u8; 32]> = key
-                    .get(ID_LEN + CREATED_LEN..ID_LEN + CREATED_LEN + ID_LEN)
-                    .and_then(|s| s.try_into().ok());
-                // Skip the NIP-26 delegator duplicate of an already-counted
-                // event (same id under a second pubkey).
-                let duplicate = id.is_some_and(|id| !seen.insert(id));
-                if !duplicate {
-                    match counts.last_mut() {
-                        Some((p, c)) if *p == pubkey => *c += 1,
-                        _ => counts.push((pubkey, 1)),
-                    }
+            last_key = Some(entries.last().unwrap().0.clone());
+            for (_, id) in entries {
+                if self.events.get(&wtxn, &id)?.is_some() {
+                    self.remove_event(&mut wtxn, &id)?;
+                    removed += 1;
                 }
             }
-            examined += 1;
-            if examined >= max_keys {
-                more = true;
-                break;
-            }
         }
-        Ok((counts, more))
+        wtxn.commit()?;
+        Ok(removed)
     }
 
     /// NIP-62: deletes every event authored by `pubkey` (including NIP-09
@@ -291,7 +276,9 @@ impl Store {
         // NIP-62: the request deletes the pubkey's history *until its
         // `.created_at`* — events published (timestamped) after the request
         // are not covered by it.
-        let end = pubkey_key(pubkey, until_created, &[0xffu8; ID_LEN]);
+        // Exclusive `(until + 1, 0..)`: covers every event with
+        // `created_at <= until`, including the maximal id at exactly `until`.
+        let end = pubkey_key(pubkey, until_created.saturating_add(1), &[0u8; ID_LEN]);
         let mut last_key: Option<Vec<u8>> = None;
         loop {
             let lower = match &last_key {
@@ -455,9 +442,10 @@ impl Store {
         let since_key = created_key(0, &[0u8; ID_LEN]);
         // NIP-40 semantics are `expiration < now` (every other path checks
         // `exp < now`): the purge must not delete events whose expiration
-        // equals the current second, so the upper bound steps one second
-        // below `now`.
-        let until_key = created_key(now.saturating_sub(1), &[0xffu8; ID_LEN]);
+        // equals the current second. The exclusive `(now, 0..)` upper bound
+        // covers every expiration below `now` (including the maximal id at
+        // exactly `now - 1`).
+        let until_key = created_key(now, &[0u8; ID_LEN]);
         let mut last_key: Option<Vec<u8>> = None;
         let mut removed = 0usize;
         loop {
@@ -481,10 +469,15 @@ impl Store {
                 break;
             }
             last_key = Some(entries.last().unwrap().0.clone());
-            for (_, id) in entries {
+            for (key, id) in entries {
                 if self.events.get(&wtxn, &id)?.is_some() {
                     self.remove_event(&mut wtxn, &id)?;
                     removed += 1;
+                } else {
+                    // The event is already gone (removed outside the normal
+                    // path or corrupt data): drop the orphaned expiry key
+                    // too, or every purge would re-examine it forever.
+                    self.expiry.delete(&mut wtxn, &key)?;
                 }
             }
         }

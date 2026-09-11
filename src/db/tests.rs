@@ -213,6 +213,55 @@ fn deletion_by_address_and_author() {
 }
 
 #[test]
+fn deleted_address_rejects_older_republication() {
+    // NIP-09: an `a`-tag deletion must stop the relay from publishing older
+    // versions of the address afterwards ("stop publishing any referenced
+    // events"). The per-id tombstones only cover the versions present at
+    // deletion time; the address tombstone covers any later older version.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let pk = "0000000000000000000000000000000000000000000000000000000000000000";
+        let d = vec![vec!["d".to_string(), "post-1".to_string()]];
+        let v1 = event(30023, "v1", now - 10, d.clone());
+        assert_eq!(db.put(v1.clone(), now).await, PutOutcome::Stored);
+        let address = crate::nips::nip09::Address {
+            kind: 30023,
+            pubkey: pk.into(),
+            d: "post-1".into(),
+        };
+        assert_eq!(
+            db.apply_deletion(vec![], vec![address], Some(pk.into()), now)
+                .await,
+            1
+        );
+
+        // The deleted version stays deleted...
+        assert_eq!(db.put(v1.clone(), now).await, PutOutcome::PreviouslyDeleted);
+        // ...and so does any other version timestamped up to the request.
+        let older = event(30023, "older", now - 20, d.clone());
+        assert_eq!(db.put(older, now).await, PutOutcome::PreviouslyDeleted);
+        let equal = event(30023, "equal", now, d.clone());
+        assert_eq!(db.put(equal, now).await, PutOutcome::PreviouslyDeleted);
+        // A version timestamped after the request is admitted: the deletion
+        // only covers history up to its own created_at.
+        let newer = event(30023, "newer", now + 10, d);
+        assert_eq!(db.put(newer, now).await, PutOutcome::Stored);
+    });
+    db.shutdown();
+}
+
+#[test]
 fn deletion_by_address_with_empty_d() {
     // NIP-09 `a`-tag deletion of a *replaceable* event (kind 0/3, empty `d`)
     // must work: the replaceable slot key is kind(8)+pubkey(32)+dlen(4)+d(0)
@@ -608,6 +657,59 @@ fn ids_filter_checks_every_id_regardless_of_limit() {
 }
 
 #[test]
+fn ids_filter_limit_returns_the_newest() {
+    // NIP-01: `limit: n` selects the last n events ordered by `created_at`,
+    // not the first n entries of the `ids` array. The events database is
+    // keyed by id, so the ids path must sort its candidates by created_at
+    // before the limit cuts them. A later filter also keeps its own quota
+    // after the ids filter fills up.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let old = event(1, "old", now - 10, vec![]);
+        let new = event(1, "new", now, vec![]);
+        for ev in [&old, &new] {
+            assert_eq!(db.put(ev.clone(), now).await, PutOutcome::Stored);
+        }
+        // The older id comes first in the filter: the newer event must win.
+        let f: Filter = serde_json::from_value(serde_json::json!({
+            "ids": [old.id, new.id],
+            "limit": 1
+        }))
+        .unwrap();
+        let (res, _) = db.query(vec![f], 500, now).await;
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].id, new.id, "the newest id must win the limit");
+
+        // The ids filter's quota does not abort a later filter.
+        let k7 = event(7, "kind 7", now - 5, vec![]);
+        assert_eq!(db.put(k7.clone(), now).await, PutOutcome::Stored);
+        let f: Vec<Filter> = serde_json::from_value(serde_json::json!([
+            {"ids": [old.id, new.id], "limit": 1},
+            {"kinds": [7], "limit": 1}
+        ]))
+        .unwrap();
+        let (res, _) = db.query(f, 500, now).await;
+        let ids: Vec<String> = res.iter().map(|e| e.id.clone()).collect();
+        assert_eq!(res.len(), 2);
+        assert!(ids.contains(&new.id));
+        assert!(ids.contains(&k7.id));
+        assert!(!ids.contains(&old.id), "the older id is over quota");
+    });
+    db.shutdown();
+}
+
+#[test]
 fn nip28_channel_queries_use_e_tag_index() {
     // NIP-28 channel messages reference their channel with an `e` tag; the
     // generic tag index must serve `{"#e": [channel_id]}` queries.
@@ -725,11 +827,11 @@ fn store_blossom_mapping_lifecycle() {
 }
 
 #[test]
-fn all_values_of_a_single_letter_tag_are_indexed() {
-    // NIP-01: the filter match is "at least one item in common" over all
-    // tag values, so a stored query for the SECOND value of a same-name
-    // tag pair must find the event exactly like the live path does. Only
-    // single-letter names are indexed (the spec's indexing convention).
+fn only_first_value_of_a_single_letter_tag_is_indexed() {
+    // NIP-01: "Only the first value in any given tag is indexed." A filter
+    // matching the second value of a same-name tag must not find the event,
+    // matching the live path (`Filter::matches`). Only single-letter names
+    // are indexed (the spec's indexing convention).
     let db = DbClient::open(
         &config(),
         true,
@@ -750,28 +852,56 @@ fn all_values_of_a_single_letter_tag_are_indexed() {
             vec![vec!["e".into(), "aa".repeat(32), "bb".repeat(32)]],
         );
         assert_eq!(db.put(ev.clone(), now).await, PutOutcome::Stored);
-        for value in ["aa".repeat(32).as_str(), "bb".repeat(32).as_str()] {
+        let f: Filter =
+            serde_json::from_value(serde_json::json!({ "kinds": [1], "#e": ["aa".repeat(32)] }))
+                .unwrap();
+        let (res, _) = db.query(vec![f], 500, now).await;
+        assert_eq!(res.len(), 1, "the first tag value must be indexed");
+        assert_eq!(res[0].id, ev.id);
+        let f: Filter =
+            serde_json::from_value(serde_json::json!({ "kinds": [1], "#e": ["bb".repeat(32)] }))
+                .unwrap();
+        let (res, _) = db.query(vec![f], 500, now).await;
+        assert!(res.is_empty(), "the second tag value must not be indexed");
+
+        // Several same-name tags: every tag contributes its own first value.
+        let multi = event(
+            1,
+            "two tags",
+            now,
+            vec![
+                vec!["e".into(), "cc".repeat(32), "dd".repeat(32)],
+                vec!["e".into(), "ee".repeat(32)],
+            ],
+        );
+        assert_eq!(db.put(multi.clone(), now).await, PutOutcome::Stored);
+        for value in ["cc".repeat(32), "ee".repeat(32)] {
             let f: Filter =
                 serde_json::from_value(serde_json::json!({ "kinds": [1], "#e": [value] })).unwrap();
             let (res, _) = db.query(vec![f], 500, now).await;
             assert_eq!(
                 res.len(),
                 1,
-                "the event must be found via every value of the tag"
+                "each same-name tag's first value must be indexed"
             );
-            assert_eq!(res[0].id, ev.id);
         }
-        // Removing the event removes every value's index entry: a later
-        // query for the second value returns nothing.
+        let f: Filter =
+            serde_json::from_value(serde_json::json!({ "kinds": [1], "#e": ["dd".repeat(32)] }))
+                .unwrap();
+        let (res, _) = db.query(vec![f], 500, now).await;
+        assert!(res.is_empty(), "a trailing tag value must not be indexed");
+
+        // Removing the event removes the index entries: a later query for
+        // the first value returns nothing.
         db.apply_deletion(vec![ev.id.clone()], vec![], Some(ev.pubkey.clone()), now)
             .await;
         let f: Filter =
-            serde_json::from_value(serde_json::json!({ "kinds": [1], "#e": ["bb".repeat(32)] }))
+            serde_json::from_value(serde_json::json!({ "kinds": [1], "#e": ["aa".repeat(32)] }))
                 .unwrap();
         let (res, _) = db.query(vec![f], 500, now).await;
         assert!(
             res.is_empty(),
-            "deleted events must not be served via any tag value"
+            "deleted events must not be served via their tag index"
         );
     });
     db.shutdown();
@@ -965,11 +1095,126 @@ fn overlong_index_components_do_not_poison_the_batch() {
         let f: Filter = serde_json::from_value(serde_json::json!({"kinds": [1]})).unwrap();
         let (res, _) = db.query(vec![f], 500, now).await;
         assert_eq!(res.len(), 3);
-        // The long tag value is not indexed, so a filter for it matches nothing.
+        // The long tag value is not indexed, but the scan falls back to the
+        // time-range match, so the filter still finds the event.
         let f: Filter = serde_json::from_value(serde_json::json!({"#t": [long_tag]})).unwrap();
         let (res, _) = db.query(vec![f], 500, now).await;
-        assert!(res.is_empty());
+        assert_eq!(
+            res.len(),
+            1,
+            "an over-long tag value must match via the scan fallback"
+        );
+        assert_eq!(res[0].id, e_long_tag.id);
     });
+}
+
+#[test]
+fn non_alphanumeric_tag_names_fall_back_to_the_scan() {
+    // Only single-letter ASCII-alphanumeric tag names are indexed; `#_` (and
+    // other non-alphanumeric names) must still match through the time-range
+    // scan so stored results agree with live delivery.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let ev = event(1, "underscore tag", now, vec![vec!["_".into(), "v".into()]]);
+        assert_eq!(db.put(ev.clone(), now).await, PutOutcome::Stored);
+        let f: Filter = serde_json::from_value(serde_json::json!({"#_": ["v"]})).unwrap();
+        let (res, _) = db.query(vec![f], 500, now).await;
+        assert_eq!(
+            res.len(),
+            1,
+            "a non-indexed tag name must be found by the scan"
+        );
+        assert_eq!(res[0].id, ev.id);
+    });
+    db.shutdown();
+}
+
+#[test]
+fn until_bound_includes_the_maximal_id() {
+    // An event with `created_at == until` and the maximal id (`ff..ff`) sits
+    // exactly on the old exclusive upper bound and used to be dropped.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let mut ev = event(1, "max id at until", now, vec![]);
+        ev.id = "ff".repeat(32);
+        assert_eq!(db.put(ev.clone(), now).await, PutOutcome::Stored);
+        let f: Filter = serde_json::from_value(serde_json::json!({"until": now})).unwrap();
+        let (res, _) = db.query(vec![f], 500, now).await;
+        assert_eq!(res.len(), 1, "the maximal id at `until` must be included");
+        assert_eq!(res[0].id, ev.id);
+        // One second earlier excludes it.
+        let f: Filter = serde_json::from_value(serde_json::json!({"until": now - 1})).unwrap();
+        let (res, _) = db.query(vec![f], 500, now).await;
+        assert!(res.is_empty(), "the event is newer than the bound");
+    });
+    db.shutdown();
+}
+
+#[test]
+fn group_purge_removes_only_that_groups_events() {
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let g1 = event(
+            1,
+            "g1 message",
+            now,
+            vec![vec!["h".into(), "group-1".into()]],
+        );
+        let g2 = event(
+            1,
+            "g2 message",
+            now - 1,
+            vec![vec!["h".into(), "group-2".into()]],
+        );
+        let plain = event(1, "no group", now - 2, vec![]);
+        for e in [&g1, &g2, &plain] {
+            assert_eq!(db.put(e.clone(), now).await, PutOutcome::Stored);
+        }
+        assert_eq!(db.group_purge("group-1".into()).await, 1);
+        let f: Filter = serde_json::from_value(serde_json::json!({"#h": ["group-1"]})).unwrap();
+        let (res, _) = db.query(vec![f], 500, now).await;
+        assert!(res.is_empty(), "the purged group must have no events");
+        let f: Filter = serde_json::from_value(serde_json::json!({"#h": ["group-2"]})).unwrap();
+        let (res, _) = db.query(vec![f], 500, now).await;
+        assert_eq!(res.len(), 1, "other groups are untouched");
+        let f: Filter = serde_json::from_value(serde_json::json!({"kinds": [1]})).unwrap();
+        let (res, _) = db.query(vec![f], 500, now).await;
+        assert_eq!(res.len(), 2, "the other group and the plain event survive");
+    });
+    db.shutdown();
 }
 
 #[test]
@@ -1014,6 +1259,56 @@ fn multi_filter_req_survives_an_early_limit() {
         assert!(res.is_empty());
         assert!(!more, "limit: 0 must report finish, not more");
     });
+}
+
+#[test]
+fn multi_filter_limits_are_per_filter() {
+    // NIP-01: each filter of a REQ has its own `limit`, and the response is
+    // the union of what each filter returns. An earlier filter filling its
+    // quota must not consume (or abort) a later filter's quota; the union is
+    // ordered by created_at, not by filter order.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let k1_old = event(1, "kind 1 old", now - 10, vec![]);
+        let k1_new = event(1, "kind 1 new", now, vec![]);
+        let k7 = event(7, "kind 7", now - 5, vec![]);
+        for ev in [&k1_old, &k1_new, &k7] {
+            assert_eq!(db.put(ev.clone(), now).await, PutOutcome::Stored);
+        }
+
+        let f: Vec<Filter> = serde_json::from_value(serde_json::json!([
+            {"kinds": [1], "limit": 1},
+            {"kinds": [7], "limit": 1}
+        ]))
+        .unwrap();
+        let (res, _) = db.query(f, 500, now).await;
+        assert_eq!(
+            res.len(),
+            2,
+            "the second filter must contribute despite the first filter's limit"
+        );
+        let ids: Vec<String> = res.iter().map(|e| e.id.clone()).collect();
+        assert!(ids.contains(&k1_new.id), "the newest kind-1 event wins");
+        assert!(
+            !ids.contains(&k1_old.id),
+            "the older kind-1 event is over quota"
+        );
+        assert!(ids.contains(&k7.id), "the kind-7 filter keeps its quota");
+        assert_eq!(res[0].id, k1_new.id, "the union is newest-first");
+        assert_eq!(res[1].id, k7.id);
+    });
+    db.shutdown();
 }
 
 #[test]
@@ -1200,6 +1495,62 @@ fn vanish_keeps_delegatee_events_of_a_delegator() {
         let (res, _) = db.query(vec![f], 10, now).await;
         assert!(res.is_empty());
     });
+}
+
+#[test]
+fn vanished_recipient_gift_wraps_are_rejected_on_republish() {
+    // NIP-62: "Relays MUST ensure that the deleted events cannot be
+    // re-broadcasted into the relay." Gift wraps addressed to the vanished
+    // pubkey are signed by random keys, so the author check cannot catch
+    // them; the recipient's p tag must.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let recipient = "aa".repeat(32);
+        assert_eq!(
+            db.apply_vanish(
+                hex::decode(&recipient).unwrap().try_into().unwrap(),
+                u64::MAX
+            )
+            .await,
+            0
+        );
+        let wrap = |content: &str, wrapper: &str, p: &str| {
+            let mut e = event(1059, content, now, vec![vec!["p".into(), p.to_string()]]);
+            e.pubkey = wrapper.to_string();
+            e.id = nip01::compute_id(&e);
+            e
+        };
+        let blocked = wrap("wrap", &"bb".repeat(32), &recipient);
+        assert!(
+            matches!(
+                db.put(blocked, now).await,
+                PutOutcome::Invalid(reason) if reason.contains("vanish")
+            ),
+            "a wrap to a vanished recipient must not be re-accepted"
+        );
+        // An uppercase p tag value decodes to the same recipient.
+        let upper = wrap(
+            "wrap-upper",
+            &"bb".repeat(32),
+            &recipient.to_ascii_uppercase(),
+        );
+        assert!(matches!(db.put(upper, now).await, PutOutcome::Invalid(_)));
+        // A wrap to someone else is still accepted.
+        let other = wrap("wrap-other", &"bb".repeat(32), &"cc".repeat(32));
+        assert_eq!(db.put(other, now).await, PutOutcome::Stored);
+    });
+    db.shutdown();
 }
 
 #[test]
@@ -1518,6 +1869,46 @@ fn expiry_enabled_toggles_at_runtime() {
 }
 
 #[test]
+fn events_stored_while_nip40_was_disabled_are_purged_on_reenable() {
+    // The expiry index is maintained even while NIP-40 is disabled, so an
+    // event accepted during that window becomes purgeable when the feature
+    // is re-enabled (it used to stay stored forever).
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        db.set_expiry_enabled(false);
+        let ev = event(
+            1,
+            "stored while disabled",
+            now,
+            vec![vec!["expiration".into(), (now - 5).to_string()]],
+        );
+        assert_eq!(db.put(ev.clone(), now).await, PutOutcome::Stored);
+        // Re-enabling makes the stored event expired; the purge reclaims it.
+        db.set_expiry_enabled(true);
+        assert_eq!(
+            db.purge_expired(now).await,
+            1,
+            "the event stored while disabled must be purged"
+        );
+        let f: Filter = serde_json::from_value(serde_json::json!({"ids": [ev.id]})).unwrap();
+        let (res, _) = db.query(vec![f], 10, now).await;
+        assert!(res.is_empty());
+    });
+    db.shutdown();
+}
+
+#[test]
 
 // ----- filters, search and ordering -----
 fn multiletter_tag_filters_match() {
@@ -1578,12 +1969,22 @@ fn delegated_events_match_delegator_queries() {
         let delegatee = "b".repeat(64);
         let mut delegated = event(1, "delegated", now, vec![]);
         delegated.pubkey = delegatee.clone();
-        delegated.tags = vec![vec![
-            "delegation".into(),
-            delegator.clone(),
-            "kind=1".into(),
-            "00".repeat(64),
-        ]];
+        delegated.tags = vec![
+            vec![
+                "delegation".into(),
+                delegator.clone(),
+                "kind=1".into(),
+                "00".repeat(64),
+            ],
+            // Only the first well-formed delegation tag is honored, so this
+            // second one must not index the event under another delegator.
+            vec![
+                "delegation".into(),
+                "c".repeat(64),
+                "kind=1".into(),
+                "00".repeat(64),
+            ],
+        ];
         delegated.id = nip01::compute_id(&delegated);
         let own = event(1, "own", now, vec![]);
 
@@ -1600,6 +2001,14 @@ fn delegated_events_match_delegator_queries() {
             serde_json::from_value(serde_json::json!({"authors": [delegatee]})).unwrap();
         let (res, _) = db.query(vec![f], 500, now).await;
         assert_eq!(res.len(), 1);
+        // The forged second delegation tag is inert.
+        let f: Filter =
+            serde_json::from_value(serde_json::json!({"authors": ["c".repeat(64)]})).unwrap();
+        let (res, _) = db.query(vec![f], 500, now).await;
+        assert!(
+            res.is_empty(),
+            "a second delegation tag must not be indexed"
+        );
     });
 }
 
@@ -1745,6 +2154,41 @@ fn created_at_ties_are_not_split_across_pages() {
         assert!(!more, "the tie completed the scan");
         assert!(res.windows(2).all(|w| w[0].created_at >= w[1].created_at));
     });
+}
+
+#[test]
+fn tie_continuation_is_bounded() {
+    // A flood of events sharing one created_at must not defeat the collector
+    // cap: a `limit: 1` query stops at a small multiple of the cap and
+    // reports `more` instead of materializing every tie.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        for i in 0..200 {
+            let e = event(1, &format!("tie-{i}"), now, vec![]);
+            assert_eq!(db.put(e, now).await, PutOutcome::Stored);
+        }
+        let f: Filter =
+            serde_json::from_value(serde_json::json!({"kinds": [1], "limit": 1})).unwrap();
+        let (res, more) = db.query(vec![f], 500, now).await;
+        assert!(
+            res.len() <= 2,
+            "the tie group must be bounded by the collector cap: {}",
+            res.len()
+        );
+        assert!(more, "a cut tie group must report `more`");
+    });
+    db.shutdown();
 }
 
 #[test]
@@ -2124,21 +2568,25 @@ fn read_flood_does_not_fail_fast_writes() {
 }
 
 #[test]
-fn kind_and_author_counts_serve_through_the_api_reader() {
+fn aggregate_sample_serves_through_the_api_reader() {
     let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0, 128, 4, 8).unwrap();
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
         let now = unix_now();
         db.put(event(1, "a", now, vec![]), now).await;
         db.put(event(7, "b", now, vec![]), now).await;
-        let (kinds, _) = db.kind_counts(100).await;
+        let (items, _) = db.api_neg_sample(100, now).await.expect("sample");
         assert!(
-            kinds.iter().any(|(k, c)| *k == 1 && *c >= 1),
-            "kind counts must include stored events: {kinds:?}"
+            items.iter().any(|i| i.kind == 1) && items.iter().any(|i| i.kind == 7),
+            "the sample must include the stored events"
         );
-        let (authors, _) = db.author_counts(100).await;
-        assert!(!authors.is_empty(), "author counts must be served");
+        assert!(
+            items.iter().any(|i| i.pubkey.starts_with("0000")),
+            "sample records carry the author pubkey"
+        );
         db.shutdown();
+        // After shutdown the API reader is gone: None, never a hang.
+        assert!(db.api_neg_sample(10, now).await.is_none());
     });
 }
 
@@ -2623,13 +3071,13 @@ fn mixed_search_and_plain_filters_return_the_union() {
         let (res, _) = db.query(f, 500, now).await;
         // The old code truncated the whole response to the search filters'
         // limits, dropping every plain-filter result (only the hit would
-        // come back). The plain filter must now contribute its own events
-        // (the per-filter created_at boundary may cut the second plain
-        // event: it shares no timestamp with the limit-filling one).
-        assert_eq!(res.len(), 2, "search hit plus one plain event");
+        // come back). Each filter now has its own quota: the search filter
+        // contributes the hit and the plain filter its two events.
+        assert_eq!(res.len(), 3, "search hit plus the plain events");
         let ids: Vec<String> = res.iter().map(|e| e.id.clone()).collect();
         assert!(ids.contains(&hit.id));
         assert!(ids.contains(&plain1.id));
+        assert!(ids.contains(&plain2.id));
     });
 }
 
@@ -2741,6 +3189,53 @@ fn search_finds_big_events() {
         let (res2, _) = db.query_req(vec![f], 500, now).await;
         assert_eq!(res2.len(), 1);
     });
+}
+
+#[test]
+fn search_finds_words_past_the_index_cap() {
+    // NIP-50 searches the whole content, but the word index only stores the
+    // first `max_indexed_words` tokens; an event whose matching word comes
+    // later must still be found (long events carry an overflow marker that
+    // the scan walks with a full-content check).
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        2, // max_indexed_words: only "early" and "fills" are indexed
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let ev = event(1, "early fills the cap late", now, vec![]);
+        assert_eq!(db.put(ev.clone(), now).await, PutOutcome::Stored);
+        // A word past the index cap is found via the overflow walk.
+        let f: Filter = serde_json::from_value(serde_json::json!({"search": "late"})).unwrap();
+        let (res, _) = db.query(vec![f], 500, now).await;
+        assert_eq!(
+            res.len(),
+            1,
+            "a word past the index cap must still be found"
+        );
+        assert_eq!(res[0].id, ev.id);
+        // The indexed prefix still works.
+        let f: Filter = serde_json::from_value(serde_json::json!({"search": "early"})).unwrap();
+        let (res, _) = db.query(vec![f], 500, now).await;
+        assert_eq!(res.len(), 1);
+        // Removal drops the overflow marker too.
+        db.apply_deletion(vec![ev.id.clone()], vec![], Some(ev.pubkey.clone()), now)
+            .await;
+        let f: Filter = serde_json::from_value(serde_json::json!({"search": "late"})).unwrap();
+        let (res, _) = db.query(vec![f], 500, now).await;
+        assert!(
+            res.is_empty(),
+            "the overflow index entry must be removed with the event"
+        );
+    });
+    db.shutdown();
 }
 
 #[test]
@@ -2954,4 +3449,24 @@ fn group_and_role_snapshots_survive_restart() {
         );
         db.shutdown();
     });
+}
+
+#[test]
+fn sixteen_max_dbs_still_opens_with_the_word_index() {
+    // 17 named tables are created (16 plus the word index); an operator
+    // value of 16 must not fail at startup (the clamp raises it to 17).
+    let mut cfg = config();
+    cfg.max_dbs = 16;
+    assert!(cfg.search_index);
+    let db = DbClient::open(
+        &cfg,
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .expect("17 tables must fit via the clamp");
+    db.shutdown();
 }

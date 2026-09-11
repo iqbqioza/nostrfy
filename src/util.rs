@@ -43,3 +43,32 @@ pub fn normalize_ip(ip: std::net::IpAddr) -> std::net::IpAddr {
         other => other,
     }
 }
+
+/// Whether `peer` is covered by a blocked-IP list. Both sides are parsed and
+/// normalized, so an operator-written or legacy spelling (`::ffff:127.0.0.1`
+/// versus `127.0.0.1`, `0:0:0:0:0:0:0:1` versus `::1`) still matches.
+pub fn ip_blocked(blocked: &[(String, String)], peer: std::net::IpAddr) -> bool {
+    let peer = normalize_ip(peer);
+    blocked.iter().any(|(entry, _)| {
+        entry
+            .parse::<std::net::IpAddr>()
+            .map(normalize_ip)
+            .is_ok_and(|b| b == peer)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ip_blocked_normalizes_both_sides() {
+        let v4_mapped = vec![("::ffff:127.0.0.1".to_string(), "x".to_string())];
+        assert!(ip_blocked(&v4_mapped, "127.0.0.1".parse().unwrap()));
+        let expanded = vec![("0:0:0:0:0:0:0:1".to_string(), "x".to_string())];
+        assert!(ip_blocked(&expanded, "::1".parse().unwrap()));
+        let v4 = vec![("127.0.0.1".to_string(), "x".to_string())];
+        assert!(!ip_blocked(&v4, "127.0.0.2".parse().unwrap()));
+        assert!(!ip_blocked(&[], "127.0.0.1".parse().unwrap()));
+    }
+}

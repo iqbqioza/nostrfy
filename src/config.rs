@@ -20,9 +20,10 @@ pub const DEFAULT_CONFIG: &str = "nostrfy.toml";
 /// (kind 10133) is served but cannot be advertised: it is a `draft` with no
 /// integer identifier and NIP-11's `supported_nips` is an array of integer
 /// identifiers. File storage is covered too: NIP-94 (file metadata) is
-/// stored and served like any other event, and NIP-96 (Blossom) is served
-/// by the dedicated `[blossom]` file server; only NIP-95 (plain HTTP file
-/// storage) is not implemented. NIP-33 was merged into NIP-01 but remains
+/// stored and served like any other event, and Blossom (BUD-01/02, NIP-B7)
+/// is served by the dedicated `[blossom]` file server; NIP-95 (plain HTTP
+/// file storage) and NIP-96 (HTTP file storage integration) are not
+/// implemented. NIP-33 was merged into NIP-01 but remains
 /// advertised for clients that check it.
 pub const RELAY_NIPS: &[u16] = &[
     1, 9, 11, 13, 17, 22, 26, 29, 32, 33, 34, 40, 42, 43, 45, 46, 47, 50, 57, 59, 62, 65, 66, 67,
@@ -644,6 +645,20 @@ fn apply_legacy_aliases(raw: &str, cfg: &mut Config) {
         return;
     };
     for (old_section, old_key, new_section, new_key) in LEGACY_ALIASES {
+        // An explicitly set current key wins over the deprecated alias: a
+        // config mid-migration must not have the old value silently override
+        // the new one.
+        if table
+            .get(*new_section)
+            .and_then(toml::Value::as_table)
+            .is_some_and(|section| section.contains_key(*new_key))
+        {
+            log::warn!(
+                "config key [{old_section}].{old_key} is deprecated and ignored because \
+                 [{new_section}].{new_key} is set"
+            );
+            continue;
+        }
         let Some(section) = table.get(*old_section).and_then(toml::Value::as_table) else {
             continue;
         };
@@ -792,8 +807,22 @@ impl Config {
                 .filter(|num| !self.relay.disabled_nips.contains(num))
                 .collect::<Vec<_>>()
         };
+        // NIPs whose relay-side behaviour needs the relay's own key (NIP-29
+        // group metadata, NIP-43 role/membership events, NIP-66 discovery
+        // publication) are not advertised without it; NIP-86 is not
+        // advertised without management credentials (every RPC call would be
+        // refused).
+        let relay_has_key = !self.relay.private_key.trim().is_empty();
+        let rpc_usable = !self.rpc.management_token.trim().is_empty()
+            || !self.rpc.admin_pubkey.trim().is_empty();
         base.into_iter()
             .filter(|nip| {
+                if !relay_has_key && matches!(nip, 29 | 43 | 66) {
+                    return false;
+                }
+                if !rpc_usable && *nip == 86 {
+                    return false;
+                }
                 if let Some(kinds) = Self::nip_kinds(*nip) {
                     kinds
                         .iter()
@@ -1134,6 +1163,7 @@ impl Config {
             ("limits.max_tags", l.max_tags),
             ("limits.max_tag_value_bytes", l.max_tag_value_bytes),
             ("limits.max_sub_id_len", l.max_sub_id_len),
+            ("rpc.max_admin_body_bytes", self.rpc.max_admin_body_bytes),
         ];
         let db_nonzero = [
             ("database.db_buffer_size", self.database.db_buffer_size),
@@ -1361,6 +1391,22 @@ impl Config {
                 }
                 // Unreachable: validated above even when disabled.
                 _ => {}
+            }
+            // SigV4 puts the credentials in every request: sending them over
+            // plaintext exposes them to any network observer. Loopback is
+            // exempt so a local MinIO can still be used for testing.
+            if b.storage == "s3" {
+                let endpoint = b.s3_endpoint.trim().to_ascii_lowercase();
+                let loopback = endpoint.starts_with("http://127.0.0.1")
+                    || endpoint.starts_with("http://localhost")
+                    || endpoint.starts_with("http://[::1]");
+                if !endpoint.starts_with("https://") && !loopback {
+                    return Err(Error::Config(format!(
+                        "blossom.s3_endpoint must use https:// (plain http is only allowed \
+                         for loopback hosts); got {:?}",
+                        b.s3_endpoint
+                    )));
+                }
             }
         }
         Ok(())
@@ -1988,6 +2034,29 @@ log_max_files = 2
     }
 
     #[test]
+    fn current_keys_win_over_legacy_aliases() {
+        // A partly migrated config must not have the deprecated key override
+        // the current one.
+        let raw = r#"
+[limits]
+count_limit = 5
+max_count = 2000
+max_admin_body_bytes = 1024
+[server]
+require_auth = true
+[relay]
+require_auth = false
+[rpc]
+max_admin_body_bytes = 2048
+"#;
+        let mut cfg: Config = toml::from_str(raw).unwrap();
+        apply_legacy_aliases(raw, &mut cfg);
+        assert_eq!(cfg.limits.max_count, 2000, "the current key must win");
+        assert!(!cfg.relay.require_auth, "the current key must win");
+        assert_eq!(cfg.rpc.max_admin_body_bytes, 2048);
+    }
+
+    #[test]
     fn legacy_aliases_do_not_wrap_invalid_values() {
         // The old serde field types rejected a negative or overflowing
         // value at load time; an alias must not silently wrap one into a
@@ -2207,7 +2276,12 @@ log_max_files = 2
 
     #[test]
     fn only_relay_nips_are_advertised() {
-        let cfg = Config::default();
+        // The key/credential-dependent NIPs (29/43/66/86) have their own
+        // prerequisite test; configure them here so this test focuses on
+        // the kind filters.
+        let mut cfg = Config::default();
+        cfg.relay.private_key = "11".repeat(32);
+        cfg.rpc.management_token = "token".to_string();
         let access = AccessControl::default();
         let nips = cfg.effective_supported_nips(&access);
         // Relay-side NIPs are advertised.
@@ -2275,7 +2349,8 @@ log_max_files = 2
 
         // Blocking only ONE of a NIP's many kinds keeps it advertised
         // (any accepted kind keeps the NIP).
-        let cfg = Config::default();
+        let mut cfg = Config::default();
+        cfg.relay.private_key = "11".repeat(32);
         let access = AccessControl {
             blocked_kinds: vec![9000], // one NIP-29 group kind
             ..Default::default()
@@ -2301,7 +2376,8 @@ log_max_files = 2
         );
 
         // Allowing only a subset still advertises the NIP (any accepted kind).
-        let cfg = Config::default();
+        let mut cfg = Config::default();
+        cfg.relay.private_key = "11".repeat(32);
         let access = AccessControl {
             allowed_kinds: vec![1, 9000, 28936, 24242, 22242],
             ..Default::default()
@@ -2321,7 +2397,10 @@ log_max_files = 2
 
     #[test]
     fn advertised_client_nips_track_their_kinds() {
-        let cfg = Config::default();
+        // A relay key keeps NIP-66 (key-dependent) advertised so its kind
+        // filter is actually exercised below.
+        let mut cfg = Config::default();
+        cfg.relay.private_key = "11".repeat(32);
         // Each advertised client-side NIP is dropped when all its kinds are
         // blocked.
         for (nip, kinds) in [
@@ -2693,6 +2772,7 @@ log_max_files = 2
             |c: &mut Config| c.limits.max_tag_value_bytes = 0,
             |c: &mut Config| c.limits.max_sub_id_len = 0,
             |c: &mut Config| c.limits.max_api_queue_msgs = 0,
+            |c: &mut Config| c.rpc.max_admin_body_bytes = 0,
         ] {
             let mut cfg = Config::default();
             set(&mut cfg);
@@ -2733,6 +2813,37 @@ log_max_files = 2
                 .validate()
                 .is_ok(),
             "an empty region stays allowed for R2 endpoints"
+        );
+    }
+
+    #[test]
+    fn validation_rejects_plaintext_s3_endpoints() {
+        fn s3cfg(endpoint: &str) -> Config {
+            let mut cfg = Config::default();
+            cfg.blossom.host = "media.example.com".into();
+            cfg.blossom.storage = "s3".into();
+            cfg.blossom.s3_endpoint = endpoint.into();
+            cfg.blossom.s3_region = "us-east-1".into();
+            cfg.blossom.s3_bucket = "b".into();
+            cfg.blossom.s3_access_key = "k".into();
+            cfg.blossom.s3_secret_key = "s".into();
+            cfg
+        }
+        assert!(
+            s3cfg("http://s3.example.com").validate().is_err(),
+            "plaintext S3 endpoints must be rejected"
+        );
+        assert!(
+            s3cfg("https://s3.example.com").validate().is_ok(),
+            "https endpoints are fine"
+        );
+        assert!(
+            s3cfg("http://127.0.0.1:9000").validate().is_ok(),
+            "loopback stays usable for a local MinIO"
+        );
+        assert!(
+            s3cfg("http://localhost:9000").validate().is_ok(),
+            "localhost stays usable for a local MinIO"
         );
     }
 

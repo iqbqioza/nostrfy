@@ -1,7 +1,5 @@
 //! NIP-01 subscription filters and the in-memory match.
 
-use std::collections::BTreeMap;
-
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -66,7 +64,11 @@ pub struct Filter {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub search: Option<String>,
     #[serde(flatten)]
-    pub tags: BTreeMap<String, Value>,
+    /// Tag constraints (`#`-prefixed keys) plus any unknown filter fields.
+    /// A `serde_json::Map` preserves the client's JSON attribute order
+    /// (`preserve_order`), which NIP-45's HLL offset derivation needs: it
+    /// is defined over the *first* tag attribute in the filter.
+    pub tags: serde_json::Map<String, Value>,
     /// Cached tokenized search terms (the `search` string is immutable
     /// after parsing, so the terms are computed once per filter and shared
     /// across the filter's clones; the live delivery path matches every
@@ -136,26 +138,31 @@ impl Filter {
                 return false;
             }
         }
-        // NIP-26: events published under a valid delegation tag match filters
-        // on the delegator's pubkey as well as on the event's own author.
-        // Only a well-formed delegation (`delegation` tags have exactly 4
-        // elements, see `nip26::delegation`) counts: a malformed tag of
-        // any other length must not let an attacker's event match filters
-        // on somebody else's pubkey. Pubkey comparison is case-insensitive
-        // for the same stored/live agreement reason as `ids` above.
+        // NIP-26: an event published under a valid delegation tag matches
+        // filters on the delegator's pubkey as well as on the event's own
+        // author. Only the first well-formed delegation tag is honored (the
+        // one `nip26::verify` validated at intake): a second tag is inert and
+        // must not let the event match another pubkey's feed, and a malformed
+        // tag of any other length is skipped like `nip26::delegation` does.
+        // Pubkey comparison is case-insensitive for the same stored/live
+        // agreement reason as `ids` above.
         // Note: the tag's signature and conditions are NOT re-verified here
         // (trusted input — every caller feeds events that passed
         // `nip26::verify` at intake before store/broadcast); future callers
         // with unvalidated events must verify first.
         if let Some(authors) = &self.authors
             && !authors.iter().any(|a| Self::hex_eq(a, ev.pubkey()))
-            && !ev.tags().iter().any(|t| {
-                t.len() == 4
-                    && t[0] == "delegation"
-                    && authors.iter().any(|a| Self::hex_eq(a, &t[1]))
-            })
         {
-            return false;
+            let delegated = ev
+                .tags()
+                .iter()
+                .find(|t| t.len() == 4 && t[0] == "delegation")
+                .map(|t| t[1].as_str());
+            if !delegated
+                .is_some_and(|delegator| authors.iter().any(|a| Self::hex_eq(a, delegator)))
+            {
+                return false;
+            }
         }
         if let Some(kinds) = &self.kinds
             && !kinds.contains(&ev.kind())
@@ -204,11 +211,14 @@ impl Filter {
             // `ids`/`authors` which decode hex case-insensitively. An
             // uppercase `#e`/`#p` value therefore matches nothing on either
             // path — consistent, but clients should send lowercase hex.
+            // NIP-01: only the first value of a tag is indexed (`tag[1]`);
+            // further elements are metadata (relay hints, markers) and never
+            // match a filter on their own.
             let tag_name = name.strip_prefix('#').unwrap_or(name);
             tag_values(value).any(|v| {
                 ev.tags()
                     .iter()
-                    .any(|t| t.len() >= 2 && t[0] == tag_name && t[1..].iter().any(|x| x == v))
+                    .any(|t| t.len() >= 2 && t[0] == tag_name && t.get(1).is_some_and(|x| x == v))
             })
         })
     }
@@ -386,28 +396,38 @@ mod tests {
     }
 
     #[test]
-    fn tag_match_any_value_in_common() {
-        // NIP-01: a `#` constraint matches when at least one of the
-        // filter's values equals at least one of the event tag's values.
-        // Both the first and the second value of a same-name tag pair
-        // must match — the live path compares every value, like the stored
-        // tag index (see the `all_values_of_a_single_letter_tag_are_indexed`
-        // db test).
+    fn tag_match_uses_only_the_first_tag_value() {
+        // NIP-01: "Only the first value in any given tag is indexed." The
+        // elements after the first are metadata (relay hints, markers), so a
+        // filter value equal to `tag[2]` matches nothing on either path (see
+        // the `only_first_value_of_a_single_letter_tag_is_indexed` db test).
         let e = ev(1, vec![vec!["e".into(), "aa".repeat(32), "bb".repeat(32)]]);
         let f: Filter =
             serde_json::from_value(serde_json::json!({"#e": ["aa".repeat(32)]})).unwrap();
         assert!(f.matches(&e), "the first tag value must match");
         let f: Filter =
             serde_json::from_value(serde_json::json!({"#e": ["bb".repeat(32)]})).unwrap();
-        assert!(f.matches(&e), "the second tag value must match");
+        assert!(!f.matches(&e), "the second tag value must not match");
         let f: Filter =
             serde_json::from_value(serde_json::json!({"#e": ["cc".repeat(32)]})).unwrap();
         assert!(!f.matches(&e), "a value present in no tag must not match");
-        // The filter value can match any one of several values too.
+        // The filter value can match any one of several values (the first
+        // value of any same-name tag).
         let f: Filter =
-            serde_json::from_value(serde_json::json!({"#e": ["cc".repeat(32), "bb".repeat(32)]}))
+            serde_json::from_value(serde_json::json!({"#e": ["cc".repeat(32), "aa".repeat(32)]}))
                 .unwrap();
         assert!(f.matches(&e));
+        // Several same-name tags: every tag contributes its own first value.
+        let multi = ev(
+            1,
+            vec![
+                vec!["e".into(), "aa".repeat(32), "bb".repeat(32)],
+                vec!["e".into(), "dd".repeat(32)],
+            ],
+        );
+        let f: Filter =
+            serde_json::from_value(serde_json::json!({"#e": ["dd".repeat(32)]})).unwrap();
+        assert!(f.matches(&multi), "the second tag's first value must match");
     }
 
     #[test]
@@ -580,6 +600,32 @@ mod tests {
         assert!(!f.matches(&e));
         f.authors = Some(vec!["aa".repeat(32)]);
         assert!(f.matches(&e), "the delegator named in the tag matches");
+        // Only the first well-formed delegation tag is honored: a second tag
+        // must not let the event match another pubkey's feed.
+        let e = ev(
+            1,
+            vec![
+                vec![
+                    "delegation".into(),
+                    "aa".repeat(32),
+                    "sig".into(),
+                    "kind".into(),
+                ],
+                vec![
+                    "delegation".into(),
+                    "cc".repeat(32),
+                    "sig".into(),
+                    "kind".into(),
+                ],
+            ],
+        );
+        f.authors = Some(vec!["cc".repeat(32)]);
+        assert!(
+            !f.matches(&e),
+            "a forged second delegation tag must not match"
+        );
+        f.authors = Some(vec!["aa".repeat(32)]);
+        assert!(f.matches(&e), "the first delegation tag still matches");
     }
 
     #[test]
@@ -623,5 +669,15 @@ mod tests {
         let mut v = serde_json::json!({"kinds": [1]});
         rewrite_inbox_outbox(&mut v).unwrap();
         assert_eq!(v, serde_json::json!({"kinds": [1]}));
+    }
+
+    #[test]
+    fn tag_attribute_order_is_preserved() {
+        // NIP-45 derives the HLL offset from the *first* tag attribute, so
+        // the parsed filter must keep the client's JSON attribute order.
+        let f: Filter =
+            serde_json::from_value(serde_json::json!({"#b": ["x"], "#a": ["y"]})).unwrap();
+        let keys: Vec<&str> = f.tags.keys().map(String::as_str).collect();
+        assert_eq!(keys, vec!["#b", "#a"]);
     }
 }

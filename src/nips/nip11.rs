@@ -45,11 +45,16 @@ pub fn relay_info(
             "min_pow_difficulty": if config.nip_enabled(13) { config.relay.require_pow } else { 0 },
             "auth_required": config.relay.require_auth,
             "payment_required": false,
-            "restricted_writes": access.restrict_relay,
+            // NIP-11: true when users must know a write policy up front —
+            // the pubkey whitelist or a kind allow/deny list qualifies;
+            // ordinary anti-spam heuristics do not.
+            "restricted_writes": access.restrict_relay
+                || !access.allowed_kinds.is_empty()
+                || !access.blocked_kinds.is_empty(),
             "created_at_lower_limit": 0,
-            // NIP-11: an absolute unix timestamp. The relay accepts events up
-            // to `max_created_at_future` seconds into the future.
-            "created_at_upper_limit": crate::util::unix_now() + limits.max_created_at_future_secs,
+            // NIP-11 limits are *relative* seconds from now (the spec's
+            // examples are `300` and `3`), not absolute timestamps.
+            "created_at_upper_limit": limits.max_created_at_future_secs,
             "default_limit": limits.max_limit,
         },
         "relay_countries": [],
@@ -94,7 +99,6 @@ pub async fn stats_handler(State(relay): State<Arc<Relay>>) -> Json<Value> {
 mod tests {
     use super::*;
     use crate::config::Config;
-    use crate::util::unix_now;
 
     fn info() -> Value {
         let cfg = Config::default();
@@ -104,16 +108,51 @@ mod tests {
     }
 
     #[test]
-    fn upper_limit_is_absolute() {
+    fn upper_limit_is_relative() {
         let info = info();
         let upper = info["limitation"]["created_at_upper_limit"]
             .as_u64()
             .expect("upper limit is a number");
-        let now = unix_now();
-        let max_future = Config::default().limits.max_created_at_future_secs;
-        assert!(
-            upper >= now + max_future.saturating_sub(1) && upper <= now + max_future + 1,
-            "upper limit must be now + max_created_at_future, got {upper} vs now {now} + {max_future}"
+        // NIP-11's examples are relative seconds (300, 3), not absolute
+        // timestamps.
+        assert_eq!(upper, Config::default().limits.max_created_at_future_secs);
+    }
+
+    #[test]
+    fn restricted_writes_tracks_kind_lists() {
+        let stats = Stats::new();
+        let access = AccessControl::default();
+        let info = relay_info(&Config::default(), &access, &stats, None);
+        assert_eq!(
+            info["limitation"]["restricted_writes"], false,
+            "default writes are unrestricted"
+        );
+        let access = AccessControl {
+            allowed_kinds: vec![1],
+            ..Default::default()
+        };
+        let info = relay_info(&Config::default(), &access, &stats, None);
+        assert_eq!(
+            info["limitation"]["restricted_writes"], true,
+            "a kind allowlist restricts writes"
+        );
+        let access = AccessControl {
+            blocked_kinds: vec![5],
+            ..Default::default()
+        };
+        let info = relay_info(&Config::default(), &access, &stats, None);
+        assert_eq!(
+            info["limitation"]["restricted_writes"], true,
+            "a kind denylist restricts writes"
+        );
+        let access = AccessControl {
+            restrict_relay: true,
+            ..Default::default()
+        };
+        let info = relay_info(&Config::default(), &access, &stats, None);
+        assert_eq!(
+            info["limitation"]["restricted_writes"], true,
+            "a pubkey whitelist restricts writes"
         );
     }
 
@@ -152,7 +191,14 @@ mod tests {
 
     #[test]
     fn advertises_relay_nips() {
-        let info = info();
+        // Key-dependent (29/43/66) and credential-dependent (86) NIPs are
+        // advertised only when their prerequisites are configured.
+        let mut cfg = Config::default();
+        cfg.relay.private_key = "11".repeat(32);
+        cfg.rpc.management_token = "token".to_string();
+        let stats = Stats::new();
+        let access = crate::config::AccessControl::default();
+        let info = relay_info(&cfg, &access, &stats, None);
         let nips = info["supported_nips"]
             .as_array()
             .expect("supported_nips is an array");
@@ -171,5 +217,19 @@ mod tests {
             !nips.contains(&34),
             "NIP-34 must not be advertised while enable_git is false"
         );
+    }
+
+    #[test]
+    fn key_dependent_nips_require_prerequisites() {
+        // Without a relay key (or RPC credentials) the NIPs whose relay-side
+        // behaviour cannot work are not advertised.
+        let info = info();
+        let nips = info["supported_nips"].as_array().unwrap();
+        for missing in [29u64, 43, 66, 86] {
+            assert!(
+                !nips.iter().any(|n| n.as_u64() == Some(missing)),
+                "NIP-{missing} must not be advertised without its prerequisites"
+            );
+        }
     }
 }

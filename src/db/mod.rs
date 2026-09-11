@@ -23,9 +23,7 @@ use std::sync::Arc;
 
 use tokio::sync::{mpsc, oneshot};
 
-use scan::{FULL_SCAN_BUDGET, NegItems, SCAN_BUDGET};
-/// `(pubkey, count)` pairs of a relay-wide author-activity walk.
-pub(crate) type AuthorCounts = Vec<(Vec<u8>, u64)>;
+pub(crate) use scan::{FULL_SCAN_BUDGET, NegItem, NegItems, SCAN_BUDGET};
 use store::Store;
 
 use crate::config::DatabaseConfig;
@@ -46,7 +44,7 @@ pub enum PutOutcome {
     /// NIP-01: kinds 20000-29999 are ephemeral and must not be stored
     /// (NIP-59 requires kind 21059 in particular to never be stored).
     /// The event is delivered live to subscribers and acknowledged with
-    /// an `OK` carrying the `mute:` prefix.
+    /// `OK true` (accepted, empty message).
     Ephemeral,
     Invalid(String),
 }
@@ -127,17 +125,14 @@ enum Msg {
         now: u64,
         reply: oneshot::Sender<(Vec<Event>, bool)>,
     },
-    /// Relay-wide per-kind event counts (REST API): walks the `by_kind`
-    /// index, examining at most `max_keys` entries.
-    KindCounts {
-        max_keys: usize,
-        reply: oneshot::Sender<(Vec<(u64, u64)>, bool)>,
-    },
-    /// Relay-wide per-author event counts (REST API): walks the
-    /// `by_pubkey` index, examining at most `max_keys` entries.
-    AuthorCounts {
-        max_keys: usize,
-        reply: oneshot::Sender<(AuthorCounts, bool)>,
+    /// REST-API aggregate sample: up to `limit` newest events as lightweight
+    /// negentropy records (no content), so the relay-wide kind/author
+    /// aggregates can apply the connection visibility rules without loading
+    /// hidden event contents.
+    AggregateSample {
+        limit: usize,
+        now: u64,
+        reply: oneshot::Sender<Option<(NegItems, bool)>>,
     },
     Delete {
         targets: Vec<String>,
@@ -146,6 +141,12 @@ enum Msg {
         request_created: u64,
         /// NIP-29 9005 moderation: restrict deletion to events of this group.
         group: Option<String>,
+        reply: oneshot::Sender<usize>,
+    },
+    /// NIP-29 `kind:9008`: purge every stored event of a deleted group, so a
+    /// later re-creation of the id cannot expose the old history.
+    GroupPurge {
+        group: String,
         reply: oneshot::Sender<usize>,
     },
     Vanish {
@@ -885,18 +886,13 @@ impl DbClient {
         .await
     }
 
-    /// Relay-wide per-kind event counts (REST API). Served by the dedicated
-    /// API reader thread so heavy aggregate walks never stall WebSocket
-    /// REQ/COUNT/NEG queries on the shared reader.
-    pub async fn kind_counts(&self, max_keys: usize) -> (Vec<(u64, u64)>, bool) {
-        self.api_request(|reply| Msg::KindCounts { max_keys, reply })
-            .await
-    }
-
-    /// Relay-wide per-author event counts (REST API). Same isolation as
-    /// [`Self::kind_counts`].
-    pub async fn author_counts(&self, max_keys: usize) -> (AuthorCounts, bool) {
-        self.api_request(|reply| Msg::AuthorCounts { max_keys, reply })
+    /// REST-API aggregate sample: the newest events as lightweight
+    /// negentropy records (no content), served by the dedicated API reader
+    /// thread so a large sample never stalls WebSocket queries. `None` on
+    /// timeout / fail-fast: the aggregate endpoints must not present an
+    /// empty sample as a complete count.
+    pub async fn api_neg_sample(&self, limit: usize, now: u64) -> Option<(NegItems, bool)> {
+        self.api_request(|reply| Msg::AggregateSample { limit, now, reply })
             .await
     }
 
@@ -978,6 +974,13 @@ impl DbClient {
             reply,
         })
         .await
+    }
+
+    /// NIP-29 `kind:9008`: purges every stored event tagged with the deleted
+    /// group id.
+    pub async fn group_purge(&self, group: String) -> usize {
+        self.request_write(|reply| Msg::GroupPurge { group, reply })
+            .await
     }
 
     /// Every vanished pubkey (raw 32-byte keys). Startup-only use.

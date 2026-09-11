@@ -400,11 +400,11 @@ curl "http://127.0.0.1:8080/api/v1/npub180cvv07tjdrrgpa0j7j7tmnyl2yr6yr7l8j4s3ev
 - `GET /api/v1/{npub1...}/{kind}/hourly?year=&month=&day=` — 24 per-hour counts for one day, zero-filled.
 - `GET /api/v1/ids/{hex}/related` — replies (`#e`) and quotes (`#q`) referencing the event.
 - `GET /api/v1/{npub1...}/follows` — the author's latest kind-3 follow list.
-- `GET /api/v1/relay/kinds` — the most common kinds on the relay (bounded walk, `approximate` flag).
+- `GET /api/v1/relay/kinds` — the most common kinds on the relay (bounded, visibility-filtered sample; `approximate` flag).
 
 ### Top authors / relay lists
 
-- `GET /api/v1/relay/top-authors` — the most active authors on the relay (bounded walk, `approximate` flag).
+- `GET /api/v1/relay/top-authors` — the most active authors on the relay (bounded, visibility-filtered sample; `approximate` flag).
 - `GET /api/v1/{npub1...}/relays` — the author's latest NIP-65 relay list (kind 10002).
 
 ### Monthly counts
@@ -528,7 +528,8 @@ The NIP-11 `supported_nips` list is not static: a NIP is dropped from it when ev
 - **`blocked_kinds`** — blocking all kinds of a NIP hides it (e.g. blocking kind `5` hides NIP-09). Blocking only some kinds keeps the NIP (e.g. blocking `9000` but not `9001` keeps NIP-29).
 - **`allowed_kinds`** — a NIP's kind is only accepted when listed; a NIP whose kinds are all unlisted is hidden.
 - **`reject_ephemeral`** — ephemeral kinds that are not in the NIP-mandated exempt list (`22242`, `27235`, `28934`/`28935`/`28936`, `24133`, `23194`/`23195`, `24242`, `21059`) are rejected, so NIPs relying on them are hidden.
-- NIPs without dedicated kinds (11, 13, 26, 33, 40, 45, 50, 67, 70, 77, 86) are always advertised when enabled.
+- **Prerequisites** — NIP-29, NIP-43 and NIP-66 rely on relay-signed events (group metadata, role/membership lists, the relay's own discovery event) and are hidden without `relay.private_key`; NIP-86 is hidden unless `rpc.management_token` or `rpc.admin_pubkey` is configured (otherwise every management call is refused).
+- NIPs without dedicated kinds (11, 13, 26, 33, 40, 45, 50, 67, 70, 77) are always advertised when enabled.
 
 Changes made at runtime — NIP-86 `allowkind`/`disallowkind`, or a `SIGHUP` reload of `reject_ephemeral` — are reflected in the next NIP-11 fetch. `enabled_nips`/`disabled_nips` still require a restart.
 
@@ -551,10 +552,12 @@ nostrfy supports NIP-29 (relay-based groups): closed chat spaces where only memb
 | `kind:9000` / `9001` | Add member (with roles) / remove member |
 | `kind:9002` | Edit metadata (name, description, public/private, ...) |
 | `kind:9005` | Delete event (moderation) |
-| `kind:9008` | Delete group |
+| `kind:9008` | Delete group (its stored events are purged) |
 | `kind:9009` | Create invite code |
 | `kind:9010` | Update pin list |
 | `kind:9021` / `9022` | Join request / leave request |
+
+> **Leave policy (NIP-29)**: any member — including the group's last admin — may leave with `kind:9022` and is automatically removed; the spec defines no admin exception. If the last admin leaves, the group has no admins left. To avoid that, grant another admin first, or delete the group with `kind:9008` (which removes the group and purges its stored events). To recover an admin-less group, sign a moderation event (e.g. `kind:9000` adding an admin) with the relay's own key (`relay.private_key`, the NIP-11 `self` pubkey): the relay accepts moderation from its master key — see [TROUBLESHOOTING 4-6](TROUBLESHOOTING.md#4-6-accidentally-left-a-group-or-the-group-has-no-admins).
 
 From these moderation events, the relay generates the following **relay-signed snapshots** (used by clients for display):
 
@@ -585,7 +588,7 @@ With a LiveKit server configured, groups can have audio/video chat rooms.
 
 1. Set `relay.livekit_url`, `relay.livekit_api_key`, and `relay.livekit_api_secret`
 2. Add the `livekit` tag to the group's metadata (via an admin's 9002 edit)
-3. Clients fetch a JWT from `/.well-known/nip29/livekit/<group-id>` with NIP-98 auth
+3. Clients fetch a JWT from `/.well-known/nip29/livekit/<group-id>` with NIP-98 auth (a pubkey banned with NIP-86 `banpubkey` is refused)
 
 ```bash
 # Support check (204 means enabled)
@@ -618,7 +621,7 @@ s3_access_key = "..."
 s3_secret_key = "..."
 ```
 
-Point `media.example.com` (and only that hostname) at the same port in your reverse proxy, then restart (`nostrfy restart`). `GET /` on that host answers with the Blossom server info document.
+Point `media.example.com` (and only that hostname) at the same port in your reverse proxy, then restart (`nostrfy restart`). `GET /` on that host answers with the Blossom server info document. With `storage = "s3"` the endpoint must be HTTPS (SigV4 credentials are sent on every request); plain `http://` is rejected unless the host is loopback (`127.0.0.1` / `localhost` / `[::1]`, e.g. a local MinIO for testing).
 
 ### 11.2 Storage layout
 
@@ -632,20 +635,21 @@ Both backends use the `bucket/{npub1xxx}/{file}` hierarchy: every upload is stor
 | Method | Path | Auth | Description |
 | --- | --- | --- | --- |
 | `GET` | `/` | — | Blossom server info |
-| `GET` / `HEAD` | `/<sha256>[.ext]` | — | Fetch / probe a blob (`.ext` is advisory); `GET` supports RFC 7233 byte ranges (206 / `accept-ranges: bytes`) |
+| `GET` / `HEAD` | `/<sha256>[.ext]` | — | Fetch / probe a blob (`.ext` is advisory); both support RFC 7233 byte ranges (206 / `accept-ranges: bytes`) and both 404 when the backing file/object is gone |
 | `PUT` | `/upload` | kind 24242 (`t=upload`, `x=<sha256>`, `expiration`) | Upload a blob; returns 201 + the descriptor |
 | `HEAD` | `/upload` | kind 24242 (`t=upload`, `x=<sha256>`, `expiration`) | BUD-06 pre-flight — would the upload be accepted? Uses `X-SHA-256` / `X-Content-Length` / `X-Content-Type` headers (400 malformed / 411 missing length / 413 too large) |
 | `PUT` | `/media` | kind 24242 (`t=media`, `x=<sha256>`, `expiration`) | BUD-05 media upload (stored verbatim — no optimization); returns 201 + the descriptor |
 | `HEAD` | `/media` | kind 24242 (`t=media`, `x=<sha256>`, `expiration`) | BUD-05 pre-flight — would the upload be accepted? Uses `X-SHA-256` / `X-Content-Length` / `X-Content-Type` headers (400 malformed / 411 missing length / 413 too large) |
-| `GET` | `/list/<pubkey>` | — | Blobs uploaded by a pubkey (hex), sorted by `uploaded` descending; supports `cursor` (the sha256 of the last entry of the previous page) and `limit` |
+| `GET` | `/list/<pubkey>` | kind 24242 (`t=list`, `expiration`) | Blobs uploaded by the requesting pubkey (hex, must match the token's author), sorted by `uploaded` descending; supports `cursor` (the sha256 of the last entry of the previous page) and `limit` |
 | `DELETE` | `/<sha256>` | kind 24242 (`t=delete`, `x=<sha256>`, `expiration`) | Delete a blob (uploader only) |
 
 - `PUT /upload` returns **201** when the blob was newly stored and **200** when it already exists (BUD-02).
 - Authorization tokens are accepted in the spec's **Base64url (no padding)** form and in the padded standard form (BUD-11).
 - The optional `X-SHA-256` request header is verified against the actual bytes: a mismatch returns **409** (BUD-02).
+- User-uploaded bytes are served with `X-Content-Type-Options: nosniff`; active document types (HTML/SVG/XML/JavaScript) additionally get `Content-Disposition: attachment` and `Content-Security-Policy: default-src 'none'; sandbox`, so the media origin cannot be used for stored XSS. (An SVG used as an `<img>` subresource is unaffected.)
 - The CORS pre-flight accepts the BUD-05/06 headers (`X-SHA-256`, `X-Content-Type`, `X-Content-Length`), so browser clients like nostter can upload to `/media`.
 
-Uploads and deletes authenticate with a Nostr auth event (kind 24242, `server` tag naming the Blossom host), sent as `Authorization: Nostr <base64>`. Per BUD-11 the token must carry an `expiration` tag set to a unix timestamp in the future, the `t` verb matching the endpoint (`upload` / `delete`), and — for upload and delete — an `x` tag with the blob's sha256.
+Uploads, deletes and listings authenticate with a Nostr auth event (kind 24242, `server` tag naming the Blossom host), sent as `Authorization: Nostr <base64>`. Per BUD-11 the token must carry an `expiration` tag set to a unix timestamp in the future, the `t` verb matching the endpoint (`upload` / `media` / `delete` / `list`), and — for upload and delete — an `x` tag with the blob's sha256. The `/list` inventory is owner-only: the token must be issued by the listed pubkey. A pubkey banned with NIP-86 `banpubkey` is refused on every Blossom endpoint as well.
 
 The descriptor `url` includes the MIME-derived extension (e.g. `https://media.example.com/<sha256>.png`; unknown types get `.bin`), like the Blossom spec's examples. The extension is advisory: the file is served by its hash alone, and `/<sha256>.<ext>` (any extension) resolves to the same blob.
 
@@ -661,8 +665,8 @@ curl -X PUT -H "Authorization: Nostr <auth>" -H "Content-Type: image/png" --data
 # Fetch
 curl https://media.example.com/<sha256>
 
-# List the uploads of a pubkey
-curl https://media.example.com/list/<pubkey-hex>
+# List your own uploads (auth event with t=list; the path pubkey must be yours)
+curl -H "Authorization: Nostr <auth>" https://media.example.com/list/<pubkey-hex>
 
 # Delete (auth event with t=delete and x=<sha256>)
 curl -X DELETE -H "Authorization: Nostr <auth>" https://media.example.com/<sha256>

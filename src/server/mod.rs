@@ -258,6 +258,27 @@ async fn build_router(
             async move { host_split(&api_host, &blossom_host, req, next).await }
         }));
     }
+    // NIP-86 `blockip` applies to every route on this listener (API,
+    // Blossom, health/metrics/stats, NIP-11 and the WebSocket/RPC
+    // endpoint), not only the WebSocket handler. The peer address is
+    // injected as `ConnectInfo` by `serve_limited`.
+    let blocked_relay = relay.clone();
+    app = app.layer(axum::middleware::from_fn(
+        move |req: Request, next: Next| {
+            let relay = blocked_relay.clone();
+            async move {
+                if let Some(ip) = req
+                    .extensions()
+                    .get::<axum::extract::connect_info::ConnectInfo<std::net::SocketAddr>>()
+                    .map(|info| info.0.ip())
+                    && crate::util::ip_blocked(&relay.access.read().await.blocked_ips, ip)
+                {
+                    return StatusCode::FORBIDDEN.into_response();
+                }
+                next.run(req).await
+            }
+        },
+    ));
     app.layer(axum::middleware::from_fn(cors_middleware))
         .with_state(relay.clone())
 }
@@ -424,7 +445,9 @@ pub async fn run_server(config_path: PathBuf, config: Config, db: DbClient) -> R
                 listener.tap_io(|stream| {
                     let _ = stream.set_nodelay(true);
                 }),
-                mgmt_app,
+                // The legacy admin routes enforce `blockip` too, which needs
+                // the peer address as `ConnectInfo`.
+                mgmt_app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
             )
             .with_graceful_shutdown(await_shutdown(rx))
             .await
@@ -589,16 +612,22 @@ async fn reject_ws_upgrade(request: Request, next: Next) -> Response {
 }
 
 /// The Blossom server-info document (BUD-01) when the request Host names
-/// the configured Blossom host; `None` otherwise. Used by the shared root
-/// route and by the dedicated root route of the `inbox-outbox` mode, so
-/// the info document stays available on the Blossom host whatever the
-/// WebSocket path selection is. Takes the Host header value (not the whole
-/// request) so the future never borrows the request across the await.
+/// the configured Blossom host and the storage backend initialized;
+/// `None` otherwise. Used by the shared root route and by the dedicated
+/// root route of the `inbox-outbox` mode, so the info document stays
+/// available on the Blossom host whatever the WebSocket path selection is.
+/// Takes the Host header value (not the whole request) so the future never
+/// borrows the request across the await.
 async fn blossom_root_info(
     relay: Arc<Relay>,
     host_header: Option<&str>,
     is_websocket: bool,
 ) -> Option<Response> {
+    // Without a live Blossom state (storage initialization failed) the
+    // info document must not advertise endpoints that are not mounted.
+    if relay.blossom.read().await.is_none() {
+        return None;
+    }
     let cfg = relay.config.read().await;
     if cfg.blossom.host.trim().is_empty()
         || !blossom::host_is_blossom(&cfg.blossom.host, host_header)
@@ -618,9 +647,10 @@ async fn blossom_root_info(
     let info = json!({
         "name": format!("{name} (media)"),
         // File-related NIPs this server implements: 94 (file-metadata
-        // events are stored and served), 96 (HTTP file storage) and
-        // 98 (HTTP auth, used for the uploads).
-        "supported_nips": [94, 96, 98],
+        // events are stored and served) and 98 (HTTP auth, used for the
+        // uploads). NIP-96 (HTTP file storage) is a different protocol and
+        // is not implemented: the file server speaks Blossom/BUD.
+        "supported_nips": [94, 98],
         "supported_file_hashes": ["sha256"],
         "tos_url": null,
         "payment_required": false,
@@ -685,17 +715,7 @@ async fn ws_handler(State(relay): State<Arc<Relay>>, request: Request) -> Respon
         .extensions()
         .get::<axum::extract::connect_info::ConnectInfo<std::net::SocketAddr>>()
         .map(|info| info.0.ip())
-        && relay
-            .access
-            .read()
-            .await
-            .blocked_ips
-            .iter()
-            .any(|(blocked, _)| {
-                blocked
-                    .parse::<std::net::IpAddr>()
-                    .is_ok_and(|b| b == crate::util::normalize_ip(ip))
-            })
+        && crate::util::ip_blocked(&relay.access.read().await.blocked_ips, ip)
     {
         return StatusCode::FORBIDDEN.into_response();
     }
@@ -1510,11 +1530,13 @@ mod tests {
         let mut cfg = crate::config::Config::default();
         cfg.relay.name = "example relay".into();
         cfg.blossom.host = "media.example.com".into();
+        cfg.blossom.storage = "local".into();
         cfg.database.map_size = 16 * 1024 * 1024;
         cfg.database.max_map_size = 256 * 1024 * 1024;
         cfg.database.path = std::env::temp_dir()
             .join("nostrfy-server-test")
             .join(format!("{:x}-{id}", std::process::id()));
+        cfg.blossom.local_path = cfg.database.path.join("blobs");
         let _ = std::fs::remove_dir_all(&cfg.database.path);
         let db = crate::db::DbClient::open(
             &cfg.database,
@@ -1527,20 +1549,23 @@ mod tests {
         )
         .unwrap();
         let config = Arc::new(tokio::sync::RwLock::new(cfg));
-        Arc::new(
-            Relay::new(
-                config,
-                db,
-                crate::stats::Stats::new(),
-                "",
-                crate::relay::LiveBusConfig {
-                    buffer: 1024,
-                    batch_interval_ms: 10,
-                    batch_size: 64,
-                },
-            )
-            .await,
+        let relay = Relay::new(
+            config,
+            db,
+            crate::stats::Stats::new(),
+            "",
+            crate::relay::LiveBusConfig {
+                buffer: 1024,
+                batch_interval_ms: 10,
+                batch_size: 64,
+            },
         )
+        .await;
+        // The Blossom handlers (and the root info document) require a live
+        // storage state, exactly like `run_server`.
+        let state = blossom::build_state(&relay.config.read().await.clone(), &relay).await;
+        *relay.blossom.write().await = state;
+        Arc::new(relay)
     }
 
     #[tokio::test]
@@ -1708,6 +1733,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn blockip_applies_to_every_main_route() {
+        let relay = blossom_relay().await;
+        // Block the v4-mapped spelling: the plain IPv4 peer must be refused
+        // on every route, not only the WebSocket handler.
+        relay
+            .access
+            .write()
+            .await
+            .blocked_ips
+            .push(("::ffff:198.51.100.7".into(), String::new()));
+        let app = build_router(&relay, None).await;
+        for uri in ["/health", "/api/v1/count", "/relay/stats"] {
+            let mut request = Request::builder()
+                .method(Method::GET)
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap();
+            request
+                .extensions_mut()
+                .insert(axum::extract::connect_info::ConnectInfo::<
+                    std::net::SocketAddr,
+                >("198.51.100.7:1234".parse().unwrap()));
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::FORBIDDEN,
+                "{uri} must be refused for a blocked peer"
+            );
+        }
+        // A different peer passes the middleware and reaches the route.
+        let mut request = Request::builder()
+            .method(Method::GET)
+            .uri("/health")
+            .body(Body::empty())
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(axum::extract::connect_info::ConnectInfo::<
+                std::net::SocketAddr,
+            >("198.51.100.8:1234".parse().unwrap()));
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn blossom_root_info_requires_live_storage() {
+        let relay = blossom_relay().await;
+        // With live storage the info document is served.
+        assert!(
+            blossom_root_info(relay.clone(), Some("media.example.com"), false)
+                .await
+                .is_some()
+        );
+        // Storage initialization failed: no info document (and therefore no
+        // advertisement of endpoints that are not mounted).
+        *relay.blossom.write().await = None;
+        assert!(
+            blossom_root_info(relay.clone(), Some("media.example.com"), false)
+                .await
+                .is_none()
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
     async fn blossom_server_info_carries_name_and_file_nips() {
         let relay = blossom_relay().await;
         let resp = blossom_root_info(relay.clone(), Some("media.example.com"), false)
@@ -1718,8 +1809,8 @@ mod tests {
         assert_eq!(json["name"], "example relay (media)");
         assert_eq!(
             json["supported_nips"],
-            serde_json::json!([94, 96, 98]),
-            "file-related NIPs are advertised"
+            serde_json::json!([94, 98]),
+            "file-related NIPs are advertised (NIP-96 is not implemented)"
         );
         assert_eq!(json["upload_url"], "https://media.example.com/upload");
         assert_eq!(json["supported_file_hashes"], serde_json::json!(["sha256"]));

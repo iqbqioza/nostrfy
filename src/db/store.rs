@@ -359,7 +359,8 @@ impl Store {
         let map_size = map_max_size as usize;
         let env = unsafe {
             EnvOpenOptions::new()
-                .max_dbs(cfg.max_dbs.max(16))
+                // 16 named tables, plus the word index when search is on.
+                .max_dbs(cfg.max_dbs.max(17))
                 .max_readers(cfg.max_readers.max(8))
                 .map_size(map_size)
                 .open(&cfg.path)?
@@ -401,10 +402,11 @@ impl Store {
         let groups = env.create_database::<Bytes, Bytes>(&mut wtxn, Some(GROUPS))?;
         let roles = env.create_database::<Bytes, Bytes>(&mut wtxn, Some(ROLES))?;
         wtxn.commit()?;
+        let tables = if by_word.is_some() { 17 } else { 16 };
         log::info!(
             "database ready at {} ({} tables, map {} MiB)",
             cfg.path.display(),
-            16,
+            tables,
             map_size / (1024 * 1024)
         );
         Ok(Store {
@@ -877,10 +879,12 @@ pub(crate) fn tag_range(name: u8, value: &[u8], since: u64, until: u64) -> (Vec<
     start.extend_from_slice(&since.to_be_bytes());
     start.extend_from_slice(&[0u8; ID_LEN]);
 
+    // Exclusive `(until + 1, 0..)`: covers every event with
+    // `created_at <= until`, including the maximal id at exactly `until`.
     let mut end = Vec::with_capacity(prefix_len + CREATED_LEN + ID_LEN);
     end.extend_from_slice(&start[..prefix_len]);
-    end.extend_from_slice(&until.to_be_bytes());
-    end.extend_from_slice(&[0xffu8; ID_LEN]);
+    end.extend_from_slice(&until.saturating_add(1).to_be_bytes());
+    end.extend_from_slice(&[0u8; ID_LEN]);
     (start, end)
 }
 
@@ -892,6 +896,14 @@ pub(crate) fn word_key(word: &str, created: u64, id: &[u8]) -> Vec<u8> {
     key.extend_from_slice(id);
     key
 }
+
+/// Sentinel word marking an event whose content has more tokens than
+/// `max_indexed_words`. The word index stores only the first N tokens, so
+/// long events also get this marker and the search scan walks those records
+/// (checking the full content per event) to find words past the cap. The
+/// sentinel contains a NUL byte, which `tokenize` can never produce (its
+/// words are alphanumeric), so it cannot collide with a real term.
+pub(crate) const WORD_OVERFLOW: &str = "\u{0}overflow";
 
 pub(crate) fn replaceable_key(kind: u64, pubkey: &[u8], dtag: &str) -> Vec<u8> {
     let mut key = Vec::with_capacity(CREATED_LEN + ID_LEN + 4 + dtag.len());
@@ -930,6 +942,18 @@ fn dtag_fingerprint(value: &str) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(value.as_bytes());
     hex::encode(&digest[..4])
+}
+
+/// Tombstone key for an `a`-tag (address) deletion, stored in the
+/// [`DELETED`] table. Event ids are exactly 32 bytes, so the one-byte prefix
+/// keeps the two key spaces disjoint; the `d` tag is normalized with
+/// [`dtag_key_safe`] exactly like the replaceable slot key it mirrors.
+pub(crate) fn deleted_address_key(kind: u64, pubkey: &[u8], dtag: &str) -> Vec<u8> {
+    let safe = dtag_key_safe(dtag);
+    let mut key = Vec::with_capacity(1 + CREATED_LEN + ID_LEN + 4 + safe.len());
+    key.push(b'a');
+    key.extend_from_slice(&replaceable_key(kind, pubkey, &safe));
+    key
 }
 impl Store {
     // ----- event persistence -----
@@ -970,6 +994,25 @@ impl Store {
                 "blocked: the delegator has requested to vanish".into(),
             ));
         }
+        // NIP-62: "Relays MUST ensure that the deleted events cannot be
+        // re-broadcasted into the relay." Gift wraps addressed to a vanished
+        // pubkey are signed by random keys, so the author checks above cannot
+        // catch them: reject any kind:1059 whose `p` tag names a vanished
+        // recipient.
+        if event.kind == crate::nips::nip62::GIFT_WRAP_KIND {
+            for tag in &event.tags {
+                if tag.len() >= 2
+                    && tag[0] == "p"
+                    && let Ok(recipient) = hex::decode(&tag[1])
+                    && recipient.len() == ID_LEN
+                    && self.vanish.get(wtxn, &recipient)?.is_some()
+                {
+                    return Ok(PutOutcome::Invalid(
+                        "blocked: the recipient has requested to vanish".into(),
+                    ));
+                }
+            }
+        }
         if self.banned.get(wtxn, &id)?.is_some() {
             return Ok(PutOutcome::Invalid("blocked: event has been banned".into()));
         }
@@ -1008,6 +1051,19 @@ impl Store {
             // write batch, and realistic addressable events use short `d`
             // tags. The stored event keeps its full `d` tag.
             let rkey = replaceable_key(event.kind, &pubkey, &dtag_key_safe(&dtag));
+            // NIP-09: an `a`-tag deletion tombstones the whole address up to
+            // the request's created_at, so a later re-publication of an older
+            // (or equal-timestamped) version stays deleted. Newer versions
+            // are allowed: the request only covers history up to its own
+            // timestamp.
+            if let Some(tomb) = self
+                .deleted
+                .get(wtxn, &deleted_address_key(event.kind, &pubkey, &dtag))?
+                && tomb.len() >= CREATED_LEN
+                && event.created_at <= u64::from_be_bytes(tomb[..CREATED_LEN].try_into().unwrap())
+            {
+                return Ok(PutOutcome::PreviouslyDeleted);
+            }
             let old = self.replaceable.get(wtxn, &rkey)?;
             let had_old = old
                 .as_ref()
@@ -1166,35 +1222,41 @@ impl Store {
         }
         for tag in &event.tags {
             if indexable_tag(tag) {
-                // Index every value of a single-letter tag: NIP-01 says the
-                // "at least one item in common" match applies to all tag
-                // values, so a stored query for the second value must find
-                // the event exactly like the live path does.
-                for value in &tag[1..] {
-                    let key = tag_key(tag[0].as_bytes()[0], value.as_bytes(), created, id);
-                    // Skip rather than error: an over-long key would abort
-                    // the whole write batch (see MAX_INDEX_KEY).
-                    if key.len() <= MAX_INDEX_KEY {
-                        self.by_tag.put(wtxn, &key, b"")?;
-                    }
+                // NIP-01: only the first value in any given tag is indexed.
+                // An event may carry several same-name tags; each of them
+                // contributes its own first value (see `Filter::matches`).
+                let value = &tag[1];
+                let key = tag_key(tag[0].as_bytes()[0], value.as_bytes(), created, id);
+                // Skip rather than error: an over-long key would abort
+                // the whole write batch (see MAX_INDEX_KEY).
+                if key.len() <= MAX_INDEX_KEY {
+                    self.by_tag.put(wtxn, &key, b"")?;
                 }
             }
         }
-        if self
-            .expiry_enabled
-            .load(std::sync::atomic::Ordering::Relaxed)
-            && let Some(exp) = nip40::expiry(event)
-        {
+        // The expiry index is maintained regardless of the NIP-40 toggle:
+        // events stored while the feature was disabled must become
+        // purgeable when it is re-enabled. The entries are tiny and are
+        // removed with the event by `remove_event`.
+        if let Some(exp) = nip40::expiry(event) {
             self.expiry.put(wtxn, &created_key(exp, id), b"")?;
         }
         if let Some(by_word) = self.by_word {
-            for word in nip50::tokenize(&event.content)
-                .iter()
-                .take(self.max_indexed_words)
-            {
+            let words = nip50::tokenize(&event.content);
+            let overflow = words.len() > self.max_indexed_words;
+            for word in words.iter().take(self.max_indexed_words) {
                 let key = word_key(word, created, id);
                 // Skip rather than error: an over-long word would abort the
                 // whole write batch (see MAX_INDEX_KEY).
+                if key.len() <= MAX_INDEX_KEY {
+                    by_word.put(wtxn, &key, b"")?;
+                }
+            }
+            // Long events also carry the overflow marker so the search scan
+            // can check their full content (NIP-50 searches the whole
+            // content, but the index only stores the first N tokens).
+            if overflow {
+                let key = word_key(WORD_OVERFLOW, created, id);
                 if key.len() <= MAX_INDEX_KEY {
                     by_word.put(wtxn, &key, b"")?;
                 }
@@ -1249,14 +1311,13 @@ impl Store {
         }
         for tag in &event.tags {
             if indexable_tag(tag) {
-                for value in &tag[1..] {
-                    // Mirror the put path: over-long keys were skipped at
-                    // index time, so deleting them would hit MDB_BAD_VALSIZE
-                    // and abort the whole write batch.
-                    let key = tag_key(tag[0].as_bytes()[0], value.as_bytes(), event.created_at, id);
-                    if key.len() <= MAX_INDEX_KEY {
-                        self.by_tag.delete(wtxn, &key)?;
-                    }
+                // Mirror the put path: only the first tag value was indexed,
+                // and over-long keys were skipped at index time (deleting
+                // them would hit MDB_BAD_VALSIZE and abort the write batch).
+                let value = &tag[1];
+                let key = tag_key(tag[0].as_bytes()[0], value.as_bytes(), event.created_at, id);
+                if key.len() <= MAX_INDEX_KEY {
+                    self.by_tag.delete(wtxn, &key)?;
                 }
             }
         }
@@ -1268,12 +1329,17 @@ impl Store {
             self.expiry.delete(wtxn, &created_key(exp, id))?;
         }
         if let Some(by_word) = self.by_word {
-            for word in nip50::tokenize(&event.content)
-                .iter()
-                .take(self.max_indexed_words)
-            {
+            let words = nip50::tokenize(&event.content);
+            let overflow = words.len() > self.max_indexed_words;
+            for word in words.iter().take(self.max_indexed_words) {
                 // Mirror the put path for the same reason as tags above.
                 let key = word_key(word, event.created_at, id);
+                if key.len() <= MAX_INDEX_KEY {
+                    by_word.delete(wtxn, &key)?;
+                }
+            }
+            if overflow {
+                let key = word_key(WORD_OVERFLOW, event.created_at, id);
                 if key.len() <= MAX_INDEX_KEY {
                     by_word.delete(wtxn, &key)?;
                 }
@@ -1373,12 +1439,15 @@ pub(crate) fn is_replaceable(event: &Event) -> bool {
         || nip33::is_param_replaceable_kind(event.kind)
 }
 
-/// Returns `true` when the event was published under a NIP-26 delegation
-/// granted by `delegator`. Compared case-insensitively like every other
-/// hex comparison, so an uppercase filter still matches.
+/// Returns `true` when the event was published under the NIP-26 delegation
+/// granted by `delegator`. Only the first well-formed delegation tag counts
+/// (the one `nip26::verify` validated and the query paths honor). Compared
+/// case-insensitively like every other hex comparison, so an uppercase
+/// filter still matches.
 pub(crate) fn delegated_by(event: &Event, delegator: &str) -> bool {
     event
         .tags
         .iter()
-        .any(|t| t.len() == 4 && t[0] == "delegation" && t[1].eq_ignore_ascii_case(delegator))
+        .find(|t| t.len() == 4 && t[0] == "delegation")
+        .is_some_and(|t| t[1].eq_ignore_ascii_case(delegator))
 }

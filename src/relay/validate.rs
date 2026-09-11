@@ -54,8 +54,9 @@ pub(crate) fn verify_signatures_parallel(
             .collect();
     }
     let per = events.len().div_ceil(threads);
+    let chunk_lens: Vec<usize> = events.chunks(per).map(<[Event]>::len).collect();
     std::thread::scope(|s| {
-        let mut handles = Vec::with_capacity(events.len().div_ceil(per));
+        let mut handles = Vec::with_capacity(chunk_lens.len());
         for chunk in events.chunks(per) {
             handles.push(s.spawn(move || {
                 chunk
@@ -64,15 +65,33 @@ pub(crate) fn verify_signatures_parallel(
                     .collect::<Vec<bool>>()
             }));
         }
-        let verdicts: Vec<bool> = handles
-            .into_iter()
-            .flat_map(|h| h.join().unwrap_or_default())
-            .collect();
+        let verdicts = join_verdicts(handles, &chunk_lens);
         // `div_ceil(per)` chunks never run empty, so the flattened length
-        // is exactly `events.len()`.
+        // is exactly `events.len()` even when a chunk panicked.
         debug_assert_eq!(verdicts.len(), events.len());
         verdicts
     })
+}
+
+/// Joins the per-chunk verification threads, preserving the
+/// one-verdict-per-event alignment: a panicking chunk yields `false` for
+/// each of its events (fail closed) instead of silently shifting every
+/// later chunk's verdicts left.
+fn join_verdicts<'scope>(
+    handles: Vec<std::thread::ScopedJoinHandle<'scope, Vec<bool>>>,
+    chunk_lens: &[usize],
+) -> Vec<bool> {
+    handles
+        .into_iter()
+        .enumerate()
+        .flat_map(|(i, handle)| match handle.join() {
+            Ok(verdicts) => verdicts,
+            Err(_) => {
+                log::error!("signature verification thread {i} panicked; rejecting its events");
+                vec![false; chunk_lens.get(i).copied().unwrap_or(0)]
+            }
+        })
+        .collect()
 }
 
 impl super::Relay {
@@ -178,7 +197,16 @@ impl super::Relay {
                 }
                 let reason = {
                     let groups = self.groups.read().await;
-                    groups.validate_write(event).err()
+                    // Moderation events may also come from the relay's own
+                    // key (NIP-29: "the relay master key or ... group
+                    // admins"), so the operator can recover an admin-less
+                    // group.
+                    match self.relay_pubkey() {
+                        Some(relay_pk) => groups
+                            .validate_write_for_relay(event, Some(&relay_pk))
+                            .err(),
+                        None => groups.validate_write(event).err(),
+                    }
                 };
                 if let Some(reason) = reason {
                     return Precheck::Reject(reason);
@@ -383,7 +411,13 @@ impl super::Relay {
             return Err("invalid: sig must be lowercase hex".into());
         }
 
-        if cfg.nip_enabled(26) && !nip26::verify(event, self.secp()) {
+        // NIP-26: a delegation tag is honored by the query/index paths
+        // unconditionally, so it must be verified unconditionally too — not
+        // only while NIP-26 is advertised. Gating the check on the toggle let
+        // a forged `delegation` tag index the event under an arbitrary
+        // delegator's pubkey (author-feed impersonation). `verify` checks the
+        // first well-formed delegation tag, the only one the read paths use.
+        if !nip26::verify(event, self.secp()) {
             return Err("invalid: delegation failed".into());
         }
 
@@ -400,6 +434,17 @@ impl super::Relay {
         // clients, so the check runs regardless of the NIP-42 toggle.
         if event.kind == crate::nips::nip42::AUTH_KIND {
             return Err("invalid: authentication events cannot be published".into());
+        }
+
+        // NIP-43: a `kind:28935` invite request "MUST be signed by the pubkey
+        // specified in the `self` field of the relay's NIP 11 document". This
+        // relay never generates claims, so a client-signed 28935 is bogus and
+        // must not be broadcast to subscribers that could mistake it for a
+        // relay-issued claim. Unconditional like the NIP-42 AUTH rule above.
+        if event.kind == nip43::INVITE
+            && Some(event.pubkey.as_str()) != self.relay_pubkey().as_deref()
+        {
+            return Err("blocked: invite responses must be published by the relay".into());
         }
 
         // NIP-43: role definitions, membership lists and add/remove user
@@ -542,6 +587,25 @@ mod tests {
     use secp256k1::{Keypair, Secp256k1, XOnlyPublicKey};
     use std::sync::Arc;
     use tokio::sync::RwLock;
+
+    #[test]
+    fn panicking_verification_chunk_stays_aligned() {
+        // A panicking verifier chunk must not shift the later chunks'
+        // verdicts: every event of the panicked chunk is failed closed.
+        std::thread::scope(|s| {
+            let handles = vec![
+                s.spawn(|| vec![true, false, true]),
+                s.spawn(|| -> Vec<bool> { panic!("simulated verifier panic") }),
+                s.spawn(|| vec![false, true]),
+            ];
+            let out = super::join_verdicts(handles, &[3, 3, 2]);
+            assert_eq!(
+                out,
+                vec![true, false, true, false, false, false, false, true],
+                "the panicked chunk must contribute three `false` verdicts"
+            );
+        });
+    }
 
     fn signed(kind: u64, tags: Vec<Vec<String>>) -> Event {
         signed_with_seed(3u8, kind, tags)
@@ -1106,6 +1170,16 @@ mod tests {
             // malformed too.
             let bare = signed(1, vec![vec!["expiration".into()]]);
             assert!(relay.validate_base(&cfg, &bare, now, &[], None).is_err());
+            // A bare tag alongside a valid one is malformed as well: the
+            // valid sibling must not mask the missing value.
+            let mixed = signed(
+                1,
+                vec![
+                    vec!["expiration".into(), (now + 100).to_string()],
+                    vec!["expiration".into()],
+                ],
+            );
+            assert!(relay.validate_base(&cfg, &mixed, now, &[], None).is_err());
             // A well-formed value passes.
             let good = signed(1, vec![vec!["expiration".into(), (now + 100).to_string()]]);
             assert!(relay.validate_base(&cfg, &good, now, &[], None).is_ok());
@@ -1374,7 +1448,9 @@ mod tests {
                 .await;
             assert!(matches!(out, super::Precheck::Reject(m) if m.contains("signature")));
 
-            // A bad delegation is rejected when NIP-26 is enabled.
+            // A bad delegation is rejected unconditionally: the query/index
+            // paths honor the delegation tag whether or not NIP-26 is
+            // advertised, so an unverified tag must never be stored.
             let ev = signed(
                 1,
                 vec![vec![
@@ -1388,6 +1464,16 @@ mod tests {
                 .precheck(&cfg, &access, &ev, now, &[], None, None)
                 .await;
             assert!(matches!(out, super::Precheck::Reject(m) if m.contains("delegation")));
+            // The same holds with NIP-26 disabled (not advertised).
+            let mut cfg_no26 = (*cfg).clone();
+            cfg_no26.relay.disabled_nips.push(26);
+            let out = relay
+                .precheck(&cfg_no26, &access, &ev, now, &[], None, None)
+                .await;
+            assert!(
+                matches!(out, super::Precheck::Reject(m) if m.contains("delegation")),
+                "a forged delegation must be rejected even with NIP-26 disabled"
+            );
 
             // Uppercase pubkey: without a verified verdict the signature
             // fails first; with the verdict the pubkey check itself runs.
@@ -1459,6 +1545,36 @@ mod tests {
                 .precheck(&cfg, &access, &join, now, &[], None, None)
                 .await;
             assert!(matches!(out, super::Precheck::Reject(m) if m.contains("h tag")));
+
+            // A client-signed NIP-43 invite response is rejected: kind 28935
+            // "MUST be signed by the pubkey specified in the `self` field"
+            // and this relay never generates claims.
+            let invite = h(crate::nips::nip43::INVITE, vec![]);
+            let out = relay
+                .precheck(&cfg, &access, &invite, now, &[], None, None)
+                .await;
+            assert!(
+                matches!(out, super::Precheck::Reject(m) if m.contains("invite")),
+                "a foreign invite response must be rejected"
+            );
+
+            // An event with several h tags is rejected: the first tag would
+            // be validated while the stored tag index and subscriptions match
+            // any of them.
+            let multi = h(
+                1,
+                vec![
+                    vec!["h".to_string(), "g".into()],
+                    vec!["h".to_string(), "other".into()],
+                ],
+            );
+            let out = relay
+                .precheck(&cfg, &access, &multi, now, &[], None, None)
+                .await;
+            assert!(
+                matches!(out, super::Precheck::Reject(m) if m.contains("only one h tag")),
+                "a multi-h event must be rejected"
+            );
 
             // Group metadata not signed by the relay is rejected.
             let meta = gh(39000, vec![vec!["d".into(), "g".into()]]);

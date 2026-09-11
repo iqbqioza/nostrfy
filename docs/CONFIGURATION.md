@@ -150,10 +150,10 @@ The changes take effect immediately and are persisted (same lists as `nostrfy re
 
 - **`name` / `description` / `icon` / `pubkey` / `contact`** are served to every client in the NIP-11 document (`GET /`). Empty string fields are omitted from the document. Runtime changes via NIP-86 are **persisted into this config file**, so a later SIGHUP reload keeps them.
 - **`private_key`**: without it, no 39001/39002 group snapshots are generated. Generate with `nostrfy genkey`; changing requires `restart`.
-- **`public_url`**: matching tolerates different schemes (`wss`/`ws`/`https`/`http`) and paths, and is case-insensitive. When the relay binds `0.0.0.0` or `127.0.0.1` and `public_url` is empty, a loud warning explains that NIP-42/62/98 URL checks will fail.
+- **`public_url`**: NIP-42/62 `relay`-tag matching tolerates different schemes (`wss`/`ws`/`https`/`http`) and paths, and is case-insensitive. NIP-98 `u`-tag matching is stricter: the tag must equal the relay's canonical HTTP URL exactly (the `public_url` authority with `wss` -> `https` / `ws` -> `http`, plus the exact path and query); each auth event is single-use within its 60-second window. When the relay binds `0.0.0.0` or `127.0.0.1` and `public_url` is empty, a loud warning explains that NIP-42/62/98 URL checks will fail.
 - **`livekit_url` + `livekit_api_key` + `livekit_api_secret`**: all three are needed together; a URL without credentials logs a warning (tokens would be signed with an empty secret).
 - **`enabled_nips` / `disabled_nips`**: `enabled_nips` wins over `disabled_nips`. Both affect the NIP-11 `supported_nips` list and the relay's behavior gates (NIP-29 groups, NIP-50 search, NIP-40 expiry, ...).
-- **The NIP-11 `supported_nips` list is dynamic**: besides `enabled_nips`/`disabled_nips`, a NIP is dropped when every kind it defines is blocked — by `blocked_kinds`, by `allowed_kinds` (a NIP's kind is only accepted if it is listed), or by `reject_ephemeral` (a NIP whose kinds are all ephemeral and not in the exempt list is hidden). Kinds without an owning NIP are not affected. Runtime access changes (NIP-86 `allowkind`/`disallowkind`) and `SIGHUP` reloads are reflected in the next NIP-11 fetch; `enabled_nips`/`disabled_nips` still require a restart.
+- **The NIP-11 `supported_nips` list is dynamic**: besides `enabled_nips`/`disabled_nips`, a NIP is dropped when every kind it defines is blocked — by `blocked_kinds`, by `allowed_kinds` (a NIP's kind is only accepted if it is listed), or by `reject_ephemeral` (a NIP whose kinds are all ephemeral and not in the exempt list is hidden). NIP-29/43/66 are hidden without `relay.private_key` (their relay-signed events cannot be produced), and NIP-86 is hidden without `rpc.management_token` or `rpc.admin_pubkey`. Kinds without an owning NIP are not affected. Runtime access changes (NIP-86 `allowkind`/`disallowkind`) and `SIGHUP` reloads are reflected in the next NIP-11 fetch; `enabled_nips`/`disabled_nips` still require a restart.
 
 ---
 
@@ -171,7 +171,7 @@ The changes take effect immediately and are persisted (same lists as `nostrfy re
 
 **`management_port`** — A separate port for the legacy management REST API (`/admin/...`). `0` disables it. Must differ from `server.port`.
 
-**`max_admin_body_bytes`** — The request body limit for the NIP-86 management RPC: the JSON-RPC handler mounted on the relay's public `POST /` routes and the legacy management port. NIP-86 requests are tiny method+params documents, so the 64 KiB default is generous while keeping the publicly reachable route from buffering large bodies. Management mutations are recorded in a rate-limited audit log (at most 600 entries per minute, then a single per-window summary line) with the authenticated identity.
+**`max_admin_body_bytes`** — The request body limit for the NIP-86 management RPC: the JSON-RPC handler mounted on the relay's public `POST /` routes and the legacy management port (must be at least 1; `0` fails validation). NIP-86 requests are tiny method+params documents, so the 64 KiB default is generous while keeping the publicly reachable route from buffering large bodies. Management mutations are recorded in a rate-limited audit log (at most 600 entries per minute, then a single per-window summary line) with the authenticated identity.
 
 ## 5. `[server]` — server settings
 
@@ -201,7 +201,7 @@ The changes take effect immediately and are persisted (same lists as `nostrfy re
 
 **`management_token`** — The bearer token that authenticates management calls (`Authorization: Bearer <token>`). Compared in constant time. Empty = token authentication is disabled.
 
-**`admin_pubkey`** — The administrator's public key for NIP-98 authentication: management calls must carry a valid NIP-98 auth event (kind 27235, with a `payload` tag, a `u` tag matching the relay URL, signed by this key). Empty = NIP-98 authentication is disabled.
+**`admin_pubkey`** — The administrator's public key for NIP-98 authentication: management calls must carry a valid NIP-98 auth event (kind 27235, with a `payload` tag, a `u` tag matching the relay URL exactly, signed by this key). Empty = NIP-98 authentication is disabled. Each auth event is single-use within its 60-second window.
 
 **`metrics_enabled`** — When `true`, serves Prometheus-formatted metrics at `/metrics` (no authentication). Fixed at startup — requires a `restart`.
 
@@ -362,7 +362,7 @@ The changes take effect immediately and are persisted (same lists as `nostrfy re
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
 | `path` | string | `"./data"` | Database directory (LMDB) |
-| `max_dbs` | integer | `32` | LMDB max named databases (must be ≥ 16) |
+| `max_dbs` | integer | `32` | LMDB max named databases (must be ≥ 17) |
 | `max_readers` | integer | `128` | LMDB max concurrent readers (must be ≥ 8) |
 | `map_size` | integer | `1073741824` (1 GB) | Floor for the memory map size (bytes) |
 | `max_map_size` | integer | `1099511627776` (1 TB) | Memory-map ceiling (bytes) |
@@ -377,7 +377,7 @@ The changes take effect immediately and are persisted (same lists as `nostrfy re
 
 **`path`** — The directory holding the LMDB database files. Relative paths are resolved against the config file's directory, so they stay valid after the daemon changes its working directory. Do not point two relay instances at the same directory.
 
-**`max_dbs`** — LMDB's maximum number of named databases (the relay uses 13). Must be ≥ 16.
+**`max_dbs`** — LMDB's maximum number of named databases. The relay uses 17 when `search_index = true` (16 tables plus the word index) and 16 otherwise; values below 17 are raised to 17 so the word index can always be created.
 
 **`max_readers`** — LMDB's maximum number of concurrent read transactions. Must be ≥ 8; the relay uses three threads (writer, reader, API reader).
 
@@ -389,7 +389,7 @@ The changes take effect immediately and are persisted (same lists as `nostrfy re
 
 **`search_index`** — When `true`, event content is word-indexed for fast NIP-50 search. When `false`, search still works (whole-word matching against content) but scans are slower. Toggling takes effect at startup. For a tiny VPS (0.25 vCPU / 512 MB) set `search_index = false` — it **halves the database** (41.8 MB → 20.5 MB per 10,000 events with 3 tags and 21 words in testing) and saves CPU/IO; see the Manual's [Low-spec Tuning](MANUAL.md#low-spec-vps-025-vcpu--512-mb).
 **`db_buffer_size`** — The initial per-connection WebSocket buffer in bytes (grows on demand); the kernel receive buffer is tuned separately with `limits.socket_recv_buffer_kb`.
-**`max_indexed_words`** — How many words of each event's content are added to the NIP-50 search index. Higher values improve recall for long texts at a small storage cost.
+**`max_indexed_words`** — How many words of each event's content are added to the NIP-50 search index. Higher values improve index-based recall for long texts at a small storage cost; words past the cap are still matched — long events carry an overflow marker and the search scan checks their full content — so lowering this trades query speed for index size, not correctness.
 **`db_request_timeout_secs`** — How long a database request may wait before it fails (`0` = forever). Keeps the relay responsive when the storage is stuck. Write requests are not subject to the timeout (a false timeout would skip their side effects). The startup loads of the persisted access state (deny/allow lists, Blossom allowlist) wait without a timeout and never fail fast: an empty result would silently lift every ban (fail-open). Their SIGHUP reloads keep the previous lists when a load fails.
 **`disabled_fsync`** — Skip the synchronous disk flush after every write batch (LMDB `MDB_NOSYNC`). Writes are committed to the mapped pages and left in the OS page cache, so commits cost microseconds instead of an fsync; the kernel flushes them shortly after. A power loss or OS crash may lose the writes since the last kernel flush — a fine trade for a high-throughput relay with a replica/backup, a poor one for a single always-live instance. Takes effect at startup. The Manual's [Throughput tuning](MANUAL.md#throughput-events-per-second) section shows the settings that move ingest throughput.
 **`max_db_queue_msgs`** — When the database queue holds more than this many pending messages, new requests fail fast instead of piling up in memory.
@@ -513,7 +513,7 @@ nostrfy relay list                # show both lists and restrict_relay
 
 **`min_free_bytes`** — Local-storage disk-full guard. Before writing a blob, the relay checks the free space on the filesystem hosting `local_path` (the same `statvfs` check the LMDB writer uses) and refuses the upload with `507 Insufficient Storage` while the free space is below this margin — a full disk would otherwise fail the LMDB writer and risk SIGBUS on memory-map writes. `0` disables the check. The S3 backend has no local disk, so the guard only applies to `storage = "local"`.
 
-**S3 keys** — With `storage = "s3"`, `s3_endpoint`, `s3_bucket`, `s3_access_key` and `s3_secret_key` are required. The endpoint must be the *path-style* form (`https://s3.amazonaws.com` or `https://<account>.r2.cloudflarestorage.com`); the request signing follows AWS Signature Version 4.
+**S3 keys** — With `storage = "s3"`, `s3_endpoint`, `s3_bucket`, `s3_access_key` and `s3_secret_key` are required. The endpoint must be the *path-style* HTTPS form (`https://s3.amazonaws.com` or `https://<account>.r2.cloudflarestorage.com`); the request signing follows AWS Signature Version 4. Plain `http://` is rejected because SigV4 credentials would travel in cleartext — only loopback hosts (`127.0.0.1`, `localhost`, `[::1]`) may use `http://`, so a local MinIO remains usable for testing.
 
 **`restrict_uploads`** — When `true`, `PUT /upload` accepts only the pubkeys on the Blossom upload allowlist (everyone else gets `403`). The allowlist itself is **not** part of the config file: it lives in the relay database (LMDB), is loaded at startup and managed at runtime with:
 

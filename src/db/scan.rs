@@ -11,8 +11,8 @@ use heed::types::Bytes;
 use heed::{Database, RoTxn};
 
 use super::store::{
-    ID_LEN, Store, TAG_INDEX_VALUE_MAX, WORD_INDEX_MAX, created_key, kind_key, pubkey_key,
-    tag_range,
+    ID_LEN, Store, TAG_INDEX_VALUE_MAX, WORD_INDEX_MAX, WORD_OVERFLOW, created_key, kind_key,
+    pubkey_key, tag_range, word_key,
 };
 use crate::error::Result;
 use crate::event::Event;
@@ -27,6 +27,9 @@ use crate::nips::nip50;
 pub(crate) struct NegItem {
     pub created: u64,
     pub id: [u8; 32],
+    /// Event kind, so relay-wide aggregate endpoints can count kinds from
+    /// the lightweight records without loading the full events.
+    pub kind: u64,
     /// Author pubkey (hex), so the connection layer can serve NIP-78
     /// application-specific events only to their authenticated owner.
     pub pubkey: String,
@@ -108,9 +111,12 @@ trait ScanCollector {
     fn full(&self) -> bool;
     /// The hard collection cap of this collector.
     fn cap(&self) -> usize;
-    /// Starts the per-filter limit accounting over (the boundary timestamp
-    /// belongs to one filter's limit, not the next one's).
-    fn reset_boundary(&mut self);
+    /// Starts a filter's limit accounting over: the created_at boundary
+    /// belongs to one filter's limit, not the next one's, and a collector
+    /// that tracks per-filter quotas selects the counter for `index`.
+    fn begin_filter(&mut self, index: usize) {
+        let _ = index;
+    }
     /// Pushes a matched event; returns `false` when the per-filter limit is
     /// reached and the event is strictly older than the boundary timestamp,
     /// so the scan stops. Events at the boundary timestamp are still
@@ -158,17 +164,44 @@ struct EventCollector {
     /// created_at of the event that filled a per-filter limit; events at
     /// the same timestamp keep being collected (see [`ScanCollector::push`]).
     boundary: Option<u64>,
+    /// Hard stop including the same-created_at tie continuation: a per-filter
+    /// boundary may exceed its limit to keep a tie in one page, but never
+    /// beyond twice the collection cap. Without this a flood of events
+    /// sharing one timestamp (up to the candidate budget) would be
+    /// materialized for a `limit: 1` query.
+    tie_cap: usize,
+    /// Accepted events per filter, indexed by the filter's position in the
+    /// REQ. NIP-01 applies `limit` to each filter independently, so a
+    /// filter's quota must not be consumed by an earlier filter's matches.
+    counts: Vec<usize>,
+    /// The filter currently being scanned (`counts` index).
+    filter: usize,
 }
 
 impl EventCollector {
-    fn new(cap: usize, boundary_ok: bool) -> Self {
+    fn new(cap: usize, boundary_ok: bool, filters: usize) -> Self {
         EventCollector {
             events: Vec::new(),
             cap,
             boundary_ok,
             boundary: None,
+            tie_cap: cap.saturating_mul(2),
+            counts: vec![0; filters],
+            filter: 0,
         }
     }
+}
+
+/// The per-filter collection cap: the filter's requested `limit` (bounded by
+/// `max_limit`), over-fetched by `hidden_slack` for the connection-level
+/// visibility rules. Kept in sync with [`ScanCollector::push`]'s `limit`.
+fn filter_collect_cap(filter: &Filter, max_limit: usize, hidden_slack: usize) -> usize {
+    filter
+        .limit
+        .unwrap_or(max_limit)
+        .min(max_limit)
+        .saturating_mul(hidden_slack.saturating_add(1))
+        .min(max_limit)
 }
 
 /// The NIP-50 relevance score of an event: the sum of the weights of the
@@ -189,16 +222,19 @@ fn score(event: &Event, terms: &[String], weights: &[f64]) -> f64 {
 
 impl ScanCollector for EventCollector {
     fn full(&self) -> bool {
-        self.events.len() >= self.cap && self.boundary.is_none()
+        // The tie continuation may exceed `cap`, but only up to `tie_cap`.
+        self.events.len() >= self.tie_cap
     }
     fn cap(&self) -> usize {
         self.cap
     }
-    fn reset_boundary(&mut self) {
+    fn begin_filter(&mut self, index: usize) {
+        self.filter = index;
         self.boundary = None;
     }
     fn push(&mut self, event: Event, _id: [u8; 32], limit: usize) -> bool {
-        if self.events.len() >= limit {
+        let count = self.counts[self.filter];
+        if count >= limit {
             if !self.boundary_ok {
                 return false;
             }
@@ -206,9 +242,10 @@ impl ScanCollector for EventCollector {
                 Some(b) if b == event.created_at => {}
                 _ => return false,
             }
-        } else if self.events.len() + 1 == limit {
+        } else if count + 1 == limit {
             self.boundary = Some(event.created_at);
         }
+        self.counts[self.filter] += 1;
         self.events.push(event);
         true
     }
@@ -299,7 +336,7 @@ impl ScanCollector for ItemCollector {
     fn cap(&self) -> usize {
         self.cap
     }
-    fn reset_boundary(&mut self) {
+    fn begin_filter(&mut self, _index: usize) {
         self.boundary = None;
     }
     fn push(&mut self, event: Event, id: [u8; 32], limit: usize) -> bool {
@@ -335,6 +372,7 @@ impl ScanCollector for ItemCollector {
         self.items.push(NegItem {
             created: event.created_at,
             id,
+            kind: event.kind,
             pubkey: event.pubkey.clone(),
             protected,
             app_specific: crate::nips::nip78::is_app_specific(&event),
@@ -379,6 +417,7 @@ impl ScanCollector for ItemCollector {
         self.items.push(NegItem {
             created: event.created_at(),
             id,
+            kind: event.kind(),
             pubkey: event.pubkey().to_string(),
             protected,
             app_specific: crate::nips::nip78::is_app_specific_kind(event.kind()),
@@ -507,21 +546,46 @@ impl Store {
         hidden_slack: usize,
     ) -> Result<(Vec<Event>, bool)> {
         let has_search = filters.iter().any(Filter::has_search);
-        // NIP-50: relevance ordering needs more candidates than the response
-        // limit, so the scan gathers up to the search budget.
-        let collect_cap = if has_search {
-            max_limit
-                .saturating_mul(SEARCH_BUDGET_MULTIPLIER)
-                .min(SEARCH_BUDGET_MAX)
-        } else {
-            max_limit
-        };
         let kind = if count_mode {
             ScanKind::Count
         } else {
             ScanKind::Query
         };
-        let mut out = EventCollector::new(collect_cap, !count_mode);
+        // NIP-50: relevance ordering needs more candidates than the response
+        // limit, so the scan gathers up to the search budget. Per-filter
+        // quotas are tracked by the collector; the global cap only bounds
+        // total memory, so a plain REQ sums its per-filter caps (a later
+        // filter must not be starved by an earlier one's matches). COUNT
+        // keeps the old single-budget bound: it only needs enough candidates
+        // to make the count exact or report it as approximate.
+        let collect_cap = if has_search {
+            max_limit
+                .saturating_mul(SEARCH_BUDGET_MULTIPLIER)
+                .min(SEARCH_BUDGET_MAX)
+        } else if count_mode {
+            max_limit
+        } else {
+            let caps = filters.iter().fold(0usize, |acc, filter| {
+                acc.saturating_add(filter_collect_cap(filter, max_limit, hidden_slack))
+            });
+            if filters.len() == 1 {
+                // A single filter needs only its own quota. Internal
+                // full-history rebuilds (`query_full`) pass a large
+                // `max_limit` and must not be cut off by the search budget.
+                caps
+            } else {
+                // Multiple filters: bound the total memory like a search
+                // REQ while letting every filter keep its own quota up to
+                // that bound, so a later filter is never starved by an
+                // earlier one's matches.
+                caps.min(
+                    max_limit
+                        .saturating_mul(SEARCH_BUDGET_MULTIPLIER)
+                        .min(SEARCH_BUDGET_MAX),
+                )
+            }
+        };
+        let mut out = EventCollector::new(collect_cap, !count_mode, filters.len());
         let more = self.scan_collect(
             filters,
             now,
@@ -638,17 +702,22 @@ impl Store {
             self.term_dfs(&rtxn, &all_terms)
         };
 
-        for filter in filters {
-            if out.full() {
-                more = true;
-                break;
-            }
+        for (index, filter) in filters.iter().enumerate() {
             // NIP-01: `limit: 0` returns nothing for that filter but keeps
             // the subscription alive — it must neither collect nor report
             // `more` (otherwise a leading `{"limit": 0}` filter poisons the
             // whole REQ into a pagination loop).
             if !count_mode && filter.limit == Some(0) {
                 continue;
+            }
+            // NIP-01 applies `limit` to each filter independently: starting
+            // one resets its created_at boundary and selects its own quota
+            // counter, so an earlier filter filling its limit cannot starve
+            // a later one.
+            out.begin_filter(index);
+            if out.full() {
+                more = true;
+                break;
             }
             let has_search = filter.has_search();
             let limit = if count_mode {
@@ -659,14 +728,12 @@ impl Store {
                 // collection budget.
                 out.cap()
             } else {
-                let base = filter.limit.unwrap_or(max_limit).min(max_limit);
                 // Hidden-event slack: events withheld by the connection's
                 // visibility rules (NIP-70/59/29) must not consume the
-                // per-filter limit slots, so a REQ over-fetches a little
+                // per-filter limit slots, so a REQ over-fetches each filter
                 // and the connection truncates the visible results back to
                 // the requested limits.
-                base.saturating_mul(hidden_slack.saturating_add(1))
-                    .min(max_limit)
+                filter_collect_cap(filter, max_limit, hidden_slack)
             };
             let terms = if has_search {
                 let terms = nip50::terms(filter.search.as_deref().unwrap_or(""));
@@ -680,7 +747,6 @@ impl Store {
             } else {
                 Vec::new()
             };
-            out.reset_boundary();
             let scan = FilterScan {
                 filter,
                 terms: &terms,
@@ -703,7 +769,13 @@ impl Store {
                 &all_dfs,
                 &all_terms,
             )?;
-            if stop {
+            // A stopped walk is the global collection cap (nothing more can
+            // be held), the shared work budget, or this filter's quota
+            // filling. Only the cap drops the remaining filters: a
+            // quota-filled filter is done (`more` was already set by the
+            // walk) and later filters still contribute their own quotas.
+            if stop || out.full() {
+                more = true;
                 break;
             }
         }
@@ -770,32 +842,75 @@ impl Store {
         };
 
         if let Some(ids) = &filter.ids {
-            // Every id is checked (each maps to at most one event): the
-            // collection limit only bounds the results, not the number of
-            // ids examined, so `{"ids": [A, B], "limit": 1}` must still find
-            // B when A does not exist. The work budget bounds the walk.
-            for id in ids {
-                if let Ok(id) = hex::decode(id) {
-                    if id.len() == ID_LEN {
-                        if !consider(&id)? {
-                            *more = true;
-                            return Ok(false);
+            // NIP-01: `limit: n` returns the last n events ordered by
+            // `created_at`. The events database is keyed by id, so walking
+            // `ids` in filter order says nothing about chronology. Gather
+            // the candidates first, then replay them newest-first so the
+            // per-filter boundary cuts the same way as a chronological index
+            // walk. Every id is still checked (each maps to at most one
+            // event): `{"ids": [A, B], "limit": 1}` must find B even when A
+            // is older.
+            let mut candidates: Vec<(u64, Vec<u8>)> = Vec::new();
+            'gather: for id in ids {
+                let Ok(decoded) = hex::decode(id) else {
+                    continue;
+                };
+                if decoded.len() == ID_LEN {
+                    // The exact-id set is bounded by the filter member cap
+                    // (`MAX_FILTER_MEMBERS`); the budget guard is defensive.
+                    if candidates.len() >= budget {
+                        *more = true;
+                        break;
+                    }
+                    let Some(raw) = self.events.get(rtxn, &decoded)? else {
+                        continue;
+                    };
+                    if let Some(created) = candidate_created_at(&ctx, &decoded, raw)? {
+                        candidates.push((created, decoded));
+                    }
+                } else if !decoded.is_empty() {
+                    // NIP-01: `ids` entries may be event-id *prefixes*.
+                    // A prefix selects a range, so the gather is the only
+                    // unbounded walk: cap it at the shared work budget and
+                    // report `more` when it is cut short.
+                    let start = prefix_start(&decoded);
+                    let end = prefix_end(&decoded);
+                    let range = (
+                        std::ops::Bound::Included(start.as_slice()),
+                        std::ops::Bound::Included(end.as_slice()),
+                    );
+                    for item in self.events.range(rtxn, &range)? {
+                        let (key, raw) = item?;
+                        // Corrupt short keys (bitrot/hand edit) must
+                        // loud-fail the scan, never panic the reader thread.
+                        if key.len() != ID_LEN {
+                            return Err(crate::error::Error::Other(format!(
+                                "corrupt event key ({} bytes)",
+                                key.len()
+                            )));
                         }
-                    } else if !id.is_empty() {
-                        // NIP-01: `ids` entries may be event-id *prefixes*.
-                        // Walk the events range of that prefix (bounded by
-                        // the work budget); the collection limit and the
-                        // final created_at sort apply as usual.
-                        let start = prefix_start(&id);
-                        let end = prefix_end(&id);
-                        if !self.walk_events_prefix(rtxn, &start, &end, &mut consider, more)? {
-                            return Ok(false);
+                        if candidates.len() >= budget {
+                            *more = true;
+                            break 'gather;
+                        }
+                        if let Some(created) = candidate_created_at(&ctx, key, raw)? {
+                            candidates.push((created, key.to_vec()));
                         }
                     }
                 }
             }
+            candidates.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+            for (_, id) in candidates {
+                if !consider(&id)? {
+                    *more = true;
+                    return Ok(false);
+                }
+            }
             return Ok(out.full());
         }
+
+        let since = filter.since.unwrap_or(0);
+        let until = filter.until.unwrap_or(u64::MAX);
 
         if filter.has_search() && !terms.is_empty() {
             // With the word index available, scan the index of every term
@@ -866,13 +981,28 @@ impl Store {
                     if !self.walk_merged(rtxn, by_word, &ranges, ascending, &mut consider, more)? {
                         return Ok(false);
                     }
+                    // The word index only stores the first
+                    // `max_indexed_words` tokens of each event; long events
+                    // also carry an overflow marker, and this walk checks
+                    // their full content so a term past the index cap is
+                    // still found (NIP-50 searches the whole content).
+                    let start = word_key(WORD_OVERFLOW, since, &[0u8; ID_LEN]);
+                    let end = word_key(WORD_OVERFLOW, until.saturating_add(1), &[0u8; ID_LEN]);
+                    if !self.walk_created_range(
+                        rtxn,
+                        by_word,
+                        &start,
+                        &end,
+                        ascending,
+                        &mut consider,
+                        more,
+                    )? {
+                        return Ok(false);
+                    }
                     return Ok(out.full());
                 }
             }
         }
-
-        let since = filter.since.unwrap_or(0);
-        let until = filter.until.unwrap_or(u64::MAX);
 
         if let Some(authors) = &filter.authors {
             let mut ranges: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(authors.len());
@@ -885,7 +1015,10 @@ impl Store {
                 }
                 ranges.push((
                     pubkey_key(&pk, since, &[0u8; ID_LEN]),
-                    pubkey_key(&pk, until, &[0xffu8; ID_LEN]),
+                    // Exclusive bound `(until + 1, 0..)` covers every event
+                    // with `created_at <= until`, including the maximal id
+                    // (`ff..ff`) at exactly `until`.
+                    pubkey_key(&pk, until.saturating_add(1), &[0u8; ID_LEN]),
                 ));
             }
             if !ranges.is_empty()
@@ -911,37 +1044,48 @@ impl Store {
             let tag_name = name.strip_prefix('#').unwrap_or(name);
             if tag_name.len() == 1 {
                 let name_byte = tag_name.as_bytes()[0];
+                // Only ASCII-alphanumeric single-letter names are indexed
+                // (put skips the rest), and a value longer than the index-key
+                // limit is never indexed either. Anything the index cannot
+                // represent falls through to the time-range scan below, where
+                // the in-memory `Filter::matches` applies (so stored results
+                // agree with live delivery).
                 let mut ranges: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+                let mut fully_indexed = name_byte.is_ascii_alphanumeric();
+                let mut has_value = false;
                 for value in crate::filter::tag_values(values) {
+                    has_value = true;
                     // A value beyond the index-key limit was never indexed
-                    // (put skips it): a range boundary past LMDB's key
-                    // limit would error the whole query.
+                    // (put skips it): a range boundary past LMDB's key limit
+                    // would error the whole query anyway.
                     if value.len() > TAG_INDEX_VALUE_MAX {
+                        fully_indexed = false;
                         continue;
                     }
                     ranges.push(tag_range(name_byte, value.as_bytes(), since, until));
                 }
-                if !ranges.is_empty()
-                    && !self.walk_merged(
+                if fully_indexed {
+                    if !has_value {
+                        // A tag attribute with no string values (e.g. a
+                        // numeric `{"#a": 123}`) matches nothing: the final
+                        // in-memory match requires every attribute.
+                        return Ok(out.full());
+                    }
+                    if !self.walk_merged(
                         rtxn,
                         self.by_tag,
                         &ranges,
                         ascending,
                         &mut consider,
                         more,
-                    )?
-                {
-                    return Ok(false);
+                    )? {
+                        return Ok(false);
+                    }
+                    return Ok(out.full());
                 }
-                // A tag attribute with no string values (e.g. a numeric
-                // `{"#a": 123}`) matches nothing: the final in-memory
-                // `Filter::matches` requires every tag attribute to match,
-                // so an empty value set yields zero results — consistent
-                // with this index path.
-                return Ok(out.full());
             }
-            // Multi-letter tag names are not indexed (NIP-01 only requires
-            // single-letter tags to be indexed): fall through to the
+            // Multi-letter or non-alphanumeric tag names, and values too long
+            // to index, are not in the tag index: fall through to the
             // time-range scan, where the final in-memory match enforces the
             // tag filter.
         }
@@ -951,7 +1095,10 @@ impl Store {
             for kind in kinds {
                 ranges.push((
                     kind_key(*kind, since, &[0u8; ID_LEN]),
-                    kind_key(*kind, until, &[0xffu8; ID_LEN]),
+                    // Exclusive `(until + 1, 0..)`: includes every event with
+                    // `created_at <= until`, including the maximal id at
+                    // exactly `until`.
+                    kind_key(*kind, until.saturating_add(1), &[0u8; ID_LEN]),
                 ));
             }
             if !ranges.is_empty()
@@ -963,7 +1110,9 @@ impl Store {
         }
 
         let start = created_key(since, &[0u8; ID_LEN]);
-        let end = created_key(until, &[0xffu8; ID_LEN]);
+        // Exclusive `(until + 1, 0..)`: includes every event with
+        // `created_at <= until`, including the maximal id at exactly `until`.
+        let end = created_key(until.saturating_add(1), &[0u8; ID_LEN]);
         // A per-filter limit/budget stop only ends this filter's walk, like
         // every other index path: the remaining filters still contribute
         // results. (Returning `true` here used to drop the rest of a
@@ -1017,33 +1166,6 @@ impl Store {
             }
             let id = &key[key.len() - ID_LEN..];
             if !consider(id)? {
-                *more = true;
-                return Ok(false);
-            }
-        }
-        Ok(true)
-    }
-
-    /// Walks the `events` database over the id range `[start, end]` (an
-    /// id-prefix range from NIP-01 `ids` filters), handing every full id key
-    /// to `consider`. The range is inclusive on both ends so the maximum id
-    /// with the prefix is covered.
-    fn walk_events_prefix(
-        &self,
-        rtxn: &RoTxn,
-        start: &[u8],
-        end: &[u8],
-        mut consider: impl FnMut(&[u8]) -> Result<bool>,
-        more: &mut bool,
-    ) -> Result<bool> {
-        let range = (
-            std::ops::Bound::Included(start),
-            std::ops::Bound::Included(end),
-        );
-        let iter = self.events.range(rtxn, &range)?;
-        for item in iter {
-            let (key, _) = item?;
-            if !consider(key)? {
                 *more = true;
                 return Ok(false);
             }
@@ -1193,6 +1315,22 @@ impl crate::filter::EventFields for NegLight {
     fn content(&self) -> &str {
         ""
     }
+}
+
+/// The `created_at` sort key of a candidate event, from the metadata header
+/// when present (fast path) or from the stored event JSON otherwise. `None`
+/// means the stored value could not be parsed (corruption); the candidate is
+/// skipped like [`consider_event`] skips it.
+fn candidate_created_at(ctx: &ScanContext<'_>, id: &[u8], raw: &[u8]) -> Result<Option<u64>> {
+    if let Some(meta) = ctx.event_meta
+        && let Some(header) = meta.get(ctx.rtxn, id)?
+        && let Some((_, created, _, _)) = crate::db::store::decode_meta(header)
+    {
+        return Ok(Some(created));
+    }
+    Ok(serde_json::from_slice::<Event>(raw)
+        .ok()
+        .map(|event| event.created_at))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1410,7 +1548,7 @@ mod tests {
             !c.push_light(&light2, [0xFFu8; 32], 2),
             "light limit reached"
         );
-        c.reset_boundary();
+        c.begin_filter(0);
         // A fresh collector (its own limit) for the per-kind tagging checks.
         let mut c = ItemCollector::new(8);
         // Gift wraps record their p-tag recipients; group metadata records

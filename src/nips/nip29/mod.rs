@@ -269,6 +269,41 @@ impl GroupStore {
     /// string for the `OK` message on rejection. Access control is based on
     /// the event's author (`event.pubkey`), not on connection authentication.
     pub fn validate_write(&self, event: &Event) -> Result<(), String> {
+        self.validate_write_inner(event, None)
+    }
+
+    /// Like [`Self::validate_write`], but treats the relay's own key as the
+    /// group master key. NIP-29 expects moderation events from "the relay
+    /// master key or by group admins", so an operator can recover a group
+    /// whose admins all left by signing the moderation event with
+    /// `relay.private_key` (the NIP-11 `self` key).
+    pub fn validate_write_for_relay(
+        &self,
+        event: &Event,
+        relay_pubkey: Option<&str>,
+    ) -> Result<(), String> {
+        self.validate_write_inner(event, relay_pubkey)
+    }
+
+    fn validate_write_inner(
+        &self,
+        event: &Event,
+        relay_pubkey: Option<&str>,
+    ) -> Result<(), String> {
+        // NIP-29: the event's `h` tag carries *the* group id. Multiple `h`
+        // tags are ambiguous and dangerous: the checks below use the first
+        // one while the stored tag index and subscriptions match any of
+        // them, so an event validated against an open group could surface in
+        // a restricted group's feed. Reject them outright.
+        if event
+            .tags
+            .iter()
+            .filter(|t| t.first().is_some_and(|name| name == H))
+            .count()
+            > 1
+        {
+            return Err("invalid: group events must carry only one h tag".into());
+        }
         let Some(gid) = group_id(event) else {
             return Ok(());
         };
@@ -300,6 +335,10 @@ impl GroupStore {
             return Err("restricted: unknown group".into());
         };
         let pubkey = event.pubkey.as_str();
+        // The relay's own key is the group master key for moderation events
+        // (see `validate_write_for_relay`): it is accepted even when no
+        // group admin remains.
+        let relay_signed = relay_pubkey.is_some_and(|pk| pk.eq_ignore_ascii_case(pubkey));
 
         if event.kind == JOIN {
             if group.is_member(pubkey) {
@@ -337,20 +376,16 @@ impl GroupStore {
         }
 
         if event.kind == LEAVE {
-            // NIP-29: leaving must not remove the group's last admin
-            // (nobody could then manage the group).
-            let retains_admin = group
-                .members
-                .iter()
-                .any(|(pk, roles)| !roles.is_empty() && pk != &event.pubkey);
-            if !retains_admin {
-                return Err("restricted: the group must retain at least one admin".into());
-            }
+            // NIP-29: "Any user can send one of these events to the relay in
+            // order to be automatically removed from the group." There is no
+            // admin exception: even the group's last admin may leave. The
+            // group then has no admins and can only be managed by the relay's
+            // own key.
             return Ok(());
         }
 
         if (MOD_MIN..=MOD_MAX).contains(&event.kind) {
-            if !group.is_admin(pubkey) {
+            if !relay_signed && !group.is_admin(pubkey) {
                 return Err("restricted: you are not an admin of this group".into());
             }
             if event.kind == 9002 {
@@ -397,8 +432,10 @@ impl GroupStore {
             }
             // NIP-29: the group must retain at least one admin — a 9000
             // without roles could silently demote the last admin, and a
-            // 9001/LEAVE could remove them, leaving the group unmanageable
-            // (nobody could then issue 9000/9001/9002 again).
+            // 9001 could remove them, leaving the group unmanageable
+            // (nobody could then issue 9000/9001/9002 again). A member's own
+            // LEAVE is exempt (NIP-29: any user may leave), so an admin-less
+            // group is possible; the relay's own key can still manage it.
             let admin_removed: HashSet<String> = match event.kind {
                 9000 => event
                     .tags
@@ -612,20 +649,30 @@ impl GroupStore {
                     if old_parent.as_deref() == Some(gid) {
                         continue;
                     }
-                    // Only a child that does not already belong to another
-                    // parent gets its back-pointer assigned here: changing
-                    // an existing child's parent is the child's own 9002's
-                    // decision (the parent's admin must not re-parent a
-                    // group they do not administer).
-                    if old_parent.is_some() {
-                        continue;
+                    // A child that currently belongs to another parent is
+                    // moved, not just listed: validation required the author
+                    // to administer the child too, and NIP-29 keeps both
+                    // sides of the link consistent ("and vice-versa"). The
+                    // old parent's list is updated and republished as well.
+                    if let Some(old) = old_parent.as_ref()
+                        && let Some(old_group) = self.groups.get_mut(old)
+                    {
+                        old_group.children.retain(|c| c != child);
                     }
                     if let Some(child_group) = self.groups.get_mut(child) {
                         child_group.parent = Some(gid.to_string());
                     }
-                    // The child's metadata changed (its parent tag):
-                    // republish it so peers see the new link.
+                    // The child's metadata changed (its parent tag): republish
+                    // it so peers see the new link.
                     if emit {
+                        if let Some(old) = &old_parent {
+                            out.push(build_meta_event(
+                                old,
+                                self.groups.get(old),
+                                relay_pubkey,
+                                now,
+                            ));
+                        }
                         out.push(build_meta_event(
                             child,
                             self.groups.get(child),
@@ -699,11 +746,10 @@ impl GroupStore {
                 if !self.groups.contains_key(gid) && (ignore_capacity || !self.at_capacity()) {
                     // A fresh create resurrects the id: clear a previous
                     // delete tombstone (and ghost marker) so the id is
-                    // reusable. Note the tombstone itself is memory-only;
-                    // if the `9008` event is later lost (author vanish,
-                    // expiry, NIP-09 deletion), the next rebuild replays
-                    // surviving history and the group returns — events are
-                    // the source of truth, and an admin can re-delete.
+                    // reusable. The deleted group's events were purged by
+                    // the relay when the `9008` was applied, so re-creation
+                    // starts from an empty history (no old private content
+                    // can surface under the new, default-public settings).
                     self.deleted.remove(gid);
                     self.unghost(gid);
                     let mut group = Group::default();

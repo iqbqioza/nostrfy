@@ -143,10 +143,7 @@ pub async fn rpc_handler(
     // NIP-86 `blockip` also applies to this endpoint: a blocked peer must
     // not reach the management RPC (the WebSocket handler already refuses
     // its connections).
-    if relay.access.read().await.blocked_ips.iter().any(|(b, _)| {
-        b.parse::<std::net::IpAddr>()
-            .is_ok_and(|b| b == crate::util::normalize_ip(peer.ip()))
-    }) {
+    if crate::util::ip_blocked(&relay.access.read().await.blocked_ips, peer.ip()) {
         return StatusCode::FORBIDDEN.into_response();
     }
     // The spec requires the JSON-RPC content type (parameters such as
@@ -445,10 +442,16 @@ pub async fn rpc_handler(
             if !is_pubkey(pubkey) {
                 return rpc_err("invalid pubkey");
             }
+            // Normalize to lowercase like `banpubkey`/`allowpubkey`:
+            // `hex::decode` accepts uppercase, but events always carry
+            // lowercase pubkeys, so an uppercase assignment would report
+            // success while matching no event (and would be echoed in the
+            // relay's membership list in the wrong case).
+            let pubkey = pubkey.to_ascii_lowercase();
             if let Err(msg) = check_role_id(role) {
                 return rpc_err(&msg);
             }
-            if relay.assign_role(pubkey, role).await {
+            if relay.assign_role(&pubkey, role).await {
                 audit!(&relay, &identity, "assignrole", params);
                 rpc_ok(json!(true))
             } else {
@@ -467,10 +470,12 @@ pub async fn rpc_handler(
             if !is_pubkey(pubkey) {
                 return rpc_err("invalid pubkey");
             }
+            // Same lowercase normalization as `assignrole` above.
+            let pubkey = pubkey.to_ascii_lowercase();
             if let Err(msg) = check_role_id(role) {
                 return rpc_err(&msg);
             }
-            if relay.unassign_role(pubkey, role).await {
+            if relay.unassign_role(&pubkey, role).await {
                 audit!(&relay, &identity, "unassignrole", params);
                 rpc_ok(json!(true))
             } else {
@@ -486,12 +491,16 @@ pub async fn rpc_handler(
             ) else {
                 return rpc_err("invalid params");
             };
-            if ip.parse::<std::net::IpAddr>().is_err() {
+            let Ok(ip) = ip.parse::<std::net::IpAddr>() else {
                 return rpc_err("invalid ip address");
-            }
+            };
+            // Normalize so a dual-stack `::ffff:a.b.c.d` block and a plain
+            // IPv4 block refer to the same peer (and an equivalent-spelling
+            // entry is not duplicated).
+            let ip = crate::util::normalize_ip(ip);
             {
                 let mut access = relay.access.write().await;
-                if !access.blocked_ips.iter().any(|(i, _)| i == ip) {
+                if !crate::util::ip_blocked(&access.blocked_ips, ip) {
                     access
                         .blocked_ips
                         .push((ip.to_string(), reason.to_string()));
@@ -507,9 +516,21 @@ pub async fn rpc_handler(
             let Some(ip) = params.first().and_then(Value::as_str) else {
                 return rpc_err("invalid params");
             };
+            let Ok(ip) = ip.parse::<std::net::IpAddr>() else {
+                return rpc_err("invalid ip address");
+            };
+            let ip = crate::util::normalize_ip(ip);
             {
                 let mut access = relay.access.write().await;
-                access.blocked_ips.retain(|(i, _)| i != ip);
+                // Remove equivalently-spelled entries too (`::1` versus
+                // `0:0:0:0:0:0:0:1`, v4-mapped versus IPv4).
+                access.blocked_ips.retain(|(entry, _)| {
+                    entry
+                        .parse::<std::net::IpAddr>()
+                        .map(crate::util::normalize_ip)
+                        .map(|b| b != ip)
+                        .unwrap_or(true)
+                });
             }
             relay.persist_access().await;
             // Re-connect checks: unblocking also bumps the version so
@@ -644,7 +665,7 @@ async fn rpc_authenticated(
             .get(header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("Nostr "))
-        && let Some(pubkey) = nip98::verify(
+        && let Some(verified) = nip98::verify(
             auth,
             Some(&cfg.rpc.admin_pubkey),
             relay.secp(),
@@ -654,8 +675,11 @@ async fn rpc_authenticated(
             |url| nip98::matches_request_url(url, &cfg.relay_identity(), uri.path(), uri.query()),
         )
         .await
+        && relay
+            .nip98_replay
+            .accept(&verified.id, crate::util::unix_now())
     {
-        return Some(pubkey);
+        return Some(verified.pubkey);
     }
     None
 }
@@ -935,8 +959,64 @@ mod tests {
         assert!(rpc_err_of(resp).await.contains("params"));
         let resp = rpc_call(&relay, "unblockip", vec![json!("127.0.0.1")]).await;
         assert!(rpc_ok_of(resp).await);
+        let resp = rpc_call(&relay, "unblockip", vec![json!("not-an-ip")]).await;
+        assert!(rpc_err_of(resp).await.contains("ip address"));
         let resp = rpc_call(&relay, "listblockedips", vec![]).await;
         assert_eq!(resp.status(), StatusCode::OK);
+
+        // blockip normalizes v4-mapped IPv6 to IPv4, unblockip accepts any
+        // equivalent spelling, and equivalent entries are not duplicated.
+        let resp = rpc_call(
+            &relay,
+            "blockip",
+            vec![json!("::ffff:127.0.0.9"), json!("mapped")],
+        )
+        .await;
+        assert!(rpc_ok_of(resp).await);
+        assert!(
+            relay
+                .access
+                .read()
+                .await
+                .blocked_ips
+                .iter()
+                .any(|(i, r)| i == "127.0.0.9" && r == "mapped"),
+            "the v4-mapped address must be stored normalized"
+        );
+        let resp = rpc_call(&relay, "unblockip", vec![json!("127.0.0.9")]).await;
+        assert!(rpc_ok_of(resp).await);
+        assert!(
+            !relay
+                .access
+                .read()
+                .await
+                .blocked_ips
+                .iter()
+                .any(|(i, _)| i == "127.0.0.9"),
+            "the equivalent spelling must remove the entry"
+        );
+        let resp = rpc_call(
+            &relay,
+            "blockip",
+            vec![json!("0:0:0:0:0:0:0:9"), json!("expanded")],
+        )
+        .await;
+        assert!(rpc_ok_of(resp).await);
+        let resp = rpc_call(&relay, "blockip", vec![json!("::9"), json!("again")]).await;
+        assert!(rpc_ok_of(resp).await);
+        assert_eq!(
+            relay
+                .access
+                .read()
+                .await
+                .blocked_ips
+                .iter()
+                .filter(|(i, _)| i == "::9")
+                .count(),
+            1,
+            "equivalent spellings must not duplicate the entry"
+        );
+        let _ = rpc_call(&relay, "unblockip", vec![json!("::9")]).await;
 
         // banevent / allowevent / listbannedevents.
         let id = "ab".repeat(32);
@@ -1064,6 +1144,33 @@ mod tests {
             recent.iter().any(|e| e.contains("createrole")),
             "the role mutation must be audited: {recent:?}"
         );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn assignrole_normalizes_pubkey_case() {
+        let relay = build_admin_relay_with_key(Some(&"cd".repeat(32))).await;
+        let resp = rpc_call(&relay, "createrole", vec![json!("mod")]).await;
+        assert!(rpc_ok_of(resp).await);
+        // Uppercase hex is valid to `hex::decode`, but events always carry
+        // lowercase pubkeys: the assignment must be stored lowercased, or it
+        // would report success while matching nothing.
+        let upper = "AB".repeat(32);
+        let lower = "ab".repeat(32);
+        let resp = rpc_call(&relay, "assignrole", vec![json!(upper), json!("mod")]).await;
+        assert!(rpc_ok_of(resp).await);
+        {
+            let roles = relay.roles.read().await;
+            assert!(
+                roles.is_member_of(&lower),
+                "the assignment must be stored lowercased"
+            );
+            assert!(!roles.is_member_of(&upper));
+        }
+        // Unassign accepts either case too.
+        let resp = rpc_call(&relay, "unassignrole", vec![json!(upper), json!("mod")]).await;
+        assert!(rpc_ok_of(resp).await);
+        assert!(!relay.roles.read().await.is_member_of(&lower));
         relay.db.shutdown();
     }
 

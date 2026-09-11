@@ -41,6 +41,16 @@ pub(crate) struct PendingReq {
     /// Serialized bytes of the EVENT messages queued so far (against
     /// `limits.max_req_response_bytes`).
     pub(crate) sent_bytes: u64,
+    /// Live EVENT messages that matched this subscription while its stored
+    /// response was still pumping. NIP-01 defines EOSE as the boundary
+    /// between stored and real-time events, so these wait here until the
+    /// stored events and the EOSE have been queued.
+    pub(crate) live: std::collections::VecDeque<String>,
+    /// Serialized bytes held in `live`, against the outgoing byte cap.
+    pub(crate) live_bytes: usize,
+    /// Whether the EOSE (and any AUTH challenge before it) has been queued;
+    /// afterwards the pump only drains `live`.
+    pub(crate) eose_sent: bool,
 }
 
 /// Upper bound on queued REQ responses per connection: beyond this the
@@ -92,6 +102,9 @@ pub struct Conn {
     /// Events received but not yet accepted; flushed in batches so the
     /// database commit cost is amortized over many events.
     pub(crate) pending_events: Vec<Event>,
+    /// Wire bytes of the events held in `pending_events`, so a burst of
+    /// maximum-size frames cannot accumulate before the batch is flushed.
+    pub(crate) pending_bytes: usize,
     /// Live-event receiver, created when the first REQ subscribes (before
     /// the query runs, so no stored event can fall into the gap between the
     /// query and the subscription) and dropped when the last subscription
@@ -208,6 +221,15 @@ impl Conn {
         self.send_json(json!(["OK", id, accepted, message]));
     }
 
+    /// Whether the pending EVENT batch must be flushed before reading more
+    /// frames: the documented count ([`EVENT_BATCH`], sharing one database
+    /// commit) or the byte budget (one full frame, `max_msg_size`) is
+    /// reached. Without the byte bound a burst of maximum-size frames
+    /// accumulated up to the whole window before validation.
+    pub(crate) fn pending_batch_full(&self, max_msg_size: usize) -> bool {
+        self.pending_events.len() >= EVENT_BATCH || self.pending_bytes >= max_msg_size
+    }
+
     /// Queues a REQ response for the pump. Responses are processed in
     /// order; when more than [`MAX_PENDING_REQS`] are queued (a client
     /// flooding REQs while reading slowly), the oldest is cut off — its
@@ -226,7 +248,14 @@ impl Conn {
             // "more" hint instead of claiming a complete result (the
             // subscription itself stays open).
             dropped.truncated_or_more = true;
-            self.finish_pending_req(dropped);
+            // Only a response whose EOSE has not gone out needs the closing
+            // EOSE. A response that already ended (EOSE sent, live events
+            // still buffered) must not get a second EOSE, and a CLOSEd
+            // subscription must not receive anything further (the pump
+            // applies the same guard before its EOSE).
+            if !dropped.eose_sent && self.subs.contains_key(&dropped.sub_id) {
+                self.finish_pending_req(&dropped);
+            }
         }
         self.pending_reqs.push_back(pending);
     }
@@ -235,7 +264,7 @@ impl Conn {
     /// response. EOSE/CLOSED are tiny, so they take the uncapped path —
     /// the byte cap exists for large payloads, and a dropped EOSE would
     /// leave the client hanging on a completed subscription.
-    fn finish_pending_req(&mut self, pending: PendingReq) {
+    fn finish_pending_req(&mut self, pending: &PendingReq) {
         let eose = if pending.eose_hint {
             // NIP-67: `"auth"` advertises stored events that match the
             // filters but are withheld pending AUTH (protected events,
@@ -358,14 +387,55 @@ impl Conn {
                 self.pending_reqs.pop_front();
                 continue;
             }
-            if front.events.is_empty() {
-                let pending = self.pending_reqs.pop_front().unwrap();
-                self.finish_pending_req(pending);
+            if !front.events.is_empty() {
+                // The queue is full or the count cap is reached: the next
+                // loop iteration resumes the pump after the drain.
+                break;
+            }
+            // All stored events are queued. Send the EOSE (with any AUTH
+            // challenge ahead of it) before draining the live events that
+            // arrived while the response was pumping: NIP-01 defines EOSE
+            // as the boundary between stored and real-time events.
+            let mut pending = self.pending_reqs.pop_front().expect("front exists");
+            if !pending.eose_sent {
+                pending.eose_sent = true;
+                self.finish_pending_req(&pending);
+            }
+            self.drain_pending_live(&mut pending);
+            if pending.live.is_empty() {
                 continue;
             }
-            // The queue is full or the count cap is reached: the next
-            // loop iteration resumes the pump after the drain.
+            // The queue filled up again with live events: keep the entry so
+            // the next pump (after the socket drains) resumes in order.
+            self.pending_reqs.push_front(pending);
             break;
+        }
+    }
+
+    /// Moves the live events held for a pumped-out REQ response into the
+    /// capped outgoing queue. The caller keeps the entry while a non-empty
+    /// backlog remains, so the next pump (after the socket drains) resumes
+    /// exactly where this one stopped.
+    fn drain_pending_live(&mut self, pending: &mut PendingReq) {
+        while self.outgoing.len() < OUT_QUEUE_LIMIT {
+            let Some(text) = pending.live.front() else {
+                return;
+            };
+            let size = text.len();
+            // The same byte-cap rule as the stored events: the first message
+            // may exceed the cap so a single event is never lost.
+            if self.out_queue_bytes > 0
+                && self.out_bytes > 0
+                && self.out_bytes.saturating_add(size) > self.out_queue_bytes
+            {
+                return;
+            }
+            let text = pending.live.pop_front().expect("front checked");
+            pending.live_bytes = pending.live_bytes.saturating_sub(size);
+            self.out_bytes += size;
+            self.out_msgs += 1;
+            self.out_bytes_total += size as u64;
+            self.outgoing.push_back(Message::Text(text.into()));
         }
     }
 
@@ -382,6 +452,13 @@ impl Conn {
         if enabled {
             self.send_json(nip42::auth_message(&self.challenge));
         }
+    }
+
+    /// Whether this connection's source IP is blocked (NIP-86 `blockip`).
+    /// Called when the blocked-IP list changes, so a read-only subscriber
+    /// that never sends a frame is disconnected like any other.
+    pub(crate) async fn source_ip_blocked(&self, peer_ip: std::net::IpAddr) -> bool {
+        crate::util::ip_blocked(&self.relay.access.read().await.blocked_ips, peer_ip)
     }
 }
 
@@ -602,12 +679,10 @@ pub async fn handle_connection(
         interval
     });
 
-    // Blocked-IP version captured at connect: when the NIP-86 admin
-    // blocks (or unblocks) an IP, every connection re-checks the list and
-    // closes if its own source IP became blocked.
-    let mut blocks_version = relay
-        .ip_blocks_version
-        .load(std::sync::atomic::Ordering::Relaxed);
+    // NIP-86 blockip: watch the blocked-IP list changes so this connection
+    // is dropped when its source IP becomes blocked, even if it only
+    // receives live events and never sends a frame.
+    let mut ip_blocks_rx = relay.ip_blocks_tx.subscribe();
 
     let idle_jitter = Duration::from_millis(conn_id % 2000);
     let idle_sleep: Option<tokio::time::Sleep> =
@@ -640,6 +715,7 @@ pub async fn handle_connection(
         challenge,
         authed_pubkeys: Vec::new(),
         pending_events: Vec::new(),
+        pending_bytes: 0,
         expiry_enabled,
         giftwrap_restricted,
         nip78_restricted,
@@ -756,29 +832,6 @@ pub async fn handle_connection(
                     Ok(Message::Close(_)) => break,
                     Ok(frame) => {
                         last_activity = std::time::Instant::now();
-                        // Re-check the blocked-IP list when it changed since
-                        // connect: a newly blocked IP's existing connections
-                        // are dropped (a version bump also re-checks after
-                        // an unblock; the list is then empty).
-                        let version =
-                            conn.relay.ip_blocks_version.load(std::sync::atomic::Ordering::Relaxed);
-                        if version != blocks_version {
-                            blocks_version = version;
-                            let blocked = conn
-                                .relay
-                                .access
-                                .read()
-                                .await
-                                .blocked_ips
-                                .iter()
-                                .any(|(b, _)| {
-                                    b.parse::<std::net::IpAddr>()
-                                        .is_ok_and(|b| b == crate::util::normalize_ip(peer_ip))
-                                });
-                            if blocked {
-                                break;
-                            }
-                        }
                         if conn.handle_frame(frame, max_msg_size).await {
                             break;
                         }
@@ -835,6 +888,13 @@ pub async fn handle_connection(
                         too_large = true;
                         break;
                     }
+                    // The pending batch is bounded by count and bytes: flush
+                    // it through the post-window path instead of reading the
+                    // rest of the window (which let a flood of maximum-size
+                    // frames pile up parsed events before validation).
+                    if conn.pending_batch_full(max_msg_size) {
+                        break;
+                    }
                     // Slide the window: the next frame extends the batch
                     // instead of starting a new window (and a new commit).
                     window_deadline
@@ -872,6 +932,14 @@ pub async fn handle_connection(
                 // must reach the peer for its send path to unblock: wake
                 // the top-of-loop drain promptly instead of waiting for
                 // the next inbound frame.
+            }
+            changed = ip_blocks_rx.changed() => {
+                // NIP-86 blockip: wake on every blocked-IP list change so a
+                // read-only subscriber (no inbound frames) is dropped too.
+                // An `Err` means the relay (and its sender) is gone.
+                if changed.is_err() || conn.source_ip_blocked(peer_ip).await {
+                    break;
+                }
             }
             live_batch = live_fut => {
                 match live_batch {
@@ -1163,6 +1231,7 @@ mod tests {
             challenge: "test-challenge".into(),
             authed_pubkeys: Vec::new(),
             pending_events: Vec::new(),
+            pending_bytes: 0,
             expiry_enabled,
             giftwrap_restricted,
             nip78_restricted,
@@ -2388,6 +2457,10 @@ mod tests {
             owner
                 .handle_req(&[json!("sub"), json!({"kinds": [30078]})])
                 .await;
+            // The stored response (here empty) is pumped before any live
+            // event: pulling it through the pump mirrors the connection loop
+            // and leaves the subscription in its EOSE-sent state.
+            owner.pump_pending_reqs();
             relay.broadcast(ev.clone());
             let received = tokio::time::timeout(
                 std::time::Duration::from_secs(2),
@@ -2562,7 +2635,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let now = unix_now();
-            // Default config: ephemeral forwarded (mute).
+            // Default config: ephemeral forwarded (accepted, not stored).
             let mut conn = build_conn().await;
             let ephemeral = signed_note_seeded(conn.relay.secp(), 1, "ephemeral", now, vec![]);
             let mut ev = ephemeral.clone();
@@ -2582,9 +2655,10 @@ mod tests {
             let msgs = outgoing_json(&conn);
             let ok = msgs.iter().find(|m| m[0] == "OK" && m[1] == ev.id).unwrap();
             assert_eq!(ok[2], true, "ephemeral must be forwarded when not rejected");
-            assert!(
-                ok[3].as_str().unwrap_or("").contains("mute"),
-                "ephemeral OK carries mute prefix"
+            assert_eq!(
+                ok[3].as_str().unwrap_or(""),
+                "",
+                "an accepted ephemeral must not carry the `mute:` prefix"
             );
             conn.relay.db.shutdown();
 
@@ -2868,6 +2942,10 @@ mod tests {
             let now = unix_now();
             conn.handle_req(&[json!("sub"), json!({"kinds": [30002]})])
                 .await;
+            // Finish the stored response first: a live event delivered while
+            // the response is pumping waits for its EOSE (by design), so the
+            // shared-JSON wrapping is asserted after the pump.
+            conn.pump_pending_reqs();
             // The sub id JSON is cached at REQ time.
             let cached = conn.subs.get("sub").map(|(_, _, j)| j.clone()).unwrap();
             assert_eq!(cached, "\"sub\"");
@@ -2999,6 +3077,11 @@ mod tests {
             conn.handle_req(&[json!("sub"), json!({"kinds": [30001]})])
                 .await;
             assert!(conn.live.is_some(), "REQ must subscribe to live events");
+            // Finish the (empty) stored response before the live event: a
+            // live event delivered while a response is pumping is held for
+            // its EOSE, so the queue assertion needs the subscription in its
+            // EOSE-sent state.
+            conn.pump_pending_reqs();
 
             let mut ev = signed_note(conn.relay.secp(), "live-check", now, vec![]);
             ev.kind = 30001;
@@ -3573,6 +3656,63 @@ mod tests {
     }
 
     #[test]
+    fn failed_neg_opens_consume_the_connection_budget() {
+        // A NEG-OPEN that runs the database scan and then fails (here: the
+        // response exceeds the per-connection byte budget) must still spend
+        // the connection-wide open budget, or a client could run scans
+        // unbounded by always failing the open after the scan.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            conn.req_response_bytes = 1;
+            conn.handle_neg_open(&[json!("s"), json!({}), json!("61000000")])
+                .await;
+            assert!(
+                outgoing_json(&conn).iter().any(|m| m[0] == "NEG-ERR"),
+                "the oversized response must be refused"
+            );
+            assert_eq!(
+                conn.neg_opens_total, 1,
+                "a refused open must still spend the connection budget"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn exhausted_neg_open_budget_skips_the_database_query() {
+        // The connection-wide NEG-OPEN cap is checked before the large
+        // database query: an exhausted budget answers "connection limit"
+        // instead of spending the scan and then reporting a different
+        // refusal.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let now = unix_now();
+            // More events than a tiny item cap, so the scan would answer
+            // "too big" if it ran.
+            conn.relay.config.write().await.limits.max_neg_items = 1;
+            for i in 0..3 {
+                let ev = signed_note(conn.relay.secp(), &format!("e{i}"), now - i, vec![]);
+                conn.relay.db.put(ev, now).await;
+            }
+            conn.neg_opens_total = super::negentropy::MAX_NEG_OPENS;
+            conn.handle_neg_open(&[json!("s"), json!({"kinds": [1]}), json!("61000000")])
+                .await;
+            let msgs = outgoing_json(&conn);
+            let err = msgs
+                .iter()
+                .find(|m| m[0] == "NEG-ERR")
+                .expect("the open must be refused");
+            assert!(
+                err[2].as_str().unwrap().contains("connection limit"),
+                "the budget check must run before the database query: {err:?}"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
     fn neg_open_counts_towards_active_subscriptions() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -3605,10 +3745,12 @@ mod tests {
     }
 
     #[test]
-    fn neg_open_replacement_keeps_old_state_on_failed_replace() {
-        // A failed NEG-OPEN replacement (invalid initial message) must not
-        // close the peer's existing subscription: the response is computed
-        // before the old state is removed.
+    fn neg_open_failed_replace_closes_the_old_subscription() {
+        // NIP-77: "If a NEG-OPEN is issued for a currently open subscription
+        // ID, the existing subscription is first closed", and "after a
+        // NEG-ERR is issued, the subscription is considered to be closed".
+        // A failed replacement therefore closes the id instead of leaving
+        // the old state running.
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let mut conn = build_conn().await;
@@ -3625,26 +3767,28 @@ mod tests {
                 before + 1,
                 "the first open holds a slot"
             );
+            assert!(conn.neg.contains_key("s"), "the first open is live");
             // A syntactically valid hex message that fails to parse:
             // version byte followed by an out-of-order bound.
             let bad = hex::encode([0x61u8, 0x02, 0x00, 0x01]);
             conn.handle_neg_open(&[json!("s"), json!({"kinds": [1]}), json!(bad)])
                 .await;
-            assert_eq!(
-                stats
-                    .subscriptions_active
-                    .load(std::sync::atomic::Ordering::Relaxed),
-                before + 1,
-                "a failed replacement must not release the old subscription"
+            assert!(
+                conn.outgoing
+                    .iter()
+                    .any(|m| m.to_text().is_ok_and(|t| t.contains("NEG-ERR"))),
+                "the failed replacement must send a NEG-ERR"
             );
-            // The old subscription still works.
-            conn.handle_neg_close(&[json!("s")]);
+            assert!(
+                !conn.neg.contains_key("s"),
+                "a NEG-ERR closes the subscription: the old state is released"
+            );
             assert_eq!(
                 stats
                     .subscriptions_active
                     .load(std::sync::atomic::Ordering::Relaxed),
                 before,
-                "closing releases the slot"
+                "the closed id's subscription slot is released"
             );
             conn.relay.db.shutdown();
         });
@@ -3656,8 +3800,8 @@ mod tests {
         rt.block_on(async {
             let mut conn = build_conn().await;
             // A small response budget: any mode-2 answer over it is
-            // rejected with NEG-ERR while the (empty) old subscription is
-            // kept.
+            // rejected with NEG-ERR, which closes the (here non-existent)
+            // subscription.
             // Any initial answer is at least the version byte plus a
             // bound, so a 1-byte budget rejects everything.
             conn.req_response_bytes = 1;
@@ -3710,23 +3854,34 @@ mod tests {
     }
 
     #[test]
-    fn neg_open_item_cap_keeps_old_subscription() {
+    fn neg_open_item_cap_closes_the_old_subscription() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let mut conn = build_conn().await;
-            conn.relay.config.write().await.limits.max_neg_items = 2;
+            let now = unix_now();
+            // Open "s" against an empty database: it succeeds and holds
+            // state.
             conn.handle_neg_open(&[json!("s"), json!({"kinds": [1]}), json!("61000000")])
                 .await;
             assert_eq!(conn.neg.len(), 1, "the first open succeeds");
-            // A replacement with more items than the cap is rejected and
-            // the old subscription survives.
-            let too_many = hex::encode([0x61u8, 0x02, 0x00, 0x00, 0x03, 0x00]);
-            conn.handle_neg_open(&[json!("s"), json!({"kinds": [1]}), json!(too_many)])
+            conn.relay.config.write().await.limits.max_neg_items = 2;
+            // Store more matching events than the cap, then replace "s":
+            // the over-cap NEG-ERR closes the id (NIP-77).
+            for i in 0..3 {
+                let ev = signed_note(conn.relay.secp(), &format!("e{i}"), now - i, vec![]);
+                conn.relay.db.put(ev, now).await;
+            }
+            conn.handle_neg_open(&[json!("s"), json!({"kinds": [1]}), json!("61000000")])
                 .await;
-            assert_eq!(
-                conn.neg.len(),
-                1,
-                "the over-cap open must not remove the old subscription"
+            assert!(
+                outgoing_json(&conn)
+                    .iter()
+                    .any(|m| { m[0] == "NEG-ERR" && m[2].as_str().unwrap().contains("too big") }),
+                "the over-cap query must be refused"
+            );
+            assert!(
+                conn.neg.is_empty(),
+                "the NEG-ERR must close the old subscription"
             );
             conn.relay.db.shutdown();
         });
@@ -3863,6 +4018,97 @@ mod tests {
     }
 
     #[test]
+    fn live_events_wait_for_the_pending_eose() {
+        // NIP-01: EOSE marks the end of stored events and the beginning of
+        // the real-time stream. A live event that arrives while a stored
+        // response is still pumping must be queued after the EOSE, never
+        // ahead of the remaining stored events.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            // One stored event per pump, so the live event arrives while the
+            // response is still being drained.
+            conn.out_queue_bytes = 1024;
+            let now = unix_now();
+            conn.subs
+                .insert("s".into(), (vec![Filter::default()], 0, "\"s\"".into()));
+            let mut events = std::collections::VecDeque::new();
+            for i in 0..3 {
+                events.push_back(signed_note(
+                    conn.relay.secp(),
+                    &format!("stored-{i}-{}", "x".repeat(2_000)),
+                    now - i,
+                    vec![],
+                ));
+            }
+            conn.enqueue_pending_req(PendingReq {
+                sub_id: "s".into(),
+                events,
+                eose_hint: false,
+                truncated_or_more: false,
+                auth_hint: false,
+                sent_bytes: 0,
+                live: Default::default(),
+                live_bytes: 0,
+                eose_sent: false,
+            });
+            // A live event for the same subscription arrives mid-response:
+            // it must be held for the post-EOSE stream.
+            let live = signed_note(conn.relay.secp(), "live", now, vec![]);
+            let live_json = serde_json::to_string(&live).unwrap();
+            conn.deliver_live(&live, &live_json, None);
+            assert!(
+                !outgoing_json(&conn)
+                    .iter()
+                    .any(|m| m[0] == "EVENT" && m[2]["content"] == "live"),
+                "the live event must not overtake the stored response"
+            );
+
+            // Drain the queue chunk by chunk, collecting the message order.
+            let mut order = Vec::new();
+            for _ in 0..20 {
+                conn.pump_pending_reqs();
+                order.extend(outgoing_json(&conn));
+                conn.outgoing.clear();
+                conn.out_bytes = 0;
+                if conn.pending_reqs.is_empty() {
+                    break;
+                }
+            }
+            assert!(
+                conn.pending_reqs.is_empty(),
+                "the response must finish within the drain loop"
+            );
+            let stored = |m: &Value| {
+                m[0] == "EVENT"
+                    && m[2]["content"]
+                        .as_str()
+                        .is_some_and(|c| c.starts_with("stored-"))
+            };
+            let eose = order
+                .iter()
+                .position(|m| m[0] == "EOSE" && m[1] == "s")
+                .expect("the EOSE must be queued");
+            let last_stored = order.iter().rposition(stored).expect("stored events");
+            let live_pos = order
+                .iter()
+                .position(|m| m[0] == "EVENT" && m[2]["content"] == "live")
+                .expect("the live event must be queued");
+            assert_eq!(
+                order.iter().filter(|m| stored(m)).count(),
+                3,
+                "all stored events must be delivered"
+            );
+            assert!(
+                last_stored < eose,
+                "every stored event must precede the EOSE"
+            );
+            assert!(live_pos > eose, "the live event must follow the EOSE");
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
     fn pump_closes_oversized_responses() {
         // `max_req_response_bytes`: a response exceeding the budget is
         // closed with `CLOSED ... response too large`; the events already
@@ -3892,6 +4138,9 @@ mod tests {
                 truncated_or_more: false,
                 auth_hint: false,
                 sent_bytes: 0,
+                live: Default::default(),
+                live_bytes: 0,
+                eose_sent: false,
             });
             conn.pump_pending_reqs();
             let msgs = outgoing_json(&conn);
@@ -3931,6 +4180,9 @@ mod tests {
                 truncated_or_more: false,
                 auth_hint: false,
                 sent_bytes: 0,
+                live: Default::default(),
+                live_bytes: 0,
+                eose_sent: false,
             });
             conn.pump_pending_reqs();
             let msgs = outgoing_json(&conn);
@@ -3969,6 +4221,9 @@ mod tests {
                     truncated_or_more: false,
                     auth_hint: false,
                     sent_bytes: 0,
+                    live: Default::default(),
+                    live_bytes: 0,
+                    eose_sent: false,
                 });
             }
             assert_eq!(
@@ -4014,6 +4269,90 @@ mod tests {
     }
 
     #[test]
+    fn pending_req_cutoff_does_not_resend_eose() {
+        // A pending response whose EOSE was already sent (its buffered live
+        // events still queued) must not receive a second EOSE when the
+        // pending queue overflows, and a CLOSEd subscription must not
+        // receive an EOSE at all.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            conn.subs
+                .insert("s0".into(), (Vec::new(), 0, "\"s0\"".into()));
+            let mut live = std::collections::VecDeque::new();
+            live.push_back("[\"EVENT\",\"s0\",{}]".to_string());
+            conn.enqueue_pending_req(PendingReq {
+                sub_id: "s0".into(),
+                events: Default::default(),
+                eose_hint: true,
+                truncated_or_more: false,
+                auth_hint: false,
+                sent_bytes: 0,
+                live,
+                live_bytes: 0,
+                eose_sent: true,
+            });
+            for i in 1..=MAX_PENDING_REQS {
+                conn.subs
+                    .insert(format!("s{i}"), (Vec::new(), 0, String::new()));
+                conn.enqueue_pending_req(PendingReq {
+                    sub_id: format!("s{i}"),
+                    events: Default::default(),
+                    eose_hint: true,
+                    truncated_or_more: false,
+                    auth_hint: false,
+                    sent_bytes: 0,
+                    live: Default::default(),
+                    live_bytes: 0,
+                    eose_sent: false,
+                });
+            }
+            assert!(
+                !outgoing_json(&conn)
+                    .iter()
+                    .any(|m| m[0] == "EOSE" && m[1] == "s0"),
+                "a response whose EOSE was already sent must not get a second EOSE"
+            );
+
+            // The same cutoff for a CLOSEd subscription stays silent.
+            conn.pending_reqs.clear();
+            conn.outgoing.clear();
+            conn.out_bytes = 0;
+            conn.enqueue_pending_req(PendingReq {
+                sub_id: "gone".into(),
+                events: Default::default(),
+                eose_hint: true,
+                truncated_or_more: false,
+                auth_hint: false,
+                sent_bytes: 0,
+                live: Default::default(),
+                live_bytes: 0,
+                eose_sent: false,
+            });
+            for i in 0..MAX_PENDING_REQS {
+                conn.enqueue_pending_req(PendingReq {
+                    sub_id: format!("t{i}"),
+                    events: Default::default(),
+                    eose_hint: true,
+                    truncated_or_more: false,
+                    auth_hint: false,
+                    sent_bytes: 0,
+                    live: Default::default(),
+                    live_bytes: 0,
+                    eose_sent: false,
+                });
+            }
+            assert!(
+                !outgoing_json(&conn)
+                    .iter()
+                    .any(|m| m[0] == "EOSE" && m[1] == "gone"),
+                "a CLOSEd subscription must not receive an EOSE"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
     fn eose_auth_hint_is_preceded_by_a_challenge() {
         // NIP-67 `"auth"` hint: the hint array carries `"auth"`, and the
         // spec's MUST — an AUTH message before the EOSE — is honored by
@@ -4030,6 +4369,9 @@ mod tests {
                 truncated_or_more: false,
                 auth_hint: true,
                 sent_bytes: 0,
+                live: Default::default(),
+                live_bytes: 0,
+                eose_sent: false,
             });
             conn.pump_pending_reqs();
             let msgs = outgoing_json(&conn);
@@ -4141,6 +4483,9 @@ mod tests {
                 truncated_or_more: false,
                 auth_hint: false,
                 sent_bytes: 0,
+                live: Default::default(),
+                live_bytes: 0,
+                eose_sent: false,
             });
             conn.pump_pending_reqs();
             assert!(
@@ -4164,6 +4509,9 @@ mod tests {
                 truncated_or_more: false,
                 auth_hint: false,
                 sent_bytes: 0,
+                live: Default::default(),
+                live_bytes: 0,
+                eose_sent: false,
             });
             let mut second = std::collections::VecDeque::new();
             second.push_back(signed_note(conn.relay.secp(), "new", now - 1, vec![]));
@@ -4174,6 +4522,9 @@ mod tests {
                 truncated_or_more: false,
                 auth_hint: false,
                 sent_bytes: 0,
+                live: Default::default(),
+                live_bytes: 0,
+                eose_sent: false,
             });
             assert_eq!(conn.pending_reqs.len(), 1, "the stale response is dropped");
             conn.pump_pending_reqs();
@@ -4224,6 +4575,9 @@ mod tests {
                 truncated_or_more: false,
                 auth_hint: false,
                 sent_bytes: 0,
+                live: Default::default(),
+                live_bytes: 0,
+                eose_sent: false,
             });
             conn.pump_pending_reqs();
             let msgs = outgoing_json(&conn);
@@ -4240,6 +4594,197 @@ mod tests {
                 conn.pending_reqs.is_empty(),
                 "the response must be finished"
             );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn pending_event_batch_is_bounded_by_count_and_bytes() {
+        // A flood of maximum-size frames must not accumulate parsed events
+        // up to the whole window cap: the batch is flushed at EVENT_BATCH
+        // events or one full frame's bytes, whichever comes first.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let now = unix_now();
+            let max_msg = 1 << 20;
+            assert!(!conn.pending_batch_full(max_msg));
+            // Bytes: one full-size frame trips the bound.
+            let ev = signed_note(conn.relay.secp(), "big", now, vec![]);
+            conn.queue_event_sized(ev, max_msg).await;
+            assert_eq!(conn.pending_bytes, max_msg);
+            assert!(conn.pending_batch_full(max_msg), "the byte bound must trip");
+            conn.flush_pending_events().await;
+            assert!(conn.pending_events.is_empty());
+            assert_eq!(conn.pending_bytes, 0, "the byte counter resets on flush");
+            assert!(!conn.pending_batch_full(max_msg));
+            // Count: EVENT_BATCH small events trip the bound.
+            for i in 0..EVENT_BATCH - 1 {
+                let ev = signed_note(
+                    conn.relay.secp(),
+                    &format!("small-{i}"),
+                    now - i as u64,
+                    vec![],
+                );
+                conn.queue_event_sized(ev, 64).await;
+            }
+            assert!(
+                !conn.pending_batch_full(max_msg),
+                "below the count bound the batch stays open"
+            );
+            let ev = signed_note(conn.relay.secp(), "last", now, vec![]);
+            conn.queue_event_sized(ev, 64).await;
+            assert!(
+                conn.pending_batch_full(max_msg),
+                "the count bound must trip"
+            );
+            conn.flush_pending_events().await;
+            assert_eq!(conn.pending_bytes, 0);
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn refused_count_releases_the_same_id_req_subscription() {
+        // NIP-01/NIP-45: CLOSED is terminal for a subscription id. A COUNT
+        // refused with CLOSED for an id that is also an active REQ
+        // subscription must release that subscription, or the client would
+        // consider it closed while the relay kept delivering live events.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            // Open a REQ subscription "x".
+            conn.handle_req(&[json!("x"), json!({"kinds": [1]})]).await;
+            conn.pump_pending_reqs();
+            assert!(conn.subs.contains_key("x"), "the REQ subscription is open");
+            // Disable COUNT and refuse a COUNT with the same id.
+            conn.relay.config.write().await.relay.disabled_nips.push(45);
+            conn.handle_count(&[json!("x"), json!({"kinds": [1]})])
+                .await;
+            let msgs = outgoing_json(&conn);
+            assert!(
+                msgs.iter().any(|m| m[0] == "CLOSED" && m[1] == "x"),
+                "the refusal must be a CLOSED"
+            );
+            assert!(
+                !conn.subs.contains_key("x"),
+                "the same-id REQ subscription must be released with the CLOSED"
+            );
+            // The live index no longer wakes the connection for "x".
+            assert!(
+                conn.relay
+                    .sub_index
+                    .read()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .candidates(&signed_note(conn.relay.secp(), "after", unix_now(), vec![]))
+                    .is_empty(),
+                "a closed subscription must not receive live events"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn source_ip_blocked_and_change_notification() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let conn = build_conn().await;
+            let peer: std::net::IpAddr = "198.51.100.7".parse().unwrap();
+            assert!(!conn.source_ip_blocked(peer).await);
+            // A v4-mapped entry must match the plain IPv4 peer.
+            conn.relay
+                .access
+                .write()
+                .await
+                .blocked_ips
+                .push(("::ffff:198.51.100.7".into(), String::new()));
+            assert!(conn.source_ip_blocked(peer).await);
+            // Every mutation wakes the connection's watcher immediately,
+            // which is what disconnects read-only subscribers.
+            let mut rx = conn.relay.ip_blocks_tx.subscribe();
+            conn.relay.note_ip_blocks_changed();
+            assert!(
+                rx.changed().await.is_ok(),
+                "the block change must wake the connection watcher"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn malformed_event_and_auth_still_get_ok() {
+        // NIP-01/NIP-42: EVENT and AUTH messages must be answered with OK
+        // even when the payload is malformed, as long as an id can be
+        // correlated.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let id = "ab".repeat(32);
+            conn.handle_text(&format!(r#"["EVENT", {{"id":"{id}","created_at":-1}}]"#))
+                .await;
+            let msgs = outgoing_json(&conn);
+            let ok = msgs
+                .iter()
+                .find(|m| m[0] == "OK" && m[1] == id)
+                .expect("a malformed EVENT with an id must get an OK");
+            assert_eq!(ok[2], false);
+            assert!(
+                ok[3].as_str().unwrap_or("").starts_with("invalid:"),
+                "the OK must carry a machine-readable reason: {ok:?}"
+            );
+
+            // Without an id there is nothing to correlate: NOTICE.
+            conn.outgoing.clear();
+            conn.out_bytes = 0;
+            conn.handle_text(r#"["EVENT", {"created_at":-1}]"#).await;
+            let msgs = outgoing_json(&conn);
+            assert!(msgs.iter().any(|m| m[0] == "NOTICE"));
+            assert!(!msgs.iter().any(|m| m[0] == "OK"));
+
+            // A malformed AUTH with an id likewise gets OK false.
+            conn.outgoing.clear();
+            conn.out_bytes = 0;
+            conn.handle_text(&format!(r#"["AUTH", {{"id":"{id}","created_at":-1}}]"#))
+                .await;
+            let msgs = outgoing_json(&conn);
+            let ok = msgs
+                .iter()
+                .find(|m| m[0] == "OK" && m[1] == id)
+                .expect("a malformed AUTH with an id must get an OK");
+            assert_eq!(ok[2], false);
+
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn uppercase_auth_pubkey_is_rejected() {
+        // NIP-01: hex fields are lowercase. An uppercase AUTH pubkey would
+        // verify but never match the exact-case author checks, so it must be
+        // refused instead of stored as an authenticated key.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let now = unix_now();
+            let mut auth = signed_auth(conn.relay.secp(), "test-challenge", now);
+            auth.pubkey = auth.pubkey.to_ascii_uppercase();
+            auth.id = crate::nips::nip01::compute_id(&auth);
+            let keypair = Keypair::from_seckey_slice(conn.relay.secp(), &[2u8; 32]).unwrap();
+            let id = auth.id_bytes().unwrap();
+            auth.sig = conn
+                .relay
+                .secp()
+                .sign_schnorr_no_aux_rand(&id, &keypair)
+                .to_string();
+            conn.handle_auth(&[serde_json::to_value(&auth).unwrap()])
+                .await;
+            let msgs = outgoing_json(&conn);
+            let ok = msgs
+                .iter()
+                .find(|m| m[0] == "OK" && m[1] == auth.id)
+                .expect("AUTH must be answered with OK");
+            assert_eq!(ok[2], false, "uppercase pubkeys must be rejected");
+            assert!(!conn.is_authed(), "no key must be recorded");
             conn.relay.db.shutdown();
         });
     }

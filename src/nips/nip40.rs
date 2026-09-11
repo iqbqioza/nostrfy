@@ -22,17 +22,17 @@ pub fn expiry(event: &Event) -> Option<u64> {
         .min()
 }
 
-/// Whether any `expiration` tag of the event fails to parse as a unix
-/// timestamp. NIP-40 requires the value to be a timestamp: a single
-/// malformed tag must reject the event even when another tag parses, or a
-/// client could smuggle one valid tag past intake while the store/scan honor
-/// only the first.
+/// Whether any `expiration` tag of the event is malformed: it has no value
+/// (NIP-40 requires the timestamp) or its value does not parse as a unix
+/// timestamp. A single malformed tag must reject the event even when another
+/// tag parses, or a client could smuggle one valid tag past intake while a
+/// bare sibling is ignored by the store/scan.
 pub fn has_malformed_expiration(event: &Event) -> bool {
     event
         .tags
         .iter()
-        .filter(|t| t.len() >= 2 && t[0] == EXPIRATION_TAG)
-        .any(|t| t[1].parse::<u64>().is_err())
+        .filter(|t| t.first().is_some_and(|n| n == EXPIRATION_TAG))
+        .any(|t| t.len() < 2 || t[1].parse::<u64>().is_err())
 }
 
 #[cfg(test)]
@@ -79,5 +79,15 @@ mod tests {
         };
         assert!(has_malformed_expiration(&mixed));
         assert!(!has_malformed_expiration(&event_with(None)));
+        // A bare `["expiration"]` sibling is malformed even when another tag
+        // parses: the valid value must not mask the missing one.
+        let bare_mixed = Event {
+            tags: vec![
+                vec![EXPIRATION_TAG.into(), "1700000000".into()],
+                vec![EXPIRATION_TAG.into()],
+            ],
+            ..event_with(None)
+        };
+        assert!(has_malformed_expiration(&bare_mixed));
     }
 }

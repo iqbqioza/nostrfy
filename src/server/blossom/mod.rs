@@ -304,14 +304,28 @@ async fn verify_auth(
         .or_else(|_| base64::engine::general_purpose::STANDARD.decode(encoded))
         .ok()?;
     let event: crate::event::Event = serde_json::from_slice(&raw).ok()?;
-    validate_auth_event(
+    let pubkey = validate_auth_event(
         relay.secp(),
         &event,
         &state.host,
         verb,
         expected_sha,
         unix_now(),
-    )
+    )?;
+    // NIP-86 `banpubkey` applies to authenticated actions on every
+    // endpoint: a blocked pubkey must not upload, delete or list Blossom
+    // blobs either (the WebSocket publish/read paths already enforce it).
+    let blocked = relay
+        .access
+        .read()
+        .await
+        .blocked_pubkeys
+        .iter()
+        .any(|(pk, _)| pk.eq_ignore_ascii_case(&pubkey));
+    if blocked {
+        return None;
+    }
+    Some(pubkey)
 }
 
 fn error(status: StatusCode, reason: &str) -> Response {
@@ -466,6 +480,45 @@ impl futures_util::Stream for S3Chunks {
     }
 }
 
+/// Whether `mime` is an active document type that a browser would execute
+/// if navigated to directly (HTML, SVG, XML, JavaScript). `sanitize_mime`
+/// lowercases and strips parameters, so exact matches are enough.
+fn is_active_content(mime: &str) -> bool {
+    matches!(
+        mime,
+        "text/html"
+            | "application/xhtml+xml"
+            | "image/svg+xml"
+            | "text/xml"
+            | "application/xml"
+            | "application/javascript"
+            | "text/javascript"
+            | "application/x-javascript"
+    )
+}
+
+/// Anti-XSS hardening for user-uploaded bytes served from the Blossom
+/// origin: browsers must never sniff a benign MIME into an active one, and
+/// active document types are forced to download with a sandboxed policy.
+/// (An SVG served as an `<img>` subresource is unaffected by
+/// `Content-Disposition`; only direct navigation downloads it.)
+fn harden_blob_response(response: &mut Response, mime: &str) {
+    response.headers_mut().insert(
+        axum::http::header::HeaderName::from_static("x-content-type-options"),
+        axum::http::header::HeaderValue::from_static("nosniff"),
+    );
+    if is_active_content(mime) {
+        response.headers_mut().insert(
+            axum::http::header::CONTENT_DISPOSITION,
+            axum::http::header::HeaderValue::from_static("attachment"),
+        );
+        response.headers_mut().insert(
+            axum::http::header::HeaderName::from_static("content-security-policy"),
+            axum::http::header::HeaderValue::from_static("default-src 'none'; sandbox"),
+        );
+    }
+}
+
 /// `GET /<sha256>` — serve the blob, streamed from the storage backend
 /// (with RFC 7233 single-range support): a large blob is never loaded
 /// into memory in full.
@@ -491,7 +544,7 @@ async fn get_blob(
         return error(StatusCode::NOT_FOUND, "blob not found");
     };
     let base_headers = [
-        (axum::http::header::CONTENT_TYPE, desc.mime),
+        (axum::http::header::CONTENT_TYPE, desc.mime.clone()),
         (axum::http::header::ETAG, format!("\"{sha}\"")),
         (
             axum::http::header::CACHE_CONTROL,
@@ -579,6 +632,7 @@ async fn get_blob(
                 axum::http::header::CONTENT_LENGTH,
                 served_len.to_string().parse().unwrap(),
             );
+            harden_blob_response(&mut response, &desc.mime);
             response
         }
         Ok(None) => error(StatusCode::NOT_FOUND, "blob not found"),
@@ -589,8 +643,15 @@ async fn get_blob(
     }
 }
 
-/// `HEAD /<sha256>` — blob headers without the body.
-async fn head_blob(State(relay): State<Arc<Relay>>, AxPath(blob): AxPath<String>) -> Response {
+/// `HEAD /<sha256>` — blob headers without the body, mirroring GET: the
+/// backing file/object must resolve (a mapping whose blob is gone is a
+/// 404, exactly like GET), and a single satisfiable Range yields 206 with
+/// `Content-Range` and a ranged `Content-Length`.
+async fn head_blob(
+    State(relay): State<Arc<Relay>>,
+    headers: HeaderMap,
+    AxPath(blob): AxPath<String>,
+) -> Response {
     let Some(state) = state_of(&relay).await else {
         return error(StatusCode::SERVICE_UNAVAILABLE, "blossom not initialized");
     };
@@ -600,16 +661,84 @@ async fn head_blob(State(relay): State<Arc<Relay>>, AxPath(blob): AxPath<String>
     let Some(desc) = state.store.find(&sha).await else {
         return error(StatusCode::NOT_FOUND, "blob not found");
     };
-    (
-        StatusCode::OK,
+    let size = desc.size;
+    let Ok(size_usize) = usize::try_from(size) else {
+        return error(StatusCode::NOT_FOUND, "blob not found");
+    };
+    let range = headers
+        .get(axum::http::header::RANGE)
+        .and_then(|v| v.to_str().ok())
+        .map(|r| parse_range(r, size_usize));
+    let (start, end) = match range {
+        Some(Err(())) => {
+            let mut response = error(
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                "requested byte range is not satisfiable",
+            );
+            response.headers_mut().insert(
+                axum::http::header::CONTENT_RANGE,
+                format!("bytes */{size}").parse().unwrap(),
+            );
+            return response;
+        }
+        Some(Ok(Some((start, end)))) => (start, end),
+        _ => (0, size_usize.saturating_sub(1)),
+    };
+    let len = if size == 0 {
+        0
+    } else {
+        (end - start + 1) as u64
+    };
+    // Resolve the backing object exactly like GET: a mapping without a
+    // readable blob must 404, and the backend's range support decides
+    // whether a Range yields 206 or a full 200.
+    let honored = match state.store.open_stream_any(&sha, start as u64, len).await {
+        Ok(Some((stream, _owner))) => match stream {
+            storage::BlobStream::Local(_) => true,
+            storage::BlobStream::S3(resp) => resp.status() == reqwest::StatusCode::PARTIAL_CONTENT,
+        },
+        Ok(None) => return error(StatusCode::NOT_FOUND, "blob not found"),
+        Err(e) => {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("storage error: {e}"),
+            );
+        }
+    };
+    let ranged = matches!(range, Some(Ok(Some(_))));
+    let status = if ranged && honored {
+        StatusCode::PARTIAL_CONTENT
+    } else {
+        StatusCode::OK
+    };
+    // An S3 backend that ignored the range serves the whole blob (like GET);
+    // Content-Length must describe what GET would actually send.
+    let served_len = if ranged && honored { len } else { size };
+    let mut response = (
+        status,
         [
-            (axum::http::header::CONTENT_TYPE, desc.mime),
-            (axum::http::header::CONTENT_LENGTH, desc.size.to_string()),
+            (axum::http::header::CONTENT_TYPE, desc.mime.clone()),
+            (axum::http::header::CONTENT_LENGTH, served_len.to_string()),
             (axum::http::header::ETAG, format!("\"{sha}\"")),
+            (
+                axum::http::header::CACHE_CONTROL,
+                "public, max-age=31536000, immutable".to_string(),
+            ),
             (axum::http::header::ACCEPT_RANGES, "bytes".to_string()),
         ],
     )
-        .into_response()
+        .into_response();
+    if ranged
+        && honored
+        && let Some(Ok(Some((start, end)))) = range
+    {
+        response.headers_mut().insert(
+            axum::http::header::CONTENT_RANGE,
+            format!("bytes {start}-{end}/{size}").parse().unwrap(),
+        );
+    }
+    harden_blob_response(&mut response, &desc.mime);
+    response
 }
 
 /// `PUT /upload` — upload a blob (BUD-02). Returns 201 + the descriptor.
@@ -777,17 +906,30 @@ async fn head_preflight(relay: Arc<Relay>, headers: HeaderMap, verb: &str) -> Re
 /// `GET /list/<pubkey>` — blobs uploaded by a pubkey (hex), sorted by
 /// `uploaded` descending, with BUD-12 cursor-based pagination
 /// (`cursor` = the sha256 of the last entry of the previous page,
-/// `limit` = the maximum number of results).
+/// `limit` = the maximum number of results). The inventory is private:
+/// BUD-11 assigns this endpoint the `t=list` verb and the token must be
+/// issued by the listed pubkey itself.
 async fn list(
     State(relay): State<Arc<Relay>>,
+    headers: HeaderMap,
     AxPath(pubkey): AxPath<String>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
     let Some(state) = state_of(&relay).await else {
         return error(StatusCode::SERVICE_UNAVAILABLE, "blossom not initialized");
     };
+    // BUD-11: `/list/<pubkey>` uses the `t=list` verb. A user's blob
+    // inventory is private to that user, so the token must be issued by the
+    // listed pubkey.
+    let Some(auth_pubkey) = verify_auth(&relay, &state, &headers, "list", None).await else {
+        return error(StatusCode::UNAUTHORIZED, "invalid or missing authorization");
+    };
     if !is_pubkey(&pubkey) {
         return error(StatusCode::BAD_REQUEST, "invalid pubkey");
+    }
+    let pubkey = pubkey.to_ascii_lowercase();
+    if !auth_pubkey.eq_ignore_ascii_case(&pubkey) {
+        return error(StatusCode::FORBIDDEN, "only the owner may list their blobs");
     }
     // BUD-12: malformed query parameters are a 400, not silently ignored
     // (an ignored `cursor` would return an unbounded page).
@@ -1044,6 +1186,21 @@ mod tests {
         let id = ev.id_bytes().unwrap();
         ev.sig = secp.sign_schnorr_no_aux_rand(&id, &keypair).to_string();
         ev
+    }
+
+    /// A valid Blossom `Authorization: Nostr <token>` header for `verb`,
+    /// returning the header map and the author's hex pubkey.
+    fn auth_headers(secp: &Secp256k1<secp256k1::All>, verb: &str) -> (HeaderMap, String) {
+        let now = unix_now();
+        let ev = auth_event(secp, now, verb, Some(now + 600), None, None);
+        let token = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&ev).unwrap());
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Nostr {token}").parse().unwrap(),
+        );
+        (headers, ev.pubkey)
     }
 
     #[tokio::test]
@@ -1526,11 +1683,170 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn head_matches_get_for_ranges_and_missing_files() {
+        let relay = build_blossom_relay(0).await;
+        let state = state_of(&relay).await.expect("blossom state");
+        let pk = "aa".repeat(32);
+        let data: Vec<u8> = (0..10_000u32).map(|i| (i % 251) as u8).collect();
+        let sha = sha256_hex(&data);
+        state
+            .store
+            .put(&pk, &sha, &data, "application/octet-stream")
+            .await
+            .unwrap();
+
+        // A single satisfiable Range yields 206 + Content-Range, like GET.
+        let mut headers = HeaderMap::new();
+        headers.insert(axum::http::header::RANGE, "bytes=100-199".parse().unwrap());
+        let resp = head_blob(State(relay.clone()), headers, AxPath(sha.clone())).await;
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(resp.headers()[axum::http::header::CONTENT_LENGTH], "100");
+        assert_eq!(
+            resp.headers()[axum::http::header::CONTENT_RANGE],
+            format!("bytes 100-199/{}", data.len())
+        );
+        // An unsatisfiable range is a 416 with `Content-Range: bytes */`.
+        let mut headers = HeaderMap::new();
+        headers.insert(axum::http::header::RANGE, "bytes=999999-".parse().unwrap());
+        let resp = head_blob(State(relay.clone()), headers, AxPath(sha.clone())).await;
+        assert_eq!(resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(
+            resp.headers()[axum::http::header::CONTENT_RANGE],
+            format!("bytes */{}", data.len())
+        );
+
+        // The backing file disappears while the LMDB mapping remains:
+        // HEAD must 404 exactly like GET (a mapping alone is not a blob).
+        let local_path = relay.config.read().await.blossom.local_path.clone();
+        let npub = crate::nips::nip19::bech32_encode("npub", &hex::decode(&pk).unwrap()).unwrap();
+        std::fs::remove_file(local_path.join(npub).join(&sha)).unwrap();
+        let resp = get_blob(State(relay.clone()), HeaderMap::new(), AxPath(sha.clone())).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "GET 404s once the backing file is gone"
+        );
+        let resp = head_blob(State(relay.clone()), HeaderMap::new(), AxPath(sha)).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "HEAD must agree with GET for a missing backing file"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn blob_responses_are_hardened_against_sniffing() {
+        // BUD-01: user-uploaded bytes are served from the Blossom origin, so
+        // responses never allow MIME sniffing, and active document types are
+        // forced to download under a sandboxed policy.
+        let relay = build_blossom_relay(0).await;
+        let state = state_of(&relay).await.expect("blossom state");
+        let pk = "aa".repeat(32);
+        let png = b"not really a png";
+        let png_sha = sha256_hex(png);
+        state
+            .store
+            .put(&pk, &png_sha, png, "image/png")
+            .await
+            .unwrap();
+        let html = b"<script>alert(1)</script>";
+        let html_sha = sha256_hex(html);
+        state
+            .store
+            .put(&pk, &html_sha, html, "text/html")
+            .await
+            .unwrap();
+
+        let nosniff = axum::http::header::HeaderName::from_static("x-content-type-options");
+        let csp = axum::http::header::HeaderName::from_static("content-security-policy");
+        // Safe media: nosniff, but no forced download.
+        let resp = get_blob(State(relay.clone()), HeaderMap::new(), AxPath(png_sha)).await;
+        assert_eq!(resp.headers().get(&nosniff).unwrap(), "nosniff");
+        assert!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_DISPOSITION)
+                .is_none()
+        );
+        // Active document: nosniff + attachment + sandboxed CSP.
+        let resp = get_blob(
+            State(relay.clone()),
+            HeaderMap::new(),
+            AxPath(html_sha.clone()),
+        )
+        .await;
+        assert_eq!(resp.headers().get(&nosniff).unwrap(), "nosniff");
+        assert_eq!(
+            resp.headers()[axum::http::header::CONTENT_DISPOSITION],
+            "attachment"
+        );
+        assert_eq!(
+            resp.headers().get(&csp).unwrap(),
+            "default-src 'none'; sandbox"
+        );
+        // HEAD carries the same hardening.
+        let resp = head_blob(State(relay.clone()), HeaderMap::new(), AxPath(html_sha)).await;
+        assert_eq!(resp.headers().get(&nosniff).unwrap(), "nosniff");
+        assert_eq!(
+            resp.headers()[axum::http::header::CONTENT_DISPOSITION],
+            "attachment"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn open_stream_any_falls_back_past_a_broken_owner() {
+        // A storage error for the first owner must not hide a retrievable
+        // copy under a later owner (only a missing file used to fall back).
+        let relay = build_blossom_relay(0).await;
+        let state = state_of(&relay).await.expect("blossom state");
+        let owner0 = "aa".repeat(32);
+        let owner1 = "bb".repeat(32);
+        let data = b"shared bytes";
+        let sha = sha256_hex(data);
+        state
+            .store
+            .put(&owner0, &sha, data, "text/plain")
+            .await
+            .unwrap();
+        state
+            .store
+            .put(&owner1, &sha, data, "text/plain")
+            .await
+            .unwrap();
+        let local_path = relay.config.read().await.blossom.local_path.clone();
+        let dir_of = |pk: &str| {
+            let npub =
+                crate::nips::nip19::bech32_encode("npub", &hex::decode(pk).unwrap()).unwrap();
+            local_path.join(npub)
+        };
+        // Break owner0's directory (a regular file cannot contain the blob).
+        std::fs::remove_dir_all(dir_of(&owner0)).unwrap();
+        std::fs::write(dir_of(&owner0), b"not a directory").unwrap();
+        let (stream, owner) = state
+            .store
+            .open_stream_any(&sha, 0, data.len() as u64)
+            .await
+            .expect("a later working owner must not be masked by an earlier error")
+            .expect("the later copy resolves");
+        assert_eq!(owner, owner1);
+        drop(stream);
+        // When every owner fails, the storage error is reported.
+        std::fs::remove_dir_all(dir_of(&owner1)).unwrap();
+        std::fs::write(dir_of(&owner1), b"not a directory").unwrap();
+        assert!(
+            state.store.open_stream_any(&sha, 0, 4).await.is_err(),
+            "an error is returned when no owner can be opened"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
     async fn list_caps_page_size() {
         // `?limit=` is capped at 1000 with a default of 100: a heavy
         // uploader cannot force a single unbounded JSON page.
         let relay = build_blossom_relay(0).await;
-        let pk = "aa".repeat(32);
+        let (headers, pk) = auth_headers(relay.secp(), "list");
         let state = state_of(&relay).await.expect("blossom state");
         for i in 0..5 {
             let sha = sha256_hex(format!("blob-{i}").as_bytes());
@@ -1549,6 +1865,7 @@ mod tests {
         };
         let resp = list(
             State(relay.clone()),
+            headers.clone(),
             AxPath(pk.clone()),
             query(Some("9999999")),
         )
@@ -1561,7 +1878,7 @@ mod tests {
             items.as_array().unwrap().len() <= 1000,
             "huge limit must be capped"
         );
-        let resp = list(State(relay.clone()), AxPath(pk), query(None)).await;
+        let resp = list(State(relay.clone()), headers, AxPath(pk), query(None)).await;
         let body = axum::body::to_bytes(resp.into_body(), 256 * 1024)
             .await
             .unwrap();
@@ -1574,11 +1891,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_requires_owner_auth() {
+        // BUD-11/BUD-12: a user's blob inventory is private; an anonymous
+        // request or a token for a different pubkey must not list it.
+        let relay = build_blossom_relay(0).await;
+        let other = "aa".repeat(32);
+        // No Authorization header: 401.
+        let resp = list(
+            State(relay.clone()),
+            HeaderMap::new(),
+            AxPath(other.clone()),
+            axum::extract::Query(std::collections::HashMap::new()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        // A valid token for a *different* pubkey: 403.
+        let (headers, pk) = auth_headers(relay.secp(), "list");
+        assert_ne!(pk, other);
+        let resp = list(
+            State(relay.clone()),
+            headers,
+            AxPath(other),
+            axum::extract::Query(std::collections::HashMap::new()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        // The owner's token works, including an uppercase spelling of the
+        // same pubkey (hex is case-insensitive).
+        let (headers, pk) = auth_headers(relay.secp(), "list");
+        let resp = list(
+            State(relay.clone()),
+            headers,
+            AxPath(pk.to_ascii_uppercase()),
+            axum::extract::Query(std::collections::HashMap::new()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn banned_pubkey_cannot_use_blossom() {
+        // NIP-86 `banpubkey` must deny authenticated Blossom actions too,
+        // not only WebSocket publishing/reading.
+        let relay = build_blossom_relay(0).await;
+        let (headers, pk) = auth_headers(relay.secp(), "list");
+        relay
+            .access
+            .write()
+            .await
+            .blocked_pubkeys
+            .push((pk.clone(), "spam".into()));
+        let resp = list(
+            State(relay.clone()),
+            headers,
+            AxPath(pk),
+            axum::extract::Query(std::collections::HashMap::new()),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "a banned pubkey's Blossom token must be refused"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
     async fn list_unknown_cursor_yields_empty_page() {
         // A well-formed but unknown cursor must not restart at page one
         // (a stale cursor would loop duplicates forever).
         let relay = build_blossom_relay(0).await;
-        let pk = "bb".repeat(32);
+        let (headers, pk) = auth_headers(relay.secp(), "list");
         let state = state_of(&relay).await.expect("blossom state");
         let sha = sha256_hex(b"one blob");
         state
@@ -1588,7 +1972,13 @@ mod tests {
             .unwrap();
         let mut map = std::collections::HashMap::new();
         map.insert("cursor".to_string(), "cc".repeat(32));
-        let resp = list(State(relay.clone()), AxPath(pk), axum::extract::Query(map)).await;
+        let resp = list(
+            State(relay.clone()),
+            headers,
+            AxPath(pk),
+            axum::extract::Query(map),
+        )
+        .await;
         let body = axum::body::to_bytes(resp.into_body(), 256 * 1024)
             .await
             .unwrap();
