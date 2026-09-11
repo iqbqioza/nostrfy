@@ -442,10 +442,16 @@ pub async fn rpc_handler(
             if !is_pubkey(pubkey) {
                 return rpc_err("invalid pubkey");
             }
+            // Normalize to lowercase like `banpubkey`/`allowpubkey`:
+            // `hex::decode` accepts uppercase, but events always carry
+            // lowercase pubkeys, so an uppercase assignment would report
+            // success while matching no event (and would be echoed in the
+            // relay's membership list in the wrong case).
+            let pubkey = pubkey.to_ascii_lowercase();
             if let Err(msg) = check_role_id(role) {
                 return rpc_err(&msg);
             }
-            if relay.assign_role(pubkey, role).await {
+            if relay.assign_role(&pubkey, role).await {
                 audit!(&relay, &identity, "assignrole", params);
                 rpc_ok(json!(true))
             } else {
@@ -464,10 +470,12 @@ pub async fn rpc_handler(
             if !is_pubkey(pubkey) {
                 return rpc_err("invalid pubkey");
             }
+            // Same lowercase normalization as `assignrole` above.
+            let pubkey = pubkey.to_ascii_lowercase();
             if let Err(msg) = check_role_id(role) {
                 return rpc_err(&msg);
             }
-            if relay.unassign_role(pubkey, role).await {
+            if relay.unassign_role(&pubkey, role).await {
                 audit!(&relay, &identity, "unassignrole", params);
                 rpc_ok(json!(true))
             } else {
@@ -1136,6 +1144,33 @@ mod tests {
             recent.iter().any(|e| e.contains("createrole")),
             "the role mutation must be audited: {recent:?}"
         );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn assignrole_normalizes_pubkey_case() {
+        let relay = build_admin_relay_with_key(Some(&"cd".repeat(32))).await;
+        let resp = rpc_call(&relay, "createrole", vec![json!("mod")]).await;
+        assert!(rpc_ok_of(resp).await);
+        // Uppercase hex is valid to `hex::decode`, but events always carry
+        // lowercase pubkeys: the assignment must be stored lowercased, or it
+        // would report success while matching nothing.
+        let upper = "AB".repeat(32);
+        let lower = "ab".repeat(32);
+        let resp = rpc_call(&relay, "assignrole", vec![json!(upper), json!("mod")]).await;
+        assert!(rpc_ok_of(resp).await);
+        {
+            let roles = relay.roles.read().await;
+            assert!(
+                roles.is_member_of(&lower),
+                "the assignment must be stored lowercased"
+            );
+            assert!(!roles.is_member_of(&upper));
+        }
+        // Unassign accepts either case too.
+        let resp = rpc_call(&relay, "unassignrole", vec![json!(upper), json!("mod")]).await;
+        assert!(rpc_ok_of(resp).await);
+        assert!(!relay.roles.read().await.is_member_of(&lower));
         relay.db.shutdown();
     }
 
