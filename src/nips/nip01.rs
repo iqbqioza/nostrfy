@@ -7,7 +7,9 @@ use secp256k1::schnorr::Signature;
 use secp256k1::{Keypair, Secp256k1, XOnlyPublicKey};
 use sha2::{Digest, Sha256};
 
-use crate::error::{Error, Result};
+use anyhow::anyhow;
+
+use crate::error::Result;
 use crate::event::Event;
 
 pub const ID_BYTES: usize = 32;
@@ -50,14 +52,12 @@ pub fn verify(event: &Event, secp: &Secp256k1<secp256k1::All>) -> Result<()> {
         || event.pubkey.len() != PK_BYTES * 2
         || event.sig.len() != SIG_BYTES * 2
     {
-        return Err(Error::Protocol("invalid id/pubkey/sig length".into()));
+        return Err(anyhow!("invalid id/pubkey/sig length"));
     }
     if compute_id(event) != event.id {
-        return Err(Error::Protocol("invalid event id".into()));
+        return Err(anyhow!("invalid event id"));
     }
-    let id_bytes: [u8; ID_BYTES] = event
-        .id_bytes()
-        .ok_or_else(|| Error::Protocol("invalid id hex".into()))?;
+    let id_bytes: [u8; ID_BYTES] = event.id_bytes().ok_or_else(|| anyhow!("invalid id hex"))?;
     let pk = XOnlyPublicKey::from_slice(&hex::decode(&event.pubkey)?)?;
     let sig = Signature::from_slice(&hex::decode(&event.sig)?)?;
     secp.verify_schnorr(&sig, &id_bytes, &pk)?;
@@ -68,11 +68,9 @@ pub fn verify(event: &Event, secp: &Secp256k1<secp256k1::All>) -> Result<()> {
 /// signature. Used by the relay for NIP-29 relay-generated events.
 pub fn sign(event: &mut Event, keypair: &Keypair, secp: &Secp256k1<secp256k1::All>) -> Result<()> {
     event.id = compute_id(event);
-    let id: [u8; ID_BYTES] = event
-        .id_bytes()
-        .ok_or_else(|| Error::Protocol("invalid id".into()))?;
+    let id: [u8; ID_BYTES] = event.id_bytes().ok_or_else(|| anyhow!("invalid id"))?;
     let mut aux = [0u8; 32];
-    getrandom::getrandom(&mut aux).map_err(|_| Error::Protocol("rng failure".into()))?;
+    getrandom::getrandom(&mut aux).map_err(|_| anyhow!("rng failure"))?;
     event.sig = secp
         .sign_schnorr_with_aux_rand(&id, keypair, &aux)
         .to_string();

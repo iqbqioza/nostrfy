@@ -12,6 +12,8 @@
 use std::path::{Path, PathBuf};
 
 use crate::db::DbClient;
+use anyhow::anyhow;
+
 use crate::error::Result;
 
 use super::s3::S3Client;
@@ -68,7 +70,7 @@ impl BlobStore {
                 S3Store::new(s3.expect("s3 config validated by Config::validate")).await?,
             ),
             other => {
-                return Err(crate::error::Error::Config(format!(
+                return Err(crate::error::config_err(format!(
                     "unsupported blossom storage backend {other:?}"
                 )));
             }
@@ -115,9 +117,7 @@ impl BlobStore {
             .blossom_add_owner(sha256, mime, bytes.len() as u64, uploaded, pubkey)
             .await
         {
-            return Err(crate::error::Error::Other(
-                "blossom mapping write failed".into(),
-            ));
+            return Err(anyhow!("blossom mapping write failed"));
         }
         let npub = npub_of(pubkey);
         let stored = match &self.storage {
@@ -180,7 +180,7 @@ impl BlobStore {
         let Some(meta) = self.db.blossom_load(sha256).await else {
             return Ok(None);
         };
-        let mut last_error: Option<crate::error::Error> = None;
+        let mut last_error: Option<anyhow::Error> = None;
         for owner in &meta.owners {
             match self.open_stream(owner, sha256, start, len).await {
                 Ok(Some(stream)) => return Ok(Some((stream, owner.clone()))),
@@ -297,8 +297,8 @@ impl BlobStore {
                                 // The marker is not set: the migration
                                 // retries on the next startup (the failed
                                 // chunk may need a bigger map).
-                                return Err(crate::error::Error::Other(
-                                    "blossom migration write failed; will retry on the next start".into(),
+                                return Err(anyhow!(
+                                    "blossom migration write failed; will retry on the next start"
                                 ));
                             }
                         }
@@ -430,7 +430,7 @@ impl LocalStore {
                 .free_space()
                 .is_some_and(|free| free < self.min_free_bytes)
         {
-            return Err(crate::error::Error::StorageFull);
+            return Err(crate::error::storage_full());
         }
         Ok(())
     }
@@ -449,9 +449,7 @@ impl LocalStore {
         // directory must resolve inside the blob root, or the write
         // would land in the symlink target's directory.
         if !self.parent_within_root(npub).await {
-            return Err(crate::error::Error::Other(
-                "blossom storage directory is a symlink".into(),
-            ));
+            return Err(anyhow!("blossom storage directory is a symlink"));
         }
         // Atomic write: the bytes land in a temp file first and are moved
         // into place with a rename. A crash mid-write can then never leave
@@ -1023,7 +1021,7 @@ mod tests {
             .unwrap();
             let err = full.put(&a, &sha, b"x", "text/plain").await.unwrap_err();
             assert!(
-                matches!(err, crate::error::Error::StorageFull),
+                err.is::<crate::error::StorageFull>(),
                 "the upload must be refused with StorageFull: {err}"
             );
             // The guard runs before any write: neither a file nor an orphan
@@ -1215,7 +1213,8 @@ mod tests {
             std::os::unix::fs::symlink(&external, &tmp).unwrap();
             let err = s.put(&a, &sha, b"third", "text/plain").await.unwrap_err();
             assert!(
-                err.to_string().contains("symlink") || matches!(err, crate::error::Error::Io(_)),
+                err.to_string().contains("symlink")
+                    || err.downcast_ref::<std::io::Error>().is_some(),
                 "the write must not follow the temp symlink: {err}"
             );
             assert_eq!(

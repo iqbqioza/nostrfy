@@ -14,6 +14,8 @@ use super::store::{
     ID_LEN, Store, TAG_INDEX_VALUE_MAX, WORD_INDEX_MAX, WORD_OVERFLOW, created_key, kind_key,
     pubkey_key, tag_range, word_key,
 };
+use anyhow::anyhow;
+
 use crate::error::Result;
 use crate::event::Event;
 use crate::filter::{EventFields, Filter};
@@ -884,10 +886,7 @@ impl Store {
                         // Corrupt short keys (bitrot/hand edit) must
                         // loud-fail the scan, never panic the reader thread.
                         if key.len() != ID_LEN {
-                            return Err(crate::error::Error::Other(format!(
-                                "corrupt event key ({} bytes)",
-                                key.len()
-                            )));
+                            return Err(anyhow!("corrupt event key ({} bytes)", key.len()));
                         }
                         if candidates.len() >= budget {
                             *more = true;
@@ -1159,10 +1158,7 @@ impl Store {
             // scan, never panic the reader thread: every sibling walk
             // guards lengths before slicing.
             if key.len() < ID_LEN {
-                return Err(crate::error::Error::Other(format!(
-                    "corrupt index key ({} bytes)",
-                    key.len()
-                )));
+                return Err(anyhow!("corrupt index key ({} bytes)", key.len()));
             }
             let id = &key[key.len() - ID_LEN..];
             if !consider(id)? {
@@ -1221,8 +1217,7 @@ impl Store {
                 if head.next_key.is_none() {
                     match head.iter.next() {
                         Some(Ok((key, _))) => {
-                            let (created, id) =
-                                index_tail(key).map_err(crate::error::Error::Other)?;
+                            let (created, id) = index_tail(key).map_err(|e| anyhow!(e))?;
                             head.next_key = Some((key.to_vec(), created, id));
                         }
                         Some(Err(e)) => return Err(e.into()),

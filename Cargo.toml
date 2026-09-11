@@ -34,6 +34,7 @@ toml = "0.8"
 # `nostrfy upgrade`: fetches the latest release binary (and the latest
 # version tag) over HTTPS with rustls; no other network use.
 ureq = { version = "2", default-features = false, features = ["tls", "gzip"] }
+anyhow = "1.0.104"
 
 # Release build tuning: full LTO across all crates, single codegen unit and
 # stripped symbols give the best runtime performance and the smallest binary

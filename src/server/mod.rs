@@ -30,7 +30,7 @@ use tower::util::ServiceExt;
 
 use crate::config::Config;
 use crate::db::DbClient;
-use crate::error::{Error, Result};
+use crate::error::{Result, config_err};
 use crate::nips::nip11::{relay_info, stats_handler};
 use crate::nips::nip86;
 use crate::relay::Relay;
@@ -166,7 +166,7 @@ async fn bind_listener(addr: &(String, u16), label: &str) -> Result<TcpListener>
         Err(e) => {
             let msg = format!("cannot bind to {}:{}: {e}", addr.0, addr.1);
             log::error!("{msg}");
-            return Err(Error::Config(msg));
+            return Err(config_err(msg));
         }
     };
     info!("{label}{}:{}", addr.0, addr.1);

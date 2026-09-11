@@ -6,6 +6,8 @@
 //! `hmac_sha256`); Cloudflare R2 is an S3-compatible service and needs no
 //! special handling beyond the endpoint/`auto` region.
 
+use anyhow::anyhow;
+
 use crate::error::Result;
 
 #[derive(Clone)]
@@ -114,7 +116,7 @@ impl S3Client {
         builder
             .send()
             .await
-            .map_err(|e| crate::error::Error::Other(format!("s3 request failed: {e}")))
+            .map_err(|e| anyhow!(format!("s3 request failed: {e}")))
     }
 
     /// Like [`Self::request`] but on the unbounded-streaming client, used
@@ -171,7 +173,7 @@ impl S3Client {
         builder
             .send()
             .await
-            .map_err(|e| crate::error::Error::Other(format!("s3 request failed: {e}")))
+            .map_err(|e| anyhow!(format!("s3 request failed: {e}")))
     }
 
     async fn send(
@@ -190,7 +192,7 @@ impl S3Client {
         let bytes = resp
             .bytes()
             .await
-            .map_err(|e| crate::error::Error::Other(format!("s3 response failed: {e}")))?
+            .map_err(|e| anyhow!(format!("s3 response failed: {e}")))?
             .to_vec();
         Ok((status, bytes))
     }
@@ -266,9 +268,7 @@ impl S3Client {
             .send("PUT", key, "", Some(bytes), Some(mime), &[])
             .await?;
         if !status.is_success() {
-            return Err(crate::error::Error::Other(format!(
-                "s3 put failed: {status}"
-            )));
+            return Err(anyhow!(format!("s3 put failed: {status}")));
         }
         Ok(())
     }
@@ -279,9 +279,7 @@ impl S3Client {
             return Ok(None);
         }
         if !status.is_success() {
-            return Err(crate::error::Error::Other(format!(
-                "s3 get failed: {status}"
-            )));
+            return Err(anyhow!(format!("s3 get failed: {status}")));
         }
         Ok(Some(bytes))
     }
@@ -317,9 +315,7 @@ impl S3Client {
             return Ok(None);
         }
         if !status.is_success() {
-            return Err(crate::error::Error::Other(format!(
-                "s3 get failed: {status}"
-            )));
+            return Err(anyhow!(format!("s3 get failed: {status}")));
         }
         Ok(Some(resp))
     }
@@ -333,9 +329,7 @@ impl S3Client {
             // Propagate the failure: the caller must not drop the owner
             // mapping for an object that is still in the bucket (that
             // would orphan a billed object with no way to delete it).
-            return Err(crate::error::Error::Other(format!(
-                "s3 delete failed: {status}"
-            )));
+            return Err(anyhow!(format!("s3 delete failed: {status}")));
         }
         Ok(true)
     }
@@ -378,9 +372,7 @@ impl S3Client {
         );
         let (status, bytes) = self.send("GET", "", &query, None, None, &[]).await?;
         if !status.is_success() {
-            return Err(crate::error::Error::Other(format!(
-                "s3 list failed: {status}"
-            )));
+            return Err(anyhow!(format!("s3 list failed: {status}")));
         }
         let xml = String::from_utf8_lossy(&bytes);
         let mut keys = Vec::new();

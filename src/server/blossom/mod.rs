@@ -825,7 +825,7 @@ async fn put_blob(relay: Arc<Relay>, headers: HeaderMap, body: Bytes, verb: &str
             )
                 .into_response()
         }
-        Err(crate::error::Error::StorageFull) => {
+        Err(e) if e.is::<crate::error::StorageFull>() => {
             error(StatusCode::INSUFFICIENT_STORAGE, "storage is full")
         }
         Err(e) => error(
@@ -897,7 +897,11 @@ async fn head_preflight(relay: Arc<Relay>, headers: HeaderMap, verb: &str) -> Re
     }
     // The preflight must reflect the PUT outcome: a full disk would
     // refuse the upload with 507, so the preflight does too.
-    if let Err(crate::error::Error::StorageFull) = state.store.check_space() {
+    if state
+        .store
+        .check_space()
+        .is_err_and(|e| e.is::<crate::error::StorageFull>())
+    {
         return error(StatusCode::INSUFFICIENT_STORAGE, "storage is full");
     }
     StatusCode::OK.into_response()

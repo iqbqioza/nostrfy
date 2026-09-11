@@ -1,82 +1,49 @@
-//! Error type shared across the crate.
+//! anyhow-based error handling shared across the crate.
+//!
+//! Every fallible function returns `anyhow::Result`, so the `?` operator
+//! carries I/O, JSON, database, crypto and hex failures with their sources
+//! intact. Two sentinel types preserve the branches that used to match on
+//! enum variants: [`ConfigError`] (CLI configuration failures) and
+//! [`StorageFull`] (disk-full guards). Match on them with
+//! `err.downcast_ref::<...>()` / `err.is::<...>()`, never on strings.
 
-use std::fmt;
+pub type Result<T> = anyhow::Result<T>;
 
-pub type Result<T> = std::result::Result<T, Error>;
-
+/// A configuration failure. Displays with the historical `config error: `
+/// prefix so CLI output stays unchanged.
 #[derive(Debug)]
-pub enum Error {
-    Io(std::io::Error),
-    Json(serde_json::Error),
-    Heed(heed::Error),
-    Secp(secp256k1::Error),
-    Hex(hex::FromHexError),
-    Config(String),
-    Protocol(String),
-    /// The storage backend is out of space: the free space on the
-    /// filesystem hosting the Blossom blobs dropped below
-    /// `blossom.min_free_bytes`.
-    StorageFull,
-    Other(String),
-}
+pub struct ConfigError(pub String);
 
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Error::Io(e) => write!(f, "io error: {e}"),
-            Error::Json(e) => write!(f, "json error: {e}"),
-            Error::Heed(e) => write!(f, "database error: {e}"),
-            Error::Secp(e) => write!(f, "crypto error: {e}"),
-            Error::Hex(e) => write!(f, "hex error: {e}"),
-            Error::Config(e) => write!(f, "config error: {e}"),
-            Error::Protocol(e) => write!(f, "protocol error: {e}"),
-            Error::StorageFull => write!(f, "storage is full"),
-            Error::Other(e) => write!(f, "{e}"),
-        }
+impl std::fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "config error: {}", self.0)
     }
 }
 
-impl std::error::Error for Error {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Error::Io(e) => Some(e),
-            Error::Json(e) => Some(e),
-            Error::Heed(e) => Some(e),
-            Error::Secp(e) => Some(e),
-            Error::Hex(e) => Some(e),
-            _ => None,
-        }
+impl std::error::Error for ConfigError {}
+
+/// The storage backend is out of space: the free space on the filesystem
+/// hosting the Blossom blobs (or the LMDB map) dropped below the
+/// configured margin.
+#[derive(Debug)]
+pub struct StorageFull;
+
+impl std::fmt::Display for StorageFull {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "storage is full")
     }
 }
 
-impl From<std::io::Error> for Error {
-    fn from(e: std::io::Error) -> Self {
-        Error::Io(e)
-    }
+impl std::error::Error for StorageFull {}
+
+/// Builds a [`ConfigError`] as an `anyhow::Error`.
+pub fn config_err(msg: impl Into<String>) -> anyhow::Error {
+    ConfigError(msg.into()).into()
 }
 
-impl From<serde_json::Error> for Error {
-    fn from(e: serde_json::Error) -> Self {
-        Error::Json(e)
-    }
-}
-
-impl From<heed::Error> for Error {
-    fn from(e: heed::Error) -> Self {
-        Error::Heed(e)
-    }
-}
-
-impl From<secp256k1::Error> for Error {
-    fn from(e: secp256k1::Error) -> Self {
-        Error::Secp(e)
-    }
-}
-
-impl From<hex::FromHexError> for Error {
-    fn from(e: hex::FromHexError) -> Self {
-        Error::Hex(e)
-    }
+/// Builds a [`StorageFull`] as an `anyhow::Error`.
+pub fn storage_full() -> anyhow::Error {
+    StorageFull.into()
 }
 
 #[cfg(test)]
@@ -84,49 +51,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn display_covers_every_variant() {
-        let io = Error::Io(std::io::Error::other("io"));
-        let json = Error::Json(serde_json::from_str::<()>("x").unwrap_err());
-        let heed = Error::Heed(heed::Error::Mdb(heed::MdbError::NotFound));
-        let secp = Error::Secp(secp256k1::Error::InvalidSignature);
-        let hex = Error::Hex(hex::FromHexError::InvalidHexCharacter { c: 'z', index: 0 });
-        for e in [
-            &io,
-            &json,
-            &heed,
-            &secp,
-            &hex,
-            &Error::Config("cfg".into()),
-            &Error::Protocol("proto".into()),
-            &Error::StorageFull,
-            &Error::Other("other".into()),
-        ] {
-            let text = e.to_string();
-            assert!(!text.is_empty(), "every variant must display something");
-        }
-    }
-
-    #[test]
-    fn source_reports_inner_errors() {
-        let io = Error::Io(std::io::Error::other("io"));
-        assert!(std::error::Error::source(&io).is_some());
-        let hex = Error::Hex(hex::FromHexError::OddLength);
-        assert!(std::error::Error::source(&hex).is_some());
-        let config = Error::Config("x".into());
-        assert!(
-            std::error::Error::source(&config).is_none(),
-            "String variants have no source"
+    fn sentinels_display_the_historical_messages() {
+        assert_eq!(
+            config_err("bad value").to_string(),
+            "config error: bad value"
         );
-        assert!(std::error::Error::source(&Error::StorageFull).is_none());
+        assert_eq!(storage_full().to_string(), "storage is full");
     }
 
     #[test]
-    fn conversions_build_the_right_variant() {
-        let io: Error = std::io::Error::other("io").into();
-        assert!(matches!(io, Error::Io(_)));
-        let hex: Error = hex::FromHexError::OddLength.into();
-        assert!(matches!(hex, Error::Hex(_)));
-        let json: Error = serde_json::from_str::<()>("x").unwrap_err().into();
-        assert!(matches!(json, Error::Json(_)));
+    fn sentinels_downcast_back() {
+        let e = config_err("bad value");
+        assert_eq!(
+            e.downcast_ref::<ConfigError>().map(|e| e.0.as_str()),
+            Some("bad value")
+        );
+        let e = storage_full();
+        assert!(e.is::<StorageFull>());
+        let e = anyhow::anyhow!("plain failure");
+        assert!(e.downcast_ref::<ConfigError>().is_none());
+        assert!(!e.is::<StorageFull>());
     }
 }
