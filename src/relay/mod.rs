@@ -1142,6 +1142,30 @@ impl Relay {
             self.stats.bump(&self.stats.events_deleted, removed as u64);
         }
 
+        // One moderation event can generate several versions of the same
+        // replaceable metadata slot (e.g. a parent loses two adopted
+        // children in one 9002, rebuilding its 39000 after each removal).
+        // They all share the single per-apply stamp, so the NIP-01 id
+        // tie-break would keep one arbitrarily — retaining the stale
+        // version when its id happens to be lower and dropping the
+        // corrected one as a duplicate. Keep only the last build per `d`
+        // slot: the emit order lists the group's final state last.
+        let mut seen = std::collections::HashSet::new();
+        let mut generated: Vec<Event> = generated
+            .into_iter()
+            .rev()
+            .filter(|ev| {
+                let d = ev
+                    .tags
+                    .iter()
+                    .find(|t| t.len() >= 2 && t[0] == "d")
+                    .map(|t| t[1].clone())
+                    .unwrap_or_default();
+                seen.insert((ev.kind, d))
+            })
+            .collect();
+        generated.reverse();
+
         for mut ev in generated {
             if !self.store_relay_event(&mut ev).await {
                 // The in-memory group state moved on, but the stored
@@ -1729,6 +1753,95 @@ mod tests {
                 serde_json::from_value(serde_json::json!({"#h": ["g1"]})).unwrap();
             let (res, _) = relay.db.query(vec![f], 10, now).await;
             assert!(res.is_empty(), "the deleted group's events must be purged");
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn one_edit_keeps_only_the_final_group_metadata() {
+        // A single 9002 can rebuild the same parent metadata several times
+        // (adopting B1 and B2 in one edit clears the old parent's child list
+        // after each move). With one shared stamp per moderation event, the
+        // NIP-01 id tie-break could keep the stale version and drop the
+        // corrected one as a duplicate, leaving the stored children
+        // inconsistent with the in-memory group state.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let key = "01".repeat(32);
+            let relay = build_role_relay(Some(&key)).await;
+            relay.config.write().await.relay.enabled_nips.push(29);
+            let now = crate::util::unix_now();
+            let secp = secp256k1::Secp256k1::new();
+            let keypair = secp256k1::Keypair::from_seckey_slice(&secp, &[4u8; 32]).unwrap();
+            let pubkey = secp256k1::XOnlyPublicKey::from_keypair(&keypair)
+                .0
+                .to_string();
+            let signed = |kind: u64, gid: &str, tags: Vec<Vec<String>>| {
+                let mut all = vec![vec!["h".to_string(), gid.to_string()]];
+                all.extend(tags);
+                let mut e = crate::event::Event {
+                    id: String::new(),
+                    pubkey: pubkey.clone(),
+                    created_at: now,
+                    kind,
+                    tags: all,
+                    content: String::new(),
+                    sig: String::new(),
+                };
+                e.id = crate::nips::nip01::compute_id(&e);
+                let id = e.id_bytes().unwrap();
+                e.sig = secp.sign_schnorr_no_aux_rand(&id, &keypair).to_string();
+                e
+            };
+            // Create A (the adopting group), X (the old parent) and both
+            // children.
+            for gid in ["a", "x", "b1", "b2"] {
+                let ev = signed(crate::nips::nip29::CREATE_GROUP, gid, vec![]);
+                assert!(matches!(
+                    relay.accept_event(ev, &[], None).await.0,
+                    crate::db::PutOutcome::Stored
+                ));
+            }
+            // Both children point at X.
+            for child in ["b1", "b2"] {
+                let ev = signed(
+                    9002,
+                    child,
+                    vec![vec!["parent".to_string(), "x".to_string()]],
+                );
+                assert!(matches!(
+                    relay.accept_event(ev, &[], None).await.0,
+                    crate::db::PutOutcome::Stored
+                ));
+            }
+            // One 9002 on A adopts both: X's metadata is rebuilt after each
+            // removal.
+            let ev = signed(
+                9002,
+                "a",
+                vec![
+                    vec!["child".to_string(), "b1".to_string()],
+                    vec!["child".to_string(), "b2".to_string()],
+                ],
+            );
+            assert!(matches!(
+                relay.accept_event(ev, &[], None).await.0,
+                crate::db::PutOutcome::Stored
+            ));
+            let f: crate::filter::Filter = serde_json::from_value(
+                serde_json::json!({"kinds": [crate::nips::nip29::GROUP_META], "#d": ["x"]}),
+            )
+            .unwrap();
+            let (stored, _) = relay.db.query(vec![f], 10, now).await;
+            assert_eq!(stored.len(), 1, "exactly one X metadata event");
+            assert!(
+                !stored[0]
+                    .tags
+                    .iter()
+                    .any(|t| t.first().map(String::as_str) == Some("child")),
+                "the final X metadata must not list its old children: {:?}",
+                stored[0].tags
+            );
             relay.db.shutdown();
         });
     }
