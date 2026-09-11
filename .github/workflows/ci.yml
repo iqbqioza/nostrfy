@@ -71,7 +71,12 @@ jobs:
             env IGNORE_OSVERSION=yes pkg update -f
             env IGNORE_OSVERSION=yes pkg install -y rust
           run: |
-            cargo test --all-targets
+            # The VM runs a cold, debuginfo-heavy `cargo test` build and
+            # the final link of the nostrfy test binary exceeded the VM
+            # memory, OOM-killing the compiler. Debug info is not needed
+            # to run the tests, so drop it (debug assertions are an
+            # independent setting and stay on).
+            CARGO_PROFILE_DEV_DEBUG=0 cargo test --all-targets
 
   build:
     # Plain "Build": this is the CI compile check, not the tag-triggered
