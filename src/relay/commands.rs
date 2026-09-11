@@ -16,6 +16,8 @@
 //! even without NIP-42). Only the admin (`relay.pubkey`) can issue
 //! commands: the author check runs on the event's verified signature.
 
+use anyhow::anyhow;
+
 use crate::config;
 use crate::event::Event;
 use crate::nips::nip19::{self, Nip19Entity};
@@ -63,7 +65,7 @@ impl Command {
 /// - `Some(Err(msg))` — command-shaped content that could not be executed
 ///   (unknown verb, invalid pubkey): the relay answers with an error;
 /// - `Some(Ok(cmd))` — a recognized command to execute.
-pub(crate) fn parse(content: &str) -> Option<Result<Command, String>> {
+pub(crate) fn parse(content: &str) -> Option<anyhow::Result<Command>> {
     let parts: Vec<&str> = content.split_whitespace().collect();
     let (list, action, raw) = match parts.as_slice() {
         ["/relay", "allow" | "add", pk] => ("relay", "allow", *pk),
@@ -71,7 +73,7 @@ pub(crate) fn parse(content: &str) -> Option<Result<Command, String>> {
         ["/blossom", "allow", pk] => ("blossom", "allow", *pk),
         ["/blossom", "deny", pk] => ("blossom", "deny", *pk),
         ["/relay", _, _] | ["/blossom", _, _] => {
-            return Some(Err(format!("error: unknown command: {content}")));
+            return Some(Err(anyhow!("error: unknown command: {content}")));
         }
         _ => return None,
     };
@@ -80,7 +82,7 @@ pub(crate) fn parse(content: &str) -> Option<Result<Command, String>> {
     let pk = match normalize_pubkey(raw) {
         Some(pk) => pk,
         None => {
-            return Some(Err(format!("error: invalid pubkey: {raw}")));
+            return Some(Err(anyhow!("error: invalid pubkey: {raw}")));
         }
     };
     Some(Ok(match (list, action) {
@@ -138,7 +140,7 @@ impl Relay {
         };
         let text = match outcome {
             Ok(cmd) => self.execute_command(&cmd).await,
-            Err(msg) => msg,
+            Err(e) => e.to_string(),
         };
         self.reply_to_command(event, text).await;
     }
@@ -244,40 +246,45 @@ mod tests {
 
     #[test]
     fn parses_all_command_forms() {
+        // `anyhow::Error` is not `PartialEq`, so compare the parsed
+        // command after unwrapping the anyhow result.
+        fn parsed(content: &str) -> Option<Command> {
+            parse(content).and_then(|r| r.ok())
+        }
         let hex = "aa".repeat(32);
         let upper = "AA".repeat(32);
         assert_eq!(
-            parse(&format!("/relay allow {hex}")),
-            Some(Ok(Command::RelayAllow(hex.clone())))
+            parsed(&format!("/relay allow {hex}")),
+            Some(Command::RelayAllow(hex.clone()))
         );
         assert_eq!(
-            parse(&format!("/relay add {hex}")),
-            Some(Ok(Command::RelayAllow(hex.clone())))
+            parsed(&format!("/relay add {hex}")),
+            Some(Command::RelayAllow(hex.clone()))
         );
         assert_eq!(
-            parse(&format!("/relay deny {hex}")),
-            Some(Ok(Command::RelayDeny(hex.clone())))
+            parsed(&format!("/relay deny {hex}")),
+            Some(Command::RelayDeny(hex.clone()))
         );
         // 64-hex input is normalized to lowercase.
         assert_eq!(
-            parse(&format!("/blossom allow {upper}")),
-            Some(Ok(Command::BlossomAllow(hex)))
+            parsed(&format!("/blossom allow {upper}")),
+            Some(Command::BlossomAllow(hex))
         );
         // A real npub1 decodes to its hex pubkey.
         let npub = "npub180cvv07tjdrrgpa0j7j7tmnyl2yr6yr7l8j4s3evf6u64th6gkws3w8ktc";
         let npub_hex = "3bf0c63fcb93463407af97a5e5ee64fa883d107ef9e558472c4eb9aaaefa459d";
         assert_eq!(
-            parse(&format!("/blossom deny {npub}")),
-            Some(Ok(Command::BlossomDeny(npub_hex.into())))
+            parsed(&format!("/blossom deny {npub}")),
+            Some(Command::BlossomDeny(npub_hex.into()))
         );
         // The `nostr:` URI prefix is stripped before validation.
         assert_eq!(
-            parse(&format!("/relay allow nostr:{npub}")),
-            Some(Ok(Command::RelayAllow(npub_hex.into())))
+            parsed(&format!("/relay allow nostr:{npub}")),
+            Some(Command::RelayAllow(npub_hex.into()))
         );
         assert_eq!(
-            parse(&format!("/blossom deny nostr:{npub}")),
-            Some(Ok(Command::BlossomDeny(npub_hex.into())))
+            parsed(&format!("/blossom deny nostr:{npub}")),
+            Some(Command::BlossomDeny(npub_hex.into()))
         );
     }
 
@@ -298,7 +305,7 @@ mod tests {
             "hello world",
             "",
         ] {
-            assert_eq!(parse(bad), None, "must ignore {bad:?}");
+            assert!(parse(bad).is_none(), "must ignore {bad:?}");
         }
         for bad in [
             "/relay allow npub1invalid",

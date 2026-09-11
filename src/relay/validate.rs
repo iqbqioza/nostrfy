@@ -2,6 +2,8 @@
 //! NIP-13/26/42/43/70 and access control), the shared [`Precheck`] used by
 //! both accept paths, and the nsec-leak detector.
 
+use anyhow::{anyhow, bail};
+
 use crate::config::{AccessControl, Config};
 use crate::event::Event;
 use crate::nips::{nip01, nip09, nip13, nip26, nip29, nip40, nip43, nip62, nip70};
@@ -116,8 +118,8 @@ impl super::Relay {
         // below must only ever run on a properly signed event authored by
         // the vanished pubkey (an unverified event claiming a foreign
         // pubkey must not trigger the deletion of that pubkey).
-        if let Err(reason) = self.validate_base(cfg, event, now, authed, verified) {
-            return Precheck::Reject(reason);
+        if let Err(e) = self.validate_base(cfg, event, now, authed, verified) {
+            return Precheck::Reject(e.to_string());
         }
         // NIP-62: request to vanish — delete everything by this pubkey.
         // The spec requires the relay to honor the request "regardless of
@@ -204,8 +206,9 @@ impl super::Relay {
                     match self.relay_pubkey() {
                         Some(relay_pk) => groups
                             .validate_write_for_relay(event, Some(&relay_pk))
-                            .err(),
-                        None => groups.validate_write(event).err(),
+                            .err()
+                            .map(|e| e.to_string()),
+                        None => groups.validate_write(event).err().map(|e| e.to_string()),
                     }
                 };
                 if let Some(reason) = reason {
@@ -292,12 +295,12 @@ impl super::Relay {
         now: u64,
         authed: &[String],
         verified: Option<bool>,
-    ) -> std::result::Result<(), String> {
+    ) -> anyhow::Result<()> {
         let limits = &cfg.limits;
 
         // NIP-01: kind is an integer between 0 and 65535.
         if event.kind > 65535 {
-            return Err("invalid: kind out of range".into());
+            bail!("invalid: kind out of range");
         }
         // Ephemeral rejection (configurable): NIP-01 kinds 20000-29999 are
         // normally forwarded live without storage; when enabled they are
@@ -308,21 +311,21 @@ impl super::Relay {
             && (20000..30000).contains(&event.kind)
             && !Self::is_ephemeral_exempt(event.kind)
         {
-            return Err("blocked: ephemeral events not allowed".into());
+            bail!("blocked: ephemeral events not allowed");
         }
         // NIP-34 (git): the kinds are rejected unless `relay.enabled_git`
         // is set — the default keeps the relay free of patch payloads.
         if !cfg.relay.enabled_git && Config::is_git_kind(event.kind) {
-            return Err("blocked: NIP-34 git events are disabled".into());
+            bail!("blocked: NIP-34 git events are disabled");
         }
         // NIP-01: each tag is an array of one or more strings.
         if event.tags.iter().any(|t| t.is_empty()) {
-            return Err("invalid: empty tag".into());
+            bail!("invalid: empty tag");
         }
         // NIP-59: "Tags MUST always be empty in a `kind:13`" (the seal
         // wrapping an encrypted rumor) — a seal with tags is malformed.
         if event.kind == 13 && !event.tags.is_empty() {
-            return Err("invalid: kind 13 seals must not have tags".into());
+            bail!("invalid: kind 13 seals must not have tags");
         }
         // NIP-09: a deletion request is defined as having a list of one or
         // more `e` or `a` tags. A kind-5 event with no targets has no
@@ -336,31 +339,31 @@ impl super::Relay {
                 .iter()
                 .any(|t| t.len() >= 2 && (t[0] == "e" || t[0] == "a"))
         {
-            return Err("invalid: deletion request must reference at least one event".into());
+            bail!("invalid: deletion request must reference at least one event");
         }
 
         // NIP-11's `max_content_length` is a count of unicode characters,
         // so the enforcement counts characters (the byte size is bounded by
         // the websocket message limit instead).
         if event.content.chars().count() > limits.max_content_bytes {
-            return Err("invalid: content too large".into());
+            bail!("invalid: content too large");
         }
         if event.tags.len() > limits.max_tags {
-            return Err("invalid: too many tags".into());
+            bail!("invalid: too many tags");
         }
         if event
             .tags
             .iter()
             .any(|t| t.iter().any(|v| v.len() > limits.max_tag_value_bytes))
         {
-            return Err("invalid: tag value too large".into());
+            bail!("invalid: tag value too large");
         }
         // Events with a future created_at (beyond the tolerated skew) are
         // rejected as invalid (the NIP-01 example for this case carries
         // the `invalid:` prefix; `mute:` is reserved for ignored ephemeral
         // events).
         if event.created_at > now.saturating_add(limits.max_created_at_future_secs) {
-            return Err("invalid: event creation date is in the future".into());
+            bail!("invalid: event creation date is in the future");
         }
 
         // NIP-40: the expiration value is required to be a unix timestamp.
@@ -376,7 +379,7 @@ impl super::Relay {
                 .any(|t| t.first().is_some_and(|n| n == nip40::EXPIRATION_TAG))
             && (nip40::expiry(event).is_none() || nip40::has_malformed_expiration(event))
         {
-            return Err("invalid: malformed expiration tag".into());
+            bail!("invalid: malformed expiration tag");
         }
 
         // Security: events carrying secret key material (bech32 `nsec1`
@@ -387,14 +390,14 @@ impl super::Relay {
                 .iter()
                 .any(|t| t.iter().any(|v| contains_secret_key(v)));
         if leaks_secret {
-            return Err("mute: event contains secret key material".into());
+            bail!("mute: event contains secret key material");
         }
 
         match verified {
             Some(true) => {}
-            Some(false) => return Err("invalid: signature verification failed".to_string()),
+            Some(false) => bail!("invalid: signature verification failed"),
             None => nip01::verify(event, self.secp())
-                .map_err(|_| "invalid: signature verification failed".to_string())?,
+                .map_err(|_| anyhow!("invalid: signature verification failed"))?,
         }
         // NIP-01: hex fields are lowercase by convention. An uppercase-hex
         // pubkey would be stored verbatim and then never match the
@@ -402,13 +405,13 @@ impl super::Relay {
         // to clients), while normalizing it would break the id/signature
         // that were computed over the original string — so reject it.
         if event.pubkey != event.pubkey.to_ascii_lowercase() {
-            return Err("invalid: pubkey must be lowercase hex".into());
+            bail!("invalid: pubkey must be lowercase hex");
         }
         // The same convention applies to the signature: an uppercase-hex
         // sig would be stored verbatim (and never match a lowercase
         // re-computation), so reject it.
         if event.sig != event.sig.to_ascii_lowercase() {
-            return Err("invalid: sig must be lowercase hex".into());
+            bail!("invalid: sig must be lowercase hex");
         }
 
         // NIP-26: a delegation tag is honored by the query/index paths
@@ -418,14 +421,14 @@ impl super::Relay {
         // delegator's pubkey (author-feed impersonation). `verify` checks the
         // first well-formed delegation tag, the only one the read paths use.
         if !nip26::verify(event, self.secp()) {
-            return Err("invalid: delegation failed".into());
+            bail!("invalid: delegation failed");
         }
 
         if cfg.nip_enabled(13)
             && cfg.relay.require_pow > 0
             && !nip13::verify(event, cfg.relay.require_pow)
         {
-            return Err("pow: difficulty requirement not reached".into());
+            bail!("pow: difficulty requirement not reached");
         }
 
         // NIP-42: auth events are ephemeral and must never be stored or
@@ -433,7 +436,7 @@ impl super::Relay {
         // advertise NIP-42 must still not broadcast kind 22242 to other
         // clients, so the check runs regardless of the NIP-42 toggle.
         if event.kind == crate::nips::nip42::AUTH_KIND {
-            return Err("invalid: authentication events cannot be published".into());
+            bail!("invalid: authentication events cannot be published");
         }
 
         // NIP-43: a `kind:28935` invite request "MUST be signed by the pubkey
@@ -444,7 +447,7 @@ impl super::Relay {
         if event.kind == nip43::INVITE
             && Some(event.pubkey.as_str()) != self.relay_pubkey().as_deref()
         {
-            return Err("blocked: invite responses must be published by the relay".into());
+            bail!("blocked: invite responses must be published by the relay");
         }
 
         // NIP-43: role definitions, membership lists and add/remove user
@@ -461,7 +464,7 @@ impl super::Relay {
             )
             && Some(event.pubkey.as_str()) != self.relay_pubkey().as_deref()
         {
-            return Err("blocked: relay metadata must be published by the relay".into());
+            bail!("blocked: relay metadata must be published by the relay");
         }
 
         // NIP-43: leave requests must be signed at the time of sending
@@ -469,10 +472,10 @@ impl super::Relay {
         // carry the NIP-70 `-` tag.
         if cfg.nip_enabled(43) && event.kind == nip43::LEAVE {
             if event.created_at.abs_diff(now) > 600 {
-                return Err("invalid: leave request is too old".into());
+                bail!("invalid: leave request is too old");
             }
             if !nip70::is_protected(event) {
-                return Err("invalid: leave request must carry a `-` tag".into());
+                bail!("invalid: leave request must carry a `-` tag");
             }
         }
 
@@ -484,11 +487,11 @@ impl super::Relay {
             && let Ok(embedded) = serde_json::from_str::<Event>(&event.content)
             && nip70::is_protected(&embedded)
         {
-            return Err("restricted: repost of a protected event".into());
+            bail!("restricted: repost of a protected event");
         }
 
         if cfg.nip_enabled(42) && cfg.relay.require_auth && authed.is_empty() {
-            return Err("auth-required: this relay requires authentication".into());
+            bail!("auth-required: this relay requires authentication");
         }
 
         // NIP-70: "The default behavior of a relay MUST be to reject any
@@ -496,9 +499,7 @@ impl super::Relay {
         // author's own NIP-42 authentication. The rule is unconditional —
         // the NIP-70 toggle only relaxes the SHOULD-level repost check.
         if nip70::is_protected(event) && !authed.iter().any(|pk| pk == &event.pubkey) {
-            return Err(
-                "auth-required: protected events may only be published by their author".into(),
-            );
+            bail!("auth-required: protected events may only be published by their author");
         }
 
         // NIP-78: relays SHOULD require the NIP-42 AUTH flow before
@@ -509,7 +510,7 @@ impl super::Relay {
             && crate::nips::nip78::is_app_specific(event)
             && authed.is_empty()
         {
-            return Err("auth-required: application-specific events require authentication".into());
+            bail!("auth-required: application-specific events require authentication");
         }
 
         Ok(())
@@ -1154,7 +1155,8 @@ mod tests {
                 .validate_base(&cfg, &future, now, &[], None)
                 .unwrap_err();
             assert!(
-                err.starts_with("invalid: event creation date is in the future"),
+                err.to_string()
+                    .starts_with("invalid: event creation date is in the future"),
                 "{err}"
             );
 
@@ -1163,7 +1165,8 @@ mod tests {
             let bad = signed(1, vec![vec!["expiration".into(), "not-a-number".into()]]);
             let err = relay.validate_base(&cfg, &bad, now, &[], None).unwrap_err();
             assert!(
-                err.starts_with("invalid: malformed expiration tag"),
+                err.to_string()
+                    .starts_with("invalid: malformed expiration tag"),
                 "{err}"
             );
             // A bare `["expiration"]` tag (the value is required) is
@@ -1192,7 +1195,8 @@ mod tests {
                 .validate_base(&cfg, &upper, now, &[], None)
                 .unwrap_err();
             assert!(
-                err.starts_with("invalid: sig must be lowercase hex"),
+                err.to_string()
+                    .starts_with("invalid: sig must be lowercase hex"),
                 "{err}"
             );
 
@@ -1203,7 +1207,8 @@ mod tests {
                 .validate_base(&cfg, &auth, now, &[], None)
                 .unwrap_err();
             assert!(
-                err.starts_with("invalid: authentication events cannot be published"),
+                err.to_string()
+                    .starts_with("invalid: authentication events cannot be published"),
                 "{err}"
             );
 
@@ -1222,7 +1227,8 @@ mod tests {
                 .validate_base(&cfg, &protected, now, &[], None)
                 .unwrap_err();
             assert!(
-                err.starts_with("auth-required: protected events may only be published"),
+                err.to_string()
+                    .starts_with("auth-required: protected events may only be published"),
                 "{err}"
             );
             // The author's own authenticated key is the exception.
@@ -1322,7 +1328,8 @@ mod tests {
                 .validate_base(&cfg, &tagged, now, &[], None)
                 .unwrap_err();
             assert!(
-                err.starts_with("invalid: kind 13 seals must not have tags"),
+                err.to_string()
+                    .starts_with("invalid: kind 13 seals must not have tags"),
                 "{err}"
             );
             let clean = signed(13, vec![]);
@@ -1854,7 +1861,7 @@ mod tests {
             let ev = signed(20001, vec![]);
             let res = relay.validate_base(&cfg, &ev, unix_now(), &[], None);
             assert!(
-                res.is_err() && res.unwrap_err().contains("ephemeral"),
+                res.is_err() && res.unwrap_err().to_string().contains("ephemeral"),
                 "validate_base must reject ephemeral when enabled"
             );
             // NIP-42 AUTH (22242) must not be masked as ephemeral — it has
@@ -1862,7 +1869,7 @@ mod tests {
             let auth_ev = signed(22242, vec![]);
             let auth_res = relay.validate_base(&cfg, &auth_ev, unix_now(), &[], None);
             assert!(
-                auth_res.is_err() && !auth_res.unwrap_err().contains("ephemeral"),
+                auth_res.is_err() && !auth_res.unwrap_err().to_string().contains("ephemeral"),
                 "AUTH kind must not be rejected as ephemeral"
             );
             relay.db.shutdown();

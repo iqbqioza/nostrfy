@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use anyhow::anyhow;
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -227,10 +228,15 @@ fn error_response(status: StatusCode, message: &str) -> (StatusCode, Json<Value>
     (status, Json(json!({ "error": message })))
 }
 
+/// Answers a rejected API query parameter.
+fn param_rejection(e: anyhow::Error) -> (StatusCode, Json<Value>) {
+    error_response(StatusCode::BAD_REQUEST, &e.to_string())
+}
+
 /// Bounds the API query parameters so a single request cannot trigger an
 /// arbitrarily large database scan: `limit` is capped, `offset` is capped,
 /// and over-long `search` terms are rejected.
-fn bound_params(params: &mut ApiParams, cfg: &Config) -> Result<(), (StatusCode, String)> {
+fn bound_params(params: &mut ApiParams, cfg: &Config) -> anyhow::Result<()> {
     let limits = &cfg.limits;
     if limits.max_api_limit > 0
         && let Some(limit) = params.limit
@@ -242,21 +248,18 @@ fn bound_params(params: &mut ApiParams, cfg: &Config) -> Result<(), (StatusCode,
         && let Some(offset) = params.offset
         && offset > limits.max_api_offset
     {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!("offset exceeds the maximum of {}", limits.max_api_offset),
+        return Err(anyhow!(
+            "offset exceeds the maximum of {}",
+            limits.max_api_offset
         ));
     }
     if limits.max_api_search_bytes > 0
         && let Some(ref search) = params.search
         && search.len() > limits.max_api_search_bytes
     {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!(
-                "search exceeds the maximum of {} bytes",
-                limits.max_api_search_bytes
-            ),
+        return Err(anyhow!(
+            "search exceeds the maximum of {} bytes",
+            limits.max_api_search_bytes
         ));
     }
     Ok(())
@@ -347,14 +350,16 @@ fn sort_ascending(sort: &Option<String>) -> bool {
 
 /// Parses an author identifier: an `npub1...` code or a 64-hex pubkey
 /// (case-insensitive). Returns the lowercase hex pubkey.
-fn parse_author_identifier(identifier: &str) -> Result<String, String> {
+fn parse_author_identifier(identifier: &str) -> anyhow::Result<String> {
     if identifier.len() == 64 && identifier.chars().all(|c| c.is_ascii_hexdigit()) {
         return Ok(identifier.to_ascii_lowercase());
     }
     match nip19::parse_nip19(identifier) {
         Ok(Nip19Entity::Pubkey(pk)) => Ok(hex::encode(pk)),
-        Ok(_) => Err("the endpoint requires an npub1 identifier or a 64-hex pubkey".into()),
-        Err(e) => Err(format!("invalid identifier: {e}")),
+        Ok(_) => Err(anyhow!(
+            "the endpoint requires an npub1 identifier or a 64-hex pubkey"
+        )),
+        Err(e) => Err(anyhow!("invalid identifier: {e}")),
     }
 }
 
@@ -367,8 +372,8 @@ pub async fn api_handler(
     Query(mut params): Query<ApiParams>,
 ) -> (StatusCode, Json<Value>) {
     let cfg = relay.config.read().await;
-    if let Err((status, msg)) = bound_params(&mut params, &cfg) {
-        return error_response(status, &msg);
+    if let Err(e) = bound_params(&mut params, &cfg) {
+        return param_rejection(e);
     }
     // A 64-hex identifier is an author pubkey (profile lookup); everything
     // else goes through the NIP-19 parsing below.
@@ -509,12 +514,12 @@ pub async fn api_kind_handler(
     Query(mut params): Query<ApiParams>,
 ) -> (StatusCode, Json<Value>) {
     let cfg = relay.config.read().await;
-    if let Err((status, msg)) = bound_params(&mut params, &cfg) {
-        return error_response(status, &msg);
+    if let Err(e) = bound_params(&mut params, &cfg) {
+        return param_rejection(e);
     }
     let hex_pk = match parse_author_identifier(&identifier) {
         Ok(pk) => pk,
-        Err(msg) => return error_response(StatusCode::BAD_REQUEST, &msg),
+        Err(e) => return error_response(StatusCode::BAD_REQUEST, &e.to_string()),
     };
     {
         // `bound_params` already capped `params.limit` at
@@ -564,7 +569,7 @@ pub async fn api_monthly_handler(
 ) -> (StatusCode, Json<Value>) {
     let hex_pk = match parse_author_identifier(&identifier) {
         Ok(pk) => pk,
-        Err(msg) => return error_response(StatusCode::BAD_REQUEST, &msg),
+        Err(e) => return error_response(StatusCode::BAD_REQUEST, &e.to_string()),
     };
 
     // Bounded month range: without `since` the range spans the whole period
@@ -736,8 +741,8 @@ pub async fn api_query_handler(
     Query(mut params): Query<ApiParams>,
 ) -> (StatusCode, Json<Value>) {
     let cfg = relay.config.read().await;
-    if let Err((status, msg)) = bound_params(&mut params, &cfg) {
-        return error_response(status, &msg);
+    if let Err(e) = bound_params(&mut params, &cfg) {
+        return param_rejection(e);
     }
     let limit = params.limit.unwrap_or(100);
     let filter = apply_params(Filter::default(), &params);
@@ -763,8 +768,8 @@ pub async fn api_count_handler(
     Query(mut params): Query<ApiParams>,
 ) -> (StatusCode, Json<Value>) {
     let cfg = relay.config.read().await;
-    if let Err((status, msg)) = bound_params(&mut params, &cfg) {
-        return error_response(status, &msg);
+    if let Err(e) = bound_params(&mut params, &cfg) {
+        return param_rejection(e);
     }
     drop(cfg);
     let Some(_permit) = relay.api_limit.try_acquire() else {
@@ -813,7 +818,7 @@ pub async fn api_kinds_handler(
 ) -> (StatusCode, Json<Value>) {
     let hex_pk = match parse_author_identifier(&identifier) {
         Ok(pk) => pk,
-        Err(msg) => return error_response(StatusCode::BAD_REQUEST, &msg),
+        Err(e) => return error_response(StatusCode::BAD_REQUEST, &e.to_string()),
     };
 
     let Some(_permit) = relay.api_limit.try_acquire() else {
@@ -872,7 +877,7 @@ pub async fn api_daily_handler(
 ) -> (StatusCode, Json<Value>) {
     let hex_pk = match parse_author_identifier(&identifier) {
         Ok(pk) => pk,
-        Err(msg) => return error_response(StatusCode::BAD_REQUEST, &msg),
+        Err(e) => return error_response(StatusCode::BAD_REQUEST, &e.to_string()),
     };
 
     let now = unix_now();
@@ -963,8 +968,8 @@ pub async fn api_id_handler(
     // Bound the query parameters like every other handler: the `limit` /
     // `offset` caps protect against a scan over the whole budget.
     let cfg = relay.config.read().await;
-    if let Err((status, msg)) = bound_params(&mut params, &cfg) {
-        return error_response(status, &msg);
+    if let Err(e) = bound_params(&mut params, &cfg) {
+        return param_rejection(e);
     }
     drop(cfg);
     let filter = apply_params(
@@ -999,7 +1004,7 @@ pub async fn api_stats_handler(
 ) -> (StatusCode, Json<Value>) {
     let hex_pk = match parse_author_identifier(&identifier) {
         Ok(pk) => pk,
-        Err(msg) => return error_response(StatusCode::BAD_REQUEST, &msg),
+        Err(e) => return error_response(StatusCode::BAD_REQUEST, &e.to_string()),
     };
     // Permits are taken per scan round-trip — never across the whole
     // handler — so one slow `stats` cannot pin a slot through 9 scans.
@@ -1128,7 +1133,7 @@ pub async fn api_hourly_handler(
 ) -> (StatusCode, Json<Value>) {
     let hex_pk = match parse_author_identifier(&identifier) {
         Ok(pk) => pk,
-        Err(msg) => return error_response(StatusCode::BAD_REQUEST, &msg),
+        Err(e) => return error_response(StatusCode::BAD_REQUEST, &e.to_string()),
     };
     let now = unix_now();
     let (year, month) = match (params.year, params.month) {
@@ -1229,8 +1234,8 @@ pub async fn api_related_handler(
     // cap an unauthenticated request could collect and serialize the
     // whole scan budget (~200k events) and OOM the relay.
     let cfg = relay.config.read().await;
-    if let Err((status, msg)) = bound_params(&mut params, &cfg) {
-        return error_response(status, &msg);
+    if let Err(e) = bound_params(&mut params, &cfg) {
+        return param_rejection(e);
     }
     drop(cfg);
     let no_tags = excluded_tags(&params);
@@ -1288,11 +1293,11 @@ pub async fn api_follows_handler(
 ) -> (StatusCode, Json<Value>) {
     let hex_pk = match parse_author_identifier(&identifier) {
         Ok(pk) => pk,
-        Err(msg) => return error_response(StatusCode::BAD_REQUEST, &msg),
+        Err(e) => return error_response(StatusCode::BAD_REQUEST, &e.to_string()),
     };
     let cfg = relay.config.read().await;
-    if let Err((status, msg)) = bound_params(&mut params, &cfg) {
-        return error_response(status, &msg);
+    if let Err(e) = bound_params(&mut params, &cfg) {
+        return param_rejection(e);
     }
     drop(cfg);
     let no_tags = excluded_tags(&params);
@@ -1467,11 +1472,11 @@ pub async fn api_relays_handler(
 ) -> (StatusCode, Json<Value>) {
     let hex_pk = match parse_author_identifier(&identifier) {
         Ok(pk) => pk,
-        Err(msg) => return error_response(StatusCode::BAD_REQUEST, &msg),
+        Err(e) => return error_response(StatusCode::BAD_REQUEST, &e.to_string()),
     };
     let cfg = relay.config.read().await;
-    if let Err((status, msg)) = bound_params(&mut params, &cfg) {
-        return error_response(status, &msg);
+    if let Err(e) = bound_params(&mut params, &cfg) {
+        return param_rejection(e);
     }
     drop(cfg);
     let no_tags = excluded_tags(&params);
@@ -1872,6 +1877,29 @@ mod tests {
         };
         bound_params(&mut p, &cfg2).unwrap();
         assert_eq!(p.limit, Some(10_000));
+    }
+
+    #[test]
+    fn param_rejection_keeps_status_and_message() {
+        // `bound_params` reports with anyhow, but the HTTP layer must
+        // answer with the original status code and message.
+        let mut p = ApiParams {
+            offset: Some(51),
+            ..Default::default()
+        };
+        let mut cfg = crate::config::Config::default();
+        cfg.limits.max_api_offset = 50;
+        let err = bound_params(&mut p, &cfg).unwrap_err();
+        let (status, body) = param_rejection(err);
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            body.0
+                .get("error")
+                .and_then(|v| v.as_str())
+                .is_some_and(|m| m.contains("offset exceeds the maximum of 50")),
+            "the original message must survive the anyhow round-trip: {}",
+            body.0
+        );
     }
 
     #[test]

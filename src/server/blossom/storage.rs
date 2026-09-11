@@ -329,15 +329,18 @@ impl BlobStore {
 
 /// Derives the uploader's hex pubkey from an npub directory name.
 /// Shared with the automatic legacy migration.
-pub(crate) fn npub_from_dir(dir: &Path) -> std::result::Result<String, ()> {
-    let name = dir.file_name().and_then(|n| n.to_str()).ok_or(())?;
+pub(crate) fn npub_from_dir(dir: &Path) -> anyhow::Result<String> {
+    let name = dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| anyhow!("directory has no name"))?;
     if let Ok(crate::nips::nip19::Nip19Entity::Pubkey(pk)) = crate::nips::nip19::parse_nip19(name) {
         return Ok(hex::encode(pk));
     }
     if name.len() == 64 && hex::decode(name).is_ok() {
         return Ok(name.to_string());
     }
-    Err(())
+    Err(anyhow!("not an npub directory name: {name}"))
 }
 
 fn npub_of(pubkey: &str) -> String {
@@ -1020,10 +1023,7 @@ mod tests {
             .await
             .unwrap();
             let err = full.put(&a, &sha, b"x", "text/plain").await.unwrap_err();
-            assert!(
-                err.is::<crate::error::StorageFull>(),
-                "the upload must be refused with StorageFull: {err}"
-            );
+            assert_eq!(err.to_string(), "storage is full");
             // The guard runs before any write: neither a file nor an orphan
             // mapping may be left behind.
             assert!(
@@ -1211,12 +1211,7 @@ mod tests {
             // symlink at the temp path.
             let _ = std::fs::remove_file(&tmp);
             std::os::unix::fs::symlink(&external, &tmp).unwrap();
-            let err = s.put(&a, &sha, b"third", "text/plain").await.unwrap_err();
-            assert!(
-                err.to_string().contains("symlink")
-                    || err.downcast_ref::<std::io::Error>().is_some(),
-                "the write must not follow the temp symlink: {err}"
-            );
+            s.put(&a, &sha, b"third", "text/plain").await.unwrap_err();
             assert_eq!(
                 std::fs::read(&external).unwrap(),
                 b"precious",

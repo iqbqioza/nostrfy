@@ -777,16 +777,8 @@ fn wait_for_pid_file(path: &Path) -> Option<u32> {
 }
 
 fn init_config(path: &Path) -> Result<()> {
-    match Config::write_default(path) {
-        Ok(()) => print_line(&format!("wrote {}", path.display())),
-        Err(e) => {
-            if let Some(cfg) = e.downcast_ref::<crate::error::ConfigError>() {
-                error!("{}", cfg.0);
-                std::process::exit(1);
-            }
-            return Err(e);
-        }
-    }
+    Config::write_default(path)?;
+    print_line(&format!("wrote {}", path.display()));
     Ok(())
 }
 

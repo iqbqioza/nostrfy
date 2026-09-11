@@ -461,9 +461,9 @@ pub(crate) enum ScanKind {
 /// (`(prefix..., created_at, id)`). A key shorter than 40 bytes is
 /// corruption (a truncated or hand-crafted index entry): the scan fails
 /// loudly instead of panicking on the slice.
-fn index_tail(key: &[u8]) -> std::result::Result<([u8; 8], [u8; 32]), String> {
+fn index_tail(key: &[u8]) -> anyhow::Result<([u8; 8], [u8; 32])> {
     if key.len() < 40 {
-        return Err(format!("corrupt index key ({} bytes)", key.len()));
+        return Err(anyhow!("corrupt index key ({} bytes)", key.len()));
     }
     let created: [u8; 8] = key[key.len() - 40..key.len() - 32]
         .try_into()
@@ -1217,7 +1217,7 @@ impl Store {
                 if head.next_key.is_none() {
                     match head.iter.next() {
                         Some(Ok((key, _))) => {
-                            let (created, id) = index_tail(key).map_err(|e| anyhow!(e))?;
+                            let (created, id) = index_tail(key)?;
                             head.next_key = Some((key.to_vec(), created, id));
                         }
                         Some(Err(e)) => return Err(e.into()),

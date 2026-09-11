@@ -1661,7 +1661,7 @@ fn stricter_mode(captured: u32, current: u32) -> u32 {
     captured & current
 }
 
-pub(crate) fn write_text_atomic(path: &Path, text: &str) -> std::io::Result<()> {
+pub(crate) fn write_text_atomic(path: &Path, text: &str) -> anyhow::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let tmp = path.with_extension("tmp");

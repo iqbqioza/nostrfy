@@ -72,7 +72,7 @@ pub fn init() {
 }
 
 /// Installs a rotating file backend (used in daemon mode).
-pub fn install_file_logger(path: PathBuf, max_size: u64, max_files: u32) -> std::io::Result<()> {
+pub fn install_file_logger(path: PathBuf, max_size: u64, max_files: u32) -> anyhow::Result<()> {
     let logger = FileLogger::open(path, max_size, max_files)?;
     let mut inner = LOGGER.inner.lock().unwrap_or_else(|e| e.into_inner());
     *inner = Some(Box::new(logger));
@@ -93,7 +93,7 @@ struct FileState {
 }
 
 impl FileLogger {
-    fn open(path: PathBuf, max_size: u64, max_files: u32) -> std::io::Result<FileLogger> {
+    fn open(path: PathBuf, max_size: u64, max_files: u32) -> anyhow::Result<FileLogger> {
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
         let size = file.metadata().map(|m| m.len()).unwrap_or(0);
         Ok(FileLogger {

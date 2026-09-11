@@ -18,6 +18,7 @@ use events::{
 /// and may send moderation events; the relay's own key is always an admin.
 use std::collections::{HashMap, HashSet};
 
+use anyhow::{anyhow, bail};
 use serde_json::json;
 
 use crate::db::DbClient;
@@ -265,10 +266,11 @@ impl GroupStore {
         self.groups.get(id)
     }
 
-    /// Validates a write against the current group state. Returns the reason
-    /// string for the `OK` message on rejection. Access control is based on
-    /// the event's author (`event.pubkey`), not on connection authentication.
-    pub fn validate_write(&self, event: &Event) -> Result<(), String> {
+    /// Validates a write against the current group state. The error message
+    /// is the reason string for the `OK` message on rejection. Access
+    /// control is based on the event's author (`event.pubkey`), not on
+    /// connection authentication.
+    pub fn validate_write(&self, event: &Event) -> anyhow::Result<()> {
         self.validate_write_inner(event, None)
     }
 
@@ -281,7 +283,7 @@ impl GroupStore {
         &self,
         event: &Event,
         relay_pubkey: Option<&str>,
-    ) -> Result<(), String> {
+    ) -> anyhow::Result<()> {
         self.validate_write_inner(event, relay_pubkey)
     }
 
@@ -289,7 +291,7 @@ impl GroupStore {
         &self,
         event: &Event,
         relay_pubkey: Option<&str>,
-    ) -> Result<(), String> {
+    ) -> anyhow::Result<()> {
         // NIP-29: the event's `h` tag carries *the* group id. Multiple `h`
         // tags are ambiguous and dangerous: the checks below use the first
         // one while the stored tag index and subscriptions match any of
@@ -302,7 +304,7 @@ impl GroupStore {
             .count()
             > 1
         {
-            return Err("invalid: group events must carry only one h tag".into());
+            bail!("invalid: group events must carry only one h tag");
         }
         let Some(gid) = group_id(event) else {
             return Ok(());
@@ -314,11 +316,11 @@ impl GroupStore {
             // marker in `apply`). Without this an id could never be reused.
             if event.kind == CREATE_GROUP {
                 if self.at_capacity() {
-                    return Err("restricted: group limit reached".into());
+                    bail!("restricted: group limit reached");
                 }
                 return Ok(());
             }
-            return Err("blocked: the group has been deleted".into());
+            bail!("blocked: the group has been deleted");
         }
         let Some(group) = self.groups.get(gid) else {
             // Unknown groups are open: only a create-group event may target
@@ -328,11 +330,11 @@ impl GroupStore {
             // every other moderation event for an unknown group.
             if event.kind == CREATE_GROUP {
                 if self.at_capacity() {
-                    return Err("restricted: group limit reached".into());
+                    bail!("restricted: group limit reached");
                 }
                 return Ok(());
             }
-            return Err("restricted: unknown group".into());
+            bail!("restricted: unknown group");
         };
         let pubkey = event.pubkey.as_str();
         // The relay's own key is the group master key for moderation events
@@ -342,12 +344,12 @@ impl GroupStore {
 
         if event.kind == JOIN {
             if group.is_member(pubkey) {
-                return Err("duplicate: you are already a member of this group".into());
+                bail!("duplicate: you are already a member of this group");
             }
             // Bound the member map like pins and invites: an uncapped
             // group would let joins grow mirrored state without limit.
             if group.members.len() >= MAX_MEMBERS {
-                return Err("restricted: the group is full".into());
+                bail!("restricted: the group is full");
             }
             if group.settings.closed {
                 // NIP-29: `closed` means join requests are ignored — the
@@ -362,11 +364,11 @@ impl GroupStore {
                 // flow, so every rejection is marked final.
                 if let Some(code) = event_code(event) {
                     if !group.has_invite(code) {
-                        return Err("restricted: invalid invite code (final decision)".into());
+                        bail!("restricted: invalid invite code (final decision)");
                     }
                     return Ok(());
                 }
-                return Err("restricted: this group is closed (final decision)".into());
+                bail!("restricted: this group is closed (final decision)");
             }
             // NIP-29: omitting the `closed` tag means join requests are
             // honored; the relay admits the user right away. A `code` tag
@@ -386,7 +388,7 @@ impl GroupStore {
 
         if (MOD_MIN..=MOD_MAX).contains(&event.kind) {
             if !relay_signed && !group.is_admin(pubkey) {
-                return Err("restricted: you are not an admin of this group".into());
+                bail!("restricted: you are not an admin of this group");
             }
             if event.kind == 9002 {
                 validate_edit_metadata(self, gid, group, event)?;
@@ -402,7 +404,7 @@ impl GroupStore {
                     .count()
                     > MAX_PINS
             {
-                return Err("restricted: too many pinned events".into());
+                bail!("restricted: too many pinned events");
             }
             // Invite codes accumulate without consumption: bound the 9009
             // additions so repeated events cannot grow the set without
@@ -412,7 +414,7 @@ impl GroupStore {
                     .filter(|c| !group.has_invite(c))
                     .count();
                 if group.invites.len().saturating_add(fresh) > MAX_INVITES {
-                    return Err("restricted: too many invite codes".into());
+                    bail!("restricted: too many invite codes");
                 }
             }
             // Bound the member map: count fresh pubkeys (not already
@@ -427,7 +429,7 @@ impl GroupStore {
                     .collect::<std::collections::HashSet<_>>()
                     .len();
                 if group.members.len().saturating_add(fresh) > MAX_MEMBERS {
-                    return Err("restricted: too many group members".into());
+                    bail!("restricted: too many group members");
                 }
             }
             // NIP-29: the group must retain at least one admin — a 9000
@@ -471,7 +473,7 @@ impl GroupStore {
                 }
                 let retains_admin = final_roles.values().any(|admin| *admin);
                 if !retains_admin {
-                    return Err("restricted: the group must retain at least one admin".into());
+                    bail!("restricted: the group must retain at least one admin");
                 }
                 return Ok(());
             }
@@ -480,18 +482,18 @@ impl GroupStore {
                 .iter()
                 .any(|(pk, roles)| !roles.is_empty() && !admin_removed.contains(pk));
             if !retains_admin {
-                return Err("restricted: the group must retain at least one admin".into());
+                bail!("restricted: the group must retain at least one admin");
             }
             return Ok(());
         }
 
         if group.settings.restricted && !group.is_member(pubkey) {
-            return Err("restricted: only group members can post".into());
+            bail!("restricted: only group members can post");
         }
         if let Some(kinds) = &group.settings.supported_kinds
             && !kinds.contains(&event.kind)
         {
-            return Err("restricted: this kind is not supported by the group".into());
+            bail!("restricted: this kind is not supported by the group");
         }
         Ok(())
     }
@@ -1111,12 +1113,12 @@ fn validate_edit_metadata(
     gid: &str,
     _group: &Group,
     event: &Event,
-) -> Result<(), String> {
+) -> anyhow::Result<()> {
     // NIP-29: "A kind:9002 MAY carry at most one parent tag". A second
     // parent tag would be silently ignored (only the first is applied), so
     // the edit is rejected outright instead.
     if tag_values(event, "parent").count() > 1 {
-        return Err("restricted: at most one parent tag is allowed".into());
+        bail!("restricted: at most one parent tag is allowed");
     }
     // A group cannot be its own child, and one 9002 must not make a
     // group both the parent and the child of this one (that would create
@@ -1124,12 +1126,12 @@ fn validate_edit_metadata(
     // be applied and every later parent edit would loop forever).
     let parent_value = tag_value(event, "parent").map(str::to_string);
     if tag_values(event, "child").any(|c| c == gid) {
-        return Err("restricted: a group cannot be its own child".into());
+        bail!("restricted: a group cannot be its own child");
     }
     if let Some(parent) = &parent_value
         && tag_values(event, "child").any(|c| c == parent)
     {
-        return Err("restricted: a group cannot be both parent and child".into());
+        bail!("restricted: a group cannot be both parent and child");
     }
     // The declared children must not create a cycle either: walking down
     // the children lists from the declared children must not reach this
@@ -1144,7 +1146,7 @@ fn validate_edit_metadata(
         let mut visited: HashSet<&str> = HashSet::new();
         while let Some(current) = queue.pop() {
             if current == gid {
-                return Err("restricted: would create a cycle".into());
+                bail!("restricted: would create a cycle");
             }
             if !visited.insert(current) {
                 continue;
@@ -1161,7 +1163,7 @@ fn validate_edit_metadata(
         let mut visited: HashSet<&str> = HashSet::new();
         while let Some(current) = cursor {
             if current == gid {
-                return Err("restricted: would create a cycle".into());
+                bail!("restricted: would create a cycle");
             }
             if !visited.insert(current) {
                 // A pre-existing cycle in the stored data: stop the walk
@@ -1173,9 +1175,9 @@ fn validate_edit_metadata(
         let parent_group = store
             .groups
             .get(&parent)
-            .ok_or_else(|| "restricted: parent group does not exist".to_string())?;
+            .ok_or_else(|| anyhow!("restricted: parent group does not exist"))?;
         if !parent_group.is_admin(event.pubkey.as_str()) {
-            return Err("restricted: you are not an admin of the parent group".into());
+            bail!("restricted: you are not an admin of the parent group");
         }
     }
     // NIP-29: a metadata edit must carry every existing child as a child
@@ -1188,7 +1190,7 @@ fn validate_edit_metadata(
         .iter()
         .all(|c| children.contains(c.as_str()))
     {
-        return Err("restricted: missing child tags in metadata edit".into());
+        bail!("restricted: missing child tags in metadata edit");
     }
     // Adopting a new child through the parent's list requires authority
     // over the child too: otherwise a foreign admin could hijack an
@@ -1203,7 +1205,7 @@ fn validate_edit_metadata(
             && child_group.parent.as_deref() != Some(gid)
             && !child_group.is_admin(event.pubkey.as_str())
         {
-            return Err("restricted: you are not an admin of the child group".into());
+            bail!("restricted: you are not an admin of the child group");
         }
     }
     Ok(())

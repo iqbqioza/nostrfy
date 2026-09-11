@@ -5,6 +5,7 @@
 
 mod codec;
 
+use anyhow::anyhow;
 use codec::{parse_message, write_bound, write_varint};
 
 /// A from-scratch implementation of the Negentropy protocol V1 (range-based
@@ -109,7 +110,7 @@ fn fingerprint(items: &[Item]) -> [u8; 16] {
 ///
 /// `items` must already be sorted ascending by (timestamp, id) via
 /// [`sort_items`]. Returns the raw response message (without hex encoding).
-pub fn respond(items: &[Item], client_message: &[u8]) -> Result<Vec<u8>, String> {
+pub fn respond(items: &[Item], client_message: &[u8]) -> anyhow::Result<Vec<u8>> {
     if client_message.first() != Some(&PROTOCOL_VERSION) {
         // Protocol version negotiation: reply with the highest version we
         // support (a single byte).
@@ -121,7 +122,7 @@ pub fn respond(items: &[Item], client_message: &[u8]) -> Result<Vec<u8>, String>
     // of CPU per frame (the client controls the number of ranges it
     // sends, so this is the input-side budget of the protocol).
     if ranges.len() > MAX_NEG_RANGES_PER_MSG {
-        return Err("too many ranges in one negentropy message".into());
+        return Err(anyhow!("too many ranges in one negentropy message"));
     }
     let mut out: Vec<u8> = Vec::new();
     out.push(PROTOCOL_VERSION);
@@ -137,7 +138,7 @@ pub fn respond(items: &[Item], client_message: &[u8]) -> Result<Vec<u8>, String>
         if lower.ts > upper.ts
             || (lower.ts == upper.ts && lower.prefix.as_slice() > upper.prefix.as_slice())
         {
-            return Err("ranges out of order".into());
+            return Err(anyhow!("ranges out of order"));
         }
         match &range.mode {
             Mode::Skip => {
