@@ -381,22 +381,40 @@ impl Cli {
         match action {
             RelayAction::Allow { pubkey } => {
                 let hex = normalize_pubkey(pubkey);
+                // Removing the pubkey from the deny list is itself a change
+                // that must be persisted even when it is already allowed
+                // (e.g. after a NIP-86 `banpubkey` put it on both lists).
+                let deny_before = deny.len();
                 deny.retain(|(p, _)| p != &hex);
+                let was_denied = deny.len() != deny_before;
+                changed |= was_denied;
                 if !allow.iter().any(|(p, _)| p == &hex) {
                     allow.push((hex.clone(), String::new()));
                     changed = true;
                     print_line(&format!("allowed {hex} to publish"));
+                } else if was_denied {
+                    print_line(&format!(
+                        "{hex} is already allowed; removed it from the deny list"
+                    ));
                 } else {
                     print_line(&format!("{hex} is already allowed"));
                 }
             }
             RelayAction::Deny { pubkey } => {
                 let hex = normalize_pubkey(pubkey);
+                // Symmetric: removing an existing allow entry is a change.
+                let allow_before = allow.len();
                 allow.retain(|(p, _)| p != &hex);
+                let was_allowed = allow.len() != allow_before;
+                changed |= was_allowed;
                 if !deny.iter().any(|(p, _)| p == &hex) {
                     deny.push((hex.clone(), String::new()));
                     changed = true;
                     print_line(&format!("denied {hex}: its events are now rejected"));
+                } else if was_allowed {
+                    print_line(&format!(
+                        "{hex} is already denied; removed it from the allow list"
+                    ));
                 } else {
                     print_line(&format!("{hex} is already denied"));
                 }
@@ -1239,5 +1257,68 @@ name = \"nostrfy\"\n",
         assert_eq!(key.len(), 64);
         assert!(hex::decode(&key).is_ok());
         assert!(secp256k1::SecretKey::from_slice(&hex::decode(&key).unwrap()).is_ok());
+    }
+
+    #[test]
+    fn relay_access_persists_removal_from_the_other_list() {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir()
+            .join("nostrfy-relay-access-test")
+            .join(format!("{:x}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("nostrfy.toml");
+        let db_path = dir.join("db");
+        std::fs::write(
+            &config_path,
+            format!("[database]\npath = {:?}\n", db_path.display().to_string()),
+        )
+        .unwrap();
+        let cli = Cli {
+            config: config_path,
+            command: Command::Check,
+            daemonized: false,
+        };
+        let cfg = cli.load_config().unwrap();
+        let hex = "ab".repeat(32);
+
+        // The NIP-86 state: the pubkey is on both lists. `relay allow` must
+        // remove the deny entry and persist that removal.
+        save_relay_pubkeys(
+            &cfg,
+            &[(hex.clone(), String::new())],
+            &[(hex.clone(), String::new())],
+        )
+        .unwrap();
+        cli.relay_access(&RelayAction::Allow {
+            pubkey: hex.clone(),
+        })
+        .unwrap();
+        let (deny, allow) = load_relay_pubkeys(&cfg).unwrap();
+        assert!(
+            !deny.iter().any(|(p, _)| p == &hex),
+            "allow must remove the deny entry"
+        );
+        assert!(allow.iter().any(|(p, _)| p == &hex));
+
+        // Symmetric: `relay deny` must remove and persist an allow entry.
+        save_relay_pubkeys(
+            &cfg,
+            &[(hex.clone(), String::new())],
+            &[(hex.clone(), String::new())],
+        )
+        .unwrap();
+        cli.relay_access(&RelayAction::Deny {
+            pubkey: hex.clone(),
+        })
+        .unwrap();
+        let (deny, allow) = load_relay_pubkeys(&cfg).unwrap();
+        assert!(
+            !allow.iter().any(|(p, _)| p == &hex),
+            "deny must remove the allow entry"
+        );
+        assert!(deny.iter().any(|(p, _)| p == &hex));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -73,6 +73,11 @@ pub struct Relay {
     /// preserved); fresh pubkeys alone are fail-open until old windows
     /// expire.
     publish_rate: std::sync::Mutex<HashMap<String, std::collections::VecDeque<u64>>>,
+    /// Serializes `persist_access`: two concurrent NIP-86 mutations must
+    /// not capture snapshots in one order and queue their writes in the
+    /// other, or the older snapshot lands last and loses the newer entry
+    /// (a ban silently disappearing on the next restart).
+    persist_access_lock: tokio::sync::Mutex<()>,
     /// NIP-86 blockip/unblockip: every list change notifies each
     /// connection's watcher, so established read-only subscribers (which
     /// never send a frame) are disconnected too — a version counter could
@@ -278,6 +283,13 @@ impl Relay {
                         nip29::GROUP_PINS,
                         nip43::ROLE_DEFINITION,
                         nip43::MEMBERSHIP_LIST,
+                        // The relay's own NIP-66 discovery event is
+                        // relay-signed and addressable too: without it a
+                        // restart in the same second (or after generated
+                        // stamps ran ahead of the wall clock) leaves the
+                        // fresh publish on the losing side of the id
+                        // tie-break until the next 12h refresh.
+                        crate::nips::nip66::DISCOVERY,
                     ]),
                     ..Default::default()
                 };
@@ -346,6 +358,7 @@ impl Relay {
             api_limit: ApiLimiter::new(api_max_concurrent),
             per_ip_connections: std::sync::Mutex::new(HashMap::new()),
             publish_rate: std::sync::Mutex::new(HashMap::new()),
+            persist_access_lock: tokio::sync::Mutex::new(()),
             ip_blocks_tx: tokio::sync::watch::channel(0).0,
             config_version: AtomicU64::new(0),
             key,
@@ -522,7 +535,13 @@ impl Relay {
     /// Persists the current access control lists to the database so NIP-86
     /// runtime bans/allowlists survive restarts. Callers must release the
     /// `access` write lock before awaiting this.
+    ///
+    /// The snapshot and both writes are serialized: without the lock two
+    /// concurrent mutations could read snapshots in one order (older first)
+    /// but queue their writes in the other, so the stale lists are the last
+    /// ones committed and the newer entry is lost after a restart.
     pub async fn persist_access(&self) {
+        let _guard = self.persist_access_lock.lock().await;
         let access = self.access.read().await.clone();
         let deny = access.blocked_pubkeys.clone();
         let allow = access.allowed_pubkeys.clone();
@@ -1142,6 +1161,30 @@ impl Relay {
             self.stats.bump(&self.stats.events_deleted, removed as u64);
         }
 
+        // One moderation event can generate several versions of the same
+        // replaceable metadata slot (e.g. a parent loses two adopted
+        // children in one 9002, rebuilding its 39000 after each removal).
+        // They all share the single per-apply stamp, so the NIP-01 id
+        // tie-break would keep one arbitrarily — retaining the stale
+        // version when its id happens to be lower and dropping the
+        // corrected one as a duplicate. Keep only the last build per `d`
+        // slot: the emit order lists the group's final state last.
+        let mut seen = std::collections::HashSet::new();
+        let mut generated: Vec<Event> = generated
+            .into_iter()
+            .rev()
+            .filter(|ev| {
+                let d = ev
+                    .tags
+                    .iter()
+                    .find(|t| t.len() >= 2 && t[0] == "d")
+                    .map(|t| t[1].clone())
+                    .unwrap_or_default();
+                seen.insert((ev.kind, d))
+            })
+            .collect();
+        generated.reverse();
+
         for mut ev in generated {
             if !self.store_relay_event(&mut ev).await {
                 // The in-memory group state moved on, but the stored
@@ -1624,6 +1667,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_access_persists_keep_every_entry() {
+        // Two concurrent mutations must not capture snapshots in one order
+        // and queue their writes in the other: the older snapshot would be
+        // committed last and drop the newer entry from the persisted lists
+        // (a ban silently vanishing on the next restart). `persist_access`
+        // serializes the snapshot and both writes.
+        let relay = build_relay().await;
+        for i in 0..32u32 {
+            let a = format!("a{i:020x}");
+            let b = format!("b{i:020x}");
+            let ra = relay.clone();
+            let rb = relay.clone();
+            let (a2, b2) = (a.clone(), b.clone());
+            let ta = tokio::spawn(async move {
+                ra.access
+                    .write()
+                    .await
+                    .blocked_pubkeys
+                    .push((a2, String::new()));
+                ra.persist_access().await;
+            });
+            let tb = tokio::spawn(async move {
+                rb.access
+                    .write()
+                    .await
+                    .blocked_pubkeys
+                    .push((b2, String::new()));
+                rb.persist_access().await;
+            });
+            ta.await.unwrap();
+            tb.await.unwrap();
+            let (deny, _) = relay
+                .db
+                .load_relay_pubkeys()
+                .await
+                .expect("the access lists must load");
+            assert!(
+                deny.iter().any(|(p, _)| p == &a),
+                "iteration {i} lost {a}: {} entries persisted",
+                deny.len()
+            );
+            assert!(
+                deny.iter().any(|(p, _)| p == &b),
+                "iteration {i} lost {b}: {} entries persisted",
+                deny.len()
+            );
+        }
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
     async fn reload_db_state_keeps_previous_lists_on_failure() {
         let relay = build_relay().await;
         // Mark the live lists: a failed reload must not overwrite them
@@ -1734,6 +1828,95 @@ mod tests {
     }
 
     #[test]
+    fn one_edit_keeps_only_the_final_group_metadata() {
+        // A single 9002 can rebuild the same parent metadata several times
+        // (adopting B1 and B2 in one edit clears the old parent's child list
+        // after each move). With one shared stamp per moderation event, the
+        // NIP-01 id tie-break could keep the stale version and drop the
+        // corrected one as a duplicate, leaving the stored children
+        // inconsistent with the in-memory group state.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let key = "01".repeat(32);
+            let relay = build_role_relay(Some(&key)).await;
+            relay.config.write().await.relay.enabled_nips.push(29);
+            let now = crate::util::unix_now();
+            let secp = secp256k1::Secp256k1::new();
+            let keypair = secp256k1::Keypair::from_seckey_slice(&secp, &[4u8; 32]).unwrap();
+            let pubkey = secp256k1::XOnlyPublicKey::from_keypair(&keypair)
+                .0
+                .to_string();
+            let signed = |kind: u64, gid: &str, tags: Vec<Vec<String>>| {
+                let mut all = vec![vec!["h".to_string(), gid.to_string()]];
+                all.extend(tags);
+                let mut e = crate::event::Event {
+                    id: String::new(),
+                    pubkey: pubkey.clone(),
+                    created_at: now,
+                    kind,
+                    tags: all,
+                    content: String::new(),
+                    sig: String::new(),
+                };
+                e.id = crate::nips::nip01::compute_id(&e);
+                let id = e.id_bytes().unwrap();
+                e.sig = secp.sign_schnorr_no_aux_rand(&id, &keypair).to_string();
+                e
+            };
+            // Create A (the adopting group), X (the old parent) and both
+            // children.
+            for gid in ["a", "x", "b1", "b2"] {
+                let ev = signed(crate::nips::nip29::CREATE_GROUP, gid, vec![]);
+                assert!(matches!(
+                    relay.accept_event(ev, &[], None).await.0,
+                    crate::db::PutOutcome::Stored
+                ));
+            }
+            // Both children point at X.
+            for child in ["b1", "b2"] {
+                let ev = signed(
+                    9002,
+                    child,
+                    vec![vec!["parent".to_string(), "x".to_string()]],
+                );
+                assert!(matches!(
+                    relay.accept_event(ev, &[], None).await.0,
+                    crate::db::PutOutcome::Stored
+                ));
+            }
+            // One 9002 on A adopts both: X's metadata is rebuilt after each
+            // removal.
+            let ev = signed(
+                9002,
+                "a",
+                vec![
+                    vec!["child".to_string(), "b1".to_string()],
+                    vec!["child".to_string(), "b2".to_string()],
+                ],
+            );
+            assert!(matches!(
+                relay.accept_event(ev, &[], None).await.0,
+                crate::db::PutOutcome::Stored
+            ));
+            let f: crate::filter::Filter = serde_json::from_value(
+                serde_json::json!({"kinds": [crate::nips::nip29::GROUP_META], "#d": ["x"]}),
+            )
+            .unwrap();
+            let (stored, _) = relay.db.query(vec![f], 10, now).await;
+            assert_eq!(stored.len(), 1, "exactly one X metadata event");
+            assert!(
+                !stored[0]
+                    .tags
+                    .iter()
+                    .any(|t| t.first().map(String::as_str) == Some("child")),
+                "the final X metadata must not list its old children: {:?}",
+                stored[0].tags
+            );
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
     fn stamp_clock_is_strictly_monotonic() {
         let clock = StampClock::new_with_last(0);
         let a = clock.stamp(100);
@@ -1838,6 +2021,83 @@ mod tests {
             assert!(
                 relay.stamp_floor(stamped) > stamped,
                 "fresh stamps must outrank the stored relay event"
+            );
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn relay_bootstraps_stamps_from_the_discovery_event() {
+        // NIP-66: the relay's own 30166 is relay-signed and addressable, so
+        // the stamp clock must bootstrap from it too. Otherwise a restart
+        // with no groups or roles starts the clock at 0 and a same-second
+        // re-publish can lose the NIP-01 tie-break, leaving the stale
+        // discovery event served until the next 12h refresh.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = std::env::temp_dir()
+                .join("nostrfy-stamp-bootstrap-nip66")
+                .join(format!("{:x}-{id}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            let mut cfg = crate::config::Config::default();
+            cfg.database.path = path;
+            cfg.database.map_size = 16 * 1024 * 1024;
+            cfg.database.max_map_size = 256 * 1024 * 1024;
+            let db = crate::db::DbClient::open(
+                &cfg.database,
+                true,
+                std::sync::Arc::new(Default::default()),
+                0,
+                128,
+                4096,
+                262144,
+            )
+            .unwrap();
+            let secp = secp256k1::Secp256k1::new();
+            let keypair =
+                secp256k1::Keypair::from_seckey_slice(&secp, &[11u8; 32]).expect("test key");
+            let pubkey = secp256k1::XOnlyPublicKey::from_keypair(&keypair)
+                .0
+                .to_string();
+            let secret = hex::encode([11u8; 32]);
+            let stamped = 1_700_000_000u64;
+            let mut ev = crate::event::Event {
+                id: String::new(),
+                pubkey: pubkey.clone(),
+                created_at: stamped,
+                kind: crate::nips::nip66::DISCOVERY,
+                tags: vec![
+                    vec!["d".to_string(), "wss://relay.example.com/".to_string()],
+                    vec!["-".to_string()],
+                ],
+                content: String::new(),
+                sig: String::new(),
+            };
+            ev.id = crate::nips::nip01::compute_id(&ev);
+            let raw = ev.id_bytes().expect("test id");
+            ev.sig = secp.sign_schnorr_no_aux_rand(&raw, &keypair).to_string();
+            assert!(matches!(
+                db.put(ev, stamped).await,
+                crate::db::PutOutcome::Stored
+            ));
+            let config = std::sync::Arc::new(tokio::sync::RwLock::new(cfg));
+            let relay = Relay::new(
+                config,
+                db,
+                crate::stats::Stats::new(),
+                &secret,
+                crate::relay::LiveBusConfig {
+                    buffer: 1024,
+                    batch_interval_ms: 10,
+                    batch_size: 64,
+                },
+            )
+            .await;
+            assert!(
+                relay.stamp_floor(stamped) > stamped,
+                "fresh stamps must outrank the stored discovery event"
             );
             relay.db.shutdown();
         });

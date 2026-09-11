@@ -17,6 +17,9 @@ use crate::stats::Stats;
 /// stays recent for clients and monitors.
 pub(crate) const REFRESH_SECS: u64 = 12 * 3600;
 
+/// Kind of the relay's own addressable discovery event (NIP-66).
+pub const DISCOVERY: u64 = 30166;
+
 /// The relay's normalized URL (NIP-66 requires the `d` tag to be the
 /// normalized URL): `relay.public_url` when set, otherwise
 /// `wss://host:port/`. IPv6 literals are bracketed to form a valid
@@ -122,7 +125,7 @@ pub(crate) fn relay_discovery_event(
         id: String::new(),
         pubkey: relay_pubkey.to_string(),
         created_at: now,
-        kind: 30166,
+        kind: DISCOVERY,
         tags,
         content,
         sig: String::new(),

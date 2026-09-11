@@ -624,27 +624,41 @@ fn alias_int<T: TryFrom<i64> + Default>(v: &toml::Value) -> T {
 /// A boolean legacy alias: a non-boolean value is warned about instead of
 /// being silently dropped to `false` (an auth flag silently disabled is
 /// worse than a loudly ignored value).
-fn alias_bool(v: &toml::Value, key: &str) -> bool {
+fn alias_bool(v: &toml::Value, key: &str, warnings: &mut Vec<String>) -> bool {
     match v.as_bool() {
         Some(b) => b,
         None => {
-            log::warn!("deprecated config key {key} expects a boolean; the value was ignored");
+            warnings.push(format!(
+                "deprecated config key {key} expects a boolean; the value was ignored"
+            ));
             false
         }
     }
 }
 
-/// Applies the legacy aliases found in `raw` to `cfg` and warns about
-/// each one. The old keys are recognized (never flagged as unknown) and
-/// their values land in the new locations.
-fn apply_legacy_aliases(raw: &str, cfg: &mut Config) {
+/// Applies the legacy aliases found in `raw` to `cfg`. The old keys are
+/// recognized (never flagged as unknown) and their values land in the new
+/// locations. Returns the warnings to log: one per applied alias, plus the
+/// conflicts and invalid values.
+fn apply_legacy_aliases(raw: &str, cfg: &mut Config) -> Vec<String> {
+    let mut warnings = Vec::new();
     let Ok(value) = raw.parse::<toml::Value>() else {
-        return;
+        return warnings;
     };
     let Some(table) = value.as_table() else {
-        return;
+        return warnings;
     };
     for (old_section, old_key, new_section, new_key) in LEGACY_ALIASES {
+        // The alias exists only when the deprecated key is actually in the
+        // file: without this check every config that sets a current key
+        // warned about the legacy key it never had.
+        let Some(v) = table
+            .get(*old_section)
+            .and_then(toml::Value::as_table)
+            .and_then(|section| section.get(*old_key))
+        else {
+            continue;
+        };
         // An explicitly set current key wins over the deprecated alias: a
         // config mid-migration must not have the old value silently override
         // the new one.
@@ -653,28 +667,25 @@ fn apply_legacy_aliases(raw: &str, cfg: &mut Config) {
             .and_then(toml::Value::as_table)
             .is_some_and(|section| section.contains_key(*new_key))
         {
-            log::warn!(
+            warnings.push(format!(
                 "config key [{old_section}].{old_key} is deprecated and ignored because \
                  [{new_section}].{new_key} is set"
-            );
+            ));
             continue;
         }
-        let Some(section) = table.get(*old_section).and_then(toml::Value::as_table) else {
-            continue;
-        };
-        let Some(v) = section.get(*old_key) else {
-            continue;
-        };
-        log::warn!(
+        warnings.push(format!(
             "config key [{old_section}].{old_key} is deprecated; use [{new_section}].{new_key} instead — the value is still applied"
-        );
+        ));
         match (*old_section, *old_key) {
-            ("relay", "enable_git") => cfg.relay.enabled_git = alias_bool(v, "relay.enable_git"),
+            ("relay", "enable_git") => {
+                cfg.relay.enabled_git = alias_bool(v, "relay.enable_git", &mut warnings)
+            }
             ("server", "require_auth") => {
-                cfg.relay.require_auth = alias_bool(v, "server.require_auth")
+                cfg.relay.require_auth = alias_bool(v, "server.require_auth", &mut warnings)
             }
             ("server", "send_auth_challenge") => {
-                cfg.relay.send_auth_challenge = alias_bool(v, "server.send_auth_challenge")
+                cfg.relay.send_auth_challenge =
+                    alias_bool(v, "server.send_auth_challenge", &mut warnings)
             }
             ("server", "management_port") => cfg.rpc.management_port = alias_int::<u16>(v),
             ("server", "management_host") => {
@@ -733,6 +744,7 @@ fn apply_legacy_aliases(raw: &str, cfg: &mut Config) {
             _ => {}
         }
     }
+    warnings
 }
 
 impl Config {
@@ -741,7 +753,9 @@ impl Config {
             .map_err(|e| Error::Config(format!("cannot read {}: {e}", path.display())))?;
         let mut cfg: Config = toml::from_str(&raw)
             .map_err(|e| Error::Config(format!("invalid {}: {e}", path.display())))?;
-        apply_legacy_aliases(&raw, &mut cfg);
+        apply_legacy_aliases(&raw, &mut cfg)
+            .into_iter()
+            .for_each(|warning| log::warn!("{warning}"));
         warn_unknown_fields(&raw);
         Ok(cfg)
     }
@@ -1158,7 +1172,9 @@ impl Config {
             ("limits.max_api_queue_msgs", l.max_api_queue_msgs),
             ("limits.live_buffer", l.live_buffer),
             ("limits.live_batch_size", l.live_batch_size),
-            ("limits.max_out_queue_bytes", l.max_out_queue_bytes),
+            // `limits.max_out_queue_bytes` is intentionally absent: 0 means
+            // "unlimited" at runtime (the queue cap checks `> 0`) and in the
+            // docs, so it is a valid configuration.
             ("limits.max_content_bytes", l.max_content_bytes),
             ("limits.max_tags", l.max_tags),
             ("limits.max_tag_value_bytes", l.max_tag_value_bytes),
@@ -2001,7 +2017,11 @@ log_max_files = 2
 "#;
         let cfg: Config = toml::from_str(raw).unwrap();
         let mut cfg = cfg;
-        apply_legacy_aliases(raw, &mut cfg);
+        let warnings = apply_legacy_aliases(raw, &mut cfg);
+        assert!(
+            !warnings.is_empty(),
+            "the applied legacy aliases must warn about the migration"
+        );
         assert!(cfg.relay.enabled_git);
         assert!(cfg.relay.require_auth);
         assert!(!cfg.relay.send_auth_challenge);
@@ -2050,10 +2070,43 @@ require_auth = false
 max_admin_body_bytes = 2048
 "#;
         let mut cfg: Config = toml::from_str(raw).unwrap();
-        apply_legacy_aliases(raw, &mut cfg);
+        let warnings = apply_legacy_aliases(raw, &mut cfg);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("deprecated and ignored")),
+            "a set current key must warn about the ignored alias: {warnings:?}"
+        );
         assert_eq!(cfg.limits.max_count, 2000, "the current key must win");
         assert!(!cfg.relay.require_auth, "the current key must win");
         assert_eq!(cfg.rpc.max_admin_body_bytes, 2048);
+    }
+
+    #[test]
+    fn current_keys_do_not_warn_about_absent_legacy_keys() {
+        // Regression: the alias warning fired whenever the *new* key was
+        // present, even when the old key was not in the file at all — so a
+        // config with only current keys printed dozens of false
+        // "deprecated and ignored" warnings.
+        let raw = r#"
+[relay]
+require_auth = false
+max_groups = 7
+[limits]
+max_count = 2000
+[rpc]
+max_admin_body_bytes = 2048
+[database]
+max_map_size = 1073741824
+[daemon]
+max_log_files = 2
+"#;
+        let mut cfg: Config = toml::from_str(raw).unwrap();
+        let warnings = apply_legacy_aliases(raw, &mut cfg);
+        assert!(
+            warnings.is_empty(),
+            "a config without legacy keys must not warn: {warnings:?}"
+        );
     }
 
     #[test]
@@ -2064,7 +2117,11 @@ max_admin_body_bytes = 2048
         let raw = "[limits]\ncount_limit = -5\nmax_groups = -1\nmanagement_port = 70000\n";
         let cfg: Config = toml::from_str(raw).unwrap();
         let mut cfg = cfg;
-        apply_legacy_aliases(raw, &mut cfg);
+        let warnings = apply_legacy_aliases(raw, &mut cfg);
+        assert!(
+            !warnings.is_empty(),
+            "invalid legacy values must still warn about the deprecated keys"
+        );
         assert_eq!(
             cfg.limits.max_count, 0,
             "a negative count_limit must not wrap"
@@ -2778,6 +2835,14 @@ max_admin_body_bytes = 2048
             set(&mut cfg);
             assert!(cfg.validate().is_err(), "zero content/tag caps must fail");
         }
+        // `max_out_queue_bytes` is the exception: 0 is documented (and
+        // implemented) as "unlimited", so it must validate.
+        let mut cfg = Config::default();
+        cfg.limits.max_out_queue_bytes = 0;
+        assert!(
+            cfg.validate().is_ok(),
+            "max_out_queue_bytes = 0 must mean unlimited, not a validation error"
+        );
     }
 
     #[test]

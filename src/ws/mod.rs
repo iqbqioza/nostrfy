@@ -2802,6 +2802,56 @@ mod tests {
     }
 
     #[test]
+    fn neg_open_counts_towards_the_req_subscription_cap() {
+        // REQ and NEG-OPEN share one connection-wide `max_subscriptions`
+        // budget (both count as active subscriptions in NIP-11 and the
+        // stats): with the cap at 1, the first subscription must leave no
+        // room for the second, whichever namespace it is in.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            {
+                let mut cfg = conn.relay.config.write().await;
+                cfg.limits.max_subscriptions = 1;
+            }
+            conn.handle_req(&[json!("req"), json!({"kinds": [1]})])
+                .await;
+            assert!(conn.subs.contains_key("req"));
+            conn.outgoing.clear();
+            conn.handle_neg_open(&[json!("neg"), json!({"kinds": [1]}), json!("61000000")])
+                .await;
+            assert!(
+                outgoing_json(&conn).iter().any(|m| m[0] == "NEG-ERR"
+                    && m[2]
+                        .as_str()
+                        .unwrap_or("")
+                        .contains("too many subscriptions")),
+                "NEG-OPEN must not double the advertised subscription cap"
+            );
+            assert!(conn.neg.is_empty(), "the refused NEG must not be stored");
+
+            // The reverse order too: a held NEG subscription blocks a new
+            // REQ.
+            conn.remove_req_subscription("req");
+            conn.outgoing.clear();
+            conn.handle_neg_open(&[json!("neg2"), json!({"kinds": [1]}), json!("61000000")])
+                .await;
+            assert!(conn.neg.contains_key("neg2"));
+            conn.outgoing.clear();
+            conn.handle_req(&[json!("req2"), json!({"kinds": [1]})])
+                .await;
+            assert!(
+                outgoing_json(&conn)
+                    .iter()
+                    .any(|m| m[0] == "CLOSED" && m[1] == "req2"),
+                "a new REQ must respect the NEG-held subscription budget"
+            );
+            assert!(!conn.subs.contains_key("req2"));
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
     fn req_failed_replacement_releases_the_old_subscription() {
         // A failed re-REQ (CLOSED) must release the previous subscription
         // held under the same id: otherwise the ghost keeps receiving live

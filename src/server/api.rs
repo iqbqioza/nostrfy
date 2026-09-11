@@ -590,6 +590,10 @@ pub async fn api_monthly_handler(
             }))
             .expect("static filter");
             let mut start_ts = None;
+            // Whether the probe saw every matching event (`more == false`):
+            // a probe cut short cannot prove there is no visible event,
+            // only that none is inside the window.
+            let mut exhausted = false;
             let mut fetch = 64usize;
             for _ in 0..4 {
                 // The concurrency permit is taken per round-trip (also
@@ -601,11 +605,12 @@ pub async fn api_monthly_handler(
                         Json(json!({ "error": "server is busy, try again shortly" })),
                     );
                 };
-                let (events, _) = relay
+                let (events, more) = relay
                     .db
                     .api_query(vec![probe.clone()], fetch, now, true)
                     .await;
                 drop(_permit);
+                exhausted = !more;
                 let has_group_events = events.iter().any(nip29::is_group_event);
                 let groups = if has_group_events {
                     Some(relay.groups.read().await)
@@ -624,11 +629,21 @@ pub async fn api_monthly_handler(
             }
             match start_ts {
                 Some(s) => s,
-                None => {
-                    // No visible events at all: an empty range, reported as such.
+                // No visible events at all: an empty range, reported as such.
+                None if exhausted => {
                     return (
                         StatusCode::OK,
                         Json(json!({ "months": [], "total": 0, "approximate": false })),
+                    );
+                }
+                // The bounded probe hit more hidden events than it can look
+                // past: reporting an empty range would be wrong (visible
+                // events may exist beyond the window), so ask the client to
+                // bound the range explicitly instead.
+                None => {
+                    return error_response(
+                        StatusCode::BAD_REQUEST,
+                        "error: too many hidden events to determine the range start; pass since",
                     );
                 }
             }
@@ -2285,6 +2300,50 @@ mod tests {
                 "only the event inside [since, until] may count: {resp}"
             );
             assert_eq!(resp["months"][0]["count"], 1, "{resp}");
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn monthly_reports_an_error_when_the_probe_cannot_find_a_visible_event() {
+        // More hidden events than the bounded probe can look past: reporting
+        // an empty range would claim the author has no visible events even
+        // though the visible one is just newer than the probe window.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_relay().await;
+            let now = unix_now();
+            let visible = signed_note(relay.secp(), "public", now, vec![]);
+            let pk = visible.pubkey.clone();
+            for i in 0..1025u64 {
+                let mut hidden =
+                    signed_note(relay.secp(), &format!("h{i}"), now - 5000 + i, vec![]);
+                hidden.tags = vec![vec!["-".into()]];
+                hidden.id = crate::nips::nip01::compute_id(&hidden);
+                assert_eq!(
+                    relay.db.put(hidden, now).await,
+                    crate::db::PutOutcome::Stored
+                );
+            }
+            assert_eq!(
+                relay.db.put(visible, now).await,
+                crate::db::PutOutcome::Stored
+            );
+            let (code, Json(resp)) = api_monthly_handler(
+                State(relay.clone()),
+                Path((pk, 1)),
+                Query(ApiParams::default()),
+            )
+            .await;
+            assert_eq!(
+                code,
+                StatusCode::BAD_REQUEST,
+                "an inconclusive probe must not report an empty range: {resp}"
+            );
+            assert!(
+                resp["error"].as_str().is_some_and(|e| e.contains("since")),
+                "the error must tell the client to bound the range: {resp}"
+            );
             relay.db.shutdown();
         });
     }
