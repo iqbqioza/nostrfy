@@ -120,10 +120,7 @@ pub fn respond(items: &[Item], client_message: &[u8]) -> anyhow::Result<Vec<u8>>
     // NIP-77: every message covers the complete timestamp/ID space. A
     // message whose final explicit range does not reach infinity implicitly
     // appends a Skip range to infinity.
-    if ranges
-        .last()
-        .is_none_or(|range| range.upper.ts != u64::MAX)
-    {
+    if ranges.last().is_none_or(|range| range.upper.ts != u64::MAX) {
         ranges.push(Range {
             upper: Bound {
                 ts: u64::MAX,
