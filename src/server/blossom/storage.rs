@@ -89,6 +89,7 @@ impl BlobStore {
 
     /// Stores a blob: the LMDB mapping first (so a crash leaves a healable
     /// state — a mapping without a file can be deleted), then the file.
+    #[cfg(test)]
     pub(crate) async fn put(
         &self,
         pubkey: &str,
@@ -119,6 +120,7 @@ impl BlobStore {
         {
             return Err(anyhow!("blossom mapping write failed"));
         }
+
         let npub = npub_of(pubkey);
         let stored = match &self.storage {
             Storage::Local(s) => s.put(&npub, sha256, bytes, mime, uploaded).await,
@@ -146,6 +148,51 @@ impl BlobStore {
         Ok(Descriptor {
             sha256: sha256.to_string(),
             size: bytes.len() as u64,
+            mime: mime.to_string(),
+            uploaded,
+            pubkey: pubkey.to_string(),
+        })
+    }
+
+    /// Stores a blob from a temporary file, keeping the upload path
+    /// bounded to filesystem and transport buffers instead of retaining the
+    /// complete request body in memory.
+    pub(crate) async fn put_file(
+        &self,
+        pubkey: &str,
+        sha256: &str,
+        path: &Path,
+        size: u64,
+        mime: &str,
+    ) -> Result<Descriptor> {
+        self.check_space()?;
+        let uploaded = crate::util::unix_now() as i64;
+        let was_owner = self
+            .db
+            .blossom_load(sha256)
+            .await
+            .is_some_and(|m| m.owners.iter().any(|o| o == pubkey));
+        if !self
+            .db
+            .blossom_add_owner(sha256, mime, size, uploaded, pubkey)
+            .await
+        {
+            return Err(anyhow!("blossom mapping write failed"));
+        }
+        let npub = npub_of(pubkey);
+        let stored = match &self.storage {
+            Storage::Local(s) => s.put_file(&npub, sha256, path).await,
+            Storage::S3(s) => s.put_file(&npub, sha256, path, size, mime).await,
+        };
+        if let Err(e) = stored {
+            if !was_owner {
+                self.db.blossom_remove_owner(sha256, pubkey).await;
+            }
+            return Err(e);
+        }
+        Ok(Descriptor {
+            sha256: sha256.to_string(),
+            size,
             mime: mime.to_string(),
             uploaded,
             pubkey: pubkey.to_string(),
@@ -438,6 +485,7 @@ impl LocalStore {
         Ok(())
     }
 
+    #[cfg(test)]
     async fn put(
         &self,
         npub: &str,
@@ -454,6 +502,7 @@ impl LocalStore {
         if !self.parent_within_root(npub).await {
             return Err(anyhow!("blossom storage directory is a symlink"));
         }
+
         // Atomic write: the bytes land in a temp file first and are moved
         // into place with a rename. A crash mid-write can then never leave
         // a truncated blob at the final path — the file is either complete
@@ -486,6 +535,35 @@ impl LocalStore {
             let _ = tokio::fs::remove_file(&tmp_path).await;
             return Err(e.into());
         }
+        if let Err(e) = tokio::fs::rename(&tmp_path, self.blob_path(npub, sha256)).await {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            return Err(e.into());
+        }
+        Ok(())
+    }
+
+    async fn put_file(&self, npub: &str, sha256: &str, source: &Path) -> Result<()> {
+        use tokio::io::AsyncWriteExt;
+        let dir = self.root.join(npub);
+        tokio::fs::create_dir_all(&dir).await?;
+        if !self.parent_within_root(npub).await {
+            return Err(anyhow!("blossom storage directory is a symlink"));
+        }
+        let tmp_path = dir.join(format!(".{sha256}.tmp"));
+        let mut input = tokio::fs::File::open(source).await?;
+        let mut output = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&tmp_path)
+            .await?;
+        if let Err(e) = tokio::io::copy(&mut input, &mut output).await {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            return Err(e.into());
+        }
+        output.flush().await?;
+        drop(output);
         if let Err(e) = tokio::fs::rename(&tmp_path, self.blob_path(npub, sha256)).await {
             let _ = tokio::fs::remove_file(&tmp_path).await;
             return Err(e.into());
@@ -690,6 +768,7 @@ impl S3Store {
         })
     }
 
+    #[cfg(test)]
     async fn put(
         &self,
         npub: &str,
@@ -700,6 +779,19 @@ impl S3Store {
     ) -> Result<()> {
         self.client
             .put_object(&format!("{npub}/{sha256}"), bytes, mime)
+            .await
+    }
+
+    async fn put_file(
+        &self,
+        npub: &str,
+        sha256: &str,
+        source: &Path,
+        size: u64,
+        mime: &str,
+    ) -> Result<()> {
+        self.client
+            .put_object_file(&format!("{npub}/{sha256}"), source, size, mime)
             .await
     }
 
