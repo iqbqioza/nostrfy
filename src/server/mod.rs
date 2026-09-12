@@ -860,8 +860,12 @@ async fn nip66_publisher(relay: Arc<Relay>, mut shutdown: watch::Receiver<bool>)
                 );
                 drop(cfg);
                 drop(access);
-                if relay.store_relay_event(&mut event).await {
-                    log::debug!("nip66: published the relay discovery event");
+                match relay.store_relay_event(&mut event).await {
+                    Ok(true) => log::debug!("nip66: published the relay discovery event"),
+                    Ok(false) => {
+                        log::warn!("nip66: stored discovery event but live delivery failed")
+                    }
+                    Err(()) => log::warn!("nip66: failed to store the discovery event"),
                 }
             }
             _ = shutdown.changed() => break,

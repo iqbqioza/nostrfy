@@ -1204,13 +1204,24 @@ impl Relay {
         generated.reverse();
 
         for mut ev in generated {
-            if !self.store_relay_event(&mut ev).await {
+            let result = self.store_relay_event(&mut ev).await;
+            if result.is_err() {
                 // The in-memory group state moved on, but the stored
                 // metadata did not: without this the saved 39000-39005
                 // stay stale until the next edit (and the restart rebuild
                 // replays the older moderation events). Surface it.
                 log::warn!(
                     "could not store the relay-generated group event for {}",
+                    ev.tags
+                        .iter()
+                        .find(|t| t.first().map(String::as_str) == Some("d"))
+                        .and_then(|t| t.get(1))
+                        .cloned()
+                        .unwrap_or_default()
+                );
+            } else if matches!(result, Ok(false)) {
+                log::warn!(
+                    "stored the relay-generated group event but live delivery failed for {}",
                     ev.tags
                         .iter()
                         .find(|t| t.first().map(String::as_str) == Some("d"))
@@ -1612,6 +1623,36 @@ mod tests {
 
         relay.db.shutdown();
         keyless.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn generated_event_reports_stored_when_live_delivery_fails() {
+        let key = "02".repeat(32);
+        let mut relay = match std::sync::Arc::try_unwrap(build_role_relay(Some(&key)).await) {
+            Ok(relay) => relay,
+            Err(_) => panic!("test relay must have a single owner"),
+        };
+        relay.live_rx.take();
+        let relay_pubkey = relay.relay_pubkey().unwrap();
+        let mut event = crate::event::Event {
+            id: String::new(),
+            pubkey: relay_pubkey,
+            created_at: crate::util::unix_now(),
+            kind: 33534,
+            tags: vec![vec!["d".into(), "delivery-test".into()]],
+            content: String::new(),
+            sig: String::new(),
+        };
+
+        assert_eq!(relay.store_relay_event(&mut event).await, Ok(false));
+        let filter: crate::filter::Filter =
+            serde_json::from_value(serde_json::json!({"ids": [event.id]})).unwrap();
+        let (stored, _) = relay
+            .db
+            .query(vec![filter], 1, crate::util::unix_now())
+            .await;
+        assert_eq!(stored.len(), 1);
+        relay.db.shutdown();
     }
 
     #[tokio::test]

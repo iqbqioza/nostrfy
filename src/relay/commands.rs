@@ -236,7 +236,18 @@ impl Relay {
                 .tags
                 .push(vec!["p".into(), admin.to_ascii_lowercase()]);
         }
-        let _ = self.store_relay_event(&mut event).await;
+        match self.store_relay_event(&mut event).await {
+            Ok(true) => {}
+            Ok(false) => {
+                log::warn!(
+                    "stored command response for {} but live delivery failed",
+                    command.id
+                );
+            }
+            Err(()) => {
+                log::error!("could not store command response for {}", command.id);
+            }
+        }
     }
 }
 

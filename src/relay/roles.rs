@@ -13,19 +13,19 @@ impl super::Relay {
     /// stamp through `stamp_floor`); a stored version can never outrank the
     /// newest state because the stamps reflect the order in which the state
     /// was applied, not the order in which the events are stored.
-    pub(crate) async fn store_relay_event(&self, event: &mut Event) -> bool {
+    pub(crate) async fn store_relay_event(&self, event: &mut Event) -> Result<bool, ()> {
         let Some(keypair) = &self.key else {
-            return false;
+            return Err(());
         };
         if nip01::sign(event, keypair, &self.secp).is_err() {
-            return false;
+            return Err(());
         }
         let now = unix_now();
         let outcome = self.db.put(event.clone(), now).await;
         if matches!(outcome, PutOutcome::Stored | PutOutcome::Replaced) {
-            self.broadcast(event.clone()).await.is_ok()
+            Ok(self.broadcast(event.clone()).await.is_ok())
         } else {
-            false
+            Err(())
         }
     }
 
@@ -35,7 +35,7 @@ impl super::Relay {
     /// (a success would leave the operator with an in-memory-only change
     /// that silently disappears on the next restart).
     async fn publish_relay_event(&self, mut event: Event) -> bool {
-        self.store_relay_event(&mut event).await
+        self.store_relay_event(&mut event).await.is_ok()
     }
 
     /// Publishes the current membership list and an add/remove user event.
