@@ -75,6 +75,12 @@ fn item_cmp(item: &Item, bound: &Bound) -> Ordering {
         Ordering::Less => Ordering::Less,
         Ordering::Greater => Ordering::Greater,
         Ordering::Equal => {
+            // An empty prefix at u64::MAX is the protocol's infinity bound.
+            // Treat it as above every ID at the maximal timestamp rather
+            // than padding the empty prefix with zeroes.
+            if bound.ts == u64::MAX && bound.prefix.is_empty() {
+                return Ordering::Less;
+            }
             let mut padded = [0u8; 32];
             padded[..bound.prefix.len()].copy_from_slice(&bound.prefix);
             item.1.cmp(&padded)
@@ -344,7 +350,7 @@ mod tests {
         msg.extend_from_slice(&buf[..n]);
         msg.extend_from_slice(&[0u8; 16]); // client's fingerprint
 
-        let items = sort_items(vec![item(1, 7), item(3, 9)]);
+        let items = sort_items(vec![item(1, 7), item(3, 9), item(u64::MAX, 11)]);
         let resp = respond(&items, &msg).unwrap();
 
         // Expect: version + range with infinity upper, mode 2, 2 ids.
@@ -352,9 +358,10 @@ mod tests {
         assert_eq!(resp[1], 0x00); // infinity ts
         assert_eq!(resp[2], 0x00); // empty prefix
         assert_eq!(resp[3], 0x02); // mode id list
-        assert_eq!(resp[4], 0x02); // two ids
+        assert_eq!(resp[4], 0x03); // three ids
         assert_eq!(&resp[5..37], &items[0].1);
         assert_eq!(&resp[37..69], &items[1].1);
+        assert_eq!(&resp[69..101], &items[2].1);
     }
 
     #[test]

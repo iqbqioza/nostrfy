@@ -880,12 +880,33 @@ pub(crate) fn tag_range(name: u8, value: &[u8], since: u64, until: u64) -> (Vec<
     start.extend_from_slice(&[0u8; ID_LEN]);
 
     // Exclusive `(until + 1, 0..)`: covers every event with
-    // `created_at <= until`, including the maximal id at exactly `until`.
-    let mut end = Vec::with_capacity(prefix_len + CREATED_LEN + ID_LEN);
+    // `created_at <= until`. At the maximal timestamp, append a byte after
+    // the maximal id so the exclusive bound remains above every fixed-size
+    // event key.
+    let mut end = Vec::with_capacity(prefix_len + CREATED_LEN + ID_LEN + 1);
     end.extend_from_slice(&start[..prefix_len]);
-    end.extend_from_slice(&until.saturating_add(1).to_be_bytes());
-    end.extend_from_slice(&[0u8; ID_LEN]);
+    end.extend_from_slice(&until.to_be_bytes());
+    if until == u64::MAX {
+        end.extend_from_slice(&[0xffu8; ID_LEN]);
+        end.push(0);
+    } else {
+        end[..prefix_len + CREATED_LEN].copy_from_slice(&until.saturating_add(1).to_be_bytes());
+        end.extend_from_slice(&[0u8; ID_LEN]);
+    }
     (start, end)
+}
+
+/// Builds an exclusive upper bound for an index key whose final components
+/// are `(created_at, id)`. A maximal timestamp needs a key longer than every
+/// valid fixed-size record; otherwise saturating `until + 1` would exclude
+/// that timestamp entirely.
+pub(crate) fn range_end(mut key: Vec<u8>, until: u64) -> Vec<u8> {
+    if until == u64::MAX {
+        let id_start = key.len() - ID_LEN;
+        key[id_start..].fill(0xff);
+        key.push(0);
+    }
+    key
 }
 
 pub(crate) fn word_key(word: &str, created: u64, id: &[u8]) -> Vec<u8> {

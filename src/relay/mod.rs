@@ -192,6 +192,19 @@ fn enqueue_live_batch(queue: &LiveQueue, batch: crate::ws::LiveBatch) {
     }
 }
 
+/// Forces every subscribed connection to resynchronize after a live-bus
+/// panic. The batch may have been persisted already and may have been
+/// delivered to only some queues, so closing only affected queues cannot
+/// establish a safe delivery boundary.
+fn signal_live_resync(
+    conn_queues: &std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u64, LiveQueue>>>,
+) {
+    let queues = conn_queues.lock().unwrap_or_else(|p| p.into_inner());
+    for queue in queues.values() {
+        let _ = queue.overflow.send(());
+    }
+}
+
 /// Bounds the number of concurrently served `/api/v1` queries. Implemented
 /// with a cheap atomic counter instead of a `tokio::sync::Semaphore` so the
 /// limit can be changed at runtime (SIGHUP config reload) without
@@ -464,22 +477,38 @@ impl Relay {
                                     std::panic::AssertUnwindSafe(|| flush(&mut batch)),
                                 );
                                 if r.is_err() {
-                                    log::error!("live bus recovered from a panic");
+                                    log::error!(
+                                        "live bus recovered from a panic; forcing all subscribers to resynchronize"
+                                    );
+                                    signal_live_resync(&conn_queues);
                                     batch.clear();
                                 }
                             }
                         }
                         None => {
-                            let _ = std::panic::catch_unwind(
+                            let r = std::panic::catch_unwind(
                                 std::panic::AssertUnwindSafe(|| flush(&mut batch)),
                             );
+                            if r.is_err() {
+                                log::error!(
+                                    "live bus recovered from a panic; forcing all subscribers to resynchronize"
+                                );
+                                signal_live_resync(&conn_queues);
+                            }
                             return;
                         }
                     },
                     _ = interval.tick() => {
-                        let _ = std::panic::catch_unwind(
+                        let r = std::panic::catch_unwind(
                             std::panic::AssertUnwindSafe(|| flush(&mut batch)),
                         );
+                        if r.is_err() {
+                            log::error!(
+                                "live bus recovered from a panic; forcing all subscribers to resynchronize"
+                            );
+                            signal_live_resync(&conn_queues);
+                            batch.clear();
+                        }
                     }
                 }
             }
@@ -507,8 +536,8 @@ impl Relay {
     /// 10,000 pubkeys — the
     /// cap never clears the whole map (a clear would reset every window
     /// and permanently disable the limit): expired windows are evicted
-    /// first, and a still-full map skips tracking the new pubkey only
-    /// (fail-open for that key, limits preserved for everyone else).
+    /// first, and a still-full map rejects the new pubkey because its
+    /// window cannot be tracked safely.
     pub(crate) fn publish_rate_allowed(&self, cfg: &Config, pubkey: &str, now: u64) -> bool {
         const MAX_TRACKED_PUBKEYS: usize = 10_000;
         let max = cfg.relay.max_events_per_min_per_pubkey;
@@ -531,13 +560,13 @@ impl Relay {
         }
         // New pubkey: never clear the whole map (a clear would reset every
         // window and permanently disable the limit). Expired windows are
-        // evicted first; a still-full map skips tracking the new pubkey
-        // only (fail-open for that key, limits preserved for everyone
-        // else).
+        // evicted first; a still-full map rejects the new pubkey because
+        // admitting an untracked identity would bypass the configured
+        // limit.
         if rate.len() >= MAX_TRACKED_PUBKEYS {
             rate.retain(|_, w| w.front().is_some_and(|t| now.saturating_sub(*t) < 60));
             if rate.len() >= MAX_TRACKED_PUBKEYS {
-                return true;
+                return false;
             }
         }
         rate.entry(pubkey.to_string()).or_default().push_back(now);
@@ -1367,6 +1396,7 @@ mod tests {
     use super::Relay;
     use super::StampClock;
     use super::enqueue_live_batch;
+    use super::signal_live_resync;
     use super::validate::contains_secret_key;
 
     /// Builds a relay with an empty database.
@@ -1434,6 +1464,30 @@ mod tests {
             "a full queue must signal the connection to close"
         );
         assert_eq!(receiver.len(), crate::relay::LIVE_QUEUE_CAPACITY);
+    }
+
+    #[tokio::test]
+    async fn live_bus_panic_signals_every_subscriber_to_resync() {
+        let queues = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let mut receivers = Vec::new();
+        for id in 0..2 {
+            let (sender, _receiver) = tokio::sync::mpsc::channel(crate::relay::LIVE_QUEUE_CAPACITY);
+            let (overflow, overflow_rx) = tokio::sync::watch::channel(());
+            queues
+                .lock()
+                .unwrap()
+                .insert(id, LiveQueue { sender, overflow });
+            receivers.push(overflow_rx);
+        }
+
+        signal_live_resync(&queues);
+
+        assert!(
+            receivers
+                .iter()
+                .all(|receiver| receiver.has_changed().unwrap()),
+            "every subscriber must be told to resynchronize"
+        );
     }
 
     #[tokio::test]
