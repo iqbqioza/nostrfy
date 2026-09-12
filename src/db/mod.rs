@@ -1177,11 +1177,6 @@ impl DbClient {
         .await
     }
 
-    /// Removes one owner from a Blossom blob's persisted metadata.
-    pub async fn blossom_remove_owner(&self, sha256: &str, pubkey: &str) -> bool {
-        self.blossom_remove_owner_checked(sha256, pubkey).await.0
-    }
-
     /// Removes one owner and reports whether the database operation itself
     /// completed successfully.
     pub async fn blossom_remove_owner_checked(&self, sha256: &str, pubkey: &str) -> (bool, bool) {

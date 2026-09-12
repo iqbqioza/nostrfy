@@ -153,7 +153,12 @@ impl BlobStore {
             // pre-existing valid mapping).
             //
             if !was_owner {
-                self.db.blossom_remove_owner(sha256, pubkey).await;
+                let (removed, db_ok) = self.db.blossom_remove_owner_checked(sha256, pubkey).await;
+                if !db_ok || !removed {
+                    return Err(anyhow!(
+                        "blob storage failed ({e}); owner mapping rollback failed"
+                    ));
+                }
             }
             return Err(e);
         }
@@ -199,7 +204,12 @@ impl BlobStore {
         };
         if let Err(e) = stored {
             if !was_owner {
-                self.db.blossom_remove_owner(sha256, pubkey).await;
+                let (removed, db_ok) = self.db.blossom_remove_owner_checked(sha256, pubkey).await;
+                if !db_ok || !removed {
+                    return Err(anyhow!(
+                        "blob storage failed ({e}); owner mapping rollback failed"
+                    ));
+                }
             }
             return Err(e);
         }
