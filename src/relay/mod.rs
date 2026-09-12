@@ -470,13 +470,16 @@ impl Relay {
         });
     }
 
-    /// Queues an event for live delivery to subscribers. The event is
-    /// dropped (never stored) when the live buffer is full, as it remains
-    /// available through subscriptions. The JSON is encoded once here —
-    /// every subscriber shares the same serialization.
-    pub fn broadcast(&self, event: Event) {
+    /// Queues an event for live delivery to subscribers. Backpressure from
+    /// the bounded live buffer is propagated to the accepting task so an
+    /// accepted event is never silently lost before fan-out. The JSON is
+    /// encoded once here — every subscriber shares the same serialization.
+    pub async fn broadcast(&self, event: Event) {
         let json = Arc::new(serde_json::to_string(&event).unwrap_or_default());
-        let _ = self.live_tx.try_send((event, json));
+        if self.live_tx.send((event, json)).await.is_err() {
+            log::error!("live bus stopped before an accepted event could be broadcast");
+            self.stats.bump(&self.stats.db_errors, 1);
+        }
     }
 
     /// Whether `pubkey` may publish another event under
@@ -1061,7 +1064,7 @@ impl Relay {
         if event.kind == 1 {
             self.handle_command_event(&event).await;
         }
-        self.broadcast(event);
+        self.broadcast(event).await;
     }
 
     /// Persists the live NIP-29 group state (write-through: call after
