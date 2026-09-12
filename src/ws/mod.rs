@@ -220,6 +220,19 @@ impl Conn {
         self.send_control(json!(["CLOSED", sub_id, reason]));
     }
 
+    /// Notifies every active subscription before disconnecting after live
+    /// backpressure. The client must reconnect and issue fresh REQs because
+    /// events were dropped while its socket was not keeping up.
+    pub(crate) fn close_for_live_overflow(&mut self) {
+        let ids: Vec<String> = self.subs.keys().cloned().collect();
+        for id in ids {
+            self.send_closed(
+                &id,
+                "error: live delivery overflow; reconnect and resubscribe",
+            );
+        }
+    }
+
     pub(crate) fn send_ok(&mut self, id: &str, accepted: bool, message: &str) {
         // NIP-01/NIP-42 completion acknowledgements must not compete with
         // live EVENT traffic for the byte budget: dropping one leaves the
@@ -957,6 +970,8 @@ pub async fn handle_connection(
             }
             changed = overflow_rx.changed() => {
                 if changed.is_ok() {
+                    conn.live_overflowed = true;
+                    conn.close_for_live_overflow();
                     break;
                 }
             }
@@ -999,6 +1014,7 @@ pub async fn handle_connection(
                         for (event, json) in batch.iter() {
                             conn.deliver_live_at(event, json, groups, now);
                             if conn.live_overflowed {
+                                conn.close_for_live_overflow();
                                 break 'connection;
                             }
                         }
@@ -4498,10 +4514,22 @@ mod tests {
             let event = signed_note(conn.relay.secp(), "overflow", unix_now(), vec![]);
             let json = serde_json::to_string(&event).unwrap();
             conn.deliver_live(&event, &json, None);
+            conn.close_for_live_overflow();
 
             assert!(
                 conn.live_overflowed,
                 "pending live overflow must close the connection"
+            );
+            assert!(
+                outgoing_json(&conn).iter().any(|message| {
+                    message[0] == "CLOSED"
+                        && message[1] == "sub"
+                        && message[2]
+                            .as_str()
+                            .unwrap_or("")
+                            .contains("reconnect and resubscribe")
+                }),
+                "overflow must tell the client to reconnect and resubscribe"
             );
             conn.relay.db.shutdown();
         });
