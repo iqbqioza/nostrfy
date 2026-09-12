@@ -441,6 +441,7 @@ fn legacy_npub_of(pubkey: &str) -> String {
 
 struct LocalStore {
     root: PathBuf,
+    root_dir: std::fs::File,
     /// The resolved root: every operation's parent directory is
     /// canonicalized and must resolve under this path, so a symlinked
     /// npub directory can never redirect reads, writes or deletes
@@ -455,15 +456,40 @@ impl LocalStore {
     async fn new(root: &Path, min_free_bytes: u64) -> Result<LocalStore> {
         tokio::fs::create_dir_all(root).await?;
         let canonical_root = tokio::fs::canonicalize(root).await?;
+        let root_dir = {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+                .open(&canonical_root)?
+        };
         Ok(LocalStore {
             root: root.to_path_buf(),
+            root_dir,
             canonical_root,
             min_free_bytes,
         })
     }
 
+    #[cfg(test)]
     fn blob_path(&self, npub: &str, sha256: &str) -> PathBuf {
         self.root.join(npub).join(sha256)
+    }
+
+    fn rooted_path(&self, npub: &str, name: &str) -> PathBuf {
+        #[cfg(target_os = "linux")]
+        let fd_root = "/proc/self/fd";
+        #[cfg(not(target_os = "linux"))]
+        let fd_root = "/dev/fd";
+        PathBuf::from(format!(
+            "{fd_root}/{}/{}",
+            std::os::fd::AsRawFd::as_raw_fd(&self.root_dir),
+            Path::new(npub).join(name).display()
+        ))
+    }
+
+    fn npub_dir_path(&self, npub: &str) -> PathBuf {
+        self.rooted_path(npub, "")
     }
 
     /// Whether the blob's parent directory is a real directory inside the
@@ -540,7 +566,7 @@ impl LocalStore {
         // race can surface as a spurious failure — and O_NOFOLLOW keeps a
         // planted symlink from redirecting the write (or truncating an
         // external file through the link).
-        let tmp_path = dir.join(format!(".{sha256}.tmp"));
+        let tmp_path = self.rooted_path(npub, &format!(".{sha256}.tmp"));
         let write = {
             use tokio::io::AsyncWriteExt;
             let mut tmp = tokio::fs::OpenOptions::new()
@@ -562,7 +588,7 @@ impl LocalStore {
             let _ = tokio::fs::remove_file(&tmp_path).await;
             return Err(e.into());
         }
-        if let Err(e) = tokio::fs::rename(&tmp_path, self.blob_path(npub, sha256)).await {
+        if let Err(e) = tokio::fs::rename(&tmp_path, self.rooted_path(npub, sha256)).await {
             let _ = tokio::fs::remove_file(&tmp_path).await;
             return Err(e.into());
         }
@@ -571,12 +597,12 @@ impl LocalStore {
 
     async fn put_file(&self, npub: &str, sha256: &str, source: &Path) -> Result<()> {
         use tokio::io::AsyncWriteExt;
-        let dir = self.root.join(npub);
+        let dir = self.npub_dir_path(npub);
         tokio::fs::create_dir_all(&dir).await?;
         if !self.parent_within_root(npub).await {
             return Err(anyhow!("blossom storage directory is a symlink"));
         }
-        let tmp_path = dir.join(format!(".{sha256}.tmp"));
+        let tmp_path = self.rooted_path(npub, &format!(".{sha256}.tmp"));
         let mut input = tokio::fs::File::open(source).await?;
         let mut output = tokio::fs::OpenOptions::new()
             .write(true)
@@ -595,7 +621,7 @@ impl LocalStore {
             return Err(e.into());
         }
         drop(output);
-        if let Err(e) = tokio::fs::rename(&tmp_path, self.blob_path(npub, sha256)).await {
+        if let Err(e) = tokio::fs::rename(&tmp_path, self.rooted_path(npub, sha256)).await {
             let _ = tokio::fs::remove_file(&tmp_path).await;
             return Err(e.into());
         }
@@ -616,12 +642,19 @@ impl LocalStore {
         // outside the root; a symlinked blob file would be followed by a
         // plain open. Both are refused (the blob reads as missing).
         if !self.parent_within_root(npub).await {
+            let dir = self.root.join(npub);
+            if let Ok(meta) = tokio::fs::symlink_metadata(&dir).await
+                && !meta.file_type().is_symlink()
+                && !meta.is_dir()
+            {
+                return Err(anyhow!("blossom storage directory is not a directory"));
+            }
             return Ok(None);
         }
         let mut file = match tokio::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW)
-            .open(self.blob_path(npub, sha256))
+            .open(self.rooted_path(npub, sha256))
             .await
         {
             Ok(f) => f,
@@ -647,14 +680,14 @@ impl LocalStore {
         // (A symlinked blob file itself is safe to remove — only the link
         // is deleted.)
         if !self.parent_within_root(npub).await {
-            let dir = self.root.join(npub);
+            let dir = self.npub_dir_path(npub);
             return match tokio::fs::symlink_metadata(&dir).await {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
                 Ok(_) => Err(anyhow!("blossom storage directory is unsafe")),
                 Err(e) => Err(e.into()),
             };
         }
-        let path = self.blob_path(npub, sha256);
+        let path = self.rooted_path(npub, sha256);
         match tokio::fs::remove_file(&path).await {
             Ok(()) => Ok(true),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -1166,8 +1199,17 @@ mod tests {
             );
             // The disabled guard (0) lets the upload through.
             let sha2 = "ef".repeat(32);
+            let disabled = crate::server::blossom::storage::BlobStore::new(
+                "local",
+                &dir,
+                0,
+                None,
+                s.db.clone(),
+            )
+            .await
+            .unwrap();
             assert!(
-                s.put(&a, &sha2, b"y", "text/plain").await.is_ok(),
+                disabled.put(&a, &sha2, b"y", "text/plain").await.is_ok(),
                 "min_free_bytes = 0 must disable the guard"
             );
             s.db.shutdown();
