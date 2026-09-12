@@ -192,6 +192,19 @@ fn enqueue_live_batch(queue: &LiveQueue, batch: crate::ws::LiveBatch) {
     }
 }
 
+/// Forces every subscribed connection to resynchronize after a live-bus
+/// panic. The batch may have been persisted already and may have been
+/// delivered to only some queues, so closing only affected queues cannot
+/// establish a safe delivery boundary.
+fn signal_live_resync(
+    conn_queues: &std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u64, LiveQueue>>>,
+) {
+    let queues = conn_queues.lock().unwrap_or_else(|p| p.into_inner());
+    for queue in queues.values() {
+        let _ = queue.overflow.send(());
+    }
+}
+
 /// Bounds the number of concurrently served `/api/v1` queries. Implemented
 /// with a cheap atomic counter instead of a `tokio::sync::Semaphore` so the
 /// limit can be changed at runtime (SIGHUP config reload) without
@@ -464,22 +477,38 @@ impl Relay {
                                     std::panic::AssertUnwindSafe(|| flush(&mut batch)),
                                 );
                                 if r.is_err() {
-                                    log::error!("live bus recovered from a panic");
+                                    log::error!(
+                                        "live bus recovered from a panic; forcing all subscribers to resynchronize"
+                                    );
+                                    signal_live_resync(&conn_queues);
                                     batch.clear();
                                 }
                             }
                         }
                         None => {
-                            let _ = std::panic::catch_unwind(
+                            let r = std::panic::catch_unwind(
                                 std::panic::AssertUnwindSafe(|| flush(&mut batch)),
                             );
+                            if r.is_err() {
+                                log::error!(
+                                    "live bus recovered from a panic; forcing all subscribers to resynchronize"
+                                );
+                                signal_live_resync(&conn_queues);
+                            }
                             return;
                         }
                     },
                     _ = interval.tick() => {
-                        let _ = std::panic::catch_unwind(
+                        let r = std::panic::catch_unwind(
                             std::panic::AssertUnwindSafe(|| flush(&mut batch)),
                         );
+                        if r.is_err() {
+                            log::error!(
+                                "live bus recovered from a panic; forcing all subscribers to resynchronize"
+                            );
+                            signal_live_resync(&conn_queues);
+                            batch.clear();
+                        }
                     }
                 }
             }
@@ -1367,6 +1396,7 @@ mod tests {
     use super::Relay;
     use super::StampClock;
     use super::enqueue_live_batch;
+    use super::signal_live_resync;
     use super::validate::contains_secret_key;
 
     /// Builds a relay with an empty database.
@@ -1434,6 +1464,30 @@ mod tests {
             "a full queue must signal the connection to close"
         );
         assert_eq!(receiver.len(), crate::relay::LIVE_QUEUE_CAPACITY);
+    }
+
+    #[tokio::test]
+    async fn live_bus_panic_signals_every_subscriber_to_resync() {
+        let queues = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let mut receivers = Vec::new();
+        for id in 0..2 {
+            let (sender, _receiver) = tokio::sync::mpsc::channel(crate::relay::LIVE_QUEUE_CAPACITY);
+            let (overflow, overflow_rx) = tokio::sync::watch::channel(());
+            queues
+                .lock()
+                .unwrap()
+                .insert(id, LiveQueue { sender, overflow });
+            receivers.push(overflow_rx);
+        }
+
+        signal_live_resync(&queues);
+
+        assert!(
+            receivers
+                .iter()
+                .all(|receiver| receiver.has_changed().unwrap()),
+            "every subscriber must be told to resynchronize"
+        );
     }
 
     #[tokio::test]
