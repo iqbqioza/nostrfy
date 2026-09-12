@@ -18,7 +18,7 @@ use crate::event::Event;
 pub(crate) struct SubscriptionIndex {
     kinds: HashMap<u64, HashSet<u64>>,
     authors: HashMap<[u8; 32], HashSet<u64>>,
-    tags: HashMap<(String, String), HashSet<u64>>,
+    tags: HashMap<String, HashMap<String, HashSet<u64>>>,
     /// Connections with at least one `{}`-style filter (match anything).
     all: HashSet<u64>,
 }
@@ -113,7 +113,12 @@ impl SubscriptionIndex {
                         self.authors.entry(*author).or_default().insert(conn);
                     }
                     for tag in tags {
-                        self.tags.entry(tag.clone()).or_default().insert(conn);
+                        self.tags
+                            .entry(tag.0.clone())
+                            .or_default()
+                            .entry(tag.1.clone())
+                            .or_default()
+                            .insert(conn);
                     }
                 }
             }
@@ -131,17 +136,19 @@ impl SubscriptionIndex {
             set.remove(&conn);
             !set.is_empty()
         });
-        self.tags.retain(|_, set| {
-            set.remove(&conn);
-            !set.is_empty()
+        self.tags.retain(|_, values| {
+            values.retain(|_, set| {
+                set.remove(&conn);
+                !set.is_empty()
+            });
+            !values.is_empty()
         });
     }
 
-    /// The candidate connections for an event (the union of the index
-    /// entries its components hit). The per-connection filter match is
-    /// the final check.
-    pub(crate) fn candidates(&self, event: &Event) -> HashSet<u64> {
-        let mut out: HashSet<u64> = self.all.clone();
+    /// Adds the candidate connections for an event to `out`. The
+    /// per-connection filter match is the final check.
+    pub(crate) fn extend_candidates(&self, event: &Event, out: &mut HashSet<u64>) {
+        out.extend(self.all.iter().copied());
         if let Some(set) = self.kinds.get(&event.kind) {
             out.extend(set.iter().copied());
         }
@@ -177,11 +184,21 @@ impl SubscriptionIndex {
         for tag in &event.tags {
             if tag.len() >= 2
                 && !tag[0].is_empty()
-                && let Some(set) = self.tags.get(&(tag[0].clone(), tag[1].clone()))
+                && let Some(values) = self.tags.get(tag[0].as_str())
+                && let Some(set) = values.get(tag[1].as_str())
             {
                 out.extend(set.iter().copied());
             }
         }
+    }
+
+    /// The candidate connections for an event (the union of the index
+    /// entries its components hit). The per-connection filter match is
+    /// the final check.
+    #[cfg(test)]
+    pub(crate) fn candidates(&self, event: &Event) -> HashSet<u64> {
+        let mut out = HashSet::new();
+        self.extend_candidates(event, &mut out);
         out
     }
 }
