@@ -253,8 +253,7 @@ impl Cli {
             }
         };
         print_line(&format!("stopping nostrfy (pid {pid})"));
-        // SAFETY: `kill` only touches the targeted process id.
-        let ret = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+        let ret = signal_process(pid, libc::SIGTERM);
         if ret != 0 {
             return Err(anyhow!(format!(
                 "cannot signal pid {pid}: {}",
@@ -339,7 +338,7 @@ impl Cli {
         // Reload the running daemon so the new list applies immediately.
         match running_pid(&cfg.daemon.pid_file) {
             Some(pid) => {
-                let ret = unsafe { libc::kill(pid as i32, libc::SIGHUP) };
+                let ret = signal_process(pid, libc::SIGHUP);
                 if ret == 0 {
                     print_line(&format!("the running daemon (pid {pid}) was reloaded"));
                 } else {
@@ -444,7 +443,7 @@ impl Cli {
         // Reload the running daemon so the new lists apply immediately.
         match running_pid(&cfg.daemon.pid_file) {
             Some(pid) => {
-                let ret = unsafe { libc::kill(pid as i32, libc::SIGHUP) };
+                let ret = signal_process(pid, libc::SIGHUP);
                 if ret == 0 {
                     print_line(&format!("the running daemon (pid {pid}) was reloaded"));
                 } else {
@@ -883,6 +882,36 @@ fn running_pid(pid_file: &Path) -> Option<u32> {
         return None;
     }
     if process_alive(pid) { Some(pid) } else { None }
+}
+
+#[cfg(target_os = "linux")]
+fn signal_process(pid: u32, signal: libc::c_int) -> libc::c_int {
+    // A pidfd remains attached to the process opened here, so PID reuse
+    // cannot redirect the signal after the pid-file check.
+    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    if pidfd < 0 {
+        return -1;
+    }
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            pidfd,
+            signal,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        ) as libc::c_int
+    };
+    unsafe {
+        libc::close(pidfd as libc::c_int);
+    }
+    result
+}
+
+#[cfg(not(target_os = "linux"))]
+fn signal_process(pid: u32, signal: libc::c_int) -> libc::c_int {
+    // pidfd is Linux-specific; retain the existing Unix signal mechanism on
+    // platforms without it.
+    unsafe { libc::kill(pid as i32, signal) }
 }
 
 /// Opens the relay database environment for a short-lived CLI access
