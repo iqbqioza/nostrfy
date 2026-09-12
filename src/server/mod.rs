@@ -1171,9 +1171,6 @@ async fn reload_handler(
                             error!("config reload rejected: {e}");
                             continue;
                         }
-                        db.set_expiry_enabled(new_config.nip_enabled(40));
-                        api_limit.set_max(new_config.limits.max_api_concurrent);
-                        db.set_max_api_pending(new_config.limits.max_api_queue_msgs);
                         // The relay's signing key is fixed at startup: a
                         // reloaded private_key is not applied (NIP-29/NIP-43
                         // keep signing and NIP-11 `self` keeps advertising
@@ -1366,6 +1363,8 @@ async fn reload_handler(
                                 old.daemon.pid_file != new_config.daemon.pid_file,
                             ),
                         ];
+                        let restart_required = old.relay.private_key != new_config.relay.private_key
+                            || static_routes.iter().any(|(_, changed)| *changed);
                         for (name, changed) in static_routes {
                             if changed {
                                 warn!(
@@ -1374,6 +1373,16 @@ async fn reload_handler(
                                 );
                             }
                         }
+                        if restart_required {
+                            error!(
+                                "configuration reload rejected because startup-only settings \
+                                 changed; restart is required to apply them"
+                            );
+                            continue;
+                        }
+                        db.set_expiry_enabled(new_config.nip_enabled(40));
+                        api_limit.set_max(new_config.limits.max_api_concurrent);
+                        db.set_max_api_pending(new_config.limits.max_api_queue_msgs);
                         // The kind/IP access lists are runtime-managed via NIP-86
                         // and persisted in the database: editing them in the
                         // config file has no effect after the first run (the
