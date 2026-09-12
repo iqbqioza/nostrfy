@@ -692,11 +692,18 @@ pub async fn handle_connection(
         tokio::sync::mpsc::Sender<crate::ws::LiveBatch>,
         tokio::sync::mpsc::Receiver<crate::ws::LiveBatch>,
     ) = tokio::sync::mpsc::channel(crate::relay::LIVE_QUEUE_CAPACITY);
+    let (overflow_tx, mut overflow_rx) = tokio::sync::watch::channel(());
     relay
         .conn_queues
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .insert(conn_id, live_tx);
+        .insert(
+            conn_id,
+            crate::relay::LiveQueue {
+                sender: live_tx,
+                overflow: overflow_tx,
+            },
+        );
     let mut conn = Conn {
         relay,
         conn_id,
@@ -938,6 +945,11 @@ pub async fn handle_connection(
                 // read-only subscriber (no inbound frames) is dropped too.
                 // An `Err` means the relay (and its sender) is gone.
                 if changed.is_err() || conn.source_ip_blocked(peer_ip).await {
+                    break;
+                }
+            }
+            changed = overflow_rx.changed() => {
+                if changed.is_ok() {
                     break;
                 }
             }
@@ -1208,11 +1220,18 @@ mod tests {
             .next_conn_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let (live_tx, live_rx) = tokio::sync::mpsc::channel(crate::relay::LIVE_QUEUE_CAPACITY);
+        let (overflow_tx, _overflow_rx) = tokio::sync::watch::channel(());
         relay
             .conn_queues
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .insert(conn_id, live_tx);
+            .insert(
+                conn_id,
+                crate::relay::LiveQueue {
+                    sender: live_tx,
+                    overflow: overflow_tx,
+                },
+            );
         Conn {
             relay,
             conn_id,
