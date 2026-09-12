@@ -734,10 +734,18 @@ impl Config {
     pub fn load(path: &Path) -> Result<Config> {
         let raw = std::fs::read_to_string(path)
             .map_err(|e| config_err(format!("cannot read {}: {e}", path.display())))?;
-        let cfg: Config = toml::from_str(&raw)
+        let mut cfg: Config = toml::from_str(&raw)
             .map_err(|e| config_err(format!("invalid {}: {e}", path.display())))?;
+        cfg.normalize_identity_keys();
         warn_unknown_fields(&raw);
         Ok(cfg)
+    }
+
+    /// Canonicalizes configured public keys at the configuration boundary.
+    /// Runtime authorization then compares one canonical representation.
+    pub fn normalize_identity_keys(&mut self) {
+        self.relay.pubkey = self.relay.pubkey.trim().to_ascii_lowercase();
+        self.rpc.admin_pubkey = self.rpc.admin_pubkey.trim().to_ascii_lowercase();
     }
 
     pub fn write_default(path: &Path) -> Result<()> {
@@ -2880,5 +2888,17 @@ max_log_files = 2
             );
         }
         assert_eq!(toml_escape("quote\\backslash"), "quote\\\\backslash");
+    }
+
+    #[test]
+    fn identity_keys_are_canonicalized() {
+        let mut cfg = Config::default();
+        cfg.relay.pubkey = format!("  {}  ", "AB".repeat(32));
+        cfg.rpc.admin_pubkey = "CD".repeat(32);
+
+        cfg.normalize_identity_keys();
+
+        assert_eq!(cfg.relay.pubkey, "ab".repeat(32));
+        assert_eq!(cfg.rpc.admin_pubkey, "cd".repeat(32));
     }
 }

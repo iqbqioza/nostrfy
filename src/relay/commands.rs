@@ -132,7 +132,7 @@ impl Relay {
         }
         // Only the admin (`relay.pubkey`) can issue commands: the author
         // check runs on the event's verified signature.
-        if !admin.eq_ignore_ascii_case(&event.pubkey) {
+        if admin != event.pubkey {
             return;
         }
         let Some(outcome) = parse(&event.content) else {
