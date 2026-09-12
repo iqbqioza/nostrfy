@@ -773,16 +773,11 @@ impl Relay {
 
         match outcome {
             PutOutcome::Stored | PutOutcome::Replaced | PutOutcome::Ephemeral => {
-                if self.after_put(event, now, nip9, nip43, nip29_enabled).await {
-                    self.stats.bump(&self.stats.events_accepted, 1);
-                    (outcome, None)
-                } else {
-                    self.stats.bump(&self.stats.events_rejected, 1);
-                    (
-                        PutOutcome::Invalid("error: live delivery unavailable".into()),
-                        None,
-                    )
+                if !self.after_put(event, now, nip9, nip43, nip29_enabled).await {
+                    log::error!("event persisted but live delivery failed");
                 }
+                self.stats.bump(&self.stats.events_accepted, 1);
+                (outcome, None)
             }
             PutOutcome::Duplicate(_) => {
                 self.stats.bump(&self.stats.events_duplicate, 1);
@@ -1300,7 +1295,7 @@ impl PendingBatch {
             new_pubkeys
         };
         let mut persist_first_seen: Vec<[u8; 32]> = Vec::new();
-        for (((event, mut outcome), slot), is_new) in puts
+        for (((event, outcome), slot), is_new) in puts
             .into_iter()
             .zip(outcomes)
             .zip(put_slots)
@@ -1310,15 +1305,13 @@ impl PendingBatch {
             let first_seen_pubkey = if is_new { event.pubkey_bytes() } else { None };
             match outcome {
                 PutOutcome::Stored | PutOutcome::Replaced | PutOutcome::Ephemeral => {
-                    if relay.after_put(event, now, nip9, nip43, nip29).await {
-                        if let Some(pk) = first_seen_pubkey {
-                            persist_first_seen.push(pk);
-                        }
-                        relay.stats.bump(&relay.stats.events_accepted, 1);
-                    } else {
-                        relay.stats.bump(&relay.stats.events_rejected, 1);
-                        outcome = PutOutcome::Invalid("error: live delivery unavailable".into());
+                    if !relay.after_put(event, now, nip9, nip43, nip29).await {
+                        log::error!("event persisted but live delivery failed");
                     }
+                    if let Some(pk) = first_seen_pubkey {
+                        persist_first_seen.push(pk);
+                    }
+                    relay.stats.bump(&relay.stats.events_accepted, 1);
                 }
                 PutOutcome::Duplicate(_) => {
                     relay.stats.bump(&relay.stats.events_duplicate, 1);
@@ -1445,6 +1438,46 @@ mod tests {
             sig: String::new(),
         };
         assert!(relay.broadcast(event).await.is_err());
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn persisted_event_stays_accepted_when_live_bus_stops() {
+        let mut relay = match std::sync::Arc::try_unwrap(build_relay().await) {
+            Ok(relay) => relay,
+            Err(_) => panic!("test relay must have a single owner"),
+        };
+        let secp = secp256k1::Secp256k1::new();
+        let keypair = secp256k1::Keypair::from_seckey_slice(&secp, &[9u8; 32]).unwrap();
+        let pubkey = secp256k1::XOnlyPublicKey::from_keypair(&keypair)
+            .0
+            .to_string();
+        let mut event = crate::event::Event {
+            id: String::new(),
+            pubkey,
+            created_at: crate::util::unix_now(),
+            kind: 1,
+            tags: vec![],
+            content: "persisted".into(),
+            sig: String::new(),
+        };
+        event.id = crate::nips::nip01::compute_id(&event);
+        event.sig = secp
+            .sign_schnorr_no_aux_rand(&event.id_bytes().unwrap(), &keypair)
+            .to_string();
+        relay.live_rx.take();
+
+        let (outcome, _) = relay.accept_event(event.clone(), &[], None).await;
+        assert_eq!(outcome, crate::db::PutOutcome::Stored);
+        let (events, _) = relay
+            .db
+            .query(
+                vec![serde_json::from_value(serde_json::json!({ "ids": [event.id] })).unwrap()],
+                1,
+                crate::util::unix_now(),
+            )
+            .await;
+        assert_eq!(events.len(), 1, "the accepted event must remain queryable");
         relay.db.shutdown();
     }
 
