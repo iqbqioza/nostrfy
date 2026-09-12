@@ -9,6 +9,7 @@
 //! `bucket/{npub1xxx}/{file}`; the multi-owner mapping lets every uploader
 //! of identical content manage their own copy independently.
 
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 use crate::db::DbClient;
@@ -54,9 +55,12 @@ type LegacyEntry = (String, String, u64, i64, String);
 pub(crate) struct BlobStore {
     storage: Storage,
     db: DbClient,
+    upload_locks: Vec<tokio::sync::Mutex<()>>,
 }
 
 impl BlobStore {
+    const UPLOAD_LOCK_COUNT: usize = 256;
+
     pub(crate) async fn new(
         storage: &str,
         local_path: &Path,
@@ -75,7 +79,21 @@ impl BlobStore {
                 )));
             }
         };
-        Ok(BlobStore { storage, db })
+        Ok(BlobStore {
+            storage,
+            db,
+            upload_locks: (0..Self::UPLOAD_LOCK_COUNT)
+                .map(|_| tokio::sync::Mutex::new(()))
+                .collect(),
+        })
+    }
+
+    async fn upload_lock(&self, pubkey: &str, sha256: &str) -> tokio::sync::MutexGuard<'_, ()> {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        pubkey.hash(&mut hasher);
+        sha256.hash(&mut hasher);
+        let index = (hasher.finish() as usize) % self.upload_locks.len();
+        self.upload_locks[index].lock().await
     }
 
     /// Whether the storage backend currently accepts uploads (the
@@ -102,6 +120,7 @@ impl BlobStore {
         // leftovers, but only the bytes that will actually land should be
         // committed).
         self.check_space()?;
+        let _upload_guard = self.upload_lock(pubkey, sha256).await;
         let uploaded = crate::util::unix_now() as i64;
         // Whether the uploader already owned the blob BEFORE this upload
         // (read before the add: a failed re-upload of identical bytes must
@@ -133,13 +152,6 @@ impl BlobStore {
             // created the mapping (a failed re-upload keeps the
             // pre-existing valid mapping).
             //
-            // Known race (accepted, astronomically rare): two concurrent
-            // FIRST uploads of the same bytes by the same owner both read
-            // `was_owner = false`; if exactly one storage write then
-            // fails, its rollback removes the owner mapping the other
-            // upload just committed (the stored blob stays unmapped until
-            // a re-upload). The add/remove are separate LMDB transactions,
-            // so the read-check-act is not atomic.
             if !was_owner {
                 self.db.blossom_remove_owner(sha256, pubkey).await;
             }
@@ -166,6 +178,7 @@ impl BlobStore {
         mime: &str,
     ) -> Result<Descriptor> {
         self.check_space()?;
+        let _upload_guard = self.upload_lock(pubkey, sha256).await;
         let uploaded = crate::util::unix_now() as i64;
         let was_owner = self
             .db
