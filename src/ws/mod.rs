@@ -2457,7 +2457,7 @@ mod tests {
             assert!(conn.live.is_some(), "REQ must subscribe to live events");
 
             let ev = signed_kind_note_seeded(relay.secp(), 2, 30078, "live-app", now, vec![]);
-            relay.broadcast(ev.clone()).await;
+            assert!(relay.broadcast(ev.clone()).await.is_ok());
             let received = tokio::time::timeout(
                 std::time::Duration::from_secs(2),
                 conn.live.as_mut().unwrap().recv(),
@@ -2489,7 +2489,7 @@ mod tests {
             // event: pulling it through the pump mirrors the connection loop
             // and leaves the subscription in its EOSE-sent state.
             owner.pump_pending_reqs();
-            relay.broadcast(ev.clone()).await;
+            assert!(relay.broadcast(ev.clone()).await.is_ok());
             let received = tokio::time::timeout(
                 std::time::Duration::from_secs(2),
                 owner.live.as_mut().unwrap().recv(),
@@ -3097,7 +3097,7 @@ mod tests {
             let mut ev = signed_note(conn_a.relay.secp(), "candidate-check", now, vec![]);
             ev.kind = 30001;
             ev.id = crate::nips::nip01::compute_id(&ev);
-            conn_a.relay.broadcast(ev.clone()).await;
+            assert!(conn_a.relay.broadcast(ev.clone()).await.is_ok());
             let received_a = tokio::time::timeout(
                 std::time::Duration::from_secs(2),
                 conn_a.live.as_mut().unwrap().recv(),
@@ -3165,7 +3165,7 @@ mod tests {
             ev.kind = 30001;
             ev.id = crate::nips::nip01::compute_id(&ev);
             // The relay broadcast path: queue, bus task, receiver, deliver.
-            conn.relay.broadcast(ev.clone()).await;
+            assert!(conn.relay.broadcast(ev.clone()).await.is_ok());
             let received = tokio::time::timeout(
                 std::time::Duration::from_secs(2),
                 conn.live.as_mut().unwrap().recv(),
@@ -5002,7 +5002,7 @@ mod tests {
                 "live receiver survives a CLOSE + REQ cycle"
             );
             let ev = signed_note(conn.relay.secp(), "resubscribed", now, vec![]);
-            conn.relay.broadcast(ev).await;
+            assert!(conn.relay.broadcast(ev).await.is_ok());
             let received = tokio::time::timeout(
                 std::time::Duration::from_secs(2),
                 conn.live.as_mut().unwrap().recv(),

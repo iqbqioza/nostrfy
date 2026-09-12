@@ -485,12 +485,14 @@ impl Relay {
     /// the bounded live buffer is propagated to the accepting task so an
     /// accepted event is never silently lost before fan-out. The JSON is
     /// encoded once here — every subscriber shares the same serialization.
-    pub async fn broadcast(&self, event: Event) {
+    pub async fn broadcast(&self, event: Event) -> Result<(), ()> {
         let json = Arc::new(serde_json::to_string(&event).unwrap_or_default());
         if self.live_tx.send((event, json)).await.is_err() {
             log::error!("live bus stopped before an accepted event could be broadcast");
             self.stats.bump(&self.stats.db_errors, 1);
+            return Err(());
         }
+        Ok(())
     }
 
     /// Whether `pubkey` may publish another event under
@@ -771,9 +773,16 @@ impl Relay {
 
         match outcome {
             PutOutcome::Stored | PutOutcome::Replaced | PutOutcome::Ephemeral => {
-                self.stats.bump(&self.stats.events_accepted, 1);
-                self.after_put(event, now, nip9, nip43, nip29_enabled).await;
-                (outcome, None)
+                if self.after_put(event, now, nip9, nip43, nip29_enabled).await {
+                    self.stats.bump(&self.stats.events_accepted, 1);
+                    (outcome, None)
+                } else {
+                    self.stats.bump(&self.stats.events_rejected, 1);
+                    (
+                        PutOutcome::Invalid("error: live delivery unavailable".into()),
+                        None,
+                    )
+                }
             }
             PutOutcome::Duplicate(_) => {
                 self.stats.bump(&self.stats.events_duplicate, 1);
@@ -1036,7 +1045,7 @@ impl Relay {
         nip9: bool,
         nip43: bool,
         nip29_enabled: bool,
-    ) {
+    ) -> bool {
         if nip9 && event.kind == nip09::DELETION_KIND {
             let removed = self
                 .db
@@ -1075,7 +1084,7 @@ impl Relay {
         if event.kind == 1 {
             self.handle_command_event(&event).await;
         }
-        self.broadcast(event).await;
+        self.broadcast(event).await.is_ok()
     }
 
     /// Persists the live NIP-29 group state (write-through: call after
@@ -1291,20 +1300,25 @@ impl PendingBatch {
             new_pubkeys
         };
         let mut persist_first_seen: Vec<[u8; 32]> = Vec::new();
-        for (((event, outcome), slot), is_new) in puts
+        for (((event, mut outcome), slot), is_new) in puts
             .into_iter()
             .zip(outcomes)
             .zip(put_slots)
             .zip(is_new_vec)
         {
             let id = event.id.clone();
+            let first_seen_pubkey = if is_new { event.pubkey_bytes() } else { None };
             match outcome {
                 PutOutcome::Stored | PutOutcome::Replaced | PutOutcome::Ephemeral => {
-                    relay.stats.bump(&relay.stats.events_accepted, 1);
-                    if is_new && let Some(pk) = event.pubkey_bytes() {
-                        persist_first_seen.push(pk);
+                    if relay.after_put(event, now, nip9, nip43, nip29).await {
+                        if let Some(pk) = first_seen_pubkey {
+                            persist_first_seen.push(pk);
+                        }
+                        relay.stats.bump(&relay.stats.events_accepted, 1);
+                    } else {
+                        relay.stats.bump(&relay.stats.events_rejected, 1);
+                        outcome = PutOutcome::Invalid("error: live delivery unavailable".into());
                     }
-                    relay.after_put(event, now, nip9, nip43, nip29).await;
                 }
                 PutOutcome::Duplicate(_) => {
                     relay.stats.bump(&relay.stats.events_duplicate, 1);
@@ -1411,6 +1425,27 @@ mod tests {
             "a full queue must signal the connection to close"
         );
         assert_eq!(receiver.len(), crate::relay::LIVE_QUEUE_CAPACITY);
+    }
+
+    #[tokio::test]
+    async fn broadcast_reports_stopped_live_bus() {
+        let mut relay = match std::sync::Arc::try_unwrap(build_relay().await) {
+            Ok(relay) => relay,
+            Err(_) => panic!("test relay must have a single owner"),
+        };
+        relay.live_rx.take();
+
+        let event = crate::event::Event {
+            id: String::new(),
+            pubkey: String::new(),
+            created_at: 0,
+            kind: 1,
+            tags: Vec::new(),
+            content: String::new(),
+            sig: String::new(),
+        };
+        assert!(relay.broadcast(event).await.is_err());
+        relay.db.shutdown();
     }
 
     /// Builds a relay with NIP-43 enabled and an optional relay key.
