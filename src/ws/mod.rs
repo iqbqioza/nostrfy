@@ -976,8 +976,9 @@ pub async fn handle_connection(
                             None
                         };
                         let groups = guard.as_deref();
+                        let now = crate::util::unix_now();
                         for (event, json) in batch.iter() {
-                            conn.deliver_live(event, json, groups);
+                            conn.deliver_live_at(event, json, groups, now);
                         }
                     }
                     None => break,

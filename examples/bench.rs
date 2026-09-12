@@ -182,12 +182,6 @@ async fn fanout(url: &str, subscribers: usize, publishes: usize) {
                 }
             }
         });
-        // Pace the connections under the relay's per-IP connection rate
-        // limit (default 10/s): a faster connect burst would be refused
-        // (the limit is a fixed 1-second window, so stay well below it).
-        // The subscriber count itself must stay under
-        // `limits.max_connections_per_ip` (default 64).
-        tokio::time::sleep(Duration::from_millis(250)).await;
     }
     let (mut pub_sink, mut pub_stream) = connect(url).await.split();
     // The relay sends an AUTH challenge first; confirm the connection is

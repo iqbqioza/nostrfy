@@ -950,11 +950,25 @@ impl super::Conn {
     /// caller skips the lock otherwise); `expiry_enabled` is a per-connection
     /// cache refreshed whenever a message arrives, so the hot live path does
     /// not acquire the shared config lock once per batch per connection.
+    #[cfg(test)]
     pub(crate) fn deliver_live(
         &mut self,
         event: &Event,
         event_json: &str,
         groups: Option<&nip29::GroupStore>,
+    ) {
+        self.deliver_live_at(event, event_json, groups, unix_now());
+    }
+
+    /// Delivers a live event using a timestamp shared by its live batch.
+    /// Expiration checks only need second precision, so querying the clock
+    /// once per batch avoids repeated system calls at high event rates.
+    pub(crate) fn deliver_live_at(
+        &mut self,
+        event: &Event,
+        event_json: &str,
+        groups: Option<&nip29::GroupStore>,
+        now: u64,
     ) {
         // Fast path: most connections have no subscriptions.
         if self.subs.is_empty() {
@@ -993,7 +1007,7 @@ impl super::Conn {
         if self.expiry_enabled
             && !(20000..30000).contains(&event.kind)
             && let Some(exp) = nip40::expiry(event)
-            && exp < unix_now()
+            && exp < now
         {
             return;
         }
