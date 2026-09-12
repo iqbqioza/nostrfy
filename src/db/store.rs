@@ -1270,7 +1270,17 @@ impl Store {
         let Some(raw) = self.events.get(wtxn, id)? else {
             return Ok(());
         };
-        let event: Event = serde_json::from_slice(raw)?;
+        let event: Event = match serde_json::from_slice(raw) {
+            Ok(event) => event,
+            Err(error) => {
+                log::error!(
+                    "removing corrupt event {} and its index entries: {error}",
+                    hex::encode(id)
+                );
+                self.remove_corrupt_event(wtxn, id)?;
+                return Ok(());
+            }
+        };
         let Some(pubkey) = event.pubkey_bytes() else {
             return Ok(());
         };
@@ -1345,6 +1355,46 @@ impl Store {
                 }
             }
         }
+        Ok(())
+    }
+
+    fn remove_corrupt_event(&self, wtxn: &mut heed::RwTxn, id: &[u8]) -> Result<()> {
+        let databases = [
+            self.by_created,
+            self.by_pubkey,
+            self.by_kind,
+            self.by_tag,
+            self.replaceable,
+            self.expiry,
+        ];
+        for database in databases {
+            let keys: Vec<Vec<u8>> = database
+                .iter(wtxn)?
+                .filter_map(|entry| {
+                    let (key, value) = entry.ok()?;
+                    (key.ends_with(id) || value.ends_with(id)).then(|| key.to_vec())
+                })
+                .collect();
+            for key in keys {
+                database.delete(wtxn, &key)?;
+            }
+        }
+        if let Some(meta) = self.event_meta {
+            meta.delete(wtxn, id)?;
+        }
+        if let Some(by_word) = self.by_word {
+            let keys: Vec<Vec<u8>> = by_word
+                .iter(wtxn)?
+                .filter_map(|entry| {
+                    let (key, value) = entry.ok()?;
+                    (key.ends_with(id) || value.ends_with(id)).then(|| key.to_vec())
+                })
+                .collect();
+            for key in keys {
+                by_word.delete(wtxn, &key)?;
+            }
+        }
+        self.events.delete(wtxn, id)?;
         Ok(())
     }
     /// Records `now` as the first-seen time of `pubkey` when the pubkey is
