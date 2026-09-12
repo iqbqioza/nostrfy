@@ -158,6 +158,26 @@ fn expired_events_are_filtered() {
             .await;
         assert!(res.is_empty());
         assert_eq!(db.purge_expired(now).await, 1);
+
+        // Query filtering must use the earliest value when multiple
+        // expiration tags are present, matching storage and purge semantics.
+        let mut multi = event(1, "multiple expirations", now, vec![]);
+        multi.tags = vec![
+            vec!["expiration".into(), (now + 3600).to_string()],
+            vec!["expiration".into(), (now - 1).to_string()],
+        ];
+        db.set_expiry_enabled(false);
+        assert_eq!(db.put(multi.clone(), now).await, PutOutcome::Stored);
+        db.set_expiry_enabled(true);
+        let (res, _) = db
+            .query(
+                vec![serde_json::from_value(serde_json::json!({"ids": [multi.id]})).unwrap()],
+                500,
+                now,
+            )
+            .await;
+        assert!(res.is_empty());
+        assert_eq!(db.purge_expired(now).await, 1);
     });
 }
 
