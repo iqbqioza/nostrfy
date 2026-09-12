@@ -43,7 +43,6 @@ use api::{
     api_related_handler, api_relay_kinds_handler, api_relays_handler, api_stats_handler,
     api_top_authors_handler,
 };
-use axum::serve::ListenerExt;
 use livekit::{livekit_supported, livekit_token};
 
 /// Sets an integer socket option on a TCP stream.
@@ -425,39 +424,6 @@ pub async fn run_server(config_path: PathBuf, config: Config, db: DbClient) -> R
 
     let mut tasks = Vec::new();
 
-    let mgmt = {
-        let cfg = relay.config.read().await;
-        if cfg.rpc.management_port > 0 {
-            let mgmt_addr = (cfg.rpc.management_host.clone(), cfg.rpc.management_port);
-            let listener = bind_listener(&mgmt_addr, "management listening on http://").await?;
-            Some((mgmt_addr, listener))
-        } else {
-            None
-        }
-    };
-
-    if let Some((addr, listener)) = mgmt {
-        let max_admin_body = relay.config.read().await.rpc.max_admin_body_bytes;
-        let mgmt_app = nip86::router(relay.clone(), shutdown_tx.clone(), max_admin_body);
-        let rx = shutdown_rx.clone();
-        tasks.push(tokio::spawn(async move {
-            if let Err(e) = axum::serve(
-                listener.tap_io(|stream| {
-                    let _ = stream.set_nodelay(true);
-                }),
-                // The legacy admin routes enforce `blockip` too, which needs
-                // the peer address as `ConnectInfo`.
-                mgmt_app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-            )
-            .with_graceful_shutdown(await_shutdown(rx))
-            .await
-            {
-                error!("management server error: {e}");
-            }
-            info!("management server stopped ({addr:?})");
-        }));
-    }
-
     // Supervisor: a background task that exits before shutdown would
     // silently lose its function (expiry purge, stats, discovery, SIGHUP).
     // Today that is unreachable (DB helpers return defaults, never panic),
@@ -542,6 +508,7 @@ pub async fn run_server(config_path: PathBuf, config: Config, db: DbClient) -> R
     Ok(())
 }
 
+#[cfg(test)]
 async fn await_shutdown(mut rx: watch::Receiver<bool>) {
     while !*rx.borrow() {
         if rx.changed().await.is_err() {
@@ -1223,14 +1190,6 @@ async fn reload_handler(
                             ("server.port", old.server.port != new_config.server.port),
                             ("server.ws_paths", old.server.ws_paths != new_config.server.ws_paths),
                             (
-                                "rpc.management_port",
-                                old.rpc.management_port != new_config.rpc.management_port,
-                            ),
-                            (
-                                "rpc.management_host",
-                                old.rpc.management_host != new_config.rpc.management_host,
-                            ),
-                            (
                                 "server.metrics_enabled",
                                 old.server.metrics_enabled != new_config.server.metrics_enabled,
                             ),
@@ -1438,8 +1397,6 @@ async fn reload_handler(
                         new_config.server.port = old.server.port;
                         new_config.server.ws_paths = old.server.ws_paths.clone();
                         new_config.server.metrics_enabled = old.server.metrics_enabled;
-                        new_config.rpc.management_port = old.rpc.management_port;
-                        new_config.rpc.management_host = old.rpc.management_host.clone();
                         new_config.rpc.max_admin_body_bytes = old.rpc.max_admin_body_bytes;
                         new_config.relay.private_key = old.relay.private_key.clone();
                         new_config.relay.livekit_url = old.relay.livekit_url.clone();

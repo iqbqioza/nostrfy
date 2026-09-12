@@ -45,7 +45,6 @@ max_connections_per_ip = 8
 [rpc]
 # Management API (NIP-86) on its own port (must differ from
 # server.port) with a strong token; 0 disables the API entirely.
-management_port = 8081
 management_token = "change-me-to-a-long-random-string"
 
 [server]

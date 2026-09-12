@@ -244,7 +244,7 @@ enum Msg {
     BlossomRemoveOwner {
         sha256: String,
         pubkey: String,
-        reply: oneshot::Sender<bool>,
+        reply: oneshot::Sender<(bool, bool)>,
     },
     /// Lists the blob hashes uploaded by a pubkey (reverse index), capped
     /// at `limit` entries.
@@ -1177,8 +1177,9 @@ impl DbClient {
         .await
     }
 
-    /// Removes one owner from a Blossom blob's persisted metadata.
-    pub async fn blossom_remove_owner(&self, sha256: &str, pubkey: &str) -> bool {
+    /// Removes one owner and reports whether the database operation itself
+    /// completed successfully.
+    pub async fn blossom_remove_owner_checked(&self, sha256: &str, pubkey: &str) -> (bool, bool) {
         self.request_write(|reply| Msg::BlossomRemoveOwner {
             sha256: sha256.to_string(),
             pubkey: pubkey.to_string(),

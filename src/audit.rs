@@ -1,5 +1,5 @@
 //! Rate-limited audit log for the management operations (NIP-86 JSON-RPC
-//! and the legacy management endpoints).
+//! and the NIP-86 management API).
 //!
 //! Admin operations are rare, but a runaway admin script (or a bug) must
 //! not be able to flood the log: entries beyond the per-window budget are

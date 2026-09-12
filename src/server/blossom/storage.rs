@@ -9,6 +9,7 @@
 //! `bucket/{npub1xxx}/{file}`; the multi-owner mapping lets every uploader
 //! of identical content manage their own copy independently.
 
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 use crate::db::DbClient;
@@ -54,9 +55,12 @@ type LegacyEntry = (String, String, u64, i64, String);
 pub(crate) struct BlobStore {
     storage: Storage,
     db: DbClient,
+    upload_locks: Vec<tokio::sync::Mutex<()>>,
 }
 
 impl BlobStore {
+    const UPLOAD_LOCK_COUNT: usize = 256;
+
     pub(crate) async fn new(
         storage: &str,
         local_path: &Path,
@@ -75,7 +79,21 @@ impl BlobStore {
                 )));
             }
         };
-        Ok(BlobStore { storage, db })
+        Ok(BlobStore {
+            storage,
+            db,
+            upload_locks: (0..Self::UPLOAD_LOCK_COUNT)
+                .map(|_| tokio::sync::Mutex::new(()))
+                .collect(),
+        })
+    }
+
+    async fn blob_lock(&self, pubkey: &str, sha256: &str) -> tokio::sync::MutexGuard<'_, ()> {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        pubkey.hash(&mut hasher);
+        sha256.hash(&mut hasher);
+        let index = (hasher.finish() as usize) % self.upload_locks.len();
+        self.upload_locks[index].lock().await
     }
 
     /// Whether the storage backend currently accepts uploads (the
@@ -102,6 +120,7 @@ impl BlobStore {
         // leftovers, but only the bytes that will actually land should be
         // committed).
         self.check_space()?;
+        let _blob_guard = self.blob_lock(pubkey, sha256).await;
         let uploaded = crate::util::unix_now() as i64;
         // Whether the uploader already owned the blob BEFORE this upload
         // (read before the add: a failed re-upload of identical bytes must
@@ -133,15 +152,13 @@ impl BlobStore {
             // created the mapping (a failed re-upload keeps the
             // pre-existing valid mapping).
             //
-            // Known race (accepted, astronomically rare): two concurrent
-            // FIRST uploads of the same bytes by the same owner both read
-            // `was_owner = false`; if exactly one storage write then
-            // fails, its rollback removes the owner mapping the other
-            // upload just committed (the stored blob stays unmapped until
-            // a re-upload). The add/remove are separate LMDB transactions,
-            // so the read-check-act is not atomic.
             if !was_owner {
-                self.db.blossom_remove_owner(sha256, pubkey).await;
+                let (removed, db_ok) = self.db.blossom_remove_owner_checked(sha256, pubkey).await;
+                if !db_ok || !removed {
+                    return Err(anyhow!(
+                        "blob storage failed ({e}); owner mapping rollback failed"
+                    ));
+                }
             }
             return Err(e);
         }
@@ -166,6 +183,7 @@ impl BlobStore {
         mime: &str,
     ) -> Result<Descriptor> {
         self.check_space()?;
+        let _blob_guard = self.blob_lock(pubkey, sha256).await;
         let uploaded = crate::util::unix_now() as i64;
         let was_owner = self
             .db
@@ -186,7 +204,12 @@ impl BlobStore {
         };
         if let Err(e) = stored {
             if !was_owner {
-                self.db.blossom_remove_owner(sha256, pubkey).await;
+                let (removed, db_ok) = self.db.blossom_remove_owner_checked(sha256, pubkey).await;
+                if !db_ok || !removed {
+                    return Err(anyhow!(
+                        "blob storage failed ({e}); owner mapping rollback failed"
+                    ));
+                }
             }
             return Err(e);
         }
@@ -284,6 +307,7 @@ impl BlobStore {
     /// (blob first, so a crash leaves a healable state) and their entry in
     /// the LMDB mapping. Other uploaders of the same bytes keep theirs.
     pub(crate) async fn delete(&self, pubkey: &str, sha256: &str) -> Result<bool> {
+        let _blob_guard = self.blob_lock(pubkey, sha256).await;
         let npub = npub_of(pubkey);
         let legacy = legacy_npub_of(pubkey);
         let mut existed = false;
@@ -297,7 +321,10 @@ impl BlobStore {
                 break;
             }
         }
-        self.db.blossom_remove_owner(sha256, pubkey).await;
+        let (_, db_ok) = self.db.blossom_remove_owner_checked(sha256, pubkey).await;
+        if !db_ok {
+            return Err(anyhow!("blossom mapping removal failed"));
+        }
         Ok(existed)
     }
 
@@ -562,7 +589,11 @@ impl LocalStore {
             let _ = tokio::fs::remove_file(&tmp_path).await;
             return Err(e.into());
         }
-        output.flush().await?;
+        if let Err(e) = output.flush().await {
+            drop(output);
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            return Err(e.into());
+        }
         drop(output);
         if let Err(e) = tokio::fs::rename(&tmp_path, self.blob_path(npub, sha256)).await {
             let _ = tokio::fs::remove_file(&tmp_path).await;
@@ -616,12 +647,19 @@ impl LocalStore {
         // (A symlinked blob file itself is safe to remove — only the link
         // is deleted.)
         if !self.parent_within_root(npub).await {
-            return Ok(false);
+            let dir = self.root.join(npub);
+            return match tokio::fs::symlink_metadata(&dir).await {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                Ok(_) => Err(anyhow!("blossom storage directory is unsafe")),
+                Err(e) => Err(e.into()),
+            };
         }
         let path = self.blob_path(npub, sha256);
-        let existed = tokio::fs::try_exists(&path).await.unwrap_or(false);
-        let _ = tokio::fs::remove_file(&path).await;
-        Ok(existed)
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Scans `<root>/<npub>/<sha>.meta.json` for the legacy migration.
@@ -1218,10 +1256,8 @@ mod tests {
             std::fs::remove_dir_all(local(&s).root.join(&npub)).unwrap();
             std::os::unix::fs::symlink(&external, local(&s).root.join(&npub)).unwrap();
             // The delete is refused: the external file must survive.
-            assert!(
-                !s.delete(&a, &sha).await.unwrap(),
-                "the delete must not touch the symlink target"
-            );
+            assert!(s.delete(&a, &sha).await.is_err());
+            assert!(s.has(&a, &sha).await, "failed delete must keep the mapping");
             assert_eq!(
                 std::fs::read(external.join("victim")).unwrap(),
                 b"keep me",

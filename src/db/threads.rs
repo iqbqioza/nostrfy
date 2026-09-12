@@ -843,10 +843,10 @@ pub(crate) fn spawn(
                                 } => {
                                     let removed = match store.remove_blossom_owner(&sha256, &pubkey)
                                     {
-                                        Ok(removed) => removed,
+                                        Ok(removed) => (removed, true),
                                         Err(e) => {
                                             db_error(&thread_errors, &e);
-                                            false
+                                            (false, false)
                                         }
                                     };
                                     let _ = reply.send(removed);

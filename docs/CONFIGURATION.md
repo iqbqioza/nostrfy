@@ -161,17 +161,13 @@ The changes take effect immediately and are persisted (same lists as `nostrfy re
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
-| `management_port` | integer | `0` | Legacy management API port (`0` = disabled; must differ from `server.port`) |
-| `management_host` | string | `"127.0.0.1"` | Bind address of the management port |
 | `management_token` | string | `""` | Bearer token for the management APIs |
 | `admin_pubkey` | string (64 hex) | `""` | Administrator pubkey for NIP-98 management auth |
-| `max_admin_body_bytes` | integer | `65536` | Body limit for the NIP-86 management RPC (`POST /` and the legacy management port); oversized requests are refused with `413` |
+| `max_admin_body_bytes` | integer | `65536` | Body limit for the NIP-86 management RPC; oversized requests are refused with `413` |
 
 ### Key details
 
-**`management_port`** — A separate port for the legacy management REST API (`/admin/...`). `0` disables it. Must differ from `server.port`.
-
-**`max_admin_body_bytes`** — The request body limit for the NIP-86 management RPC: the JSON-RPC handler mounted on the relay's public `POST /` routes and the legacy management port (must be at least 1; `0` fails validation). NIP-86 requests are tiny method+params documents, so the 64 KiB default is generous while keeping the publicly reachable route from buffering large bodies. Management mutations are recorded in a rate-limited audit log (at most 600 entries per minute, then a single per-window summary line) with the authenticated identity.
+**`max_admin_body_bytes`** — The request body limit for the NIP-86 JSON-RPC handler mounted on the relay's public `POST /` routes (must be at least 1; `0` fails validation). NIP-86 requests are tiny method+params documents, so the 64 KiB default is generous while keeping the publicly reachable route from buffering large bodies. Management mutations are recorded in a rate-limited audit log (at most 600 entries per minute, then a single per-window summary line) with the authenticated identity.
 
 ## 5. `[server]` — server settings
 
@@ -195,10 +191,6 @@ The changes take effect immediately and are persisted (same lists as `nostrfy re
 
 **`ws_paths`** — Which paths serve the WebSocket endpoint and the NIP-11 document: `root` serves `/` only (the default; the legacy `/ws` and `/ws/` paths are removed); `inbox-outbox` serves only `/inbox` and `/outbox`; `all` serves the root and the inbox/outbox paths. The inbox/outbox paths give the relay distinct endpoints for the inbox/outbox routing model (e.g. `wss://relay.example.com/inbox` and `wss://relay.example.com/outbox`). In `inbox-outbox` mode the root path returns 404 on every host except a configured Blossom host, where it answers the Blossom server-info document. Fixed at startup — requires a `restart`.
 
-**`management_port`** — A separate port for the legacy management REST API (`/admin/...`). `0` disables it. Must differ from `port`.
-
-**`management_host`** — The bind address for the management port (localhost by default — keep it local unless you know what you are doing).
-
 **`management_token`** — The bearer token that authenticates management calls (`Authorization: Bearer <token>`). Compared in constant time. Empty = token authentication is disabled.
 
 **`admin_pubkey`** — The administrator's public key for NIP-98 authentication: management calls must carry a valid NIP-98 auth event (kind 27235, with a `payload` tag, a `u` tag matching the relay URL exactly, signed by this key). Empty = NIP-98 authentication is disabled. Each auth event is single-use within its 60-second window.
@@ -209,7 +201,7 @@ The changes take effect immediately and are persisted (same lists as `nostrfy re
 
 - **`require_auth = true` with `send_auth_challenge = false`** locks everyone out — the challenge is never sent, so nobody can ever authenticate. The relay warns about this combination at startup.
 - **`management_token` and `admin_pubkey`** can both be configured at once; either one authorizes. When both are empty, the management APIs are effectively disabled (every request gets `401`).
-- The NIP-86 RPC is served on `POST /` of the main port (and on the paths selected by `server.ws_paths`); the legacy API on `management_port`. Both share the same authentication.
+- The NIP-86 RPC is served on `POST /` of the main port (and on the paths selected by `server.ws_paths`).
 
 ---
 
@@ -547,7 +539,6 @@ Each `allow`/`deny` writes the database and reloads the running daemon (SIGHUP),
 | `pubkey`/`admin_pubkey`/access pubkeys must be 64 hex chars | `relay.pubkey must be 64 hex characters (32 bytes)` |
 | `private_key` must be a valid secp256k1 secret key | `relay.private_key is not a valid secp256k1 secret key` |
 | `port` must be 1–65535 | `server.port must be between 1 and 65535` |
-| `management_port` must differ from `port` | `rpc.management_port must differ from server.port` |
 | `api_host` / `blossom.host` must be bare hostnames | `server.api_host must be a bare hostname (no scheme, port or path), got "https://..."` |
 | `api_host` must differ from `blossom.host` | `server.api_host and blossom.host must be different hostnames` |
 | blocked IPs must parse | `access.blocked_ips contains an invalid IP address: "..."` |
@@ -572,7 +563,6 @@ Editing the file and sending `kill -HUP $(cat nostrfy.pid)` reloads it **without
 | --- | --- |
 | `relay.name`, `description`, `pubkey`, `contact`, `icon`, `post_policy`, `public_url`, `relay.reject_ephemeral`, `relay.enabled_git`, `relay.enabled_nip78_auth` | `relay.private_key` |
 | most of `[limits]` (the restart-column entries below apply on restart only) | `relay.livekit_*`, `relay.enabled_nips` / `disabled_nips` |
-| NIP-40 on/off, API concurrency | `server.host`, `server.port`, `server.api_host`, `server.ws_paths`, `rpc.management_port`, `rpc.management_host`, `server.metrics_enabled` |
 | — | `database.path`, `database.purge_interval_secs`, `database.map_size`, `database.max_map_size`, `database.search_index`, `database.meta_index`, `database.reader_threads`, `database.disabled_fsync`, `database.db_request_timeout_secs`, `database.max_db_queue_msgs`, `database.max_db_queue_events`, `database.max_indexed_words`, `daemon.max_log_size_bytes`, `max_log_files`, `stats_interval_secs`, `limits.live_buffer`, `live_batch_size`, `live_batch_interval_ms`, `socket_recv_buffer_kb`, `max_connections`, `http_read_timeout_secs`, `max_connections_per_sec_per_ip`, `rpc.max_admin_body_bytes`, `relay.max_groups`, `blossom.host`, `blossom.storage`, `blossom.local_path`, `blossom.max_upload_bytes`, `blossom.min_free_bytes`, `blossom.s3_*` |
 
 `[access]` is **not** applied by a reload: the access lists are seeded once at startup and then managed at runtime via NIP-86.
@@ -605,8 +595,6 @@ enabled_git = false
 host = "0.0.0.0"
 port = 8080
 api_host = "api.example.com"
-management_port = 0
-management_host = "127.0.0.1"
 management_token = ""
 admin_pubkey = ""
 require_auth = false

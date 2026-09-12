@@ -14,8 +14,13 @@ pub const EXPIRATION_TAG: &str = "expiration";
 /// claim rather than a later (or missing) one. Malformed siblings are
 /// reported by [`has_malformed_expiration`] and rejected at intake.
 pub fn expiry(event: &Event) -> Option<u64> {
+    expiry_fields(event)
+}
+
+/// Expiration timestamp for any event-like value with NIP-40 tags.
+pub fn expiry_fields<E: crate::filter::EventFields>(event: &E) -> Option<u64> {
     event
-        .tags
+        .tags()
         .iter()
         .filter(|t| t.len() >= 2 && t[0] == EXPIRATION_TAG)
         .filter_map(|t| t[1].parse().ok())

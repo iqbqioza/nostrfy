@@ -139,6 +139,9 @@ pub struct Conn {
     /// back to this instead of failing open when the lists are contended.
     pub(crate) access_allowed_cache: bool,
     pub(crate) dropped: u64,
+    /// Set when a pending live-response buffer overflows. The connection
+    /// loop closes after the current batch so the client can resynchronize.
+    pub(crate) live_overflowed: bool,
     /// Per-connection message/byte counters, flushed into the shared stats
     /// once on disconnect so that a million connections do not hammer the
     /// same cache lines for every single message.
@@ -729,6 +732,7 @@ pub async fn handle_connection(
         access_allowed_cache: false,
         config_version: 0,
         dropped: 0,
+        live_overflowed: false,
         in_msgs: 0,
         in_bytes: 0,
         out_msgs: 0,
@@ -748,7 +752,7 @@ pub async fn handle_connection(
     // writer task) and the per-connection channel.
     #[allow(unused_assignments)] // the initial value is overwritten before the first read
     let mut drain_stalled = !conn.outgoing.is_empty();
-    loop {
+    'connection: loop {
         // Drain pending outgoing messages. A slow reader stalls only its
         // own connection (outgoing is bounded, so new messages are dropped).
         // Batch the flush: `start_send` for every queued message and one
@@ -991,6 +995,9 @@ pub async fn handle_connection(
                         let now = crate::util::unix_now();
                         for (event, json) in batch.iter() {
                             conn.deliver_live_at(event, json, groups, now);
+                            if conn.live_overflowed {
+                                break 'connection;
+                            }
                         }
                     }
                     None => break,
@@ -1258,6 +1265,7 @@ mod tests {
             access_allowed_cache: false,
             config_version: 0,
             dropped: 0,
+            live_overflowed: false,
             in_msgs: 0,
             in_bytes: 0,
             out_msgs: 0,
@@ -2449,7 +2457,7 @@ mod tests {
             assert!(conn.live.is_some(), "REQ must subscribe to live events");
 
             let ev = signed_kind_note_seeded(relay.secp(), 2, 30078, "live-app", now, vec![]);
-            relay.broadcast(ev.clone()).await;
+            assert!(relay.broadcast(ev.clone()).await.is_ok());
             let received = tokio::time::timeout(
                 std::time::Duration::from_secs(2),
                 conn.live.as_mut().unwrap().recv(),
@@ -2481,7 +2489,7 @@ mod tests {
             // event: pulling it through the pump mirrors the connection loop
             // and leaves the subscription in its EOSE-sent state.
             owner.pump_pending_reqs();
-            relay.broadcast(ev.clone()).await;
+            assert!(relay.broadcast(ev.clone()).await.is_ok());
             let received = tokio::time::timeout(
                 std::time::Duration::from_secs(2),
                 owner.live.as_mut().unwrap().recv(),
@@ -3089,7 +3097,7 @@ mod tests {
             let mut ev = signed_note(conn_a.relay.secp(), "candidate-check", now, vec![]);
             ev.kind = 30001;
             ev.id = crate::nips::nip01::compute_id(&ev);
-            conn_a.relay.broadcast(ev.clone()).await;
+            assert!(conn_a.relay.broadcast(ev.clone()).await.is_ok());
             let received_a = tokio::time::timeout(
                 std::time::Duration::from_secs(2),
                 conn_a.live.as_mut().unwrap().recv(),
@@ -3157,7 +3165,7 @@ mod tests {
             ev.kind = 30001;
             ev.id = crate::nips::nip01::compute_id(&ev);
             // The relay broadcast path: queue, bus task, receiver, deliver.
-            conn.relay.broadcast(ev.clone()).await;
+            assert!(conn.relay.broadcast(ev.clone()).await.is_ok());
             let received = tokio::time::timeout(
                 std::time::Duration::from_secs(2),
                 conn.live.as_mut().unwrap().recv(),
@@ -4377,6 +4385,7 @@ mod tests {
                     eose_sent: false,
                 });
             }
+
             assert!(
                 !outgoing_json(&conn)
                     .iter()
@@ -4417,6 +4426,79 @@ mod tests {
                     .iter()
                     .any(|m| m[0] == "EOSE" && m[1] == "gone"),
                 "a CLOSEd subscription must not receive an EOSE"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn close_removes_pending_req_response() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            conn.enqueue_pending_req(PendingReq {
+                sub_id: "stale".into(),
+                events: std::collections::VecDeque::from([Event {
+                    id: "a".repeat(64),
+                    pubkey: "b".repeat(64),
+                    created_at: 1,
+                    kind: 1,
+                    tags: Vec::new(),
+                    content: "stale".into(),
+                    sig: "c".repeat(128),
+                }]),
+                eose_hint: false,
+                truncated_or_more: false,
+                auth_hint: false,
+                sent_bytes: 0,
+                live: Default::default(),
+                live_bytes: 0,
+                eose_sent: false,
+            });
+
+            conn.remove_req_subscription("stale");
+            conn.pump_pending_reqs();
+
+            assert!(conn.pending_reqs.is_empty());
+            assert!(
+                outgoing_json(&conn)
+                    .iter()
+                    .all(|message| message[0] != "EVENT" && message[0] != "EOSE"),
+                "closing a subscription must discard its pending response"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn pending_live_overflow_marks_connection_for_close() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            conn.subs
+                .insert("sub".into(), (vec![Filter::default()], 0, "\"sub\"".into()));
+            let live = std::collections::VecDeque::from_iter(
+                (0..OUT_QUEUE_LIMIT).map(|_| "[\"EVENT\",\"sub\",{}]".to_string()),
+            );
+            conn.enqueue_pending_req(PendingReq {
+                sub_id: "sub".into(),
+                events: Default::default(),
+                eose_hint: false,
+                truncated_or_more: false,
+                auth_hint: false,
+                sent_bytes: 0,
+                live,
+                live_bytes: 0,
+                eose_sent: false,
+            });
+
+            let event = signed_note(conn.relay.secp(), "overflow", unix_now(), vec![]);
+            let json = serde_json::to_string(&event).unwrap();
+            conn.deliver_live(&event, &json, None);
+
+            assert!(
+                conn.live_overflowed,
+                "pending live overflow must close the connection"
             );
             conn.relay.db.shutdown();
         });
@@ -4920,7 +5002,7 @@ mod tests {
                 "live receiver survives a CLOSE + REQ cycle"
             );
             let ev = signed_note(conn.relay.secp(), "resubscribed", now, vec![]);
-            conn.relay.broadcast(ev).await;
+            assert!(conn.relay.broadcast(ev).await.is_ok());
             let received = tokio::time::timeout(
                 std::time::Duration::from_secs(2),
                 conn.live.as_mut().unwrap().recv(),

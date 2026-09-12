@@ -44,8 +44,6 @@ inbox_write_policy = "any"
 outbox_write_policy = "any"
 
 [rpc]
-management_port = 0
-management_host = "127.0.0.1"
 management_token = ""
 admin_pubkey = ""
 max_admin_body_bytes = 65536

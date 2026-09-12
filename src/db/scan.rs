@@ -1446,11 +1446,7 @@ fn is_deliverable<E: crate::filter::EventFields>(
         return Ok(false);
     }
     if ctx.expiry_enabled
-        && let Some(exp) = event
-            .tags()
-            .iter()
-            .find(|t| t.len() >= 2 && t[0] == crate::nips::nip40::EXPIRATION_TAG)
-            .and_then(|t| t[1].parse::<u64>().ok())
+        && let Some(exp) = crate::nips::nip40::expiry_fields(event)
         && exp <= now
     {
         return Ok(false);
