@@ -221,7 +221,10 @@ impl Conn {
     }
 
     pub(crate) fn send_ok(&mut self, id: &str, accepted: bool, message: &str) {
-        self.send_json(json!(["OK", id, accepted, message]));
+        // NIP-01/NIP-42 completion acknowledgements must not compete with
+        // live EVENT traffic for the byte budget: dropping one leaves the
+        // publisher unable to determine whether its event or AUTH succeeded.
+        self.send_control(json!(["OK", id, accepted, message]));
     }
 
     /// Whether the pending EVENT batch must be flushed before reading more
@@ -5030,6 +5033,27 @@ mod tests {
             conn.send_control(serde_json::json!(["EOSE", "s"]));
             assert_eq!(conn.outgoing.len(), OUT_QUEUE_LIMIT * 2);
             assert_eq!(conn.dropped, dropped_before + 1);
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn ok_ack_bypasses_outgoing_byte_cap() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            conn.out_queue_bytes = 1;
+            conn.out_bytes = 100;
+
+            conn.send_ok("event-id", true, "");
+
+            let messages = outgoing_json(&conn);
+            assert!(
+                messages
+                    .iter()
+                    .any(|message| message[0] == "OK" && message[1] == "event-id"),
+                "completion ACK must remain queued under outgoing byte backpressure"
+            );
             conn.relay.db.shutdown();
         });
     }
