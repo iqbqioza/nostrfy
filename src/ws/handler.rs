@@ -592,8 +592,11 @@ impl super::Conn {
 
     /// Releases a REQ subscription only (NIP-77 separate namespace):
     /// its filter bytes and its live slot. NEG state under the same id is
-    /// left untouched (`NEG-CLOSE` releases NEG).
+    /// left untouched (`NEG-CLOSE` releases NEG). Any response still waiting
+    /// for the socket is removed with the subscription, so a CLOSE or a
+    /// replacement cannot emit stale history after it.
     pub(crate) fn remove_req_subscription(&mut self, sub_id: &str) {
+        self.pending_reqs.retain(|pending| pending.sub_id != sub_id);
         if let Some((_, bytes, _)) = self.subs.remove(sub_id) {
             self.sub_bytes = self.sub_bytes.saturating_sub(bytes);
             self.relay

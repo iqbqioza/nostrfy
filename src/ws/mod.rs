@@ -4377,6 +4377,7 @@ mod tests {
                     eose_sent: false,
                 });
             }
+
             assert!(
                 !outgoing_json(&conn)
                     .iter()
@@ -4417,6 +4418,45 @@ mod tests {
                     .iter()
                     .any(|m| m[0] == "EOSE" && m[1] == "gone"),
                 "a CLOSEd subscription must not receive an EOSE"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn close_removes_pending_req_response() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            conn.enqueue_pending_req(PendingReq {
+                sub_id: "stale".into(),
+                events: std::collections::VecDeque::from([Event {
+                    id: "a".repeat(64),
+                    pubkey: "b".repeat(64),
+                    created_at: 1,
+                    kind: 1,
+                    tags: Vec::new(),
+                    content: "stale".into(),
+                    sig: "c".repeat(128),
+                }]),
+                eose_hint: false,
+                truncated_or_more: false,
+                auth_hint: false,
+                sent_bytes: 0,
+                live: Default::default(),
+                live_bytes: 0,
+                eose_sent: false,
+            });
+
+            conn.remove_req_subscription("stale");
+            conn.pump_pending_reqs();
+
+            assert!(conn.pending_reqs.is_empty());
+            assert!(
+                outgoing_json(&conn)
+                    .iter()
+                    .all(|message| message[0] != "EVENT" && message[0] != "EOSE"),
+                "closing a subscription must discard its pending response"
             );
             conn.relay.db.shutdown();
         });
