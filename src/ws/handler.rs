@@ -1067,6 +1067,8 @@ impl super::Conn {
                 if over {
                     self.dropped += 1;
                     self.relay.stats.bump(&self.relay.stats.buffers_dropped, 1);
+                    self.live_overflowed = true;
+                    break;
                 } else {
                     pending.live_bytes += size;
                     pending.live.push_back(std::mem::take(&mut out));
