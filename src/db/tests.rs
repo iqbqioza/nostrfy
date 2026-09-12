@@ -1510,6 +1510,15 @@ fn vanish_keeps_delegatee_events_of_a_delegator() {
         e.id = nip01::compute_id(&e);
         assert_eq!(db.put(e.clone(), now).await, PutOutcome::Stored);
 
+        // A forged delegation tag must not let the delegator delete the
+        // delegatee's event; deletion revalidates the NIP-26 token.
+        assert_eq!(
+            db.apply_deletion(vec![e.id.clone()], vec![], Some(delegator.clone()), now)
+                .await,
+            0,
+            "invalid delegation must not authorize deletion"
+        );
+
         // Vanish the delegator: the delegatee-authored event survives.
         let removed = db
             .apply_vanish(

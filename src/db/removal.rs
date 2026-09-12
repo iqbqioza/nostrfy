@@ -65,10 +65,9 @@ impl Store {
             };
             // NIP-09: only events authored by the request's pubkey are
             // deleted, and deletion requests cannot be deleted. NIP-26:
-            // the delegator may also delete events published by a
-            // delegatee on their behalf. Compared on decoded bytes
-            // (case-insensitive like the scan), so an uppercase hex
-            // request still matches its lowercase targets.
+            // the delegator may also delete events published on their
+            // behalf; delegated_by revalidates the target's delegation
+            // signature and conditions before allowing that exception.
             if event.kind == nip09::DELETION_KIND {
                 continue;
             }

@@ -1439,15 +1439,14 @@ pub(crate) fn is_replaceable(event: &Event) -> bool {
         || nip33::is_param_replaceable_kind(event.kind)
 }
 
-/// Returns `true` when the event was published under the NIP-26 delegation
-/// granted by `delegator`. Only the first well-formed delegation tag counts
-/// (the one `nip26::verify` validated and the query paths honor). Compared
-/// case-insensitively like every other hex comparison, so an uppercase
-/// filter still matches.
+/// Returns `true` when the event was published under a cryptographically
+/// valid NIP-26 delegation granted by `delegator`. Only the first well-formed
+/// delegation tag counts, matching the query and index paths.
 pub(crate) fn delegated_by(event: &Event, delegator: &str) -> bool {
-    event
+    let names_delegator = event
         .tags
         .iter()
         .find(|t| t.len() == 4 && t[0] == "delegation")
-        .is_some_and(|t| t[1].eq_ignore_ascii_case(delegator))
+        .is_some_and(|t| t[1].eq_ignore_ascii_case(delegator));
+    names_delegator && crate::nips::nip26::verify(event, &secp256k1::Secp256k1::new())
 }
