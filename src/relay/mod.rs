@@ -507,8 +507,8 @@ impl Relay {
     /// 10,000 pubkeys — the
     /// cap never clears the whole map (a clear would reset every window
     /// and permanently disable the limit): expired windows are evicted
-    /// first, and a still-full map skips tracking the new pubkey only
-    /// (fail-open for that key, limits preserved for everyone else).
+    /// first, and a still-full map rejects the new pubkey because its
+    /// window cannot be tracked safely.
     pub(crate) fn publish_rate_allowed(&self, cfg: &Config, pubkey: &str, now: u64) -> bool {
         const MAX_TRACKED_PUBKEYS: usize = 10_000;
         let max = cfg.relay.max_events_per_min_per_pubkey;
@@ -531,13 +531,13 @@ impl Relay {
         }
         // New pubkey: never clear the whole map (a clear would reset every
         // window and permanently disable the limit). Expired windows are
-        // evicted first; a still-full map skips tracking the new pubkey
-        // only (fail-open for that key, limits preserved for everyone
-        // else).
+        // evicted first; a still-full map rejects the new pubkey because
+        // admitting an untracked identity would bypass the configured
+        // limit.
         if rate.len() >= MAX_TRACKED_PUBKEYS {
             rate.retain(|_, w| w.front().is_some_and(|t| now.saturating_sub(*t) < 60));
             if rate.len() >= MAX_TRACKED_PUBKEYS {
-                return true;
+                return false;
             }
         }
         rate.entry(pubkey.to_string()).or_default().push_back(now);
