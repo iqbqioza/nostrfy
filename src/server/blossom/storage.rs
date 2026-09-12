@@ -311,7 +311,10 @@ impl BlobStore {
                 break;
             }
         }
-        self.db.blossom_remove_owner(sha256, pubkey).await;
+        let (_, db_ok) = self.db.blossom_remove_owner_checked(sha256, pubkey).await;
+        if !db_ok {
+            return Err(anyhow!("blossom mapping removal failed"));
+        }
         Ok(existed)
     }
 
