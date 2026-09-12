@@ -692,7 +692,7 @@ Uploads from unlisted pubkeys are rejected with `403`. The list survives restart
 ### 11.6 Notes
 
 - Files are served with `ETag`, `Cache-Control: immutable` and the stored content type.
-- Blobs never touch the relay database; the relay's WebSocket / REST API performance is unaffected.
+- Blob bytes never touch the relay database; the relay stores only SHA-256-to-owner metadata and the upload allowlist in LMDB. Back up both the configured blob storage and `database.path` to preserve the complete Blossom inventory and authorization state.
 - The sha256 → owner mapping is persisted in the relay database (LMDB): the relay restarts instantly, lookups read the mapping directly from the database (no in-memory index, no startup scan), and existing files keep working.
 - **Automatic migration**: on the first start after an upgrade, the relay rebuilds the mapping from blobs stored by older versions (a background scan — the table itself is created instantly, and later restarts skip the migration via a marker). No manual step is needed.
 - **All database upgrades are automatic**: every LMDB table is opened-or-created at startup (instant, non-destructive), and the one-time data migrations (access lists, Blossom mapping) run by themselves — see [CONFIGURATION.md](CONFIGURATION.md#upgrades-are-automatic-and-instant).

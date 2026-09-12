@@ -393,6 +393,7 @@ All data lives in the `database.path` directory. **Stop the relay before copying
 ```bash
 ./target/release/nostrfy --config nostrfy.toml stop
 cp -a ./data ./data-backup
+# Also back up [blossom].local_path when using local Blossom storage.
 ./target/release/nostrfy --config nostrfy.toml start
 ```
 
