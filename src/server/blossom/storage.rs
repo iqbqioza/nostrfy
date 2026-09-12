@@ -441,7 +441,9 @@ fn legacy_npub_of(pubkey: &str) -> String {
 
 struct LocalStore {
     root: PathBuf,
-    root_dir: std::fs::File,
+    // Kept open for the lifetime of the store so fd_root remains valid.
+    _root_dir: std::fs::File,
+    fd_root: Option<PathBuf>,
     /// The resolved root: every operation's parent directory is
     /// canonicalized and must resolve under this path, so a symlinked
     /// npub directory can never redirect reads, writes or deletes
@@ -463,9 +465,15 @@ impl LocalStore {
                 .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
                 .open(&canonical_root)?
         };
+        let fd = std::os::fd::AsRawFd::as_raw_fd(&root_dir);
+        let fd_root = ["/proc/self/fd", "/dev/fd"]
+            .into_iter()
+            .map(|base| PathBuf::from(base).join(fd.to_string()))
+            .find(|path| path.exists());
         Ok(LocalStore {
             root: root.to_path_buf(),
-            root_dir,
+            _root_dir: root_dir,
+            fd_root,
             canonical_root,
             min_free_bytes,
         })
@@ -477,15 +485,13 @@ impl LocalStore {
     }
 
     fn rooted_path(&self, npub: &str, name: &str) -> PathBuf {
-        #[cfg(target_os = "linux")]
-        let fd_root = "/proc/self/fd";
-        #[cfg(not(target_os = "linux"))]
-        let fd_root = "/dev/fd";
-        PathBuf::from(format!(
-            "{fd_root}/{}/{}",
-            std::os::fd::AsRawFd::as_raw_fd(&self.root_dir),
-            Path::new(npub).join(name).display()
-        ))
+        // FreeBSD installations without fdescfs do not expose open
+        // descriptors as pathname components. The canonical-root fallback
+        // retains the symlink checks and keeps those systems functional.
+        self.fd_root
+            .as_ref()
+            .map(|root| root.join(npub).join(name))
+            .unwrap_or_else(|| self.canonical_root.join(npub).join(name))
     }
 
     fn npub_dir_path(&self, npub: &str) -> PathBuf {
