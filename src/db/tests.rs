@@ -1515,6 +1515,39 @@ fn vanish_respects_the_request_created_at_bound() {
 }
 
 #[test]
+fn vanish_removes_events_at_maximal_timestamp() {
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let pubkey = "bb".repeat(32);
+        let mut event = event(1, "maximal vanish timestamp", u64::MAX, vec![]);
+        event.pubkey = pubkey.clone();
+        event.id = nip01::compute_id(&event);
+        assert_eq!(db.put(event.clone(), u64::MAX).await, PutOutcome::Stored);
+
+        let removed = db
+            .apply_vanish(hex::decode(pubkey).unwrap().try_into().unwrap(), u64::MAX)
+            .await;
+        assert_eq!(removed, 1);
+
+        let filter: Filter =
+            serde_json::from_value(serde_json::json!({"authors": [event.pubkey]})).unwrap();
+        let (events, _) = db.query(vec![filter], 10, u64::MAX).await;
+        assert!(events.is_empty(), "maximal-timestamp event survived vanish");
+    });
+    db.shutdown();
+}
+
+#[test]
 fn vanish_keeps_delegatee_events_of_a_delegator() {
     // NIP-62: a request to vanish removes only events *authored* by the
     // pubkey. NIP-26 delegatee events are indexed under the delegator too,

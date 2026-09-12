@@ -277,7 +277,10 @@ impl Store {
         // are not covered by it.
         // Exclusive `(until + 1, 0..)`: covers every event with
         // `created_at <= until`, including the maximal id at exactly `until`.
-        let end = pubkey_key(pubkey, until_created.saturating_add(1), &[0u8; ID_LEN]);
+        let end = crate::db::store::range_end(
+            pubkey_key(pubkey, until_created.saturating_add(1), &[0u8; ID_LEN]),
+            until_created,
+        );
         let mut last_key: Option<Vec<u8>> = None;
         loop {
             let lower = match &last_key {
@@ -333,7 +336,10 @@ impl Store {
             hex::encode_upper(pubkey).into_bytes(),
         ] {
             let start = tag_key(b'p', &pubkey_hex, 0, &[0u8; ID_LEN]);
-            let end = tag_key(b'p', &pubkey_hex, u64::MAX, &[0xffu8; ID_LEN]);
+            let end = crate::db::store::range_end(
+                tag_key(b'p', &pubkey_hex, u64::MAX, &[0xffu8; ID_LEN]),
+                u64::MAX,
+            );
             let mut last_key: Option<Vec<u8>> = None;
             loop {
                 let lower = match &last_key {
