@@ -112,6 +112,10 @@ pub struct Relay {
     /// management request (a captured header must not be reusable within
     /// its 60-second window).
     pub nip98_replay: crate::nips::nip98::ReplayGuard,
+    /// Command event ids already executed during this process. Event ids are
+    /// persisted in the database, but this guard also makes direct/replayed
+    /// side-effect dispatch idempotent before another response is emitted.
+    command_events: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 /// Issues strictly increasing timestamps for relay-generated events.
@@ -381,6 +385,7 @@ impl Relay {
             blossom_allow: Arc::new(tokio::sync::RwLock::new(blossom_allow)),
             audit: crate::audit::AuditLog::default(),
             nip98_replay: Default::default(),
+            command_events: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
     }
 

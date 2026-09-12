@@ -2099,6 +2099,12 @@ mod tests {
                 replies[0].content
             );
 
+            // Re-dispatching the same accepted event must not repeat the
+            // side effect or create a second response.
+            relay.handle_command_event(&cmd).await;
+            let replies = stored_replies(&relay, &cmd.id, now).await;
+            assert_eq!(replies.len(), 1, "replayed command must stay idempotent");
+
             // relay deny: moves the pubkey from allow to deny (the `nostr:`
             // URI prefix is accepted on the operand).
             let cmd = signed_command_event(

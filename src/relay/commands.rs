@@ -135,6 +135,19 @@ impl Relay {
         if admin != event.pubkey {
             return;
         }
+        {
+            let mut processed = self
+                .command_events
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !processed.insert(event.id.clone()) {
+                return;
+            }
+            if processed.len() > 4096 {
+                processed.clear();
+                processed.insert(event.id.clone());
+            }
+        }
         let Some(outcome) = parse(&event.content) else {
             return;
         };
