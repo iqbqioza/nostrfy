@@ -292,8 +292,8 @@ pub struct LimitsConfig {
     /// idle connections wake up once per batch instead of once per event.
     pub live_batch_interval_ms: u64,
     pub live_batch_size: usize,
-    /// Bounded queue for events waiting to be broadcast live; messages are
-    /// dropped (never stored) when it overflows.
+    /// Bounded queue for events waiting to be broadcast live; publishers
+    /// wait for capacity when it is full so accepted events are not lost.
     pub live_buffer: usize,
     /// HTTP/1.1 header read timeout in seconds: a connection that does not
     /// deliver a complete request head within this window is closed

@@ -1007,7 +1007,7 @@ impl super::Conn {
         if self.expiry_enabled
             && !(20000..30000).contains(&event.kind)
             && let Some(exp) = nip40::expiry(event)
-            && exp < now
+            && exp <= now
         {
             return;
         }

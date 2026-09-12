@@ -28,8 +28,8 @@ use crate::stats::Stats;
 use crate::util::unix_now;
 
 /// Per-connection live-delivery queue capacity (in batches): a
-/// connection that stops reading drops live batches instead of
-/// accumulating them (the old broadcast channel's lag semantics).
+/// connection that stops reading is closed when its queue fills so it can
+/// reconnect and resynchronize instead of missing events silently.
 pub(crate) const LIVE_QUEUE_CAPACITY: usize = 64;
 
 pub struct Relay {
@@ -44,12 +44,10 @@ pub struct Relay {
     /// subscriber (the per-connection filter match remains the final
     /// check).
     pub sub_index: std::sync::Arc<std::sync::RwLock<crate::relay::SubscriptionIndex>>,
-    /// Per-connection live-delivery queues: the bus task sends each batch
-    /// to the candidate connections' bounded queues (dropped when full,
-    /// the same backpressure semantics as the old broadcast).
-    pub conn_queues: std::sync::Arc<
-        std::sync::Mutex<std::collections::HashMap<u64, mpsc::Sender<crate::ws::LiveBatch>>>,
-    >,
+    /// Per-connection live-delivery queues and overflow signals. A full
+    /// queue signals the connection to close instead of silently losing a
+    /// batch.
+    pub conn_queues: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u64, LiveQueue>>>,
     /// Connection id counter: the id identifies a connection in the
     /// subscription index and the queue map.
     pub next_conn_id: std::sync::atomic::AtomicU64,
@@ -175,6 +173,19 @@ pub struct LiveBusConfig {
     pub batch_interval_ms: u64,
     /// Maximum events per flushed batch.
     pub batch_size: usize,
+}
+
+pub(crate) struct LiveQueue {
+    pub(crate) sender: mpsc::Sender<crate::ws::LiveBatch>,
+    pub(crate) overflow: tokio::sync::watch::Sender<()>,
+}
+
+fn enqueue_live_batch(queue: &LiveQueue, batch: crate::ws::LiveBatch) {
+    if let Err(error) = queue.sender.try_send(batch)
+        && matches!(error, mpsc::error::TrySendError::Full(_))
+    {
+        let _ = queue.overflow.send(());
+    }
 }
 
 /// Bounds the number of concurrently served `/api/v1` queries. Implemented
@@ -415,23 +426,23 @@ impl Relay {
                     }
                     conns
                 };
-                // Collect the candidate senders under the lock, then drop
-                // the lock before delivering: the sends never block
-                // (`try_send`), so holding the map lock during the
-                // fan-out would only delay connections joining/leaving.
-                let senders: Vec<mpsc::Sender<crate::ws::LiveBatch>> = {
+                // Collect the candidate queues under the lock, then drop
+                // the lock before delivering. A full queue signals its
+                // connection to close instead of silently losing a batch.
+                let queues: Vec<LiveQueue> = {
                     let queues = conn_queues.lock().unwrap_or_else(|p| p.into_inner());
                     conns
                         .iter()
-                        .filter_map(|conn| queues.get(conn).cloned())
+                        .filter_map(|conn| {
+                            queues.get(conn).map(|queue| LiveQueue {
+                                sender: queue.sender.clone(),
+                                overflow: queue.overflow.clone(),
+                            })
+                        })
                         .collect()
                 };
-                for sender in senders {
-                    // `try_send` on the bounded queue: a slow connection
-                    // that stops reading drops the batch instead of
-                    // accumulating it in memory (the same lag semantics
-                    // as the old broadcast channel).
-                    let _ = sender.try_send(batch.clone());
+                for queue in queues {
+                    enqueue_live_batch(&queue, batch.clone());
                 }
             };
             loop {
@@ -470,13 +481,16 @@ impl Relay {
         });
     }
 
-    /// Queues an event for live delivery to subscribers. The event is
-    /// dropped (never stored) when the live buffer is full, as it remains
-    /// available through subscriptions. The JSON is encoded once here —
-    /// every subscriber shares the same serialization.
-    pub fn broadcast(&self, event: Event) {
+    /// Queues an event for live delivery to subscribers. Backpressure from
+    /// the bounded live buffer is propagated to the accepting task so an
+    /// accepted event is never silently lost before fan-out. The JSON is
+    /// encoded once here — every subscriber shares the same serialization.
+    pub async fn broadcast(&self, event: Event) {
         let json = Arc::new(serde_json::to_string(&event).unwrap_or_default());
-        let _ = self.live_tx.try_send((event, json));
+        if self.live_tx.send((event, json)).await.is_err() {
+            log::error!("live bus stopped before an accepted event could be broadcast");
+            self.stats.bump(&self.stats.db_errors, 1);
+        }
     }
 
     /// Whether `pubkey` may publish another event under
@@ -1061,7 +1075,7 @@ impl Relay {
         if event.kind == 1 {
             self.handle_command_event(&event).await;
         }
-        self.broadcast(event);
+        self.broadcast(event).await;
     }
 
     /// Persists the live NIP-29 group state (write-through: call after
@@ -1326,8 +1340,10 @@ impl PendingBatch {
 
 #[cfg(test)]
 mod tests {
+    use super::LiveQueue;
     use super::Relay;
     use super::StampClock;
+    use super::enqueue_live_batch;
     use super::validate::contains_secret_key;
 
     /// Builds a relay with an empty database.
@@ -1372,6 +1388,29 @@ mod tests {
         )
         .await;
         std::sync::Arc::new(relay)
+    }
+
+    #[tokio::test]
+    async fn full_live_queue_signals_connection_overflow() {
+        let (sender, receiver) = tokio::sync::mpsc::channel(crate::relay::LIVE_QUEUE_CAPACITY);
+        let (overflow, overflow_rx) = tokio::sync::watch::channel(());
+        let queue = LiveQueue { sender, overflow };
+        let batch = std::sync::Arc::new(Vec::new());
+
+        for _ in 0..crate::relay::LIVE_QUEUE_CAPACITY {
+            enqueue_live_batch(&queue, batch.clone());
+        }
+        assert!(
+            !overflow_rx.has_changed().unwrap(),
+            "a queue at capacity must not signal overflow"
+        );
+
+        enqueue_live_batch(&queue, batch);
+        assert!(
+            overflow_rx.has_changed().unwrap(),
+            "a full queue must signal the connection to close"
+        );
+        assert_eq!(receiver.len(), crate::relay::LIVE_QUEUE_CAPACITY);
     }
 
     /// Builds a relay with NIP-43 enabled and an optional relay key.

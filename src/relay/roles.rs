@@ -23,7 +23,7 @@ impl super::Relay {
         let now = unix_now();
         let outcome = self.db.put(event.clone(), now).await;
         if matches!(outcome, PutOutcome::Stored | PutOutcome::Replaced) {
-            self.broadcast(event.clone());
+            self.broadcast(event.clone()).await;
             true
         } else {
             false
