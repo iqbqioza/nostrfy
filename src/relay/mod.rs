@@ -411,7 +411,7 @@ impl Relay {
                     let index = sub_index.read().unwrap_or_else(|p| p.into_inner());
                     let mut conns = std::collections::HashSet::new();
                     for (event, _) in batch.iter() {
-                        conns.extend(index.candidates(event));
+                        index.extend_candidates(event, &mut conns);
                     }
                     conns
                 };
