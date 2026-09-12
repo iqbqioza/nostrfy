@@ -88,7 +88,7 @@ impl BlobStore {
         })
     }
 
-    async fn upload_lock(&self, pubkey: &str, sha256: &str) -> tokio::sync::MutexGuard<'_, ()> {
+    async fn blob_lock(&self, pubkey: &str, sha256: &str) -> tokio::sync::MutexGuard<'_, ()> {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         pubkey.hash(&mut hasher);
         sha256.hash(&mut hasher);
@@ -120,7 +120,7 @@ impl BlobStore {
         // leftovers, but only the bytes that will actually land should be
         // committed).
         self.check_space()?;
-        let _upload_guard = self.upload_lock(pubkey, sha256).await;
+        let _blob_guard = self.blob_lock(pubkey, sha256).await;
         let uploaded = crate::util::unix_now() as i64;
         // Whether the uploader already owned the blob BEFORE this upload
         // (read before the add: a failed re-upload of identical bytes must
@@ -178,7 +178,7 @@ impl BlobStore {
         mime: &str,
     ) -> Result<Descriptor> {
         self.check_space()?;
-        let _upload_guard = self.upload_lock(pubkey, sha256).await;
+        let _blob_guard = self.blob_lock(pubkey, sha256).await;
         let uploaded = crate::util::unix_now() as i64;
         let was_owner = self
             .db
@@ -297,6 +297,7 @@ impl BlobStore {
     /// (blob first, so a crash leaves a healable state) and their entry in
     /// the LMDB mapping. Other uploaders of the same bytes keep theirs.
     pub(crate) async fn delete(&self, pubkey: &str, sha256: &str) -> Result<bool> {
+        let _blob_guard = self.blob_lock(pubkey, sha256).await;
         let npub = npub_of(pubkey);
         let legacy = legacy_npub_of(pubkey);
         let mut existed = false;
