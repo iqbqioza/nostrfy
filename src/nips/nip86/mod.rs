@@ -2,13 +2,7 @@
 //!
 //! The current NIP-86 revision defines a JSON-RPC style protocol served on
 //! the same URI as the relay's websocket, with `Content-Type:
-//! application/nostr+json+rpc` and NIP-98 authentication. For backwards
-//! compatibility the older REST endpoints remain available on a separate
-//! localhost management port.
-
-mod legacy;
-
-pub(crate) use legacy::router;
+//! application/nostr+json+rpc` and NIP-98 authentication.
 
 use std::sync::Arc;
 

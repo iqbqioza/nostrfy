@@ -178,12 +178,6 @@ outbox_write_policy = "any"
 # -----------------------------------------------------------------------------
 [rpc]
 
-# Separate localhost management port for the legacy NIP-86 REST endpoints;
-# 0 disables the management server entirely. The NIP-86 JSON-RPC API is
-# always served on the relay's own HTTP endpoint.
-management_port = 0
-management_host = "127.0.0.1"
-
 # Bearer token that authorizes NIP-86 management calls
 # (Authorization: Bearer <token>). Empty disables this method.
 management_token = ""

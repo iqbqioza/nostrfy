@@ -194,8 +194,6 @@ To generate a secret key, use the `nostrfy genkey` command (see [5. Command Refe
 
 | Key | Description | Default |
 | --- | --- | --- |
-| `management_port` | Legacy management port (0 = disabled) | `0` |
-| `management_host` | Bind address for the management port | `127.0.0.1` |
 | `management_token` | Bearer token for the management API | empty |
 | `admin_pubkey` | Administrator public key for NIP-98 auth | empty |
 
@@ -474,7 +472,6 @@ curl -X POST http://127.0.0.1:8080/ \
 
 ### Legacy management port
 
-If `rpc.management_port` is set, the legacy REST endpoints are available at `http://<management_host>:<port>/admin/...` (`/admin/info`, `/admin/stats`, `/admin/block_pubkey`, `/admin/allow_pubkey`, `/admin/block_kind`, `/admin/allow_kind`, `/admin/status/{id}`, `/admin/shutdown`). Same authentication.
 
 ---
 
@@ -790,7 +787,7 @@ kill -HUP $(cat nostrfy.pid)
 
 Settings that take effect on reload: the relay name/description/pubkey/contact/icon/post-policy, `public_url`, most `[limits]` entries (the restart-only ones are listed below), the NIP toggles (`reject_ephemeral`, `enabled_git`, `enabled_nip78_auth`), NIP-40 on/off and the REST API concurrency ceiling.
 
-Settings that require a **restart** (the log warns when one of them changed): `private_key`, `api_host`, `metrics_enabled`, LiveKit settings, `enabled_nips`/`disabled_nips`, `server.host`/`port`/`ws_paths`, `rpc.management_port`/`management_host`/`max_admin_body_bytes`, `database.path`/`purge_interval_secs`/`map_size`/`max_map_size`/`search_index`/`meta_index`/`reader_threads`/`disabled_fsync`/`db_request_timeout_secs`/`max_db_queue_msgs`/`max_db_queue_events`/`max_indexed_words`, `daemon.max_log_size_bytes`/`max_log_files`/`stats_interval_secs`, `limits.live_buffer`/`live_batch_size`/`live_batch_interval_ms`/`socket_recv_buffer_kb`/`max_connections`/`http_read_timeout_secs`/`max_connections_per_sec_per_ip`, all `blossom.*`, and `relay.max_groups` (captured at startup; not covered by the reload warning). See the CONFIGURATION.md SIGHUP table for the full matrix.
+Settings that require a **restart** (the log warns when one of them changed): `private_key`, `api_host`, `metrics_enabled`, LiveKit settings, `enabled_nips`/`disabled_nips`, `server.host`/`port`/`ws_paths`, `rpc.max_admin_body_bytes`, `database.path`/`purge_interval_secs`/`map_size`/`max_map_size`/`search_index`/`meta_index`/`reader_threads`/`disabled_fsync`/`db_request_timeout_secs`/`max_db_queue_msgs`/`max_db_queue_events`/`max_indexed_words`, `daemon.max_log_size_bytes`/`max_log_files`/`stats_interval_secs`, `limits.live_buffer`/`live_batch_size`/`live_batch_interval_ms`/`socket_recv_buffer_kb`/`max_connections`/`http_read_timeout_secs`/`max_connections_per_sec_per_ip`, all `blossom.*`, and `relay.max_groups` (captured at startup; not covered by the reload warning). See the CONFIGURATION.md SIGHUP table for the full matrix.
 
 ---
 

@@ -212,15 +212,10 @@ pub struct ServerConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RpcConfig {
-    /// Separate local management port for NIP-86; 0 disables it.
-    pub management_port: u16,
-    pub management_host: String,
     pub management_token: String,
     /// Admin pubkey for NIP-98 authenticated management calls.
     pub admin_pubkey: String,
-    /// Body limit for the NIP-86 management RPC (the JSON-RPC handler and
-    /// the legacy management endpoints): requests are tiny method+params
-    /// documents, so a 64 KiB ceiling is generous.
+    /// Body limit for the NIP-86 JSON-RPC handler.
     pub max_admin_body_bytes: usize,
 }
 
@@ -426,8 +421,6 @@ impl Default for ServerConfig {
 impl Default for RpcConfig {
     fn default() -> Self {
         RpcConfig {
-            management_port: 0,
-            management_host: "127.0.0.1".into(),
             management_token: String::new(),
             admin_pubkey: String::new(),
             max_admin_body_bytes: 64 * 1024,
@@ -512,6 +505,7 @@ impl Default for DaemonConfig {
 /// A config written for an older layout is accepted: the old value is
 /// applied to the new location with a deprecation warning (the warning
 /// also tells the operator which key to use next time).
+#[cfg(test)]
 const LEGACY_ALIASES: &[(&str, &str, &str, &str)] = &[
     ("relay", "enable_git", "relay", "enabled_git"),
     ("server", "require_auth", "relay", "require_auth"),
@@ -521,10 +515,6 @@ const LEGACY_ALIASES: &[(&str, &str, &str, &str)] = &[
         "relay",
         "send_auth_challenge",
     ),
-    ("server", "management_port", "rpc", "management_port"),
-    ("server", "management_host", "rpc", "management_host"),
-    ("server", "management_token", "rpc", "management_token"),
-    ("server", "admin_pubkey", "rpc", "admin_pubkey"),
     ("limits", "require_pow", "relay", "require_pow"),
     (
         "limits",
@@ -615,6 +605,7 @@ const LEGACY_ALIASES: &[(&str, &str, &str, &str)] = &[
 /// silently wrap one into a huge number. On failure the value degrades to
 /// the safe default (0) — the config validation rejects the resulting
 /// zero limits, and 0 means "disabled" for the policy knobs.
+#[cfg(test)]
 fn alias_int<T: TryFrom<i64> + Default>(v: &toml::Value) -> T {
     v.as_integer()
         .and_then(|i| T::try_from(i).ok())
@@ -624,6 +615,7 @@ fn alias_int<T: TryFrom<i64> + Default>(v: &toml::Value) -> T {
 /// A boolean legacy alias: a non-boolean value is warned about instead of
 /// being silently dropped to `false` (an auth flag silently disabled is
 /// worse than a loudly ignored value).
+#[cfg(test)]
 fn alias_bool(v: &toml::Value, key: &str, warnings: &mut Vec<String>) -> bool {
     match v.as_bool() {
         Some(b) => b,
@@ -640,6 +632,7 @@ fn alias_bool(v: &toml::Value, key: &str, warnings: &mut Vec<String>) -> bool {
 /// recognized (never flagged as unknown) and their values land in the new
 /// locations. Returns the warnings to log: one per applied alias, plus the
 /// conflicts and invalid values.
+#[cfg(test)]
 fn apply_legacy_aliases(raw: &str, cfg: &mut Config) -> Vec<String> {
     let mut warnings = Vec::new();
     let Ok(value) = raw.parse::<toml::Value>() else {
@@ -686,16 +679,6 @@ fn apply_legacy_aliases(raw: &str, cfg: &mut Config) -> Vec<String> {
             ("server", "send_auth_challenge") => {
                 cfg.relay.send_auth_challenge =
                     alias_bool(v, "server.send_auth_challenge", &mut warnings)
-            }
-            ("server", "management_port") => cfg.rpc.management_port = alias_int::<u16>(v),
-            ("server", "management_host") => {
-                cfg.rpc.management_host = v.as_str().unwrap_or("").to_string()
-            }
-            ("server", "management_token") => {
-                cfg.rpc.management_token = v.as_str().unwrap_or("").to_string()
-            }
-            ("server", "admin_pubkey") => {
-                cfg.rpc.admin_pubkey = v.as_str().unwrap_or("").to_string()
             }
             ("limits", "require_pow") => cfg.relay.require_pow = alias_int::<u8>(v),
             ("limits", "new_pubkey_min_age_secs") => {
@@ -751,11 +734,8 @@ impl Config {
     pub fn load(path: &Path) -> Result<Config> {
         let raw = std::fs::read_to_string(path)
             .map_err(|e| config_err(format!("cannot read {}: {e}", path.display())))?;
-        let mut cfg: Config = toml::from_str(&raw)
+        let cfg: Config = toml::from_str(&raw)
             .map_err(|e| config_err(format!("invalid {}: {e}", path.display())))?;
-        apply_legacy_aliases(&raw, &mut cfg)
-            .into_iter()
-            .for_each(|warning| log::warn!("{warning}"));
         warn_unknown_fields(&raw);
         Ok(cfg)
     }
@@ -1024,11 +1004,6 @@ impl Config {
                 "server.outbox_write_policy must be \"any\" or \"relay\", got {:?}",
                 self.server.outbox_write_policy
             )));
-        }
-        if self.rpc.management_port > 0 && self.rpc.management_port == self.server.port {
-            return Err(config_err(
-                "rpc.management_port must differ from server.port",
-            ));
         }
         // Host split hostnames must be bare hostnames: a scheme, path or
         // port in the config would never match a request Host header and
@@ -1752,8 +1727,6 @@ fn known_config_keys() -> &'static [(&'static str, &'static [&'static str])] {
                 "inbox_write_policy",
                 "outbox_write_policy",
                 "metrics_enabled",
-                "management_port",
-                "management_host",
                 "management_token",
                 "admin_pubkey",
                 "require_auth",
@@ -1762,13 +1735,7 @@ fn known_config_keys() -> &'static [(&'static str, &'static [&'static str])] {
         ),
         (
             "rpc",
-            &[
-                "management_port",
-                "management_host",
-                "management_token",
-                "admin_pubkey",
-                "max_admin_body_bytes",
-            ],
+            &["management_token", "admin_pubkey", "max_admin_body_bytes"],
         ),
         (
             "limits",
@@ -1979,10 +1946,6 @@ enable_git = true
 [server]
 require_auth = true
 send_auth_challenge = false
-management_port = 9999
-management_host = "127.0.0.2"
-management_token = "old-token"
-admin_pubkey = "abababababababababababababababababababababababababababababababab"
 [limits]
 require_pow = 4
 new_pubkey_min_age_secs = 60
@@ -2019,10 +1982,6 @@ log_max_files = 2
         assert!(cfg.relay.enabled_git);
         assert!(cfg.relay.require_auth);
         assert!(!cfg.relay.send_auth_challenge);
-        assert_eq!(cfg.rpc.management_port, 9999);
-        assert_eq!(cfg.rpc.management_host, "127.0.0.2");
-        assert_eq!(cfg.rpc.management_token, "old-token");
-        assert_eq!(cfg.rpc.admin_pubkey, "ab".repeat(32));
         assert_eq!(cfg.relay.require_pow, 4);
         assert_eq!(cfg.relay.new_pubkey_min_age_secs, 60);
         assert_eq!(cfg.relay.max_events_per_min_per_pubkey, 30);
@@ -2108,7 +2067,7 @@ max_log_files = 2
         // The old serde field types rejected a negative or overflowing
         // value at load time; an alias must not silently wrap one into a
         // huge number. Invalid values degrade to 0 (safe defaults).
-        let raw = "[limits]\ncount_limit = -5\nmax_groups = -1\nmanagement_port = 70000\n";
+        let raw = "[limits]\ncount_limit = -5\nmax_groups = -1\n";
         let cfg: Config = toml::from_str(raw).unwrap();
         let mut cfg = cfg;
         let warnings = apply_legacy_aliases(raw, &mut cfg);
@@ -2123,10 +2082,6 @@ max_log_files = 2
         assert_eq!(
             cfg.relay.max_groups, 0,
             "a negative max_groups must not wrap"
-        );
-        assert_eq!(
-            cfg.rpc.management_port, 0,
-            "an overflowing port must not wrap"
         );
     }
 
@@ -2633,13 +2588,6 @@ max_log_files = 2
     fn validation_rejects_port_collision_and_map_layout() {
         let mut cfg = Config::default();
         cfg.server.port = 8080;
-        cfg.rpc.management_port = 8080;
-        assert!(
-            cfg.validate().is_err(),
-            "management_port must differ from port"
-        );
-        cfg.rpc.management_port = 0;
-
         cfg.database.map_size = 1024 * 1024;
         cfg.database.max_map_size = 512 * 1024;
         assert!(
