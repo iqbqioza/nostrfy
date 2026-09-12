@@ -440,12 +440,10 @@ impl Store {
         }
         let mut wtxn = self.env.write_txn()?;
         let since_key = created_key(0, &[0u8; ID_LEN]);
-        // NIP-40 semantics are `expiration < now` (every other path checks
-        // `exp < now`): the purge must not delete events whose expiration
-        // equals the current second. The exclusive `(now, 0..)` upper bound
-        // covers every expiration below `now` (including the maximal id at
-        // exactly `now - 1`).
-        let until_key = created_key(now, &[0u8; ID_LEN]);
+        // NIP-40 semantics are `expiration <= now`: include every key at the
+        // current second by using the largest possible event id as the
+        // inclusive upper bound.
+        let until_key = created_key(now, &[0xff; ID_LEN]);
         let mut last_key: Option<Vec<u8>> = None;
         let mut removed = 0usize;
         loop {
@@ -457,7 +455,7 @@ impl Store {
                 .expiry
                 .range(
                     &wtxn,
-                    &(lower, std::ops::Bound::Excluded(until_key.as_slice())),
+                    &(lower, std::ops::Bound::Included(until_key.as_slice())),
                 )?
                 .filter_map(|item| {
                     item.ok()

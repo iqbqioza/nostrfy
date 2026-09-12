@@ -1385,7 +1385,7 @@ fn consider_event<C: ScanCollector>(
         {
             return Ok(true);
         }
-        if ctx.expiry_enabled && exp != 0 && exp < now {
+        if ctx.expiry_enabled && exp != 0 && exp <= now {
             return Ok(true);
         }
     }
@@ -1451,7 +1451,7 @@ fn is_deliverable<E: crate::filter::EventFields>(
             .iter()
             .find(|t| t.len() >= 2 && t[0] == crate::nips::nip40::EXPIRATION_TAG)
             .and_then(|t| t[1].parse::<u64>().ok())
-        && exp < now
+        && exp <= now
     {
         return Ok(false);
     }

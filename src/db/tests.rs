@@ -139,6 +139,25 @@ fn expired_events_are_filtered() {
         let f: Filter = serde_json::from_value(serde_json::json!({"kinds": [1]})).unwrap();
         let (res, _) = db.query(vec![f], 500, now).await;
         assert!(res.is_empty());
+
+        let equal = event(
+            1,
+            "expires exactly now",
+            now,
+            vec![vec!["expiration".into(), now.to_string()]],
+        );
+        db.set_expiry_enabled(false);
+        assert_eq!(db.put(equal.clone(), now).await, PutOutcome::Stored);
+        db.set_expiry_enabled(true);
+        let (res, _) = db
+            .query(
+                vec![serde_json::from_value(serde_json::json!({"ids": [equal.id]})).unwrap()],
+                500,
+                now,
+            )
+            .await;
+        assert!(res.is_empty());
+        assert_eq!(db.purge_expired(now).await, 1);
     });
 }
 

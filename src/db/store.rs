@@ -1024,14 +1024,14 @@ impl Store {
         if (20000..30000).contains(&event.kind) {
             return Ok(PutOutcome::Ephemeral);
         }
-        // NIP-40: events whose expiration already passed are dropped. The
+        // NIP-40: events whose expiration has arrived are dropped. The
         // check comes after the ephemeral range because "an expiration
         // timestamp does not affect storage of ephemeral events".
         if self
             .expiry_enabled
             .load(std::sync::atomic::Ordering::Relaxed)
             && let Some(exp) = nip40::expiry(event)
-            && exp < now
+            && exp <= now
         {
             return Ok(PutOutcome::Expired);
         }
