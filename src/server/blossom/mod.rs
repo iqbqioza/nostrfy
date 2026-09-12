@@ -838,8 +838,11 @@ async fn put_blob(relay: Arc<Relay>, headers: HeaderMap, body: Body, verb: &str)
         .store
         .put_file(&pubkey, &sha, &path, size, &mime)
         .await;
-    let _ = tokio::fs::remove_file(&path).await;
-    cleanup.disarm();
+    match tokio::fs::remove_file(&path).await {
+        Ok(()) => cleanup.disarm(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => cleanup.disarm(),
+        Err(_) => {}
+    }
     drop(permits);
     match result {
         Ok(desc) => {
