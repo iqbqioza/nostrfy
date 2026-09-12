@@ -88,9 +88,8 @@ impl BlobStore {
         })
     }
 
-    async fn blob_lock(&self, pubkey: &str, sha256: &str) -> tokio::sync::MutexGuard<'_, ()> {
+    async fn blob_lock(&self, sha256: &str) -> tokio::sync::MutexGuard<'_, ()> {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        pubkey.hash(&mut hasher);
         sha256.hash(&mut hasher);
         let index = (hasher.finish() as usize) % self.upload_locks.len();
         self.upload_locks[index].lock().await
@@ -120,7 +119,7 @@ impl BlobStore {
         // leftovers, but only the bytes that will actually land should be
         // committed).
         self.check_space()?;
-        let _blob_guard = self.blob_lock(pubkey, sha256).await;
+        let _blob_guard = self.blob_lock(sha256).await;
         let uploaded = crate::util::unix_now() as i64;
         // Whether the uploader already owned the blob BEFORE this upload
         // (read before the add: a failed re-upload of identical bytes must
@@ -181,15 +180,13 @@ impl BlobStore {
         path: &Path,
         size: u64,
         mime: &str,
-    ) -> Result<Descriptor> {
+    ) -> Result<(Descriptor, bool)> {
         self.check_space()?;
-        let _blob_guard = self.blob_lock(pubkey, sha256).await;
+        let _blob_guard = self.blob_lock(sha256).await;
         let uploaded = crate::util::unix_now() as i64;
-        let was_owner = self
-            .db
-            .blossom_load(sha256)
-            .await
-            .is_some_and(|m| m.owners.iter().any(|o| o == pubkey));
+        let existing = self.db.blossom_load(sha256).await;
+        let existed = existing.is_some();
+        let was_owner = existing.is_some_and(|m| m.owners.iter().any(|o| o == pubkey));
         if !self
             .db
             .blossom_add_owner(sha256, mime, size, uploaded, pubkey)
@@ -213,13 +210,16 @@ impl BlobStore {
             }
             return Err(e);
         }
-        Ok(Descriptor {
-            sha256: sha256.to_string(),
-            size,
-            mime: mime.to_string(),
-            uploaded,
-            pubkey: pubkey.to_string(),
-        })
+        Ok((
+            Descriptor {
+                sha256: sha256.to_string(),
+                size,
+                mime: mime.to_string(),
+                uploaded,
+                pubkey: pubkey.to_string(),
+            },
+            existed,
+        ))
     }
 
     /// Resolves a blob by its sha256 straight from LMDB.
@@ -307,7 +307,7 @@ impl BlobStore {
     /// (blob first, so a crash leaves a healable state) and their entry in
     /// the LMDB mapping. Other uploaders of the same bytes keep theirs.
     pub(crate) async fn delete(&self, pubkey: &str, sha256: &str) -> Result<bool> {
-        let _blob_guard = self.blob_lock(pubkey, sha256).await;
+        let _blob_guard = self.blob_lock(sha256).await;
         let npub = npub_of(pubkey);
         let legacy = legacy_npub_of(pubkey);
         let mut existed = false;
