@@ -575,7 +575,11 @@ impl LocalStore {
             let _ = tokio::fs::remove_file(&tmp_path).await;
             return Err(e.into());
         }
-        output.flush().await?;
+        if let Err(e) = output.flush().await {
+            drop(output);
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            return Err(e.into());
+        }
         drop(output);
         if let Err(e) = tokio::fs::rename(&tmp_path, self.blob_path(npub, sha256)).await {
             let _ = tokio::fs::remove_file(&tmp_path).await;
