@@ -446,6 +446,22 @@ impl super::Conn {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
 
+        // Install the response barrier before querying. The connection task
+        // cannot process live batches while this query is awaited, but
+        // creating it here also makes the ordering invariant explicit:
+        // stored events and EOSE are always queued before live events.
+        self.enqueue_pending_req(crate::ws::PendingReq {
+            sub_id: sub_id.to_string(),
+            events: Default::default(),
+            eose_hint,
+            truncated_or_more: false,
+            auth_hint: false,
+            sent_bytes: 0,
+            live: Default::default(),
+            live_bytes: 0,
+            eose_sent: false,
+        });
+
         let now = unix_now();
         // The scan over-fetches each filter's limit (hidden-event slack) so
         // that events withheld by the visibility rules below do not consume
@@ -522,17 +538,18 @@ impl super::Conn {
         // the capped queue in bounded chunks as the socket drains, so a
         // slow reader can never pin more than the byte cap in the queue —
         // or more than `limits.max_req_response_bytes` per response.
-        self.enqueue_pending_req(crate::ws::PendingReq {
-            sub_id: sub_id.to_string(),
-            events: to_send.into(),
-            eose_hint,
-            truncated_or_more: truncated || more,
-            auth_hint: auth_hidden,
-            sent_bytes: 0,
-            live: Default::default(),
-            live_bytes: 0,
-            eose_sent: false,
-        });
+        let Some(pending) = self
+            .pending_reqs
+            .iter_mut()
+            .find(|pending| pending.sub_id == sub_id)
+        else {
+            self.remove_req_subscription(sub_id);
+            self.send_closed(sub_id, "error: response barrier lost, please retry");
+            return;
+        };
+        pending.events = to_send.into();
+        pending.truncated_or_more = truncated || more;
+        pending.auth_hint = auth_hidden;
     }
 
     pub(crate) fn handle_close(&mut self, rest: &[Value]) {
