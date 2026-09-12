@@ -100,7 +100,9 @@ pub struct Verified {
 /// absolute request URL" only authorizes one request, so a captured
 /// `Authorization` header must not be reusable. Entries expire with the
 /// 60-second auth window; a hard cap bounds memory even under an
-/// authenticated event flood (fail closed at the cap).
+/// authenticated event flood. At capacity, the earliest-expiring entry is
+/// evicted so a new authorization cannot deny every subsequent request.
+/// This is process-local replay protection; restarting clears the guard.
 pub struct ReplayGuard {
     seen: std::sync::Mutex<std::collections::HashMap<String, u64>>,
 }
@@ -118,12 +120,21 @@ impl ReplayGuard {
     const MAX_ENTRIES: usize = 4096;
 
     /// Records `id` (valid until `now + 60`); returns `false` when it was
-    /// already used (a replay) or the guard is full.
+    /// already used (a replay). At capacity, the earliest expiry is evicted.
     pub fn accept(&self, id: &str, now: u64) -> bool {
         let mut seen = self.seen.lock().unwrap_or_else(|p| p.into_inner());
         seen.retain(|_, expiry| *expiry > now);
-        if seen.contains_key(id) || seen.len() >= Self::MAX_ENTRIES {
+        if seen.contains_key(id) {
             return false;
+        }
+        if seen.len() >= Self::MAX_ENTRIES {
+            let oldest = seen
+                .iter()
+                .min_by_key(|(_, expiry)| **expiry)
+                .map(|(id, _)| id.clone());
+            if let Some(oldest) = oldest {
+                seen.remove(&oldest);
+            }
         }
         seen.insert(id.to_string(), now.saturating_add(60));
         true
@@ -428,5 +439,22 @@ mod tests {
         assert!(guard.accept("aa", 1_061));
         // Distinct ids are independent.
         assert!(guard.accept("bb", 1_061));
+    }
+
+    #[test]
+    fn replay_guard_evicts_oldest_entry_at_capacity() {
+        let guard = ReplayGuard::default();
+        for n in 0..ReplayGuard::MAX_ENTRIES {
+            assert!(guard.accept(&format!("id-{n}"), 1_000 + n as u64));
+        }
+        assert!(guard.accept("new", 1_001));
+        assert!(
+            guard.accept("id-0", 1_001),
+            "the oldest entry was evicted instead of denying new auth"
+        );
+        assert!(
+            !guard.accept("id-4095", 1_001),
+            "the newest entry remains protected from replay"
+        );
     }
 }
