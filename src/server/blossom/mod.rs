@@ -789,6 +789,7 @@ async fn put_blob(relay: Arc<Relay>, headers: HeaderMap, body: Body, verb: &str)
         Ok(value) => value,
         Err(response) => return *response,
     };
+    let mut cleanup = TempUploadCleanup::new(path.clone());
     // BUD-02/05: the optional `X-SHA-256` header declares the expected hash
     // of the request body — a provided value that does not match the actual
     // bytes is a 409 Conflict, and a malformed value is a 400.
@@ -838,6 +839,7 @@ async fn put_blob(relay: Arc<Relay>, headers: HeaderMap, body: Body, verb: &str)
         .put_file(&pubkey, &sha, &path, size, &mime)
         .await;
     let _ = tokio::fs::remove_file(&path).await;
+    cleanup.disarm();
     drop(permits);
     match result {
         Ok(desc) => {
@@ -887,6 +889,7 @@ async fn spool_upload(
         std::process::id(),
         TEMP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
+    let mut cleanup = TempUploadCleanup::new(path.clone());
     let mut file = match tokio::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -908,7 +911,6 @@ async fn spool_upload(
         let chunk = match chunk {
             Ok(chunk) => chunk,
             Err(e) => {
-                let _ = tokio::fs::remove_file(&path).await;
                 return Err(Box::new(error(
                     StatusCode::BAD_REQUEST,
                     &format!("upload body failed: {e}"),
@@ -917,7 +919,6 @@ async fn spool_upload(
         };
         size = size.saturating_add(chunk.len() as u64);
         if size > max_upload as u64 {
-            let _ = tokio::fs::remove_file(&path).await;
             return Err(Box::new(error(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "upload exceeds the configured size limit",
@@ -925,7 +926,6 @@ async fn spool_upload(
         }
         hash.update(&chunk);
         if let Err(e) = file.write_all(&chunk).await {
-            let _ = tokio::fs::remove_file(&path).await;
             return Err(Box::new(error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 &format!("temporary upload failed: {e}"),
@@ -933,13 +933,44 @@ async fn spool_upload(
         }
     }
     if let Err(e) = file.flush().await {
-        let _ = tokio::fs::remove_file(&path).await;
         return Err(Box::new(error(
             StatusCode::INTERNAL_SERVER_ERROR,
             &format!("temporary upload failed: {e}"),
         )));
     }
+    drop(file);
+    cleanup.disarm();
     Ok((path, size, hex::encode(hash.finalize())))
+}
+
+struct TempUploadCleanup {
+    path: Option<std::path::PathBuf>,
+}
+
+impl TempUploadCleanup {
+    fn new(path: std::path::PathBuf) -> Self {
+        Self { path: Some(path) }
+    }
+
+    fn disarm(&mut self) {
+        self.path = None;
+    }
+}
+
+impl Drop for TempUploadCleanup {
+    fn drop(&mut self) {
+        let Some(path) = self.path.take() else {
+            return;
+        };
+        if let Err(e) = std::fs::remove_file(&path)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            log::warn!(
+                "cannot remove temporary Blossom upload {}: {e}",
+                path.display()
+            );
+        }
+    }
 }
 
 /// `HEAD /upload` — BUD-06 pre-flight: whether a `PUT /upload` would be
@@ -1753,6 +1784,18 @@ mod tests {
             sanitize_mime(&format!("image/{}", "x".repeat(65))),
             "application/octet-stream"
         );
+    }
+
+    #[test]
+    fn temporary_upload_cleanup_removes_abandoned_file() {
+        let path =
+            std::env::temp_dir().join(format!("nostrfy-blossom-cleanup-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, b"abandoned").unwrap();
+        {
+            let _cleanup = TempUploadCleanup::new(path.clone());
+        }
+        assert!(!path.exists());
     }
 
     #[test]
