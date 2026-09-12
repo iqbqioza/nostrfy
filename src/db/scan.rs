@@ -986,7 +986,10 @@ impl Store {
                     // their full content so a term past the index cap is
                     // still found (NIP-50 searches the whole content).
                     let start = word_key(WORD_OVERFLOW, since, &[0u8; ID_LEN]);
-                    let end = word_key(WORD_OVERFLOW, until.saturating_add(1), &[0u8; ID_LEN]);
+                    let end = crate::db::store::range_end(
+                        word_key(WORD_OVERFLOW, until.saturating_add(1), &[0u8; ID_LEN]),
+                        until,
+                    );
                     if !self.walk_created_range(
                         rtxn,
                         by_word,
@@ -1017,7 +1020,10 @@ impl Store {
                     // Exclusive bound `(until + 1, 0..)` covers every event
                     // with `created_at <= until`, including the maximal id
                     // (`ff..ff`) at exactly `until`.
-                    pubkey_key(&pk, until.saturating_add(1), &[0u8; ID_LEN]),
+                    crate::db::store::range_end(
+                        pubkey_key(&pk, until.saturating_add(1), &[0u8; ID_LEN]),
+                        until,
+                    ),
                 ));
             }
             if !ranges.is_empty()
@@ -1097,7 +1103,10 @@ impl Store {
                     // Exclusive `(until + 1, 0..)`: includes every event with
                     // `created_at <= until`, including the maximal id at
                     // exactly `until`.
-                    kind_key(*kind, until.saturating_add(1), &[0u8; ID_LEN]),
+                    crate::db::store::range_end(
+                        kind_key(*kind, until.saturating_add(1), &[0u8; ID_LEN]),
+                        until,
+                    ),
                 ));
             }
             if !ranges.is_empty()
@@ -1111,7 +1120,10 @@ impl Store {
         let start = created_key(since, &[0u8; ID_LEN]);
         // Exclusive `(until + 1, 0..)`: includes every event with
         // `created_at <= until`, including the maximal id at exactly `until`.
-        let end = created_key(until.saturating_add(1), &[0u8; ID_LEN]);
+        let end = crate::db::store::range_end(
+            created_key(until.saturating_add(1), &[0u8; ID_LEN]),
+            until,
+        );
         // A per-filter limit/budget stop only ends this filter's walk, like
         // every other index path: the remaining filters still contribute
         // results. (Returning `true` here used to drop the rest of a

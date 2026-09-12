@@ -83,6 +83,45 @@ fn insert_and_query() {
 }
 
 #[test]
+fn maximal_timestamp_is_included_by_indexed_queries() {
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let max = event(
+            777,
+            "maximal timestamp searchable",
+            u64::MAX,
+            vec![vec!["t".into(), "boundary".into()]],
+        );
+        assert_eq!(db.put(max.clone(), u64::MAX).await, PutOutcome::Stored);
+
+        for filter in [
+            serde_json::json!({}),
+            serde_json::json!({"kinds": [777]}),
+            serde_json::json!({"authors": [max.pubkey]}),
+            serde_json::json!({"#t": ["boundary"]}),
+            serde_json::json!({"search": "searchable"}),
+        ] {
+            let filter: Filter = serde_json::from_value(filter).unwrap();
+            let (events, _) = db.query(vec![filter], 10, u64::MAX).await;
+            assert!(
+                events.iter().any(|event| event.id == max.id),
+                "maximal-timestamp event missing from filter result"
+            );
+        }
+    });
+}
+
+#[test]
 fn replaceable_and_deletion() {
     let db = DbClient::open(
         &config(),
