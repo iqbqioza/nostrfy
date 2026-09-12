@@ -633,12 +633,19 @@ impl LocalStore {
         // (A symlinked blob file itself is safe to remove — only the link
         // is deleted.)
         if !self.parent_within_root(npub).await {
-            return Ok(false);
+            let dir = self.root.join(npub);
+            return match tokio::fs::symlink_metadata(&dir).await {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                Ok(_) => Err(anyhow!("blossom storage directory is unsafe")),
+                Err(e) => Err(e.into()),
+            };
         }
         let path = self.blob_path(npub, sha256);
-        let existed = tokio::fs::try_exists(&path).await.unwrap_or(false);
-        let _ = tokio::fs::remove_file(&path).await;
-        Ok(existed)
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Scans `<root>/<npub>/<sha>.meta.json` for the legacy migration.
@@ -1235,10 +1242,8 @@ mod tests {
             std::fs::remove_dir_all(local(&s).root.join(&npub)).unwrap();
             std::os::unix::fs::symlink(&external, local(&s).root.join(&npub)).unwrap();
             // The delete is refused: the external file must survive.
-            assert!(
-                !s.delete(&a, &sha).await.unwrap(),
-                "the delete must not touch the symlink target"
-            );
+            assert!(s.delete(&a, &sha).await.is_err());
+            assert!(s.has(&a, &sha).await, "failed delete must keep the mapping");
             assert_eq!(
                 std::fs::read(external.join("victim")).unwrap(),
                 b"keep me",
