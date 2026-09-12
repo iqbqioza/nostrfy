@@ -43,6 +43,10 @@ pub(crate) struct BlossomState {
     pub store: BlobStore,
     /// The configured blossom hostname (used for the `server` auth tag).
     pub host: String,
+    /// Upload limit fixed when the HTTP router and semaphore are created.
+    /// Config reloads keep this value unchanged because the router cannot be
+    /// rebuilt without restarting the listener.
+    pub max_upload_bytes: usize,
     /// Shared in-flight upload budget. Upload bodies are spooled to a
     /// temporary file, so this bounds disk-backed work and prevents a burst
     /// of maximum-sized requests from creating unbounded concurrent work.
@@ -50,8 +54,7 @@ pub(crate) struct BlossomState {
 }
 
 /// The routes, mounted by `build_router` only when `blossom.host` is set.
-pub(crate) async fn routes(relay: &Arc<Relay>) -> axum::Router<Arc<Relay>> {
-    let max_upload = relay.config.read().await.blossom.max_upload_bytes;
+pub(crate) async fn routes(relay: &Arc<Relay>, max_upload: usize) -> axum::Router<Arc<Relay>> {
     // The root `/` route belongs to the relay: the WS handler answers it
     // with the Blossom server info when the Host names the Blossom host.
     axum::Router::new()
@@ -768,7 +771,7 @@ async fn put_blob(relay: Arc<Relay>, headers: HeaderMap, body: Body, verb: &str)
     let Some(state) = state_of(&relay).await else {
         return error(StatusCode::SERVICE_UNAVAILABLE, "blossom not initialized");
     };
-    let max_upload = relay.config.read().await.blossom.max_upload_bytes;
+    let max_upload = state.max_upload_bytes;
     let permits = match state
         .upload_budget
         .clone()
@@ -981,7 +984,7 @@ async fn head_preflight(relay: Arc<Relay>, headers: HeaderMap, verb: &str) -> Re
             "missing X-Content-Length header",
         );
     };
-    let max_upload = relay.config.read().await.blossom.max_upload_bytes as u64;
+    let max_upload = state.max_upload_bytes as u64;
     if len > max_upload {
         return error(
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -1161,6 +1164,7 @@ pub(crate) async fn build_state(cfg: &Config, _relay: &Relay) -> Option<Arc<Blos
             let state = Arc::new(BlossomState {
                 store,
                 host: cfg.blossom.host.clone(),
+                max_upload_bytes: cfg.blossom.max_upload_bytes,
                 upload_budget: Arc::new(tokio::sync::Semaphore::new(
                     cfg.blossom.max_upload_bytes.saturating_mul(4).max(1),
                 )),

@@ -244,8 +244,9 @@ async fn build_router(
             normalize_host(&cfg.blossom.host),
         )
     };
-    if blossom_state.is_some() {
-        app = app.merge(blossom::routes(relay).await);
+    if let Some(state) = blossom_state.as_ref() {
+        let max_upload = state.max_upload_bytes;
+        app = app.merge(blossom::routes(relay, max_upload).await);
     }
     drop(cfg);
     if !api_host.is_empty() || !blossom_host.is_empty() {
@@ -654,7 +655,13 @@ async fn blossom_root_info(
         "tos_url": null,
         "payment_required": false,
         "upload_url": format!("https://{}/upload", cfg.blossom.host.trim()),
-        "max_file_size": cfg.blossom.max_upload_bytes,
+        "max_file_size": relay
+            .blossom
+            .read()
+            .await
+            .as_ref()
+            .map(|state| state.max_upload_bytes)
+            .unwrap_or(cfg.blossom.max_upload_bytes),
         "storage": cfg.blossom.storage,
     });
     let mut response = Json(info).into_response();
