@@ -569,8 +569,24 @@ impl Relay {
                 return false;
             }
         }
+
         rate.entry(pubkey.to_string()).or_default().push_back(now);
         true
+    }
+
+    /// Releases one publish-rate reservation when database admission rejects
+    /// the event after validation. The timestamp is unique to this
+    /// reservation only by count, so remove exactly one matching entry.
+    pub(crate) fn publish_rate_rollback(&self, pubkey: &str, now: u64) {
+        let mut rate = self.publish_rate.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(window) = rate.get_mut(pubkey)
+            && let Some(pos) = window.iter().rposition(|timestamp| *timestamp == now)
+        {
+            window.remove(pos);
+        }
+        if rate.get(pubkey).is_some_and(|window| window.is_empty()) {
+            rate.remove(pubkey);
+        }
     }
 
     /// Hex pubkey of the relay's own key, if configured.
@@ -749,7 +765,6 @@ impl Relay {
                 let Some(pubkey) = event.pubkey_bytes() else {
                     return (PutOutcome::Invalid("invalid: bad pubkey".into()), None);
                 };
-                drop(cfg);
                 drop(access);
                 self.vanish_pubkey(pubkey, event.created_at).await;
                 // A vanish request is accepted like any other event (the
@@ -790,6 +805,13 @@ impl Relay {
             }
         }
 
+        if !self.publish_rate_allowed(&cfg, &event.pubkey, now) {
+            self.stats.bump(&self.stats.events_rejected, 1);
+            return (
+                PutOutcome::Invalid("rate-limited: too many events".into()),
+                None,
+            );
+        }
         let outcome = self.db.put(event.clone(), now).await;
         if persist_first_seen
             && matches!(
@@ -802,9 +824,16 @@ impl Relay {
         }
         let (nip9, nip43, nip29_enabled) =
             (cfg.nip_enabled(9), cfg.nip_enabled(43), cfg.nip_enabled(29));
-        drop(cfg);
         drop(access);
 
+        let accepted = matches!(
+            outcome,
+            PutOutcome::Stored | PutOutcome::Replaced | PutOutcome::Ephemeral
+        );
+        if !accepted {
+            self.publish_rate_rollback(&event.pubkey, now);
+        }
+        drop(cfg);
         match outcome {
             PutOutcome::Stored | PutOutcome::Replaced | PutOutcome::Ephemeral => {
                 if !self.after_put(event, now, nip9, nip43, nip29_enabled).await {
@@ -993,7 +1022,7 @@ impl Relay {
         let roles_enabled = cfg.nip_enabled(43);
         let nip9_enabled = cfg.nip_enabled(9);
         let min_age = cfg.relay.new_pubkey_min_age_secs;
-        drop(cfg);
+        let rate_limit = cfg.relay.max_events_per_min_per_pubkey;
         drop(access);
 
         // First-seen trust check: pubkeys first seen within the configured
@@ -1045,12 +1074,39 @@ impl Relay {
             }
         }
 
+        if rate_limit > 0 && !puts.is_empty() {
+            let mut kept = Vec::with_capacity(puts.len());
+            let mut kept_slots = Vec::with_capacity(put_slots.len());
+            let mut kept_new = Vec::with_capacity(new_pubkeys.len());
+            let new_flags = if new_pubkeys.is_empty() {
+                vec![false; puts.len()]
+            } else {
+                new_pubkeys
+            };
+            for ((event, slot), is_new) in puts.into_iter().zip(put_slots).zip(new_flags) {
+                if self.publish_rate_allowed(&cfg, &event.pubkey, now) {
+                    kept.push(event);
+                    kept_slots.push(slot);
+                    kept_new.push(is_new);
+                } else {
+                    self.stats.bump(&self.stats.events_rejected, 1);
+                    results[slot] = (
+                        event.id,
+                        PutOutcome::Invalid("rate-limited: too many events".into()),
+                    );
+                }
+            }
+            puts = kept;
+            put_slots = kept_slots;
+            new_pubkeys = kept_new;
+        }
         let receiver = if puts.is_empty() {
             None
         } else {
             self.db
                 .put_batch_deferred(puts.iter().map(|e| (e.clone(), now)).collect())
         };
+        drop(cfg);
 
         PendingBatch {
             receiver,
@@ -1303,6 +1359,7 @@ impl PendingBatch {
         let nip29 = self.nip29;
         let Some(receiver) = self.receiver else {
             for (event, slot) in puts.into_iter().zip(put_slots) {
+                relay.publish_rate_rollback(&event.pubkey, now);
                 relay.stats.bump(&relay.stats.events_rejected, 1);
                 results[slot] = (
                     event.id,
@@ -1359,9 +1416,11 @@ impl PendingBatch {
                     relay.stats.bump(&relay.stats.events_accepted, 1);
                 }
                 PutOutcome::Duplicate(_) => {
+                    relay.publish_rate_rollback(&event.pubkey, now);
                     relay.stats.bump(&relay.stats.events_duplicate, 1);
                 }
                 _ => {
+                    relay.publish_rate_rollback(&event.pubkey, now);
                     relay.stats.bump(&relay.stats.events_rejected, 1);
                 }
             }

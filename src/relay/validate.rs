@@ -150,13 +150,6 @@ impl super::Relay {
         if !access.allows_kind(event.kind) {
             return Precheck::Reject("blocked: kind not allowed".into());
         }
-        // Spam defense: a pubkey may publish at most
-        // `relay.max_events_per_min_per_pubkey` events per minute
-        // (sliding 60-second window). Counted per accepted event before
-        // the database write.
-        if !self.publish_rate_allowed(cfg, &event.pubkey, now) {
-            return Precheck::Reject("rate-limited: too many events".into());
-        }
         // NIP-43: join requests carry an invite code, which this relay
         // never issues; every claim therefore fails (NIP-43 mandates an
         // OK reply). A member who already belongs to the relay gets the
@@ -730,6 +723,7 @@ mod tests {
                     matches!(out, super::Precheck::Accept),
                     "event {i} must be accepted under the limit"
                 );
+                assert!(relay.publish_rate_allowed(&cfg, &ev.pubkey, now));
             }
             // The fourth is rate-limited.
             let ev = signed(1, vec![vec!["content".into(), "4".into()]]);
@@ -737,8 +731,9 @@ mod tests {
                 .precheck(&cfg, &access, &ev, now, &[], None, None)
                 .await;
             assert!(
-                matches!(out, super::Precheck::Reject(msg) if msg.contains("rate-limited")),
-                "the event over the limit must be rate-limited"
+                matches!(out, super::Precheck::Accept)
+                    && !relay.publish_rate_allowed(&cfg, &ev.pubkey, now),
+                "the admission step must rate-limit the event"
             );
             // A different pubkey has its own window.
             let ev = signed_other_key(1, vec![]);
@@ -749,6 +744,7 @@ mod tests {
                 matches!(out, super::Precheck::Accept),
                 "another pubkey is not limited by the first window"
             );
+            assert!(relay.publish_rate_allowed(&cfg, &ev.pubkey, now));
             // After the minute passes the window slides open again.
             let ev = signed(1, vec![vec!["content".into(), "5".into()]]);
             let out = relay
@@ -758,7 +754,58 @@ mod tests {
                 matches!(out, super::Precheck::Accept),
                 "the window must slide open after 60 seconds"
             );
+            assert!(relay.publish_rate_allowed(&cfg, &ev.pubkey, now + 61));
             drop(cfg);
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn rejected_event_does_not_consume_publish_rate_quota() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut cfg = Config::default();
+            cfg.relay.max_events_per_min_per_pubkey = 1;
+            cfg.database.map_size = 16 * 1024 * 1024;
+            cfg.database.max_map_size = 256 * 1024 * 1024;
+            cfg.database.path = std::env::temp_dir().join("nostrfy-rate-reject-test");
+            let _ = std::fs::remove_dir_all(&cfg.database.path);
+            let db = crate::db::DbClient::open(
+                &cfg.database,
+                true,
+                Arc::new(Default::default()),
+                0,
+                128,
+                4096,
+                262144,
+            )
+            .unwrap();
+            let relay = Arc::new(
+                Relay::new(
+                    Arc::new(RwLock::new(cfg)),
+                    db,
+                    crate::stats::Stats::new(),
+                    "",
+                    crate::relay::LiveBusConfig {
+                        buffer: 1024,
+                        batch_interval_ms: 10,
+                        batch_size: 64,
+                    },
+                )
+                .await,
+            );
+            let rejected = signed(1, vec![vec!["h".into(), "missing-group".into()]]);
+            let valid = signed(1, vec![]);
+            let rejected_outcome = relay.accept_event(rejected, &[], None).await.0;
+            assert!(matches!(
+                rejected_outcome,
+                crate::db::PutOutcome::Invalid(_)
+            ));
+            let valid_outcome = relay.accept_event(valid, &[], None).await.0;
+            assert!(
+                matches!(valid_outcome, crate::db::PutOutcome::Stored),
+                "a rejected event must not consume the publish quota: {valid_outcome:?}"
+            );
             relay.db.shutdown();
         });
     }
