@@ -132,8 +132,21 @@ impl Relay {
         }
         // Only the admin (`relay.pubkey`) can issue commands: the author
         // check runs on the event's verified signature.
-        if !admin.eq_ignore_ascii_case(&event.pubkey) {
+        if admin != event.pubkey {
             return;
+        }
+        {
+            let mut processed = self
+                .command_events
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !processed.insert(event.id.clone()) {
+                return;
+            }
+            if processed.len() > 4096 {
+                processed.clear();
+                processed.insert(event.id.clone());
+            }
         }
         let Some(outcome) = parse(&event.content) else {
             return;
@@ -236,7 +249,18 @@ impl Relay {
                 .tags
                 .push(vec!["p".into(), admin.to_ascii_lowercase()]);
         }
-        let _ = self.store_relay_event(&mut event).await;
+        match self.store_relay_event(&mut event).await {
+            Ok(true) => {}
+            Ok(false) => {
+                log::warn!(
+                    "stored command response for {} but live delivery failed",
+                    command.id
+                );
+            }
+            Err(()) => {
+                log::error!("could not store command response for {}", command.id);
+            }
+        }
     }
 }
 

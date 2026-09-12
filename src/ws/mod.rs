@@ -220,8 +220,24 @@ impl Conn {
         self.send_control(json!(["CLOSED", sub_id, reason]));
     }
 
+    /// Notifies every active subscription before disconnecting after live
+    /// backpressure. The client must reconnect and issue fresh REQs because
+    /// events were dropped while its socket was not keeping up.
+    pub(crate) fn close_for_live_overflow(&mut self) {
+        let ids: Vec<String> = self.subs.keys().cloned().collect();
+        for id in ids {
+            self.send_closed(
+                &id,
+                "error: live delivery overflow; reconnect and resubscribe",
+            );
+        }
+    }
+
     pub(crate) fn send_ok(&mut self, id: &str, accepted: bool, message: &str) {
-        self.send_json(json!(["OK", id, accepted, message]));
+        // NIP-01/NIP-42 completion acknowledgements must not compete with
+        // live EVENT traffic for the byte budget: dropping one leaves the
+        // publisher unable to determine whether its event or AUTH succeeded.
+        self.send_control(json!(["OK", id, accepted, message]));
     }
 
     /// Whether the pending EVENT batch must be flushed before reading more
@@ -954,6 +970,8 @@ pub async fn handle_connection(
             }
             changed = overflow_rx.changed() => {
                 if changed.is_ok() {
+                    conn.live_overflowed = true;
+                    conn.close_for_live_overflow();
                     break;
                 }
             }
@@ -996,6 +1014,7 @@ pub async fn handle_connection(
                         for (event, json) in batch.iter() {
                             conn.deliver_live_at(event, json, groups, now);
                             if conn.live_overflowed {
+                                conn.close_for_live_overflow();
                                 break 'connection;
                             }
                         }
@@ -2079,6 +2098,12 @@ mod tests {
                 "reply content: {}",
                 replies[0].content
             );
+
+            // Re-dispatching the same accepted event must not repeat the
+            // side effect or create a second response.
+            relay.handle_command_event(&cmd).await;
+            let replies = stored_replies(&relay, &cmd.id, now).await;
+            assert_eq!(replies.len(), 1, "replayed command must stay idempotent");
 
             // relay deny: moves the pubkey from allow to deny (the `nostr:`
             // URI prefix is accepted on the operand).
@@ -4495,10 +4520,22 @@ mod tests {
             let event = signed_note(conn.relay.secp(), "overflow", unix_now(), vec![]);
             let json = serde_json::to_string(&event).unwrap();
             conn.deliver_live(&event, &json, None);
+            conn.close_for_live_overflow();
 
             assert!(
                 conn.live_overflowed,
                 "pending live overflow must close the connection"
+            );
+            assert!(
+                outgoing_json(&conn).iter().any(|message| {
+                    message[0] == "CLOSED"
+                        && message[1] == "sub"
+                        && message[2]
+                            .as_str()
+                            .unwrap_or("")
+                            .contains("reconnect and resubscribe")
+                }),
+                "overflow must tell the client to reconnect and resubscribe"
             );
             conn.relay.db.shutdown();
         });
@@ -5030,6 +5067,27 @@ mod tests {
             conn.send_control(serde_json::json!(["EOSE", "s"]));
             assert_eq!(conn.outgoing.len(), OUT_QUEUE_LIMIT * 2);
             assert_eq!(conn.dropped, dropped_before + 1);
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn ok_ack_bypasses_outgoing_byte_cap() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            conn.out_queue_bytes = 1;
+            conn.out_bytes = 100;
+
+            conn.send_ok("event-id", true, "");
+
+            let messages = outgoing_json(&conn);
+            assert!(
+                messages
+                    .iter()
+                    .any(|message| message[0] == "OK" && message[1] == "event-id"),
+                "completion ACK must remain queued under outgoing byte backpressure"
+            );
             conn.relay.db.shutdown();
         });
     }

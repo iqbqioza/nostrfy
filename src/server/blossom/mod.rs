@@ -832,8 +832,6 @@ async fn put_blob(relay: Arc<Relay>, headers: HeaderMap, body: Body, verb: &str)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("application/octet-stream"),
     );
-    // BUD-02/05: 201 for a newly stored blob, 200 when it already exists.
-    let existed = state.store.find(&sha).await.is_some();
     let result = state
         .store
         .put_file(&pubkey, &sha, &path, size, &mime)
@@ -845,7 +843,7 @@ async fn put_blob(relay: Arc<Relay>, headers: HeaderMap, body: Body, verb: &str)
     }
     drop(permits);
     match result {
-        Ok(desc) => {
+        Ok((desc, existed)) => {
             let url = format!("https://{}/{sha}{}", state.host, ext_of(&desc.mime));
             let status = if existed {
                 StatusCode::OK

@@ -112,6 +112,10 @@ pub struct Relay {
     /// management request (a captured header must not be reusable within
     /// its 60-second window).
     pub nip98_replay: crate::nips::nip98::ReplayGuard,
+    /// Command event ids already executed during this process. Event ids are
+    /// persisted in the database, but this guard also makes direct/replayed
+    /// side-effect dispatch idempotent before another response is emitted.
+    command_events: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 /// Issues strictly increasing timestamps for relay-generated events.
@@ -381,6 +385,7 @@ impl Relay {
             blossom_allow: Arc::new(tokio::sync::RwLock::new(blossom_allow)),
             audit: crate::audit::AuditLog::default(),
             nip98_replay: Default::default(),
+            command_events: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -773,16 +778,11 @@ impl Relay {
 
         match outcome {
             PutOutcome::Stored | PutOutcome::Replaced | PutOutcome::Ephemeral => {
-                if self.after_put(event, now, nip9, nip43, nip29_enabled).await {
-                    self.stats.bump(&self.stats.events_accepted, 1);
-                    (outcome, None)
-                } else {
-                    self.stats.bump(&self.stats.events_rejected, 1);
-                    (
-                        PutOutcome::Invalid("error: live delivery unavailable".into()),
-                        None,
-                    )
+                if !self.after_put(event, now, nip9, nip43, nip29_enabled).await {
+                    log::error!("event persisted but live delivery failed");
                 }
+                self.stats.bump(&self.stats.events_accepted, 1);
+                (outcome, None)
             }
             PutOutcome::Duplicate(_) => {
                 self.stats.bump(&self.stats.events_duplicate, 1);
@@ -1209,13 +1209,24 @@ impl Relay {
         generated.reverse();
 
         for mut ev in generated {
-            if !self.store_relay_event(&mut ev).await {
+            let result = self.store_relay_event(&mut ev).await;
+            if result.is_err() {
                 // The in-memory group state moved on, but the stored
                 // metadata did not: without this the saved 39000-39005
                 // stay stale until the next edit (and the restart rebuild
                 // replays the older moderation events). Surface it.
                 log::warn!(
                     "could not store the relay-generated group event for {}",
+                    ev.tags
+                        .iter()
+                        .find(|t| t.first().map(String::as_str) == Some("d"))
+                        .and_then(|t| t.get(1))
+                        .cloned()
+                        .unwrap_or_default()
+                );
+            } else if matches!(result, Ok(false)) {
+                log::warn!(
+                    "stored the relay-generated group event but live delivery failed for {}",
                     ev.tags
                         .iter()
                         .find(|t| t.first().map(String::as_str) == Some("d"))
@@ -1300,7 +1311,7 @@ impl PendingBatch {
             new_pubkeys
         };
         let mut persist_first_seen: Vec<[u8; 32]> = Vec::new();
-        for (((event, mut outcome), slot), is_new) in puts
+        for (((event, outcome), slot), is_new) in puts
             .into_iter()
             .zip(outcomes)
             .zip(put_slots)
@@ -1310,15 +1321,13 @@ impl PendingBatch {
             let first_seen_pubkey = if is_new { event.pubkey_bytes() } else { None };
             match outcome {
                 PutOutcome::Stored | PutOutcome::Replaced | PutOutcome::Ephemeral => {
-                    if relay.after_put(event, now, nip9, nip43, nip29).await {
-                        if let Some(pk) = first_seen_pubkey {
-                            persist_first_seen.push(pk);
-                        }
-                        relay.stats.bump(&relay.stats.events_accepted, 1);
-                    } else {
-                        relay.stats.bump(&relay.stats.events_rejected, 1);
-                        outcome = PutOutcome::Invalid("error: live delivery unavailable".into());
+                    if !relay.after_put(event, now, nip9, nip43, nip29).await {
+                        log::error!("event persisted but live delivery failed");
                     }
+                    if let Some(pk) = first_seen_pubkey {
+                        persist_first_seen.push(pk);
+                    }
+                    relay.stats.bump(&relay.stats.events_accepted, 1);
                 }
                 PutOutcome::Duplicate(_) => {
                     relay.stats.bump(&relay.stats.events_duplicate, 1);
@@ -1445,6 +1454,46 @@ mod tests {
             sig: String::new(),
         };
         assert!(relay.broadcast(event).await.is_err());
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn persisted_event_stays_accepted_when_live_bus_stops() {
+        let mut relay = match std::sync::Arc::try_unwrap(build_relay().await) {
+            Ok(relay) => relay,
+            Err(_) => panic!("test relay must have a single owner"),
+        };
+        let secp = secp256k1::Secp256k1::new();
+        let keypair = secp256k1::Keypair::from_seckey_slice(&secp, &[9u8; 32]).unwrap();
+        let pubkey = secp256k1::XOnlyPublicKey::from_keypair(&keypair)
+            .0
+            .to_string();
+        let mut event = crate::event::Event {
+            id: String::new(),
+            pubkey,
+            created_at: crate::util::unix_now(),
+            kind: 1,
+            tags: vec![],
+            content: "persisted".into(),
+            sig: String::new(),
+        };
+        event.id = crate::nips::nip01::compute_id(&event);
+        event.sig = secp
+            .sign_schnorr_no_aux_rand(&event.id_bytes().unwrap(), &keypair)
+            .to_string();
+        relay.live_rx.take();
+
+        let (outcome, _) = relay.accept_event(event.clone(), &[], None).await;
+        assert_eq!(outcome, crate::db::PutOutcome::Stored);
+        let (events, _) = relay
+            .db
+            .query(
+                vec![serde_json::from_value(serde_json::json!({ "ids": [event.id] })).unwrap()],
+                1,
+                crate::util::unix_now(),
+            )
+            .await;
+        assert_eq!(events.len(), 1, "the accepted event must remain queryable");
         relay.db.shutdown();
     }
 
@@ -1579,6 +1628,36 @@ mod tests {
 
         relay.db.shutdown();
         keyless.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn generated_event_reports_stored_when_live_delivery_fails() {
+        let key = "02".repeat(32);
+        let mut relay = match std::sync::Arc::try_unwrap(build_role_relay(Some(&key)).await) {
+            Ok(relay) => relay,
+            Err(_) => panic!("test relay must have a single owner"),
+        };
+        relay.live_rx.take();
+        let relay_pubkey = relay.relay_pubkey().unwrap();
+        let mut event = crate::event::Event {
+            id: String::new(),
+            pubkey: relay_pubkey,
+            created_at: crate::util::unix_now(),
+            kind: 33534,
+            tags: vec![vec!["d".into(), "delivery-test".into()]],
+            content: String::new(),
+            sig: String::new(),
+        };
+
+        assert_eq!(relay.store_relay_event(&mut event).await, Ok(false));
+        let filter: crate::filter::Filter =
+            serde_json::from_value(serde_json::json!({"ids": [event.id]})).unwrap();
+        let (stored, _) = relay
+            .db
+            .query(vec![filter], 1, crate::util::unix_now())
+            .await;
+        assert_eq!(stored.len(), 1);
+        relay.db.shutdown();
     }
 
     #[tokio::test]

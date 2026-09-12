@@ -1510,6 +1510,15 @@ fn vanish_keeps_delegatee_events_of_a_delegator() {
         e.id = nip01::compute_id(&e);
         assert_eq!(db.put(e.clone(), now).await, PutOutcome::Stored);
 
+        // A forged delegation tag must not let the delegator delete the
+        // delegatee's event; deletion revalidates the NIP-26 token.
+        assert_eq!(
+            db.apply_deletion(vec![e.id.clone()], vec![], Some(delegator.clone()), now)
+                .await,
+            0,
+            "invalid delegation must not authorize deletion"
+        );
+
         // Vanish the delegator: the delegatee-authored event survives.
         let removed = db
             .apply_vanish(
@@ -3442,6 +3451,35 @@ fn event_meta_rebuilds_from_stored_events() {
         assert_eq!(kind, 1);
         assert_eq!(created, now);
     });
+}
+
+#[test]
+fn removing_corrupt_event_cleans_primary_indexes() {
+    let expiry = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let store = crate::db::store::Store::open(&config(), expiry, 128).unwrap();
+    let id = [7u8; 32];
+    let created = 1_700_000_000;
+    let mut wtxn = store.env.write_txn().unwrap();
+    store.events.put(&mut wtxn, &id, b"{not-json").unwrap();
+    store
+        .by_created
+        .put(&mut wtxn, &crate::db::store::created_key(created, &id), b"")
+        .unwrap();
+    wtxn.commit().unwrap();
+
+    let mut wtxn = store.env.write_txn().unwrap();
+    store.remove_event(&mut wtxn, &id).unwrap();
+    wtxn.commit().unwrap();
+
+    let rtxn = store.env.read_txn().unwrap();
+    assert!(store.events.get(&rtxn, &id).unwrap().is_none());
+    assert!(
+        store
+            .by_created
+            .get(&rtxn, &crate::db::store::created_key(created, &id))
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[test]

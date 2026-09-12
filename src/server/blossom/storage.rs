@@ -88,9 +88,8 @@ impl BlobStore {
         })
     }
 
-    async fn blob_lock(&self, pubkey: &str, sha256: &str) -> tokio::sync::MutexGuard<'_, ()> {
+    async fn blob_lock(&self, sha256: &str) -> tokio::sync::MutexGuard<'_, ()> {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        pubkey.hash(&mut hasher);
         sha256.hash(&mut hasher);
         let index = (hasher.finish() as usize) % self.upload_locks.len();
         self.upload_locks[index].lock().await
@@ -120,7 +119,7 @@ impl BlobStore {
         // leftovers, but only the bytes that will actually land should be
         // committed).
         self.check_space()?;
-        let _blob_guard = self.blob_lock(pubkey, sha256).await;
+        let _blob_guard = self.blob_lock(sha256).await;
         let uploaded = crate::util::unix_now() as i64;
         // Whether the uploader already owned the blob BEFORE this upload
         // (read before the add: a failed re-upload of identical bytes must
@@ -181,15 +180,13 @@ impl BlobStore {
         path: &Path,
         size: u64,
         mime: &str,
-    ) -> Result<Descriptor> {
+    ) -> Result<(Descriptor, bool)> {
         self.check_space()?;
-        let _blob_guard = self.blob_lock(pubkey, sha256).await;
+        let _blob_guard = self.blob_lock(sha256).await;
         let uploaded = crate::util::unix_now() as i64;
-        let was_owner = self
-            .db
-            .blossom_load(sha256)
-            .await
-            .is_some_and(|m| m.owners.iter().any(|o| o == pubkey));
+        let existing = self.db.blossom_load(sha256).await;
+        let existed = existing.is_some();
+        let was_owner = existing.is_some_and(|m| m.owners.iter().any(|o| o == pubkey));
         if !self
             .db
             .blossom_add_owner(sha256, mime, size, uploaded, pubkey)
@@ -213,13 +210,16 @@ impl BlobStore {
             }
             return Err(e);
         }
-        Ok(Descriptor {
-            sha256: sha256.to_string(),
-            size,
-            mime: mime.to_string(),
-            uploaded,
-            pubkey: pubkey.to_string(),
-        })
+        Ok((
+            Descriptor {
+                sha256: sha256.to_string(),
+                size,
+                mime: mime.to_string(),
+                uploaded,
+                pubkey: pubkey.to_string(),
+            },
+            existed,
+        ))
     }
 
     /// Resolves a blob by its sha256 straight from LMDB.
@@ -307,7 +307,7 @@ impl BlobStore {
     /// (blob first, so a crash leaves a healable state) and their entry in
     /// the LMDB mapping. Other uploaders of the same bytes keep theirs.
     pub(crate) async fn delete(&self, pubkey: &str, sha256: &str) -> Result<bool> {
-        let _blob_guard = self.blob_lock(pubkey, sha256).await;
+        let _blob_guard = self.blob_lock(sha256).await;
         let npub = npub_of(pubkey);
         let legacy = legacy_npub_of(pubkey);
         let mut existed = false;
@@ -441,6 +441,9 @@ fn legacy_npub_of(pubkey: &str) -> String {
 
 struct LocalStore {
     root: PathBuf,
+    // Kept open for the lifetime of the store so fd_root remains valid.
+    _root_dir: std::fs::File,
+    fd_root: Option<PathBuf>,
     /// The resolved root: every operation's parent directory is
     /// canonicalized and must resolve under this path, so a symlinked
     /// npub directory can never redirect reads, writes or deletes
@@ -455,15 +458,44 @@ impl LocalStore {
     async fn new(root: &Path, min_free_bytes: u64) -> Result<LocalStore> {
         tokio::fs::create_dir_all(root).await?;
         let canonical_root = tokio::fs::canonicalize(root).await?;
+        let root_dir = {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+                .open(&canonical_root)?
+        };
+        let fd = std::os::fd::AsRawFd::as_raw_fd(&root_dir);
+        let fd_root = ["/proc/self/fd", "/dev/fd"]
+            .into_iter()
+            .map(|base| PathBuf::from(base).join(fd.to_string()))
+            .find(|path| path.exists());
         Ok(LocalStore {
             root: root.to_path_buf(),
+            _root_dir: root_dir,
+            fd_root,
             canonical_root,
             min_free_bytes,
         })
     }
 
+    #[cfg(test)]
     fn blob_path(&self, npub: &str, sha256: &str) -> PathBuf {
         self.root.join(npub).join(sha256)
+    }
+
+    fn rooted_path(&self, npub: &str, name: &str) -> PathBuf {
+        // FreeBSD installations without fdescfs do not expose open
+        // descriptors as pathname components. The canonical-root fallback
+        // retains the symlink checks and keeps those systems functional.
+        self.fd_root
+            .as_ref()
+            .map(|root| root.join(npub).join(name))
+            .unwrap_or_else(|| self.canonical_root.join(npub).join(name))
+    }
+
+    fn npub_dir_path(&self, npub: &str) -> PathBuf {
+        self.rooted_path(npub, "")
     }
 
     /// Whether the blob's parent directory is a real directory inside the
@@ -540,7 +572,7 @@ impl LocalStore {
         // race can surface as a spurious failure — and O_NOFOLLOW keeps a
         // planted symlink from redirecting the write (or truncating an
         // external file through the link).
-        let tmp_path = dir.join(format!(".{sha256}.tmp"));
+        let tmp_path = self.rooted_path(npub, &format!(".{sha256}.tmp"));
         let write = {
             use tokio::io::AsyncWriteExt;
             let mut tmp = tokio::fs::OpenOptions::new()
@@ -562,7 +594,7 @@ impl LocalStore {
             let _ = tokio::fs::remove_file(&tmp_path).await;
             return Err(e.into());
         }
-        if let Err(e) = tokio::fs::rename(&tmp_path, self.blob_path(npub, sha256)).await {
+        if let Err(e) = tokio::fs::rename(&tmp_path, self.rooted_path(npub, sha256)).await {
             let _ = tokio::fs::remove_file(&tmp_path).await;
             return Err(e.into());
         }
@@ -571,12 +603,12 @@ impl LocalStore {
 
     async fn put_file(&self, npub: &str, sha256: &str, source: &Path) -> Result<()> {
         use tokio::io::AsyncWriteExt;
-        let dir = self.root.join(npub);
+        let dir = self.npub_dir_path(npub);
         tokio::fs::create_dir_all(&dir).await?;
         if !self.parent_within_root(npub).await {
             return Err(anyhow!("blossom storage directory is a symlink"));
         }
-        let tmp_path = dir.join(format!(".{sha256}.tmp"));
+        let tmp_path = self.rooted_path(npub, &format!(".{sha256}.tmp"));
         let mut input = tokio::fs::File::open(source).await?;
         let mut output = tokio::fs::OpenOptions::new()
             .write(true)
@@ -595,7 +627,7 @@ impl LocalStore {
             return Err(e.into());
         }
         drop(output);
-        if let Err(e) = tokio::fs::rename(&tmp_path, self.blob_path(npub, sha256)).await {
+        if let Err(e) = tokio::fs::rename(&tmp_path, self.rooted_path(npub, sha256)).await {
             let _ = tokio::fs::remove_file(&tmp_path).await;
             return Err(e.into());
         }
@@ -616,12 +648,19 @@ impl LocalStore {
         // outside the root; a symlinked blob file would be followed by a
         // plain open. Both are refused (the blob reads as missing).
         if !self.parent_within_root(npub).await {
+            let dir = self.root.join(npub);
+            if let Ok(meta) = tokio::fs::symlink_metadata(&dir).await
+                && !meta.file_type().is_symlink()
+                && !meta.is_dir()
+            {
+                return Err(anyhow!("blossom storage directory is not a directory"));
+            }
             return Ok(None);
         }
         let mut file = match tokio::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW)
-            .open(self.blob_path(npub, sha256))
+            .open(self.rooted_path(npub, sha256))
             .await
         {
             Ok(f) => f,
@@ -647,14 +686,14 @@ impl LocalStore {
         // (A symlinked blob file itself is safe to remove — only the link
         // is deleted.)
         if !self.parent_within_root(npub).await {
-            let dir = self.root.join(npub);
+            let dir = self.npub_dir_path(npub);
             return match tokio::fs::symlink_metadata(&dir).await {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
                 Ok(_) => Err(anyhow!("blossom storage directory is unsafe")),
                 Err(e) => Err(e.into()),
             };
         }
-        let path = self.blob_path(npub, sha256);
+        let path = self.rooted_path(npub, sha256);
         match tokio::fs::remove_file(&path).await {
             Ok(()) => Ok(true),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -1166,8 +1205,17 @@ mod tests {
             );
             // The disabled guard (0) lets the upload through.
             let sha2 = "ef".repeat(32);
+            let disabled = crate::server::blossom::storage::BlobStore::new(
+                "local",
+                &dir,
+                0,
+                None,
+                s.db.clone(),
+            )
+            .await
+            .unwrap();
             assert!(
-                s.put(&a, &sha2, b"y", "text/plain").await.is_ok(),
+                disabled.put(&a, &sha2, b"y", "text/plain").await.is_ok(),
                 "min_free_bytes = 0 must disable the guard"
             );
             s.db.shutdown();

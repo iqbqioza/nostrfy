@@ -889,10 +889,9 @@ impl super::Conn {
     /// Whether any authenticated pubkey is an operator identity: the
     /// relay's own key or the admin pubkey (`relay.pubkey`).
     fn is_operator_pubkey(&self, admin: &str) -> bool {
-        self.authed_pubkeys.iter().any(|pk| {
-            self.relay.relay_pubkey.as_ref().is_some_and(|r| r == pk)
-                || admin.eq_ignore_ascii_case(pk)
-        })
+        self.authed_pubkeys
+            .iter()
+            .any(|pk| self.relay.relay_pubkey.as_ref().is_some_and(|r| r == pk) || admin == pk)
     }
 
     pub(crate) fn auth_hidden_behind(&self, groups: &nip29::GroupStore, event: &Event) -> bool {
