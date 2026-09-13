@@ -27,6 +27,67 @@ fn pubkeys_equal(a: &str, b: &str) -> bool {
 }
 
 impl Store {
+    fn remove_mixed_case_gift_wraps(
+        &self,
+        wtxn: &mut heed::RwTxn<'_>,
+        pubkey: &[u8],
+        removed: &mut usize,
+    ) -> Result<()> {
+        let start = vec![b'p'];
+        let end = vec![b'q'];
+        let mut last_key: Option<Vec<u8>> = None;
+        loop {
+            let lower = match &last_key {
+                Some(key) => std::ops::Bound::Excluded(key.as_slice()),
+                None => std::ops::Bound::Included(start.as_slice()),
+            };
+            let entries: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = self
+                .by_tag
+                .range(wtxn, &(lower, std::ops::Bound::Excluded(end.as_slice())))?
+                .filter_map(|item| {
+                    let (key, _) = item.ok()?;
+                    let key = key.to_vec();
+                    if key.len() < 6 || key[0] != b'p' || key[1] != 0 {
+                        return None;
+                    }
+                    let value_len = u32::from_be_bytes(key[2..6].try_into().ok()?) as usize;
+                    let value_start: usize = 6;
+                    let value_end = value_start.checked_add(value_len)?;
+                    if key.len() < value_end + CREATED_LEN + ID_LEN {
+                        return None;
+                    }
+                    let value = key[value_start..value_end].to_vec();
+                    let id = key[key.len() - ID_LEN..].to_vec();
+                    Some((key, value, id))
+                })
+                .take(REMOVAL_CHUNK)
+                .collect();
+            if entries.is_empty() {
+                break;
+            }
+            last_key = Some(entries.last().unwrap().0.clone());
+            for (_, value, id) in entries {
+                let Ok(value) = hex::decode(value) else {
+                    continue;
+                };
+                if value != pubkey {
+                    continue;
+                }
+                let Some(raw) = self.events.get(wtxn, &id)? else {
+                    continue;
+                };
+                let Ok(event) = serde_json::from_slice::<Event>(raw) else {
+                    continue;
+                };
+                if event.kind == crate::nips::nip62::GIFT_WRAP_KIND {
+                    self.remove_event(wtxn, &id)?;
+                    *removed += 1;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Applies a deletion request.
     ///
     /// `request_pubkey` is the hex pubkey of the deletion event: only events
@@ -373,6 +434,7 @@ impl Store {
                 }
             }
         }
+        self.remove_mixed_case_gift_wraps(&mut wtxn, pubkey, &mut removed)?;
 
         wtxn.commit()?;
         Ok(removed)
@@ -427,6 +489,8 @@ impl Store {
                 }
             }
         }
+        self.remove_mixed_case_gift_wraps(&mut wtxn, pubkey, &mut removed)?;
+
         wtxn.commit()?;
         Ok(removed)
     }
