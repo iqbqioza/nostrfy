@@ -648,6 +648,56 @@ fn gift_wraps_with_uppercase_p_are_deleted() {
 }
 
 #[test]
+fn gift_wraps_with_mixed_case_p_are_deleted() {
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let recipient = "aB3130de0d1386592fe7b9f407f5f1ae8f1db91d772e484b3d81df0fa2e88f24";
+        let wrap = event(
+            1059,
+            "encrypted",
+            now,
+            vec![vec!["p".into(), recipient.into()]],
+        );
+        let vanish_wrap = event(
+            1059,
+            "encrypted for vanish",
+            now + 1,
+            vec![vec!["p".into(), recipient.into()]],
+        );
+        assert_eq!(db.put(wrap, now).await, PutOutcome::Stored);
+        assert_eq!(db.put(vanish_wrap, now + 1).await, PutOutcome::Stored);
+        let recipient_bytes = hex::decode(recipient).unwrap();
+        let removed = db
+            .delete_gift_wraps_to(recipient_bytes.clone().try_into().unwrap())
+            .await;
+        assert_eq!(removed, 2, "mixed-case p-tagged wraps must be found");
+
+        let vanish_wrap = event(
+            1059,
+            "encrypted for vanish",
+            now + 2,
+            vec![vec!["p".into(), recipient.into()]],
+        );
+        assert_eq!(db.put(vanish_wrap, now + 2).await, PutOutcome::Stored);
+        let removed = db
+            .apply_vanish(recipient_bytes.try_into().unwrap(), now + 2)
+            .await;
+        assert_eq!(removed, 1, "vanish must find mixed-case p-tagged wraps");
+    });
+}
+
+#[test]
 
 // ----- database growth -----
 fn map_grows_beyond_initial_size() {
