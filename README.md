@@ -9,6 +9,10 @@
   <a href="https://github.com/iqbqioza/nostrfy/actions/workflows/release.yml"><img src="https://github.com/iqbqioza/nostrfy/actions/workflows/release.yml/badge.svg" alt="Release"></a>
 </p>
 
+<p align="center">
+  <a href="https://nostrfy.org/">Official website</a>
+</p>
+
 > [!NOTE]
 > This project is maintained by an individual in their spare time. If you'd like to show your support, please consider a tip via Lightning or Bitcoin.
 >
@@ -19,7 +23,7 @@
 > **Bitcoin (SegWit):** bc1qttlc8m9gsh24xxqys26gaz2mtgfzw7s7770am6
 
 > [!TIP]
-> This project's relays are running live at **wss://relay.damustr.com** and **wss://relay.nostrfy.org**.
+> This project's relay is running live at **wss://relay.nostrfy.org**.
 
 **All in one Nostr relay server engine written in Rust. Blazing fast by Design. Lean by Nature. Powerful by Default.**
 
