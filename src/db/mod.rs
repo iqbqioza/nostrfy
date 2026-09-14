@@ -315,14 +315,114 @@ pub struct DbClient {
     /// Queued-but-unprocessed REST API queries, counted separately so an API
     /// flood fails fast without tripping the WebSocket-side caps.
     api_pending: Arc<std::sync::atomic::AtomicUsize>,
+    /// Queued payload bytes on the writer queue (events and the other
+    /// write messages' dominant fields). The count caps alone let a queue
+    /// of maximum-size events reach gigabytes before tripping; this counter
+    /// enforces `max_pending_bytes` on what actually dominates memory.
+    pending_bytes: Arc<std::sync::atomic::AtomicUsize>,
+    /// Same, for the WebSocket reader queue (filter fields).
+    pending_read_bytes: Arc<std::sync::atomic::AtomicUsize>,
+    /// Same, for the dedicated REST API reader queue.
+    api_pending_bytes: Arc<std::sync::atomic::AtomicUsize>,
     /// Caps for the counters above (`max_api_pending` is shared so the
-    /// SIGHUP reload can adjust it live).
+    /// SIGHUP reload can adjust it live). `max_pending_bytes` comes from
+    /// `database.max_db_queue_bytes` (0 = no byte cap).
     max_pending_msgs: usize,
     max_pending_events: usize,
+    max_pending_bytes: usize,
     max_api_pending: Arc<std::sync::atomic::AtomicUsize>,
     /// How many threads serve the WebSocket reader queue (from
     /// `database.reader_threads`); used to fan the shutdown messages out.
     reader_threads: usize,
+}
+
+/// An estimate of the heap bytes a queued message pins, used by the
+/// `database.max_db_queue_bytes` admission check. Only the dominant
+/// payloads are measured (event fields for writes, filter fields for
+/// reads, delete targets); metadata-only messages count as zero and stay
+/// bounded by the count caps alone. An estimate is enough: it only has to
+/// stop a queue of large payloads from exhausting memory, while the count
+/// caps keep the exact accounting.
+fn msg_bytes(msg: &Msg) -> usize {
+    match msg {
+        Msg::Put { event, .. } => event_heap_bytes(event),
+        Msg::PutBatch { events, .. } => events
+            .iter()
+            .map(|(event, _)| event_heap_bytes(event))
+            .sum(),
+        Msg::Query { filters, .. } | Msg::Count { filters, .. } => {
+            filters.iter().map(filter_heap_bytes).sum()
+        }
+        Msg::NegQuery { filter, .. } => filter_heap_bytes(filter),
+        Msg::Delete {
+            targets,
+            addresses,
+            request_pubkey,
+            group,
+            ..
+        } => targets
+            .iter()
+            .map(String::len)
+            .sum::<usize>()
+            .saturating_add(
+                addresses
+                    .iter()
+                    .map(|address| address.pubkey.len() + address.d.len())
+                    .sum(),
+            )
+            .saturating_add(request_pubkey.as_deref().map_or(0, str::len))
+            .saturating_add(group.as_deref().map_or(0, str::len)),
+        _ => 0,
+    }
+}
+
+/// The heap bytes an event owns (content, tag strings and the hex fields).
+fn event_heap_bytes(event: &Event) -> usize {
+    let tags: usize = event
+        .tags
+        .iter()
+        .map(|tag| tag.iter().map(String::len).sum::<usize>())
+        .sum();
+    event
+        .content
+        .len()
+        .saturating_add(tags)
+        .saturating_add(event.id.len())
+        .saturating_add(event.pubkey.len())
+        .saturating_add(event.sig.len())
+}
+
+/// The heap bytes a filter owns: the id/author/kind/search strings and the
+/// tag constraint values.
+fn filter_heap_bytes(filter: &Filter) -> usize {
+    let string_list = |values: &Option<Vec<String>>| {
+        values
+            .as_ref()
+            .map_or(0, |v| v.iter().map(String::len).sum::<usize>())
+    };
+    let strings = string_list(&filter.ids)
+        .saturating_add(string_list(&filter.authors))
+        .saturating_add(filter.kinds.as_ref().map_or(0, |v| v.len() * 8))
+        .saturating_add(filter.search.as_deref().map_or(0, str::len));
+    let tags: usize = filter
+        .tags
+        .iter()
+        .map(|(name, value)| name.len().saturating_add(value_heap_bytes(value)))
+        .sum();
+    strings.saturating_add(tags)
+}
+
+/// The heap bytes a JSON filter value owns (tag constraint values).
+fn value_heap_bytes(value: &serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::String(s) => s.len(),
+        serde_json::Value::Array(values) => values.iter().map(value_heap_bytes).sum(),
+        serde_json::Value::Object(map) => map
+            .iter()
+            .map(|(key, value)| key.len().saturating_add(value_heap_bytes(value)))
+            .sum(),
+        _ => 8,
+    }
 }
 
 impl DbClient {
@@ -363,8 +463,12 @@ impl DbClient {
             pending_events: threads.pending_events,
             pending_reads: threads.pending_reads,
             api_pending: threads.api_pending,
+            pending_bytes: threads.pending_bytes,
+            pending_read_bytes: threads.pending_read_bytes,
+            api_pending_bytes: threads.api_pending_bytes,
             max_pending_msgs: threads.max_pending_msgs,
             max_pending_events: threads.max_pending_events,
+            max_pending_bytes: cfg.max_db_queue_bytes,
             max_api_pending: threads.max_api_pending,
             reader_threads: threads.reader_threads,
         })
@@ -523,6 +627,9 @@ impl DbClient {
             Msg::Put { .. } => 1,
             _ => 0,
         };
+        let bytes = msg_bytes(&msg);
+        let over_bytes =
+            |pending: usize| self.max_pending_bytes > 0 && pending > self.max_pending_bytes;
         if check_writer || is_write {
             // Writer path (and any gated path): reserve first, then enforce.
             let msgs = self
@@ -537,12 +644,27 @@ impl DbClient {
                 self.pending_events
                     .load(std::sync::atomic::Ordering::Relaxed)
             };
-            if msgs > self.max_pending_msgs || events > self.max_pending_events {
+            let pending_bytes = if bytes > 0 {
+                self.pending_bytes
+                    .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed)
+                    .saturating_add(bytes)
+            } else {
+                self.pending_bytes
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            };
+            if msgs > self.max_pending_msgs
+                || events > self.max_pending_events
+                || over_bytes(pending_bytes)
+            {
                 self.pending_msgs
                     .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                 if write_events > 0 {
                     self.pending_events
                         .fetch_sub(write_events, std::sync::atomic::Ordering::Relaxed);
+                }
+                if bytes > 0 {
+                    self.pending_bytes
+                        .fetch_sub(bytes, std::sync::atomic::Ordering::Relaxed);
                 }
                 self.errors
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -556,9 +678,21 @@ impl DbClient {
                 .pending_reads
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                 .saturating_add(1);
-            if reads > self.max_pending_msgs {
+            let pending_bytes = if bytes > 0 {
+                self.pending_read_bytes
+                    .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed)
+                    .saturating_add(bytes)
+            } else {
+                self.pending_read_bytes
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            };
+            if reads > self.max_pending_msgs || over_bytes(pending_bytes) {
                 self.pending_reads
                     .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                if bytes > 0 {
+                    self.pending_read_bytes
+                        .fetch_sub(bytes, std::sync::atomic::Ordering::Relaxed);
+                }
                 self.errors
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return None;
@@ -592,6 +726,15 @@ impl DbClient {
                 _ => {
                     self.pending_reads
                         .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            if bytes > 0 {
+                if check_writer || is_write {
+                    self.pending_bytes
+                        .fetch_sub(bytes, std::sync::atomic::Ordering::Relaxed);
+                } else {
+                    self.pending_read_bytes
+                        .fetch_sub(bytes, std::sync::atomic::Ordering::Relaxed);
                 }
             }
             return None;
@@ -708,9 +851,6 @@ impl DbClient {
         now: u64,
         ascending: bool,
     ) -> (Vec<Event>, bool) {
-        if !self.api_reserve() {
-            return (Vec::new(), false);
-        }
         let (tx, rx) = oneshot::channel();
         let msg = Msg::Query {
             filters,
@@ -721,9 +861,12 @@ impl DbClient {
             hidden_slack: 0,
             reply: tx,
         };
+        let bytes = msg_bytes(&msg);
+        if !self.api_reserve(bytes) {
+            return (Vec::new(), false);
+        }
         if self.api_read_tx.send(msg).is_err() {
-            self.api_pending
-                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            self.api_release(bytes);
             return (Vec::new(), false);
         }
         let out = if self.timeout_secs == 0 {
@@ -751,9 +894,6 @@ impl DbClient {
         limit: usize,
         now: u64,
     ) -> (Vec<Event>, bool) {
-        if !self.api_reserve() {
-            return (Vec::new(), false);
-        }
         let (tx, rx) = oneshot::channel();
         let msg = Msg::Count {
             filters,
@@ -761,9 +901,12 @@ impl DbClient {
             now,
             reply: tx,
         };
+        let bytes = msg_bytes(&msg);
+        if !self.api_reserve(bytes) {
+            return (Vec::new(), false);
+        }
         if self.api_read_tx.send(msg).is_err() {
-            self.api_pending
-                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            self.api_release(bytes);
             return (Vec::new(), false);
         }
         let out = if self.timeout_secs == 0 {
@@ -892,14 +1035,14 @@ impl DbClient {
     /// Generic REST-API reader request with the API queue cap and timeout.
     /// Admission uses [`Self::api_reserve`] (add-then-check with rollback).
     async fn api_request<R: Default>(&self, make: impl FnOnce(oneshot::Sender<R>) -> Msg) -> R {
-        if !self.api_reserve() {
-            return R::default();
-        }
         let (tx, rx) = oneshot::channel();
         let msg = make(tx);
+        let bytes = msg_bytes(&msg);
+        if !self.api_reserve(bytes) {
+            return R::default();
+        }
         if self.api_read_tx.send(msg).is_err() {
-            self.api_pending
-                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            self.api_release(bytes);
             return R::default();
         }
         // The API reader thread decrements `api_pending` on completion
@@ -914,26 +1057,46 @@ impl DbClient {
         }
     }
 
-    /// Reserves one API-reader queue slot (add-then-check with rollback).
-    /// Returns `false` when the queue is deep (fail-fast, counted in stats).
-    /// The API reader thread releases the slot on completion.
-    fn api_reserve(&self) -> bool {
+    /// Reserves one API-reader queue slot and its payload bytes
+    /// (add-then-check with rollback). Returns `false` when the queue is
+    /// deep (fail-fast, counted in stats). The API reader thread releases
+    /// the reservation on completion.
+    fn api_reserve(&self, bytes: usize) -> bool {
         let pending = self
             .api_pending
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             .saturating_add(1);
+        let pending_bytes = if bytes > 0 {
+            self.api_pending_bytes
+                .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed)
+                .saturating_add(bytes)
+        } else {
+            self.api_pending_bytes
+                .load(std::sync::atomic::Ordering::Relaxed)
+        };
         if pending
             > self
                 .max_api_pending
                 .load(std::sync::atomic::Ordering::Relaxed)
+            || (self.max_pending_bytes > 0 && pending_bytes > self.max_pending_bytes)
         {
-            self.api_pending
-                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            self.api_release(bytes);
             self.errors
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return false;
         }
         true
+    }
+
+    /// Releases an API-reader reservation (count and payload bytes) after a
+    /// failed send. The reader thread releases it on completion otherwise.
+    fn api_release(&self, bytes: usize) {
+        self.api_pending
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        if bytes > 0 {
+            self.api_pending_bytes
+                .fetch_sub(bytes, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     pub async fn apply_deletion(

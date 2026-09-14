@@ -370,6 +370,11 @@ disabled_fsync = false
 max_db_queue_msgs = 4096
 max_db_queue_events = 262144
 
+# The same protection in bytes, over the queued event/filter payloads: the
+# count caps alone allow a queue of maximum-size messages to exhaust memory.
+# 0 disables the byte cap.
+max_db_queue_bytes = 268435456
+
 # -----------------------------------------------------------------------------
 # Daemon
 # -----------------------------------------------------------------------------
