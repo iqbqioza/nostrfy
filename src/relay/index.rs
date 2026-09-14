@@ -21,6 +21,12 @@ pub(crate) struct SubscriptionIndex {
     tags: HashMap<String, HashMap<String, HashSet<u64>>>,
     /// Connections with at least one `{}`-style filter (match anything).
     all: HashSet<u64>,
+    /// The exact components each connection is registered with. A
+    /// re-registration or removal then touches only that connection's
+    /// entries instead of walking every entry in the index under the
+    /// write lock (the previous global `retain` per REQ/CLOSE let one
+    /// connection's frames block live delivery).
+    registered: HashMap<u64, Vec<FilterComponents>>,
 }
 
 /// The components of a filter that can be indexed ahead of the full
@@ -94,9 +100,13 @@ impl FilterComponents {
 }
 
 impl SubscriptionIndex {
-    /// Registers a connection's filter components.
-    pub(crate) fn register(&mut self, conn: u64, components: &[FilterComponents]) {
-        for component in components {
+    /// Registers a connection's filter components, replacing any previous
+    /// registration for the same connection.
+    pub(crate) fn register(&mut self, conn: u64, components: Vec<FilterComponents>) {
+        if let Some(previous) = self.registered.remove(&conn) {
+            self.remove_components(conn, &previous);
+        }
+        for component in &components {
             match component {
                 FilterComponents::All => {
                     self.all.insert(conn);
@@ -123,26 +133,69 @@ impl SubscriptionIndex {
                 }
             }
         }
+        self.registered.insert(conn, components);
     }
 
-    /// Removes a connection from every entry.
+    /// Removes a connection from every entry it registered. Idempotent:
+    /// the explicit teardown and the panic-safety guard both call it, and
+    /// an already-removed (or never-registered) connection is a no-op.
+    /// Registration is the only writer, so the tracked components cover
+    /// every entry the connection can be in.
     pub(crate) fn unregister(&mut self, conn: u64) {
-        self.all.remove(&conn);
-        self.kinds.retain(|_, set| {
-            set.remove(&conn);
-            !set.is_empty()
-        });
-        self.authors.retain(|_, set| {
-            set.remove(&conn);
-            !set.is_empty()
-        });
-        self.tags.retain(|_, values| {
-            values.retain(|_, set| {
-                set.remove(&conn);
-                !set.is_empty()
-            });
-            !values.is_empty()
-        });
+        if let Some(components) = self.registered.remove(&conn) {
+            self.remove_components(conn, &components);
+        }
+    }
+
+    /// Removes exactly the given components for `conn`, pruning entries
+    /// that become empty. Measured against the tracked components, so the
+    /// cost is proportional to this connection's own filters.
+    fn remove_components(&mut self, conn: u64, components: &[FilterComponents]) {
+        for component in components {
+            match component {
+                FilterComponents::All => {
+                    self.all.remove(&conn);
+                }
+                FilterComponents::Indexed {
+                    kinds,
+                    authors,
+                    tags,
+                } => {
+                    for kind in kinds {
+                        if self.kinds.get_mut(kind).is_some_and(|set| {
+                            set.remove(&conn);
+                            set.is_empty()
+                        }) {
+                            self.kinds.remove(kind);
+                        }
+                    }
+                    for author in authors {
+                        if self.authors.get_mut(author).is_some_and(|set| {
+                            set.remove(&conn);
+                            set.is_empty()
+                        }) {
+                            self.authors.remove(author);
+                        }
+                    }
+                    for (name, value) in tags {
+                        let empty = if let Some(values) = self.tags.get_mut(name) {
+                            if values.get_mut(value).is_some_and(|set| {
+                                set.remove(&conn);
+                                set.is_empty()
+                            }) {
+                                values.remove(value);
+                            }
+                            values.is_empty()
+                        } else {
+                            false
+                        };
+                        if empty {
+                            self.tags.remove(name);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Adds the candidate connections for an event to `out`. The
@@ -224,7 +277,7 @@ mod tests {
         let mut index = SubscriptionIndex::default();
         index.register(
             1,
-            &[FilterComponents::Indexed {
+            vec![FilterComponents::Indexed {
                 kinds: vec![1],
                 authors: vec![],
                 tags: vec![],
@@ -232,13 +285,13 @@ mod tests {
         );
         index.register(
             2,
-            &[FilterComponents::Indexed {
+            vec![FilterComponents::Indexed {
                 kinds: vec![],
                 authors: vec![],
                 tags: vec![("p".into(), "aa".repeat(32))],
             }],
         );
-        index.register(3, &[FilterComponents::All]);
+        index.register(3, vec![FilterComponents::All]);
         let e = ev(1, vec![vec!["p".into(), "aa".repeat(32)]]);
         let candidates = index.candidates(&e);
         assert!(candidates.contains(&1), "kind match");
@@ -256,7 +309,7 @@ mod tests {
         let mut index = SubscriptionIndex::default();
         index.register(
             1,
-            &[FilterComponents::Indexed {
+            vec![FilterComponents::Indexed {
                 kinds: vec![1, 2],
                 authors: vec![[7u8; 32]],
                 tags: vec![("p".into(), "x".into())],
@@ -265,6 +318,75 @@ mod tests {
         index.unregister(1);
         assert!(index.candidates(&ev(1, vec![])).is_empty());
         assert!(index.candidates(&ev(2, vec![])).is_empty());
+        // The tracked removal prunes the entries instead of leaving an
+        // empty set behind, so a long-lived index does not accumulate
+        // dead keys.
+        assert!(index.kinds.is_empty());
+        assert!(index.authors.is_empty());
+        assert!(index.tags.is_empty());
+    }
+
+    #[test]
+    fn register_replaces_the_previous_registration() {
+        let mut index = SubscriptionIndex::default();
+        index.register(
+            1,
+            vec![FilterComponents::Indexed {
+                kinds: vec![1],
+                authors: vec![],
+                tags: vec![],
+            }],
+        );
+        index.register(
+            2,
+            vec![FilterComponents::Indexed {
+                kinds: vec![1],
+                authors: vec![],
+                tags: vec![],
+            }],
+        );
+        // Re-registering connection 1 with a different kind must drop its
+        // old kind entry without disturbing connection 2.
+        index.register(
+            1,
+            vec![FilterComponents::Indexed {
+                kinds: vec![2],
+                authors: vec![],
+                tags: vec![],
+            }],
+        );
+        assert_eq!(index.candidates(&ev(1, vec![])), HashSet::from([2]));
+        assert_eq!(index.candidates(&ev(2, vec![])), HashSet::from([1]));
+        // Unregistering now removes only the current registration.
+        index.unregister(1);
+        assert!(index.candidates(&ev(2, vec![])).is_empty());
+        assert_eq!(index.candidates(&ev(1, vec![])), HashSet::from([2]));
+    }
+
+    #[test]
+    fn unregister_is_idempotent_and_scoped() {
+        let mut index = SubscriptionIndex::default();
+        index.register(
+            1,
+            vec![FilterComponents::Indexed {
+                kinds: vec![1],
+                authors: vec![],
+                tags: vec![],
+            }],
+        );
+        index.register(
+            2,
+            vec![FilterComponents::Indexed {
+                kinds: vec![1],
+                authors: vec![],
+                tags: vec![],
+            }],
+        );
+        index.unregister(1);
+        // The explicit teardown and the panic-safety guard both call
+        // `unregister`; the second call must not disturb connection 2.
+        index.unregister(1);
+        assert_eq!(index.candidates(&ev(1, vec![])), HashSet::from([2]));
     }
 
     #[test]
@@ -272,7 +394,7 @@ mod tests {
         let mut index = SubscriptionIndex::default();
         index.register(
             7,
-            &[FilterComponents::Indexed {
+            vec![FilterComponents::Indexed {
                 kinds: vec![],
                 authors: vec![[0xaa; 32]],
                 tags: vec![],
@@ -384,7 +506,7 @@ mod tests {
         let mut index = SubscriptionIndex::default();
         index.register(
             7,
-            &[FilterComponents::Indexed {
+            vec![FilterComponents::Indexed {
                 kinds: vec![],
                 authors: vec![[0xaa; 32]],
                 tags: vec![],
@@ -418,7 +540,7 @@ mod tests {
         let mut index = SubscriptionIndex::default();
         index.register(
             7,
-            &[FilterComponents::Indexed {
+            vec![FilterComponents::Indexed {
                 kinds: vec![],
                 authors: vec![[0xaa; 32]],
                 tags: vec![],
