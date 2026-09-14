@@ -76,6 +76,14 @@ pub(crate) const BY_PUBKEY: &str = "by_pubkey";
 pub(crate) const BY_KIND: &str = "by_kind";
 pub(crate) const BY_TAG: &str = "by_tag";
 pub(crate) const BY_WORD: &str = "by_word";
+/// Key/value table for one-time index migrations (a marker key per rebuilt
+/// derived index). Separate from [`EVENT_META`], which stores one header per
+/// event.
+pub(crate) const INDEX_META: &str = "index_meta";
+/// Reserved single-byte name for the NIP-59 gift-wrap recipient index inside
+/// [`BY_TAG`]. Real tag names are ASCII alphanumeric ([`indexable_tag`]), so
+/// `0x01` cannot collide with an actual tag.
+pub(crate) const GIFT_WRAP_INDEX: u8 = 0x01;
 pub(crate) const DELETED: &str = "deleted";
 pub(crate) const EXPIRY: &str = "expiry";
 pub(crate) const REPLACEABLE: &str = "replaceable";
@@ -317,6 +325,8 @@ pub(crate) struct Store {
     /// Serialized NIP-43 role state snapshot (see
     /// [`crate::nips::nip43::RolesSnapshot`]), same lifecycle as [`Self::groups`].
     pub(crate) roles: Database<Bytes, Bytes>,
+    /// One-time index migration markers (see [`INDEX_META`]).
+    pub(crate) index_meta: Database<Bytes, Bytes>,
     /// NIP-40 expiration handling is only active when the NIP is enabled.
     /// Shared with the relay so that a config reload can toggle it at runtime.
     pub(crate) expiry_enabled: Arc<std::sync::atomic::AtomicBool>,
@@ -359,8 +369,8 @@ impl Store {
         let map_size = map_max_size as usize;
         let env = unsafe {
             EnvOpenOptions::new()
-                // 16 named tables, plus the word index when search is on.
-                .max_dbs(cfg.max_dbs.max(17))
+                // 17 named tables, plus the word index when search is on.
+                .max_dbs(cfg.max_dbs.max(18))
                 .max_readers(cfg.max_readers.max(8))
                 .map_size(map_size)
                 .open(&cfg.path)?
@@ -401,8 +411,9 @@ impl Store {
         let blossom = env.create_database::<Bytes, Bytes>(&mut wtxn, Some(BLOSSOM))?;
         let groups = env.create_database::<Bytes, Bytes>(&mut wtxn, Some(GROUPS))?;
         let roles = env.create_database::<Bytes, Bytes>(&mut wtxn, Some(ROLES))?;
+        let index_meta = env.create_database::<Bytes, Bytes>(&mut wtxn, Some(INDEX_META))?;
         wtxn.commit()?;
-        let tables = if by_word.is_some() { 17 } else { 16 };
+        let tables = if by_word.is_some() { 18 } else { 17 };
         log::info!(
             "database ready at {} ({} tables, map {} MiB)",
             cfg.path.display(),
@@ -429,6 +440,7 @@ impl Store {
             blossom,
             groups,
             roles,
+            index_meta,
             expiry_enabled,
             max_indexed_words: max_indexed_words.max(1),
             map_max_size,
@@ -495,6 +507,7 @@ impl Store {
             blossom: self.blossom,
             groups: self.groups,
             roles: self.roles,
+            index_meta: self.index_meta,
             expiry_enabled: Arc::clone(&self.expiry_enabled),
             max_indexed_words: self.max_indexed_words,
             map_max_size: self.map_max_size,
@@ -1212,6 +1225,98 @@ impl Store {
         Ok(count)
     }
 
+    /// Whether the NIP-59 recipient index still needs its one-time backfill.
+    /// Marker-based (unlike [`Self::meta_needs_rebuild`]): a database with no
+    /// gift wraps is indistinguishable from one that predates the index, so
+    /// the marker written after the backfill is authoritative.
+    pub(crate) fn gift_wrap_index_needs_rebuild(&self) -> Result<bool> {
+        let rtxn = self.env.read_txn()?;
+        Ok(self.index_meta.get(&rtxn, b"gift_wrap_index")?.is_none())
+    }
+
+    /// One-time backfill of the [`GIFT_WRAP_INDEX`] entries from the stored
+    /// `kind:1059` events (chunked read/write like [`Self::rebuild_event_meta`]),
+    /// then writes the marker. Runs on the writer thread at startup before
+    /// any put, so a NIP-09 deletion after an upgrade still finds wraps that
+    /// were stored before the index existed.
+    pub(crate) fn rebuild_gift_wrap_index(&self) -> Result<usize> {
+        const CHUNK: usize = 4096;
+        self.disk_full_error()?;
+        let kind = crate::nips::nip62::GIFT_WRAP_KIND;
+        let start = kind_key(kind, 0, &[0u8; ID_LEN]);
+        let end = range_end(kind_key(kind, u64::MAX, &[0xffu8; ID_LEN]), u64::MAX);
+        let mut last_key: Option<Vec<u8>> = None;
+        let mut indexed = 0usize;
+        loop {
+            // Collect a chunk under a read transaction, index it under a
+            // separate write transaction (the heed iterator borrows its txn).
+            let chunk: Vec<(Vec<u8>, u64, Vec<[u8; ID_LEN]>)> = {
+                let rtxn = self.env.read_txn()?;
+                let lower = match &last_key {
+                    Some(key) => std::ops::Bound::Excluded(key.as_slice()),
+                    None => std::ops::Bound::Included(start.as_slice()),
+                };
+                let mut out = Vec::with_capacity(CHUNK);
+                let mut iter = self
+                    .by_kind
+                    .range(&rtxn, &(lower, std::ops::Bound::Excluded(end.as_slice())))?;
+                while out.len() < CHUNK {
+                    let Some(item) = iter.next() else { break };
+                    let (key, _) = item?;
+                    // by_kind keys are always kind(8) + created(8) + id(32);
+                    // anything shorter is corruption and is skipped.
+                    if key.len() < CREATED_LEN + ID_LEN {
+                        continue;
+                    }
+                    let key = key.to_vec();
+                    let created = u64::from_be_bytes(
+                        key[8..8 + CREATED_LEN]
+                            .try_into()
+                            .expect("checked key length"),
+                    );
+                    let id = &key[key.len() - ID_LEN..];
+                    let recipients = match self.events.get(&rtxn, id)? {
+                        Some(raw) => serde_json::from_slice::<Event>(raw)
+                            .map(|event| gift_wrap_recipients(&event))
+                            .unwrap_or_default(),
+                        None => Vec::new(),
+                    };
+                    out.push((key, created, recipients));
+                }
+                out
+            };
+            if chunk.is_empty() {
+                break;
+            }
+            last_key = chunk.last().map(|(key, _, _)| key.clone());
+            if chunk
+                .iter()
+                .any(|(_, _, recipients)| !recipients.is_empty())
+            {
+                let mut wtxn = self.env.write_txn()?;
+                for (key, created, recipients) in &chunk {
+                    let id = &key[key.len() - ID_LEN..];
+                    for recipient in recipients {
+                        self.by_tag.put(
+                            &mut wtxn,
+                            &tag_key(GIFT_WRAP_INDEX, recipient, *created, id),
+                            b"",
+                        )?;
+                        indexed += 1;
+                    }
+                }
+                wtxn.commit()?;
+            }
+            if chunk.len() < CHUNK {
+                break;
+            }
+        }
+        let mut wtxn = self.env.write_txn()?;
+        self.index_meta.put(&mut wtxn, b"gift_wrap_index", b"1")?;
+        wtxn.commit()?;
+        Ok(indexed)
+    }
+
     fn put_indexes(
         &self,
         wtxn: &mut heed::RwTxn,
@@ -1254,6 +1359,17 @@ impl Store {
                     self.by_tag.put(wtxn, &key, b"")?;
                 }
             }
+        }
+        // NIP-59: additionally index a gift wrap under each decoded `p`-tag
+        // recipient. The visible tag index above stores values verbatim, so
+        // without this a recipient lookup would have to walk the whole `p`
+        // namespace to catch hex case variants.
+        for recipient in gift_wrap_recipients(event) {
+            self.by_tag.put(
+                wtxn,
+                &tag_key(GIFT_WRAP_INDEX, &recipient, created, id),
+                b"",
+            )?;
         }
         // The expiry index is maintained regardless of the NIP-40 toggle:
         // events stored while the feature was disabled must become
@@ -1351,6 +1467,14 @@ impl Store {
                     self.by_tag.delete(wtxn, &key)?;
                 }
             }
+        }
+        // Mirror the NIP-59 recipient index entries written by
+        // `put_indexes`.
+        for recipient in gift_wrap_recipients(&event) {
+            self.by_tag.delete(
+                wtxn,
+                &tag_key(GIFT_WRAP_INDEX, &recipient, event.created_at, id),
+            )?;
         }
         // The expiry entry is deleted regardless of the NIP-40 toggle: a
         // stale key would otherwise survive a removal performed while the
@@ -1503,6 +1627,23 @@ fn indexable_tag(tag: &[String]) -> bool {
         && tag[0].len() == 1
         && tag[0].as_bytes()[0].is_ascii_alphanumeric()
         && tag[1].len() <= TAG_VALUE_MAX
+}
+
+/// The decoded `p`-tag recipients of a NIP-59 gift wrap (empty for every
+/// other kind). Each recipient is indexed in the reserved
+/// [`GIFT_WRAP_INDEX`] namespace of [`BY_TAG`], so a NIP-09 deletion can
+/// find the wraps with one narrow, case-insensitive range instead of
+/// walking every `p` tag entry in the store.
+fn gift_wrap_recipients(event: &Event) -> Vec<[u8; ID_LEN]> {
+    if event.kind != crate::nips::nip62::GIFT_WRAP_KIND {
+        return Vec::new();
+    }
+    event
+        .tags
+        .iter()
+        .filter(|tag| tag.len() >= 2 && tag[0] == "p")
+        .filter_map(|tag| hex::decode(&tag[1]).ok()?.try_into().ok())
+        .collect()
 }
 
 pub(crate) fn is_replaceable(event: &Event) -> bool {

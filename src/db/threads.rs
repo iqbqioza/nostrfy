@@ -433,6 +433,17 @@ pub(crate) fn spawn(
                 Err(e) => log::warn!("event metadata index rebuild failed: {e}"),
             }
         }
+        // One-time backfill of the NIP-59 gift-wrap recipient index: an
+        // older database has the wraps but no recipient entries, so a
+        // NIP-09 deletion would not find them until the index is built.
+        match store.gift_wrap_index_needs_rebuild() {
+            Ok(true) => match store.rebuild_gift_wrap_index() {
+                Ok(n) => log::info!("gift-wrap recipient index rebuilt ({n} recipients)"),
+                Err(e) => log::warn!("gift-wrap recipient index rebuild failed: {e}"),
+            },
+            Ok(false) => {}
+            Err(e) => log::warn!("gift-wrap recipient index check failed: {e}"),
+        }
         // Puts are applied in batches sharing one write transaction so
         // that the LMDB commit cost (a full fsync by default) is paid
         // once per batch instead of once per event. Replies are only
