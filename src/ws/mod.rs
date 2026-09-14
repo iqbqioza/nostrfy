@@ -1320,7 +1320,7 @@ mod tests {
             4096,
             262144,
         )
-        .unwrap();
+        .unwrap_or_else(|e| panic!("open test db at {}: {e}", cfg.database.path.display()));
         let config = Arc::new(RwLock::new(cfg));
         let stats = Stats::new();
         let mut relay = Relay::new(

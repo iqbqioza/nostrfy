@@ -76,11 +76,16 @@ jobs:
             # memory, OOM-killing the compiler. Debug info is not needed
             # to run the tests, so drop it (debug assertions are an
             # independent setting and stay on).
-            # Each test opens its own LMDB environment (a shared writable
-            # mapping that FreeBSD charges against the VM's commit limit);
-            # bounding the parallelism keeps the aggregate mapping size
-            # well below the VM memory instead of one-per-CPU.
-            CARGO_PROFILE_DEV_DEBUG=0 RUST_TEST_THREADS=4 cargo test --all-targets
+            # Run the tests one at a time: every test opens its own LMDB
+            # environment (a lock file with fcntl locks and process-shared
+            # mutexes). Under parallel execution the FreeBSD VM hit a
+            # per-process lock/keys resource limit and `mdb_env_open`
+            # returned EAGAIN ("environment locked by another process"),
+            # failing a couple of unrelated tests near the end of the
+            # suite. Serial execution keeps the footprint flat.
+            ulimit -a || true
+            sysctl kern.maxposixlocksperuid kern.maxfiles kern.maxproc vm.max_proc_mmap 2>/dev/null || true
+            CARGO_PROFILE_DEV_DEBUG=0 RUST_TEST_THREADS=1 cargo test --all-targets
 
   build:
     # Plain "Build": this is the CI compile check, not the tag-triggered
