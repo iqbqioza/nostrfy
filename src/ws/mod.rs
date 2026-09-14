@@ -401,9 +401,12 @@ impl Conn {
                 ]));
                 // The CLOSED ends the subscription: release it exactly
                 // like a client CLOSE (filter bytes, live slot, stats).
-                // REQ namespace only (NIP-77 separate namespace).
+                // REQ namespace only (NIP-77 separate namespace). This
+                // also removes this response from `pending_reqs`, so
+                // popping the front again would silently discard the
+                // *next* subscription's queued response (its events and
+                // EOSE) and leave that client hanging.
                 self.remove_req_subscription(&sub_id);
-                self.pending_reqs.pop_front();
                 continue;
             }
             if !front.events.is_empty() {
@@ -4294,6 +4297,79 @@ mod tests {
                 "an event beyond the whole budget closes without delivery"
             );
             assert!(!conn.subs.contains_key("s2"));
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn pump_oversized_response_keeps_the_next_pending() {
+        // Regression: the over-budget CLOSED removed its entry via
+        // `remove_req_subscription` and then popped the queue front again,
+        // silently discarding the *next* subscription's stored response
+        // (no events, no EOSE), so that client waited forever.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            conn.req_response_bytes = 3_000;
+            let now = unix_now();
+            conn.subs
+                .insert("a".into(), (Vec::new(), 0, "\"a\"".into()));
+            let mut big = std::collections::VecDeque::new();
+            for i in 0..3 {
+                big.push_back(signed_note(
+                    conn.relay.secp(),
+                    &format!("big-{i}-{}", "y".repeat(2_000)),
+                    now - i,
+                    vec![],
+                ));
+            }
+            conn.enqueue_pending_req(PendingReq {
+                sub_id: "a".into(),
+                events: big,
+                eose_hint: false,
+                truncated_or_more: false,
+                auth_hint: false,
+                sent_bytes: 0,
+                live: Default::default(),
+                live_bytes: 0,
+                eose_sent: false,
+            });
+            conn.subs
+                .insert("b".into(), (Vec::new(), 0, "\"b\"".into()));
+            let mut small = std::collections::VecDeque::new();
+            small.push_back(signed_note(conn.relay.secp(), "small", now, vec![]));
+            conn.enqueue_pending_req(PendingReq {
+                sub_id: "b".into(),
+                events: small,
+                eose_hint: false,
+                truncated_or_more: false,
+                auth_hint: false,
+                sent_bytes: 0,
+                live: Default::default(),
+                live_bytes: 0,
+                eose_sent: false,
+            });
+            conn.pump_pending_reqs();
+            let msgs = outgoing_json(&conn);
+            assert!(
+                msgs.iter().any(|m| m[0] == "CLOSED" && m[1] == "a"),
+                "the over-budget response is closed"
+            );
+            assert_eq!(
+                msgs.iter()
+                    .filter(|m| m[0] == "EVENT" && m[1] == "b")
+                    .count(),
+                1,
+                "the next subscription's event must still be delivered"
+            );
+            assert!(
+                msgs.iter().any(|m| m[0] == "EOSE" && m[1] == "b"),
+                "the next subscription must still receive its EOSE"
+            );
+            assert!(
+                !conn.subs.contains_key("a") && !conn.pending_reqs.iter().any(|p| p.sub_id == "b"),
+                "a is released and b is fully pumped"
+            );
             conn.relay.db.shutdown();
         });
     }
