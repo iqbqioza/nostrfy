@@ -76,7 +76,11 @@ jobs:
             # memory, OOM-killing the compiler. Debug info is not needed
             # to run the tests, so drop it (debug assertions are an
             # independent setting and stay on).
-            CARGO_PROFILE_DEV_DEBUG=0 cargo test --all-targets
+            # Each test opens its own LMDB environment (a shared writable
+            # mapping that FreeBSD charges against the VM's commit limit);
+            # bounding the parallelism keeps the aggregate mapping size
+            # well below the VM memory instead of one-per-CPU.
+            CARGO_PROFILE_DEV_DEBUG=0 RUST_TEST_THREADS=4 cargo test --all-targets
 
   build:
     # Plain "Build": this is the CI compile check, not the tag-triggered

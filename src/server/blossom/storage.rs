@@ -1016,6 +1016,10 @@ mod tests {
                 "nostrfy-blossom-store-test-{tmp}-{}",
                 std::process::id()
             )),
+            // Small mappings: the test VM cannot afford several
+            // default-sized (1 GB / 1 TiB) LMDB reservations at once.
+            map_size: 16 * 1024 * 1024,
+            max_map_size: 32 * 1024 * 1024,
             ..Default::default()
         };
         let _ = std::fs::remove_dir_all(&cfg.path);
@@ -1496,6 +1500,10 @@ mod tests {
         let db = DbClient::open(
             &crate::config::DatabaseConfig {
                 path: db_path,
+                // Small mappings: the test VM cannot afford several
+                // default-sized (1 GB / 1 TiB) LMDB reservations at once.
+                map_size: 16 * 1024 * 1024,
+                max_map_size: 32 * 1024 * 1024,
                 ..Default::default()
             },
             false,
