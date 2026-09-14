@@ -14,6 +14,14 @@ use crate::event::Event;
 /// authors in a single filter.
 pub const MAX_FILTER_MEMBERS: usize = 512;
 
+/// Maximum combined number of tag constraint values (`#e`, `#p`, ...) across
+/// every tag attribute of a filter. Each value becomes one scan range (the
+/// merged walk compares all range heads per emitted candidate) and one
+/// in-memory comparison per event, so an unbounded list is a CPU and memory
+/// amplification vector; filters beyond this bound are rejected like
+/// oversized `ids`/`authors`/`kinds`.
+pub const MAX_FILTER_TAG_VALUES: usize = MAX_FILTER_MEMBERS;
+
 /// The event fields the in-memory filter matching reads. `Event`
 /// implements it directly; the negentropy path uses a lightweight
 /// deserialization that skips the content (the dominant field) and the
@@ -80,9 +88,10 @@ pub struct Filter {
 
 impl Filter {
     /// Whether the filter exceeds the [`MAX_FILTER_MEMBERS`] bound on
-    /// `ids`, `authors` or `kinds`, which would make the in-memory match
-    /// quadratic (`kinds.contains` is linear per live event per
-    /// subscription, and the scan fans out per kind).
+    /// `ids`, `authors` or `kinds`, or the [`MAX_FILTER_TAG_VALUES`] bound
+    /// on the combined tag constraint values, which would make the
+    /// in-memory match quadratic (`kinds.contains` is linear per live event
+    /// per subscription) and the scan fan out per kind/tag value.
     pub fn too_many_members(&self) -> bool {
         self.ids
             .as_ref()
@@ -95,6 +104,18 @@ impl Filter {
                 .kinds
                 .as_ref()
                 .is_some_and(|v| v.len() > MAX_FILTER_MEMBERS)
+            || {
+                // The count stops at the cap: the check never walks a
+                // hostile array to its end, and saturates so many oversized
+                // attributes cannot overflow the sum.
+                let values = self
+                    .tags
+                    .iter()
+                    .filter(|(name, _)| name.starts_with('#'))
+                    .map(|(_, value)| tag_values(value).take(MAX_FILTER_TAG_VALUES + 1).count())
+                    .fold(0usize, usize::saturating_add);
+                values > MAX_FILTER_TAG_VALUES
+            }
     }
 
     /// Case-insensitive hex equality: stored events are lowercase hex while
@@ -514,6 +535,43 @@ mod tests {
         f.authors = None;
         f.kinds = Some(vec![1; MAX_FILTER_MEMBERS + 1]);
         assert!(f.too_many_members(), "oversized kinds must be rejected too");
+        f.kinds = None;
+
+        // Tag constraint values are bounded across all attributes combined:
+        // each value is one scan range and one live comparison.
+        f.tags.insert(
+            "#e".into(),
+            json!(vec!["a".repeat(64); MAX_FILTER_TAG_VALUES]),
+        );
+        assert!(!f.too_many_members(), "exactly at the bound is allowed");
+        f.tags.insert(
+            "#e".into(),
+            json!(vec!["a".repeat(64); MAX_FILTER_TAG_VALUES + 1]),
+        );
+        assert!(
+            f.too_many_members(),
+            "an oversized tag attribute is rejected"
+        );
+        f.tags.clear();
+        f.tags.insert(
+            "#e".into(),
+            json!(vec!["a".repeat(64); MAX_FILTER_TAG_VALUES / 2 + 1]),
+        );
+        f.tags.insert(
+            "#p".into(),
+            json!(vec!["b".repeat(64); MAX_FILTER_TAG_VALUES / 2]),
+        );
+        assert!(
+            f.too_many_members(),
+            "the bound is the combined total, not per attribute"
+        );
+        // Unknown non-tag keys are ignored and carry no tag values.
+        f.tags.clear();
+        f.tags.insert(
+            "unknown".into(),
+            json!(vec!["a".repeat(64); MAX_FILTER_TAG_VALUES + 1]),
+        );
+        assert!(!f.too_many_members());
     }
 
     #[test]
