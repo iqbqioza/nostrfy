@@ -335,29 +335,6 @@ pub(crate) struct Store {
     /// Ceiling for the memory map (bytes): the map is opened at this size
     /// and never resized at runtime.
     pub(crate) map_max_size: u64,
-    /// Whether the heed environment close has been started. heed keeps a
-    /// strong reference to every opened environment in a global cache and
-    /// only closes it when [`heed::Env::prepare_for_closing`] is called:
-    /// dropping the handles alone leaks the environment (its lock file,
-    /// fcntl lock, TLS key and mappings) for the whole process lifetime.
-    /// Every `Store` handle shares this flag, so the cache entry is removed
-    /// exactly once; the environment itself is unmapped when the last handle
-    /// drops.
-    env_close_started: Arc<std::sync::atomic::AtomicBool>,
-}
-
-impl Drop for Store {
-    fn drop(&mut self) {
-        if !self
-            .env_close_started
-            .swap(true, std::sync::atomic::Ordering::SeqCst)
-        {
-            // The environment stays usable by the other handles (the map is
-            // only unmapped when the last one drops); this only removes
-            // heed's cache entry so that last drop actually closes it.
-            self.env.clone().prepare_for_closing();
-        }
-    }
 }
 
 /// `(created_at, id, protected, group_id, is_meta)` records returned by the
@@ -390,30 +367,13 @@ impl Store {
         // transactions — and would risk unmapping memory the readers are
         // still using.
         let map_size = map_max_size as usize;
-        let mut options = EnvOpenOptions::new();
-        // 17 named tables, plus the word index when search is on.
-        options
-            .max_dbs(cfg.max_dbs.max(18))
-            .max_readers(cfg.max_readers.max(8))
-            .map_size(map_size);
-        // heed closes an environment asynchronously once closing starts (a
-        // previous `Store`'s database threads may still be shutting down).
-        // A caller that reopens the same path right after dropping the
-        // previous handle — `Store` now closes its environment on the last
-        // drop — must wait out that short window instead of failing with
-        // `DatabaseClosing`. Bounded so a genuinely stuck closer surfaces.
         let env = unsafe {
-            let mut retries = 0u32;
-            loop {
-                match options.open(&cfg.path) {
-                    Ok(env) => break env,
-                    Err(heed::Error::DatabaseClosing) if retries < 200 => {
-                        retries += 1;
-                        std::thread::sleep(std::time::Duration::from_millis(5));
-                    }
-                    Err(e) => return Err(e.into()),
-                }
-            }
+            EnvOpenOptions::new()
+                // 17 named tables, plus the word index when search is on.
+                .max_dbs(cfg.max_dbs.max(18))
+                .max_readers(cfg.max_readers.max(8))
+                .map_size(map_size)
+                .open(&cfg.path)?
         };
         if cfg.disabled_fsync {
             // SAFETY: `NO_SYNC` is marked unsafe by heed because it trades
@@ -484,7 +444,6 @@ impl Store {
             expiry_enabled,
             max_indexed_words: max_indexed_words.max(1),
             map_max_size,
-            env_close_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 
@@ -552,7 +511,6 @@ impl Store {
             expiry_enabled: Arc::clone(&self.expiry_enabled),
             max_indexed_words: self.max_indexed_words,
             map_max_size: self.map_max_size,
-            env_close_started: Arc::clone(&self.env_close_started),
         }
     }
 
