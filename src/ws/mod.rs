@@ -1374,6 +1374,51 @@ mod tests {
     }
 
     #[test]
+    fn req_response_is_bounded_by_the_byte_budget() {
+        // A slow reader must not pin the whole scan result per pending
+        // response: the materialized prefix is truncated to the response
+        // byte budget, with the first over-budget event kept so the pump
+        // still emits its exact-check CLOSED (never a silent drop).
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let now = unix_now();
+            for i in 0..10 {
+                let ev = signed_note(
+                    conn.relay.secp(),
+                    &format!("e{i}-{}", "z".repeat(1_000)),
+                    now - i as u64,
+                    vec![],
+                );
+                conn.relay.db.put(ev, now).await;
+            }
+            // Each frame is well over 1 KiB; only a few fit in the budget.
+            conn.req_response_bytes = 5_000;
+            conn.handle_req(&[json!("sub"), json!({"kinds": [1]})])
+                .await;
+            let pending = conn.pending_reqs.front().expect("pending response");
+            assert!(
+                !pending.events.is_empty() && pending.events.len() < 10,
+                "the response must be truncated to the byte budget, got {} events",
+                pending.events.len()
+            );
+            conn.pump_pending_reqs();
+            let msgs = outgoing_json(&conn);
+            assert!(
+                msgs.iter().any(|m| m[0] == "CLOSED"
+                    && m[1] == "sub"
+                    && m[2].as_str().unwrap_or("").contains("response too large")),
+                "the truncated response must still end in the over-budget CLOSED"
+            );
+            assert!(
+                !conn.subs.contains_key("sub"),
+                "the over-budget response must release the subscription"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
     fn req_timeout_closes_and_releases_the_subscription() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
