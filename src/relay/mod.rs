@@ -765,6 +765,11 @@ impl Relay {
                 let Some(pubkey) = event.pubkey_bytes() else {
                     return (PutOutcome::Invalid("invalid: bad pubkey".into()), None);
                 };
+                // `vanish_pubkey` re-reads the config: release this guard
+                // first. Holding a read guard across that second read would
+                // deadlock against a queued config writer (SIGHUP reload,
+                // NIP-86 command), freezing every later config read.
+                drop(cfg);
                 drop(access);
                 self.vanish_pubkey(pubkey, event.created_at).await;
                 // A vanish request is accepted like any other event (the

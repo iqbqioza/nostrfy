@@ -375,6 +375,7 @@ pub async fn api_handler(
     if let Err(e) = bound_params(&mut params, &cfg) {
         return param_rejection(e);
     }
+    drop(cfg);
     // A 64-hex identifier is an author pubkey (profile lookup); everything
     // else goes through the NIP-19 parsing below.
     if let Ok(hex_pk) = parse_author_identifier(&identifier) {
@@ -517,6 +518,7 @@ pub async fn api_kind_handler(
     if let Err(e) = bound_params(&mut params, &cfg) {
         return param_rejection(e);
     }
+    drop(cfg);
     let hex_pk = match parse_author_identifier(&identifier) {
         Ok(pk) => pk,
         Err(e) => return error_response(StatusCode::BAD_REQUEST, &e.to_string()),
@@ -744,6 +746,7 @@ pub async fn api_query_handler(
     if let Err(e) = bound_params(&mut params, &cfg) {
         return param_rejection(e);
     }
+    drop(cfg);
     let limit = params.limit.unwrap_or(100);
     let filter = apply_params(Filter::default(), &params);
     let no_tags = excluded_tags(&params);
