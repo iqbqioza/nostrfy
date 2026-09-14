@@ -10,6 +10,30 @@ use crate::filter::Filter;
 use crate::nips::{nip29, nip40, nip42, nip45, nip70};
 use crate::util::unix_now;
 
+/// A strict lower bound of the serialized wire frame
+/// `["EVENT", <sub_id>, <event>]` in bytes, used to stop materializing a
+/// stored response that already exceeds the connection's
+/// `max_req_response_bytes`. JSON escaping and the numeric fields can only
+/// add bytes, so an event whose lower bound pushes the total past the
+/// budget will certainly fail the pump's exact byte check — the bound can
+/// only keep *more* events than fit (bounded by the underestimate), never
+/// less, so it cannot cause a silent truncation.
+fn event_frame_lower_bound(event: &Event, sub_id_len: usize) -> u64 {
+    let tag_bytes: usize = event
+        .tags
+        .iter()
+        .map(|tag| tag.iter().map(String::len).sum::<usize>())
+        .sum();
+    event
+        .content
+        .len()
+        .saturating_add(tag_bytes)
+        .saturating_add(event.id.len())
+        .saturating_add(event.pubkey.len())
+        .saturating_add(event.sig.len())
+        .saturating_add(sub_id_len) as u64
+}
+
 impl super::Conn {
     /// The verb of a JSON array message, extracted with a lightweight scan
     /// (no full parse): `["EVENT", ...]` → `"EVENT"`. Returns `None` when
@@ -351,7 +375,7 @@ impl super::Conn {
         if filters.iter().any(|f| f.too_many_members()) {
             self.reject_req(
                 sub_id,
-                "invalid: too many ids, authors or kinds in a filter",
+                "invalid: too many ids, authors, kinds or tag values in a filter",
             );
             return;
         }
@@ -532,6 +556,26 @@ impl super::Conn {
             to_send.truncate(end);
         } else {
             to_send.truncate(original_total);
+        }
+        // Bound the memory this response pins while it waits for the
+        // socket. The pump enforces `max_req_response_bytes` on the wire,
+        // but without this a slow reader would hold the whole
+        // `max_limit × filters` scan result per queued response (up to
+        // `MAX_PENDING_REQS` of them). The first event past the budget is
+        // kept, so the pump still hits its exact byte check on it and emits
+        // the same `CLOSED ... response too large` the client would
+        // otherwise receive: the truncation is never silent.
+        if self.req_response_bytes > 0 {
+            let mut total = 0u64;
+            let mut kept = 0usize;
+            for event in &to_send {
+                total = total.saturating_add(event_frame_lower_bound(event, sub_id.len()));
+                kept += 1;
+                if total > self.req_response_bytes {
+                    break;
+                }
+            }
+            to_send.truncate(kept);
         }
         // The response is queued for the pump instead of being pushed into
         // the outgoing queue all at once: the connection loop moves it into
@@ -752,7 +796,7 @@ impl super::Conn {
         if filters.iter().any(|f| f.too_many_members()) {
             self.reject_count(
                 sub_id,
-                "invalid: too many ids, authors or kinds in a filter",
+                "invalid: too many ids, authors, kinds or tag values in a filter",
             );
             return;
         }

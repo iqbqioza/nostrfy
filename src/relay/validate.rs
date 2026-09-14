@@ -634,7 +634,7 @@ mod tests {
         rt.block_on(async {
             let mut cfg = Config::default();
             cfg.database.map_size = 16 * 1024 * 1024;
-            cfg.database.max_map_size = 256 * 1024 * 1024;
+            cfg.database.max_map_size = 64 * 1024 * 1024;
             cfg.database.path = std::env::temp_dir().join("nostrfy-vanish-test");
             let _ = std::fs::remove_dir_all(&cfg.database.path);
             let db = crate::db::DbClient::open(
@@ -682,7 +682,7 @@ mod tests {
             let mut cfg = Config::default();
             cfg.relay.max_events_per_min_per_pubkey = 3;
             cfg.database.map_size = 16 * 1024 * 1024;
-            cfg.database.max_map_size = 256 * 1024 * 1024;
+            cfg.database.max_map_size = 64 * 1024 * 1024;
             cfg.database.path = std::env::temp_dir().join("nostrfy-rate-test");
             let _ = std::fs::remove_dir_all(&cfg.database.path);
             let db = crate::db::DbClient::open(
@@ -767,7 +767,7 @@ mod tests {
             let mut cfg = Config::default();
             cfg.relay.max_events_per_min_per_pubkey = 1;
             cfg.database.map_size = 16 * 1024 * 1024;
-            cfg.database.max_map_size = 256 * 1024 * 1024;
+            cfg.database.max_map_size = 64 * 1024 * 1024;
             cfg.database.path = std::env::temp_dir().join("nostrfy-rate-reject-test");
             let _ = std::fs::remove_dir_all(&cfg.database.path);
             let db = crate::db::DbClient::open(
@@ -816,7 +816,7 @@ mod tests {
         rt.block_on(async {
             let mut cfg = Config::default();
             cfg.database.map_size = 16 * 1024 * 1024;
-            cfg.database.max_map_size = 256 * 1024 * 1024;
+            cfg.database.max_map_size = 64 * 1024 * 1024;
             cfg.database.path = std::env::temp_dir().join("nostrfy-rate-map-test");
             let _ = std::fs::remove_dir_all(&cfg.database.path);
             let db = crate::db::DbClient::open(
@@ -898,7 +898,7 @@ mod tests {
             // rejected.
             let mut cfg = Config::default();
             cfg.database.map_size = 16 * 1024 * 1024;
-            cfg.database.max_map_size = 256 * 1024 * 1024;
+            cfg.database.max_map_size = 64 * 1024 * 1024;
             cfg.database.path = std::env::temp_dir().join("nostrfy-git-test-disabled");
             let _ = std::fs::remove_dir_all(&cfg.database.path);
             let db = crate::db::DbClient::open(
@@ -1006,7 +1006,7 @@ mod tests {
             // Default config: ephemeral events are allowed.
             let mut cfg = Config::default();
             cfg.database.map_size = 16 * 1024 * 1024;
-            cfg.database.max_map_size = 256 * 1024 * 1024;
+            cfg.database.max_map_size = 64 * 1024 * 1024;
             cfg.database.path = std::env::temp_dir().join("nostrfy-ephemeral-test-allow");
             let _ = std::fs::remove_dir_all(&cfg.database.path);
             let db = crate::db::DbClient::open(
@@ -1163,7 +1163,7 @@ mod tests {
         rt.block_on(async {
             let mut cfg = Config::default();
             cfg.database.map_size = 16 * 1024 * 1024;
-            cfg.database.max_map_size = 256 * 1024 * 1024;
+            cfg.database.max_map_size = 64 * 1024 * 1024;
             cfg.database.path = std::env::temp_dir().join("nostrfy-spec-strictness-validate");
             let _ = std::fs::remove_dir_all(&cfg.database.path);
             let db = crate::db::DbClient::open(
@@ -1312,7 +1312,7 @@ mod tests {
         rt.block_on(async {
             let mut cfg = Config::default();
             cfg.database.map_size = 16 * 1024 * 1024;
-            cfg.database.max_map_size = 256 * 1024 * 1024;
+            cfg.database.max_map_size = 64 * 1024 * 1024;
             cfg.database.path =
                 std::env::temp_dir().join("nostrfy-nip43-claim-test");
             let _ = std::fs::remove_dir_all(&cfg.database.path);
@@ -1393,7 +1393,7 @@ mod tests {
     async fn build_validate_relay(dir: &str) -> Arc<Relay> {
         let mut cfg = Config::default();
         cfg.database.map_size = 16 * 1024 * 1024;
-        cfg.database.max_map_size = 256 * 1024 * 1024;
+        cfg.database.max_map_size = 64 * 1024 * 1024;
         cfg.database.path = std::env::temp_dir().join(dir);
         let _ = std::fs::remove_dir_all(&cfg.database.path);
         let db = crate::db::DbClient::open(
@@ -1880,7 +1880,7 @@ mod tests {
             let mut cfg = Config::default();
             cfg.relay.reject_ephemeral = true;
             cfg.database.map_size = 16 * 1024 * 1024;
-            cfg.database.max_map_size = 256 * 1024 * 1024;
+            cfg.database.max_map_size = 64 * 1024 * 1024;
             cfg.database.path = std::env::temp_dir().join("nostrfy-ephemeral-validate-base");
             let _ = std::fs::remove_dir_all(&cfg.database.path);
             let db = crate::db::DbClient::open(
@@ -1935,7 +1935,7 @@ mod tests {
         rt.block_on(async {
             let mut cfg = Config::default();
             cfg.database.map_size = 16 * 1024 * 1024;
-            cfg.database.max_map_size = 256 * 1024 * 1024;
+            cfg.database.max_map_size = 64 * 1024 * 1024;
             cfg.database.path = std::env::temp_dir().join("nostrfy-vanish-blocked-test");
             let _ = std::fs::remove_dir_all(&cfg.database.path);
             let db = crate::db::DbClient::open(

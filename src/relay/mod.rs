@@ -1478,7 +1478,7 @@ mod tests {
         let mut cfg = crate::config::Config::default();
         cfg.database.path = path;
         cfg.database.map_size = 16 * 1024 * 1024;
-        cfg.database.max_map_size = 256 * 1024 * 1024;
+        cfg.database.max_map_size = 64 * 1024 * 1024;
         cfg.database.disabled_fsync = disable_fsync;
         let db = crate::db::DbClient::open(
             &cfg.database,
@@ -1626,7 +1626,7 @@ mod tests {
         let mut cfg = crate::config::Config::default();
         cfg.database.path = path;
         cfg.database.map_size = 16 * 1024 * 1024;
-        cfg.database.max_map_size = 256 * 1024 * 1024;
+        cfg.database.max_map_size = 64 * 1024 * 1024;
         if let Some(key) = key {
             cfg.relay.enabled_nips = vec![43];
             cfg.relay.private_key = key.to_string();
@@ -2241,7 +2241,7 @@ mod tests {
             let mut cfg = crate::config::Config::default();
             cfg.database.path = path;
             cfg.database.map_size = 16 * 1024 * 1024;
-            cfg.database.max_map_size = 256 * 1024 * 1024;
+            cfg.database.max_map_size = 64 * 1024 * 1024;
             let db = crate::db::DbClient::open(
                 &cfg.database,
                 true,
@@ -2315,7 +2315,7 @@ mod tests {
             let mut cfg = crate::config::Config::default();
             cfg.database.path = path;
             cfg.database.map_size = 16 * 1024 * 1024;
-            cfg.database.max_map_size = 256 * 1024 * 1024;
+            cfg.database.max_map_size = 64 * 1024 * 1024;
             let db = crate::db::DbClient::open(
                 &cfg.database,
                 true,

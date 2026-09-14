@@ -401,9 +401,12 @@ impl Conn {
                 ]));
                 // The CLOSED ends the subscription: release it exactly
                 // like a client CLOSE (filter bytes, live slot, stats).
-                // REQ namespace only (NIP-77 separate namespace).
+                // REQ namespace only (NIP-77 separate namespace). This
+                // also removes this response from `pending_reqs`, so
+                // popping the front again would silently discard the
+                // *next* subscription's queued response (its events and
+                // EOSE) and leave that client hanging.
                 self.remove_req_subscription(&sub_id);
-                self.pending_reqs.pop_front();
                 continue;
             }
             if !front.events.is_empty() {
@@ -1307,7 +1310,7 @@ mod tests {
         // memory under the concurrent load (sparse, but the mappings add
         // up). The tests store a handful of events.
         cfg.database.map_size = 16 * 1024 * 1024;
-        cfg.database.max_map_size = 256 * 1024 * 1024;
+        cfg.database.max_map_size = 64 * 1024 * 1024;
         let db = crate::db::DbClient::open(
             &cfg.database,
             true,
@@ -1317,7 +1320,7 @@ mod tests {
             4096,
             262144,
         )
-        .unwrap();
+        .unwrap_or_else(|e| panic!("open test db at {}: {e}", cfg.database.path.display()));
         let config = Arc::new(RwLock::new(cfg));
         let stats = Stats::new();
         let mut relay = Relay::new(
@@ -1369,6 +1372,51 @@ mod tests {
                 .collect();
             assert!(ids.contains(&e1.id) && ids.contains(&e2.id));
             assert!(msgs.iter().any(|m| m[0] == "EOSE" && m[1] == "sub"));
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn req_response_is_bounded_by_the_byte_budget() {
+        // A slow reader must not pin the whole scan result per pending
+        // response: the materialized prefix is truncated to the response
+        // byte budget, with the first over-budget event kept so the pump
+        // still emits its exact-check CLOSED (never a silent drop).
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let now = unix_now();
+            for i in 0..10 {
+                let ev = signed_note(
+                    conn.relay.secp(),
+                    &format!("e{i}-{}", "z".repeat(1_000)),
+                    now - i as u64,
+                    vec![],
+                );
+                conn.relay.db.put(ev, now).await;
+            }
+            // Each frame is well over 1 KiB; only a few fit in the budget.
+            conn.req_response_bytes = 5_000;
+            conn.handle_req(&[json!("sub"), json!({"kinds": [1]})])
+                .await;
+            let pending = conn.pending_reqs.front().expect("pending response");
+            assert!(
+                !pending.events.is_empty() && pending.events.len() < 10,
+                "the response must be truncated to the byte budget, got {} events",
+                pending.events.len()
+            );
+            conn.pump_pending_reqs();
+            let msgs = outgoing_json(&conn);
+            assert!(
+                msgs.iter().any(|m| m[0] == "CLOSED"
+                    && m[1] == "sub"
+                    && m[2].as_str().unwrap_or("").contains("response too large")),
+                "the truncated response must still end in the over-budget CLOSED"
+            );
+            assert!(
+                !conn.subs.contains_key("sub"),
+                "the over-budget response must release the subscription"
+            );
             conn.relay.db.shutdown();
         });
     }
@@ -2816,6 +2864,34 @@ mod tests {
     }
 
     #[test]
+    fn req_rejects_too_many_tag_values() {
+        // Each tag value becomes one scan range and one live-match
+        // comparison, so an unbounded `#e`/`#p` list is a CPU and memory
+        // amplification vector; oversized filters are refused like
+        // oversized ids/authors/kinds.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let values: Vec<String> = (0..crate::filter::MAX_FILTER_TAG_VALUES + 1)
+                .map(|_| "a".repeat(64))
+                .collect();
+            conn.handle_req(&[json!("sub"), json!({"#e": values})])
+                .await;
+            let msgs = outgoing_json(&conn);
+            assert!(
+                msgs.iter()
+                    .any(|m| m[0] == "CLOSED" && m[2].as_str().unwrap_or("").contains("too many")),
+                "an oversized tag filter must be refused with CLOSED"
+            );
+            assert!(
+                !conn.subs.contains_key("sub"),
+                "the refused subscription must not be registered"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
     fn req_replacement_is_allowed_at_the_subscription_cap() {
         // NIP-01: re-REQ with an existing id replaces the subscription, so
         // it must work even when the connection already holds the maximum
@@ -3086,7 +3162,7 @@ mod tests {
                         let mut cfg = Config::default();
                         cfg.database.path = temp_db_path();
                         cfg.database.map_size = 16 * 1024 * 1024;
-                        cfg.database.max_map_size = 256 * 1024 * 1024;
+                        cfg.database.max_map_size = 64 * 1024 * 1024;
                         cfg.database
                     },
                     true,
@@ -4294,6 +4370,79 @@ mod tests {
                 "an event beyond the whole budget closes without delivery"
             );
             assert!(!conn.subs.contains_key("s2"));
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn pump_oversized_response_keeps_the_next_pending() {
+        // Regression: the over-budget CLOSED removed its entry via
+        // `remove_req_subscription` and then popped the queue front again,
+        // silently discarding the *next* subscription's stored response
+        // (no events, no EOSE), so that client waited forever.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            conn.req_response_bytes = 3_000;
+            let now = unix_now();
+            conn.subs
+                .insert("a".into(), (Vec::new(), 0, "\"a\"".into()));
+            let mut big = std::collections::VecDeque::new();
+            for i in 0..3 {
+                big.push_back(signed_note(
+                    conn.relay.secp(),
+                    &format!("big-{i}-{}", "y".repeat(2_000)),
+                    now - i,
+                    vec![],
+                ));
+            }
+            conn.enqueue_pending_req(PendingReq {
+                sub_id: "a".into(),
+                events: big,
+                eose_hint: false,
+                truncated_or_more: false,
+                auth_hint: false,
+                sent_bytes: 0,
+                live: Default::default(),
+                live_bytes: 0,
+                eose_sent: false,
+            });
+            conn.subs
+                .insert("b".into(), (Vec::new(), 0, "\"b\"".into()));
+            let mut small = std::collections::VecDeque::new();
+            small.push_back(signed_note(conn.relay.secp(), "small", now, vec![]));
+            conn.enqueue_pending_req(PendingReq {
+                sub_id: "b".into(),
+                events: small,
+                eose_hint: false,
+                truncated_or_more: false,
+                auth_hint: false,
+                sent_bytes: 0,
+                live: Default::default(),
+                live_bytes: 0,
+                eose_sent: false,
+            });
+            conn.pump_pending_reqs();
+            let msgs = outgoing_json(&conn);
+            assert!(
+                msgs.iter().any(|m| m[0] == "CLOSED" && m[1] == "a"),
+                "the over-budget response is closed"
+            );
+            assert_eq!(
+                msgs.iter()
+                    .filter(|m| m[0] == "EVENT" && m[1] == "b")
+                    .count(),
+                1,
+                "the next subscription's event must still be delivered"
+            );
+            assert!(
+                msgs.iter().any(|m| m[0] == "EOSE" && m[1] == "b"),
+                "the next subscription must still receive its EOSE"
+            );
+            assert!(
+                !conn.subs.contains_key("a") && !conn.pending_reqs.iter().any(|p| p.sub_id == "b"),
+                "a is released and b is fully pumped"
+            );
             conn.relay.db.shutdown();
         });
     }

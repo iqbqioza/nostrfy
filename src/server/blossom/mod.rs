@@ -1256,6 +1256,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let mut cfg = Config::default();
         cfg.database.path = dir.join("db");
+        // Small mappings: the test VM cannot afford several default-sized
+        // (1 GB / 1 TiB) LMDB reservations at once.
+        cfg.database.map_size = 16 * 1024 * 1024;
+        cfg.database.max_map_size = 32 * 1024 * 1024;
         cfg.blossom.host = "media.example.com".into();
         cfg.blossom.storage = "local".into();
         cfg.blossom.local_path = dir.join("blobs");

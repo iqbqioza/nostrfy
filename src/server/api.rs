@@ -1782,7 +1782,7 @@ mod tests {
         let mut cfg = Config::default();
         cfg.database.path = path;
         cfg.database.map_size = 16 * 1024 * 1024;
-        cfg.database.max_map_size = 256 * 1024 * 1024;
+        cfg.database.max_map_size = 64 * 1024 * 1024;
         let db = DbClient::open(
             &cfg.database,
             true,
