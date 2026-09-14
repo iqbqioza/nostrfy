@@ -581,13 +581,14 @@ impl super::Conn {
             .values()
             .flat_map(|(filters, _, _)| filters.iter().map(crate::relay::FilterComponents::of))
             .collect();
-        let mut index = self
-            .relay
+        // `register` replaces this connection's previous components in
+        // place, so only this connection's entries are touched instead of
+        // the whole index.
+        self.relay
             .sub_index
             .write()
-            .unwrap_or_else(|p| p.into_inner());
-        index.unregister(self.conn_id);
-        index.register(self.conn_id, &components);
+            .unwrap_or_else(|p| p.into_inner())
+            .register(self.conn_id, components);
     }
 
     /// Releases a REQ subscription only (NIP-77 separate namespace):
@@ -605,8 +606,13 @@ impl super::Conn {
                 .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             self.subscriptions_held
                 .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            // Only an actual removal changes the live index. A CLOSE (or a
+            // rejected REQ) for an unknown id must not take the index
+            // write lock at all: an attacker could otherwise spam such
+            // frames and block live delivery with no subscription state
+            // to justify it.
+            self.sync_live_index();
         }
-        self.sync_live_index();
     }
 
     /// Releases negentropy state only (NIP-77 separate namespace).
