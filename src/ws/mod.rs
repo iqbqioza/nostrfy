@@ -1310,7 +1310,7 @@ mod tests {
         // memory under the concurrent load (sparse, but the mappings add
         // up). The tests store a handful of events.
         cfg.database.map_size = 16 * 1024 * 1024;
-        cfg.database.max_map_size = 256 * 1024 * 1024;
+        cfg.database.max_map_size = 64 * 1024 * 1024;
         let db = crate::db::DbClient::open(
             &cfg.database,
             true,
@@ -1320,7 +1320,7 @@ mod tests {
             4096,
             262144,
         )
-        .unwrap();
+        .unwrap_or_else(|e| panic!("open test db at {}: {e}", cfg.database.path.display()));
         let config = Arc::new(RwLock::new(cfg));
         let stats = Stats::new();
         let mut relay = Relay::new(
@@ -3162,7 +3162,7 @@ mod tests {
                         let mut cfg = Config::default();
                         cfg.database.path = temp_db_path();
                         cfg.database.map_size = 16 * 1024 * 1024;
-                        cfg.database.max_map_size = 256 * 1024 * 1024;
+                        cfg.database.max_map_size = 64 * 1024 * 1024;
                         cfg.database
                     },
                     true,

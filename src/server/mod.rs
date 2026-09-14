@@ -1508,7 +1508,7 @@ mod tests {
         cfg.blossom.host = "media.example.com".into();
         cfg.blossom.storage = "local".into();
         cfg.database.map_size = 16 * 1024 * 1024;
-        cfg.database.max_map_size = 256 * 1024 * 1024;
+        cfg.database.max_map_size = 64 * 1024 * 1024;
         cfg.database.path = std::env::temp_dir()
             .join("nostrfy-server-test")
             .join(format!("{:x}-{id}", std::process::id()));

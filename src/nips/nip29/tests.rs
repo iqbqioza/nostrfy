@@ -841,6 +841,11 @@ fn rebuild_keeps_join_membership() {
     let _ = std::fs::remove_dir_all(&path);
     let cfg = crate::config::DatabaseConfig {
         path,
+        // Small mappings: the test VM cannot afford several default-sized
+        // (1 GB / 1 TiB) LMDB reservations at once, and the test stores a
+        // handful of events.
+        map_size: 16 * 1024 * 1024,
+        max_map_size: 32 * 1024 * 1024,
         ..Default::default()
     };
     let db = DbClient::open(
@@ -897,6 +902,11 @@ fn rebuild_ghosts_group_whose_only_surviving_events_are_relay_metadata() {
     let _ = std::fs::remove_dir_all(&path);
     let cfg = crate::config::DatabaseConfig {
         path,
+        // Small mappings: the test VM cannot afford several default-sized
+        // (1 GB / 1 TiB) LMDB reservations at once, and the test stores a
+        // handful of events.
+        map_size: 16 * 1024 * 1024,
+        max_map_size: 32 * 1024 * 1024,
         ..Default::default()
     };
     let db = DbClient::open(

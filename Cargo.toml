@@ -15,7 +15,13 @@ daemonize = "0.5"
 env_logger = "0.11"
 futures-util = "0.3"
 getrandom = "0.2"
-heed = "0.20"
+# `read-txn-no-tls` makes heed open LMDB environments with MDB_NOTLS: without
+# it, every environment allocates a process-wide pthread TLS key when it is
+# opened, the key is only released when the environment is closed, and the
+# FreeBSD CI opens enough environments to exhaust the (small) pthread key
+# table, making `mdb_env_open` fail with EAGAIN. MDB_NOTLS is safe here: every
+# read transaction is created and dropped on the same database thread.
+heed = { version = "0.20", features = ["read-txn-no-tls"] }
 hex = "0.4"
 hyper = { version = "1", features = ["http1", "http2", "server"] }
 hyper-util = { version = "0.1", features = ["tokio", "server", "service", "http1", "http2"] }

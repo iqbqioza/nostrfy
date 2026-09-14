@@ -187,6 +187,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&path);
         let mut cfg = Config::default();
         cfg.database.path = path;
+        // Small mappings: the test VM cannot afford several default-sized
+        // (1 GB / 1 TiB) LMDB reservations at once.
+        cfg.database.map_size = 16 * 1024 * 1024;
+        cfg.database.max_map_size = 32 * 1024 * 1024;
         cfg.relay.enabled_nips = vec![29];
         cfg.relay.livekit_api_key = "test-key".into();
         cfg.relay.livekit_api_secret = "test-secret".into();
