@@ -351,7 +351,7 @@ impl super::Conn {
         if filters.iter().any(|f| f.too_many_members()) {
             self.reject_req(
                 sub_id,
-                "invalid: too many ids, authors or kinds in a filter",
+                "invalid: too many ids, authors, kinds or tag values in a filter",
             );
             return;
         }
@@ -752,7 +752,7 @@ impl super::Conn {
         if filters.iter().any(|f| f.too_many_members()) {
             self.reject_count(
                 sub_id,
-                "invalid: too many ids, authors or kinds in a filter",
+                "invalid: too many ids, authors, kinds or tag values in a filter",
             );
             return;
         }

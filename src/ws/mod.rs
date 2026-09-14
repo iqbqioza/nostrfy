@@ -2816,6 +2816,34 @@ mod tests {
     }
 
     #[test]
+    fn req_rejects_too_many_tag_values() {
+        // Each tag value becomes one scan range and one live-match
+        // comparison, so an unbounded `#e`/`#p` list is a CPU and memory
+        // amplification vector; oversized filters are refused like
+        // oversized ids/authors/kinds.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let values: Vec<String> = (0..crate::filter::MAX_FILTER_TAG_VALUES + 1)
+                .map(|_| "a".repeat(64))
+                .collect();
+            conn.handle_req(&[json!("sub"), json!({"#e": values})])
+                .await;
+            let msgs = outgoing_json(&conn);
+            assert!(
+                msgs.iter()
+                    .any(|m| m[0] == "CLOSED" && m[2].as_str().unwrap_or("").contains("too many")),
+                "an oversized tag filter must be refused with CLOSED"
+            );
+            assert!(
+                !conn.subs.contains_key("sub"),
+                "the refused subscription must not be registered"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
     fn req_replacement_is_allowed_at_the_subscription_cap() {
         // NIP-01: re-REQ with an existing id replaces the subscription, so
         // it must work even when the connection already holds the maximum

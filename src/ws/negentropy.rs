@@ -125,7 +125,7 @@ impl super::Conn {
         if filter.too_many_members() {
             self.neg_err(
                 &sub_id,
-                "error: too many ids, authors or kinds in the filter",
+                "error: too many ids, authors, kinds or tag values in the filter",
             );
             return;
         }
