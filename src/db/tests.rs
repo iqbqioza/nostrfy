@@ -3576,6 +3576,78 @@ fn event_meta_rebuilds_from_stored_events() {
 }
 
 #[test]
+fn gift_wrap_index_backfills_legacy_wraps() {
+    let expiry = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let store = crate::db::store::Store::open(&config(), expiry, 128).unwrap();
+    let now = 1_700_000_000;
+    let recipient = "aB3130de0d1386592fe7b9f407f5f1ae8f1db91d772e484b3d81df0fa2e88f24";
+    let wrap = event(
+        1059,
+        "legacy wrap",
+        now,
+        vec![vec!["p".into(), recipient.into()]],
+    );
+    let id = wrap.id_bytes().unwrap();
+    let mut wtxn = store.env.write_txn().unwrap();
+    assert!(matches!(
+        store.put_event_in(&mut wtxn, &wrap, now).unwrap(),
+        PutOutcome::Stored
+    ));
+    wtxn.commit().unwrap();
+    let key = crate::db::store::tag_key(
+        crate::db::store::GIFT_WRAP_INDEX,
+        &hex::decode(recipient).unwrap(),
+        now,
+        &id,
+    );
+    // Simulate a database written before the recipient index existed: the
+    // event is stored but its hidden entry is missing.
+    let mut wtxn = store.env.write_txn().unwrap();
+    store.by_tag.delete(&mut wtxn, &key).unwrap();
+    wtxn.commit().unwrap();
+    assert!(store.gift_wrap_index_needs_rebuild().unwrap());
+    assert_eq!(store.rebuild_gift_wrap_index().unwrap(), 1);
+    assert!(!store.gift_wrap_index_needs_rebuild().unwrap());
+    // The backfilled entry makes the mixed-case recipient lookup find it.
+    let removed = store
+        .delete_gift_wraps_to(&hex::decode(recipient).unwrap())
+        .unwrap();
+    assert_eq!(removed, 1);
+}
+
+#[test]
+fn gift_wrap_index_entries_are_removed_with_the_event() {
+    let expiry = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let store = crate::db::store::Store::open(&config(), expiry, 128).unwrap();
+    let now = 1_700_000_000;
+    let recipient = "b83130de0d1386592fe7b9f407f5f1ae8f1db91d772e484b3d81df0fa2e88f24";
+    let wrap = event(1059, "wrap", now, vec![vec!["p".into(), recipient.into()]]);
+    let id = wrap.id_bytes().unwrap();
+    let mut wtxn = store.env.write_txn().unwrap();
+    assert!(matches!(
+        store.put_event_in(&mut wtxn, &wrap, now).unwrap(),
+        PutOutcome::Stored
+    ));
+    wtxn.commit().unwrap();
+    let key = crate::db::store::tag_key(
+        crate::db::store::GIFT_WRAP_INDEX,
+        &hex::decode(recipient).unwrap(),
+        now,
+        &id,
+    );
+    let rtxn = store.env.read_txn().unwrap();
+    assert!(store.by_tag.get(&rtxn, &key).unwrap().is_some());
+    drop(rtxn);
+    // Removing the event (any path) must drop the recipient entry with it,
+    // or a later deletion by recipient would find a dangling key.
+    let mut wtxn = store.env.write_txn().unwrap();
+    store.remove_event(&mut wtxn, &id).unwrap();
+    wtxn.commit().unwrap();
+    let rtxn = store.env.read_txn().unwrap();
+    assert!(store.by_tag.get(&rtxn, &key).unwrap().is_none());
+}
+
+#[test]
 fn removing_corrupt_event_cleans_primary_indexes() {
     let expiry = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let store = crate::db::store::Store::open(&config(), expiry, 128).unwrap();
