@@ -278,6 +278,11 @@ max_api_limit = 5000
 # values are rejected with a 400.
 max_api_offset = 50000
 
+# Maximum rows one `/api/v1` query may prefetch for pagination (0 = no
+# bound). The over-fetch window is `offset + limit + 1` and every row is a
+# full event in memory; larger windows are rejected with a 400.
+max_api_fetch = 10000
+
 # Maximum length in bytes of the API `search` query parameter (0 = no bound).
 # Longer values are rejected with a 400.
 max_api_search_bytes = 2048
