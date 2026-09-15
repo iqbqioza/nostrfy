@@ -134,12 +134,35 @@ pub fn terms(search: &str) -> Vec<String> {
 /// "rust"), making search results depend on whether the word index is
 /// enabled. With whole-word matching the index, the non-indexed fallback
 /// scan and the live delivery all agree.
+///
+/// The words are compared while streaming the content: the previous
+/// implementation materialized every word as a `String` in a `Vec` (once
+/// per event per matching subscription, and once per candidate in the scan
+/// engine). The single reused buffer keeps the exact [`tokenize`] rules
+/// (Unicode-aware lowercasing, words shorter than two bytes and
+/// numeric-only words are not words), so the index, the fallback scan and
+/// the live delivery still agree.
 pub fn matches_terms(content: &str, terms: &[String]) -> bool {
     if terms.is_empty() {
         return true;
     }
-    let words = tokenize(content);
-    terms.iter().any(|t| words.iter().any(|w| w == t))
+    let mut current = String::new();
+    let mut numeric = true;
+    for ch in content.chars() {
+        if ch.is_alphanumeric() {
+            numeric &= ch.is_ascii_digit();
+            current.extend(ch.to_lowercase());
+            continue;
+        }
+        if !current.is_empty() {
+            if current.len() >= 2 && !numeric && terms.iter().any(|t| t == &current) {
+                return true;
+            }
+            current.clear();
+            numeric = true;
+        }
+    }
+    current.len() >= 2 && !numeric && terms.iter().any(|t| t == &current)
 }
 
 #[cfg(test)]
@@ -224,5 +247,50 @@ mod tests {
             &super::terms("nostr bitcoin")
         ));
         assert!(!matches_terms("neither", &super::terms("nostr bitcoin")));
+    }
+
+    #[test]
+    fn streaming_matcher_agrees_with_tokenize() {
+        // The allocation-free matcher must produce exactly the words
+        // `tokenize` would: same Unicode lowercasing, same two-byte minimum
+        // and the same numeric-only exclusion.
+        let contents = [
+            "Hello, World! 123",
+            "a bc",
+            "2023 nostr",
+            "abc123 def",
+            "12ab 34",
+            "I have 123 apples",
+            "",
+            "!!!",
+            "rust ru",
+            "café CAFÉ",
+            "İstanbul",
+            "multi   spaces\tand\nnewlines",
+            "日本語 テスト",
+        ];
+        for content in contents {
+            let words = tokenize(content);
+            assert!(
+                matches_terms(content, &words) || words.is_empty(),
+                "every tokenized word must match: {content:?} -> {words:?}"
+            );
+            if let Some(first) = words.first() {
+                assert!(
+                    matches_terms(content, std::slice::from_ref(first)),
+                    "the first tokenized word must match: {content:?} -> {first:?}"
+                );
+            }
+            assert!(
+                !matches_terms(content, &["definitelynotpresent".to_string()]),
+                "an absent term must not match: {content:?}"
+            );
+        }
+        // Numeric-only and one-byte words are not words (the index excludes
+        // them), so they cannot be matched.
+        assert!(!matches_terms("123", &["123".to_string()]));
+        assert!(!matches_terms("a b", &["a".to_string()]));
+        // Mixed words are matched (the numeric exclusion is per word).
+        assert!(matches_terms("abc123", &["abc123".to_string()]));
     }
 }
