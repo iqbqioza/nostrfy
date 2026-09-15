@@ -332,8 +332,15 @@ impl Relay {
         // pubkey allow/deny lists live in the relay database (LMDB),
         // managed with `nostrfy relay allow/deny` — never in the config.
         let mut access = match db.load_access().await {
-            Some(access) => access,
-            None => config.read().await.access.clone(),
+            crate::db::LoadAccessOutcome::Loaded(access) => access,
+            crate::db::LoadAccessOutcome::Missing => config.read().await.access.clone(),
+            crate::db::LoadAccessOutcome::Failed => {
+                // A failed read must not be mistaken for "nothing was ever
+                // persisted": the config seed would silently replace the
+                // persisted NIP-86 bans/IP blocks with it (fail-open).
+                log::error!("cannot load the persisted access control state; refusing to start");
+                std::process::exit(1);
+            }
         };
         // `restrict_relay` is config-owned: an older persisted blob (which
         // predates the flag) would otherwise silently override it with the

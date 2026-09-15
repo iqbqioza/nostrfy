@@ -32,6 +32,23 @@ use crate::event::Event;
 use crate::filter::Filter;
 use crate::nips::nip09;
 
+/// Outcome of the startup access-control load. `Missing` and `Failed` must
+/// stay distinct: `Missing` seeds the config's `access` section on the very
+/// first run, while `Failed` must stop the relay — treating a failed read
+/// as "nothing persisted" would silently replace the persisted NIP-86 bans
+/// and IP blocks with the config seed (fail-open).
+#[derive(Debug, Default)]
+pub enum LoadAccessOutcome {
+    /// The persisted state was read successfully.
+    Loaded(crate::config::AccessControl),
+    /// Nothing was ever persisted (first run).
+    Missing,
+    /// The database could not answer. Also the [`Default`]: a missing reply
+    /// is a failure, never "nothing was persisted".
+    #[default]
+    Failed,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PutOutcome {
     Stored,
@@ -184,7 +201,7 @@ enum Msg {
     },
     /// Loads the persisted access control lists.
     LoadAccess {
-        reply: oneshot::Sender<Option<crate::config::AccessControl>>,
+        reply: oneshot::Sender<LoadAccessOutcome>,
     },
     /// Loads the persisted Blossom upload allowlist.
     LoadBlossomAllow {
@@ -1293,11 +1310,12 @@ impl DbClient {
             .await
     }
 
-    /// Loads the persisted access control lists, if any.
     /// Loads the persisted access control at startup: waits for the reader
     /// (no timeout, no fail-fast) so a slow database cannot silently
-    /// degrade the security state to "empty = allow everyone".
-    pub async fn load_access(&self) -> Option<crate::config::AccessControl> {
+    /// degrade the security state to "empty = allow everyone". A failed
+    /// read is reported as [`LoadAccessOutcome::Failed`], never conflated
+    /// with the first-run [`LoadAccessOutcome::Missing`].
+    pub async fn load_access(&self) -> LoadAccessOutcome {
         self.request_read_blocking(|reply| Msg::LoadAccess { reply })
             .await
     }
