@@ -529,6 +529,29 @@ impl DbClient {
         }
     }
 
+    /// Startup-only read that reports failure instead of degrading to a
+    /// default value: like [`Self::request_read_blocking`] it neither fails
+    /// fast nor applies the response timeout (a merely slow database must
+    /// not silently turn startup state into an empty one), but a missing
+    /// reply is returned as `None` so the caller can fail closed instead of
+    /// persisting an empty/incomplete state.
+    async fn request_read_startup<R>(
+        &self,
+        make: impl FnOnce(oneshot::Sender<R>) -> Msg,
+    ) -> Option<R> {
+        let (tx, rx) = oneshot::channel();
+        let msg = make(tx);
+        self.pending_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if self.read_tx.send(msg).is_err() {
+            self.pending_reads
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            log::error!("database reader is gone; cannot rebuild startup state");
+            return None;
+        }
+        rx.await.ok()
+    }
+
     /// Read-only request that reports failure (`None`) instead of
     /// degrading to a default value: used by the SIGHUP reloads, where
     /// an empty result would overwrite the live deny/allow lists with
@@ -816,17 +839,19 @@ impl DbClient {
         .await
     }
 
-    /// Like [`Self::query_directed`] but with a much larger scan budget for
-    /// the startup rebuilds (NIP-29 group state, NIP-43 role store): they
-    /// legitimately walk the whole event history and must not be truncated
-    /// by the anti-DoS candidate budget.
-    pub async fn query_full(
+    /// Full-history scan for the startup rebuilds (NIP-29 group state,
+    /// NIP-43 role store): the large scan budget walks the whole event
+    /// history, and a failed or timed-out reply is reported as `None`
+    /// instead of degrading to an empty page. An empty page would be
+    /// mistaken for the end of the history, and the resulting incomplete
+    /// state would be persisted (missing groups become world-readable).
+    pub async fn query_full_startup(
         &self,
         filters: Vec<Filter>,
         limit: usize,
         now: u64,
-    ) -> (Vec<Event>, bool) {
-        self.request_read(|reply| Msg::Query {
+    ) -> Option<(Vec<Event>, bool)> {
+        self.request_read_startup(|reply| Msg::Query {
             filters,
             limit,
             now,
@@ -1139,9 +1164,11 @@ impl DbClient {
             .await
     }
 
-    /// Every vanished pubkey (raw 32-byte keys). Startup-only use.
-    pub async fn vanish_pubkeys(&self) -> Vec<Vec<u8>> {
-        self.request_read(|reply| Msg::VanishPubkeys { reply })
+    /// Every vanished pubkey (raw 32-byte keys) for the startup rebuilds.
+    /// `None` when the reader could not answer: the caller fails closed
+    /// instead of resurrecting vanished identities with an empty list.
+    pub async fn vanish_pubkeys(&self) -> Option<Vec<Vec<u8>>> {
+        self.request_read_startup(|reply| Msg::VanishPubkeys { reply })
             .await
     }
 

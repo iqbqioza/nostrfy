@@ -220,19 +220,62 @@ impl RoleStore {
     /// membership lists (only the latest addressable/replaceable versions
     /// are retained in the database). Only events signed by the relay's own
     /// key are honored (NIP-43: these MUST be signed by the `self` pubkey).
-    pub async fn rebuild(&mut self, db: &DbClient, relay_pubkey: &str) {
-        let filter: Filter =
-            serde_json::from_value(json!({ "kinds": [ROLE_DEFINITION, MEMBERSHIP_LIST] }))
-                .expect("static filter");
-        let (events, _) = db.query_full(vec![filter], 1_000_000, unix_now()).await;
+    ///
+    /// Returns `false` when the rebuild could not be completed (the database
+    /// did not answer, or the scan budget was exhausted mid-page): the
+    /// caller must not persist or serve a role store rebuilt from an
+    /// incomplete history. The store is left empty on failure.
+    pub async fn rebuild(&mut self, db: &DbClient, relay_pubkey: &str) -> bool {
+        // Page the full-history walk like the NIP-29 rebuild: a single
+        // million-event query materialized the whole history at once and
+        // silently discarded anything past the scan budget, so a truncated
+        // rebuild could be persisted as if it were complete.
+        const PAGE: usize = 50_000;
+        let mut events: Vec<Event> = Vec::new();
+        let mut until: Option<u64> = None;
+        loop {
+            let mut filter: Filter =
+                serde_json::from_value(json!({ "kinds": [ROLE_DEFINITION, MEMBERSHIP_LIST] }))
+                    .expect("static filter");
+            filter.until = until;
+            let Some((page, more)) = db.query_full_startup(vec![filter], PAGE, unix_now()).await
+            else {
+                log::error!(
+                    "role state rebuild aborted: the database did not answer; refusing to \
+                     persist an incomplete role store"
+                );
+                return false;
+            };
+            if page.is_empty() {
+                break;
+            }
+            let min_created = page.iter().map(|e| e.created_at).min().unwrap_or(0);
+            let full = page.len() >= PAGE;
+            if !full && more {
+                log::error!(
+                    "role state rebuild aborted: the scan budget was exhausted with {} events \
+                     in the page, so the history is incomplete",
+                    page.len()
+                );
+                return false;
+            }
+            events.extend(page);
+            if !full || min_created == 0 {
+                break;
+            }
+            until = Some(min_created - 1);
+        }
         // A vanished pubkey must not be resurrected as a role holder by a
         // pre-vanish membership list.
-        let vanished: std::collections::HashSet<String> = db
-            .vanish_pubkeys()
-            .await
-            .into_iter()
-            .map(hex::encode)
-            .collect();
+        let Some(vanished) = db.vanish_pubkeys().await else {
+            log::error!(
+                "role state rebuild aborted: the vanished-pubkey list is unavailable; \
+                 refusing to persist an incomplete role store"
+            );
+            return false;
+        };
+        let vanished: std::collections::HashSet<String> =
+            vanished.into_iter().map(hex::encode).collect();
         for event in events {
             if event.pubkey != relay_pubkey {
                 continue;
@@ -277,6 +320,7 @@ impl RoleStore {
                 _ => {}
             }
         }
+        true
     }
 }
 
@@ -411,7 +455,10 @@ mod tests {
             );
 
             let mut store = RoleStore::default();
-            store.rebuild(&db, &relay_pk).await;
+            assert!(
+                store.rebuild(&db, &relay_pk).await,
+                "the rebuild must complete"
+            );
             assert_eq!(store.roles.len(), 1);
             assert_eq!(store.roles["king"].label, "real");
         });
@@ -491,11 +538,56 @@ mod tests {
                 "the tombstone replaces the stored role definition"
             );
             let mut store = RoleStore::default();
-            store.rebuild(&db, &relay_pk).await;
+            assert!(
+                store.rebuild(&db, &relay_pk).await,
+                "the rebuild must complete"
+            );
             assert!(
                 !store.roles.contains_key("king"),
                 "a deleted role must not resurrect on restart"
             );
+        });
+    }
+
+    #[test]
+    fn rebuild_fails_closed_when_the_database_is_unavailable() {
+        // A missing reply must not be mistaken for an empty history: the
+        // rebuild reports failure so the startup refuses to persist or serve
+        // an incomplete role store.
+        use std::sync::Arc;
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir()
+            .join("nostrfy-nip43-rebuild-fail")
+            .join(format!("{:x}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        let cfg = crate::config::DatabaseConfig {
+            path,
+            map_size: 16 * 1024 * 1024,
+            max_map_size: 32 * 1024 * 1024,
+            ..Default::default()
+        };
+        let db = crate::db::DbClient::open(
+            &cfg,
+            true,
+            Arc::new(Default::default()),
+            0,
+            128,
+            4096,
+            262144,
+        )
+        .unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            db.shutdown();
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let relay_pk = "aa".repeat(32);
+            let mut store = RoleStore::default();
+            assert!(
+                !store.rebuild(&db, &relay_pk).await,
+                "an unanswered rebuild must fail closed"
+            );
+            assert!(store.roles.is_empty());
         });
     }
 }
