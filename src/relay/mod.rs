@@ -768,7 +768,14 @@ impl Relay {
             }
             crate::relay::validate::Precheck::Vanish => {
                 // NIP-62: delete everything by this pubkey and never
-                // accept anything from it again.
+                // accept anything from it again. The access/rate/first-seen
+                // gates are intentionally bypassed here: the spec requires
+                // the request to be honored "regardless of the user's
+                // status". A replay cannot be used as a DoS amplifier
+                // because the database records the furthest honored
+                // `until_created` and covered requests become a no-op
+                // (and the group/role snapshots are only rewritten when a
+                // membership actually changed).
                 let Some(pubkey) = event.pubkey_bytes() else {
                     return (PutOutcome::Invalid("invalid: bad pubkey".into()), None);
                 };
@@ -1214,22 +1221,33 @@ impl Relay {
         let removed = self.db.apply_vanish(pubkey, until_created).await;
         self.stats.bump(&self.stats.events_deleted, removed as u64);
         if self.config.read().await.nip_enabled(29) {
-            {
+            let changed = {
                 let mut groups = self.groups.write().await;
+                let mut changed = false;
                 for group in groups.groups.values_mut() {
-                    group.members.remove(&pubkey_hex);
+                    if group.members.remove(&pubkey_hex).is_some() {
+                        changed = true;
+                    }
                 }
+                changed
+            };
+            // Only a real membership change is worth a full snapshot write:
+            // a replayed vanish (already honored by the database) must not
+            // reserialize the whole group store on every delivery.
+            if changed {
+                self.persist_groups().await;
             }
-            self.persist_groups().await;
         }
         // NIP-43 role assignments hold pubkeys too: a vanished author
         // must not keep its roles.
         if self.config.read().await.nip_enabled(43) {
-            {
+            let changed = {
                 let mut roles = self.roles.write().await;
-                roles.assignments.remove(&pubkey_hex);
+                roles.assignments.remove(&pubkey_hex).is_some()
+            };
+            if changed {
+                self.persist_roles().await;
             }
-            self.persist_roles().await;
         }
     }
 

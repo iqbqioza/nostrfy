@@ -1598,6 +1598,48 @@ fn vanish_removes_events_at_maximal_timestamp() {
 }
 
 #[test]
+fn vanish_replay_is_a_no_op() {
+    // NIP-62 requests are signed and can be re-broadcast: replaying one must
+    // not re-walk the author's history. The stored marker keeps the furthest
+    // honored `until_created`, so covered requests remove nothing.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let pubkey = "cc".repeat(32);
+        let ev = |created| {
+            let mut e = event(1, "v", created, vec![]);
+            e.pubkey = pubkey.clone();
+            e.id = nip01::compute_id(&e);
+            e
+        };
+        assert_eq!(db.put(ev(1_000), 4_000).await, PutOutcome::Stored);
+        assert_eq!(db.put(ev(3_000), 4_000).await, PutOutcome::Stored);
+        let pk: [u8; 32] = hex::decode(&pubkey).unwrap().try_into().unwrap();
+        assert_eq!(
+            db.apply_vanish(pk, 3_000).await,
+            2,
+            "the first request deletes both events"
+        );
+        // The same request, and an older one, are covered: no work.
+        assert_eq!(db.apply_vanish(pk, 3_000).await, 0);
+        assert_eq!(db.apply_vanish(pk, 2_000).await, 0);
+        // A newer request is still honored (and finds nothing left).
+        assert_eq!(db.apply_vanish(pk, 5_000).await, 0);
+        assert_eq!(db.apply_vanish(pk, 3_000).await, 0);
+    });
+    db.shutdown();
+}
+
+#[test]
 fn vanish_keeps_delegatee_events_of_a_delegator() {
     // NIP-62: a request to vanish removes only events *authored* by the
     // pubkey. NIP-26 delegatee events are indexed under the delegator too,

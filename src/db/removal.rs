@@ -319,10 +319,29 @@ impl Store {
     /// NIP-62: deletes every event authored by `pubkey` (including NIP-09
     /// deletion requests and NIP-59 gift wraps that p-tag it) and records the
     /// pubkey so that no future event from it is accepted.
+    ///
+    /// Replays are cheap: the stored marker keeps the furthest `until_created`
+    /// already honored, and a request covered by it removes nothing (NIP-62
+    /// requests are signed, re-broadcastable events, so an unchecked replay
+    /// would re-walk the author's whole history and rewrite the NIP-29/43
+    /// snapshots on every delivery).
     pub(crate) fn apply_vanish(&self, pubkey: &[u8], until_created: u64) -> Result<usize> {
         self.disk_full_error()?;
         let mut wtxn = self.env.write_txn()?;
-        self.vanish.put(&mut wtxn, pubkey, b"")?;
+        // Legacy entries (written before the marker carried the timestamp)
+        // have an empty value and count as `until_created = 0`, so they are
+        // upgraded by the next request.
+        if let Some(raw) = self.vanish.get(&wtxn, pubkey)? {
+            let covered = raw
+                .get(..8)
+                .map(|bytes| u64::from_be_bytes(bytes.try_into().expect("checked length")))
+                .unwrap_or(0);
+            if covered >= until_created {
+                return Ok(0);
+            }
+        }
+        self.vanish
+            .put(&mut wtxn, pubkey, &until_created.to_be_bytes())?;
 
         let mut removed = 0usize;
         let start = pubkey_key(pubkey, 0, &[0u8; ID_LEN]);
