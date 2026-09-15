@@ -3724,8 +3724,8 @@ fn group_and_role_snapshots_survive_restart() {
 
 #[test]
 fn sixteen_max_dbs_still_opens_with_the_word_index() {
-    // 17 named tables are created (16 plus the word index); an operator
-    // value of 16 must not fail at startup (the clamp raises it to 17).
+    // 18 named tables are created (17 plus the word index); an operator
+    // value of 16 must not fail at startup (the clamp raises it to 18).
     let mut cfg = config();
     cfg.max_dbs = 16;
     assert!(cfg.search_index);
@@ -3738,6 +3738,61 @@ fn sixteen_max_dbs_still_opens_with_the_word_index() {
         4096,
         262144,
     )
-    .expect("17 tables must fit via the clamp");
+    .expect("18 tables must fit via the clamp");
     db.shutdown();
+}
+
+#[test]
+fn db_queue_byte_cap_fails_fast() {
+    // The count caps alone let a queue of maximum-size events reach
+    // gigabytes; the byte cap refuses the message up front. The failed
+    // reservation must be rolled back, or the first oversized payload
+    // would permanently fail-fast every later write.
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let mut cfg = config();
+        cfg.max_db_queue_bytes = 1_000;
+        let errors = Arc::new(Default::default());
+        let db = DbClient::open(&cfg, true, Arc::clone(&errors), 0, 128, 4096, 262144).unwrap();
+        let now = unix_now();
+        let big = event(1, &"x".repeat(4_000), now, vec![]);
+        assert!(
+            db.put_batch_deferred(vec![(big, now)]).is_none(),
+            "an over-budget write must fail fast"
+        );
+        assert!(errors.load(std::sync::atomic::Ordering::Relaxed) >= 1);
+        // The reservation was rolled back: a normal event still stores.
+        let small = event(1, "ok", now, vec![]);
+        assert_eq!(db.put(small, now).await, PutOutcome::Stored);
+        db.shutdown();
+    });
+}
+
+#[test]
+fn reader_queue_byte_cap_fails_fast() {
+    // The reader/API queues get the same byte cap over their filter
+    // payloads: a huge filter is refused instead of queueing behind the
+    // scan threads.
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let mut cfg = config();
+        cfg.max_db_queue_bytes = 1_000;
+        let errors = Arc::new(Default::default());
+        let db = DbClient::open(&cfg, true, Arc::clone(&errors), 0, 128, 4096, 262144).unwrap();
+        let now = unix_now();
+        let e = event(1, "hello", now, vec![]);
+        assert_eq!(db.put(e, now).await, PutOutcome::Stored);
+        let huge: Filter = serde_json::from_value(serde_json::json!({
+            "#e": vec!["a".repeat(2_000)]
+        }))
+        .unwrap();
+        let (out, _) = db.query(vec![huge], 10, now).await;
+        assert!(out.is_empty(), "the over-budget query is refused");
+        assert!(errors.load(std::sync::atomic::Ordering::Relaxed) >= 1);
+        // The reservation was rolled back: a normal query still works.
+        let small: Filter = serde_json::from_value(serde_json::json!({"kinds": [1]})).unwrap();
+        let (out, _) = db.query(vec![small], 10, now).await;
+        assert_eq!(out.len(), 1);
+        db.shutdown();
+    });
 }

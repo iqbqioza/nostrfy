@@ -90,6 +90,7 @@ db_request_timeout_secs = 30
 disabled_fsync = false
 max_db_queue_msgs = 4096
 max_db_queue_events = 262144
+max_db_queue_bytes = 268435456
 
 [daemon]
 # Foreground mode under systemd: these are unused but must be non-empty.

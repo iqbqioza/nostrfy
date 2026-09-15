@@ -354,7 +354,7 @@ The changes take effect immediately and are persisted (same lists as `nostrfy re
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
 | `path` | string | `"./data"` | Database directory (LMDB) |
-| `max_dbs` | integer | `32` | LMDB max named databases (must be ≥ 17) |
+| `max_dbs` | integer | `32` | LMDB max named databases (must be ≥ 18) |
 | `max_readers` | integer | `128` | LMDB max concurrent readers (must be ≥ 8) |
 | `map_size` | integer | `1073741824` (1 GB) | Floor for the memory map size (bytes) |
 | `max_map_size` | integer | `1099511627776` (1 TB) | Memory-map ceiling (bytes) |
@@ -364,12 +364,13 @@ The changes take effect immediately and are persisted (same lists as `nostrfy re
 | `max_indexed_words` | integer | `32` | Words of each event's content indexed for search |
 | `meta_index` | boolean | `true` | Write the per-event metadata header used by the scan prefilter. Disabling it drops one random index write per event (ingest stays flat as the database grows) at the cost of scans falling back to the full parse |
 | `disabled_fsync` | boolean | `false` | Skip the synchronous disk flush after every write batch (`MDB_NOSYNC`). Multiplies ingest throughput at the cost of durability: a power loss may lose the most recent writes |
+| `max_db_queue_bytes` | integer | `268435456` (256 MiB) | Byte cap for queued database payloads (event fields on the writer queue, filter fields on the reader/API queues). Complements the count caps: a queue of maximum-size messages is refused before it exhausts memory. `0` disables the byte cap |
 
 ### Key details
 
 **`path`** — The directory holding the LMDB database files. Relative paths are resolved against the config file's directory, so they stay valid after the daemon changes its working directory. Do not point two relay instances at the same directory.
 
-**`max_dbs`** — LMDB's maximum number of named databases. The relay uses 17 when `search_index = true` (16 tables plus the word index) and 16 otherwise; values below 17 are raised to 17 so the word index can always be created.
+**`max_dbs`** — LMDB's maximum number of named databases. The relay uses 18 when `search_index = true` (17 tables plus the word index) and 17 otherwise; values below 18 are raised to 18 so the word index can always be created.
 
 **`max_readers`** — LMDB's maximum number of concurrent read transactions. Must be ≥ 8; the relay uses three threads (writer, reader, API reader).
 
@@ -386,6 +387,7 @@ The changes take effect immediately and are persisted (same lists as `nostrfy re
 **`disabled_fsync`** — Skip the synchronous disk flush after every write batch (LMDB `MDB_NOSYNC`). Writes are committed to the mapped pages and left in the OS page cache, so commits cost microseconds instead of an fsync; the kernel flushes them shortly after. A power loss or OS crash may lose the writes since the last kernel flush — a fine trade for a high-throughput relay with a replica/backup, a poor one for a single always-live instance. Takes effect at startup. The Manual's [Throughput tuning](MANUAL.md#throughput-events-per-second) section shows the settings that move ingest throughput.
 **`max_db_queue_msgs`** — When the database queue holds more than this many pending messages, new requests fail fast instead of piling up in memory.
 **`max_db_queue_events`** — Like `max_db_queue_msgs`, but counts the events inside queued batches (the memory-dominant part). Whichever limit is hit first applies.
+**`max_db_queue_bytes`** — The same overload protection in bytes, measured over the queued payloads: event fields (content, tags, hex fields) on the writer queue and filter fields on the reader/API queues. The count caps alone let a queue of maximum-size messages reach gigabytes before tripping, because one message can carry a whole batch of large events. `0` disables the byte cap (a warning is logged).
 
 
 ### Behavior notes
@@ -563,7 +565,7 @@ Editing the file and sending `kill -HUP $(cat nostrfy.pid)` reloads it **without
 | --- | --- |
 | `relay.name`, `description`, `pubkey`, `contact`, `icon`, `post_policy`, `public_url`, `relay.reject_ephemeral`, `relay.enabled_git`, `relay.enabled_nip78_auth` | `relay.private_key` |
 | most of `[limits]` (the restart-column entries below apply on restart only) | `relay.livekit_*`, `relay.enabled_nips` / `disabled_nips` |
-| — | `database.path`, `database.purge_interval_secs`, `database.map_size`, `database.max_map_size`, `database.search_index`, `database.meta_index`, `database.reader_threads`, `database.disabled_fsync`, `database.db_request_timeout_secs`, `database.max_db_queue_msgs`, `database.max_db_queue_events`, `database.max_indexed_words`, `daemon.max_log_size_bytes`, `max_log_files`, `stats_interval_secs`, `limits.live_buffer`, `live_batch_size`, `live_batch_interval_ms`, `socket_recv_buffer_kb`, `max_connections`, `http_read_timeout_secs`, `max_connections_per_sec_per_ip`, `rpc.max_admin_body_bytes`, `relay.max_groups`, `blossom.host`, `blossom.storage`, `blossom.local_path`, `blossom.max_upload_bytes`, `blossom.min_free_bytes`, `blossom.s3_*` |
+| — | `database.path`, `database.purge_interval_secs`, `database.map_size`, `database.max_map_size`, `database.search_index`, `database.meta_index`, `database.reader_threads`, `database.disabled_fsync`, `database.db_request_timeout_secs`, `database.max_db_queue_msgs`, `database.max_db_queue_events`, `database.max_db_queue_bytes`, `database.max_indexed_words`, `daemon.max_log_size_bytes`, `max_log_files`, `stats_interval_secs`, `limits.live_buffer`, `live_batch_size`, `live_batch_interval_ms`, `socket_recv_buffer_kb`, `max_connections`, `http_read_timeout_secs`, `max_connections_per_sec_per_ip`, `rpc.max_admin_body_bytes`, `relay.max_groups`, `blossom.host`, `blossom.storage`, `blossom.local_path`, `blossom.max_upload_bytes`, `blossom.min_free_bytes`, `blossom.s3_*` |
 
 `[access]` is **not** applied by a reload: the access lists are seeded once at startup and then managed at runtime via NIP-86.
 
@@ -648,6 +650,7 @@ max_map_size = 1099511627776
 purge_interval_secs = 300
 search_index = true
 disabled_fsync = false
+max_db_queue_bytes = 268435456
 
 [daemon]
 pid_file = "./nostrfy.pid"

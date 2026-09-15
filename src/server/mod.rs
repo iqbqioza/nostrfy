@@ -1309,6 +1309,10 @@ async fn reload_handler(
                                 old.database.max_db_queue_events != new_config.database.max_db_queue_events,
                             ),
                             (
+                                "database.max_db_queue_bytes",
+                                old.database.max_db_queue_bytes != new_config.database.max_db_queue_bytes,
+                            ),
+                            (
                                 "database.max_indexed_words",
                                 old.database.max_indexed_words
                                     != new_config.database.max_indexed_words,
@@ -1436,6 +1440,8 @@ async fn reload_handler(
                         new_config.database.max_db_queue_msgs = old.database.max_db_queue_msgs;
                         new_config.database.max_db_queue_events =
                             old.database.max_db_queue_events;
+                        new_config.database.max_db_queue_bytes =
+                            old.database.max_db_queue_bytes;
                         new_config.database.max_indexed_words = old.database.max_indexed_words;
                         new_config.blossom.host = old.blossom.host.clone();
                         new_config.blossom.storage = old.blossom.storage.clone();

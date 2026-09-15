@@ -356,6 +356,12 @@ pub struct DatabaseConfig {
     /// database requests fail fast instead of accumulating in memory.
     pub max_db_queue_msgs: usize,
     pub max_db_queue_events: usize,
+    /// The same overload protection in bytes, applied to the queued payloads
+    /// (event fields on the writer queue, filter fields on the reader/API
+    /// queues): a queue full of maximum-size messages would otherwise reach
+    /// `max_db_queue_events` (or `max_db_queue_msgs`) long after it already
+    /// exhausted memory. `0` disables the byte cap.
+    pub max_db_queue_bytes: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -484,6 +490,7 @@ impl Default for DatabaseConfig {
             disabled_fsync: false,
             max_db_queue_msgs: 4_096,
             max_db_queue_events: 262_144,
+            max_db_queue_bytes: 256 * 1024 * 1024,
         }
     }
 }
@@ -1290,6 +1297,17 @@ impl Config {
                 l.max_req_response_bytes
             );
         }
+        // The byte cap is the only bound that accounts for maximum-size
+        // queued messages; a huge value (or 0, which disables it) leaves the
+        // count caps in charge of a queue that can be gigabytes tall.
+        if self.database.max_db_queue_bytes == 0 || self.database.max_db_queue_bytes > 4 << 30 {
+            log::warn!(
+                "config.database.max_db_queue_bytes = {} disables (or barely limits) the \
+                 queued-memory protection; the count caps alone allow a queue of \
+                 maximum-size messages to exhaust memory",
+                self.database.max_db_queue_bytes
+            );
+        }
         // A very high PoW requirement makes every event infeasible to mine;
         // warn instead of silently disabling writes.
         if self.relay.require_pow >= 64 {
@@ -1816,6 +1834,7 @@ fn known_config_keys() -> &'static [(&'static str, &'static [&'static str])] {
                 "disabled_fsync",
                 "max_db_queue_msgs",
                 "max_db_queue_events",
+                "max_db_queue_bytes",
                 "map_max_size",
             ],
         ),

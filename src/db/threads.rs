@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 
 use super::store::WriteBatch;
 use super::store::{Store, flush_everything};
-use super::{Msg, PutOutcome, db_error};
+use super::{Msg, PutOutcome, db_error, msg_bytes};
 use crate::db::scan::SCAN_BUDGET;
 use anyhow::anyhow;
 
@@ -24,8 +24,10 @@ use crate::error::Result;
 struct PendingGuard {
     msgs: usize,
     events: usize,
+    bytes: usize,
     msgs_counter: Arc<std::sync::atomic::AtomicUsize>,
     events_counter: Arc<std::sync::atomic::AtomicUsize>,
+    bytes_counter: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Drop for PendingGuard {
@@ -34,6 +36,8 @@ impl Drop for PendingGuard {
             .fetch_sub(self.msgs, std::sync::atomic::Ordering::Relaxed);
         self.events_counter
             .fetch_sub(self.events, std::sync::atomic::Ordering::Relaxed);
+        self.bytes_counter
+            .fetch_sub(self.bytes, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -50,6 +54,11 @@ pub(crate) struct DbThreads {
     pub(crate) pending_events: Arc<std::sync::atomic::AtomicUsize>,
     pub(crate) pending_reads: Arc<std::sync::atomic::AtomicUsize>,
     pub(crate) api_pending: Arc<std::sync::atomic::AtomicUsize>,
+    /// Queued payload bytes on the writer/reader/API queues (see
+    /// `DbClient::max_pending_bytes`).
+    pub(crate) pending_bytes: Arc<std::sync::atomic::AtomicUsize>,
+    pub(crate) pending_read_bytes: Arc<std::sync::atomic::AtomicUsize>,
+    pub(crate) api_pending_bytes: Arc<std::sync::atomic::AtomicUsize>,
     pub(crate) max_pending_msgs: usize,
     pub(crate) max_pending_events: usize,
     /// Independent cap for the API reader queue (adjustable live via
@@ -331,6 +340,12 @@ pub(crate) fn spawn(
     let read_pending = Arc::clone(&pending_reads);
     let api_pending = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let api_thread_pending = Arc::clone(&api_pending);
+    let pending_bytes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let thread_pending_bytes = Arc::clone(&pending_bytes);
+    let pending_read_bytes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let read_pending_bytes = Arc::clone(&pending_read_bytes);
+    let api_pending_bytes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let api_pending_bytes_thread = Arc::clone(&api_pending_bytes);
     // Dedicated reader threads: serve Query/Count/NEG and the small
     // lookups without ever taking the LMDB write lock. Two threads share
     // the channel (the receiver behind a mutex; each thread holds the
@@ -346,6 +361,7 @@ pub(crate) fn spawn(
             let read_errors = Arc::clone(&errors);
             let read_rx = Arc::clone(&read_rx);
             let read_pending = Arc::clone(&read_pending);
+            let read_pending_bytes = Arc::clone(&read_pending_bytes);
             std::thread::spawn(move || {
                 'reader: loop {
                     let Some(msg) = read_rx
@@ -360,6 +376,7 @@ pub(crate) fn spawn(
                     // wrap the counter to `usize::MAX` and fail-fast every
                     // later read forever).
                     let is_shutdown = matches!(msg, Msg::Shutdown);
+                    let bytes = msg_bytes(&msg);
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         let shutdown = handle_read_msg(&read_store, &read_errors, msg);
                         // `Msg::Shutdown` is sent directly (never through
@@ -368,6 +385,10 @@ pub(crate) fn spawn(
                         // counter.
                         if !shutdown {
                             read_pending.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                            if bytes > 0 {
+                                read_pending_bytes
+                                    .fetch_sub(bytes, std::sync::atomic::Ordering::Relaxed);
+                            }
                         }
                         shutdown
                     }));
@@ -378,6 +399,10 @@ pub(crate) fn spawn(
                             log::error!("reader thread recovered from a panic");
                             if !is_shutdown {
                                 read_pending.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                                if bytes > 0 {
+                                    read_pending_bytes
+                                        .fetch_sub(bytes, std::sync::atomic::Ordering::Relaxed);
+                                }
                             }
                         }
                     }
@@ -400,11 +425,16 @@ pub(crate) fn spawn(
                 // See the reader thread above: never decrement for an
                 // uncounted `Shutdown`.
                 let is_shutdown = matches!(msg, Msg::Shutdown);
+                let bytes = msg_bytes(&msg);
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let shutdown = handle_read_msg(&api_store, &api_errors, msg);
                     // `Msg::Shutdown` is not counted (see the reader thread).
                     if !shutdown {
                         api_thread_pending.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                        if bytes > 0 {
+                            api_pending_bytes_thread
+                                .fetch_sub(bytes, std::sync::atomic::Ordering::Relaxed);
+                        }
                     }
                     shutdown
                 }));
@@ -415,6 +445,10 @@ pub(crate) fn spawn(
                         log::error!("api reader thread recovered from a panic");
                         if !is_shutdown {
                             api_thread_pending.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                            if bytes > 0 {
+                                api_pending_bytes_thread
+                                    .fetch_sub(bytes, std::sync::atomic::Ordering::Relaxed);
+                            }
                         }
                     }
                 }
@@ -489,6 +523,9 @@ pub(crate) fn spawn(
                         _ => 0,
                     })
                     .sum();
+                // The payload bytes reserved by the senders (0 for the
+                // metadata-only messages, which the count caps bound).
+                let drained_bytes: usize = msgs.iter().map(msg_bytes).sum();
                 // Release the queued-work accounting of everything the
                 // drain processed. The guard drops on every exit path of
                 // the drain (including a panic mid-drain), so the
@@ -496,8 +533,10 @@ pub(crate) fn spawn(
                 let _pending = PendingGuard {
                     msgs: drained_msgs,
                     events: drained_events,
+                    bytes: drained_bytes,
                     msgs_counter: Arc::clone(&thread_pending_msgs),
                     events_counter: Arc::clone(&thread_pending_events),
+                    bytes_counter: Arc::clone(&thread_pending_bytes),
                 };
                 for msg in msgs {
                     match msg {
@@ -981,6 +1020,9 @@ pub(crate) fn spawn(
         pending_events,
         pending_reads: thread_pending_reads,
         api_pending,
+        pending_bytes,
+        pending_read_bytes,
+        api_pending_bytes,
         max_pending_msgs: max_pending_msgs.max(1),
         max_pending_events: max_pending_events.max(1),
         max_api_pending: Arc::new(std::sync::atomic::AtomicUsize::new(max_pending_msgs.max(1))),
