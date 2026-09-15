@@ -956,7 +956,13 @@ pub(crate) fn replaceable_key(kind: u64, pubkey: &[u8], dtag: &str) -> Vec<u8> {
 /// replace the other, breaking NIP-33); the stored event keeps its full
 /// `d` tag.
 pub(crate) fn dtag_key_safe(dtag: &str) -> String {
-    let max = MAX_INDEX_KEY.saturating_sub(CREATED_LEN + ID_LEN + 4);
+    dtag_key_safe_max(dtag, MAX_INDEX_KEY.saturating_sub(CREATED_LEN + ID_LEN + 4))
+}
+
+/// [`dtag_key_safe`] with an explicit ceiling. The `a`-tag tombstone key
+/// spends one extra byte on its prefix, so its `d` component must be one
+/// byte shorter than a replaceable slot key's.
+fn dtag_key_safe_max(dtag: &str, max: usize) -> String {
     if dtag.len() <= max {
         return dtag.to_string();
     }
@@ -980,10 +986,17 @@ fn dtag_fingerprint(value: &str) -> String {
 
 /// Tombstone key for an `a`-tag (address) deletion, stored in the
 /// [`DELETED`] table. Event ids are exactly 32 bytes, so the one-byte prefix
-/// keeps the two key spaces disjoint; the `d` tag is normalized with
-/// [`dtag_key_safe`] exactly like the replaceable slot key it mirrors.
+/// keeps the two key spaces disjoint. The `d` tag is normalized like the
+/// replaceable slot key it mirrors, but with one byte less headroom: the
+/// prefix counts against LMDB's key-size limit ([`MAX_INDEX_KEY`]), and a
+/// full-size slot key plus prefix would exceed it and abort the whole
+/// deletion batch (every sibling `e`-tag target rolled back with it).
 pub(crate) fn deleted_address_key(kind: u64, pubkey: &[u8], dtag: &str) -> Vec<u8> {
-    let safe = dtag_key_safe(dtag);
+    let safe = dtag_key_safe_max(
+        dtag,
+        MAX_INDEX_KEY.saturating_sub(1 + CREATED_LEN + ID_LEN + 4),
+    );
+    debug_assert!(1 + CREATED_LEN + ID_LEN + 4 + safe.len() <= MAX_INDEX_KEY);
     let mut key = Vec::with_capacity(1 + CREATED_LEN + ID_LEN + 4 + safe.len());
     key.push(b'a');
     key.extend_from_slice(&replaceable_key(kind, pubkey, &safe));

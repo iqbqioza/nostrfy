@@ -385,6 +385,79 @@ fn deletion_by_address_with_empty_d() {
 }
 
 #[test]
+fn long_d_address_deletion_keeps_the_rest_of_the_batch() {
+    // A `d` tag long enough to fill LMDB's key-size limit must not make the
+    // address tombstone too long: `deleted_address_key` adds an `a` prefix
+    // on top of the replaceable slot key, and one byte of overflow used to
+    // abort the whole deletion transaction (the sibling `e`-tag targets
+    // were rolled back with it).
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let pk = "0000000000000000000000000000000000000000000000000000000000000000";
+        let long_d = "d".repeat(500);
+        let d_tag = vec![vec!["d".to_string(), long_d.clone()]];
+        let long = event(30023, "long-d", now - 10, d_tag.clone());
+        assert_eq!(db.put(long.clone(), now).await, PutOutcome::Stored);
+        let sibling = event(1, "sibling", now, vec![]);
+        assert_eq!(db.put(sibling.clone(), now).await, PutOutcome::Stored);
+
+        let address = crate::nips::nip09::Address {
+            kind: 30023,
+            pubkey: pk.into(),
+            d: long_d,
+        };
+        assert_eq!(
+            db.apply_deletion(
+                vec![sibling.id.clone()],
+                vec![address],
+                Some(pk.into()),
+                u64::MAX,
+            )
+            .await,
+            2,
+            "both the e-tag target and the long-d address must be deleted"
+        );
+        let f: Filter = serde_json::from_value(serde_json::json!({"kinds": [1, 30023]})).unwrap();
+        let (res, _) = db.query(vec![f], 500, now).await;
+        assert!(res.is_empty(), "no target may survive the deletion");
+
+        // The address tombstone (built with the same one-byte-shorter
+        // normalization) still blocks older re-publications.
+        let older = event(30023, "older", now - 20, d_tag);
+        assert_eq!(db.put(older, now).await, PutOutcome::PreviouslyDeleted);
+    });
+    db.shutdown();
+}
+
+#[test]
+fn deleted_address_key_fits_the_lmdb_limit() {
+    use crate::db::store::{MAX_INDEX_KEY, deleted_address_key};
+    let key = deleted_address_key(30023, &[7u8; 32], &"x".repeat(5_000));
+    assert!(
+        key.len() <= MAX_INDEX_KEY,
+        "tombstone key is {} bytes, over the {MAX_INDEX_KEY}-byte limit",
+        key.len()
+    );
+    assert_eq!(key[0], b'a');
+    // Distinct over-long `d` tags sharing the truncation prefix stay
+    // distinct through the fingerprint.
+    let a = deleted_address_key(30023, &[7u8; 32], &"x".repeat(5_000));
+    let b = deleted_address_key(30023, &[7u8; 32], &("x".repeat(4_999) + "y"));
+    assert_ne!(a, b);
+}
+
+#[test]
 fn deletion_requests_are_never_deleted() {
     let db = DbClient::open(
         &config(),
