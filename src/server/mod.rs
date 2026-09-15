@@ -486,7 +486,7 @@ pub async fn run_server(config_path: PathBuf, config: Config, db: DbClient) -> R
         }));
     }
 
-    let (header_timeout, max_connections, per_sec_per_ip, recv_buf_kb) = {
+    let (header_timeout, max_connections, max_connections_per_ip, per_sec_per_ip, recv_buf_kb) = {
         let cfg = relay.config.read().await;
         (
             // 0 = disabled (the documented convention): hyper treats
@@ -495,6 +495,7 @@ pub async fn run_server(config_path: PathBuf, config: Config, db: DbClient) -> R
             (cfg.limits.http_read_timeout_secs > 0)
                 .then(|| std::time::Duration::from_secs(cfg.limits.http_read_timeout_secs)),
             cfg.limits.max_connections,
+            cfg.limits.max_connections_per_ip,
             IpConnLimiter::new(cfg.limits.max_connections_per_sec_per_ip),
             cfg.limits.socket_recv_buffer_kb,
         )
@@ -503,6 +504,7 @@ pub async fn run_server(config_path: PathBuf, config: Config, db: DbClient) -> R
         listener,
         app,
         max_connections,
+        max_connections_per_ip,
         header_timeout,
         per_sec_per_ip,
         recv_buf_kb,
@@ -957,10 +959,65 @@ impl IpConnLimiter {
     }
 }
 
+/// Per-IP concurrent connection accounting at the accept layer. The
+/// WebSocket handler only sees upgrades, so without this a single host could
+/// open every one of `limits.max_connections` as plain HTTP and hold them
+/// (pinning file descriptors and the connection budget). `max == 0`
+/// disables the cap, mirroring [`crate::relay::Relay::try_register_connection`].
+#[derive(Default)]
+struct IpConnCounter {
+    counts: std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, usize>>,
+}
+
+impl IpConnCounter {
+    /// Reserves a connection slot for `ip`; `false` means the per-IP cap is
+    /// reached and the connection must be dropped at the socket level.
+    fn try_acquire(&self, ip: std::net::IpAddr, max: usize) -> bool {
+        if max == 0 {
+            return true;
+        }
+        // Recover from a poisoned lock instead of panicking: a panic while
+        // holding the map would otherwise kill every later connection.
+        let mut counts = self.counts.lock().unwrap_or_else(|p| p.into_inner());
+        let count = counts.entry(ip).or_insert(0);
+        if *count >= max {
+            return false;
+        }
+        *count += 1;
+        true
+    }
+
+    /// Releases one slot; the entry is removed when the last connection of
+    /// that IP closes, so the map never grows beyond the live connections.
+    fn release(&self, ip: std::net::IpAddr) {
+        let mut counts = self.counts.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(count) = counts.get_mut(&ip) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                counts.remove(&ip);
+            }
+        }
+    }
+}
+
+/// Releases the accept-layer per-IP slot on every exit path of the
+/// connection task (including a panic).
+struct IpConnGuard {
+    counter: Arc<IpConnCounter>,
+    ip: std::net::IpAddr,
+}
+
+impl Drop for IpConnGuard {
+    fn drop(&mut self) {
+        self.counter.release(self.ip);
+    }
+}
+
 /// Serves the main listener with the HTTP-layer hardening: a cap on
-/// concurrent connections (`limits.max_connections`, also enforced on
-/// plain HTTP and WebSocket upgrades), an optional per-IP connection rate
-/// limit, and an HTTP/1.1 header read timeout that closes slow-loris
+/// concurrent connections (`limits.max_connections`) and a per-IP
+/// concurrent cap (`limits.max_connections_per_ip`), both also enforced on
+/// plain HTTP (not only WebSocket upgrades), an optional per-IP connection
+/// rate limit, and an HTTP/1.1 header read timeout that closes slow-loris
 /// sockets that never complete a request head. On shutdown the accept
 /// loop stops, active connections get a graceful-shutdown signal, and
 /// stragglers are aborted after a bounded grace period.
@@ -969,6 +1026,7 @@ async fn serve_limited(
     listener: tokio::net::TcpListener,
     app: axum::Router,
     max_connections: usize,
+    max_per_ip: usize,
     header_timeout: Option<std::time::Duration>,
     per_sec_per_ip: Option<IpConnLimiter>,
     recv_buf_kb: u32,
@@ -977,6 +1035,7 @@ async fn serve_limited(
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     let active = Arc::new(AtomicUsize::new(0));
+    let ip_counter = Arc::new(IpConnCounter::default());
     let (drain_tx, drain_rx) = watch::channel(());
     // Connection task handles, used to abort stragglers at shutdown. The
     // vector is pruned of finished handles above 1024 entries, so a
@@ -1001,18 +1060,25 @@ async fn serve_limited(
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     continue;
                 };
-                // Per-IP connection rate limit (slow-loris / socket flood).
                 // The address is normalized like every other per-IP
                 // accounting: a dual-stack listener reports IPv4 peers as
-                // ::ffff:a.b.c.d, which must not dodge the per-second cap.
+                // ::ffff:a.b.c.d, which must not dodge the caps.
+                let peer_ip = crate::util::normalize_ip(peer.ip());
+                // Per-IP connection rate limit (slow-loris / socket flood).
                 if let Some(limiter) = &per_sec_per_ip
-                    && !limiter.allow(crate::util::normalize_ip(peer.ip()), crate::util::unix_now())
+                    && !limiter.allow(peer_ip, crate::util::unix_now())
                 {
                     continue;
                 }
                 // Connection cap: refuse the socket outright at the cap so
                 // established-but-idle sockets cannot pin file descriptors.
                 if active.load(Ordering::Relaxed) >= max_connections {
+                    continue;
+                }
+                // Per-IP concurrent cap: plain HTTP connections count too,
+                // not only WebSocket upgrades. The slot is released by the
+                // task guard on every exit path (including a panic).
+                if !ip_counter.try_acquire(peer_ip, max_per_ip) {
                     continue;
                 }
                 active.fetch_add(1, Ordering::Relaxed);
@@ -1035,6 +1101,10 @@ async fn serve_limited(
 
                 let app = app.clone();
                 let active = Arc::clone(&active);
+                let ip_guard = IpConnGuard {
+                    counter: Arc::clone(&ip_counter),
+                    ip: peer_ip,
+                };
                 let mut drain_rx = drain_rx.clone();
                 let io = hyper_util::rt::TokioIo::new(stream);
                 // Inject the peer address as ConnectInfo (the axum
@@ -1072,6 +1142,9 @@ async fn serve_limited(
                     let _guard = ActiveGuard {
                         active: Arc::clone(&active),
                     };
+                    // Releases the accept-layer per-IP slot on every exit
+                    // path of this task (including a panic).
+                    let _ip_guard = ip_guard;
                     let mut builder = hyper_util::server::conn::auto::Builder::new(
                         hyper_util::rt::TokioExecutor::new(),
                     );
@@ -1822,6 +1895,7 @@ mod tests {
 
     async fn serve_limited_for_test(
         max_connections: usize,
+        max_per_ip: usize,
         header_timeout: Option<Duration>,
         per_sec: Option<IpConnLimiter>,
     ) -> (SocketAddr, watch::Sender<bool>, tokio::task::JoinHandle<()>) {
@@ -1832,6 +1906,7 @@ mod tests {
             listener,
             test_app(),
             max_connections,
+            max_per_ip,
             header_timeout,
             per_sec,
             16,
@@ -1890,7 +1965,7 @@ mod tests {
     #[tokio::test]
     async fn serve_limited_serves_http_and_applies_the_connection_cap() {
         let (addr, tx, handle) =
-            serve_limited_for_test(1, Some(Duration::from_secs(30)), None).await;
+            serve_limited_for_test(1, 0, Some(Duration::from_secs(30)), None).await;
         // A normal request is served.
         let (conn1, body) = http_keepalive(addr).await;
         assert!(
@@ -1918,9 +1993,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn serve_limited_caps_plain_http_connections_per_ip() {
+        // The per-IP cap must cover plain HTTP, not only WebSocket
+        // upgrades: one host opening many idle HTTP sockets used to consume
+        // the whole global connection budget.
+        let (addr, tx, handle) =
+            serve_limited_for_test(10, 2, Some(Duration::from_secs(30)), None).await;
+        let (conn1, body1) = http_keepalive(addr).await;
+        assert!(String::from_utf8_lossy(&body1).contains("200 OK"));
+        let (conn2, body2) = http_keepalive(addr).await;
+        assert!(String::from_utf8_lossy(&body2).contains("200 OK"));
+        // The third connection from the same IP is refused at the socket.
+        let refused = http_keepalive(addr).await;
+        assert!(
+            refused.1.is_empty(),
+            "the per-IP capped connection must be dropped"
+        );
+        // Closing one connection releases its per-IP slot.
+        drop(conn1);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let (conn3, body3) = http_keepalive(addr).await;
+        assert!(
+            String::from_utf8_lossy(&body3).contains("200 OK"),
+            "the per-IP slot must be released when a connection closes"
+        );
+        drop(conn2);
+        drop(conn3);
+        tx.send(true).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn serve_limited_applies_the_per_ip_rate_limit() {
         let (addr, tx, handle) =
-            serve_limited_for_test(10, Some(Duration::from_secs(30)), IpConnLimiter::new(1)).await;
+            serve_limited_for_test(10, 0, Some(Duration::from_secs(30)), IpConnLimiter::new(1))
+                .await;
         // The first connection of the second is accepted.
         let (conn1, body) = http_keepalive(addr).await;
         assert!(String::from_utf8_lossy(&body).contains("200 OK"));
@@ -1947,7 +2054,7 @@ mod tests {
     #[tokio::test]
     async fn serve_limited_closes_slow_loris_sockets() {
         let (addr, tx, handle) =
-            serve_limited_for_test(10, Some(Duration::from_secs(2)), None).await;
+            serve_limited_for_test(10, 0, Some(Duration::from_secs(2)), None).await;
         // A connection that never completes its request head is closed
         // after the header read timeout.
         let mut s = TcpStream::connect(addr).await.unwrap();
@@ -1972,7 +2079,7 @@ mod tests {
         // `None` (the config maps `http_read_timeout_secs = 0` to `None`):
         // a connection that never completes its request head stays open
         // instead of being closed.
-        let (addr, tx, handle) = serve_limited_for_test(10, None, None).await;
+        let (addr, tx, handle) = serve_limited_for_test(10, 0, None, None).await;
         let mut s = TcpStream::connect(addr).await.unwrap();
         s.write_all(b"G").await.unwrap();
         let got = read_to_eof(s, Duration::from_millis(1500)).await;
@@ -1998,7 +2105,7 @@ mod tests {
     #[tokio::test]
     async fn serve_limited_drains_on_shutdown() {
         let (addr, tx, handle) =
-            serve_limited_for_test(10, Some(Duration::from_secs(30)), None).await;
+            serve_limited_for_test(10, 0, Some(Duration::from_secs(30)), None).await;
         let (conn, body) = http_keepalive(addr).await;
         assert!(String::from_utf8_lossy(&body).contains("200 OK"));
         // Shutdown: the accept loop stops and active connections are
