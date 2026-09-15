@@ -297,35 +297,33 @@ fn validate_auth_event(
     Some(event.pubkey.clone())
 }
 
-/// Verifies a Blossom auth event (BUD-11): kind 24242 with `t` (verb),
-/// mandatory future `expiration`, optional `server` and `x` (sha256 scope)
-/// tags. Returns the pubkey.
-async fn verify_auth(
-    relay: &Relay,
-    state: &BlossomState,
-    headers: &HeaderMap,
-    verb: &str,
-    expected_sha: Option<&str>,
-) -> Option<String> {
+/// Decodes the Blossom auth event from the `Authorization: Nostr <token>`
+/// header (BUD-11). Accepts both the spec's Base64url-without-padding and
+/// the padded standard variant for leniency.
+fn decode_auth_event(headers: &HeaderMap) -> Option<crate::event::Event> {
     let encoded = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Nostr "))?;
-    // BUD-11: the token is Base64url without padding. Accept both the
-    // spec encoding and the padded standard variant for leniency.
     let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(encoded)
         .or_else(|_| base64::engine::general_purpose::STANDARD.decode(encoded))
         .ok()?;
-    let event: crate::event::Event = serde_json::from_slice(&raw).ok()?;
-    let pubkey = validate_auth_event(
-        relay.secp(),
-        &event,
-        &state.host,
-        verb,
-        expected_sha,
-        unix_now(),
-    )?;
+    serde_json::from_slice(&raw).ok()
+}
+
+/// Verifies the parts of a Blossom auth event that do not depend on the
+/// request body (kind, signature, expiration, `t`/`server` tags and ban
+/// status). Endpoints that must authenticate before reading the body use
+/// this first and check the body-scoped `x` tag afterwards. Returns the
+/// pubkey.
+async fn verify_auth_meta(
+    relay: &Relay,
+    state: &BlossomState,
+    event: &crate::event::Event,
+    verb: &str,
+) -> Option<String> {
+    let pubkey = validate_auth_event(relay.secp(), event, &state.host, verb, None, unix_now())?;
     // NIP-86 `banpubkey` applies to authenticated actions on every
     // endpoint: a blocked pubkey must not upload, delete or list Blossom
     // blobs either (the WebSocket publish/read paths already enforce it).
@@ -337,6 +335,28 @@ async fn verify_auth(
         .iter()
         .any(|(pk, _)| pk.eq_ignore_ascii_case(&pubkey));
     if blocked {
+        return None;
+    }
+    Some(pubkey)
+}
+
+/// Verifies a Blossom auth event (BUD-11): kind 24242 with `t` (verb),
+/// mandatory future `expiration`, optional `server` and `x` (sha256 scope)
+/// tags. Returns the pubkey.
+async fn verify_auth(
+    relay: &Relay,
+    state: &BlossomState,
+    headers: &HeaderMap,
+    verb: &str,
+    expected_sha: Option<&str>,
+) -> Option<String> {
+    let event = decode_auth_event(headers)?;
+    let pubkey = verify_auth_meta(relay, state, &event, verb).await?;
+    // BUD-11: when the endpoint implies a blob hash (upload/delete), at
+    // least one `x` tag must match it.
+    if let Some(sha) = expected_sha
+        && !event_tags(&event, "x").any(|x| x == sha)
+    {
         return None;
     }
     Some(pubkey)
@@ -771,6 +791,40 @@ async fn put_blob(relay: Arc<Relay>, headers: HeaderMap, body: Body, verb: &str)
     let Some(state) = state_of(&relay).await else {
         return error(StatusCode::SERVICE_UNAVAILABLE, "blossom not initialized");
     };
+    // Authenticate before reading any body bytes: an unauthenticated client
+    // must not be able to drive temp-disk writes and hashing (up to
+    // `max_upload` per request) or pin an upload permit with a stalled
+    // body. The body-scoped `x` tag is checked after hashing below.
+    let Some(auth_event) = decode_auth_event(&headers) else {
+        return error(StatusCode::UNAUTHORIZED, "invalid or missing authorization");
+    };
+    let Some(pubkey) = verify_auth_meta(&relay, &state, &auth_event, verb).await else {
+        return error(StatusCode::UNAUTHORIZED, "invalid or missing authorization");
+    };
+    // Upload allowlist: when restrict_uploads is on, only the listed
+    // pubkeys (npub1... or hex) may upload.
+    if upload_allowed(&relay, &pubkey).await.is_err() {
+        return error(
+            StatusCode::FORBIDDEN,
+            "uploads are restricted to the configured allowlist",
+        );
+    }
+    // BUD-02/05: the optional `X-SHA-256` header declares the expected hash
+    // of the request body — a malformed value is rejected before the body
+    // is read; the match itself needs the hash computed below.
+    let declared_sha = match headers.get("x-sha-256").and_then(|v| v.to_str().ok()) {
+        Some(declared) => {
+            let declared = declared.trim().to_ascii_lowercase();
+            if declared.len() != 64 || hex::decode(&declared).is_err() {
+                return error(StatusCode::BAD_REQUEST, "malformed X-SHA-256 header");
+            }
+            Some(declared)
+        }
+        None => None,
+    };
+    if state.store.check_space().is_err() {
+        return error(StatusCode::INSUFFICIENT_STORAGE, "storage is full");
+    }
     let max_upload = state.max_upload_bytes;
     let permits = match state
         .upload_budget
@@ -785,45 +839,33 @@ async fn put_blob(relay: Arc<Relay>, headers: HeaderMap, body: Body, verb: &str)
             );
         }
     };
-    let (path, size, sha) = match spool_upload(body, max_upload).await {
+    // A stalled body must not pin an upload permit forever: the spool
+    // aborts when no chunk arrives within the HTTP read timeout (0 means
+    // the header timeout is disabled, so a bounded default keeps
+    // slow-loris protection for bodies).
+    let idle_secs = relay.config.read().await.limits.http_read_timeout_secs;
+    let idle_timeout = std::time::Duration::from_secs(if idle_secs == 0 { 60 } else { idle_secs });
+    let (path, size, sha) = match spool_upload(body, max_upload, idle_timeout).await {
         Ok(value) => value,
         Err(response) => return *response,
     };
     let mut cleanup = TempUploadCleanup::new(path.clone());
-    // BUD-02/05: the optional `X-SHA-256` header declares the expected hash
-    // of the request body — a provided value that does not match the actual
-    // bytes is a 409 Conflict, and a malformed value is a 400.
-    if let Some(declared) = headers.get("x-sha-256").and_then(|v| v.to_str().ok()) {
-        let declared = declared.trim().to_ascii_lowercase();
-        if declared.len() != 64 || hex::decode(&declared).is_err() {
-            let _ = tokio::fs::remove_file(&path).await;
-            return error(StatusCode::BAD_REQUEST, "malformed X-SHA-256 header");
-        }
-        if declared != sha {
-            let _ = tokio::fs::remove_file(&path).await;
-            return error(
-                StatusCode::CONFLICT,
-                "the X-SHA-256 header does not match the request body",
-            );
-        }
+    if let Some(declared) = declared_sha
+        && declared != sha
+    {
+        return error(
+            StatusCode::CONFLICT,
+            "the X-SHA-256 header does not match the request body",
+        );
     }
     // BUD-11: upload/media tokens MUST carry an `x` tag matching the blob
     // hash (the token is scoped to exactly the bytes being uploaded).
-    let Some(pubkey) = verify_auth(&relay, &state, &headers, verb, Some(&sha)).await else {
-        let _ = tokio::fs::remove_file(&path).await;
+    if !event_tags(&auth_event, "x").any(|x| x == sha.as_str()) {
         return error(StatusCode::UNAUTHORIZED, "invalid or missing authorization");
-    };
-    // Upload allowlist: when restrict_uploads is on, only the listed
-    // pubkeys (npub1... or hex) may upload.
-    if upload_allowed(&relay, &pubkey).await.is_err() {
-        let _ = tokio::fs::remove_file(&path).await;
-        return error(
-            StatusCode::FORBIDDEN,
-            "uploads are restricted to the configured allowlist",
-        );
     }
+    // Re-check after the spool: the pre-spool check narrows the window in
+    // which the disk can fill while a body is streaming.
     if state.store.check_space().is_err() {
-        let _ = tokio::fs::remove_file(&path).await;
         return error(StatusCode::INSUFFICIENT_STORAGE, "storage is full");
     }
     let mime = sanitize_mime(
@@ -875,9 +917,12 @@ async fn put_blob(relay: Arc<Relay>, headers: HeaderMap, body: Body, verb: &str)
 /// Spools an upload to disk while hashing it. The request body is never
 /// materialized in one `Bytes` allocation, and the size limit is enforced
 /// while reading rather than after the extractor has buffered the body.
+/// `idle_timeout` bounds the wait for the next chunk, so a stalled upload
+/// (slow-loris) cannot pin an upload permit or a temp file forever.
 async fn spool_upload(
     body: Body,
     max_upload: usize,
+    idle_timeout: std::time::Duration,
 ) -> Result<(std::path::PathBuf, u64, String), Box<Response>> {
     use futures_util::StreamExt;
     use sha2::{Digest, Sha256};
@@ -908,7 +953,19 @@ async fn spool_upload(
     let mut stream = body.into_data_stream();
     let mut hash = Sha256::new();
     let mut size = 0u64;
-    while let Some(chunk) = stream.next().await {
+    loop {
+        let chunk = match tokio::time::timeout(idle_timeout, stream.next()).await {
+            // No chunk within the idle window: the client stalled. Abort
+            // so the upload permit and the temp file are released.
+            Err(_) => {
+                return Err(Box::new(error(
+                    StatusCode::REQUEST_TIMEOUT,
+                    "upload stalled: no data received in time",
+                )));
+            }
+            Ok(None) => break,
+            Ok(Some(chunk)) => chunk,
+        };
         let chunk = match chunk {
             Ok(chunk) => chunk,
             Err(e) => {
@@ -1557,6 +1614,75 @@ mod tests {
             resp.status(),
             StatusCode::INSUFFICIENT_STORAGE,
             "a full disk must be reported as 507"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_upload_is_rejected_before_the_body() {
+        let relay = build_blossom_relay(0).await;
+        // A body that never yields data: an authentication check placed
+        // after spooling would wait forever, so the handler must reject the
+        // request before reading it.
+        let body = Body::from_stream(futures_util::stream::pending::<
+            Result<bytes::Bytes, std::io::Error>,
+        >());
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain".parse().unwrap(),
+        );
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            upload(State(relay.clone()), headers, body),
+        )
+        .await
+        .expect("an unauthenticated upload must not wait for the body");
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn stalled_upload_body_times_out_and_releases_the_permit() {
+        use futures_util::StreamExt as _;
+        let relay = build_blossom_relay(0).await;
+        // A 1-second read timeout keeps the test fast.
+        relay.config.write().await.limits.http_read_timeout_secs = 1;
+        let data = b"hello";
+        let sha = sha256_hex(data);
+        let now = unix_now();
+        let ev = auth_event(
+            relay.secp(),
+            now,
+            "upload",
+            Some(now + 300),
+            Some(&sha),
+            None,
+        );
+        let token = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&ev).unwrap());
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Nostr {token}").parse().unwrap(),
+        );
+        // The body yields one chunk, then stalls: the handler must abort
+        // instead of pinning the upload permit and temp file forever.
+        let stream = futures_util::stream::once(async {
+            Ok::<_, std::io::Error>(bytes::Bytes::from_static(data))
+        })
+        .chain(futures_util::stream::pending());
+        let resp = upload(State(relay.clone()), headers, Body::from_stream(stream)).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::REQUEST_TIMEOUT,
+            "a stalled upload must be aborted"
+        );
+        let state = relay.blossom.read().await.clone().unwrap();
+        assert_eq!(
+            state.upload_budget.available_permits(),
+            state.max_upload_bytes.saturating_mul(4).max(1),
+            "the aborted upload must release its permit"
         );
         relay.db.shutdown();
     }
