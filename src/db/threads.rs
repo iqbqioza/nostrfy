@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 
 use super::store::WriteBatch;
 use super::store::{Store, flush_everything};
-use super::{Msg, PutOutcome, db_error, msg_bytes};
+use super::{LoadAccessOutcome, Msg, PutOutcome, db_error, msg_bytes};
 use crate::db::scan::SCAN_BUDGET;
 use anyhow::anyhow;
 
@@ -184,14 +184,15 @@ fn handle_read_msg(store: &Store, errors: &Arc<std::sync::atomic::AtomicU64>, ms
             false
         }
         Msg::LoadAccess { reply } => {
-            let access = match store.load_access() {
-                Ok(access) => access,
+            let outcome = match store.load_access() {
+                Ok(Some(access)) => LoadAccessOutcome::Loaded(access),
+                Ok(None) => LoadAccessOutcome::Missing,
                 Err(e) => {
                     db_error(errors, &e);
-                    None
+                    LoadAccessOutcome::Failed
                 }
             };
-            let _ = reply.send(access);
+            let _ = reply.send(outcome);
             false
         }
         Msg::LoadBlossomAllow { reply } => {

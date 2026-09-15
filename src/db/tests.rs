@@ -1750,7 +1750,9 @@ fn access_control_persists_across_reopen() {
             // The pubkey lists live under their own key.
             db.save_relay_pubkeys(&[("aa".repeat(32), String::new())], &[])
                 .await;
-            let loaded = db.load_access().await.expect("persisted access loads");
+            let crate::db::LoadAccessOutcome::Loaded(loaded) = db.load_access().await else {
+                panic!("persisted access must load");
+            };
             assert_eq!(loaded.allowed_kinds, access.allowed_kinds);
             assert_eq!(loaded.blocked_ips, access.blocked_ips);
         }
@@ -1765,7 +1767,9 @@ fn access_control_persists_across_reopen() {
             262144,
         )
         .unwrap();
-        let loaded = db.load_access().await.expect("persisted access loads");
+        let crate::db::LoadAccessOutcome::Loaded(loaded) = db.load_access().await else {
+            panic!("persisted access must load");
+        };
         assert_eq!(loaded.allowed_kinds, vec![5]);
         assert_eq!(
             loaded.blocked_ips,
@@ -1775,6 +1779,50 @@ fn access_control_persists_across_reopen() {
         let (deny, allow) = db.load_relay_pubkeys().await.unwrap_or_default();
         assert_eq!(deny, vec![("aa".repeat(32), String::new())]);
         assert!(allow.is_empty());
+    });
+}
+
+#[test]
+fn access_load_distinguishes_missing_loaded_and_failed() {
+    // The startup load must not conflate "nothing was ever persisted" (seed
+    // the config) with "the database could not answer" (refuse to start):
+    // treating a failed read as missing would silently replace the
+    // persisted NIP-86 bans with the config seed.
+    let cfg = config();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let db = DbClient::open(
+            &cfg,
+            true,
+            Arc::new(Default::default()),
+            0,
+            128,
+            4096,
+            262144,
+        )
+        .unwrap();
+        // A fresh database has nothing persisted.
+        assert!(matches!(
+            db.load_access().await,
+            crate::db::LoadAccessOutcome::Missing
+        ));
+        // Persisted state loads back.
+        let mut access = crate::config::AccessControl::default();
+        access
+            .blocked_ips
+            .push(("203.0.113.9".into(), String::new()));
+        db.save_access(access.clone()).await;
+        let crate::db::LoadAccessOutcome::Loaded(loaded) = db.load_access().await else {
+            panic!("persisted access must load");
+        };
+        assert_eq!(loaded.blocked_ips, access.blocked_ips);
+        // A reader that cannot answer reports `Failed`, never `Missing`.
+        db.shutdown();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(matches!(
+            db.load_access().await,
+            crate::db::LoadAccessOutcome::Failed
+        ));
     });
 }
 
@@ -1827,7 +1875,9 @@ fn schema_upgrade_creates_missing_tables_instantly() {
         db.save_access(access).await;
         db.save_relay_pubkeys(&[("aa".repeat(32), String::new())], &[])
             .await;
-        let loaded = db.load_access().await.unwrap();
+        let crate::db::LoadAccessOutcome::Loaded(loaded) = db.load_access().await else {
+            panic!("persisted access must load");
+        };
         assert_eq!(loaded.blocked_ips[0].0, "203.0.113.9");
         let (deny, _) = db.load_relay_pubkeys().await.unwrap_or_default();
         assert_eq!(deny[0].0, "aa".repeat(32));
