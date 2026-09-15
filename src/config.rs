@@ -271,6 +271,13 @@ pub struct LimitsConfig {
     pub max_api_limit: usize,
     /// REST API: upper bound for the `offset` query parameter (0 = no bound).
     pub max_api_offset: usize,
+    /// REST API: maximum rows one `/api/v1` query may prefetch while
+    /// paginating over hidden events (the over-fetch window is
+    /// `offset + limit + 1`, and every row is a full event in memory).
+    /// Requests whose window exceeds this bound are rejected with `400`
+    /// instead of pinning that much memory per concurrent request.
+    /// `0` = no bound.
+    pub max_api_fetch: usize,
     /// REST API: maximum length of the `search` query parameter in bytes
     /// (0 = no bound).
     pub max_api_search_bytes: usize,
@@ -457,6 +464,7 @@ impl Default for LimitsConfig {
             max_api_queue_msgs: 512,
             max_api_limit: 5_000,
             max_api_offset: 50_000,
+            max_api_fetch: 10_000,
             max_api_search_bytes: 2_048,
             max_out_queue_bytes: 256 * 1024,
             ws_idle_timeout_secs: 300,
@@ -1277,6 +1285,7 @@ impl Config {
             ),
             ("limits.max_sub_bytes", l.max_sub_bytes, 64 << 20),
             ("limits.max_limit", l.max_limit, 100_000),
+            ("limits.max_api_fetch", l.max_api_fetch, 100_000),
             (
                 "blossom.max_upload_bytes",
                 self.blossom.max_upload_bytes,
@@ -1306,6 +1315,14 @@ impl Config {
                  queued-memory protection; the count caps alone allow a queue of \
                  maximum-size messages to exhaust memory",
                 self.database.max_db_queue_bytes
+            );
+        }
+        if l.max_api_fetch > 0 && l.max_api_limit > 0 && l.max_api_fetch <= l.max_api_limit {
+            log::warn!(
+                "config.limits.max_api_fetch ({}) is not larger than limits.max_api_limit ({}): \
+                 /api/v1 requests at the maximum limit will be rejected as over the fetch window",
+                l.max_api_fetch,
+                l.max_api_limit
             );
         }
         // A very high PoW requirement makes every event infeasible to mine;
@@ -1786,6 +1803,7 @@ fn known_config_keys() -> &'static [(&'static str, &'static [&'static str])] {
                 "max_api_queue_msgs",
                 "max_api_limit",
                 "max_api_offset",
+                "max_api_fetch",
                 "max_api_search_bytes",
                 "max_out_queue_bytes",
                 "ws_idle_timeout_secs",

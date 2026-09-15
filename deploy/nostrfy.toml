@@ -66,6 +66,7 @@ group_late_publish_secs = 3600
 max_api_concurrent = 8
 max_api_limit = 5000
 max_api_offset = 50000
+max_api_fetch = 10000
 max_api_search_bytes = 2048
 max_out_queue_bytes = 262144
 ws_idle_timeout_secs = 300

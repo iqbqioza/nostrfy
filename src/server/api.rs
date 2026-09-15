@@ -1623,12 +1623,30 @@ async fn query_and_respond(
     // Bound total work: at most 4 rounds, each at most 4x the visible target
     // and never more than the configured offset cap + limit (defaults keep
     // this small; `0` means unbounded so fall back to 8x with a hard 10k).
-    let cfg_limit = relay.config.read().await.limits.max_api_offset;
-    let hard_cap = if cfg_limit > 0 {
-        cfg_limit.saturating_add(max_limit).saturating_add(1)
+    let (cfg_offset, cfg_fetch) = {
+        let cfg = relay.config.read().await;
+        (cfg.limits.max_api_offset, cfg.limits.max_api_fetch)
+    };
+    let hard_cap = if cfg_offset > 0 {
+        cfg_offset.saturating_add(max_limit).saturating_add(1)
     } else {
         want_visible.saturating_mul(8).clamp(128, 10_000)
     };
+    // Every row of the over-fetch window is a full event in memory (up to
+    // `max_api_concurrent` requests at once), so the window is bounded
+    // independently of the offset cap. An unservable window is a clear 400
+    // instead of silently returning an empty/degraded page.
+    let hard_cap = if cfg_fetch > 0 {
+        hard_cap.min(cfg_fetch)
+    } else {
+        hard_cap
+    };
+    if want_visible > hard_cap {
+        return param_rejection(anyhow::anyhow!(
+            "offset + limit exceed the server fetch limit of {hard_cap}; lower the offset or \
+             limit, or raise limits.max_api_fetch"
+        ));
+    }
     let mut fetch = want_visible.min(hard_cap).max(1);
     let mut events: Vec<Event> = Vec::new();
     let mut db_more = true;
@@ -2066,6 +2084,34 @@ mod tests {
             );
             assert_eq!(resp["more"], false);
 
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn fetch_window_beyond_the_cap_is_rejected() {
+        // Pagination over hidden rows over-fetches `offset + limit + 1` full
+        // events; the fetch window is capped independently of the offset
+        // cap, and an unservable window is a clear 400 (not an empty page).
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_relay().await;
+            {
+                let mut cfg = relay.config.write().await;
+                cfg.limits.max_api_fetch = 100;
+            }
+            let filters: Vec<Filter> =
+                serde_json::from_value(serde_json::json!([{"kinds": [1]}])).unwrap();
+            let (code, Json(resp)) =
+                query_and_respond(&relay, filters.clone(), 50, Some(150), false, &[]).await;
+            assert_eq!(code, StatusCode::BAD_REQUEST);
+            assert!(
+                resp["error"].as_str().unwrap_or("").contains("fetch limit"),
+                "the error must explain the fetch cap: {resp}"
+            );
+            // A window within the cap is served.
+            let (code, _) = query_and_respond(&relay, filters, 50, Some(0), false, &[]).await;
+            assert_eq!(code, StatusCode::OK);
             relay.db.shutdown();
         });
     }

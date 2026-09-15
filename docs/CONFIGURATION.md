@@ -270,6 +270,7 @@ The changes take effect immediately and are persisted (same lists as `nostrfy re
 | `max_api_queue_msgs` | integer | `512` | Max queued `/api/v1` requests for the API reader (fail-fast beyond this) |
 | `max_api_limit` | integer | `5000` | Ceiling for the API `limit` parameter (`0` = no bound) |
 | `max_api_offset` | integer | `50000` | Ceiling for the API `offset` parameter (`0` = no bound) |
+| `max_api_fetch` | integer | `10000` | Max rows one API query may prefetch for pagination (`0` = no bound; windows beyond it get `400`) |
 | `max_api_search_bytes` | integer | `2048` | Max bytes of the API `search` parameter (`0` = no bound) |
 
 ### Live fan-out
@@ -333,6 +334,8 @@ The changes take effect immediately and are persisted (same lists as `nostrfy re
 
 **`max_api_offset`** — The ceiling for the API's `offset` parameter. Requests above it are rejected with a `400` explaining the limit. `0` = no bound.
 
+**`max_api_fetch`** — The ceiling for the rows one `/api/v1` query may prefetch. Pagination over hidden rows needs an over-fetch window of `offset + limit + 1`, and every fetched row is a full event held in memory (up to `max_api_concurrent` requests at once), so a window beyond this bound is rejected with a `400` instead of pinning that much memory. Raise it (and `max_api_offset`) to serve deeper pages. `0` = no bound.
+
 **`max_api_search_bytes`** — The maximum length (bytes) of the API's `search` parameter. Longer values are rejected with a `400`. `0` = no bound.
 
 **`live_batch_interval_ms`** — How often (milliseconds) accumulated live events are flushed to subscribers (clamped to 1-1000).
@@ -344,7 +347,7 @@ The changes take effect immediately and are persisted (same lists as `nostrfy re
 - **`max_created_at_future_secs`** uses the NIP-01 `invalid:` prefix — the event is rejected as invalid (the NIP-01 example for this case).
 - **`max_out_queue_bytes`** protects against slow readers; REQ responses are never dropped by it (see key details).
 - **`new_pubkey_min_age_secs`**: the first-seen timestamp is only recorded when an event actually stores, so failed first events cannot pre-warm the account-age clock.
-- **`max_api_limit`** clamps silently; **`max_api_offset`** and **`max_api_search_bytes`** reject with a clear `400` error message.
+- **`max_api_limit`** clamps silently; **`max_api_offset`**, **`max_api_fetch`** and **`max_api_search_bytes`** reject with a clear `400` error message.
 - COUNT with hidden events (NIP-70/59/29) reports the *visible* count, preserving privacy.
 
 ---
@@ -632,6 +635,7 @@ group_late_publish_secs = 604800
 max_api_concurrent = 32
 max_api_limit = 500
 max_api_offset = 10000
+max_api_fetch = 10000
 max_api_search_bytes = 1024
 http_read_timeout_secs = 30
 max_connections_per_sec_per_ip = 0
