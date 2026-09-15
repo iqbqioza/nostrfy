@@ -878,7 +878,7 @@ fn rebuild_keeps_join_membership() {
         );
 
         let mut store = GroupStore::default();
-        store.rebuild(&db).await;
+        assert!(store.rebuild(&db).await, "the rebuild must complete");
         let g = store.group("g1").expect("group rebuilt");
         assert!(g.is_admin(ADMIN), "creator is admin after rebuild");
         assert!(g.is_member(OTHER), "JOIN membership survives rebuild");
@@ -942,7 +942,7 @@ fn rebuild_ghosts_group_whose_only_surviving_events_are_relay_metadata() {
         }
 
         let mut store = GroupStore::default();
-        store.rebuild(&db).await;
+        assert!(store.rebuild(&db).await, "the rebuild must complete");
         assert!(
             store.ghost.contains("g1"),
             "a group with only relay metadata must be ghosted"
@@ -950,6 +950,53 @@ fn rebuild_ghosts_group_whose_only_surviving_events_are_relay_metadata() {
         assert!(
             !store.visible_gid("g1", true, None),
             "the ghosted group's metadata is withheld"
+        );
+    });
+}
+
+#[test]
+fn rebuild_fails_closed_when_the_database_is_unavailable() {
+    // A missing reply must not be mistaken for an empty history: the rebuild
+    // reports failure so the startup refuses to persist or serve an
+    // incomplete (world-readable) group store.
+    use crate::db::DbClient;
+    use std::sync::Arc;
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = std::env::temp_dir()
+        .join("nostrfy-nip29-rebuild-fail")
+        .join(format!("{:x}-{id}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&path);
+    let cfg = crate::config::DatabaseConfig {
+        path,
+        map_size: 16 * 1024 * 1024,
+        max_map_size: 32 * 1024 * 1024,
+        ..Default::default()
+    };
+    let db = DbClient::open(
+        &cfg,
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        db.shutdown();
+        // Let the reader threads exit: their reply channel is then gone and
+        // the rebuild cannot be answered.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let mut store = GroupStore::default();
+        assert!(
+            !store.rebuild(&db).await,
+            "an unanswered rebuild must fail closed"
+        );
+        assert!(
+            store.groups.is_empty(),
+            "the failed rebuild leaves no state"
         );
     });
 }

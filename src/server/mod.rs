@@ -378,7 +378,12 @@ pub async fn run_server(config_path: PathBuf, config: Config, db: DbClient) -> R
                 info!("NIP-29 group state restored from the database snapshot");
             }
             None => {
-                relay.groups.write().await.rebuild(&relay.db).await;
+                if !relay.groups.write().await.rebuild(&relay.db).await {
+                    return Err(anyhow::anyhow!(
+                        "NIP-29 group state rebuild failed: refusing to start with an \
+                         incomplete group store (missing groups would expose private content)"
+                    ));
+                }
                 relay.persist_groups().await;
             }
         }
@@ -399,12 +404,18 @@ pub async fn run_server(config_path: PathBuf, config: Config, db: DbClient) -> R
                 info!("NIP-43 role state restored from the database snapshot");
             }
             None => {
-                relay
+                if !relay
                     .roles
                     .write()
                     .await
                     .rebuild(&relay.db, &relay.relay_pubkey().unwrap_or_default())
-                    .await;
+                    .await
+                {
+                    return Err(anyhow::anyhow!(
+                        "NIP-43 role state rebuild failed: refusing to start with an \
+                         incomplete role store"
+                    ));
+                }
                 relay.persist_roles().await;
             }
         }

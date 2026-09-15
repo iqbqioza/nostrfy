@@ -912,7 +912,13 @@ impl GroupStore {
     }
 
     /// Rebuilds the in-memory group state from the stored moderation events.
-    pub async fn rebuild(&mut self, db: &DbClient) {
+    ///
+    /// Returns `false` when the rebuild could not be completed (the database
+    /// did not answer, or the scan budget was exhausted mid-page): the
+    /// caller must not persist or serve a group store rebuilt from an
+    /// incomplete history (missing groups turn private content
+    /// world-readable). The store is left empty on failure.
+    pub async fn rebuild(&mut self, db: &DbClient) -> bool {
         // 9021 JOIN is included so that honored joins survive a restart even
         // on relays without a private key (which never emit the relay-signed
         // 9000 put-user that would otherwise carry the membership).
@@ -930,23 +936,30 @@ impl GroupStore {
             let mut filter: Filter =
                 serde_json::from_value(json!({ "kinds": kinds })).expect("static filter");
             filter.until = until;
-            // `query_full` gives each page the full-scan work budget (not the
-            // smaller per-query one), so a single second holding more events
-            // than the small budget cannot be silently cut mid-boundary.
-            let (page, more) = db.query_full(vec![filter], PAGE, unix_now()).await;
+            // `query_full_startup` gives each page the full-scan work budget
+            // (not the smaller per-query one) and reports a missing reply
+            // instead of degrading to an empty page; an empty page must only
+            // ever mean "no more events".
+            let Some((page, more)) = db.query_full_startup(vec![filter], PAGE, unix_now()).await
+            else {
+                log::error!(
+                    "group state rebuild aborted: the database did not answer; refusing to \
+                     persist an incomplete group store"
+                );
+                return false;
+            };
             if page.is_empty() {
                 break;
             }
             let min_created = page.iter().map(|e| e.created_at).min().unwrap_or(0);
             let full = page.len() >= PAGE;
             if !full && more {
-                log::warn!(
-                    "group state rebuild ended early (scan budget exhausted with {} events in \
-                     the page): the in-memory group store may be incomplete after this restart",
+                log::error!(
+                    "group state rebuild aborted: the scan budget was exhausted with {} events \
+                     in the page, so the history is incomplete",
                     page.len()
                 );
-                events.extend(page);
-                break;
+                return false;
             }
             events.extend(page);
             if !full {
@@ -993,12 +1006,15 @@ impl GroupStore {
         // deleted the author's own JOIN, but an admin's put-user or the
         // relay's own JOIN-time put-user survive): skip the events that
         // would add a vanished pubkey to a group.
-        let vanished: std::collections::HashSet<String> = db
-            .vanish_pubkeys()
-            .await
-            .into_iter()
-            .map(hex::encode)
-            .collect();
+        let Some(vanished) = db.vanish_pubkeys().await else {
+            log::error!(
+                "group state rebuild aborted: the vanished-pubkey list is unavailable; \
+                 refusing to persist an incomplete group store"
+            );
+            return false;
+        };
+        let vanished: std::collections::HashSet<String> =
+            vanished.into_iter().map(hex::encode).collect();
         // Every group id referenced by the surviving events: any of them
         // that did not make it into `groups` (its create event was
         // deleted by a vanish / NIP-09 / expiry) becomes a ghost — its
@@ -1025,7 +1041,14 @@ impl GroupStore {
             let mut filter: Filter =
                 serde_json::from_value(json!({ "kinds": meta_kinds })).expect("static filter");
             filter.until = until;
-            let (page, more) = db.query_full(vec![filter], PAGE, unix_now()).await;
+            let Some((page, more)) = db.query_full_startup(vec![filter], PAGE, unix_now()).await
+            else {
+                log::error!(
+                    "group state rebuild aborted: the database did not answer; refusing to \
+                     persist an incomplete group store"
+                );
+                return false;
+            };
             if page.is_empty() {
                 break;
             }
@@ -1035,15 +1058,13 @@ impl GroupStore {
                 // The scan budget was exhausted mid-timestamp: the page is
                 // partial and stepping the cursor would silently skip the
                 // unexamined events of the same timestamp, leaving their
-                // groups out of the ghost detection (fail-open). Stop and
-                // warn, like the moderation walk above.
-                log::warn!(
-                    "group metadata scan ended early (scan budget exhausted with {} events in \
-                     the page): the ghost detection may be incomplete after this restart",
+                // groups out of the ghost detection (fail-open).
+                log::error!(
+                    "group state rebuild aborted: the metadata scan budget was exhausted with \
+                     {} events in the page, so the ghost detection is incomplete",
                     page.len()
                 );
-                meta_events.extend(page);
-                break;
+                return false;
             }
             meta_events.extend(page);
             if !full || min_created == 0 {
@@ -1083,6 +1104,7 @@ impl GroupStore {
                 self.ghost.insert(gid);
             }
         }
+        true
     }
 
     /// Removes a group id from the ghost set once a fresh CREATE_GROUP

@@ -572,7 +572,7 @@ impl Store {
             });
             if filters.len() == 1 {
                 // A single filter needs only its own quota. Internal
-                // full-history rebuilds (`query_full`) pass a large
+                // full-history rebuilds (`query_full_startup`) pass a large
                 // `max_limit` and must not be cut off by the search budget.
                 caps
             } else {
