@@ -348,17 +348,23 @@ pub async fn rpc_handler(
             {
                 return rpc_err("invalid params: value too long or contains control characters");
             }
-            let mut cfg = relay.config.write().await;
-            let (field, _) = match method {
-                "changerelayname" => ("name", cfg.relay.name = value.to_string()),
-                "changerelaydescription" => {
-                    ("description", cfg.relay.description = value.to_string())
-                }
-                _ => ("icon", cfg.relay.icon = value.to_string()),
+            let field = match method {
+                "changerelayname" => "name",
+                "changerelaydescription" => "description",
+                _ => "icon",
             };
+            {
+                let mut cfg = relay.config.write().await;
+                match method {
+                    "changerelayname" => cfg.relay.name = value.to_string(),
+                    "changerelaydescription" => cfg.relay.description = value.to_string(),
+                    _ => cfg.relay.icon = value.to_string(),
+                }
+            }
             // Persist the change to the config file so it survives a SIGHUP
             // reload and a restart (without persistence the reload handler
-            // would silently revert it).
+            // would silently revert it). The lock is released first: the
+            // (blocking) file write must not stall every config reader.
             relay.persist_relay_field(field, value).await;
             audit!(&relay, &identity, method, params);
             rpc_ok(json!(true))

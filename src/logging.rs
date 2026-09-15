@@ -90,6 +90,9 @@ struct FileLogger {
 struct FileState {
     file: std::fs::File,
     size: u64,
+    /// Whether the last write failed (reported once per failure streak, so
+    /// a full disk cannot flood stderr with one line per log record).
+    write_failed: bool,
 }
 
 impl FileLogger {
@@ -100,7 +103,11 @@ impl FileLogger {
             path,
             max_size,
             max_files: max_files.max(1),
-            inner: Mutex::new(FileState { file, size }),
+            inner: Mutex::new(FileState {
+                file,
+                size,
+                write_failed: false,
+            }),
         })
     }
 
@@ -163,13 +170,20 @@ impl log::Log for FileLogger {
     fn log(&self, record: &log::Record) {
         let line = format_record(record);
         let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let written = state
-            .file
-            .write_all(line.as_bytes())
-            .map(|()| line.len() as u64);
-        if let Ok(written) = written {
-            state.size += written;
-            self.rotate(&mut state);
+        match state.file.write_all(line.as_bytes()) {
+            Ok(()) => {
+                state.write_failed = false;
+                state.size += line.len() as u64;
+                self.rotate(&mut state);
+            }
+            Err(e) => {
+                // The logger cannot report through itself (that would
+                // recurse): write to stderr, once per failure streak.
+                if !state.write_failed {
+                    state.write_failed = true;
+                    eprintln!("nostrfy: cannot write the log file: {e}");
+                }
+            }
         }
     }
     fn flush(&self) {

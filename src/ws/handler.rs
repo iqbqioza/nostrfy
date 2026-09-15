@@ -346,6 +346,13 @@ impl super::Conn {
             return;
         }
 
+        // Bound the filter count before parsing any filter: a frame full of
+        // maximum-size filters must be refused without cloning and parsing
+        // all of them first.
+        if rest.len().saturating_sub(1) > max_filters {
+            self.reject_req(sub_id, "invalid: too many filters");
+            return;
+        }
         let mut filters = Vec::new();
         for f in &rest[1..] {
             let mut f = f.clone();
@@ -366,10 +373,6 @@ impl super::Conn {
         }
         if filters.is_empty() {
             self.reject_req(sub_id, "invalid: REQ requires at least one filter");
-            return;
-        }
-        if filters.len() > max_filters {
-            self.reject_req(sub_id, "invalid: too many filters");
             return;
         }
         if filters.iter().any(|f| f.too_many_members()) {
@@ -668,6 +671,17 @@ impl super::Conn {
     }
 
     pub(crate) async fn handle_auth(&mut self, rest: &[Value]) {
+        // Bound the AUTH attempts per connection: each well-formed frame
+        // costs a Schnorr verification, so an unlimited stream of AUTH
+        // frames would burn CPU on one connection. The limit is generous
+        // (a client retries a couple of times at most) and does not close
+        // the connection: the client can still read and reconnect.
+        const MAX_AUTH_ATTEMPTS: u32 = 16;
+        self.auth_attempts = self.auth_attempts.saturating_add(1);
+        if self.auth_attempts > MAX_AUTH_ATTEMPTS {
+            self.send_notice("error: too many AUTH attempts; reconnect to retry");
+            return;
+        }
         let Some(value) = rest.first() else {
             self.send_notice("error: AUTH requires an event object");
             return;
@@ -773,6 +787,15 @@ impl super::Conn {
             self.reject_count(sub_id, "restricted: you are not allowed to count");
             return;
         }
+        // Cap the filter count before parsing any filter: a 1 MiB COUNT
+        // frame full of maximum-size filters would otherwise be cloned and
+        // parsed before the refusal. Without the cap each filter would also
+        // get its own full scan budget (~28k filters × 200k candidate
+        // examinations on the shared reader thread).
+        if rest.len().saturating_sub(1) > self.relay.config.read().await.limits.max_filters {
+            self.reject_count(sub_id, "invalid: too many filters");
+            return;
+        }
         let mut filters = Vec::new();
         for f in &rest[1..] {
             let mut f = f.clone();
@@ -802,14 +825,6 @@ impl super::Conn {
         }
         if filters.iter().any(|f| f.invalid_tag_values()) {
             self.reject_count(sub_id, "invalid: tag constraint values must be strings");
-            return;
-        }
-        // Cap the filter count like REQ: without it each filter would get its
-        // own full scan budget, so a single 1 MiB COUNT frame could drive
-        // ~28k filters × 200k candidate examinations on the shared reader
-        // thread (~1400x the full-scan budget).
-        if filters.len() > self.relay.config.read().await.limits.max_filters {
-            self.reject_count(sub_id, "invalid: too many filters");
             return;
         }
         let count_limit = self.relay.config.read().await.limits.max_count;

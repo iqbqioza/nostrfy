@@ -77,6 +77,10 @@ pub struct Relay {
     /// preserved); fresh pubkeys alone are fail-open until old windows
     /// expire.
     publish_rate: std::sync::Mutex<HashMap<String, std::collections::VecDeque<u64>>>,
+    /// When the publish-rate map was last pruned. The map is bounded, and
+    /// pruning it is a full scan: a flood of fresh pubkeys must not run that
+    /// scan once per event.
+    publish_rate_pruned_at: std::sync::atomic::AtomicU64,
     /// Serializes `persist_access`: two concurrent NIP-86 mutations must
     /// not capture snapshots in one order and queue their writes in the
     /// other, or the older snapshot lands last and loses the newer entry
@@ -91,6 +95,12 @@ pub struct Relay {
     /// NIP-42 flags against this version and refresh them only when it
     /// changes, so the hot live path never takes the shared config lock.
     pub config_version: std::sync::atomic::AtomicU64,
+    /// Graceful-shutdown signal for the WebSocket connection loops: on
+    /// shutdown the loops wake, flush their pending event batches (so the
+    /// accepted events and their OKs are not lost to the process exit) and
+    /// close. The sender lives here because the upgraded WebSocket tasks
+    /// are detached from the HTTP connection they came from.
+    drain_tx: tokio::sync::watch::Sender<bool>,
     /// The relay's own keypair (from `relay.private_key`), used to sign
     /// NIP-29 and NIP-43 relay-generated events.
     key: Option<Keypair>,
@@ -400,9 +410,11 @@ impl Relay {
             api_limit: ApiLimiter::new(api_max_concurrent),
             per_ip_connections: std::sync::Mutex::new(HashMap::new()),
             publish_rate: std::sync::Mutex::new(HashMap::new()),
+            publish_rate_pruned_at: std::sync::atomic::AtomicU64::new(0),
             persist_access_lock: tokio::sync::Mutex::new(()),
             ip_blocks_tx: tokio::sync::watch::channel(0).0,
             config_version: AtomicU64::new(0),
+            drain_tx: tokio::sync::watch::channel(false).0,
             key,
             relay_pubkey,
             secp,
@@ -421,6 +433,19 @@ impl Relay {
     /// issued before.
     pub(crate) fn stamp_floor(&self, floor: u64) -> u64 {
         self.stamps.stamp(floor)
+    }
+
+    /// Signals every WebSocket connection to flush and close (graceful
+    /// shutdown). Idempotent; the relay's shutdown sequence waits for
+    /// `stats.connections_active` to reach zero before stopping the
+    /// database, so the flushed batches are still committed.
+    pub fn signal_drain(&self) {
+        let _ = self.drain_tx.send(true);
+    }
+
+    /// A receiver for a connection loop to observe [`Self::signal_drain`].
+    pub fn subscribe_drain(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.drain_tx.subscribe()
     }
 
     /// Spawns the live batching task. Must be called once, after the relay
@@ -576,9 +601,18 @@ impl Relay {
         // window and permanently disable the limit). Expired windows are
         // evicted first; a still-full map rejects the new pubkey because
         // admitting an untracked identity would bypass the configured
-        // limit.
+        // limit. The eviction is a full scan, so it runs at most once per
+        // second: a flood of fresh pubkeys would otherwise walk the whole
+        // map per event.
         if rate.len() >= MAX_TRACKED_PUBKEYS {
-            rate.retain(|_, w| w.front().is_some_and(|t| now.saturating_sub(*t) < 60));
+            let last_pruned = self
+                .publish_rate_pruned_at
+                .load(std::sync::atomic::Ordering::Relaxed);
+            if now.saturating_sub(last_pruned) >= 1 {
+                self.publish_rate_pruned_at
+                    .store(now, std::sync::atomic::Ordering::Relaxed);
+                rate.retain(|_, w| w.front().is_some_and(|t| now.saturating_sub(*t) < 60));
+            }
             if rate.len() >= MAX_TRACKED_PUBKEYS {
                 return false;
             }

@@ -13,6 +13,10 @@ use crate::error::Result;
 #[derive(Clone)]
 pub(crate) struct S3Client {
     endpoint: String,
+    /// The endpoint's path component (e.g. `/storage` in
+    /// `https://minio.example.com/storage`): SigV4 signs the request path
+    /// exactly, so a base path must be part of the canonical URI too.
+    path_prefix: String,
     region: String,
     bucket: String,
     access_key: String,
@@ -35,8 +39,17 @@ impl S3Client {
         access_key: &str,
         secret_key: &str,
     ) -> S3Client {
+        let endpoint = endpoint.trim_end_matches('/').to_string();
+        let path_prefix = endpoint
+            .split_once("://")
+            .map(|(_, rest)| rest)
+            .unwrap_or(endpoint.as_str())
+            .split_once('/')
+            .map(|(_, path)| path.trim_matches('/').to_string())
+            .unwrap_or_default();
         S3Client {
-            endpoint: endpoint.trim_end_matches('/').to_string(),
+            endpoint,
+            path_prefix,
             region: region.to_string(),
             bucket: bucket.to_string(),
             access_key: access_key.to_string(),
@@ -213,8 +226,13 @@ impl S3Client {
         let host = host_of(&self.endpoint);
         // The canonical URI must match the request URL exactly: the object
         // key is percent-encoded segment-wise in both (a raw key in the
-        // signature would mismatch the encoded URL and yield a 403).
-        let canonical_uri = format!("/{}/{}", self.bucket, encoded_key(key));
+        // signature would mismatch the encoded URL and yield a 403), and an
+        // endpoint base path (`endpoint` may carry one) is part of the path.
+        let canonical_uri = if self.path_prefix.is_empty() {
+            format!("/{}/{}", self.bucket, encoded_key(key))
+        } else {
+            format!("/{}/{}/{}", self.path_prefix, self.bucket, encoded_key(key))
+        };
         // Canonical query: sort the key=value pairs (SigV4 requires sorted).
         let canonical_query = sorted_query(query);
         // SigV4 canonical headers must be sorted by name and lowercased.

@@ -262,6 +262,14 @@ fn bound_params(params: &mut ApiParams, cfg: &Config) -> anyhow::Result<()> {
             limits.max_api_search_bytes
         ));
     }
+    if params.authors.len() > crate::filter::MAX_FILTER_MEMBERS
+        || params.kinds.len() > crate::filter::MAX_FILTER_MEMBERS
+    {
+        return Err(anyhow!(
+            "authors and kinds are limited to {} entries each",
+            crate::filter::MAX_FILTER_MEMBERS
+        ));
+    }
     Ok(())
 }
 
@@ -312,10 +320,12 @@ async fn enabled_nip78_auth_active(relay: &Arc<Relay>) -> bool {
 }
 
 fn apply_params(mut filter: Filter, params: &ApiParams) -> Filter {
-    if !params.authors.is_empty() {
+    // Path-derived constraints (the author/kind in `/npub.../kind`) must
+    // win: a query parameter may only fill a field the path left unset.
+    if filter.authors.is_none() && !params.authors.is_empty() {
         filter.authors = Some(params.authors.clone());
     }
-    if !params.kinds.is_empty() {
+    if filter.kinds.is_none() && !params.kinds.is_empty() {
         filter.kinds = Some(params.kinds.clone());
     }
     if let Some(since) = params.since {
@@ -1157,10 +1167,20 @@ pub async fn api_hourly_handler(
         (None, None) => month_of(now),
     };
     let days_in_month = (month_start_of_next(year, month) - month_start(year, month)) / 86400;
-    let day = params.day.unwrap_or_else(|| {
-        let (_, _, d) = civil_from_days((now / 86400) as i64);
-        d.min(days_in_month as u32)
-    });
+    let day = match params.day {
+        Some(day) => day,
+        None => {
+            let (cy, cm, cd) = civil_from_days((now / 86400) as i64);
+            // Only the current month defaults to today's day: another
+            // month would reject the request whenever today's day exceeds
+            // that month's length (e.g. ?year=2024&month=2 on the 31st).
+            if (cy, cm) == (year, month) {
+                cd.min(days_in_month as u32)
+            } else {
+                1
+            }
+        }
+    };
     if day == 0 || day as u64 > days_in_month {
         return error_response(
             StatusCode::BAD_REQUEST,
@@ -1263,16 +1283,17 @@ pub async fn api_related_handler(
             .tags
             .insert("#e".to_string(), json!([hex_id.clone(), e.clone()]));
     }
-    let filters: Vec<Filter> = vec![
-        replies,
-        apply_params(
-            Filter {
-                tags: serde_json::Map::from_iter([("#q".to_string(), json!(hex_id.clone()))]),
-                ..Default::default()
-            },
-            &params,
-        ),
-    ];
+    let mut quotes = apply_params(
+        Filter {
+            tags: serde_json::Map::from_iter([("#q".to_string(), json!(hex_id.clone()))]),
+            ..Default::default()
+        },
+        &params,
+    );
+    // The `e` query parameter targets replies (`#e`), not quotes: quotes
+    // reference the event with `#q`, so the inherited `#e` must go.
+    quotes.tags.remove("#e");
+    let filters: Vec<Filter> = vec![replies, quotes];
     query_and_respond(
         &relay,
         filters,
@@ -1510,7 +1531,11 @@ fn month_of(ts: u64) -> (i64, u32) {
 
 /// The unix timestamp of the first second of `(year, month)`.
 fn month_start(y: i64, m: u32) -> u64 {
-    (days_from_civil(y, m, 1) * 86400) as u64
+    // A `since`/`until` of `u64::MAX` derives a year far outside the
+    // representable range: compute in i128 so the multiplication cannot
+    // overflow i64 (debug panic / release wrap); the final `as u64` keeps
+    // the historical wrap for pre-1970 months.
+    (days_from_civil(y, m, 1) as i128 * 86400) as u64
 }
 
 /// The first second of the month following `(year, month)`.

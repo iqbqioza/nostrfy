@@ -626,6 +626,15 @@ impl LocalStore {
             let _ = tokio::fs::remove_file(&tmp_path).await;
             return Err(e.into());
         }
+        // Flush the file contents to disk before the rename publishes the
+        // name: otherwise a crash can leave the final path pointing at a
+        // file whose data has not reached the platter yet (the mapping
+        // already references the sha, so a truncated blob would surface).
+        if let Err(e) = output.sync_all().await {
+            drop(output);
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            return Err(e.into());
+        }
         drop(output);
         if let Err(e) = tokio::fs::rename(&tmp_path, self.rooted_path(npub, sha256)).await {
             let _ = tokio::fs::remove_file(&tmp_path).await;

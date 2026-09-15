@@ -99,6 +99,9 @@ pub struct Conn {
     /// Every pubkey authenticated on this connection (NIP-42: all of them
     /// are treated as authenticated).
     pub(crate) authed_pubkeys: Vec<String>,
+    /// AUTH frames seen on this connection (bounded anti-bruteforce: each
+    /// one costs a Schnorr verification).
+    pub(crate) auth_attempts: u32,
     /// Events received but not yet accepted; flushed in batches so the
     /// database commit cost is amortized over many events.
     pub(crate) pending_events: Vec<Event>,
@@ -484,14 +487,6 @@ impl Conn {
     }
 }
 
-pub(crate) fn value_string(value: &Value) -> Option<String> {
-    match value {
-        Value::String(s) => Some(s.clone()),
-        Value::Number(n) => Some(n.to_string()),
-        _ => None,
-    }
-}
-
 fn message_size(msg: &Message) -> usize {
     match msg {
         Message::Text(text) => text.len(),
@@ -589,6 +584,87 @@ impl Conn {
     }
 }
 
+/// Why a drain attempt ended.
+enum DrainOutcome {
+    /// The queued messages were fed and flushed.
+    Drained,
+    /// The connection must close (the idle deadline expired or the relay's
+    /// notification channel is gone).
+    Stop,
+    /// The blocked-IP list changed (the caller re-checks membership).
+    IpChanged,
+    /// The live-delivery queue overflowed.
+    Overflow,
+}
+
+/// Feeds the queued outgoing messages and flushes once, while staying
+/// responsive to the connection's liveness signals. A peer that stops
+/// reading makes the socket unwritable: without racing the drain against
+/// the idle deadline (and the IP-block/live-overflow notifications) the
+/// task would sit in `feed` forever and the idle timeout could never reap
+/// it. Backpressure is preserved: no inbound frame is read while draining.
+/// A message that is already in flight when the race is lost is put back at
+/// the front, so an IP-block notification that does not actually block the
+/// peer cannot silently drop it.
+async fn drain_outgoing<F>(
+    conn: &mut Conn,
+    sender: &mut F,
+    idle_sleep: &mut Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+    ip_blocks_rx: &mut tokio::sync::watch::Receiver<u64>,
+    overflow_rx: &mut tokio::sync::watch::Receiver<()>,
+    drain_rx: &mut tokio::sync::watch::Receiver<bool>,
+) -> DrainOutcome
+where
+    F: futures_util::Sink<Message, Error = axum::Error> + Unpin,
+{
+    let drain = async {
+        while let Some(msg) = conn.outgoing.front() {
+            // Feed a clone and pop only after the feed resolved: a drain
+            // canceled by one of the races above (an IP-block notification
+            // that does not actually block the peer) must leave the message
+            // queued, not silently drop it.
+            let msg = msg.clone();
+            let size = message_size(&msg);
+            if sender.feed(msg).await.is_err() {
+                return;
+            }
+            conn.outgoing.pop_front();
+            conn.out_bytes = conn.out_bytes.saturating_sub(size);
+        }
+        let _ = sender.flush().await;
+    };
+    let idle = async {
+        match idle_sleep {
+            Some(sleep) => sleep.as_mut().await,
+            None => std::future::pending().await,
+        }
+    };
+    let outcome = tokio::select! {
+        _ = drain => DrainOutcome::Drained,
+        _ = idle => DrainOutcome::Stop,
+        changed = ip_blocks_rx.changed() => {
+            if changed.is_err() {
+                DrainOutcome::Stop
+            } else {
+                DrainOutcome::IpChanged
+            }
+        }
+        changed = overflow_rx.changed() => {
+            if changed.is_err() {
+                DrainOutcome::Stop
+            } else {
+                DrainOutcome::Overflow
+            }
+        }
+        changed = drain_rx.changed() => {
+            // Graceful shutdown: stop draining so the caller can flush the
+            // pending batch and close.
+            let _ = changed;
+            DrainOutcome::Stop
+        }
+    };
+    outcome
+}
 pub async fn handle_connection(
     mut socket: WebSocket,
     relay: Arc<Relay>,
@@ -705,6 +781,11 @@ pub async fn handle_connection(
     // is dropped when its source IP becomes blocked, even if it only
     // receives live events and never sends a frame.
     let mut ip_blocks_rx = relay.ip_blocks_tx.subscribe();
+    // Graceful shutdown: the relay signals a drain so the loop flushes its
+    // pending event batch and closes before the process exits (the upgraded
+    // WebSocket task is detached from the HTTP connection, so the server's
+    // HTTP-level drain cannot reach it).
+    let mut drain_rx = relay.subscribe_drain();
 
     let idle_jitter = Duration::from_millis(conn_id % 2000);
     let idle_sleep: Option<tokio::time::Sleep> =
@@ -743,6 +824,7 @@ pub async fn handle_connection(
         neg_opens_total: 0,
         challenge,
         authed_pubkeys: Vec::new(),
+        auth_attempts: 0,
         pending_events: Vec::new(),
         pending_bytes: 0,
         expiry_enabled,
@@ -774,20 +856,33 @@ pub async fn handle_connection(
     'connection: loop {
         // Drain pending outgoing messages. A slow reader stalls only its
         // own connection (outgoing is bounded, so new messages are dropped).
-        // Batch the flush: `start_send` for every queued message and one
-        // `flush` for the whole batch, so a burst of N messages costs one
-        // write syscall instead of N (the per-message `send` flushed each
-        // one).
-        while let Some(msg) = conn.outgoing.pop_front() {
-            conn.out_bytes = conn.out_bytes.saturating_sub(message_size(&msg));
-            if sender.feed(msg).await.is_err() {
+        // The drain races the connection's liveness signals: a peer that
+        // stops reading makes the socket unwritable, and without the race
+        // the idle timeout (and the IP-block/live-overflow notifications)
+        // could never fire.
+        match drain_outgoing(
+            &mut conn,
+            &mut sender,
+            &mut idle_sleep,
+            &mut ip_blocks_rx,
+            &mut overflow_rx,
+            &mut drain_rx,
+        )
+        .await
+        {
+            DrainOutcome::Drained => {}
+            DrainOutcome::Stop => break,
+            DrainOutcome::IpChanged => {
+                if conn.source_ip_blocked(peer_ip).await {
+                    break;
+                }
+            }
+            DrainOutcome::Overflow => {
+                conn.live_overflowed = true;
+                conn.close_for_live_overflow();
                 break;
             }
         }
-        // One flush for the whole batch: N queued messages cost a single
-        // write syscall. A failed flush (the socket died) surfaces as the
-        // next inbound read error and ends the connection.
-        let _ = sender.flush().await;
         // Pump the queued REQ responses through the capped outgoing queue
         // in bounded chunks (see `pump_pending_reqs`).
         conn.pump_pending_reqs();
@@ -940,14 +1035,37 @@ pub async fn handle_connection(
                 // REQ and waits would not receive the response until the
                 // next select event (a further frame, the keep-alive PING
                 // or a live batch) drives the top-of-loop drain.
-                while let Some(msg) = conn.outgoing.pop_front() {
-                    conn.out_bytes = conn.out_bytes.saturating_sub(message_size(&msg));
-                    if sender.feed(msg).await.is_err() {
-                        break;
+                // The frames just handled moved `last_activity`: refresh the
+                // idle deadline before the drain race, or a frame that
+                // arrived close to the old deadline would be reaped as idle.
+                if let (Some(sleep), Some(d)) = (idle_sleep.as_mut(), idle) {
+                    let target = tokio::time::Instant::from_std(last_activity) + d + idle_jitter;
+                    if sleep.as_mut().deadline() != target {
+                        sleep.as_mut().reset(target);
                     }
                 }
-                if sender.flush().await.is_err() {
-                    break;
+                match drain_outgoing(
+                    &mut conn,
+                    &mut sender,
+                    &mut idle_sleep,
+                    &mut ip_blocks_rx,
+                    &mut overflow_rx,
+                    &mut drain_rx,
+                )
+                .await
+                {
+                    DrainOutcome::Drained => {}
+                    DrainOutcome::Stop => break,
+                    DrainOutcome::IpChanged => {
+                        if conn.source_ip_blocked(peer_ip).await {
+                            break;
+                        }
+                    }
+                    DrainOutcome::Overflow => {
+                        conn.live_overflowed = true;
+                        conn.close_for_live_overflow();
+                        break;
+                    }
                 }
                 conn.pump_pending_reqs();
             }
@@ -977,6 +1095,13 @@ pub async fn handle_connection(
                     conn.close_for_live_overflow();
                     break;
                 }
+            }
+            changed = drain_rx.changed() => {
+                // Graceful shutdown: break so the teardown flushes the
+                // pending event batch (and its OKs) before the process
+                // exits.
+                let _ = changed;
+                break;
             }
             live_batch = live_fut => {
                 match live_batch {
@@ -1279,6 +1404,7 @@ mod tests {
             neg_opens_total: 0,
             challenge: "test-challenge".into(),
             authed_pubkeys: Vec::new(),
+            auth_attempts: 0,
             pending_events: Vec::new(),
             pending_bytes: 0,
             expiry_enabled,
@@ -3585,6 +3711,12 @@ mod tests {
                 outgoing_json(&conn)
             );
             conn.outgoing.clear();
+            // The short-frame check above closed "s": reopen it so the
+            // malformed-payload checks below run against a known id (an
+            // unknown id is refused before the payload is parsed).
+            conn.handle_neg_open(&[json!("s"), json!({"kinds": [1]}), json!("61000000")])
+                .await;
+            conn.outgoing.clear();
             conn.handle_neg_msg(&[json!("s"), json!(42)]).await;
             assert!(
                 outgoing_json(&conn).iter().any(|m| m[0] == "NEG-ERR"
@@ -3596,6 +3728,11 @@ mod tests {
                 !conn.neg.contains_key("s"),
                 "a malformed NEG-MSG must close the subscription"
             );
+            conn.outgoing.clear();
+            // Reopen "s" again (the check above closed it) for the non-hex
+            // payload check.
+            conn.handle_neg_open(&[json!("s"), json!({"kinds": [1]}), json!("61000000")])
+                .await;
             conn.outgoing.clear();
             conn.handle_neg_msg(&[json!("s"), json!("zzz")]).await;
             assert!(
@@ -4283,6 +4420,107 @@ mod tests {
                 "every stored event must precede the EOSE"
             );
             assert!(live_pos > eose, "the live event must follow the EOSE");
+            conn.relay.db.shutdown();
+        });
+    }
+
+    /// A sink that never becomes ready: models a peer that stopped reading.
+    struct NeverReady;
+
+    impl futures_util::Sink<Message> for NeverReady {
+        type Error = axum::Error;
+        fn poll_ready(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Pending
+        }
+        fn start_send(self: std::pin::Pin<&mut Self>, _item: Message) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Pending
+        }
+        fn poll_close(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    #[test]
+    fn blocked_drain_yields_to_the_idle_deadline() {
+        // A peer that stops reading must not pin the connection task: the
+        // drain races the idle deadline, so the connection is reaped even
+        // while the socket is unwritable.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            conn.outgoing.push_back(Message::Text("x".into()));
+            let mut sink = NeverReady;
+            let mut idle_sleep = Some(Box::pin(tokio::time::sleep(Duration::from_millis(50))));
+            let (_ip_tx, mut ip_rx) = tokio::sync::watch::channel(0u64);
+            let (_overflow_tx, mut overflow_rx) = tokio::sync::watch::channel(());
+            let (_drain_tx, mut drain_rx) = tokio::sync::watch::channel(false);
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(2),
+                drain_outgoing(
+                    &mut conn,
+                    &mut sink,
+                    &mut idle_sleep,
+                    &mut ip_rx,
+                    &mut overflow_rx,
+                    &mut drain_rx,
+                ),
+            )
+            .await
+            .expect("the blocked drain must yield to the idle deadline");
+            assert!(matches!(outcome, DrainOutcome::Stop));
+            // The in-flight message is preserved for a connection that keeps
+            // running (the idle/overflow signals end it, the IP change may
+            // not).
+            assert_eq!(conn.outgoing.len(), 1);
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn blocked_drain_yields_to_shutdown() {
+        // On shutdown the drain must observe the signal even while the
+        // socket is unwritable, so the connection can flush its pending
+        // batch and close instead of being killed with the process.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            conn.outgoing.push_back(Message::Text("x".into()));
+            let mut sink = NeverReady;
+            let mut idle_sleep = None;
+            let (_ip_tx, mut ip_rx) = tokio::sync::watch::channel(0u64);
+            let (_overflow_tx, mut overflow_rx) = tokio::sync::watch::channel(());
+            let (drain_tx, mut drain_rx) = tokio::sync::watch::channel(false);
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                let _ = drain_tx.send(true);
+            });
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(2),
+                drain_outgoing(
+                    &mut conn,
+                    &mut sink,
+                    &mut idle_sleep,
+                    &mut ip_rx,
+                    &mut overflow_rx,
+                    &mut drain_rx,
+                ),
+            )
+            .await
+            .expect("the shutdown signal must end the blocked drain");
+            assert!(matches!(outcome, DrainOutcome::Stop));
+            assert_eq!(conn.outgoing.len(), 1);
             conn.relay.db.shutdown();
         });
     }

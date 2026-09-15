@@ -79,7 +79,11 @@ pub(crate) fn read_bound(data: &[u8], pos: &mut usize, prev_ts: &mut u64) -> any
 
 // ----- message parsing -----
 
-pub(crate) fn parse_message(data: &[u8]) -> anyhow::Result<Vec<Range>> {
+/// Parses a NEG-MSG body. `max_ranges` bounds the number of ranges the
+/// message may carry, enforced *while parsing*: the caller's post-parse
+/// check would otherwise let a small frame allocate the whole range vector
+/// (and every bound prefix in it) before being rejected.
+pub(crate) fn parse_message(data: &[u8], max_ranges: usize) -> anyhow::Result<Vec<Range>> {
     if data.is_empty() {
         return Err(anyhow!("empty message"));
     }
@@ -90,6 +94,9 @@ pub(crate) fn parse_message(data: &[u8]) -> anyhow::Result<Vec<Range>> {
     let mut prev_ts = 0u64;
     let mut ranges = Vec::new();
     while pos < data.len() {
+        if ranges.len() >= max_ranges {
+            return Err(anyhow!("too many ranges in one negentropy message"));
+        }
         let upper = read_bound(data, &mut pos, &mut prev_ts)?;
         let mode = read_varint(data, &mut pos)?;
         let mode = match mode {
@@ -149,9 +156,12 @@ mod tests {
     #[test]
     fn parse_message_error_paths() {
         // Empty and wrong-version messages are refused up front.
-        assert_eq!(parse_message(&[]).unwrap_err().to_string(), "empty message");
         assert_eq!(
-            parse_message(&[0x62]).unwrap_err().to_string(),
+            parse_message(&[], 1024).unwrap_err().to_string(),
+            "empty message"
+        );
+        assert_eq!(
+            parse_message(&[0x62], 1024).unwrap_err().to_string(),
             "unsupported protocol version"
         );
         // A bound prefix longer than 32 bytes is refused.
@@ -159,7 +169,7 @@ mod tests {
         msg.extend(varint(1)); // ts delta
         msg.extend(varint(33)); // prefix length > 32
         assert_eq!(
-            parse_message(&msg).unwrap_err().to_string(),
+            parse_message(&msg, 1024).unwrap_err().to_string(),
             "bound prefix too long"
         );
         // An id list longer than the cap is refused.
@@ -169,7 +179,7 @@ mod tests {
         msg.extend(varint(2)); // mode = id list
         msg.extend(varint(10_000_001));
         assert_eq!(
-            parse_message(&msg).unwrap_err().to_string(),
+            parse_message(&msg, 1024).unwrap_err().to_string(),
             "id list too long"
         );
         // A truncated id list is refused.
@@ -180,7 +190,7 @@ mod tests {
         msg.extend(varint(2)); // two ids claimed...
         msg.extend(vec![0u8; 10]); // ...but only 10 bytes present
         assert_eq!(
-            parse_message(&msg).unwrap_err().to_string(),
+            parse_message(&msg, 1024).unwrap_err().to_string(),
             "truncated id list"
         );
         // A truncated fingerprint is refused.
@@ -190,7 +200,7 @@ mod tests {
         msg.extend(varint(1)); // mode = fingerprint
         msg.extend(vec![0u8; 4]); // only 4 of 16 bytes
         assert_eq!(
-            parse_message(&msg).unwrap_err().to_string(),
+            parse_message(&msg, 1024).unwrap_err().to_string(),
             "truncated fingerprint"
         );
         // An unknown mode is refused.
@@ -199,8 +209,35 @@ mod tests {
         msg.extend(varint(0));
         msg.extend(varint(5));
         assert_eq!(
-            parse_message(&msg).unwrap_err().to_string(),
+            parse_message(&msg, 1024).unwrap_err().to_string(),
             "unknown mode 5"
+        );
+    }
+
+    #[test]
+    fn parse_message_bails_out_at_the_range_cap() {
+        // A tiny frame can claim an unbounded number of ranges (three bytes
+        // each): the cap must stop the parse before the whole vector is
+        // materialized, not after.
+        let mut msg = vec![PROTOCOL_VERSION];
+        for _ in 0..2000 {
+            msg.extend(varint(1)); // ts delta
+            msg.extend(varint(0)); // empty prefix
+            msg.extend(varint(0)); // mode = skip
+        }
+        assert_eq!(
+            parse_message(&msg, 10).unwrap_err().to_string(),
+            "too many ranges in one negentropy message"
+        );
+        assert_eq!(
+            parse_message(&msg, 3000).unwrap().len(),
+            2000,
+            "a message within the cap still parses"
+        );
+        assert_eq!(
+            parse_message(&msg, 2000).unwrap().len(),
+            2000,
+            "exactly at the cap is allowed"
         );
     }
 }
