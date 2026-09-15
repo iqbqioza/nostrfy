@@ -223,48 +223,10 @@ impl RoleStore {
     ///
     /// Returns `false` when the rebuild could not be completed (the database
     /// did not answer, or the scan budget was exhausted mid-page): the
-    /// caller must not persist or serve a role store rebuilt from an
-    /// incomplete history. The store is left empty on failure.
+    /// caller must not persist or serve a partially-rebuilt role store and
+    /// aborts startup. The history is streamed in ascending pages and
+    /// applied as it arrives, so memory stays bounded by one page.
     pub async fn rebuild(&mut self, db: &DbClient, relay_pubkey: &str) -> bool {
-        // Page the full-history walk like the NIP-29 rebuild: a single
-        // million-event query materialized the whole history at once and
-        // silently discarded anything past the scan budget, so a truncated
-        // rebuild could be persisted as if it were complete.
-        const PAGE: usize = 50_000;
-        let mut events: Vec<Event> = Vec::new();
-        let mut until: Option<u64> = None;
-        loop {
-            let mut filter: Filter =
-                serde_json::from_value(json!({ "kinds": [ROLE_DEFINITION, MEMBERSHIP_LIST] }))
-                    .expect("static filter");
-            filter.until = until;
-            let Some((page, more)) = db.query_full_startup(vec![filter], PAGE, unix_now()).await
-            else {
-                log::error!(
-                    "role state rebuild aborted: the database did not answer; refusing to \
-                     persist an incomplete role store"
-                );
-                return false;
-            };
-            if page.is_empty() {
-                break;
-            }
-            let min_created = page.iter().map(|e| e.created_at).min().unwrap_or(0);
-            let full = page.len() >= PAGE;
-            if !full && more {
-                log::error!(
-                    "role state rebuild aborted: the scan budget was exhausted with {} events \
-                     in the page, so the history is incomplete",
-                    page.len()
-                );
-                return false;
-            }
-            events.extend(page);
-            if !full || min_created == 0 {
-                break;
-            }
-            until = Some(min_created - 1);
-        }
         // A vanished pubkey must not be resurrected as a role holder by a
         // pre-vanish membership list.
         let Some(vanished) = db.vanish_pubkeys().await else {
@@ -276,48 +238,93 @@ impl RoleStore {
         };
         let vanished: std::collections::HashSet<String> =
             vanished.into_iter().map(hex::encode).collect();
-        for event in events {
-            if event.pubkey != relay_pubkey {
-                continue;
+        // Role definitions and membership lists are replaceable, so at most
+        // one version per address is stored and the ascending scan order is
+        // the only order needed. Pages never split a timestamp (the scan
+        // collects every tie), so advancing `since` past the page cannot
+        // skip an event.
+        const PAGE: usize = 50_000;
+        let mut since: Option<u64> = None;
+        loop {
+            let mut filter: Filter =
+                serde_json::from_value(json!({ "kinds": [ROLE_DEFINITION, MEMBERSHIP_LIST] }))
+                    .expect("static filter");
+            filter.since = since;
+            let Some((page, more)) = db
+                .query_full_startup(vec![filter], PAGE, unix_now(), true)
+                .await
+            else {
+                log::error!(
+                    "role state rebuild aborted: the database did not answer; refusing to \
+                     persist an incomplete role store"
+                );
+                return false;
+            };
+            if page.is_empty() {
+                break;
             }
-            match event.kind {
-                ROLE_DEFINITION => {
-                    let Some(id) = tag_value(&event, "d") else {
-                        continue;
-                    };
-                    // A `["deleted"]` tombstone (published by `delete_role`)
-                    // must not resurrect the role on restart; lingering
-                    // assignments to the deleted role are dropped too.
-                    if event
-                        .tags
-                        .iter()
-                        .any(|t| t.first().map(String::as_str) == Some(DELETED_TAG))
-                    {
-                        self.roles.remove(id);
-                        for roles in self.assignments.values_mut() {
-                            roles.retain(|r| r != id);
-                        }
-                        self.assignments.retain(|_, roles| !roles.is_empty());
-                        continue;
-                    }
-                    self.roles.insert(
-                        id.to_string(),
-                        Role {
-                            label: tag_value(&event, "label").unwrap_or("").to_string(),
-                            description: tag_value(&event, "description").unwrap_or("").to_string(),
-                            color: tag_value(&event, "color").unwrap_or("").to_string(),
-                            order: tag_value(&event, "order").and_then(|o| o.parse().ok()),
-                        },
-                    );
+            let full = page.len() >= PAGE;
+            if !full && more {
+                log::error!(
+                    "role state rebuild aborted: the scan budget was exhausted with {} events \
+                     in the page, so the history is incomplete",
+                    page.len()
+                );
+                return false;
+            }
+            let max_created = page.last().map(|event| event.created_at);
+            for event in page {
+                if event.pubkey != relay_pubkey {
+                    continue;
                 }
-                MEMBERSHIP_LIST => {
-                    for tag in &event.tags {
-                        if tag.len() >= 2 && tag[0] == "member" && !vanished.contains(&tag[1]) {
-                            self.assignments.insert(tag[1].clone(), tag[2..].to_vec());
+                match event.kind {
+                    ROLE_DEFINITION => {
+                        let Some(id) = tag_value(&event, "d") else {
+                            continue;
+                        };
+                        // A `["deleted"]` tombstone (published by `delete_role`)
+                        // must not resurrect the role on restart; lingering
+                        // assignments to the deleted role are dropped too.
+                        if event
+                            .tags
+                            .iter()
+                            .any(|t| t.first().map(String::as_str) == Some(DELETED_TAG))
+                        {
+                            self.roles.remove(id);
+                            for roles in self.assignments.values_mut() {
+                                roles.retain(|r| r != id);
+                            }
+                            self.assignments.retain(|_, roles| !roles.is_empty());
+                            continue;
+                        }
+                        self.roles.insert(
+                            id.to_string(),
+                            Role {
+                                label: tag_value(&event, "label").unwrap_or("").to_string(),
+                                description: tag_value(&event, "description")
+                                    .unwrap_or("")
+                                    .to_string(),
+                                color: tag_value(&event, "color").unwrap_or("").to_string(),
+                                order: tag_value(&event, "order").and_then(|o| o.parse().ok()),
+                            },
+                        );
+                    }
+                    MEMBERSHIP_LIST => {
+                        for tag in &event.tags {
+                            if tag.len() >= 2 && tag[0] == "member" && !vanished.contains(&tag[1]) {
+                                self.assignments.insert(tag[1].clone(), tag[2..].to_vec());
+                            }
                         }
                     }
+                    _ => {}
                 }
-                _ => {}
+            }
+            if !full {
+                break;
+            }
+            match max_created {
+                Some(ts) if ts < u64::MAX => since = Some(ts.saturating_add(1)),
+                _ => break,
             }
         }
         true

@@ -915,92 +915,18 @@ impl GroupStore {
     ///
     /// Returns `false` when the rebuild could not be completed (the database
     /// did not answer, or the scan budget was exhausted mid-page): the
-    /// caller must not persist or serve a group store rebuilt from an
-    /// incomplete history (missing groups turn private content
-    /// world-readable). The store is left empty on failure.
+    /// caller must not persist or serve the partially-rebuilt store (missing
+    /// groups turn private content world-readable) and aborts startup.
+    ///
+    /// The walk streams the history oldest-first in pages and applies each
+    /// page as it arrives, so memory stays bounded by one page instead of
+    /// the whole history (the old implementation materialized and sorted
+    /// every stored group event before applying anything).
     pub async fn rebuild(&mut self, db: &DbClient) -> bool {
         // 9021 JOIN is included so that honored joins survive a restart even
         // on relays without a private key (which never emit the relay-signed
         // 9000 put-user that would otherwise carry the membership).
         let kinds: Vec<u64> = (MOD_MIN..=MOD_MAX).chain([JOIN, LEAVE]).collect();
-        // Walk every stored group event in pages (newest first) instead of
-        // one giant query: a single query with a huge limit would be truncated
-        // by the scan's collection cap / work budget and could exceed the
-        // database request timeout, silently rebuilding an incomplete group
-        // store (missing groups → private content world-readable, admin
-        // writes rejected, deleted groups resurrected).
-        const PAGE: usize = 50_000;
-        let mut events: Vec<Event> = Vec::new();
-        let mut until: Option<u64> = None;
-        loop {
-            let mut filter: Filter =
-                serde_json::from_value(json!({ "kinds": kinds })).expect("static filter");
-            filter.until = until;
-            // `query_full_startup` gives each page the full-scan work budget
-            // (not the smaller per-query one) and reports a missing reply
-            // instead of degrading to an empty page; an empty page must only
-            // ever mean "no more events".
-            let Some((page, more)) = db.query_full_startup(vec![filter], PAGE, unix_now()).await
-            else {
-                log::error!(
-                    "group state rebuild aborted: the database did not answer; refusing to \
-                     persist an incomplete group store"
-                );
-                return false;
-            };
-            if page.is_empty() {
-                break;
-            }
-            let min_created = page.iter().map(|e| e.created_at).min().unwrap_or(0);
-            let full = page.len() >= PAGE;
-            if !full && more {
-                log::error!(
-                    "group state rebuild aborted: the scan budget was exhausted with {} events \
-                     in the page, so the history is incomplete",
-                    page.len()
-                );
-                return false;
-            }
-            events.extend(page);
-            if !full {
-                // Fewer than a page: every remaining event was collected.
-                break;
-            }
-            if min_created == 0 {
-                break;
-            }
-            // The scan collects every event at the boundary timestamp, so
-            // stepping the cursor just below it cannot skip any event.
-            until = Some(min_created - 1);
-        }
-        // Chronological order (the scan is per-kind, not globally ordered) so
-        // that later events win. Within the same second the kind is used as a
-        // tie-breaker: the group-establishing events apply first (9007 create,
-        // 9008 delete), then the member/settings operations (9000-9006,
-        // 9009-9010) which need the group to exist, and joins/leaves last.
-        // Known limitation: events of the same kind within the same second
-        // are ordered by id, not by arrival — two conflicting 9000 edits in
-        // the same second (e.g. grant-then-revoke of a role) may replay in
-        // the wrong order after a restart. The relay stamps its generated
-        // metadata strictly monotonic, so the *stored* 39000-39005 always
-        // reflect the latest state; only the in-memory member map could
-        // diverge until the next edit.
-        // The rank ordering also inverts cross-kind arrival order within a
-        // second: a 9001 remove followed in the same second by a 9021 JOIN
-        // replays as [9001, JOIN] (correct) but a JOIN followed by a 9001
-        // replays as [9001, JOIN] too — the removed member resurrects until
-        // the next edit. Arrival order is not stored, so this cannot be
-        // fixed exactly; the relay-stamped put-user (9000) events, which
-        // arrive after the member operation, keep the stored 39002 list
-        // correct.
-        events.sort_by(|a, b| {
-            (a.created_at, group_rank(a.kind), a.kind, &a.id).cmp(&(
-                b.created_at,
-                group_rank(b.kind),
-                b.kind,
-                &b.id,
-            ))
-        });
         // A vanished author must not be resurrected as a member by
         // replaying pre-vanish events signed by others (the vanish
         // deleted the author's own JOIN, but an admin's put-user or the
@@ -1020,9 +946,95 @@ impl GroupStore {
         // deleted by a vanish / NIP-09 / expiry) becomes a ghost — its
         // content is withheld instead of turning world-readable.
         let mut seen_gids: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for event in &events {
-            if let Some(gid) = crate::nips::nip29::group_id(event) {
-                seen_gids.insert(gid.to_string());
+        // Chronological replay: the ascending scan never splits a timestamp
+        // across pages (it collects every event at the boundary timestamp),
+        // so sorting each page by the state-machine rank and applying it
+        // immediately is globally ordered exactly like the old whole-history
+        // sort. Within the same second the kind is the tie-breaker: the
+        // group-establishing events apply first (9007 create, 9008 delete),
+        // then the member/settings operations (9000-9006, 9009-9010) which
+        // need the group to exist, and joins/leaves last. Known limitation:
+        // events of the same kind within the same second are ordered by id,
+        // not by arrival — two conflicting 9000 edits in the same second
+        // (e.g. grant-then-revoke of a role) may replay in the wrong order
+        // after a restart. The relay stamps its generated metadata strictly
+        // monotonic, so the *stored* 39000-39005 always reflect the latest
+        // state; only the in-memory member map could diverge until the next
+        // edit. The rank ordering also inverts cross-kind arrival order
+        // within a second: a 9001 remove followed in the same second by a
+        // 9021 JOIN replays as [9001, JOIN] (correct) but a JOIN followed by
+        // a 9001 replays as [9001, JOIN] too — the removed member resurrects
+        // until the next edit. Arrival order is not stored, so this cannot be
+        // fixed exactly; the relay-stamped put-user (9000) events, which
+        // arrive after the member operation, keep the stored 39002 list
+        // correct.
+        const PAGE: usize = 50_000;
+        let mut since: Option<u64> = None;
+        loop {
+            let mut filter: Filter =
+                serde_json::from_value(json!({ "kinds": kinds })).expect("static filter");
+            filter.since = since;
+            // `query_full_startup` gives each page the full-scan work budget
+            // (not the smaller per-query one) and reports a missing reply
+            // instead of degrading to an empty page; an empty page must only
+            // ever mean "no more events".
+            let Some((mut page, more)) = db
+                .query_full_startup(vec![filter], PAGE, unix_now(), true)
+                .await
+            else {
+                log::error!(
+                    "group state rebuild aborted: the database did not answer; refusing to \
+                     persist an incomplete group store"
+                );
+                return false;
+            };
+            if page.is_empty() {
+                break;
+            }
+            let full = page.len() >= PAGE;
+            if !full && more {
+                log::error!(
+                    "group state rebuild aborted: the scan budget was exhausted with {} events \
+                     in the page, so the history is incomplete",
+                    page.len()
+                );
+                return false;
+            }
+            page.sort_by(|a, b| {
+                (a.created_at, group_rank(a.kind), a.kind, &a.id).cmp(&(
+                    b.created_at,
+                    group_rank(b.kind),
+                    b.kind,
+                    &b.id,
+                ))
+            });
+            let max_created = page.last().map(|event| event.created_at);
+            for mut event in page {
+                if let Some(gid) = crate::nips::nip29::group_id(&event) {
+                    seen_gids.insert(gid.to_string());
+                }
+                if event.kind == JOIN && vanished.contains(&event.pubkey) {
+                    continue;
+                }
+                if event.kind == 9000 {
+                    event
+                        .tags
+                        .retain(|t| t.len() < 2 || t[0] != P || !vanished.contains(&t[1]));
+                    if event.tags.is_empty() {
+                        continue;
+                    }
+                }
+                self.apply(&event, "", unix_now(), false, true);
+            }
+            if !full {
+                // Fewer than a page: every remaining event was collected.
+                break;
+            }
+            // The scan collects every event at the boundary timestamp, so
+            // stepping past it cannot skip an event.
+            match max_created {
+                Some(ts) if ts < u64::MAX => since = Some(ts.saturating_add(1)),
+                _ => break,
             }
         }
         // The relay-signed metadata (39000-39005: name/picture, the admins
@@ -1030,18 +1042,20 @@ impl GroupStore {
         // not part of the moderation walk above. Include its group ids in
         // the ghost detection, so a private group whose only surviving
         // events are its metadata cannot become world-readable after a
-        // restart. Walk it in pages like the moderation walk: a relay
-        // hosting many groups can hold far more than one page of metadata,
-        // and a truncated walk would silently fail the ghost detection
-        // open (private metadata world-readable).
+        // restart. Walk it in pages like the moderation walk (newest-first
+        // is fine: only the ids are collected, no events are retained): a
+        // relay hosting many groups can hold far more than one page of
+        // metadata, and a truncated walk would silently fail the ghost
+        // detection open (private metadata world-readable).
         let meta_kinds: Vec<u64> = (GROUP_META..=GROUP_PINS).collect();
-        let mut meta_events: Vec<Event> = Vec::new();
         let mut until: Option<u64> = None;
         loop {
             let mut filter: Filter =
                 serde_json::from_value(json!({ "kinds": meta_kinds })).expect("static filter");
             filter.until = until;
-            let Some((page, more)) = db.query_full_startup(vec![filter], PAGE, unix_now()).await
+            let Some((page, more)) = db
+                .query_full_startup(vec![filter], PAGE, unix_now(), false)
+                .await
             else {
                 log::error!(
                     "group state rebuild aborted: the database did not answer; refusing to \
@@ -1066,38 +1080,15 @@ impl GroupStore {
                 );
                 return false;
             }
-            meta_events.extend(page);
+            for event in &page {
+                if let Some(gid) = crate::nips::nip29::group_id_d(event) {
+                    seen_gids.insert(gid.to_string());
+                }
+            }
             if !full || min_created == 0 {
                 break;
             }
             until = Some(min_created - 1);
-        }
-        for event in &meta_events {
-            if let Some(gid) = crate::nips::nip29::group_id_d(event) {
-                seen_gids.insert(gid.to_string());
-            }
-        }
-        for mut event in events {
-            // A vanished author must not be resurrected as a member by
-            // replaying pre-vanish events signed by others (the vanish
-            // deleted the author's own JOIN, but an admin's put-user or
-            // the relay's own JOIN-time put-user survive): skip the
-            // events that would add a vanished pubkey to a group. For a
-            // 9000 put-user only the vanished pubkeys' `p` tags are
-            // dropped — the other assignments of the same event must
-            // still be applied.
-            if event.kind == JOIN && vanished.contains(&event.pubkey) {
-                continue;
-            }
-            if event.kind == 9000 {
-                event
-                    .tags
-                    .retain(|t| t.len() < 2 || t[0] != P || !vanished.contains(&t[1]));
-                if event.tags.is_empty() {
-                    continue;
-                }
-            }
-            self.apply(&event, "", unix_now(), false, true);
         }
         for gid in seen_gids {
             if !self.groups.contains_key(&gid) && !self.deleted.contains(&gid) {

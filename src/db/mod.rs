@@ -862,17 +862,24 @@ impl DbClient {
     /// instead of degrading to an empty page. An empty page would be
     /// mistaken for the end of the history, and the resulting incomplete
     /// state would be persisted (missing groups become world-readable).
+    ///
+    /// The rebuilds page with `ascending = true` and apply each page as it
+    /// arrives: the scan always collects every event of the page's boundary
+    /// timestamp, so a page never splits a second and advancing `since` past
+    /// it cannot skip an event — the rebuild stays bounded to one page in
+    /// memory instead of materializing the whole history.
     pub async fn query_full_startup(
         &self,
         filters: Vec<Filter>,
         limit: usize,
         now: u64,
+        ascending: bool,
     ) -> Option<(Vec<Event>, bool)> {
         self.request_read_startup(|reply| Msg::Query {
             filters,
             limit,
             now,
-            ascending: false,
+            ascending,
             budget: FULL_SCAN_BUDGET,
             hidden_slack: 0,
             reply,
