@@ -676,6 +676,94 @@ mod tests {
     }
 
     #[test]
+    fn vanish_rebuilds_group_state_from_surviving_events() {
+        // NIP-62: a vanish deletes the author's moderation events, so the
+        // group state derived from them (settings, pins, ...) must not
+        // survive in the snapshot. The live state is rebuilt from what
+        // remains and the snapshot is rewritten, so a restart cannot
+        // resurrect it.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut cfg = Config::default();
+            cfg.database.map_size = 16 * 1024 * 1024;
+            cfg.database.max_map_size = 64 * 1024 * 1024;
+            cfg.database.path = std::env::temp_dir().join("nostrfy-vanish-groups-test");
+            let _ = std::fs::remove_dir_all(&cfg.database.path);
+            let db = crate::db::DbClient::open(
+                &cfg.database,
+                true,
+                Arc::new(Default::default()),
+                0,
+                128,
+                4096,
+                262144,
+            )
+            .unwrap();
+            let config = Arc::new(RwLock::new(cfg));
+            let mut relay = Relay::new(
+                config.clone(),
+                db,
+                crate::stats::Stats::new(),
+                "",
+                crate::relay::LiveBusConfig {
+                    buffer: 1024,
+                    batch_interval_ms: 10,
+                    batch_size: 64,
+                },
+            )
+            .await;
+            relay.start_live_bus();
+            let relay = Arc::new(relay);
+            let creator = signed_with_seed(42u8, 1, vec![]);
+            let creator_pk = creator.pubkey.clone();
+            let now = unix_now();
+            {
+                let mut create = crate::nips::nip29::tests::event(
+                    crate::nips::nip29::CREATE_GROUP,
+                    &creator_pk,
+                    Some("g1"),
+                    vec![],
+                );
+                create.id = crate::nips::nip01::compute_id(&create);
+                let mut edit = crate::nips::nip29::tests::event(
+                    9002,
+                    &creator_pk,
+                    Some("g1"),
+                    vec![vec!["name".into(), "secret-name".into()]],
+                );
+                edit.id = crate::nips::nip01::compute_id(&edit);
+                for event in [&create, &edit] {
+                    assert_eq!(
+                        relay.db.put(event.clone(), now).await,
+                        crate::db::PutOutcome::Stored
+                    );
+                    let _ = relay
+                        .groups
+                        .write()
+                        .await
+                        .apply(event, "", now, false, false);
+                }
+                let groups = relay.groups.read().await;
+                let group = groups.group("g1").expect("group created");
+                assert_eq!(group.settings.name, "secret-name");
+            }
+            relay
+                .vanish_pubkey(hex::decode(&creator_pk).unwrap().try_into().unwrap(), now)
+                .await;
+            assert!(
+                relay.groups.read().await.group("g1").is_none(),
+                "state derived from the vanished creator must be gone"
+            );
+            let snapshot = relay.db.load_groups().await.expect("snapshot persisted");
+            assert!(
+                snapshot.groups.is_empty(),
+                "the persisted snapshot must not resurrect the group"
+            );
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
     fn publish_rate_limits_events_per_pubkey_per_minute() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {

@@ -56,6 +56,12 @@ pub struct Relay {
     live_batch_interval_ms: u64,
     live_batch_size: usize,
     pub groups: Arc<RwLock<GroupStore>>,
+    /// Set when a post-vanish group rebuild failed: the in-memory state is
+    /// stale (state derived from the vanished author's events may survive),
+    /// so `persist_groups` must not save it — the persisted snapshot is
+    /// dropped instead and the next startup rebuilds from the surviving
+    /// events.
+    groups_rebuild_pending: std::sync::atomic::AtomicBool,
     /// NIP-43 role definitions and member assignments.
     pub roles: Arc<RwLock<RoleStore>>,
     /// Limits concurrent `/api/v1` queries so a flood of REST traffic
@@ -389,6 +395,7 @@ impl Relay {
             groups: Arc::new(RwLock::new(GroupStore::with_cap(
                 config.read().await.relay.max_groups,
             ))),
+            groups_rebuild_pending: std::sync::atomic::AtomicBool::new(false),
             roles: Arc::new(RwLock::new(RoleStore::default())),
             api_limit: ApiLimiter::new(api_max_concurrent),
             per_ip_connections: std::sync::Mutex::new(HashMap::new()),
@@ -1195,7 +1202,19 @@ impl Relay {
     /// every mutation so restarts restore without replaying history).
     /// Fire-and-forget: a failed commit only logs (the next mutation
     /// retries the full snapshot).
+    ///
+    /// A failed post-vanish rebuild marks the live state as stale
+    /// (`groups_rebuild_pending`): the snapshot is dropped instead of
+    /// saved, so the next startup rebuilds from the surviving events
+    /// rather than restoring state that predates the vanish.
     pub(crate) async fn persist_groups(&self) {
+        if self
+            .groups_rebuild_pending
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            self.db.clear_groups_snapshot().await;
+            return;
+        }
         let snapshot = self.groups.read().await.snapshot();
         self.db.save_groups(snapshot).await;
     }
@@ -1207,35 +1226,69 @@ impl Relay {
         self.db.save_roles(snapshot).await;
     }
 
-    /// NIP-62: deletes every event by `pubkey` and removes the pubkey from
-    /// every NIP-29 group (its moderation events were deleted along with
-    /// everything else).
+    /// NIP-62: deletes every event by `pubkey` and relinks the NIP-29 group
+    /// state to the surviving events.
     ///
-    /// Membership/admin removal is immediate (`members` holds roles, so one
-    /// `remove` strips both). Settings/invites/pins/parent-links authored
-    /// solely by the vanished key converge on the next restart (the rebuild
-    /// replays only surviving events); until then the live view is a
-    /// transient superset, never a resurrection of the vanished content.
+    /// When the vanish actually removed events, the group state is rebuilt
+    /// from what survives: moderation events authored by the vanished key
+    /// (settings edits, invites, pins, parent links, create/delete) are gone
+    /// from the database, so their derived state must go too, and a group
+    /// whose create event was deleted becomes a ghost (content withheld)
+    /// instead of turning world-readable. The rebuild holds the group lock
+    /// so group events arriving meanwhile (already stored) apply to the
+    /// rebuilt store after the swap. If the rebuild fails, the persisted
+    /// snapshot is dropped and the next startup rebuilds (fail-closed)
+    /// instead of restoring the stale state.
     async fn vanish_pubkey(&self, pubkey: [u8; 32], until_created: u64) {
         let pubkey_hex = hex::encode(pubkey);
         let removed = self.db.apply_vanish(pubkey, until_created).await;
         self.stats.bump(&self.stats.events_deleted, removed as u64);
         if self.config.read().await.nip_enabled(29) {
-            let changed = {
-                let mut groups = self.groups.write().await;
-                let mut changed = false;
-                for group in groups.groups.values_mut() {
-                    if group.members.remove(&pubkey_hex).is_some() {
-                        changed = true;
+            if removed > 0 {
+                let cap = self.config.read().await.relay.max_groups;
+                let mut fresh = GroupStore::with_cap(cap);
+                let rebuilt = {
+                    // Hold the group lock across the rebuild: group events
+                    // that arrive meanwhile have already been stored, so
+                    // they wait here and apply to the rebuilt store after
+                    // the swap instead of being lost with the discarded one.
+                    let mut groups = self.groups.write().await;
+                    let ok = fresh.rebuild(&self.db).await;
+                    if ok {
+                        *groups = fresh;
                     }
+                    ok
+                };
+                if rebuilt {
+                    self.groups_rebuild_pending
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                } else {
+                    log::error!(
+                        "group state rebuild after vanish failed; dropping the persisted \
+                         snapshot so the next restart rebuilds from the surviving events"
+                    );
+                    self.groups_rebuild_pending
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
                 }
-                changed
-            };
-            // Only a real membership change is worth a full snapshot write:
-            // a replayed vanish (already honored by the database) must not
-            // reserialize the whole group store on every delivery.
-            if changed {
                 self.persist_groups().await;
+            } else {
+                // A replayed vanish (already honored) or one that removed
+                // nothing: the live state only needs the vanished pubkey
+                // dropped from its memberships, and only a real change is
+                // worth a snapshot write.
+                let changed = {
+                    let mut groups = self.groups.write().await;
+                    let mut changed = false;
+                    for group in groups.groups.values_mut() {
+                        if group.members.remove(&pubkey_hex).is_some() {
+                            changed = true;
+                        }
+                    }
+                    changed
+                };
+                if changed {
+                    self.persist_groups().await;
+                }
             }
         }
         // NIP-43 role assignments hold pubkeys too: a vanished author

@@ -866,6 +866,12 @@ pub(crate) fn spawn(
                                     }
                                     let _ = reply.send(());
                                 }
+                                Msg::ClearGroupsSnapshot { reply } => {
+                                    if let Err(e) = store.clear_groups_snapshot() {
+                                        db_error(&thread_errors, &e);
+                                    }
+                                    let _ = reply.send(());
+                                }
                                 Msg::BlossomAddOwner {
                                     sha256,
                                     mime,
