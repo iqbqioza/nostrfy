@@ -57,7 +57,10 @@ impl AuditLog {
         // guard is recovered with `into_inner`.
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let now = unix_now();
-        if now.saturating_sub(state.window_start) >= WINDOW_SECS {
+        // A clock that moved backwards must not freeze the window (the
+        // saturating subtraction would stay below WINDOW_SECS until the
+        // wall clock catches up, suppressing entries indefinitely).
+        if now < state.window_start || now.saturating_sub(state.window_start) >= WINDOW_SECS {
             if state.suppressed > 0 {
                 log::warn!(
                     "audit log throttled: {} management entries suppressed in the last {}s",

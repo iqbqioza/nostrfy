@@ -128,15 +128,27 @@ fn bech32_decode(input: &str) -> Result<(String, Vec<u8>, bool)> {
     if input.chars().count() > 5000 {
         return Err(anyhow!("bech32 string exceeds the 5000-character limit"));
     }
-    // Must be lowercase or uppercase, not mixed.
-    let input_lower = input.to_lowercase();
-    let input_upper = input.to_uppercase();
-    // BIP-173: all-uppercase input is valid — decode it as its lowercase
-    // form (the charset, separator and checksum are case-insensitive).
-    if input != input_lower && input != input_upper {
+    // BIP-173: input must be ASCII and either all-lowercase or
+    // all-uppercase, never mixed. Uppercase input is decoded as its
+    // lowercase form (the charset, separator and checksum are
+    // case-insensitive). The checks are byte-wise: bech32 is ASCII-only, so
+    // Unicode case conversion (which allocates and can expand characters)
+    // must not be used here.
+    if !input.is_ascii() {
         return Err(anyhow!("invalid bech32 character '?'"));
     }
-    let normalized: &str = &input_lower;
+    let has_lower = input.bytes().any(|b| b.is_ascii_lowercase());
+    let has_upper = input.bytes().any(|b| b.is_ascii_uppercase());
+    if has_lower && has_upper {
+        return Err(anyhow!("invalid bech32 character '?'"));
+    }
+    let lower;
+    let normalized: &str = if has_upper {
+        lower = input.to_ascii_lowercase();
+        &lower
+    } else {
+        input
+    };
 
     // Find the last '1' separator.
     let sep_pos = normalized

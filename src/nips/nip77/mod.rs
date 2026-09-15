@@ -122,7 +122,7 @@ pub fn respond(items: &[Item], client_message: &[u8]) -> anyhow::Result<Vec<u8>>
         // support (a single byte).
         return Ok(vec![PROTOCOL_VERSION]);
     }
-    let mut ranges = parse_message(client_message)?;
+    let mut ranges = parse_message(client_message, MAX_NEG_RANGES_PER_MSG)?;
     // NIP-77: every message covers the complete timestamp/ID space. A
     // message whose final explicit range does not reach infinity implicitly
     // appends a Skip range to infinity.
@@ -138,7 +138,10 @@ pub fn respond(items: &[Item], client_message: &[u8]) -> anyhow::Result<Vec<u8>>
     // A single message must not scan unbounded fingerprint/bisection
     // work: thousands of ranges over a 100k-item set would burn seconds
     // of CPU per frame (the client controls the number of ranges it
-    // sends, so this is the input-side budget of the protocol).
+    // sends, so this is the input-side budget of the protocol). The parse
+    // already rejected over-long messages while reading them; this keeps
+    // the implicit trailing range from pushing a maximal message over the
+    // budget.
     if ranges.len() > MAX_NEG_RANGES_PER_MSG {
         return Err(anyhow!("too many ranges in one negentropy message"));
     }
@@ -418,7 +421,7 @@ mod tests {
 
         // Structurally verify the response: two bisected fingerprint ranges
         // followed by an id list with the remaining 75 items.
-        let ranges = parse_message(&resp).unwrap();
+        let ranges = parse_message(&resp, MAX_NEG_RANGES_PER_MSG).unwrap();
         assert_eq!(ranges.len(), 3);
         assert!(matches!(ranges[0].mode, Mode::Fingerprint(_)));
         assert!(matches!(ranges[1].mode, Mode::Fingerprint(_)));

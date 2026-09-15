@@ -65,8 +65,10 @@ fn normalize_url(url: &str) -> String {
     };
     // IPv6 literals keep their brackets: only a trailing `:<digits>` is a
     // port ("[::1]:8080" -> host "[::1]", port "8080"; "[::1]" -> host).
+    // An empty port ("host:") is not a port: `all` on an empty string is
+    // vacuously true, which would emit a malformed "wss://host:/".
     let (host, port) = match authority.rsplit_once(':') {
-        Some((h, p)) if p.chars().all(|c| c.is_ascii_digit()) => (h, Some(p)),
+        Some((h, p)) if !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => (h, Some(p)),
         _ => (authority, None),
     };
     let host = host.to_ascii_lowercase();

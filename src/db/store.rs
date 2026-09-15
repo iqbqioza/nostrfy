@@ -28,6 +28,13 @@ pub(crate) struct BlossomMeta {
     /// Uploaders' hex pubkeys, in upload order.
     pub owners: Vec<String>,
 }
+
+/// The maximum number of owners one blob may accumulate. Every owner adds
+/// an entry to the JSON metadata and an `own:` index row, so an attacker
+/// re-uploading a popular blob under many keys could otherwise grow the
+/// mapping without bound. New owners past the cap are refused (the blob
+/// itself stays reachable through the existing owners).
+pub(crate) const MAX_BLOB_OWNERS: usize = 64;
 use crate::config::DatabaseConfig;
 use crate::error::Result;
 use crate::event::Event;
@@ -371,7 +378,16 @@ impl Store {
             EnvOpenOptions::new()
                 // 17 named tables, plus the word index when search is on.
                 .max_dbs(cfg.max_dbs.max(18))
-                .max_readers(cfg.max_readers.max(8))
+                // Every reader thread can hold a concurrent read transaction,
+                // and the writer/API/startup paths take slots too: a
+                // `max_readers` below the thread count makes LMDB fail
+                // queries with MDB_READERS_FULL (surfacing as silent empty
+                // scans). Raise the effective floor instead of trusting the
+                // configured value alone.
+                .max_readers(
+                    cfg.max_readers
+                        .max(cfg.reader_threads.clamp(1, 64) as u32 + 2),
+                )
                 .map_size(map_size)
                 .open(&cfg.path)?
         };
@@ -627,6 +643,11 @@ impl Store {
             owners: Vec::new(),
         });
         if !meta.owners.iter().any(|o| o == pubkey) {
+            if meta.owners.len() >= MAX_BLOB_OWNERS {
+                return Err(anyhow::anyhow!(
+                    "the blob already has the maximum of {MAX_BLOB_OWNERS} owners"
+                ));
+            }
             meta.owners.push(pubkey.to_string());
         }
         self.blossom
@@ -650,9 +671,10 @@ impl Store {
             if let Some(raw) = self.blossom.get(&wtxn, key.as_bytes())? {
                 // Legacy multi-owner blobs appear once per npub directory:
                 // merge the owner into the existing mapping instead of
-                // dropping it.
+                // dropping it (up to the per-blob owner cap).
                 if let Ok(meta) = serde_json::from_slice::<BlossomMeta>(raw)
                     && !meta.owners.iter().any(|o| o == pubkey)
+                    && meta.owners.len() < MAX_BLOB_OWNERS
                 {
                     let mut meta = meta;
                     meta.owners.push(pubkey.clone());
@@ -1443,6 +1465,11 @@ impl Store {
             }
         };
         let Some(pubkey) = event.pubkey_bytes() else {
+            // A legacy/corrupt event with an invalid pubkey cannot have its
+            // per-author index entries computed: fall back to the
+            // full-index cleanup instead of leaving the event and its
+            // indexes behind while reporting success.
+            self.remove_corrupt_event(wtxn, id)?;
             return Ok(());
         };
 
@@ -1600,7 +1627,17 @@ impl Store {
                 let ts = u64::from_be_bytes(raw[..8].try_into().unwrap());
                 Ok((false, ts))
             }
-            _ => Ok((true, 0)),
+            Some(_) => {
+                // A corrupt entry must fail closed like a read error: the
+                // fail-open `(true, 0)` would treat the pubkey as brand new
+                // and let it through the new-pubkey age gate.
+                log::warn!(
+                    "corrupt first-seen entry for {}; treating the pubkey as too new",
+                    hex::encode(pubkey)
+                );
+                Ok((false, u64::MAX))
+            }
+            None => Ok((true, 0)),
         }
     }
 

@@ -109,10 +109,23 @@ impl super::Relay {
         if !self.config.read().await.nip_enabled(43) || self.key.is_none() {
             return false;
         }
-        if !self.roles.read().await.roles.contains_key(id) {
-            return false;
-        }
-        self.create_role(id, label, description, color, order).await
+        let relay_pubkey = self.relay_pubkey().unwrap_or_default();
+        // The existence check and the update share one write guard: with a
+        // separate read check a concurrent `delete_role` could land between
+        // them and the edit would recreate the deleted role.
+        let event = {
+            let mut roles = self.roles.write().await;
+            if !roles.roles.contains_key(id) {
+                return false;
+            }
+            roles.create(id, label, description, color, order);
+            roles.role_event(id, &relay_pubkey, self.stamp_floor(unix_now()))
+        };
+        // Write-through persistence and publish (same contract as
+        // `create_role`): the in-memory change is snapshotted even when the
+        // publish fails, so a restart cannot lose it.
+        self.persist_roles().await;
+        self.publish_relay_event(event).await
     }
 
     pub async fn delete_role(&self, id: &str) -> bool {

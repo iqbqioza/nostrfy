@@ -131,8 +131,10 @@ impl Relay {
             return;
         }
         // Only the admin (`relay.pubkey`) can issue commands: the author
-        // check runs on the event's verified signature.
-        if admin != event.pubkey {
+        // check runs on the event's verified signature. The comparison is
+        // ASCII case-insensitive: an uppercase spelling of the same pubkey
+        // must not silently disable the command interface.
+        if !admin.eq_ignore_ascii_case(&event.pubkey) {
             return;
         }
         {

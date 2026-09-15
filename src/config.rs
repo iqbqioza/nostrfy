@@ -1686,15 +1686,33 @@ fn stricter_mode(captured: u32, current: u32) -> u32 {
 pub(crate) fn write_text_atomic(path: &Path, text: &str) -> anyhow::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    let tmp = path.with_extension("tmp");
+    // A unique, exclusively-created temp file: the old fixed `path.tmp`
+    // name let two concurrent writers (NIP-86 config updates, `genkey`)
+    // truncate each other's temp, so one rename could publish a
+    // half-written config. `create_new` also refuses a planted symlink.
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = path.with_extension(format!("{}.{nanos}.{seq}.tmp", std::process::id()));
     let mut file = std::fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .mode(0o600)
         .open(&tmp)?;
-    file.write_all(text.as_bytes())?;
+    let written = (|| -> std::io::Result<()> {
+        file.write_all(text.as_bytes())?;
+        // Flush to disk before the rename publishes the name: otherwise a
+        // crash can leave a truncated file at the final path.
+        file.sync_all()
+    })();
     drop(file);
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
     // Apply the final mode to the temp *before* the rename, intersecting
     // the pre-write mode with the file's current mode: the intersection
     // is the stricter of the two, so a concurrent `genkey` that set 0600
@@ -1714,7 +1732,10 @@ pub(crate) fn write_text_atomic(path: &Path, text: &str) -> anyhow::Result<()> {
             std::fs::Permissions::from_mode(stricter_mode(captured, current)),
         );
     }
-    std::fs::rename(&tmp, path)?;
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
     Ok(())
 }
 
@@ -2318,17 +2339,21 @@ max_log_files = 2
         ) & 0o777;
         assert_eq!(mode, 0o644, "a plain config keeps its mode");
         // When the rename cannot complete (the target is a directory),
-        // the leftover temp must still be 0600 — the content was never
-        // world-readable during the write.
+        // the temp is removed again and nothing world-readable is left
+        // behind.
         let dir_target = dir.join("adir");
         std::fs::create_dir(&dir_target).unwrap();
         assert!(write_text_atomic(&dir_target, "x").is_err());
-        let mode = std::os::unix::fs::PermissionsExt::mode(
-            &std::fs::metadata(dir.join("adir.tmp"))
-                .unwrap()
-                .permissions(),
-        ) & 0o777;
-        assert_eq!(mode, 0o600, "the temp must never exceed 0600");
+        let leftovers: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "a failed write must not leave temp files: {leftovers:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

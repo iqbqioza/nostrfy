@@ -257,6 +257,9 @@ async fn build_router(
             async move { host_split(&api_host, &blossom_host, req, next).await }
         }));
     }
+    // CORS runs inside the blocked-IP layer: the blockip check must apply
+    // to preflight requests too, so it is installed last (outermost).
+    app = app.layer(axum::middleware::from_fn(cors_middleware));
     // NIP-86 `blockip` applies to every route on this listener (API,
     // Blossom, health/metrics/stats, NIP-11 and the WebSocket/RPC
     // endpoint), not only the WebSocket handler. The peer address is
@@ -278,8 +281,7 @@ async fn build_router(
             }
         },
     ));
-    app.layer(axum::middleware::from_fn(cors_middleware))
-        .with_state(relay.clone())
+    app.with_state(relay.clone())
 }
 
 /// The paths serving the WebSocket/NIP-11/NIP-86 endpoint for a
@@ -325,6 +327,15 @@ async fn host_split(api_host: &str, blossom_host: &str, request: Request, next: 
         .and_then(|v| v.to_str().ok())
         .map(host_header_host)
         .map(str::to_ascii_lowercase)
+        .or_else(|| {
+            // HTTP/2 (including h2c) carries the authority in the request
+            // URI instead of a Host header: without the fallback every
+            // h2 request looks host-less and the split routes 404.
+            request
+                .uri()
+                .authority()
+                .map(|authority| authority.host().to_ascii_lowercase())
+        })
         .unwrap_or_default();
     if host_route_allowed(api_host, blossom_host, &host, request.uri().path()) {
         next.run(request).await
@@ -515,6 +526,22 @@ pub async fn run_server(config_path: PathBuf, config: Config, db: DbClient) -> R
     let _ = shutdown_tx.send(true);
     for task in tasks {
         task.await.ok();
+    }
+    // Graceful WebSocket drain: the upgraded connection tasks are detached
+    // from the HTTP connections `serve_limited` tracks, so signal them
+    // explicitly and give them a bounded window to flush their pending
+    // event batches before the database is stopped. Without this wait the
+    // process would exit with accepted-but-uncommitted events (and no OKs).
+    relay.signal_drain();
+    let ws_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while relay
+        .stats
+        .connections_active
+        .load(std::sync::atomic::Ordering::Relaxed)
+        > 0
+        && std::time::Instant::now() < ws_deadline
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
     relay.db.shutdown();
     info!("relay stopped");

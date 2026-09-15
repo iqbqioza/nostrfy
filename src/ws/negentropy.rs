@@ -8,8 +8,6 @@ use crate::filter::Filter;
 use crate::nips::nip77;
 use crate::util::unix_now;
 
-use super::value_string;
-
 /// NIP-77 negentropy state for one open subscription.
 pub(crate) struct NegState {
     pub(crate) items: Vec<nip77::Item>,
@@ -65,7 +63,8 @@ impl super::Conn {
         // correlated, NOTICE only when no id exists to echo.
         let correl_id: Option<String> = rest
             .first()
-            .and_then(value_string)
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
             .filter(|s| !s.is_empty());
         if !self.relay.config.read().await.nip_enabled(77) {
             if let Some(sub_id) = correl_id {
@@ -86,7 +85,7 @@ impl super::Conn {
             }
             return;
         }
-        let sub_id = match value_string(&rest[0]) {
+        let sub_id = match rest[0].as_str().map(str::to_string) {
             Some(id) if !id.is_empty() => id,
             _ => {
                 self.send_notice("error: NEG-OPEN subscription id must be a non-empty string");
@@ -359,7 +358,8 @@ impl super::Conn {
             // id is released like every other malformed continuation.
             if let Some(sub_id) = rest
                 .first()
-                .and_then(value_string)
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
                 .filter(|s| !s.is_empty())
             {
                 self.neg_err(
@@ -371,12 +371,33 @@ impl super::Conn {
             }
             return;
         }
-        let Some(sub_id) = value_string(&rest[0]) else {
+        let Some(sub_id) = rest[0].as_str().map(str::to_string) else {
             self.send_notice("error: NEG-MSG subscription id must be a string");
             return;
         };
         if sub_id.is_empty() {
             self.send_notice("error: NEG-MSG subscription id must be a non-empty string");
+            return;
+        }
+        // NIP-77 disabled mid-session (SIGHUP reload or a command event):
+        // stop the in-flight sync like any other refusal instead of letting
+        // a disabled feature keep running.
+        if !self.relay.config.read().await.nip_enabled(77) {
+            self.neg_err(&sub_id, "error: negentropy is not enabled on this relay");
+            return;
+        }
+        // The access lists gate in-flight syncs too: a pubkey that was
+        // denied mid-reconciliation gets its sync stopped immediately
+        // (per NIP-77 a NEG-ERR closes the subscription) — no reconnect
+        // needed.
+        if !self.access_allows_read().await {
+            self.neg_err(&sub_id, "restricted: you are not allowed to sync");
+            return;
+        }
+        // Check the subscription before decoding the message: an unknown id
+        // must not cost a hex decode (and allocation) of a large frame.
+        if !self.neg.contains_key(&sub_id) {
+            self.neg_err(&sub_id, "closed: unknown subscription");
             return;
         }
         let Some(message) = rest[1].as_str() else {
@@ -387,18 +408,6 @@ impl super::Conn {
         };
         let Ok(message) = hex::decode(message) else {
             self.neg_err(&sub_id, "error: NEG-MSG message must be hex");
-            return;
-        };
-        // The access lists gate in-flight syncs too: a pubkey that was
-        // denied mid-reconciliation gets its sync stopped immediately
-        // (per NIP-77 a NEG-ERR closes the subscription) — no reconnect
-        // needed.
-        if !self.access_allows_read().await {
-            self.neg_err(&sub_id, "restricted: you are not allowed to sync");
-            return;
-        }
-        let Some(_exists) = self.neg.get(&sub_id) else {
-            self.neg_err(&sub_id, "closed: unknown subscription");
             return;
         };
         // NIP-77: "After a NEG-ERR is issued, the subscription is considered
@@ -457,7 +466,7 @@ impl super::Conn {
     }
 
     pub(crate) fn handle_neg_close(&mut self, rest: &[Value]) {
-        let Some(sub_id) = rest.first().and_then(value_string) else {
+        let Some(sub_id) = rest.first().and_then(|v| v.as_str()).map(str::to_string) else {
             self.send_notice("error: NEG-CLOSE requires a subscription id");
             return;
         };
