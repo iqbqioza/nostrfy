@@ -232,6 +232,11 @@ enum Msg {
     LoadGroups {
         reply: oneshot::Sender<Option<crate::nips::nip29::GroupsSnapshot>>,
     },
+    /// Drops the persisted NIP-29 group state snapshot (a post-vanish
+    /// rebuild failure must not leave a stale snapshot behind).
+    ClearGroupsSnapshot {
+        reply: oneshot::Sender<()>,
+    },
     /// Persists the NIP-43 role state snapshot (write-through on every
     /// role mutation).
     SaveRoles {
@@ -1299,6 +1304,15 @@ impl DbClient {
     pub async fn load_groups(&self) -> Option<crate::nips::nip29::GroupsSnapshot> {
         self.request_read_blocking(|reply| Msg::LoadGroups { reply })
             .await
+    }
+
+    /// Drops the persisted NIP-29 group state snapshot: the next startup
+    /// rebuilds from the surviving events instead of restoring state that
+    /// predates a vanish. Fire-and-forget like the save.
+    pub async fn clear_groups_snapshot(&self) {
+        let _ = self
+            .request_write(|reply| Msg::ClearGroupsSnapshot { reply })
+            .await;
     }
 
     /// Persists the NIP-43 role state snapshot (write-through: call after

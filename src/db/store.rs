@@ -538,6 +538,17 @@ impl Store {
         Ok(())
     }
 
+    /// Drops the persisted NIP-29 group snapshot, forcing the next startup
+    /// to rebuild the group state from the surviving events (a snapshot that
+    /// predates a vanish must never be restored as authoritative).
+    pub(crate) fn clear_groups_snapshot(&self) -> Result<()> {
+        self.disk_full_error()?;
+        let mut wtxn = self.env.write_txn()?;
+        self.groups.delete(&mut wtxn, b"groups:snapshot")?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
     /// Loads the persisted NIP-29 group state snapshot, if any. `None`
     /// means no snapshot was ever written (pre-persistence database): the
     /// caller runs the event-replay migration instead.
