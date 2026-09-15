@@ -520,7 +520,6 @@ impl Default for DaemonConfig {
 /// A config written for an older layout is accepted: the old value is
 /// applied to the new location with a deprecation warning (the warning
 /// also tells the operator which key to use next time).
-#[cfg(test)]
 const LEGACY_ALIASES: &[(&str, &str, &str, &str)] = &[
     ("relay", "enable_git", "relay", "enabled_git"),
     ("server", "require_auth", "relay", "require_auth"),
@@ -620,7 +619,6 @@ const LEGACY_ALIASES: &[(&str, &str, &str, &str)] = &[
 /// silently wrap one into a huge number. On failure the value degrades to
 /// the safe default (0) — the config validation rejects the resulting
 /// zero limits, and 0 means "disabled" for the policy knobs.
-#[cfg(test)]
 fn alias_int<T: TryFrom<i64> + Default>(v: &toml::Value) -> T {
     v.as_integer()
         .and_then(|i| T::try_from(i).ok())
@@ -630,7 +628,6 @@ fn alias_int<T: TryFrom<i64> + Default>(v: &toml::Value) -> T {
 /// A boolean legacy alias: a non-boolean value is warned about instead of
 /// being silently dropped to `false` (an auth flag silently disabled is
 /// worse than a loudly ignored value).
-#[cfg(test)]
 fn alias_bool(v: &toml::Value, key: &str, warnings: &mut Vec<String>) -> bool {
     match v.as_bool() {
         Some(b) => b,
@@ -647,7 +644,6 @@ fn alias_bool(v: &toml::Value, key: &str, warnings: &mut Vec<String>) -> bool {
 /// recognized (never flagged as unknown) and their values land in the new
 /// locations. Returns the warnings to log: one per applied alias, plus the
 /// conflicts and invalid values.
-#[cfg(test)]
 fn apply_legacy_aliases(raw: &str, cfg: &mut Config) -> Vec<String> {
     let mut warnings = Vec::new();
     let Ok(value) = raw.parse::<toml::Value>() else {
@@ -751,6 +747,14 @@ impl Config {
             .map_err(|e| config_err(format!("cannot read {}: {e}", path.display())))?;
         let mut cfg: Config = toml::from_str(&raw)
             .map_err(|e| config_err(format!("invalid {}: {e}", path.display())))?;
+        // Deprecated keys from older config layouts are applied to their new
+        // locations (with a warning per key). This must run right after the
+        // parse so a migrated config behaves as written instead of silently
+        // keeping the defaults for fields whose old key is recognized as
+        // "known" by the unknown-key warning.
+        for warning in apply_legacy_aliases(&raw, &mut cfg) {
+            log::warn!("{warning}");
+        }
         cfg.normalize_identity_keys();
         warn_unknown_fields(&raw);
         Ok(cfg)
@@ -2078,6 +2082,41 @@ max_admin_body_bytes = 2048
         assert_eq!(cfg.limits.max_count, 2000, "the current key must win");
         assert!(!cfg.relay.require_auth, "the current key must win");
         assert_eq!(cfg.rpc.max_admin_body_bytes, 2048);
+    }
+
+    #[test]
+    fn config_load_applies_legacy_aliases() {
+        // Regression: the alias table was compiled out (`#[cfg(test)]`), so
+        // a config written for an older layout silently kept the defaults
+        // for every key that moved (the old keys are "known", so the
+        // unknown-key warning never fired either).
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir()
+            .join("nostrfy-config-alias-test")
+            .join(format!("{:x}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("nostrfy.toml");
+        std::fs::write(
+            &path,
+            r#"
+[limits]
+count_limit = 77
+neg_max_items = 9
+
+[database]
+map_max_size = 1073741824
+"#,
+        )
+        .unwrap();
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.limits.max_count, 77, "count_limit must migrate");
+        assert_eq!(cfg.limits.max_neg_items, 9, "neg_max_items must migrate");
+        assert_eq!(
+            cfg.database.max_map_size, 1_073_741_824,
+            "database.map_max_size must migrate"
+        );
     }
 
     #[test]
