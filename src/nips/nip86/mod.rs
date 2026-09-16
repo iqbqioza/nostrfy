@@ -140,7 +140,7 @@ pub async fn rpc_handler(
     // NIP-86 `blockip` also applies to this endpoint: a blocked peer must
     // not reach the management RPC (the WebSocket handler already refuses
     // its connections).
-    if crate::util::ip_blocked(&relay.access.read().await.blocked_ips, peer.ip()) {
+    if relay.access.read().await.is_ip_blocked(peer.ip()) {
         return StatusCode::FORBIDDEN.into_response();
     }
     // The spec requires the JSON-RPC content type (parameters such as
@@ -516,10 +516,8 @@ pub async fn rpc_handler(
             let ip = crate::util::normalize_ip(ip);
             {
                 let mut access = relay.access.write().await;
-                if !crate::util::ip_blocked(&access.blocked_ips, ip) {
-                    access
-                        .blocked_ips
-                        .push((ip.to_string(), reason.to_string()));
+                if !access.is_ip_blocked(ip) {
+                    access.blocked_ips.push(ip.to_string(), reason.to_string());
                 }
             }
             relay.persist_access().await;
@@ -540,13 +538,7 @@ pub async fn rpc_handler(
                 let mut access = relay.access.write().await;
                 // Remove equivalently-spelled entries too (`::1` versus
                 // `0:0:0:0:0:0:0:1`, v4-mapped versus IPv4).
-                access.blocked_ips.retain(|(entry, _)| {
-                    entry
-                        .parse::<std::net::IpAddr>()
-                        .map(crate::util::normalize_ip)
-                        .map(|b| b != ip)
-                        .unwrap_or(true)
-                });
+                access.blocked_ips.remove(ip);
             }
             relay.persist_access().await;
             // Re-connect checks: unblocking also bumps the version so

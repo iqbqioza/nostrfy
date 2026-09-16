@@ -329,7 +329,7 @@ async fn build_router(
                     .extensions()
                     .get::<axum::extract::connect_info::ConnectInfo<std::net::SocketAddr>>()
                     .map(|info| info.0.ip())
-                    && crate::util::ip_blocked(&relay.access.read().await.blocked_ips, ip)
+                    && relay.access.read().await.is_ip_blocked(ip)
                 {
                     return StatusCode::FORBIDDEN.into_response();
                 }
@@ -790,7 +790,7 @@ async fn ws_handler(State(relay): State<Arc<Relay>>, request: Request) -> Respon
         .extensions()
         .get::<axum::extract::connect_info::ConnectInfo<std::net::SocketAddr>>()
         .map(|info| info.0.ip())
-        && crate::util::ip_blocked(&relay.access.read().await.blocked_ips, ip)
+        && relay.access.read().await.is_ip_blocked(ip)
     {
         return StatusCode::FORBIDDEN.into_response();
     }
@@ -1849,7 +1849,7 @@ mod tests {
             .write()
             .await
             .blocked_ips
-            .push(("198.51.100.7".into(), String::new()));
+            .push("198.51.100.7".into(), String::new());
         let mut request = Request::builder()
             .method(Method::GET)
             .uri("/")
@@ -1916,7 +1916,7 @@ mod tests {
             .write()
             .await
             .blocked_ips
-            .push(("::ffff:198.51.100.7".into(), String::new()));
+            .push("::ffff:198.51.100.7".into(), String::new());
         let app = build_router(&relay, None).await;
         for uri in ["/health", "/api/v1/count", "/relay/stats"] {
             let mut request = Request::builder()

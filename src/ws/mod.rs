@@ -579,7 +579,7 @@ impl Conn {
     /// Called when the blocked-IP list changes, so a read-only subscriber
     /// that never sends a frame is disconnected like any other.
     pub(crate) async fn source_ip_blocked(&self, peer_ip: std::net::IpAddr) -> bool {
-        crate::util::ip_blocked(&self.relay.access.read().await.blocked_ips, peer_ip)
+        self.relay.access.read().await.is_ip_blocked(peer_ip)
     }
 }
 
@@ -5414,7 +5414,7 @@ mod tests {
                 .write()
                 .await
                 .blocked_ips
-                .push(("::ffff:198.51.100.7".into(), String::new()));
+                .push("::ffff:198.51.100.7".into(), String::new());
             assert!(conn.source_ip_blocked(peer).await);
             // Every mutation wakes the connection's watcher immediately,
             // which is what disconnects read-only subscribers.

@@ -1862,9 +1862,7 @@ fn access_control_persists_across_reopen() {
             .unwrap();
             let mut access = crate::config::AccessControl::default();
             access.allowed_kinds.push(5);
-            access
-                .blocked_ips
-                .push(("203.0.113.9".into(), String::new()));
+            access.blocked_ips.push("203.0.113.9".into(), String::new());
             db.save_access(access.clone()).await;
             // The pubkey lists live under their own key.
             db.save_relay_pubkeys(&[("aa".repeat(32), String::new())], &[])
@@ -1891,8 +1889,8 @@ fn access_control_persists_across_reopen() {
         };
         assert_eq!(loaded.allowed_kinds, vec![5]);
         assert_eq!(
-            loaded.blocked_ips,
-            vec![(String::from("203.0.113.9"), String::new())]
+            loaded.blocked_ips.entries(),
+            [(String::from("203.0.113.9"), String::new())]
         );
         // The dedicated pubkey key survives the reopen.
         let (deny, allow) = db.load_relay_pubkeys().await.unwrap_or_default();
@@ -1927,9 +1925,7 @@ fn access_load_distinguishes_missing_loaded_and_failed() {
         ));
         // Persisted state loads back.
         let mut access = crate::config::AccessControl::default();
-        access
-            .blocked_ips
-            .push(("203.0.113.9".into(), String::new()));
+        access.blocked_ips.push("203.0.113.9".into(), String::new());
         db.save_access(access.clone()).await;
         let crate::db::LoadAccessOutcome::Loaded(loaded) = db.load_access().await else {
             panic!("persisted access must load");
@@ -1988,16 +1984,14 @@ fn schema_upgrade_creates_missing_tables_instantly() {
         assert_eq!(found.len(), 1);
         // Access control works (access table + the relay pubkeys key).
         let mut access = crate::config::AccessControl::default();
-        access
-            .blocked_ips
-            .push(("203.0.113.9".into(), String::new()));
+        access.blocked_ips.push("203.0.113.9".into(), String::new());
         db.save_access(access).await;
         db.save_relay_pubkeys(&[("aa".repeat(32), String::new())], &[])
             .await;
         let crate::db::LoadAccessOutcome::Loaded(loaded) = db.load_access().await else {
             panic!("persisted access must load");
         };
-        assert_eq!(loaded.blocked_ips[0].0, "203.0.113.9");
+        assert_eq!(loaded.blocked_ips.entries()[0].0, "203.0.113.9");
         let (deny, _) = db.load_relay_pubkeys().await.unwrap_or_default();
         assert_eq!(deny[0].0, "aa".repeat(32));
         // The Blossom mapping works (blossom table + migration marker).

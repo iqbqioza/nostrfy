@@ -1083,7 +1083,7 @@ impl Config {
         }
 
         // Blocked IPs must parse as IP addresses.
-        for (ip, _) in &self.access.blocked_ips {
+        for (ip, _) in self.access.blocked_ips.entries() {
             ip.parse::<std::net::IpAddr>().map_err(|_| {
                 config_err(format!(
                     "access.blocked_ips contains an invalid IP address: {ip:?}"
@@ -1493,13 +1493,106 @@ pub struct AccessControl {
     pub allowed_pubkeys: Vec<(String, String)>,
     pub blocked_kinds: Vec<u64>,
     pub allowed_kinds: Vec<u64>,
-    /// (ip, reason) pairs, reported by NIP-86 `listblockedips`.
-    #[serde(deserialize_with = "de_access_entries")]
-    pub blocked_ips: Vec<(String, String)>,
+    /// (ip, reason) pairs, reported by NIP-86 `listblockedips`. The parsed
+    /// lookup set is maintained internally, so the per-request check never
+    /// re-parses the list (see [`BlockedIps`]).
+    pub blocked_ips: BlockedIps,
     /// When true, only the pubkeys on the allow list (`nostrfy relay allow`)
     /// may publish. When false (default), everyone except the denied
     /// pubkeys may publish.
     pub restrict_relay: bool,
+}
+
+/// The runtime blocked-IP list: the persisted `(ip, reason)` entries plus a
+/// pre-parsed, normalized lookup set. Every HTTP request and every
+/// WebSocket connection checks this list, so re-parsing every entry on each
+/// check would be O(n) per request once NIP-86 `blockip` has grown the
+/// list. The set is rebuilt on every deserialization (config file and the
+/// persisted snapshot alike) and kept in sync by [`Self::push`] and
+/// [`Self::remove`]; the entries remain the source of truth for
+/// persistence and `listblockedips`. The serialized wire format is
+/// unchanged (a sequence of `(ip, reason)` pairs, with the legacy
+/// plain-string entries accepted on read).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BlockedIps {
+    entries: Vec<(String, String)>,
+    parsed: std::collections::HashSet<std::net::IpAddr>,
+}
+
+impl BlockedIps {
+    /// The parsed, normalized addresses of `entries`.
+    fn parse_entries(entries: &[(String, String)]) -> std::collections::HashSet<std::net::IpAddr> {
+        entries
+            .iter()
+            .filter_map(|(entry, _)| entry.parse::<std::net::IpAddr>().ok())
+            .map(crate::util::normalize_ip)
+            .collect()
+    }
+
+    /// Whether `peer` — in any spelling of the same address — is blocked.
+    pub fn blocks(&self, peer: std::net::IpAddr) -> bool {
+        self.parsed.contains(&crate::util::normalize_ip(peer))
+    }
+
+    /// Adds an entry unless the address (in any spelling) is already
+    /// blocked. Entries that do not parse as IP addresses are ignored: the
+    /// config validation and the NIP-86 methods reject them earlier, and a
+    /// runtime entry that cannot be checked must not enter the list.
+    pub fn push(&mut self, entry: String, reason: String) {
+        let Ok(ip) = entry.parse::<std::net::IpAddr>() else {
+            return;
+        };
+        if self.parsed.insert(crate::util::normalize_ip(ip)) {
+            self.entries.push((entry, reason));
+        }
+    }
+
+    /// Removes every entry that refers to `ip` (already normalized),
+    /// whatever spelling it was stored with.
+    pub fn remove(&mut self, ip: std::net::IpAddr) {
+        self.entries.retain(|(entry, _)| {
+            entry
+                .parse::<std::net::IpAddr>()
+                .map(crate::util::normalize_ip)
+                .map(|b| b != ip)
+                .unwrap_or(true)
+        });
+        self.parsed.remove(&ip);
+    }
+
+    pub fn iter(&self) -> std::slice::Iter<'_, (String, String)> {
+        self.entries.iter()
+    }
+
+    /// The persisted entries, in insertion order (`listblockedips` and the
+    /// config validation read them).
+    pub fn entries(&self) -> &[(String, String)] {
+        &self.entries
+    }
+}
+
+impl From<Vec<(String, String)>> for BlockedIps {
+    fn from(entries: Vec<(String, String)>) -> Self {
+        let parsed = Self::parse_entries(&entries);
+        Self { entries, parsed }
+    }
+}
+
+impl serde::Serialize for BlockedIps {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        self.entries.serialize(serializer)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for BlockedIps {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        de_access_entries(deserializer).map(Self::from)
+    }
 }
 
 /// Deserializes an access list that accepts both the current format —
@@ -1556,6 +1649,11 @@ impl AccessControl {
             return false;
         }
         self.allowed_kinds.is_empty() || self.allowed_kinds.contains(&kind)
+    }
+
+    /// Whether `peer` is on the blocked-IP list (normalized comparison).
+    pub fn is_ip_blocked(&self, peer: std::net::IpAddr) -> bool {
+        self.blocked_ips.blocks(peer)
     }
 }
 
@@ -2617,7 +2715,7 @@ max_log_files = 2
             allowed_pubkeys: Vec::new(),
             blocked_kinds: vec![],
             allowed_kinds: vec![],
-            blocked_ips: vec![("203.0.113.9".into(), String::new())],
+            blocked_ips: vec![("203.0.113.9".into(), String::new())].into(),
             restrict_relay: false,
         };
         let json = serde_json::to_string(&legacy).unwrap();
@@ -2633,7 +2731,7 @@ max_log_files = 2
             "pubkey lists are not config state"
         );
         assert!(parsed.allowed_pubkeys.is_empty());
-        assert_eq!(parsed.blocked_ips[0].0, "203.0.113.9");
+        assert_eq!(parsed.blocked_ips.entries()[0].0, "203.0.113.9");
         // The current format round-trips with its reasons.
         let with_reason = AccessControl {
             blocked_pubkeys: vec![("bb".repeat(32), "spam".to_string())],
@@ -2848,9 +2946,28 @@ max_log_files = 2
     }
 
     #[test]
+    fn blocked_ips_preparse_normalizes_dedups_and_removes() {
+        use std::net::IpAddr;
+        let mut list = BlockedIps::default();
+        list.push("::ffff:127.0.0.1".into(), "mapped".into());
+        assert!(list.blocks("127.0.0.1".parse().unwrap()));
+        // An equivalent spelling must not add a second entry.
+        list.push("127.0.0.1".into(), "again".into());
+        assert_eq!(list.entries().len(), 1);
+        list.push("0:0:0:0:0:0:0:1".into(), "v6".into());
+        assert!(list.blocks("::1".parse().unwrap()));
+        list.remove("::1".parse().unwrap());
+        assert!(!list.blocks("::1".parse().unwrap()));
+        assert_eq!(list.entries().len(), 1);
+        // Deserialization builds the lookup set (no separate refresh call).
+        let parsed: BlockedIps = serde_json::from_str(r#"[["203.0.113.9","x"]]"#).unwrap();
+        assert!(parsed.blocks("203.0.113.9".parse::<IpAddr>().unwrap()));
+    }
+
+    #[test]
     fn validation_rejects_bad_access_entries() {
         let mut cfg = Config::default();
-        cfg.access.blocked_ips = vec![("not-an-ip".into(), String::new())];
+        cfg.access.blocked_ips = vec![("not-an-ip".into(), String::new())].into();
         assert!(cfg.validate().is_err(), "blocked IPs must parse");
     }
 
