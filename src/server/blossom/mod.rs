@@ -2220,6 +2220,7 @@ mod tests {
         let relay = build_blossom_relay(0).await;
         let (headers, pk) = auth_headers(relay.secp(), "list");
         let state = state_of(&relay).await.expect("blossom state");
+        let mut shas = Vec::new();
         for i in 0..5 {
             let sha = sha256_hex(format!("blob-{i}").as_bytes());
             state
@@ -2227,34 +2228,80 @@ mod tests {
                 .put(&pk, &sha, format!("blob-{i}").as_bytes(), "text/plain")
                 .await
                 .unwrap();
+            shas.push(sha);
         }
-        let query = |limit: Option<&str>| {
+        let query = |limit: Option<&str>, cursor: Option<&str>| {
             let mut map = std::collections::HashMap::new();
             if let Some(l) = limit {
                 map.insert("limit".to_string(), l.to_string());
             }
+            if let Some(c) = cursor {
+                map.insert("cursor".to_string(), c.to_string());
+            }
             axum::extract::Query(map)
+        };
+        let page = |resp: axum::response::Response| async move {
+            let body = axum::body::to_bytes(resp.into_body(), 256 * 1024)
+                .await
+                .unwrap();
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()
         };
         let resp = list(
             State(relay.clone()),
             headers.clone(),
             AxPath(pk.clone()),
-            query(Some("9999999")),
+            query(Some("9999999"), None),
         )
         .await;
-        let body = axum::body::to_bytes(resp.into_body(), 256 * 1024)
-            .await
-            .unwrap();
-        let items: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(
-            items.as_array().unwrap().len() <= 1000,
-            "huge limit must be capped"
+        let items = page(resp).await;
+        let page_shas: Vec<String> = items
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["sha256"].as_str().unwrap().to_string())
+            .collect();
+        assert!(page_shas.len() <= 1000, "huge limit must be capped");
+        assert_eq!(
+            page_shas.len(),
+            shas.len(),
+            "every uploaded blob must be listed (uploaded-order index)"
         );
-        let resp = list(State(relay.clone()), headers, AxPath(pk), query(None)).await;
-        let body = axum::body::to_bytes(resp.into_body(), 256 * 1024)
-            .await
-            .unwrap();
-        let items: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        for sha in &shas {
+            assert!(page_shas.contains(sha), "missing blob {sha}");
+        }
+        // Cursor paging: each page must make progress and never repeat a
+        // blob. Before the key-format fix the cursor landed inside the same
+        // key, so page 2 re-served page 1 (or the pages were empty).
+        let first = list(
+            State(relay.clone()),
+            headers.clone(),
+            AxPath(pk.clone()),
+            query(Some("2"), None),
+        )
+        .await;
+        let first = page(first).await;
+        let first = first.as_array().unwrap();
+        assert_eq!(first.len(), 2, "limit 2 must return two blobs");
+        let cursor = first.last().unwrap()["sha256"].as_str().unwrap();
+        let second = list(
+            State(relay.clone()),
+            headers.clone(),
+            AxPath(pk.clone()),
+            query(Some("2"), Some(cursor)),
+        )
+        .await;
+        let second = page(second).await;
+        let second = second.as_array().unwrap();
+        assert_eq!(second.len(), 2, "the cursor must advance to the next page");
+        for item in second {
+            let sha = item["sha256"].as_str().unwrap();
+            assert!(
+                !first.iter().any(|f| f["sha256"] == sha),
+                "a paged blob must not repeat on the next page"
+            );
+        }
+        let resp = list(State(relay.clone()), headers, AxPath(pk), query(None, None)).await;
+        let items = page(resp).await;
         assert!(
             items.as_array().unwrap().len() <= 100,
             "default page must be bounded"
