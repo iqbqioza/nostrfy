@@ -128,7 +128,9 @@ enum Msg {
     VanishPubkeysPage {
         after: Option<Vec<u8>>,
         limit: usize,
-        reply: oneshot::Sender<Vec<Vec<u8>>>,
+        /// `None` when the table could not be read: the caller must fail
+        /// closed instead of treating an error as "no vanished pubkeys".
+        reply: oneshot::Sender<Option<Vec<Vec<u8>>>>,
     },
     /// NIP-77: query returning only `(created_at, id)` records so that large
     /// negentropy ranges do not materialize every full event in memory.
@@ -1334,13 +1336,17 @@ impl DbClient {
         const PAGE: usize = 4096;
         let mut after: Option<Vec<u8>> = None;
         loop {
+            // Startup-style read: neither fail-fast nor timeout may degrade
+            // a failed page to "no vanished pubkeys" — the rebuilds would
+            // then resurrect vanished identities (fail-open).
             let page = self
-                .request_read(|reply| Msg::VanishPubkeysPage {
+                .request_read_startup(|reply| Msg::VanishPubkeysPage {
                     after: after.clone(),
                     limit: PAGE,
                     reply,
                 })
-                .await;
+                .await // the reader must reply
+                .and_then(|page| page)?;
             for key in &page {
                 f(key);
             }

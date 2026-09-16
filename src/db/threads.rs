@@ -82,10 +82,10 @@ fn handle_read_msg(store: &Store, errors: &Arc<std::sync::atomic::AtomicU64>, ms
             reply,
         } => {
             let page = match store.vanish_pubkeys_page(after.as_deref(), limit) {
-                Ok(page) => page,
+                Ok(page) => Some(page),
                 Err(e) => {
                     db_error(errors, &e);
-                    Vec::new()
+                    None
                 }
             };
             let _ = reply.send(page);
@@ -649,10 +649,10 @@ pub(crate) fn spawn(
                                 } => {
                                     let page =
                                         match store.vanish_pubkeys_page(after.as_deref(), limit) {
-                                            Ok(page) => page,
+                                            Ok(page) => Some(page),
                                             Err(e) => {
                                                 db_error(&thread_errors, &e);
-                                                Vec::new()
+                                                None
                                             }
                                         };
                                     let _ = reply.send(page);

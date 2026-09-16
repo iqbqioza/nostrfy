@@ -4068,3 +4068,42 @@ fn startup_rebuild_queries_keep_the_reader_byte_accounting_balanced() {
         db.shutdown();
     });
 }
+
+#[test]
+fn vanish_pubkeys_each_reports_database_failure() {
+    // The NIP-29/43 rebuilds resume from the vanished-pubkey set; a failed
+    // read used to be reported as an empty set (`Some(())`), resurrecting
+    // vanished members/roles. A dead reader must be a hard failure.
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let cfg = config();
+        let db = DbClient::open(
+            &cfg,
+            true,
+            Arc::new(Default::default()),
+            30,
+            128,
+            4096,
+            262144,
+        )
+        .unwrap();
+        let pk = [7u8; 32];
+        assert!(
+            db.apply_vanish_checked(pk, 1_700_000_000).await.is_some(),
+            "the vanish marker must be written"
+        );
+        let mut seen: Vec<Vec<u8>> = Vec::new();
+        assert!(
+            db.vanish_pubkeys_each(|key| seen.push(key.to_vec()))
+                .await
+                .is_some(),
+            "a healthy read reports success"
+        );
+        assert_eq!(seen, vec![pk.to_vec()]);
+        db.shutdown();
+        assert!(
+            db.vanish_pubkeys_each(|_| {}).await.is_none(),
+            "a failed read must report failure instead of an empty list"
+        );
+    });
+}

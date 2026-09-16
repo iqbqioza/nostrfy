@@ -987,7 +987,11 @@ impl GroupStore {
         let mut vanished: std::collections::HashSet<String> = std::collections::HashSet::new();
         if db
             .vanish_pubkeys_each(|key| {
+                // Both hex spellings: stored JOIN/9000 tags may predate the
+                // lowercase normalization and would otherwise slip past the
+                // vanish exclusion (resurrecting the member).
                 vanished.insert(hex::encode(key));
+                vanished.insert(hex::encode_upper(key));
             })
             .await
             .is_none()
