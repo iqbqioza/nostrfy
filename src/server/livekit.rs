@@ -84,8 +84,7 @@ pub(crate) async fn livekit_token(
                 &expected_path,
                 uri.query(),
             )
-        })
-        .await;
+        });
     match authed {
         Some(verified)
             if relay.nip98_replay.accept(&verified.id, unix_now())

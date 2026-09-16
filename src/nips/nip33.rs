@@ -13,13 +13,14 @@ pub fn is_param_replaceable_kind(kind: u64) -> bool {
     (PARAM_REPLACEABLE_MIN..=PARAM_REPLACEABLE_MAX).contains(&kind)
 }
 
-/// Value of the first `d` tag, or `""` when absent.
-pub fn dtag(event: &Event) -> String {
+/// Value of the first `d` tag, or `""` when absent. Borrowed: this runs on
+/// every replaceable put/remove and the caller only needs the value.
+pub fn dtag(event: &Event) -> &str {
     event
         .tags
         .iter()
         .find(|t| t.len() >= 2 && t[0] == "d")
-        .map(|t| t[1].clone())
+        .map(|t| t[1].as_str())
         .unwrap_or_default()
 }
 

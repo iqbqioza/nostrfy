@@ -1381,13 +1381,13 @@ impl Store {
             let dtag = if nip33::is_param_replaceable_kind(event.kind) {
                 nip33::dtag(event)
             } else {
-                String::new()
+                ""
             };
             // The `d` tag is truncated for the index key only: a value long
             // enough to exceed LMDB's key-size limit would abort the whole
             // write batch, and realistic addressable events use short `d`
             // tags. The stored event keeps its full `d` tag.
-            let rkey = replaceable_key(event.kind, &pubkey, &dtag_key_safe(&dtag));
+            let rkey = replaceable_key(event.kind, &pubkey, &dtag_key_safe(dtag));
             // NIP-09: an `a`-tag deletion tombstones the whole address up to
             // the request's created_at, so a later re-publication of an older
             // (or equal-timestamped) version stays deleted. Newer versions
@@ -1395,7 +1395,7 @@ impl Store {
             // timestamp.
             if let Some(tomb) = self
                 .deleted
-                .get(wtxn, &deleted_address_key(event.kind, &pubkey, &dtag))?
+                .get(wtxn, &deleted_address_key(event.kind, &pubkey, dtag))?
                 && tomb.len() >= CREATED_LEN
                 && event.created_at <= u64::from_be_bytes(tomb[..CREATED_LEN].try_into().unwrap())
             {
@@ -1752,11 +1752,11 @@ impl Store {
             let dtag = if nip33::is_param_replaceable_kind(event.kind) {
                 nip33::dtag(&event)
             } else {
-                String::new()
+                ""
             };
             self.replaceable.delete(
                 wtxn,
-                &replaceable_key(event.kind, &pubkey, &dtag_key_safe(&dtag)),
+                &replaceable_key(event.kind, &pubkey, &dtag_key_safe(dtag)),
             )?;
         }
         self.by_pubkey

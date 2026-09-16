@@ -36,7 +36,15 @@ impl Stats {
     }
 
     pub fn bump(&self, counter: &AtomicU64, delta: u64) {
-        counter.fetch_add(delta, Ordering::Relaxed);
+        // Saturate instead of wrapping: a counter that wrapped to a small
+        // value would make the metrics lie. The load is relaxed and the
+        // branch is never taken in practice.
+        let current = counter.load(Ordering::Relaxed);
+        if current > u64::MAX - delta {
+            counter.store(u64::MAX, Ordering::Relaxed);
+        } else {
+            counter.fetch_add(delta, Ordering::Relaxed);
+        }
     }
 
     pub fn as_json(&self) -> Value {

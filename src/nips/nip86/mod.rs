@@ -690,7 +690,6 @@ async fn rpc_authenticated(
             "POST",
             |url| nip98::matches_request_url(url, &cfg.relay_identity(), uri.path(), uri.query()),
         )
-        .await
         && relay
             .nip98_replay
             .accept(&verified.id, crate::util::unix_now())
