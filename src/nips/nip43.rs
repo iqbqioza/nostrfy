@@ -259,7 +259,7 @@ impl RoleStore {
                     .expect("static filter");
             filter.since = since;
             let Some((page, more)) = db
-                .query_full_startup(vec![filter], PAGE, unix_now(), true)
+                .query_full_startup(vec![filter.clone()], PAGE, unix_now(), true)
                 .await
             else {
                 log::error!(
@@ -279,6 +279,26 @@ impl RoleStore {
                     page.len()
                 );
                 return false;
+            }
+            if full && more {
+                // The collector's hard caps can cut the boundary second
+                // while the page still reports `more`.
+                let boundary = page.last().map(|e| e.created_at).unwrap_or(0);
+                let delivered = page.iter().filter(|e| e.created_at == boundary).count();
+                if !crate::nips::nip29::boundary_second_complete(
+                    db,
+                    filter.clone(),
+                    boundary,
+                    delivered,
+                )
+                .await
+                {
+                    log::error!(
+                        "role state rebuild aborted: the boundary second {boundary} is not \
+                         fully collected; refusing to persist an incomplete role store"
+                    );
+                    return false;
+                }
             }
             let max_created = page.last().map(|event| event.created_at);
             for event in page {
