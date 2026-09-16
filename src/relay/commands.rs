@@ -127,7 +127,7 @@ impl Relay {
             return;
         }
         // The reply needs a key to be signed with.
-        if self.relay_pubkey().is_none() {
+        if self.relay_pubkey_ref().is_none() {
             return;
         }
         // Only the admin (`relay.pubkey`) can issue commands: the author

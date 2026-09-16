@@ -148,7 +148,11 @@ fn replaceable_and_deletion() {
         assert_eq!(res[0].content, "v2");
 
         let targets = vec![e2.id.clone()];
-        assert_eq!(db.apply_deletion(targets, vec![], None, u64::MAX).await, 1);
+        assert_eq!(
+            db.apply_deletion(targets, vec![], Some(e2.pubkey.clone()), u64::MAX)
+                .await,
+            1
+        );
         let f: Filter = serde_json::from_value(serde_json::json!({"kinds": [30023]})).unwrap();
         let (res, _) = db.query(vec![f], 500, now).await;
         assert!(res.is_empty());
@@ -2868,7 +2872,7 @@ fn removal_of_overlong_tag_index_skips_without_poisoning() {
         let ev = event(1, "big", now, vec![vec!["t".into(), big]]);
         assert_eq!(db.put(ev.clone(), now).await, PutOutcome::Stored);
         assert_eq!(
-            db.apply_deletion(vec![ev.id.clone()], vec![], None, now)
+            db.apply_deletion(vec![ev.id.clone()], vec![], Some(ev.pubkey.clone()), now)
                 .await,
             1,
             "deleting an event with an over-long tag value must succeed"

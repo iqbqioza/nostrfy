@@ -35,6 +35,20 @@ pub(crate) struct BlossomMeta {
 /// mapping without bound. New owners past the cap are refused (the blob
 /// itself stays reachable through the existing owners).
 pub(crate) const MAX_BLOB_OWNERS: usize = 64;
+
+/// The uploaded-order index prefix for one owner:
+/// `bls:<pubkey>:<uploaded:020>:<sha256>`. BUD-12 `/list` pages iterate it
+/// in reverse, so a page never depends on scanning the sha-ordered reverse
+/// index (which hid every blob past the scan window).
+const BLOSSOM_ORDER_PREFIX: &str = "bls:";
+
+/// The uploaded-order index key of one owner/blob pair.
+fn blossom_order_key(pubkey: &str, uploaded: i64, sha256: &str) -> String {
+    format!(
+        "{BLOSSOM_ORDER_PREFIX}{pubkey}:{:020}:{sha256}",
+        uploaded.max(0) as u64
+    )
+}
 use crate::config::DatabaseConfig;
 use crate::error::Result;
 use crate::event::Event;
@@ -387,6 +401,10 @@ pub(crate) struct Store {
     pub(crate) expiry_enabled: Arc<std::sync::atomic::AtomicBool>,
     /// NIP-50 word index: maximum number of words indexed per event.
     pub(crate) max_indexed_words: usize,
+    /// The limit the existing word index was built with (persisted in
+    /// `index_meta`; used by put/remove so they stay symmetric across a
+    /// config change).
+    pub(crate) indexed_words: usize,
     /// Ceiling for the memory map (bytes): the map is opened at this size
     /// and never resized at runtime.
     pub(crate) map_max_size: u64,
@@ -478,6 +496,39 @@ impl Store {
         let roles = env.create_database::<Bytes, Bytes>(&mut wtxn, Some(ROLES))?;
         let index_meta = env.create_database::<Bytes, Bytes>(&mut wtxn, Some(INDEX_META))?;
         wtxn.commit()?;
+        // The word-index limit is persisted with the index it describes: a
+        // config change between restarts must not make put/remove
+        // asymmetric (removing an event indexed with the old limit would
+        // leave stale word keys, or clear a marker that the old limit
+        // wrote).
+        let configured_words = max_indexed_words.max(1);
+        let indexed_words = if by_word.is_some() {
+            let mut wtxn = env.write_txn()?;
+            let value = match index_meta.get(&wtxn, b"word_limit")? {
+                Some(raw) if raw.len() >= 8 => {
+                    u64::from_be_bytes(raw[..8].try_into().unwrap()) as usize
+                }
+                _ => {
+                    index_meta.put(
+                        &mut wtxn,
+                        b"word_limit",
+                        &(configured_words as u64).to_be_bytes(),
+                    )?;
+                    configured_words
+                }
+            };
+            wtxn.commit()?;
+            if value != configured_words {
+                log::warn!(
+                    "search.max_indexed_words changed from {value} to {configured_words}; \
+                     the existing word index keeps its original limit (put/remove stay \
+                     symmetric) until the index is rebuilt"
+                );
+            }
+            value
+        } else {
+            configured_words
+        };
         let tables = if by_word.is_some() { 18 } else { 17 };
         log::info!(
             "database ready at {} ({} tables, map {} MiB)",
@@ -508,6 +559,7 @@ impl Store {
             index_meta,
             expiry_enabled,
             max_indexed_words: max_indexed_words.max(1),
+            indexed_words,
             map_max_size,
         })
     }
@@ -575,6 +627,7 @@ impl Store {
             index_meta: self.index_meta,
             expiry_enabled: Arc::clone(&self.expiry_enabled),
             max_indexed_words: self.max_indexed_words,
+            indexed_words: self.indexed_words,
             map_max_size: self.map_max_size,
         }
     }
@@ -704,6 +757,13 @@ impl Store {
                 ));
             }
             meta.owners.push(pubkey.to_string());
+            // Keep the uploaded-order index in sync: BUD-12 pages iterate
+            // it instead of scanning the sha-ordered reverse index.
+            self.blossom.put(
+                &mut wtxn,
+                blossom_order_key(pubkey, meta.uploaded, sha256).as_bytes(),
+                b"",
+            )?;
         }
         self.blossom
             .put(&mut wtxn, key.as_bytes(), &serde_json::to_vec(&meta)?)?;
@@ -741,6 +801,11 @@ impl Store {
                             format!("own:{pubkey}:{sha256}").as_bytes(),
                             b"",
                         )?;
+                        self.blossom.put(
+                            &mut wtxn,
+                            blossom_order_key(pubkey, meta.uploaded, sha256).as_bytes(),
+                            b"",
+                        )?;
                     }
                     Ok(_) => {}
                     Err(e) => log::warn!("corrupt blossom mapping for {sha256}: {e}"),
@@ -760,6 +825,11 @@ impl Store {
             )?;
             self.blossom
                 .put(&mut wtxn, format!("own:{pubkey}:{sha256}").as_bytes(), b"")?;
+            self.blossom.put(
+                &mut wtxn,
+                blossom_order_key(pubkey, *uploaded, sha256).as_bytes(),
+                b"",
+            )?;
         }
         wtxn.commit()?;
         Ok(())
@@ -821,6 +891,10 @@ impl Store {
         }
         self.blossom
             .delete(&mut wtxn, format!("own:{pubkey}:{sha256}").as_bytes())?;
+        self.blossom.delete(
+            &mut wtxn,
+            blossom_order_key(pubkey, meta.uploaded, sha256).as_bytes(),
+        )?;
         self.blossom.delete(&mut wtxn, key.as_bytes())?;
         if !meta.owners.is_empty() {
             self.blossom
@@ -834,6 +908,7 @@ impl Store {
     /// capped at `limit` entries: `GET /list` pages through cursors, so an
     /// unbounded walk for a heavy uploader would materialize hundreds of
     /// thousands of entries per request.
+    #[cfg(test)]
     pub(crate) fn list_blossom_shas(&self, pubkey: &str, limit: usize) -> Result<Vec<String>> {
         let rtxn = self.env.read_txn()?;
         let prefix = format!("own:{pubkey}:");
@@ -849,6 +924,92 @@ impl Store {
             }
         }
         Ok(out)
+    }
+
+    /// BUD-12 page: the owner's blobs strictly before the cursor, newest
+    /// `uploaded` first, from the uploaded-order index. Returns the sha and
+    /// its mapping per entry.
+    pub(crate) fn list_blossom_page(
+        &self,
+        pubkey: &str,
+        after_uploaded: Option<u64>,
+        after_sha: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<(String, BlossomMeta)>> {
+        let rtxn = self.env.read_txn()?;
+        let prefix = format!("{BLOSSOM_ORDER_PREFIX}{pubkey}:");
+        let mut upper_buf: Vec<u8> = Vec::new();
+        if let (Some(uploaded), Some(sha)) = (after_uploaded, after_sha) {
+            upper_buf = format!("{prefix}{uploaded:020}{sha}").into_bytes();
+        }
+        let upper: std::ops::Bound<&[u8]> = if upper_buf.is_empty() {
+            // The whole owner range: `bls:<pubkey>:` up to the next prefix.
+            let mut end = prefix.clone().into_bytes();
+            *end.last_mut().unwrap() += 1;
+            upper_buf = end;
+            std::ops::Bound::Excluded(upper_buf.as_slice())
+        } else {
+            std::ops::Bound::Excluded(upper_buf.as_slice())
+        };
+        let mut out = Vec::new();
+        for item in self.blossom.rev_range(
+            &rtxn,
+            &(std::ops::Bound::Included(prefix.as_bytes()), upper),
+        )? {
+            if out.len() >= limit {
+                break;
+            }
+            let (key, _) = item?;
+            let rest = &key[prefix.len()..];
+            if rest.len() != 20 + ID_LEN {
+                continue;
+            }
+            let sha = String::from_utf8_lossy(&rest[20..]);
+            let Some(meta) = self.load_blossom_mapping(&sha)? else {
+                // A stale order key (mapping deleted): skip it.
+                continue;
+            };
+            if !meta.owners.iter().any(|o| o == pubkey) {
+                continue;
+            }
+            out.push((sha.into_owned(), meta));
+        }
+        Ok(out)
+    }
+
+    /// Whether the uploaded-order index has been built (marker key).
+    pub(crate) fn blossom_order_needs_rebuild(&self) -> Result<bool> {
+        let rtxn = self.env.read_txn()?;
+        Ok(self.index_meta.get(&rtxn, b"blossom_order")?.is_none())
+    }
+
+    /// Builds the uploaded-order index from the existing mappings (one-time
+    /// backfill for databases written before the index existed).
+    pub(crate) fn rebuild_blossom_order(&self) -> Result<usize> {
+        let rtxn = self.env.read_txn()?;
+        let mut wtxn = self.env.write_txn()?;
+        let mut count = 0usize;
+        for item in self.blossom.iter(&rtxn)? {
+            let (key, raw) = item?;
+            let key = String::from_utf8_lossy(key);
+            let Some(sha) = key.strip_prefix("sha:") else {
+                continue;
+            };
+            let Ok(meta) = serde_json::from_slice::<BlossomMeta>(raw) else {
+                continue;
+            };
+            for owner in &meta.owners {
+                self.blossom.put(
+                    &mut wtxn,
+                    blossom_order_key(owner, meta.uploaded, sha).as_bytes(),
+                    b"",
+                )?;
+                count += 1;
+            }
+        }
+        self.index_meta.put(&mut wtxn, b"blossom_order", b"1")?;
+        wtxn.commit()?;
+        Ok(count)
     }
 
     /// Persists the relay pubkey access lists ((pubkey, reason) pairs for
@@ -1271,11 +1432,21 @@ impl Store {
             return Ok(false);
         }
         let rtxn = self.env.read_txn()?;
-        let has_events = !self.by_created.is_empty(&rtxn)?;
-        let meta_empty = self
+        let events = self.by_created.len(&rtxn)?;
+        if events == 0 {
+            return Ok(false);
+        }
+        // Compare counts instead of "meta is empty": toggling the index off
+        // and on again leaves the *earlier* events without meta while the
+        // index is non-empty, and the old check then never rebuilt them
+        // (correctness stayed via the full-parse fallback, but scans paid
+        // the parse cost forever).
+        let meta = self
             .event_meta
-            .is_none_or(|db| db.is_empty(&rtxn).unwrap_or(true));
-        Ok(has_events && meta_empty)
+            .map(|db| db.len(&rtxn))
+            .transpose()?
+            .unwrap_or(0);
+        Ok(meta < events)
     }
 
     /// Rebuilds the [`EVENT_META`] index from the stored events (read and
@@ -1497,8 +1668,8 @@ impl Store {
         }
         if let Some(by_word) = self.by_word {
             let words = nip50::tokenize(&event.content);
-            let overflow = words.len() > self.max_indexed_words;
-            for word in words.iter().take(self.max_indexed_words) {
+            let overflow = words.len() > self.indexed_words;
+            for word in words.iter().take(self.indexed_words) {
                 let key = word_key(word, created, id);
                 // Skip rather than error: an over-long word would abort the
                 // whole write batch (see MAX_INDEX_KEY).
@@ -1607,8 +1778,8 @@ impl Store {
         }
         if let Some(by_word) = self.by_word {
             let words = nip50::tokenize(&event.content);
-            let overflow = words.len() > self.max_indexed_words;
-            for word in words.iter().take(self.max_indexed_words) {
+            let overflow = words.len() > self.indexed_words;
+            for word in words.iter().take(self.indexed_words) {
                 // Mirror the put path for the same reason as tags above.
                 let key = word_key(word, event.created_at, id);
                 if key.len() <= MAX_INDEX_KEY {

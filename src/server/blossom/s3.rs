@@ -394,6 +394,13 @@ impl S3Client {
     }
 
     pub(crate) async fn delete_object(&self, key: &str) -> Result<bool> {
+        // S3 answers 204 for DELETE of a missing key, so existence is
+        // checked with a HEAD first (the caller's `existed` flag must be
+        // meaningful).
+        let (head, _) = self.send("HEAD", key, "", None, None, &[]).await?;
+        if head == reqwest::StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
         let (status, _) = self.send("DELETE", key, "", None, None, &[]).await?;
         if status == reqwest::StatusCode::NOT_FOUND {
             return Ok(false);

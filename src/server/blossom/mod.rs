@@ -1160,27 +1160,36 @@ async fn list(
         None => Some(100),
     };
     let cursor = params.get("cursor").map(String::as_str);
-    // The store walk itself is capped (`LIST_SCAN_CAP`): resolving is what
-    // costs (one metadata read per blob), and pages past the window yield
-    // an empty page like an unknown cursor below.
-    const LIST_SCAN_CAP: usize = 5000;
-    let mut blobs = state.store.list(&pubkey, LIST_SCAN_CAP).await;
-    // BUD-12: sorted by `uploaded` descending; the page starts after the
-    // cursor and never includes it. An unknown (but well-formed) cursor
-    // yields an empty page — not the first page — so a client paging with
+    // BUD-12: the cursor is the previous page's last sha256. Its upload
+    // time positions the scan in the uploaded-order index; an unknown (but
+    // well-formed) cursor yields an empty page — never the first page — so
     // a stale cursor cannot loop over duplicates forever.
-    blobs.sort_by_key(|d| std::cmp::Reverse(d.uploaded));
-    if let Some(cursor) = cursor {
-        match blobs.iter().position(|d| d.sha256 == cursor) {
-            Some(pos) => {
-                blobs.drain(..=pos);
+    let (after_uploaded, after_sha) = match cursor {
+        Some(sha) => match state.store.find(sha).await {
+            Some(desc) => (Some(desc.uploaded.max(0) as u64), Some(sha.to_string())),
+            None => {
+                let empty: Vec<Value> = Vec::new();
+                return (
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    serde_json::to_string(&empty).unwrap(),
+                )
+                    .into_response();
             }
-            None => blobs.clear(),
-        }
-    }
-    if let Some(limit) = limit {
-        blobs.truncate(limit);
-    }
+        },
+        None => (None, None),
+    };
+    // The page comes from the uploaded-order index (newest first), so every
+    // blob of the owner is reachable — the old sha-ordered window hid
+    // everything past its first 5000 entries.
+    let blobs = state
+        .store
+        .list_page(
+            &pubkey,
+            after_uploaded,
+            after_sha.as_deref(),
+            limit.unwrap_or(100),
+        )
+        .await;
     let items: Vec<Value> = blobs
         .into_iter()
         .map(|d| {

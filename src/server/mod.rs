@@ -371,9 +371,12 @@ pub async fn run_server(config_path: PathBuf, config: Config, db: DbClient) -> R
     let config = Arc::new(tokio::sync::RwLock::new(config));
     let stats = Stats::new();
     let mut relay = Arc::new(Relay::new(config, db, stats, &private_key, live).await);
-    Arc::get_mut(&mut relay)
-        .expect("relay not cloned yet")
-        .start_live_bus();
+    match Arc::get_mut(&mut relay) {
+        Some(relay) => relay.start_live_bus(),
+        // Unreachable today (nothing cloned the Arc yet): fail soft instead
+        // of panicking at startup if a future change adds a clone.
+        None => log::error!("relay was already cloned; live bus not started"),
+    }
     // Make the config file path known to the relay so NIP-86 runtime
     // changes (relay name/description/icon) can be persisted to disk.
     *relay.config_path.write().await = Some(config_path.clone());
@@ -840,7 +843,14 @@ async fn stats_writer(relay: Arc<Relay>, mut shutdown: watch::Receiver<bool>) {
                     .store(relay.db.size_on_disk().await, std::sync::atomic::Ordering::Relaxed);
                 relay.stats.bump(&relay.stats.db_errors, relay.db.take_errors());
                 if let Ok(json) = serde_json::to_string_pretty(&relay.stats.as_json()) {
-                    write_atomic(&path, json.as_bytes());
+                    // The atomic write (fsync + rename) is blocking I/O:
+                    // run it on the blocking pool instead of stalling an
+                    // async worker.
+                    let path = path.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        write_atomic(&path, json.as_bytes())
+                    })
+                    .await;
                 }
             }
             _ = shutdown.changed() => break,
@@ -983,12 +993,13 @@ impl IpConnLimiter {
         }
         // New ip: never clear the whole map (a clear would reset every
         // window and permanently disable the per-IP limit): expired
-        // windows are evicted first, a still-full map skips tracking the
-        // new ip only.
+        // windows are evicted first. A still-full map refuses the new ip
+        // (fail closed): passing it through let a host with more than
+        // MAX_TRACKED_IPS addresses bypass the limiter entirely.
         if seen.len() >= MAX_TRACKED_IPS {
             seen.retain(|_, w| w.front().is_some_and(|t| now.saturating_sub(*t) < 1));
             if seen.len() >= MAX_TRACKED_IPS {
-                return true;
+                return false;
             }
         }
         seen.entry(ip).or_default().push_back(now);
@@ -1132,7 +1143,11 @@ async fn serve_limited(
                 // connections cost nothing.
                 let _ = stream.set_nodelay(true);
                 unsafe {
-                    set_sock_opt(&stream, libc::SO_RCVBUF, (recv_buf_kb * 1024) as i32);
+                    set_sock_opt(
+                        &stream,
+                        libc::SO_RCVBUF,
+                        i32::try_from(recv_buf_kb.saturating_mul(1024)).unwrap_or(i32::MAX),
+                    );
                     set_sock_opt(&stream, libc::SO_SNDBUF, 16 * 1024);
                 }
 
@@ -2205,16 +2220,26 @@ mod tests {
     }
 
     #[test]
-    fn ip_conn_limiter_map_is_bounded() {
+    fn ip_conn_limiter_map_is_bounded_and_fails_closed() {
         let limiter = IpConnLimiter::new(1).unwrap();
+        let mut accepted = 0usize;
         for i in 0..20_000u32 {
             let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, (i >> 8) as u8, i as u8));
-            assert!(limiter.allow(ip, 1_700_000_000));
+            if limiter.allow(ip, 1_700_000_000) {
+                accepted += 1;
+            }
         }
         assert!(
             limiter.seen.lock().unwrap().len() <= 10_000,
             "the tracked-IP map must not exceed its bound"
         );
+        assert!(accepted <= 10_000, "the limiter must not bypass the cap");
+        // A full map of unexpired windows refuses new IPs instead of
+        // letting them through untracked.
+        let extra: std::net::IpAddr = "198.51.100.9".parse().unwrap();
+        assert!(!limiter.allow(extra, 1_700_000_000));
+        // Once the windows expire, eviction resumes tracking.
+        assert!(limiter.allow(extra, 1_700_000_002));
     }
 
     #[test]

@@ -261,6 +261,7 @@ fn handle_read_msg(store: &Store, errors: &Arc<std::sync::atomic::AtomicU64>, ms
             let _ = reply.send(meta);
             false
         }
+        #[cfg(test)]
         Msg::BlossomList {
             pubkey,
             limit,
@@ -274,6 +275,25 @@ fn handle_read_msg(store: &Store, errors: &Arc<std::sync::atomic::AtomicU64>, ms
                 }
             };
             let _ = reply.send(shas);
+            false
+        }
+        Msg::BlossomListPage {
+            pubkey,
+            after_uploaded,
+            after_sha,
+            limit,
+            reply,
+        } => {
+            let page =
+                match store.list_blossom_page(&pubkey, after_uploaded, after_sha.as_deref(), limit)
+                {
+                    Ok(page) => page,
+                    Err(e) => {
+                        db_error(errors, &e);
+                        Vec::new()
+                    }
+                };
+            let _ = reply.send(page);
             false
         }
         Msg::BlossomMigrationDone { reply } => {
@@ -496,6 +516,18 @@ pub(crate) fn spawn(
             Ok(false) => {}
             Err(e) => log::warn!("gift-wrap recipient index check failed: {e}"),
         }
+        // One-time backfill of the Blossom uploaded-order index (BUD-12
+        // paging): databases written before the index existed page from
+        // their sha-ordered reverse index, which hid every blob past the
+        // scan window.
+        match store.blossom_order_needs_rebuild() {
+            Ok(true) => match store.rebuild_blossom_order() {
+                Ok(n) => log::info!("blossom uploaded-order index rebuilt ({n} owners)"),
+                Err(e) => db_error(&thread_errors, &e),
+            },
+            Ok(false) => {}
+            Err(e) => db_error(&thread_errors, &e),
+        }
         // Puts are applied in batches sharing one write transaction so
         // that the LMDB commit cost (a full fsync by default) is paid
         // once per batch instead of once per event. Replies are only
@@ -623,6 +655,28 @@ pub(crate) fn spawn(
                                     };
                                     let _ = reply.send(meta);
                                 }
+                                Msg::BlossomListPage {
+                                    pubkey,
+                                    after_uploaded,
+                                    after_sha,
+                                    limit,
+                                    reply,
+                                } => {
+                                    let page = match store.list_blossom_page(
+                                        &pubkey,
+                                        after_uploaded,
+                                        after_sha.as_deref(),
+                                        limit,
+                                    ) {
+                                        Ok(page) => page,
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            Vec::new()
+                                        }
+                                    };
+                                    let _ = reply.send(page);
+                                }
+                                #[cfg(test)]
                                 Msg::BlossomList {
                                     pubkey,
                                     limit,
