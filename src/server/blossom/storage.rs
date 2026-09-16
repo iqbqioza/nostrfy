@@ -104,6 +104,16 @@ impl BlobStore {
         }
     }
 
+    /// A directory on the blob filesystem where uploads may be spooled, so
+    /// the final store is a rename instead of a second full write (None for
+    /// S3, which keeps the system temp directory).
+    pub(crate) fn spool_dir(&self) -> Option<PathBuf> {
+        match &self.storage {
+            Storage::Local(s) => Some(s.root.join(".spool")),
+            Storage::S3(_) => None,
+        }
+    }
+
     /// Reserves `size` bytes against the local free-space floor for the
     /// duration of an upload (no-op on S3). The guard releases on drop.
     fn reserve_space(&self, size: u64) -> Result<SpaceReservation<'_>> {
@@ -709,6 +719,16 @@ impl LocalStore {
         tokio::fs::create_dir_all(&dir).await?;
         if !self.parent_within_root(npub).await {
             return Err(anyhow!("blossom storage directory is a symlink"));
+        }
+        // Fast path: a spool on the same filesystem is moved into place
+        // instead of copied (the upload already wrote it once). Any rename
+        // failure (EXDEV, permissions, a planted directory at the target)
+        // falls back to the copy path below.
+        if tokio::fs::rename(source, self.rooted_path(npub, sha256))
+            .await
+            .is_ok()
+        {
+            return Ok(());
         }
         let tmp_path = self.rooted_path(npub, &format!(".{sha256}.tmp"));
         let mut input = tokio::fs::File::open(source).await?;
