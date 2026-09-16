@@ -133,6 +133,10 @@ pub struct Relay {
     /// persisted in the database, but this guard also makes direct/replayed
     /// side-effect dispatch idempotent before another response is emitted.
     command_events: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Cached static part of the NIP-11 information document (the volatile
+    /// `stats` section is rebuilt per request); invalidated by the config
+    /// version and the access lists the document reads.
+    pub(crate) nip11_cache: std::sync::Mutex<Option<crate::nips::nip11::Nip11Cache>>,
 }
 
 /// Issues strictly increasing timestamps for relay-generated events.
@@ -426,6 +430,7 @@ impl Relay {
             audit: crate::audit::AuditLog::default(),
             nip98_replay: Default::default(),
             command_events: std::sync::Mutex::new(std::collections::HashSet::new()),
+            nip11_cache: std::sync::Mutex::new(None),
         }
     }
 
@@ -2856,5 +2861,30 @@ mod tests {
             );
             relay.db.shutdown();
         });
+    }
+
+    #[tokio::test]
+    async fn nip11_document_cache_tracks_access_and_config_version() {
+        let relay = build_relay().await;
+        let doc = relay.relay_info_document().await;
+        assert_eq!(doc["limitation"]["restricted_writes"], false);
+        assert_eq!(doc["stats"]["events"]["accepted"].as_u64(), Some(0));
+        // An access-only change (no SIGHUP) must invalidate the cached
+        // document: NIP-86 kind lists are reloaded without a version bump.
+        relay.access.write().await.allowed_kinds.push(1);
+        let doc = relay.relay_info_document().await;
+        assert_eq!(doc["limitation"]["restricted_writes"], true);
+        // The reload path bumps the version after swapping the config.
+        relay.config.write().await.relay.name = "renamed".into();
+        relay
+            .config_version
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let doc = relay.relay_info_document().await;
+        assert_eq!(doc["name"], "renamed");
+        // Stats stay fresh on the cached path too.
+        relay.stats.bump(&relay.stats.events_accepted, 5);
+        let doc = relay.relay_info_document().await;
+        assert_eq!(doc["stats"]["events"]["accepted"].as_u64(), Some(5));
+        relay.db.shutdown();
     }
 }

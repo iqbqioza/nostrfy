@@ -31,7 +31,7 @@ use tower::util::ServiceExt;
 use crate::config::Config;
 use crate::db::DbClient;
 use crate::error::{Result, config_err};
-use crate::nips::nip11::{relay_info, stats_handler};
+use crate::nips::nip11::stats_handler;
 use crate::nips::nip86;
 use crate::relay::Relay;
 use crate::stats::Stats;
@@ -741,14 +741,7 @@ async fn blossom_root_info(
 /// The NIP-11 relay information document, served with `application/nostr+json`
 /// when the client asked for it.
 async fn nip11_doc(relay: Arc<Relay>, wants_nostr_json: bool) -> Response {
-    let cfg = relay.config.read().await;
-    let access = relay.access.read().await;
-    let body = Json(relay_info(
-        &cfg,
-        &access,
-        &relay.stats,
-        relay.relay_pubkey().as_deref(),
-    ));
+    let body = Json(relay.relay_info_document().await);
     let mut response = body.into_response();
     if wants_nostr_json {
         response.headers_mut().insert(
