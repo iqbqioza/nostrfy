@@ -1360,6 +1360,52 @@ fn group_members_are_bounded() {
 }
 
 #[test]
+fn ghost_missing_withholds_groups_lost_in_a_vanish_rebuild() {
+    // A vanish rebuild that loses a group whose create/settings were
+    // authored by the vanished key must ghost it: on a keyless relay only
+    // ordinary posts may survive, and they must not become world-readable.
+    let mut store = GroupStore::default();
+    store.apply(
+        &event(CREATE_GROUP, ADMIN, Some("g1"), vec![]),
+        "relay",
+        1,
+        false,
+        false,
+    );
+    let previous: Vec<String> = store.groups.keys().cloned().collect();
+    assert_eq!(previous, vec!["g1".to_string()]);
+    let mut rebuilt = GroupStore::default();
+    rebuilt.ghost_missing(previous);
+    assert!(
+        !rebuilt.visible_gid("g1", false, None),
+        "a group lost in the rebuild must be ghosted (content withheld)"
+    );
+    // An explicitly deleted group stays deleted (not ghosted).
+    let mut store = GroupStore::default();
+    store.apply(
+        &event(CREATE_GROUP, ADMIN, Some("g2"), vec![]),
+        "relay",
+        1,
+        false,
+        false,
+    );
+    store.apply(
+        &event(9008, ADMIN, Some("g2"), vec![]),
+        "relay",
+        2,
+        false,
+        false,
+    );
+    let previous: Vec<String> = store.groups.keys().cloned().collect();
+    let mut rebuilt = GroupStore::default();
+    rebuilt.ghost_missing(previous);
+    assert!(
+        !rebuilt.ghost.contains("g2"),
+        "a 9008-deleted id must not be added to the ghost set"
+    );
+}
+
+#[test]
 fn apply_keeps_the_last_admin_on_9000_demotion() {
     // The read-side validation can be raced by two concurrent 9000
     // demotions; `apply` re-checks the resulting member map under the write
