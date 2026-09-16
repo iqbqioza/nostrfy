@@ -81,7 +81,10 @@ pub(crate) fn db_error(errors: &Arc<std::sync::atomic::AtomicU64>, e: &anyhow::E
 
 enum Msg {
     Put {
-        event: Event,
+        /// Shared with the caller: the relay keeps the same allocation for
+        /// its post-commit side effects and live broadcast instead of deep
+        /// cloning the content (up to 64 KiB) on every accepted event.
+        event: Arc<Event>,
         now: u64,
         /// First-seen reservation applied inside the same write transaction
         /// as the put (see `WriteBatch::first_seen`).
@@ -104,7 +107,7 @@ enum Msg {
     },
     /// Accepts many events in a single write transaction (one commit).
     PutBatch {
-        events: Vec<(Event, u64)>,
+        events: Vec<(Arc<Event>, u64)>,
         reply: oneshot::Sender<Vec<PutOutcome>>,
     },
     /// First-seen trust bookkeeping: records the arrival time of each
@@ -869,16 +872,17 @@ impl DbClient {
         }
     }
 
-    pub async fn put(&self, event: Event, now: u64) -> PutOutcome {
-        self.put_with_first_seen(event, now, None).await
+    pub async fn put(&self, event: impl Into<Arc<Event>>, now: u64) -> PutOutcome {
+        self.put_with_first_seen(event.into(), now, None).await
     }
 
     /// Like [`Self::put`], but records the pubkey's first-seen timestamp in
     /// the same write transaction (one commit/fsync instead of two for a
-    /// pubkey's first accepted event).
+    /// pubkey's first accepted event). Takes an [`Arc<Event>`] so the caller
+    /// can reuse the same allocation for its post-commit side effects.
     pub async fn put_with_first_seen(
         &self,
-        event: Event,
+        event: Arc<Event>,
         now: u64,
         first_seen: Option<([u8; 32], u64)>,
     ) -> PutOutcome {
@@ -1083,6 +1087,10 @@ impl DbClient {
     /// tests; the relay itself goes through [`Self::put_batch_deferred`].
     #[allow(dead_code)]
     pub async fn put_batch(&self, events: Vec<(Event, u64)>) -> Vec<PutOutcome> {
+        let events = events
+            .into_iter()
+            .map(|(event, now)| (Arc::new(event), now))
+            .collect();
         self.request_write(|reply| Msg::PutBatch { events, reply })
             .await
     }
@@ -1091,10 +1099,11 @@ impl DbClient {
     /// without awaiting it: the connection can keep reading frames while
     /// the writer commits, instead of stalling on the commit (and letting
     /// the socket buffer decide the batch size). Returns `None` when the
-    /// queue is full (the batch was not queued).
+    /// queue is full (the batch was not queued). The events are shared
+    /// [`Arc`]s so queueing a batch never deep-copies the contents.
     pub fn put_batch_deferred(
         &self,
-        events: Vec<(Event, u64)>,
+        events: Vec<(Arc<Event>, u64)>,
     ) -> Option<tokio::sync::oneshot::Receiver<Vec<PutOutcome>>> {
         self.send_request(|reply| Msg::PutBatch { events, reply }, &self.tx)
     }

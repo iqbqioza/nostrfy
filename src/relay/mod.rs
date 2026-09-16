@@ -24,6 +24,7 @@ use crate::event::Event;
 use crate::nips::nip09;
 use crate::nips::nip29::{self, GroupStore};
 use crate::nips::nip43::{self, RoleStore};
+use crate::nips::nip62;
 use crate::stats::Stats;
 use crate::util::unix_now;
 
@@ -51,8 +52,8 @@ pub struct Relay {
     /// Connection id counter: the id identifies a connection in the
     /// subscription index and the queue map.
     pub next_conn_id: std::sync::atomic::AtomicU64,
-    live_tx: mpsc::Sender<(Event, Arc<String>)>,
-    live_rx: Option<mpsc::Receiver<(Event, Arc<String>)>>,
+    live_tx: mpsc::Sender<(Arc<Event>, Arc<String>)>,
+    live_rx: Option<mpsc::Receiver<(Arc<Event>, Arc<String>)>>,
     live_batch_interval_ms: u64,
     live_batch_size: usize,
     pub groups: Arc<RwLock<GroupStore>>,
@@ -462,8 +463,8 @@ impl Relay {
             let mut interval =
                 tokio::time::interval(tokio::time::Duration::from_millis(interval_ms));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            let mut batch: Vec<(Event, Arc<String>)> = Vec::with_capacity(batch_size);
-            let flush = |batch: &mut Vec<(Event, Arc<String>)>| {
+            let mut batch: Vec<(Arc<Event>, Arc<String>)> = Vec::with_capacity(batch_size);
+            let flush = |batch: &mut Vec<(Arc<Event>, Arc<String>)>| {
                 if batch.is_empty() {
                     return;
                 }
@@ -558,8 +559,11 @@ impl Relay {
     /// the bounded live buffer is propagated to the accepting task so an
     /// accepted event is never silently lost before fan-out. The JSON is
     /// encoded once here — every subscriber shares the same serialization.
-    pub async fn broadcast(&self, event: Event) -> Result<(), ()> {
-        let json = Arc::new(serde_json::to_string(&event).unwrap_or_default());
+    /// Accepts an [`Arc<Event>`] (or an owned [`Event`]) so the accept path
+    /// can share one allocation with the database write.
+    pub async fn broadcast(&self, event: impl Into<Arc<Event>>) -> Result<(), ()> {
+        let event = event.into();
+        let json = Arc::new(serde_json::to_string(&*event).unwrap_or_default());
         if self.live_tx.send((event, json)).await.is_err() {
             log::error!("live bus stopped before an accepted event could be broadcast");
             self.stats.bump(&self.stats.db_errors, 1);
@@ -790,28 +794,45 @@ impl Relay {
 
     /// Validates and stores a single event. The live path batches events
     /// through [`Self::accept_events_batch`], which falls back to this
-    /// method for batches containing group-state events.
+    /// method for batches containing group-state events. Test-only: the
+    /// accept paths call [`Self::accept_event_verified`] directly.
+    #[cfg(test)]
     pub async fn accept_event(
         &self,
         event: Event,
         authed: &[String],
         known_prefixes: Option<&std::collections::HashSet<Vec<u8>>>,
-    ) -> (PutOutcome, Option<Arc<Event>>) {
+    ) -> PutOutcome {
+        self.accept_event_verified(event, authed, known_prefixes, None)
+            .await
+    }
+
+    /// Like [`Self::accept_event`], but accepts a precomputed signature
+    /// verdict (the mixed-batch path verifies a whole batch in parallel and
+    /// hands the verdicts to the sequential events instead of re-checking
+    /// each signature inline).
+    async fn accept_event_verified(
+        &self,
+        event: Event,
+        authed: &[String],
+        known_prefixes: Option<&std::collections::HashSet<Vec<u8>>>,
+        verified: Option<bool>,
+    ) -> PutOutcome {
         let now = unix_now();
         let cfg = self.config.read().await;
         let access = self.access.read().await;
 
         match self
-            .precheck(&cfg, &access, &event, now, authed, known_prefixes, None)
+            .precheck(&cfg, &access, &event, now, authed, known_prefixes, verified)
             .await
         {
             crate::relay::validate::Precheck::Reject(reason) => {
                 self.stats.bump(&self.stats.events_rejected, 1);
-                return (PutOutcome::Invalid(reason), None);
+                return PutOutcome::Invalid(reason);
             }
             crate::relay::validate::Precheck::Duplicate(msg) => {
                 self.stats.bump(&self.stats.events_duplicate, 1);
-                return (PutOutcome::Duplicate(msg), None);
+                return PutOutcome::Duplicate(msg);
             }
             crate::relay::validate::Precheck::Vanish => {
                 // NIP-62: delete everything by this pubkey and never
@@ -824,7 +845,7 @@ impl Relay {
                 // (and the group/role snapshots are only rewritten when a
                 // membership actually changed).
                 let Some(pubkey) = event.pubkey_bytes() else {
-                    return (PutOutcome::Invalid("invalid: bad pubkey".into()), None);
+                    return PutOutcome::Invalid("invalid: bad pubkey".into());
                 };
                 // `vanish_pubkey` re-reads the config: release this guard
                 // first. Holding a read guard across that second read would
@@ -837,7 +858,7 @@ impl Relay {
                 // OK:true is sent): count it so the accepted/rejected
                 // accounting stays consistent with the OKs.
                 self.stats.bump(&self.stats.events_accepted, 1);
-                return (PutOutcome::Stored, None);
+                return PutOutcome::Stored;
             }
             crate::relay::validate::Precheck::Accept => {}
         }
@@ -856,27 +877,18 @@ impl Relay {
             let Some(&(created, first_seen)) = first_seens.first() else {
                 // The database is unavailable or overloaded: fail closed.
                 self.stats.bump(&self.stats.events_rejected, 1);
-                return (
-                    PutOutcome::Invalid("error: database unavailable".into()),
-                    None,
-                );
+                return PutOutcome::Invalid("error: database unavailable".into());
             };
             persist_first_seen = created;
             if !created && now.saturating_sub(first_seen) < cfg.relay.new_pubkey_min_age_secs {
                 self.stats.bump(&self.stats.events_rejected, 1);
-                return (
-                    PutOutcome::Invalid("restricted: your account is too new".into()),
-                    None,
-                );
+                return PutOutcome::Invalid("restricted: your account is too new".into());
             }
         }
 
         if !self.publish_rate_allowed(&cfg, &event.pubkey, now) {
             self.stats.bump(&self.stats.events_rejected, 1);
-            return (
-                PutOutcome::Invalid("rate-limited: too many events".into()),
-                None,
-            );
+            return PutOutcome::Invalid("rate-limited: too many events".into());
         }
         // The first-seen reservation rides along with the put: applied in
         // the same write transaction (one commit/fsync) only when the event
@@ -886,9 +898,12 @@ impl Relay {
         } else {
             None
         };
+        // One allocation shared by the database write and the live
+        // broadcast: the event content is never deep-copied on this path.
+        let event = Arc::new(event);
         let outcome = self
             .db
-            .put_with_first_seen(event.clone(), now, first_seen)
+            .put_with_first_seen(Arc::clone(&event), now, first_seen)
             .await;
         let (nip9, nip43, nip29_enabled) =
             (cfg.nip_enabled(9), cfg.nip_enabled(43), cfg.nip_enabled(29));
@@ -908,15 +923,15 @@ impl Relay {
                     log::error!("event persisted but live delivery failed");
                 }
                 self.stats.bump(&self.stats.events_accepted, 1);
-                (outcome, None)
+                outcome
             }
             PutOutcome::Duplicate(_) => {
                 self.stats.bump(&self.stats.events_duplicate, 1);
-                (outcome, None)
+                outcome
             }
             other => {
                 self.stats.bump(&self.stats.events_rejected, 1);
-                (other, None)
+                other
             }
         }
     }
@@ -934,134 +949,201 @@ impl Relay {
         batch.finish(self).await
     }
 
-    /// The in-flight part of a non-group batch: the per-event checks have
-    /// run and the write is queued on the writer thread, but the commit
-    /// has not been awaited yet. The connection can keep reading frames
-    /// while the writer commits.
     /// Phase 1 of [`Self::accept_events_batch`]: the per-event checks and
     /// the writer queueing. The write is *queued* (not awaited), so the
     /// caller can keep reading frames while the writer commits; the
     /// outcomes arrive through [`PendingBatch::finish`]. Batches containing
-    /// group-state events are fully resolved here (the sequential path).
+    /// state-mutating events are split into stateless runs (committed as
+    /// batches) and sequential singletons, resolved before returning.
     pub(crate) async fn accept_batch_begin(
         &self,
         events: Vec<Event>,
         authed: &[String],
     ) -> PendingBatch {
-        // Group moderation events mutate the in-memory group state; their
-        // effects must be visible to later events of the same batch (e.g. a
-        // put-user followed by the new member's post), so batches containing
-        // them are processed sequentially.
-        if events.iter().any(|e| {
-            nip29::group_id(e).is_some()
-                || (nip29::MOD_MIN..=nip29::MOD_MAX).contains(&e.kind)
-                || e.kind == nip29::JOIN
-                || e.kind == nip29::LEAVE
-        }) {
-            // Check every `previous` tag reference of the whole batch in one
-            // database round trip: a single event must not be able to
-            // amplify into thousands of database requests. Dedup with a set
-            // so that a batch full of distinct `previous` tags (up to
-            // max_tags per event) cannot turn the dedup itself quadratic.
-            // The collection is additionally capped: without a bound a
-            // single batch (EVENT_BATCH * 32 events x max_tags references)
-            // could pin megabytes of prefixes and force millions of LMDB
-            // range probes inside one read transaction, stalling the
-            // reader. References past the cap are treated as unknown, so
-            // the affected events fail closed instead of stalling the relay.
-            const MAX_PREVIOUS_PREFIXES: usize = 1024;
-            let mut prefixes: Vec<Vec<u8>> = Vec::new();
-            let mut seen_prefixes: std::collections::HashSet<Vec<u8>> =
-                std::collections::HashSet::new();
-            let mut previous_capped = false;
-            'collect: for event in &events {
-                for prefix in nip29::previous_tags(event) {
-                    if prefixes.len() >= MAX_PREVIOUS_PREFIXES {
-                        previous_capped = true;
-                        break 'collect;
-                    }
-                    let Ok(prefix) = hex::decode(&prefix) else {
-                        continue;
-                    };
-                    if !prefix.is_empty() && seen_prefixes.insert(prefix.clone()) {
-                        prefixes.push(prefix);
-                    }
-                }
-            }
-            if previous_capped {
-                log::warn!(
-                    "capped previous-tag references at {MAX_PREVIOUS_PREFIXES} for a batch of {} events",
-                    events.len()
-                );
-            }
-            let mut known: std::collections::HashSet<Vec<u8>> = if prefixes.is_empty() {
-                std::collections::HashSet::new()
-            } else {
-                let existing = self.db.prefixes_exist(prefixes.clone()).await;
-                prefixes
-                    .into_iter()
-                    .zip(existing)
-                    .filter_map(|(p, exists)| exists.then_some(p))
-                    .collect()
-            };
-            // References to sibling events of the same batch are valid: the
-            // group state changes are applied sequentially, so an earlier
-            // event of the batch is a legitimate `previous` target even
-            // though it is not committed to the database yet.
-            for event in &events {
-                if let Ok(id_bytes) = hex::decode(&event.id) {
-                    for len in 1..=id_bytes.len() {
-                        known.insert(id_bytes[..len].to_vec());
-                    }
-                }
-            }
-            let mut out = Vec::with_capacity(events.len());
-            for event in events {
-                let id = event.id.clone();
-                let (outcome, _) = self.accept_event(event, authed, Some(&known)).await;
-                out.push((id, outcome));
-            }
-            return PendingBatch {
-                receiver: None,
-                resolved: Some(out),
-                results: Vec::new(),
-                put_slots: Vec::new(),
-                puts: Vec::new(),
-                new_pubkeys: Vec::new(),
-                vanishes: Vec::new(),
-                now: 0,
-                nip9: false,
-                nip43: false,
-                nip29: false,
-            };
+        // Events with post-commit state effects must be applied before the
+        // later events of the batch are prechecked (e.g. a put-user
+        // followed by the new member's post), so they split the batch. The
+        // common group traffic — `h`-tagged chat messages — has no such
+        // effects and keeps the batched fast path instead of forcing the
+        // whole batch through per-event commits.
+        if events.iter().any(|e| self.has_state_effects(e)) {
+            return self.accept_batch_mixed(events, authed).await;
         }
+        self.accept_batch_non_group(events, authed, None, None)
+            .await
+    }
+
+    /// Whether accepting `event` has post-commit effects that later events
+    /// of the same batch must observe before their own prechecks: NIP-29
+    /// group state and NIP-43 role mutations, NIP-62 vanish requests and
+    /// relay command events (kind:1 signed by the relay's own key, which
+    /// can change the running config).
+    fn has_state_effects(&self, event: &Event) -> bool {
+        (nip29::MOD_MIN..=nip29::MOD_MAX).contains(&event.kind)
+            || event.kind == nip29::JOIN
+            || event.kind == nip29::LEAVE
+            || nip62::is_vanish(event)
+            || (event.kind == 1 && self.relay_pubkey.as_deref() == Some(event.pubkey.as_str()))
+    }
+
+    /// Hybrid path for a batch containing state-mutating events: maximal
+    /// runs of stateless events are committed as batches, the mutating
+    /// events are processed one at a time in order. The signature
+    /// verification of the whole batch runs once, in parallel, and both
+    /// paths reuse the verdicts.
+    async fn accept_batch_mixed(&self, events: Vec<Event>, authed: &[String]) -> PendingBatch {
+        // Check every `previous` tag reference of the whole batch in one
+        // database round trip: a single event must not be able to
+        // amplify into thousands of database requests. Dedup with a set
+        // so that a batch full of distinct `previous` tags (up to
+        // max_tags per event) cannot turn the dedup itself quadratic.
+        // The collection is additionally capped: without a bound a
+        // single batch (EVENT_BATCH * 32 events x max_tags references)
+        // could pin megabytes of prefixes and force millions of LMDB
+        // range probes inside one read transaction, stalling the
+        // reader. References past the cap are treated as unknown, so
+        // the affected events fail closed instead of stalling the relay.
+        const MAX_PREVIOUS_PREFIXES: usize = 1024;
+        let mut prefixes: Vec<Vec<u8>> = Vec::new();
+        let mut seen_prefixes: std::collections::HashSet<Vec<u8>> =
+            std::collections::HashSet::new();
+        let mut previous_capped = false;
+        'collect: for event in &events {
+            for prefix in nip29::previous_tags(event) {
+                if prefixes.len() >= MAX_PREVIOUS_PREFIXES {
+                    previous_capped = true;
+                    break 'collect;
+                }
+                let Ok(prefix) = hex::decode(&prefix) else {
+                    continue;
+                };
+                if !prefix.is_empty() && seen_prefixes.insert(prefix.clone()) {
+                    prefixes.push(prefix);
+                }
+            }
+        }
+        if previous_capped {
+            log::warn!(
+                "capped previous-tag references at {MAX_PREVIOUS_PREFIXES} for a batch of {} events",
+                events.len()
+            );
+        }
+        let mut known: std::collections::HashSet<Vec<u8>> = if prefixes.is_empty() {
+            std::collections::HashSet::new()
+        } else {
+            let existing = self.db.prefixes_exist(prefixes.clone()).await;
+            prefixes
+                .into_iter()
+                .zip(existing)
+                .filter_map(|(p, exists)| exists.then_some(p))
+                .collect()
+        };
+        // References to sibling events of the same batch are valid: an
+        // earlier event of the batch is a legitimate `previous` target even
+        // though it is not committed to the database yet.
+        for event in &events {
+            if let Ok(id_bytes) = hex::decode(&event.id) {
+                for len in 1..=id_bytes.len() {
+                    known.insert(id_bytes[..len].to_vec());
+                }
+            }
+        }
+        // One parallel pass for the whole batch: the sequential singletons
+        // below must not re-verify each signature inline.
+        let verified = crate::relay::validate::verify_signatures_parallel(&events, self.secp());
+        let mut out: Vec<(String, PutOutcome)> = Vec::with_capacity(events.len());
+        let mut run: Vec<Event> = Vec::new();
+        let mut run_verdicts: Vec<bool> = Vec::new();
+        for (index, event) in events.into_iter().enumerate() {
+            if self.has_state_effects(&event) {
+                if !run.is_empty() {
+                    let resolved = self
+                        .accept_batch_non_group(
+                            std::mem::take(&mut run),
+                            authed,
+                            Some(&known),
+                            Some(&run_verdicts),
+                        )
+                        .await
+                        .finish(self)
+                        .await;
+                    out.extend(resolved);
+                    run_verdicts.clear();
+                }
+                let id = event.id.clone();
+                let outcome = self
+                    .accept_event_verified(event, authed, Some(&known), Some(verified[index]))
+                    .await;
+                out.push((id, outcome));
+            } else {
+                run_verdicts.push(verified[index]);
+                run.push(event);
+            }
+        }
+        if !run.is_empty() {
+            let resolved = self
+                .accept_batch_non_group(run, authed, Some(&known), Some(&run_verdicts))
+                .await
+                .finish(self)
+                .await;
+            out.extend(resolved);
+        }
+        PendingBatch {
+            receiver: None,
+            resolved: Some(out),
+            results: Vec::new(),
+            put_slots: Vec::new(),
+            puts: Vec::new(),
+            new_pubkeys: Vec::new(),
+            vanishes: Vec::new(),
+            now: 0,
+            nip9: false,
+            nip43: false,
+            nip29: false,
+        }
+    }
+
+    /// The batched fast path: the per-event checks run in order and the
+    /// writes are merged into one transaction. `known_prefixes` supplies
+    /// the batch's pre-fetched `previous` references (None = per-reference
+    /// database lookups); `verified` supplies precomputed signature
+    /// verdicts (None = verify the batch in parallel here).
+    async fn accept_batch_non_group(
+        &self,
+        events: Vec<Event>,
+        authed: &[String],
+        known_prefixes: Option<&std::collections::HashSet<Vec<u8>>>,
+        verified: Option<&[bool]>,
+    ) -> PendingBatch {
         let now = unix_now();
         let cfg = self.config.read().await;
         let access = self.access.read().await;
         let mut results: Vec<(String, PutOutcome)> = Vec::with_capacity(events.len());
-        let mut puts: Vec<Event> = Vec::new();
+        let mut puts: Vec<Arc<Event>> = Vec::new();
         let mut put_slots: Vec<usize> = Vec::new();
         // (slot, id, event) of the vanish requests, resolved at the end so
         // the OK replies keep the order of the received batch.
         let mut vanishes: Vec<(usize, String, Event)> = Vec::new();
 
-        // This path only sees events without group involvement: batches
-        // containing group events (an `h` tag or a moderation/join/leave
-        // kind) are routed to the sequential [`Self::accept_event`] path
-        // above. The shared `precheck` still runs for every event.
-        //
         // The Schnorr signature check dominates the per-event accept cost
-        // (tens of microseconds), so a large batch first verifies every
-        // signature in parallel across the machine's cores and the
-        // sequential loop below reuses the verdicts. `validate_base` runs
-        // its cheap checks before consulting a verdict, so the reject
-        // reasons are identical to the inline-verify path.
-        let verified = crate::relay::validate::verify_signatures_parallel(&events, self.secp());
+        // (tens of microseconds), so a large batch verifies every signature
+        // in parallel across the machine's cores and the sequential loop
+        // below reuses the verdicts. `validate_base` runs its cheap checks
+        // before consulting a verdict, so the reject reasons are identical
+        // to the inline-verify path.
+        let computed;
+        let verified: &[bool] = match verified {
+            Some(verdicts) => verdicts,
+            None => {
+                computed = crate::relay::validate::verify_signatures_parallel(&events, self.secp());
+                &computed
+            }
+        };
         for event in events {
             let id = event.id.clone();
             let verified = verified.get(results.len()).copied();
             match self
-                .precheck(&cfg, &access, &event, now, authed, None, verified)
+                .precheck(&cfg, &access, &event, now, authed, known_prefixes, verified)
                 .await
             {
                 crate::relay::validate::Precheck::Reject(reason) => {
@@ -1083,7 +1165,7 @@ impl Relay {
             }
             put_slots.push(results.len());
             results.push((String::new(), PutOutcome::Invalid(String::new())));
-            puts.push(event);
+            puts.push(Arc::new(event));
         }
 
         let groups_enabled = cfg.nip_enabled(29);
@@ -1111,7 +1193,7 @@ impl Relay {
                 for (event, slot) in puts.into_iter().zip(put_slots) {
                     self.stats.bump(&self.stats.events_rejected, 1);
                     results[slot] = (
-                        event.id,
+                        event.id.clone(),
                         PutOutcome::Invalid("error: database unavailable".into()),
                     );
                 }
@@ -1127,7 +1209,7 @@ impl Relay {
                     if !created && now.saturating_sub(first_seen) < min_age {
                         self.stats.bump(&self.stats.events_rejected, 1);
                         results[slot] = (
-                            event.id,
+                            event.id.clone(),
                             PutOutcome::Invalid("restricted: your account is too new".into()),
                         );
                     } else {
@@ -1159,7 +1241,7 @@ impl Relay {
                 } else {
                     self.stats.bump(&self.stats.events_rejected, 1);
                     results[slot] = (
-                        event.id,
+                        event.id.clone(),
                         PutOutcome::Invalid("rate-limited: too many events".into()),
                     );
                 }
@@ -1172,7 +1254,7 @@ impl Relay {
             None
         } else {
             self.db
-                .put_batch_deferred(puts.iter().map(|e| (e.clone(), now)).collect())
+                .put_batch_deferred(puts.iter().map(|e| (Arc::clone(e), now)).collect())
         };
         drop(cfg);
 
@@ -1193,7 +1275,7 @@ impl Relay {
 
     async fn after_put(
         &self,
-        event: Event,
+        event: Arc<Event>,
         now: u64,
         nip9: bool,
         nip43: bool,
@@ -1478,7 +1560,7 @@ pub(crate) struct PendingBatch {
     resolved: Option<Vec<(String, PutOutcome)>>,
     results: Vec<(String, PutOutcome)>,
     put_slots: Vec<usize>,
-    puts: Vec<Event>,
+    puts: Vec<Arc<Event>>,
     new_pubkeys: Vec<bool>,
     vanishes: Vec<(usize, String, Event)>,
     now: u64,
@@ -1511,7 +1593,7 @@ impl PendingBatch {
                 relay.publish_rate_rollback(&event.pubkey, now);
                 relay.stats.bump(&relay.stats.events_rejected, 1);
                 results[slot] = (
-                    event.id,
+                    event.id.clone(),
                     PutOutcome::Invalid("error: database overloaded".into()),
                 );
             }
@@ -1745,7 +1827,7 @@ mod tests {
             .to_string();
         relay.live_rx.take();
 
-        let (outcome, _) = relay.accept_event(event.clone(), &[], None).await;
+        let outcome = relay.accept_event(event.clone(), &[], None).await;
         assert_eq!(outcome, crate::db::PutOutcome::Stored);
         let (events, _) = relay
             .db
@@ -2031,7 +2113,7 @@ mod tests {
                 crate::util::unix_now() - 10,
             )])
             .await;
-        let (outcome, _) = relay.accept_event(ev.clone(), &[], None).await;
+        let outcome = relay.accept_event(ev.clone(), &[], None).await;
         assert!(
             matches!(&outcome, crate::db::PutOutcome::Invalid(r) if r.contains("too new")),
             "a too-new account must be gated: {outcome:?}"
@@ -2056,7 +2138,7 @@ mod tests {
         ev2.sig = secp
             .sign_schnorr_no_aux_rand(&id, &other_keypair)
             .to_string();
-        let (outcome, _) = relay.accept_event(ev2, &[], None).await;
+        let outcome = relay.accept_event(ev2, &[], None).await;
         assert!(
             matches!(outcome, crate::db::PutOutcome::Stored),
             "the first event of an unknown pubkey is accepted"
@@ -2226,12 +2308,12 @@ mod tests {
             assert_eq!(relay.db.put(msg, now).await, crate::db::PutOutcome::Stored);
             let create = signed(crate::nips::nip29::CREATE_GROUP, "");
             assert!(matches!(
-                relay.accept_event(create, &[], None).await.0,
+                relay.accept_event(create, &[], None).await,
                 crate::db::PutOutcome::Stored
             ));
             let delete = signed(crate::nips::nip29::DELETE_GROUP, "");
             assert!(matches!(
-                relay.accept_event(delete, &[], None).await.0,
+                relay.accept_event(delete, &[], None).await,
                 crate::db::PutOutcome::Stored
             ));
             let f: crate::filter::Filter =
@@ -2283,7 +2365,7 @@ mod tests {
             for gid in ["a", "x", "b1", "b2"] {
                 let ev = signed(crate::nips::nip29::CREATE_GROUP, gid, vec![]);
                 assert!(matches!(
-                    relay.accept_event(ev, &[], None).await.0,
+                    relay.accept_event(ev, &[], None).await,
                     crate::db::PutOutcome::Stored
                 ));
             }
@@ -2295,7 +2377,7 @@ mod tests {
                     vec![vec!["parent".to_string(), "x".to_string()]],
                 );
                 assert!(matches!(
-                    relay.accept_event(ev, &[], None).await.0,
+                    relay.accept_event(ev, &[], None).await,
                     crate::db::PutOutcome::Stored
                 ));
             }
@@ -2310,7 +2392,7 @@ mod tests {
                 ],
             );
             assert!(matches!(
-                relay.accept_event(ev, &[], None).await.0,
+                relay.accept_event(ev, &[], None).await,
                 crate::db::PutOutcome::Stored
             ));
             let f: crate::filter::Filter = serde_json::from_value(
@@ -2676,5 +2758,103 @@ mod tests {
         }
         relay.db.shutdown();
         fsync_off_relay.db.shutdown();
+    }
+
+    #[test]
+    fn mixed_batch_applies_state_mutations_between_runs_in_order() {
+        // A batch with `h`-tagged posts around group-state mutations: each
+        // post must be prechecked against the state *at its position* —
+        // after an earlier 9000 but before a later 9001 — even though the
+        // stateless posts are committed as one batch.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            use crate::db::PutOutcome;
+
+            let relay = build_relay().await;
+            let now = crate::util::unix_now();
+            let secp = secp256k1::Secp256k1::new();
+            let kp = |seed: u8| secp256k1::Keypair::from_seckey_slice(&secp, &[seed; 32]).unwrap();
+            let member = secp256k1::XOnlyPublicKey::from_keypair(&kp(8))
+                .0
+                .to_string();
+            let signed = |seed: u8, kind: u64, content: &str, tags: Vec<Vec<String>>| {
+                let keypair = kp(seed);
+                let mut e = crate::event::Event {
+                    id: String::new(),
+                    pubkey: secp256k1::XOnlyPublicKey::from_keypair(&keypair)
+                        .0
+                        .to_string(),
+                    created_at: now,
+                    kind,
+                    tags,
+                    content: content.into(),
+                    sig: String::new(),
+                };
+                e.id = crate::nips::nip01::compute_id(&e);
+                let id = e.id_bytes().unwrap();
+                e.sig = secp.sign_schnorr_no_aux_rand(&id, &keypair).to_string();
+                e
+            };
+            let h = |tags: Vec<Vec<String>>| {
+                let mut tags = tags;
+                tags.insert(0, vec!["h".into(), "g-mixed".into()]);
+                tags
+            };
+            // Create a restricted group (only members may post).
+            let mut results = relay
+                .accept_events_batch(vec![signed(7, 9007, "", h(vec![]))], &[])
+                .await;
+            assert!(matches!(results.remove(0).1, PutOutcome::Stored));
+            let mut results = relay
+                .accept_events_batch(
+                    vec![signed(7, 9002, "", h(vec![vec!["restricted".into()]]))],
+                    &[],
+                )
+                .await;
+            assert!(matches!(results.remove(0).1, PutOutcome::Stored));
+
+            // [post (rejected: no member yet), 9000 add member, post (accepted)]
+            let results = relay
+                .accept_events_batch(
+                    vec![
+                        signed(8, 1, "before-add", h(vec![])),
+                        signed(7, 9000, "", h(vec![vec!["p".into(), member.clone()]])),
+                        signed(8, 1, "after-add", h(vec![])),
+                    ],
+                    &[],
+                )
+                .await;
+            assert!(
+                matches!(results[0].1, PutOutcome::Invalid(_)),
+                "the post before the 9000 must see the pre-add state: {results:?}"
+            );
+            assert!(matches!(results[1].1, PutOutcome::Stored), "{results:?}");
+            assert!(
+                matches!(results[2].1, PutOutcome::Stored),
+                "the post after the 9000 must see the added member: {results:?}"
+            );
+
+            // [post (accepted), 9001 remove member, post (rejected)]
+            let results = relay
+                .accept_events_batch(
+                    vec![
+                        signed(8, 1, "before-remove", h(vec![])),
+                        signed(7, 9001, "", h(vec![vec!["p".into(), member.clone()]])),
+                        signed(8, 1, "after-remove", h(vec![])),
+                    ],
+                    &[],
+                )
+                .await;
+            assert!(
+                matches!(results[0].1, PutOutcome::Stored),
+                "the post before the 9001 must still see the member: {results:?}"
+            );
+            assert!(matches!(results[1].1, PutOutcome::Stored), "{results:?}");
+            assert!(
+                matches!(results[2].1, PutOutcome::Invalid(_)),
+                "the post after the 9001 must see the removed member: {results:?}"
+            );
+            relay.db.shutdown();
+        });
     }
 }

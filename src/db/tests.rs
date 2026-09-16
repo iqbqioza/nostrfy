@@ -3949,7 +3949,7 @@ fn db_queue_byte_cap_fails_fast() {
         let now = unix_now();
         let big = event(1, &"x".repeat(4_000), now, vec![]);
         assert!(
-            db.put_batch_deferred(vec![(big, now)]).is_none(),
+            db.put_batch_deferred(vec![(Arc::new(big), now)]).is_none(),
             "an over-budget write must fail fast"
         );
         assert!(errors.load(std::sync::atomic::Ordering::Relaxed) >= 1);

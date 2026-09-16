@@ -186,7 +186,7 @@ pub(crate) fn apply_put_batch(
     store: &Store,
     thread_errors: &Arc<std::sync::atomic::AtomicU64>,
     mut pending: Option<heed::RwTxn>,
-    puts: &[(Event, u64)],
+    puts: &[(Arc<Event>, u64)],
     first_seen: &[Option<([u8; 32], u64)>],
 ) -> Vec<PutOutcome> {
     if puts.is_empty() {
@@ -279,7 +279,7 @@ pub(crate) fn apply_put_batch(
 }
 
 /// A batch of events to store in one transaction, with its reply.
-pub(crate) type PutBatchMsg = (Vec<(Event, u64)>, oneshot::Sender<Vec<PutOutcome>>);
+pub(crate) type PutBatchMsg = (Vec<(Arc<Event>, u64)>, oneshot::Sender<Vec<PutOutcome>>);
 
 /// The writer thread's pending write state: the open transaction, the
 /// queued single puts with their reply channels and the queued put
@@ -287,7 +287,7 @@ pub(crate) type PutBatchMsg = (Vec<(Event, u64)>, oneshot::Sender<Vec<PutOutcome
 #[derive(Default)]
 pub(crate) struct WriteBatch<'tx> {
     pub(crate) pending: Option<heed::RwTxn<'tx>>,
-    pub(crate) puts: Vec<(Event, u64)>,
+    pub(crate) puts: Vec<(Arc<Event>, u64)>,
     /// Per-put first-seen reservation, aligned with `puts`: applied inside
     /// the same write transaction as the put it belongs to (one commit and
     /// one fsync instead of two for a pubkey's first accepted event).
@@ -332,7 +332,7 @@ pub(crate) fn flush_everything(
     }
     // Merge the singles and every queued batch into one list; the split
     // points let the outcomes be distributed back in order.
-    let mut all: Vec<(Event, u64)> = std::mem::take(&mut batch.puts);
+    let mut all: Vec<(Arc<Event>, u64)> = std::mem::take(&mut batch.puts);
     let mut first_seen = std::mem::take(&mut batch.first_seen);
     let mut splits: Vec<usize> = vec![all.len()];
     for (events, _) in batch.pending_batches.iter_mut() {

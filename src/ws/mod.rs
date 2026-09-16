@@ -191,9 +191,10 @@ pub struct Conn {
     pub(crate) events_received_local: u64,
 }
 
-/// A live-delivery batch: the events plus their shared, pre-serialized
-/// JSON (encoded once by the live bus task).
-pub(crate) type LiveBatch = Arc<Vec<(crate::event::Event, Arc<String>)>>;
+/// A live-delivery batch: the events (shared with the accepting path's
+/// database write) plus their shared, pre-serialized JSON (encoded once by
+/// the live bus task).
+pub(crate) type LiveBatch = Arc<Vec<(Arc<crate::event::Event>, Arc<String>)>>;
 
 impl Conn {
     pub(crate) fn send(&mut self, msg: Message) {
