@@ -318,7 +318,14 @@ impl RoleStore {
                     MEMBERSHIP_LIST => {
                         for tag in &event.tags {
                             if tag.len() >= 2 && tag[0] == "member" && !vanished.contains(&tag[1]) {
-                                self.assignments.insert(tag[1].clone(), tag[2..].to_vec());
+                                // Sorted and deduplicated: the tag order is
+                                // not part of the protocol, and an unstable
+                                // order made rebuilt role lists differ from
+                                // the published ones.
+                                let mut roles = tag[2..].to_vec();
+                                roles.sort();
+                                roles.dedup();
+                                self.assignments.insert(tag[1].clone(), roles);
                             }
                         }
                     }
