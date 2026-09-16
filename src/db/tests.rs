@@ -4107,3 +4107,52 @@ fn vanish_pubkeys_each_reports_database_failure() {
         );
     });
 }
+
+#[test]
+fn vanish_reports_whether_group_state_was_removed() {
+    // NIP-62: only a removed NIP-29 state event (moderation/join/leave)
+    // requires the derived group state to be rebuilt; deleting ordinary
+    // posts must not trigger the full-history scan.
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let db = DbClient::open(
+            &config(),
+            true,
+            Arc::new(Default::default()),
+            30,
+            128,
+            4096,
+            262144,
+        )
+        .unwrap();
+        let now = unix_now();
+        // Two distinct authors: a vanished key cannot publish again.
+        let authored = |kind: u64, pk: &str, created: u64| {
+            let mut e = event(kind, "x", created, vec![]);
+            e.pubkey = pk.to_string();
+            e.id = nip01::compute_id(&e);
+            e
+        };
+        let pk_note = "aa".repeat(32);
+        let pk_mod = "bb".repeat(32);
+        assert_eq!(
+            db.put(authored(1, &pk_note, now), now).await,
+            PutOutcome::Stored
+        );
+        assert_eq!(
+            db.apply_vanish_checked([0xaa; 32], now).await,
+            Some((1, false)),
+            "an ordinary post must not require a group state rebuild"
+        );
+        assert_eq!(
+            db.put(authored(9000, &pk_mod, now + 1), now + 1).await,
+            PutOutcome::Stored
+        );
+        assert_eq!(
+            db.apply_vanish_checked([0xbb; 32], now + 1).await,
+            Some((1, true)),
+            "a removed moderation event must require a rebuild"
+        );
+        db.shutdown();
+    });
+}

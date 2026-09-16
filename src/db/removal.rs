@@ -371,7 +371,7 @@ impl Store {
     /// requests are signed, re-broadcastable events, so an unchecked replay
     /// would re-walk the author's whole history and rewrite the NIP-29/43
     /// snapshots on every delivery).
-    pub(crate) fn apply_vanish(&self, pubkey: &[u8], until_created: u64) -> Result<usize> {
+    pub(crate) fn apply_vanish(&self, pubkey: &[u8], until_created: u64) -> Result<(usize, bool)> {
         self.disk_full_error()?;
         let mut wtxn = self.env.write_txn()?;
         // Legacy entries (written before the marker carried the timestamp)
@@ -383,13 +383,17 @@ impl Store {
                 .map(|bytes| u64::from_be_bytes(bytes.try_into().expect("checked length")))
                 .unwrap_or(0);
             if covered >= until_created {
-                return Ok(0);
+                return Ok((0, false));
             }
         }
         self.vanish
             .put(&mut wtxn, pubkey, &until_created.to_be_bytes())?;
 
         let mut removed = 0usize;
+        // Whether a NIP-29 state event (moderation/join/leave) was removed:
+        // only then does the derived group state need a rebuild. Deleting a
+        // member's ordinary posts must not trigger a full-history scan.
+        let mut group_state_removed = false;
         let start = pubkey_key(pubkey, 0, &[0u8; ID_LEN]);
         // NIP-62: the request deletes the pubkey's history *until its
         // `.created_at`* — events published (timestamped) after the request
@@ -441,6 +445,10 @@ impl Store {
                     }
                     continue;
                 }
+                group_state_removed |= (crate::nips::nip29::MOD_MIN..=crate::nips::nip29::MOD_MAX)
+                    .contains(&event.kind)
+                    || event.kind == crate::nips::nip29::JOIN
+                    || event.kind == crate::nips::nip29::LEAVE;
                 self.remove_event(&mut wtxn, &id)?;
                 removed += 1;
             }
@@ -452,7 +460,7 @@ impl Store {
         self.remove_gift_wraps_for(&mut wtxn, pubkey, &mut removed)?;
 
         wtxn.commit()?;
-        Ok(removed)
+        Ok((removed, group_state_removed))
     }
 
     /// NIP-59: relays SHOULD delete `kind:1059` gift wraps addressed to a

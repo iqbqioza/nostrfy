@@ -1396,20 +1396,26 @@ impl Relay {
     /// instead of restoring the stale state.
     async fn vanish_pubkey(&self, pubkey: [u8; 32], until_created: u64) {
         let pubkey_hex = hex::encode(pubkey);
-        let removed = match self.db.apply_vanish_checked(pubkey, until_created).await {
-            Some(removed) => removed,
-            None => {
-                // The vanish was accepted (OK) but its side effect was
-                // dropped: the marker is not stored, so the pubkey would
-                // come back. Surface the failure in the logs and metrics.
-                log::error!("NIP-62 vanish side effect was not applied");
-                self.stats.bump(&self.stats.db_errors, 1);
-                return;
-            }
-        };
+        let (removed, group_state_removed) =
+            match self.db.apply_vanish_checked(pubkey, until_created).await {
+                Some(outcome) => outcome,
+                None => {
+                    // The vanish was accepted (OK) but its side effect was
+                    // dropped: the marker is not stored, so the pubkey would
+                    // come back. Surface the failure in the logs and metrics.
+                    log::error!("NIP-62 vanish side effect was not applied");
+                    self.stats.bump(&self.stats.db_errors, 1);
+                    return;
+                }
+            };
         self.stats.bump(&self.stats.events_deleted, removed as u64);
         if self.config.read().await.nip_enabled(29) {
-            if removed > 0 {
+            if group_state_removed {
+                // A moderation/join/leave event was removed: the derived
+                // state (settings, pins, members, invites) must be rebuilt
+                // from the surviving history. Ordinary posts do not affect
+                // it, so they take the cheap path below instead of scanning
+                // the whole group history under the group write lock.
                 let cap = self.config.read().await.relay.max_groups;
                 let mut fresh = GroupStore::with_cap(cap);
                 let rebuilt = {
@@ -1437,10 +1443,10 @@ impl Relay {
                 }
                 self.persist_groups().await;
             } else {
-                // A replayed vanish (already honored) or one that removed
-                // nothing: the live state only needs the vanished pubkey
-                // dropped from its memberships, and only a real change is
-                // worth a snapshot write.
+                // A replayed vanish, one that removed nothing, or one that
+                // only deleted ordinary posts: the live state only needs the
+                // vanished pubkey dropped from its memberships, and only a
+                // real change is worth a snapshot write.
                 let changed = {
                     let mut groups = self.groups.write().await;
                     let mut changed = false;

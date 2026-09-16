@@ -175,7 +175,9 @@ enum Msg {
         /// NIP-62: events up to this created_at (the request's `.created_at`)
         /// are deleted.
         until_created: u64,
-        reply: oneshot::Sender<usize>,
+        /// `(removed events, whether a NIP-29 state event was among them)`:
+        /// only the latter requires the group state to be rebuilt.
+        reply: oneshot::Sender<(usize, bool)>,
     },
     /// NIP-59: delete gift wraps addressed to a pubkey (on NIP-09 deletion).
     GiftWrapPurge {
@@ -1361,16 +1363,19 @@ impl DbClient {
     pub async fn apply_vanish(&self, pubkey: [u8; 32], until_created: u64) -> usize {
         self.apply_vanish_checked(pubkey, until_created)
             .await
+            .map(|(removed, _)| removed)
             .unwrap_or(0)
     }
 
     /// Like [`Self::apply_vanish`], reporting a fail-fast/lost writer as
-    /// `None`.
+    /// `None`. The second element of the tuple is true when the removed
+    /// history contained a NIP-29 state event, so the group state must be
+    /// rebuilt (a plain post deletion does not change the derived state).
     pub async fn apply_vanish_checked(
         &self,
         pubkey: [u8; 32],
         until_created: u64,
-    ) -> Option<usize> {
+    ) -> Option<(usize, bool)> {
         self.request_write_checked(|reply| Msg::Vanish {
             pubkey: pubkey.to_vec(),
             until_created,

@@ -871,14 +871,14 @@ pub(crate) fn spawn(
                                     until_created,
                                     reply,
                                 } => {
-                                    let n = match store.apply_vanish(&pubkey, until_created) {
-                                        Ok(n) => n,
+                                    let outcome = match store.apply_vanish(&pubkey, until_created) {
+                                        Ok(outcome) => outcome,
                                         Err(e) => {
                                             db_error(&thread_errors, &e);
-                                            0
+                                            (0, false)
                                         }
                                     };
-                                    let _ = reply.send(n);
+                                    let _ = reply.send(outcome);
                                 }
                                 Msg::GiftWrapPurge { pubkey, reply } => {
                                     let n = match store.delete_gift_wraps_to(&pubkey) {
