@@ -95,6 +95,73 @@ pub async fn stats_handler(State(relay): State<Arc<Relay>>) -> Json<Value> {
     Json(relay.stats.as_json())
 }
 
+/// The cached static part of the NIP-11 document. The volatile `stats`
+/// section is rebuilt per request, so it is deliberately not part of the
+/// cache; the document depends on the config (invalidated by the config
+/// version) and on the access-control lists that gate the advertised NIPs
+/// and `restricted_writes`.
+pub(crate) struct Nip11Cache {
+    config_version: u64,
+    restrict_relay: bool,
+    allowed_kinds: Vec<u64>,
+    blocked_kinds: Vec<u64>,
+    doc: Arc<Value>,
+}
+
+impl Relay {
+    /// The NIP-11 document with a fresh `stats` section. Building the
+    /// static part needs the config and access locks and rebuilds the
+    /// supported-NIPs list, so it is cached until the config version or one
+    /// of the access lists it reads changes; the stats are rebuilt for
+    /// every request. The fast path avoids the config lock entirely (a
+    /// queued SIGHUP writer must not stall information requests).
+    pub async fn relay_info_document(&self) -> Value {
+        let version = self
+            .config_version
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let cached = {
+            let access = self.access.read().await;
+            let cache = self
+                .nip11_cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            cache.as_ref().and_then(|c| {
+                (c.config_version == version
+                    && c.restrict_relay == access.restrict_relay
+                    && c.allowed_kinds == access.allowed_kinds
+                    && c.blocked_kinds == access.blocked_kinds)
+                    .then(|| Arc::clone(&c.doc))
+            })
+        };
+        let mut info = match cached {
+            Some(doc) => (*doc).clone(),
+            None => {
+                // Canonical lock order: the accept paths hold `config.read`
+                // while awaiting `access.read`.
+                let cfg = self.config.read().await;
+                let access = self.access.read().await;
+                let doc = relay_info(&cfg, &access, &self.stats, self.relay_pubkey().as_deref());
+                drop(cfg);
+                self.nip11_cache
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .replace(Nip11Cache {
+                        config_version: version,
+                        restrict_relay: access.restrict_relay,
+                        allowed_kinds: access.allowed_kinds.clone(),
+                        blocked_kinds: access.blocked_kinds.clone(),
+                        doc: Arc::new(doc.clone()),
+                    });
+                doc
+            }
+        };
+        // The stats change on every request (connections, counters): always
+        // serve a fresh section, cached document or not.
+        info["stats"] = self.stats.as_json();
+        info
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

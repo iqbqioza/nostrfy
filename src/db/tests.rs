@@ -1862,9 +1862,7 @@ fn access_control_persists_across_reopen() {
             .unwrap();
             let mut access = crate::config::AccessControl::default();
             access.allowed_kinds.push(5);
-            access
-                .blocked_ips
-                .push(("203.0.113.9".into(), String::new()));
+            access.blocked_ips.push("203.0.113.9".into(), String::new());
             db.save_access(access.clone()).await;
             // The pubkey lists live under their own key.
             db.save_relay_pubkeys(&[("aa".repeat(32), String::new())], &[])
@@ -1891,8 +1889,8 @@ fn access_control_persists_across_reopen() {
         };
         assert_eq!(loaded.allowed_kinds, vec![5]);
         assert_eq!(
-            loaded.blocked_ips,
-            vec![(String::from("203.0.113.9"), String::new())]
+            loaded.blocked_ips.entries(),
+            [(String::from("203.0.113.9"), String::new())]
         );
         // The dedicated pubkey key survives the reopen.
         let (deny, allow) = db.load_relay_pubkeys().await.unwrap_or_default();
@@ -1927,9 +1925,7 @@ fn access_load_distinguishes_missing_loaded_and_failed() {
         ));
         // Persisted state loads back.
         let mut access = crate::config::AccessControl::default();
-        access
-            .blocked_ips
-            .push(("203.0.113.9".into(), String::new()));
+        access.blocked_ips.push("203.0.113.9".into(), String::new());
         db.save_access(access.clone()).await;
         let crate::db::LoadAccessOutcome::Loaded(loaded) = db.load_access().await else {
             panic!("persisted access must load");
@@ -1988,16 +1984,14 @@ fn schema_upgrade_creates_missing_tables_instantly() {
         assert_eq!(found.len(), 1);
         // Access control works (access table + the relay pubkeys key).
         let mut access = crate::config::AccessControl::default();
-        access
-            .blocked_ips
-            .push(("203.0.113.9".into(), String::new()));
+        access.blocked_ips.push("203.0.113.9".into(), String::new());
         db.save_access(access).await;
         db.save_relay_pubkeys(&[("aa".repeat(32), String::new())], &[])
             .await;
         let crate::db::LoadAccessOutcome::Loaded(loaded) = db.load_access().await else {
             panic!("persisted access must load");
         };
-        assert_eq!(loaded.blocked_ips[0].0, "203.0.113.9");
+        assert_eq!(loaded.blocked_ips.entries()[0].0, "203.0.113.9");
         let (deny, _) = db.load_relay_pubkeys().await.unwrap_or_default();
         assert_eq!(deny[0].0, "aa".repeat(32));
         // The Blossom mapping works (blossom table + migration marker).
@@ -3869,6 +3863,52 @@ fn removing_corrupt_event_cleans_primary_indexes() {
 }
 
 #[test]
+fn corrupt_event_cleanup_is_bounded_by_the_scan_cap() {
+    // A corrupt event's index cleanup must not walk an arbitrarily large
+    // table while the caller's write transaction is open: past the cap the
+    // dangling index entries are left behind (harmless, the scans verify
+    // existence) instead of blocking every queued write.
+    use crate::db::store::{CORRUPT_CLEANUP_SCAN_CAP, created_key};
+    let expiry = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let store = crate::db::store::Store::open(&config(), expiry, 128).unwrap();
+    let id = [9u8; 32];
+    let created = 1_700_000_000u64;
+    let mut wtxn = store.env.write_txn().unwrap();
+    store.events.put(&mut wtxn, &id, b"{not-json").unwrap();
+    // Fill `by_created` with unrelated keys that sort before the corrupt
+    // event's key, so the walk hits the cap before finding it.
+    for i in 0..CORRUPT_CLEANUP_SCAN_CAP {
+        store
+            .by_created
+            .put(&mut wtxn, &created_key(i as u64, &[1u8; 32]), b"")
+            .unwrap();
+    }
+    store
+        .by_created
+        .put(&mut wtxn, &created_key(created, &id), b"")
+        .unwrap();
+    wtxn.commit().unwrap();
+
+    let mut wtxn = store.env.write_txn().unwrap();
+    store.remove_event(&mut wtxn, &id).unwrap();
+    wtxn.commit().unwrap();
+
+    let rtxn = store.env.read_txn().unwrap();
+    assert!(
+        store.events.get(&rtxn, &id).unwrap().is_none(),
+        "the corrupt event itself is removed"
+    );
+    assert!(
+        store
+            .by_created
+            .get(&rtxn, &created_key(created, &id))
+            .unwrap()
+            .is_some(),
+        "the capped walk leaves the dangling index entry behind"
+    );
+}
+
+#[test]
 fn group_and_role_snapshots_survive_restart() {
     // NIP-29/43 state must survive restarts without replaying history:
     // persist a snapshot, then load + restore it into fresh stores.
@@ -3949,7 +3989,7 @@ fn db_queue_byte_cap_fails_fast() {
         let now = unix_now();
         let big = event(1, &"x".repeat(4_000), now, vec![]);
         assert!(
-            db.put_batch_deferred(vec![(big, now)]).is_none(),
+            db.put_batch_deferred(vec![(Arc::new(big), now)]).is_none(),
             "an over-budget write must fail fast"
         );
         assert!(errors.load(std::sync::atomic::Ordering::Relaxed) >= 1);
@@ -3985,6 +4025,46 @@ fn reader_queue_byte_cap_fails_fast() {
         let small: Filter = serde_json::from_value(serde_json::json!({"kinds": [1]})).unwrap();
         let (out, _) = db.query(vec![small], 10, now).await;
         assert_eq!(out.len(), 1);
+        db.shutdown();
+    });
+}
+
+#[test]
+fn startup_rebuild_queries_keep_the_reader_byte_accounting_balanced() {
+    // Regression (#96 over #94): the NIP-29/43 rebuild queries go through
+    // `request_read_startup`, which reserved only the count. The reader
+    // thread releases both counters on completion, so the payload bytes
+    // were subtracted without ever being added: `pending_read_bytes`
+    // underflowed to `usize::MAX` and every later byte-checked read (the
+    // REQ scan path, `size_on_disk`, the account-age `first_seen_batch`)
+    // failed fast for the rest of the process.
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let cfg = config();
+        let errors = Arc::new(Default::default());
+        let db = DbClient::open(&cfg, true, Arc::clone(&errors), 30, 128, 4096, 262144).unwrap();
+        let now = unix_now();
+        let e = event(1, "account-age probe", now, vec![]);
+        assert_eq!(db.put(e.clone(), now).await, PutOutcome::Stored);
+
+        // The startup rebuild query (a filter with payload bytes).
+        let kinds: Vec<u64> = (9000..=9022).collect();
+        let f: Filter = serde_json::from_value(serde_json::json!({ "kinds": kinds })).unwrap();
+        let page = db.query_full_startup(vec![f], 100, now, true).await;
+        assert!(page.is_some(), "the startup query must answer");
+
+        // The byte-checked read path must still work afterwards.
+        let small: Filter = serde_json::from_value(serde_json::json!({"kinds": [1]})).unwrap();
+        let (out, _) = db.query(vec![small], 10, now).await;
+        assert_eq!(
+            out.len(),
+            1,
+            "reads must not fail after a startup rebuild query"
+        );
+        // A fail-fast read returns an empty vec here; a working one answers
+        // exactly one status per requested pubkey.
+        let status = db.first_seen_batch(vec![e.pubkey_bytes().unwrap()]).await;
+        assert_eq!(status.len(), 1, "first-seen reads must still answer");
         db.shutdown();
     });
 }

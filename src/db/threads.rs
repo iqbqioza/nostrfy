@@ -45,7 +45,8 @@ impl Drop for PendingGuard {
 /// [`spawn`].
 pub(crate) struct DbThreads {
     pub(crate) tx: mpsc::UnboundedSender<Msg>,
-    pub(crate) read_tx: mpsc::UnboundedSender<Msg>,
+    /// One channel per reader thread (its receiver is owned by the thread).
+    pub(crate) read_txs: Vec<mpsc::UnboundedSender<Msg>>,
     pub(crate) api_read_tx: mpsc::UnboundedSender<Msg>,
     pub(crate) errors: Arc<std::sync::atomic::AtomicU64>,
     pub(crate) expiry: Arc<std::sync::atomic::AtomicBool>,
@@ -64,7 +65,6 @@ pub(crate) struct DbThreads {
     /// Independent cap for the API reader queue (adjustable live via
     /// [`super::DbClient::set_max_api_pending`], e.g. on SIGHUP reload).
     pub(crate) max_api_pending: Arc<std::sync::atomic::AtomicUsize>,
-    pub(crate) reader_threads: usize,
     /// The spawned database threads, joined by `DbClient::shutdown` after
     /// the Shutdown signals are sent: without the join a queued write could
     /// be dropped with no reply (and the process could exit before the
@@ -354,7 +354,7 @@ pub(crate) fn spawn(
     reader_threads: usize,
 ) -> Result<DbThreads> {
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let (read_tx, read_rx) = mpsc::unbounded_channel();
+    let mut read_txs: Vec<mpsc::UnboundedSender<Msg>> = Vec::with_capacity(reader_threads);
     let (api_read_tx, mut api_read_rx) = mpsc::unbounded_channel();
     let thread_errors = Arc::clone(&errors);
     let pending_msgs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -382,20 +382,19 @@ pub(crate) fn spawn(
     // safely.
     let mut handles: Vec<std::thread::JoinHandle<()>> = Vec::with_capacity(reader_threads + 2);
     {
-        let read_rx = std::sync::Arc::new(std::sync::Mutex::new(read_rx));
         for _ in 0..reader_threads {
+            // Each reader owns its receiver: sharing one behind a Mutex let a
+            // worker that held the lock in `blocking_recv` block every other
+            // worker from picking up work (audit L7).
+            let (read_tx, mut read_rx) = mpsc::unbounded_channel();
+            read_txs.push(read_tx);
             let read_store = store.clone_for_reader();
             let read_errors = Arc::clone(&errors);
-            let read_rx = Arc::clone(&read_rx);
             let read_pending = Arc::clone(&read_pending);
             let read_pending_bytes = Arc::clone(&read_pending_bytes);
             handles.push(std::thread::spawn(move || {
                 'reader: loop {
-                    let Some(msg) = read_rx
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .blocking_recv()
-                    else {
+                    let Some(msg) = read_rx.blocking_recv() else {
                         break;
                     };
                     // `Msg::Shutdown` is never counted: a panic while
@@ -1130,7 +1129,7 @@ pub(crate) fn spawn(
     }));
     Ok(DbThreads {
         tx,
-        read_tx,
+        read_txs,
         api_read_tx,
         errors,
         expiry,
@@ -1145,7 +1144,6 @@ pub(crate) fn spawn(
         max_pending_msgs: max_pending_msgs.max(1),
         max_pending_events: max_pending_events.max(1),
         max_api_pending: Arc::new(std::sync::atomic::AtomicUsize::new(max_pending_msgs.max(1))),
-        reader_threads,
         threads: std::sync::Mutex::new(handles),
     })
 }

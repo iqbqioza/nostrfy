@@ -664,7 +664,7 @@ mod tests {
             relay
                 .vanish_pubkey(vanished.pubkey_bytes().unwrap(), vanished.created_at)
                 .await;
-            let outcome = relay.accept_event(vanished, &[], None).await.0;
+            let outcome = relay.accept_event(vanished, &[], None).await;
             assert!(
                 matches!(&outcome, crate::db::PutOutcome::Invalid(reason) if reason.contains("vanish")),
                 "a vanished pubkey's new events are rejected: {outcome:?}"
@@ -882,12 +882,12 @@ mod tests {
             );
             let rejected = signed(1, vec![vec!["h".into(), "missing-group".into()]]);
             let valid = signed(1, vec![]);
-            let rejected_outcome = relay.accept_event(rejected, &[], None).await.0;
+            let rejected_outcome = relay.accept_event(rejected, &[], None).await;
             assert!(matches!(
                 rejected_outcome,
                 crate::db::PutOutcome::Invalid(_)
             ));
-            let valid_outcome = relay.accept_event(valid, &[], None).await.0;
+            let valid_outcome = relay.accept_event(valid, &[], None).await;
             assert!(
                 matches!(valid_outcome, crate::db::PutOutcome::Stored),
                 "a rejected event must not consume the publish quota: {valid_outcome:?}"
@@ -1433,7 +1433,7 @@ mod tests {
                 roles.assign(&member.pubkey, "member");
             }
             let claim = signed_with_seed(9u8, crate::nips::nip43::JOIN, vec![]);
-            let (outcome, _) = relay.accept_event(claim, &[], None).await;
+            let outcome = relay.accept_event(claim, &[], None).await;
             assert!(
                 matches!(
                     &outcome,
@@ -1443,7 +1443,7 @@ mod tests {
             );
             // A non-member's claim is refused (this relay issues no invites).
             let stranger = signed_with_seed(10u8, crate::nips::nip43::JOIN, vec![]);
-            let (outcome, _) = relay.accept_event(stranger, &[], None).await;
+            let outcome = relay.accept_event(stranger, &[], None).await;
             assert!(
                 matches!(&outcome, crate::db::PutOutcome::Invalid(reason) if reason.contains("invite codes")),
                 "a non-member claim is refused: {outcome:?}"

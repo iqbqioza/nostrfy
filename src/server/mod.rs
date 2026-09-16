@@ -31,7 +31,7 @@ use tower::util::ServiceExt;
 use crate::config::Config;
 use crate::db::DbClient;
 use crate::error::{Result, config_err};
-use crate::nips::nip11::{relay_info, stats_handler};
+use crate::nips::nip11::stats_handler;
 use crate::nips::nip86;
 use crate::relay::Relay;
 use crate::stats::Stats;
@@ -82,6 +82,46 @@ pub async fn cors_middleware(request: Request, next: Next) -> Response {
     let mut response = next.run(request).await;
     add_cors_headers(response.headers_mut());
     response
+}
+
+/// Bounds how long a request body may take to arrive: the header timeout
+/// (see [`serve_limited`]) only covers the request head, so a slow-body
+/// client could otherwise hold a connection — and with it its share of the
+/// accept-layer caps — indefinitely while trickling the body. The body is
+/// read under the deadline and re-injected, so the handler's extractors
+/// still see the exact bytes (and `DefaultBodyLimit` still applies).
+/// The documented `0 = disabled` config passes through untouched.
+async fn body_read_timeout_middleware(
+    request: Request,
+    next: Next,
+    timeout: Option<Duration>,
+    limit: usize,
+) -> Response {
+    let Some(timeout) = timeout else {
+        return next.run(request).await;
+    };
+    // Oversized bodies are refused before buffering them, mirroring the
+    // `DefaultBodyLimit` status.
+    if let Some(len) = request
+        .headers()
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+        && len > limit as u64
+    {
+        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+    }
+    let (parts, body) = request.into_parts();
+    let bytes = match tokio::time::timeout(timeout, axum::body::to_bytes(body, limit)).await {
+        Ok(Ok(bytes)) => bytes,
+        // Oversized or aborted body: the extractors would answer 400 for a
+        // read error, so keep that status rather than claiming a size
+        // problem that was not observed.
+        Ok(Err(_)) => return StatusCode::BAD_REQUEST.into_response(),
+        Err(_) => return StatusCode::REQUEST_TIMEOUT.into_response(),
+    };
+    next.run(Request::from_parts(parts, Body::from(bytes)))
+        .await
 }
 
 fn add_cors_headers(headers: &mut HeaderMap) {
@@ -200,7 +240,16 @@ async fn build_router(
     // of them. The inbox and outbox paths give the relay distinct endpoints
     // for the inbox/outbox routing model.
     let ws_paths = relay.config.read().await.server.ws_paths.trim().to_string();
-    let max_admin_body = relay.config.read().await.rpc.max_admin_body_bytes;
+    let (max_admin_body, body_read_timeout) = {
+        let cfg = relay.config.read().await;
+        (
+            cfg.rpc.max_admin_body_bytes,
+            // 0 = disabled (the documented convention): without the timeout
+            // the body is passed through untouched.
+            (cfg.limits.http_read_timeout_secs > 0)
+                .then(|| Duration::from_secs(cfg.limits.http_read_timeout_secs)),
+        )
+    };
     let mut app = Router::new()
         .route("/health", get(health_handler))
         .route("/relay/stats", get(stats_handler))
@@ -216,7 +265,14 @@ async fn build_router(
             path,
             get(ws_handler)
                 .post(nip86::rpc_handler)
-                .layer(axum::extract::DefaultBodyLimit::max(max_admin_body)),
+                .layer(axum::extract::DefaultBodyLimit::max(max_admin_body))
+                // The header timeout only covers the request head: without
+                // this, a client could trickle the NIP-86 POST body and pin
+                // its connection (and per-IP slot) indefinitely.
+                .layer(axum::middleware::from_fn(move |request, next| async move {
+                    body_read_timeout_middleware(request, next, body_read_timeout, max_admin_body)
+                        .await
+                })),
         );
     }
     let cfg = relay.config.read().await;
@@ -273,7 +329,7 @@ async fn build_router(
                     .extensions()
                     .get::<axum::extract::connect_info::ConnectInfo<std::net::SocketAddr>>()
                     .map(|info| info.0.ip())
-                    && crate::util::ip_blocked(&relay.access.read().await.blocked_ips, ip)
+                    && relay.access.read().await.is_ip_blocked(ip)
                 {
                     return StatusCode::FORBIDDEN.into_response();
                 }
@@ -685,14 +741,7 @@ async fn blossom_root_info(
 /// The NIP-11 relay information document, served with `application/nostr+json`
 /// when the client asked for it.
 async fn nip11_doc(relay: Arc<Relay>, wants_nostr_json: bool) -> Response {
-    let cfg = relay.config.read().await;
-    let access = relay.access.read().await;
-    let body = Json(relay_info(
-        &cfg,
-        &access,
-        &relay.stats,
-        relay.relay_pubkey().as_deref(),
-    ));
+    let body = Json(relay.relay_info_document().await);
     let mut response = body.into_response();
     if wants_nostr_json {
         response.headers_mut().insert(
@@ -734,7 +783,7 @@ async fn ws_handler(State(relay): State<Arc<Relay>>, request: Request) -> Respon
         .extensions()
         .get::<axum::extract::connect_info::ConnectInfo<std::net::SocketAddr>>()
         .map(|info| info.0.ip())
-        && crate::util::ip_blocked(&relay.access.read().await.blocked_ips, ip)
+        && relay.access.read().await.is_ip_blocked(ip)
     {
         return StatusCode::FORBIDDEN.into_response();
     }
@@ -1793,7 +1842,7 @@ mod tests {
             .write()
             .await
             .blocked_ips
-            .push(("198.51.100.7".into(), String::new()));
+            .push("198.51.100.7".into(), String::new());
         let mut request = Request::builder()
             .method(Method::GET)
             .uri("/")
@@ -1860,7 +1909,7 @@ mod tests {
             .write()
             .await
             .blocked_ips
-            .push(("::ffff:198.51.100.7".into(), String::new()));
+            .push("::ffff:198.51.100.7".into(), String::new());
         let app = build_router(&relay, None).await;
         for uri in ["/health", "/api/v1/count", "/relay/stats"] {
             let mut request = Request::builder()
@@ -1893,6 +1942,60 @@ mod tests {
             >("198.51.100.8:1234".parse().unwrap()));
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn rpc_body_read_is_bounded_by_the_read_timeout() {
+        let relay = blossom_relay().await;
+        relay.config.write().await.limits.http_read_timeout_secs = 1;
+        let app = build_router(&relay, None).await;
+        // A body that never produces a byte must be cut with 408 instead of
+        // pinning the connection (and its per-IP slot) indefinitely.
+        let stalled = Body::from_stream(futures_util::stream::pending::<
+            std::result::Result<axum::body::Bytes, std::io::Error>,
+        >());
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/")
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(stalled)
+            .unwrap();
+        let started = std::time::Instant::now();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the body read must be cut at the configured deadline"
+        );
+        // A complete body is re-injected and reaches the RPC handler (the
+        // missing auth is answered with 401, so the handler ran).
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri("/")
+            .header(
+                axum::http::header::CONTENT_TYPE,
+                "application/nostr+json+rpc",
+            )
+            .body(Body::from("{}"))
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(axum::extract::connect_info::ConnectInfo::<
+                std::net::SocketAddr,
+            >("198.51.100.7:1234".parse().unwrap()));
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        // An over-limit Content-Length is refused up front, like
+        // `DefaultBodyLimit` would.
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/")
+            .header(axum::http::header::CONTENT_LENGTH, "100000000")
+            .body(Body::from("{}"))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
         relay.db.shutdown();
     }
 

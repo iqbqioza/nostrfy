@@ -218,7 +218,7 @@ The changes take effect immediately and are persisted (same lists as `nostrfy re
 | `socket_recv_buffer_kb` | integer | `64` | Per-connection kernel receive buffer (KiB, `0` = kernel default; the kernel may double it). Larger values let a fast publisher's burst absorb into one batch while the relay commits; the buffer uses real memory only while data is queued |
 | `max_out_queue_bytes` | integer | `262144` | Per-connection outgoing queue cap (bytes; `0` = unlimited) |
 | `ws_idle_timeout_secs` | integer | `300` | Close idle connections after this long (`0` = never) |
-| `http_read_timeout_secs` | integer | `30` | Seconds to deliver a complete HTTP request head before the connection is closed (`0` = disabled; slow-loris defense — applies to WebSocket upgrades too) |
+| `http_read_timeout_secs` | integer | `30` | Seconds to deliver a complete HTTP request head (and the NIP-86 POST body) before the connection is closed (`0` = disabled; slow-loris defense — applies to WebSocket upgrades too) |
 | `max_connections_per_sec_per_ip` | integer | `0` | Max new connections per second per source IP (`0` = unlimited) |
 | `max_events_per_min_per_pubkey` | integer | `0` | Max events a pubkey may publish per minute (`0` = unlimited) |
 | `max_req_response_bytes` | integer | `33554432` | Byte budget for one REQ response (`0` = unlimited); beyond it the subscription is closed with `CLOSED` |
@@ -294,7 +294,7 @@ The changes take effect immediately and are persisted (same lists as `nostrfy re
 
 **`ws_idle_timeout_secs`** — Connections with no inbound frames for this long are closed. While enabled, the relay also sends periodic WebSocket PINGs: healthy clients answer with a PONG (an inbound frame, which resets the timer) and stay connected; dead peers are reaped. `0` = disabled (no timeout, no pings).
 
-**`http_read_timeout_secs`** — Seconds a connection has to deliver a complete HTTP request head (the request line and headers) before it is closed. This closes slow-loris sockets that trickle bytes without ever completing a request — the attack would otherwise pin file descriptors and memory. Applies to every HTTP connection, WebSocket upgrades included (an upgrade request is a normal HTTP request head). `0` disables the timeout.
+**`http_read_timeout_secs`** — Seconds a connection has to deliver a complete HTTP request head (the request line and headers) before it is closed. This closes slow-loris sockets that trickle bytes without ever completing a request — the attack would otherwise pin file descriptors and memory. Applies to every HTTP connection, WebSocket upgrades included (an upgrade request is a normal HTTP request head). The same deadline bounds the NIP-86 `POST` body read (a body that delivers no byte within the window is answered with `408 Request Timeout`), and Blossom uploads use it as their per-chunk idle timeout. `0` disables the timeout.
 
 **`max_connections_per_sec_per_ip`** — Maximum number of new connections a single source IP may open per second (sliding window). Sockets beyond the window are refused immediately. `0` = unlimited.
 

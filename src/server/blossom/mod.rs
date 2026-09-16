@@ -886,7 +886,18 @@ async fn put_blob(relay: Arc<Relay>, headers: HeaderMap, body: Body, verb: &str)
     // slow-loris protection for bodies).
     let idle_secs = relay.config.read().await.limits.http_read_timeout_secs;
     let idle_timeout = std::time::Duration::from_secs(if idle_secs == 0 { 60 } else { idle_secs });
-    let (path, size, sha) = match spool_upload(body, max_upload, idle_timeout).await {
+    // Spool on the blob filesystem when possible: the final store is then a
+    // rename (no second full write). A missing/uncreatable directory falls
+    // back to the system temp dir.
+    let spool_dir = state.store.spool_dir();
+    let spool_dir = match spool_dir.as_deref() {
+        Some(dir) => match tokio::fs::create_dir_all(dir).await {
+            Ok(()) => Some(dir),
+            Err(_) => None,
+        },
+        None => None,
+    };
+    let (path, size, sha) = match spool_upload(body, max_upload, idle_timeout, spool_dir).await {
         Ok(value) => value,
         Err(response) => return *response,
     };
@@ -966,13 +977,16 @@ async fn spool_upload(
     body: Body,
     max_upload: usize,
     idle_timeout: std::time::Duration,
+    spool_dir: Option<&std::path::Path>,
 ) -> Result<(std::path::PathBuf, u64, String), Box<Response>> {
     use futures_util::StreamExt;
     use sha2::{Digest, Sha256};
     use tokio::io::AsyncWriteExt;
 
     static TEMP_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let mut path = std::env::temp_dir();
+    let mut path = spool_dir
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(std::env::temp_dir);
     path.push(format!(
         "nostrfy-blossom-{}-{}",
         std::process::id(),

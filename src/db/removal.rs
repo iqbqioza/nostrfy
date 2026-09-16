@@ -173,18 +173,18 @@ impl Store {
         // NIP-09 `a` tags: remove every version of the referenced
         // addressable events published up to the deletion request.
         for address in addresses {
-            // Only the author of the addressable event may delete it.
-            // Compare decoded bytes (case-insensitive like the scan's hex
-            // decode) so an uppercase `a` value still matches the author.
-            if let Some(pubkey) = request_pubkey {
-                let same = hex::decode(&address.pubkey)
+            // The author may delete their own address; a NIP-26 delegator
+            // may delete versions published on their behalf (checked per
+            // version below, mirroring the `e`-tag path). Compare decoded
+            // bytes (case-insensitive like the scan's hex decode) so an
+            // uppercase `a` value still matches the author.
+            let author_owns = request_pubkey.is_none_or(|pubkey| {
+                hex::decode(&address.pubkey)
                     .ok()
                     .zip(hex::decode(pubkey).ok())
-                    .is_some_and(|(a, b)| a == b);
-                if !same {
-                    continue;
-                }
-            }
+                    .is_some_and(|(a, b)| a == b)
+            });
+            let mut delegated_any = false;
             let Ok(pubkey) = hex::decode(&address.pubkey) else {
                 continue;
             };
@@ -203,7 +203,6 @@ impl Store {
                 }
                 _ => request_created,
             };
-            self.deleted.put(&mut wtxn, &akey, &cut.to_be_bytes())?;
             let start = replaceable_key(address.kind, &pubkey, "");
             let end = replaceable_key(address.kind.saturating_add(1), &pubkey, "");
             let mut last_key: Option<Vec<u8>> = None;
@@ -252,10 +251,29 @@ impl Store {
                         continue;
                     }
                     let id = &value[CREATED_LEN..CREATED_LEN + ID_LEN];
+                    if !author_owns {
+                        let requester = request_pubkey.expect("not author_owns implies Some");
+                        let delegated = self
+                            .events
+                            .get(&wtxn, id)?
+                            .and_then(|raw| serde_json::from_slice::<Event>(raw).ok())
+                            .is_some_and(|event| delegated_by(&event, requester));
+                        if !delegated {
+                            continue;
+                        }
+                        delegated_any = true;
+                    }
                     self.deleted.put(&mut wtxn, id, b"")?;
                     self.remove_event(&mut wtxn, id)?;
                     removed += 1;
                 }
+            }
+            // The address tombstone is only written for an authorized
+            // requester: a delegated deletion that matched no version must
+            // not leave a tombstone behind (it would block the author's
+            // future publications up to the cut).
+            if author_owns || delegated_any {
+                self.deleted.put(&mut wtxn, &akey, &cut.to_be_bytes())?;
             }
         }
 

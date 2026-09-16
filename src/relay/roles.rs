@@ -2,6 +2,8 @@
 //! managed through the NIP-86 RPC, plus the published membership list
 //! and add/remove-user events.
 
+use std::sync::Arc;
+
 use crate::db::PutOutcome;
 use crate::event::Event;
 use crate::nips::nip01;
@@ -21,9 +23,12 @@ impl super::Relay {
             return Err(());
         }
         let now = unix_now();
-        let outcome = self.db.put(event.clone(), now).await;
+        // One allocation shared by the database write and the broadcast:
+        // relay-generated events must not deep-copy their content twice.
+        let shared = Arc::new(event.clone());
+        let outcome = self.db.put(Arc::clone(&shared), now).await;
         if matches!(outcome, PutOutcome::Stored | PutOutcome::Replaced) {
-            Ok(self.broadcast(event.clone()).await.is_ok())
+            Ok(self.broadcast(shared).await.is_ok())
         } else {
             Err(())
         }

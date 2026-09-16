@@ -104,6 +104,25 @@ impl BlobStore {
         }
     }
 
+    /// A directory on the blob filesystem where uploads may be spooled, so
+    /// the final store is a rename instead of a second full write (None for
+    /// S3, which keeps the system temp directory).
+    pub(crate) fn spool_dir(&self) -> Option<PathBuf> {
+        match &self.storage {
+            Storage::Local(s) => Some(s.root.join(".spool")),
+            Storage::S3(_) => None,
+        }
+    }
+
+    /// Reserves `size` bytes against the local free-space floor for the
+    /// duration of an upload (no-op on S3). The guard releases on drop.
+    fn reserve_space(&self, size: u64) -> Result<SpaceReservation<'_>> {
+        if let Storage::Local(s) = &self.storage {
+            s.reserve(size)?;
+        }
+        Ok(SpaceReservation { store: self, size })
+    }
+
     /// Stores a blob: the LMDB mapping first (so a crash leaves a healable
     /// state — a mapping without a file can be deleted), then the file.
     #[cfg(test)]
@@ -117,8 +136,8 @@ impl BlobStore {
         // Disk-full guard first: a refused upload must not even leave an
         // orphan mapping behind (the mapping-first design heals such
         // leftovers, but only the bytes that will actually land should be
-        // committed).
-        self.check_space()?;
+        // committed). The reservation covers the whole upload.
+        let _space = self.reserve_space(bytes.len() as u64)?;
         let _blob_guard = self.blob_lock(sha256).await;
         let uploaded = crate::util::unix_now() as i64;
         // Whether the uploader already owned the blob BEFORE this upload
@@ -181,7 +200,7 @@ impl BlobStore {
         size: u64,
         mime: &str,
     ) -> Result<(Descriptor, bool)> {
-        self.check_space()?;
+        let _space = self.reserve_space(size)?;
         let _blob_guard = self.blob_lock(sha256).await;
         let uploaded = crate::util::unix_now() as i64;
         let existing = self.db.blossom_load(sha256).await;
@@ -486,6 +505,20 @@ fn legacy_npub_of(pubkey: &str) -> String {
 
 // ----- local storage --------------------------------------------------------
 
+/// Releases a BlobStore space reservation on drop.
+struct SpaceReservation<'a> {
+    store: &'a BlobStore,
+    size: u64,
+}
+
+impl Drop for SpaceReservation<'_> {
+    fn drop(&mut self) {
+        if let Storage::Local(s) = &self.store.storage {
+            s.release(self.size);
+        }
+    }
+}
+
 struct LocalStore {
     root: PathBuf,
     // Kept open for the lifetime of the store so fd_root remains valid.
@@ -499,6 +532,10 @@ struct LocalStore {
     /// Disk-full guard: uploads are refused while the free space on the
     /// filesystem hosting `root` is below this many bytes (0 disables).
     min_free_bytes: u64,
+    /// Bytes reserved by in-flight uploads. Without this the uploads each
+    /// check the raw free space and can collectively cross the floor
+    /// (TOCTOU on `min_free_bytes`), which risks SIGBUS on LMDB writes.
+    reserved: std::sync::atomic::AtomicU64,
 }
 
 impl LocalStore {
@@ -523,6 +560,7 @@ impl LocalStore {
             fd_root,
             canonical_root,
             min_free_bytes,
+            reserved: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -591,6 +629,33 @@ impl LocalStore {
         Ok(())
     }
 
+    /// Reserves `size` bytes against the free-space floor: concurrent
+    /// uploads would otherwise all pass the raw check and overshoot it.
+    fn reserve(&self, size: u64) -> Result<()> {
+        if self.min_free_bytes == 0 {
+            return Ok(());
+        }
+        let reserved = self
+            .reserved
+            .fetch_add(size, std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(size);
+        let overflow = self
+            .free_space()
+            .is_some_and(|free| free < self.min_free_bytes.saturating_add(reserved));
+        if overflow {
+            self.reserved
+                .fetch_sub(size, std::sync::atomic::Ordering::Relaxed);
+            return Err(crate::error::storage_full());
+        }
+        // Keep the plain check for when statvfs is unavailable.
+        self.check_space()
+    }
+
+    fn release(&self, size: u64) {
+        self.reserved
+            .fetch_sub(size, std::sync::atomic::Ordering::Relaxed);
+    }
+
     #[cfg(test)]
     async fn put(
         &self,
@@ -654,6 +719,16 @@ impl LocalStore {
         tokio::fs::create_dir_all(&dir).await?;
         if !self.parent_within_root(npub).await {
             return Err(anyhow!("blossom storage directory is a symlink"));
+        }
+        // Fast path: a spool on the same filesystem is moved into place
+        // instead of copied (the upload already wrote it once). Any rename
+        // failure (EXDEV, permissions, a planted directory at the target)
+        // falls back to the copy path below.
+        if tokio::fs::rename(source, self.rooted_path(npub, sha256))
+            .await
+            .is_ok()
+        {
+            return Ok(());
         }
         let tmp_path = self.rooted_path(npub, &format!(".{sha256}.tmp"));
         let mut input = tokio::fs::File::open(source).await?;

@@ -145,6 +145,16 @@ pub(crate) const MAX_INDEX_KEY: usize = 511;
 /// free space is below this margin and keeps serving reads.
 pub(crate) const DISK_FREE_MARGIN: u64 = 32 * 1024 * 1024;
 
+/// How many index entries `remove_corrupt_event` scans per table before it
+/// gives up. Clearing a corrupt event's indexes requires walking whole
+/// tables (without the event JSON the index keys cannot be derived); the
+/// fallback exists for legacy/corrupt data only, and an unbounded walk
+/// would hold the caller's write transaction — blocking every queued write
+/// — for seconds on a large relay. Skipped entries are harmless: the scans
+/// verify that an event still exists before delivering it, so a dangling
+/// index key only costs an existence check.
+pub(crate) const CORRUPT_CLEANUP_SCAN_CAP: usize = 50_000;
+
 /// Free bytes on the filesystem hosting `path`, when statvfs succeeds.
 fn path_free_space(path: &std::path::Path) -> Option<u64> {
     let dir = if path.is_file() {
@@ -186,7 +196,7 @@ pub(crate) fn apply_put_batch(
     store: &Store,
     thread_errors: &Arc<std::sync::atomic::AtomicU64>,
     mut pending: Option<heed::RwTxn>,
-    puts: &[(Event, u64)],
+    puts: &[(Arc<Event>, u64)],
     first_seen: &[Option<([u8; 32], u64)>],
 ) -> Vec<PutOutcome> {
     if puts.is_empty() {
@@ -279,7 +289,7 @@ pub(crate) fn apply_put_batch(
 }
 
 /// A batch of events to store in one transaction, with its reply.
-pub(crate) type PutBatchMsg = (Vec<(Event, u64)>, oneshot::Sender<Vec<PutOutcome>>);
+pub(crate) type PutBatchMsg = (Vec<(Arc<Event>, u64)>, oneshot::Sender<Vec<PutOutcome>>);
 
 /// The writer thread's pending write state: the open transaction, the
 /// queued single puts with their reply channels and the queued put
@@ -287,7 +297,7 @@ pub(crate) type PutBatchMsg = (Vec<(Event, u64)>, oneshot::Sender<Vec<PutOutcome
 #[derive(Default)]
 pub(crate) struct WriteBatch<'tx> {
     pub(crate) pending: Option<heed::RwTxn<'tx>>,
-    pub(crate) puts: Vec<(Event, u64)>,
+    pub(crate) puts: Vec<(Arc<Event>, u64)>,
     /// Per-put first-seen reservation, aligned with `puts`: applied inside
     /// the same write transaction as the put it belongs to (one commit and
     /// one fsync instead of two for a pubkey's first accepted event).
@@ -332,7 +342,7 @@ pub(crate) fn flush_everything(
     }
     // Merge the singles and every queued batch into one list; the split
     // points let the outcomes be distributed back in order.
-    let mut all: Vec<(Event, u64)> = std::mem::take(&mut batch.puts);
+    let mut all: Vec<(Arc<Event>, u64)> = std::mem::take(&mut batch.puts);
     let mut first_seen = std::mem::take(&mut batch.first_seen);
     let mut splits: Vec<usize> = vec![all.len()];
     for (events, _) in batch.pending_batches.iter_mut() {
@@ -408,6 +418,11 @@ pub(crate) struct Store {
     /// Ceiling for the memory map (bytes): the map is opened at this size
     /// and never resized at runtime.
     pub(crate) map_max_size: u64,
+    /// Short-lived cache of NIP-50 document frequencies (term -> (df,
+    /// expires_at)). Each miss walks up to `DF_SAMPLE` index entries, and
+    /// a popular query repeats over many requests; the scores tolerate a
+    /// few minutes of staleness.
+    pub(crate) df_cache: Arc<std::sync::Mutex<std::collections::HashMap<String, (u64, u64)>>>,
 }
 
 /// `(created_at, id, protected, group_id, is_meta)` records returned by the
@@ -561,6 +576,7 @@ impl Store {
             max_indexed_words: max_indexed_words.max(1),
             indexed_words,
             map_max_size,
+            df_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         })
     }
 
@@ -629,6 +645,7 @@ impl Store {
             max_indexed_words: self.max_indexed_words,
             indexed_words: self.indexed_words,
             map_max_size: self.map_max_size,
+            df_cache: Arc::clone(&self.df_cache),
         }
     }
 
@@ -1822,43 +1839,73 @@ impl Store {
     }
 
     fn remove_corrupt_event(&self, wtxn: &mut heed::RwTxn, id: &[u8]) -> Result<()> {
-        let databases = [
-            self.by_created,
-            self.by_pubkey,
-            self.by_kind,
-            self.by_tag,
-            self.replaceable,
-            self.expiry,
+        let tables = [
+            ("by_created", self.by_created),
+            ("by_pubkey", self.by_pubkey),
+            ("by_kind", self.by_kind),
+            ("by_tag", self.by_tag),
+            ("replaceable", self.replaceable),
+            ("expiry", self.expiry),
         ];
-        for database in databases {
-            let keys: Vec<Vec<u8>> = database
-                .iter(wtxn)?
-                .filter_map(|entry| {
-                    let (key, value) = entry.ok()?;
-                    (key.ends_with(id) || value.ends_with(id)).then(|| key.to_vec())
-                })
-                .collect();
-            for key in keys {
-                database.delete(wtxn, &key)?;
+        let mut capped: Vec<&str> = Vec::new();
+        for (name, database) in tables {
+            if self.delete_corrupt_index_entries(wtxn, database, id)? {
+                capped.push(name);
             }
         }
         if let Some(meta) = self.event_meta {
             meta.delete(wtxn, id)?;
         }
-        if let Some(by_word) = self.by_word {
-            let keys: Vec<Vec<u8>> = by_word
-                .iter(wtxn)?
-                .filter_map(|entry| {
-                    let (key, value) = entry.ok()?;
-                    (key.ends_with(id) || value.ends_with(id)).then(|| key.to_vec())
-                })
-                .collect();
-            for key in keys {
-                by_word.delete(wtxn, &key)?;
-            }
+        if let Some(by_word) = self.by_word
+            && self.delete_corrupt_index_entries(wtxn, by_word, id)?
+        {
+            capped.push("by_word");
         }
         self.events.delete(wtxn, id)?;
+        if !capped.is_empty() {
+            log::warn!(
+                "corrupt event {}: index cleanup stopped at the {CORRUPT_CLEANUP_SCAN_CAP}-entry \
+                 scan cap for {}; the remaining dangling index entries are skipped by the \
+                 existence check",
+                hex::encode(id),
+                capped.join(", ")
+            );
+        }
         Ok(())
+    }
+
+    /// Deletes every entry of `database` whose key or value ends with `id`,
+    /// scanning at most [`CORRUPT_CLEANUP_SCAN_CAP`] entries. Returns
+    /// whether the walk stopped at the cap (or an iteration error) before
+    /// the table was exhausted.
+    fn delete_corrupt_index_entries(
+        &self,
+        wtxn: &mut heed::RwTxn<'_>,
+        database: heed::Database<Bytes, Bytes>,
+        id: &[u8],
+    ) -> Result<bool> {
+        let mut keys: Vec<Vec<u8>> = Vec::new();
+        let mut capped = false;
+        for (scanned, entry) in database.iter(wtxn)?.enumerate() {
+            if scanned >= CORRUPT_CLEANUP_SCAN_CAP {
+                capped = true;
+                break;
+            }
+            // A mid-iteration error skips the rest of this table: the event
+            // itself is still removed and the leftovers are dangling index
+            // keys, which the scans tolerate (they verify existence).
+            let Ok((key, value)) = entry else {
+                capped = true;
+                break;
+            };
+            if key.ends_with(id) || value.ends_with(id) {
+                keys.push(key.to_vec());
+            }
+        }
+        for key in keys {
+            database.delete(wtxn, &key)?;
+        }
+        Ok(capped)
     }
     /// Records `now` as the first-seen time of `pubkey` when the pubkey is
     /// unknown, and returns `(created, first_seen)`: `created` is true when

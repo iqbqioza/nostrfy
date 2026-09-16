@@ -213,6 +213,10 @@ pub struct GroupStore {
     /// (fail-closed). A fresh CREATE_GROUP later removes the id from this
     /// set.
     ghost: HashSet<String>,
+    /// Per-group timestamp of the last published member list (39002).
+    /// NIP-29 marks the member list optional, and a 10k-member group would
+    /// otherwise build, sign and store a 10k-tag event on every JOIN/LEAVE.
+    members_published_at: HashMap<String, u64>,
     /// Cap on the store size (active groups + deleted markers): bounds the
     /// in-memory state even when an attacker churns group ids. 0 =
     /// unlimited.
@@ -928,11 +932,33 @@ impl GroupStore {
         true
     }
 
-    fn membership_events(&self, gid: &str, relay_pubkey: &str, now: u64) -> Vec<Event> {
-        vec![
-            build_admins_event(gid, self.groups.get(gid), relay_pubkey, now),
-            build_members_event(gid, self.groups.get(gid), relay_pubkey, now),
-        ]
+    fn membership_events(&mut self, gid: &str, relay_pubkey: &str, now: u64) -> Vec<Event> {
+        /// Groups up to this many members always get a fresh 39002.
+        const MEMBERS_EAGER_MAX: usize = 1000;
+        /// Larger groups get it at most once per this many seconds.
+        const MEMBERS_INTERVAL_SECS: u64 = 60;
+        let mut out = vec![build_admins_event(
+            gid,
+            self.groups.get(gid),
+            relay_pubkey,
+            now,
+        )];
+        let members = self.groups.get(gid).map(|g| g.members.len()).unwrap_or(0);
+        let due = members <= MEMBERS_EAGER_MAX
+            || self
+                .members_published_at
+                .get(gid)
+                .is_none_or(|last| now.saturating_sub(*last) >= MEMBERS_INTERVAL_SECS);
+        if due {
+            self.members_published_at.insert(gid.to_string(), now);
+            out.push(build_members_event(
+                gid,
+                self.groups.get(gid),
+                relay_pubkey,
+                now,
+            ));
+        }
+        out
     }
 
     /// Rebuilds the in-memory group state from the stored moderation events.

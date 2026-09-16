@@ -81,7 +81,10 @@ pub(crate) fn db_error(errors: &Arc<std::sync::atomic::AtomicU64>, e: &anyhow::E
 
 enum Msg {
     Put {
-        event: Event,
+        /// Shared with the caller: the relay keeps the same allocation for
+        /// its post-commit side effects and live broadcast instead of deep
+        /// cloning the content (up to 64 KiB) on every accepted event.
+        event: Arc<Event>,
         now: u64,
         /// First-seen reservation applied inside the same write transaction
         /// as the put (see `WriteBatch::first_seen`).
@@ -104,7 +107,7 @@ enum Msg {
     },
     /// Accepts many events in a single write transaction (one commit).
     PutBatch {
-        events: Vec<(Event, u64)>,
+        events: Vec<(Arc<Event>, u64)>,
         reply: oneshot::Sender<Vec<PutOutcome>>,
     },
     /// First-seen trust bookkeeping: records the arrival time of each
@@ -326,7 +329,11 @@ pub struct DbClient {
     /// separate thread that never takes the write lock, so reads keep
     /// working even when the writer is stalled (a slow disk or an external
     /// lock holder cannot take the relay down for readers).
-    read_tx: mpsc::UnboundedSender<Msg>,
+    /// One channel per reader thread: `read_rr` round-robins requests so
+    /// one long scan cannot stall the others (they no longer share a
+    /// receiver behind a blocking Mutex).
+    read_txs: Vec<mpsc::UnboundedSender<Msg>>,
+    read_rr: Arc<std::sync::atomic::AtomicUsize>,
     /// Dedicated channel for REST API queries: served by its own reader
     /// thread, so a flood of `/api/v1` requests can never queue up behind
     /// (or in front of) WebSocket REQ/COUNT/NEG queries on the shared
@@ -370,9 +377,6 @@ pub struct DbClient {
     max_pending_events: usize,
     max_pending_bytes: usize,
     max_api_pending: Arc<std::sync::atomic::AtomicUsize>,
-    /// How many threads serve the WebSocket reader queue (from
-    /// `database.reader_threads`); used to fan the shutdown messages out.
-    reader_threads: usize,
     /// The spawned database threads, joined by [`Self::shutdown`] after the
     /// Shutdown signals: without the join, work queued behind `Shutdown`
     /// could be dropped without a reply and the final flush could be cut
@@ -498,7 +502,8 @@ impl DbClient {
         )?;
         Ok(DbClient {
             tx: threads.tx,
-            read_tx: threads.read_tx,
+            read_txs: threads.read_txs,
+            read_rr: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             api_read_tx: threads.api_read_tx,
             errors: threads.errors,
             expiry: threads.expiry,
@@ -514,7 +519,6 @@ impl DbClient {
             max_pending_events: threads.max_pending_events,
             max_pending_bytes: cfg.max_db_queue_bytes,
             max_api_pending: threads.max_api_pending,
-            reader_threads: threads.reader_threads,
             threads: Arc::new(threads.threads),
         })
     }
@@ -542,7 +546,71 @@ impl DbClient {
     /// writer-queue counters are not part of the gate: the reader threads
     /// exist so reads keep working while the writer is stalled.
     async fn request_read<R: Default>(&self, make: impl FnOnce(oneshot::Sender<R>) -> Msg) -> R {
-        self.request_with_checked(make, &self.read_tx, false).await
+        let channel = self.read_channel();
+        self.request_with_checked(make, channel, false).await
+    }
+
+    /// Round-robin over the per-thread reader channels.
+    fn read_channel(&self) -> &mpsc::UnboundedSender<Msg> {
+        let index = self
+            .read_rr
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            % self.read_txs.len();
+        &self.read_txs[index]
+    }
+
+    /// Reserves one reader-queue slot plus the message's estimated payload
+    /// bytes (add-then-check with rollback). Returns `false` when a cap is
+    /// exceeded, so the caller fails fast. Every read path must reserve its
+    /// bytes through here: the reader thread releases *both* counters on
+    /// completion, so an unreserved byte count underflows
+    /// `pending_read_bytes` to `usize::MAX` and every later byte-checked
+    /// read fails fast for the rest of the process.
+    fn reserve_read(&self, bytes: usize) -> bool {
+        let reads = self
+            .pending_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(1);
+        let pending_bytes = if bytes > 0 {
+            self.pending_read_bytes
+                .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed)
+                .saturating_add(bytes)
+        } else {
+            self.pending_read_bytes
+                .load(std::sync::atomic::Ordering::Relaxed)
+        };
+        let over_bytes = self.max_pending_bytes > 0 && pending_bytes > self.max_pending_bytes;
+        if reads > self.max_pending_msgs || over_bytes {
+            self.release_read(bytes);
+            self.errors
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return false;
+        }
+        true
+    }
+
+    /// Reserves a reader slot and payload bytes without the cap check:
+    /// startup loads must not fail fast (an empty security state is
+    /// fail-open), but the reader still releases both counters, so the
+    /// reservation must be recorded to keep the accounting exact.
+    fn reserve_read_force(&self, bytes: usize) {
+        self.pending_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if bytes > 0 {
+            self.pending_read_bytes
+                .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Releases a read reservation whose message could not be sent. A
+    /// queued message is released by the reader thread instead.
+    fn release_read(&self, bytes: usize) {
+        self.pending_reads
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        if bytes > 0 {
+            self.pending_read_bytes
+                .fetch_sub(bytes, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// Startup-only read: neither fails fast on a momentarily full queue
@@ -558,13 +626,12 @@ impl DbClient {
     ) -> R {
         let (tx, rx) = oneshot::channel();
         let msg = make(tx);
-        self.pending_reads
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if self.read_tx.send(msg).is_err() {
+        let bytes = msg_bytes(&msg);
+        self.reserve_read_force(bytes);
+        if self.read_channel().send(msg).is_err() {
             // The reader thread's receiver is gone: the relay is shutting
             // down or the thread died. There is no state to load.
-            self.pending_reads
-                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            self.release_read(bytes);
             log::error!("database reader is gone; cannot load persisted state");
             return R::default();
         }
@@ -593,11 +660,10 @@ impl DbClient {
     ) -> Option<R> {
         let (tx, rx) = oneshot::channel();
         let msg = make(tx);
-        self.pending_reads
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if self.read_tx.send(msg).is_err() {
-            self.pending_reads
-                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        let bytes = msg_bytes(&msg);
+        self.reserve_read_force(bytes);
+        if self.read_channel().send(msg).is_err() {
+            self.release_read(bytes);
             log::error!("database reader is gone; cannot rebuild startup state");
             return None;
         }
@@ -614,7 +680,8 @@ impl DbClient {
         &self,
         make: impl FnOnce(oneshot::Sender<R>) -> Msg,
     ) -> Option<R> {
-        let rx = self.send_request_read(make, &self.read_tx)?;
+        let channel = self.read_channel();
+        let rx = self.send_request_read(make, channel)?;
         if self.timeout_secs == 0 {
             return rx.await.ok();
         }
@@ -624,31 +691,23 @@ impl DbClient {
             .and_then(|r| r.ok())
     }
 
-    /// Reader-queue variant of [`Self::send_request`]: reserves in
-    /// `pending_reads` (add-then-check with rollback) and reports
-    /// fail-fast as `None`. The reader thread releases the slot on
-    /// completion, so this path must not decrement it.
+    /// Reader-queue variant of [`Self::send_request`]: reserves a slot and
+    /// the payload bytes (add-then-check with rollback) and reports
+    /// fail-fast as `None`. The reader thread releases both on completion,
+    /// so this path must not release them.
     fn send_request_read<R>(
         &self,
         make: impl FnOnce(oneshot::Sender<R>) -> Msg,
         channel: &mpsc::UnboundedSender<Msg>,
     ) -> Option<oneshot::Receiver<R>> {
         let (tx, rx) = oneshot::channel();
-        let reads = self
-            .pending_reads
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            .saturating_add(1);
-        if reads > self.max_pending_msgs {
-            self.pending_reads
-                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-            self.errors
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let msg = make(tx);
+        let bytes = msg_bytes(&msg);
+        if !self.reserve_read(bytes) {
             return None;
         }
-        let msg = make(tx);
         if channel.send(msg).is_err() {
-            self.pending_reads
-                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            self.release_read(bytes);
             return None;
         }
         Some(rx)
@@ -755,30 +814,10 @@ impl DbClient {
                 return None;
             }
         } else {
-            // Reader path: separate counter with the same message cap so a
+            // Reader path: a separate counter with the same message cap so a
             // REQ flood fails fast instead of growing unbounded and (via the
             // old shared counter) blocking the writes.
-            let reads = self
-                .pending_reads
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                .saturating_add(1);
-            let pending_bytes = if bytes > 0 {
-                self.pending_read_bytes
-                    .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed)
-                    .saturating_add(bytes)
-            } else {
-                self.pending_read_bytes
-                    .load(std::sync::atomic::Ordering::Relaxed)
-            };
-            if reads > self.max_pending_msgs || over_bytes(pending_bytes) {
-                self.pending_reads
-                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                if bytes > 0 {
-                    self.pending_read_bytes
-                        .fetch_sub(bytes, std::sync::atomic::Ordering::Relaxed);
-                }
-                self.errors
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if !self.reserve_read(bytes) {
                 return None;
             }
         }
@@ -857,16 +896,17 @@ impl DbClient {
         }
     }
 
-    pub async fn put(&self, event: Event, now: u64) -> PutOutcome {
-        self.put_with_first_seen(event, now, None).await
+    pub async fn put(&self, event: impl Into<Arc<Event>>, now: u64) -> PutOutcome {
+        self.put_with_first_seen(event.into(), now, None).await
     }
 
     /// Like [`Self::put`], but records the pubkey's first-seen timestamp in
     /// the same write transaction (one commit/fsync instead of two for a
-    /// pubkey's first accepted event).
+    /// pubkey's first accepted event). Takes an [`Arc<Event>`] so the caller
+    /// can reuse the same allocation for its post-commit side effects.
     pub async fn put_with_first_seen(
         &self,
-        event: Event,
+        event: Arc<Event>,
         now: u64,
         first_seen: Option<([u8; 32], u64)>,
     ) -> PutOutcome {
@@ -1071,6 +1111,10 @@ impl DbClient {
     /// tests; the relay itself goes through [`Self::put_batch_deferred`].
     #[allow(dead_code)]
     pub async fn put_batch(&self, events: Vec<(Event, u64)>) -> Vec<PutOutcome> {
+        let events = events
+            .into_iter()
+            .map(|(event, now)| (Arc::new(event), now))
+            .collect();
         self.request_write(|reply| Msg::PutBatch { events, reply })
             .await
     }
@@ -1079,10 +1123,11 @@ impl DbClient {
     /// without awaiting it: the connection can keep reading frames while
     /// the writer commits, instead of stalling on the commit (and letting
     /// the socket buffer decide the batch size). Returns `None` when the
-    /// queue is full (the batch was not queued).
+    /// queue is full (the batch was not queued). The events are shared
+    /// [`Arc`]s so queueing a batch never deep-copies the contents.
     pub fn put_batch_deferred(
         &self,
-        events: Vec<(Event, u64)>,
+        events: Vec<(Arc<Event>, u64)>,
     ) -> Option<tokio::sync::oneshot::Receiver<Vec<PutOutcome>>> {
         self.send_request(|reply| Msg::PutBatch { events, reply }, &self.tx)
     }
@@ -1613,10 +1658,9 @@ impl DbClient {
 
     pub fn shutdown(&self) {
         let _ = self.tx.send(Msg::Shutdown);
-        // One per reader thread (the WebSocket reader pool is shared
-        // behind a mutex; each thread consumes one shutdown message).
-        for _ in 0..self.reader_threads {
-            let _ = self.read_tx.send(Msg::Shutdown);
+        // One per reader thread (each owns its receiver).
+        for tx in &self.read_txs {
+            let _ = tx.send(Msg::Shutdown);
         }
         let _ = self.api_read_tx.send(Msg::Shutdown);
         // Join the threads so the final flush and the shutdown sync finish
