@@ -955,6 +955,21 @@ impl GroupStore {
     /// Whether the content of a group may be served to `authed`. `is_meta`
     /// distinguishes relay-generated metadata events (kinds 39000-39005),
     /// which `hidden` groups additionally withhold from non-members.
+    /// Marks every `previous` group id that the (rebuilt) store no longer
+    /// knows — and that was not explicitly deleted — as a ghost: its
+    /// create/state is gone, so on a keyless relay its surviving posts
+    /// must be withheld instead of turning world-readable. The vanish
+    /// rebuild seeds this from the pre-rebuild state, which catches the
+    /// "creator vanished, only ordinary posts survived" case that the
+    /// moderation-event scan cannot see.
+    pub fn ghost_missing(&mut self, previous: impl IntoIterator<Item = String>) {
+        for gid in previous {
+            if !self.groups.contains_key(&gid) && !self.deleted.contains(&gid) {
+                self.ghost.insert(gid);
+            }
+        }
+    }
+
     pub fn visible_gid(&self, gid: &str, is_meta: bool, authed: Option<&str>) -> bool {
         // Content of a deleted group is never served: the group is gone,
         // and its (possibly private) history must not become readable by

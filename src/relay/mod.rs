@@ -1424,8 +1424,15 @@ impl Relay {
                     // they wait here and apply to the rebuilt store after
                     // the swap instead of being lost with the discarded one.
                     let mut groups = self.groups.write().await;
+                    // Groups the vanished author's events may have removed:
+                    // after the rebuild they are gone from the store, but
+                    // their surviving ordinary posts must not become
+                    // world-readable on a keyless relay (no relay-signed
+                    // metadata survives to mark them). Ghost them.
+                    let previous: Vec<String> = groups.groups.keys().cloned().collect();
                     let ok = fresh.rebuild(&self.db).await;
                     if ok {
+                        fresh.ghost_missing(previous);
                         *groups = fresh;
                     }
                     ok
