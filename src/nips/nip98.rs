@@ -24,7 +24,7 @@ pub const METHOD_TAG: &str = "method";
 /// authorization be replayed against a different body. The `u` tag value is
 /// checked with `url_matches` and the `method` tag must equal the HTTP
 /// method of the request (NIP-98 requirement 4).
-pub async fn verify(
+pub fn verify(
     encoded: &str,
     expected_pubkey: Option<&str>,
     secp: &Secp256k1<secp256k1::All>,
@@ -206,14 +206,12 @@ mod tests {
             assert!(
                 verify(&encode(&ev), None, &secp, false, None, "POST", |u| u
                     == "https://relay.example.com/",)
-                .await
                 .is_some()
             );
             // Wrong method: rejected (NIP-98 requirement 4).
             assert!(
                 verify(&encode(&ev), None, &secp, false, None, "GET", |u| u
                     == "https://relay.example.com/",)
-                .await
                 .is_none()
             );
             // Missing method tag: rejected.
@@ -221,7 +219,6 @@ mod tests {
             assert!(
                 verify(&encode(&bare), None, &secp, false, None, "POST", |u| u
                     == "https://relay.example.com/",)
-                .await
                 .is_none()
             );
         });
@@ -247,7 +244,6 @@ mod tests {
             assert!(
                 verify(&encoded, None, &secp, true, Some(&want), "POST", |u| u
                     == "https://relay.example.com/",)
-                .await
                 .is_some()
             );
             // A captured authorization replayed against another body: rejected.
@@ -255,7 +251,6 @@ mod tests {
             assert!(
                 verify(&encoded, None, &secp, true, Some(&other), "POST", |u| u
                     == "https://relay.example.com/",)
-                .await
                 .is_none()
             );
             // Missing tag when required: rejected.
@@ -270,7 +265,6 @@ mod tests {
                     "POST",
                     |u| u == "https://relay.example.com/",
                 )
-                .await
                 .is_none()
             );
         });

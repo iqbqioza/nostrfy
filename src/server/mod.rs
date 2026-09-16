@@ -727,6 +727,9 @@ async fn root_inbox_outbox(State(relay): State<Arc<Relay>>, request: Request) ->
 /// ("on the same URI as the relay's websocket").
 async fn ws_handler(State(relay): State<Arc<Relay>>, request: Request) -> Response {
     // NIP-86: blockip — refuse WebSocket connections from blocked peers.
+    // Kept as defense in depth even though the global middleware layer
+    // covers every route (the duplicate walk is per handshake, not per
+    // frame).
     if let Some(ip) = request
         .extensions()
         .get::<axum::extract::connect_info::ConnectInfo<std::net::SocketAddr>>()
@@ -735,6 +738,9 @@ async fn ws_handler(State(relay): State<Arc<Relay>>, request: Request) -> Respon
     {
         return StatusCode::FORBIDDEN.into_response();
     }
+    // `is_websocket_request` is evaluated once: it was parsed twice per
+    // request (once for the Blossom root gate, once for the NIP-11 branch).
+    let is_ws = is_websocket_request(request.headers());
     // The Blossom server shares the root `/` route with the relay: when
     // the request Host names the Blossom host, the root path is answered
     // with the Blossom server info instead of the NIP-11 document (and
@@ -743,16 +749,10 @@ async fn ws_handler(State(relay): State<Arc<Relay>>, request: Request) -> Respon
         .headers()
         .get(axum::http::header::HOST)
         .and_then(|v| v.to_str().ok());
-    if let Some(response) = blossom_root_info(
-        relay.clone(),
-        host_header,
-        is_websocket_request(request.headers()),
-    )
-    .await
-    {
+    if let Some(response) = blossom_root_info(relay.clone(), host_header, is_ws).await {
         return response;
     }
-    if !is_websocket_request(request.headers()) {
+    if !is_ws {
         // Not a WebSocket handshake: serve the NIP-11 info document.
         let wants_nostr_json = request
             .headers()
