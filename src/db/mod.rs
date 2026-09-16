@@ -121,7 +121,10 @@ enum Msg {
     /// Read-only list of every vanished pubkey (startup rebuilds consult
     /// it so a vanished author cannot be resurrected as a group member or
     /// role holder by replaying pre-vanish events).
-    VanishPubkeys {
+    /// One page of the vanish table (see `Store::vanish_pubkeys_page`).
+    VanishPubkeysPage {
+        after: Option<Vec<u8>>,
+        limit: usize,
         reply: oneshot::Sender<Vec<Vec<u8>>>,
     },
     /// NIP-77: query returning only `(created_at, id)` records so that large
@@ -1279,9 +1282,28 @@ impl DbClient {
     /// Every vanished pubkey (raw 32-byte keys) for the startup rebuilds.
     /// `None` when the reader could not answer: the caller fails closed
     /// instead of resurrecting vanished identities with an empty list.
-    pub async fn vanish_pubkeys(&self) -> Option<Vec<Vec<u8>>> {
-        self.request_read_startup(|reply| Msg::VanishPubkeys { reply })
-            .await
+    /// Streams every vanished pubkey through `f` in bounded pages (the
+    /// caller builds its set), instead of materializing the whole table at
+    /// once. Returns `None` when the database did not answer.
+    pub async fn vanish_pubkeys_each<F: FnMut(&[u8])>(&self, mut f: F) -> Option<()> {
+        const PAGE: usize = 4096;
+        let mut after: Option<Vec<u8>> = None;
+        loop {
+            let page = self
+                .request_read(|reply| Msg::VanishPubkeysPage {
+                    after: after.clone(),
+                    limit: PAGE,
+                    reply,
+                })
+                .await;
+            for key in &page {
+                f(key);
+            }
+            match page.last() {
+                Some(last) if page.len() == PAGE => after = Some(last.clone()),
+                _ => return Some(()),
+            }
+        }
     }
 
     #[cfg(test)]

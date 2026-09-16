@@ -82,6 +82,27 @@ struct Collect<'a, C: ScanCollector> {
 const SEARCH_BUDGET_MULTIPLIER: usize = 8;
 const SEARCH_BUDGET_MAX: usize = 100_000;
 
+/// Byte ceiling for one scan's collected events. The item caps alone bound
+/// the *count* (up to 200k full events, each up to 64 KiB of content, so
+/// gigabytes in the worst case): the byte budget is the real memory guard,
+/// and reaching it reports `more` (an approximate result) instead of
+/// materializing the rest.
+const COLLECT_BYTE_CAP: usize = 64 * 1024 * 1024;
+
+/// A cheap upper-bound-ish estimate of an event's heap footprint: content,
+/// id/pubkey/signature strings, tags and a per-event allowance.
+fn event_size_estimate(event: &Event) -> usize {
+    event.content.len()
+        + event.pubkey.len()
+        + event.sig.len()
+        + event
+            .tags
+            .iter()
+            .map(|tag| tag.iter().map(String::len).sum::<usize>() + 8)
+            .sum::<usize>()
+        + 64
+}
+
 /// Upper bound on the number of query terms used for a search: the word
 /// index walk and the relevance ranking both stop here, so a pathological
 /// query (e.g. a 1000-byte search string) cannot fan out into hundreds of
@@ -176,6 +197,9 @@ struct EventCollector {
     /// REQ. NIP-01 applies `limit` to each filter independently, so a
     /// filter's quota must not be consumed by an earlier filter's matches.
     counts: Vec<usize>,
+    /// Estimated heap bytes of the collected events (see
+    /// [`COLLECT_BYTE_CAP`]).
+    bytes: usize,
     /// The filter currently being scanned (`counts` index).
     filter: usize,
 }
@@ -189,6 +213,7 @@ impl EventCollector {
             boundary: None,
             tie_cap: cap.saturating_mul(2),
             counts: vec![0; filters],
+            bytes: 0,
             filter: 0,
         }
     }
@@ -224,6 +249,9 @@ fn score(event: &Event, terms: &[String], weights: &[f64]) -> f64 {
 
 impl ScanCollector for EventCollector {
     fn full(&self) -> bool {
+        if self.bytes >= COLLECT_BYTE_CAP {
+            return true;
+        }
         if !self.boundary_ok {
             // COUNT/NIP-45: the count must be exact up to `cap`, but the
             // collection must not exceed it across filters (the per-filter
@@ -254,6 +282,7 @@ impl ScanCollector for EventCollector {
             self.boundary = Some(event.created_at);
         }
         self.counts[self.filter] += 1;
+        self.bytes = self.bytes.saturating_add(event_size_estimate(&event));
         self.events.push(event);
         true
     }

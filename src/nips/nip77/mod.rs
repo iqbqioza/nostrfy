@@ -156,8 +156,7 @@ pub fn respond(items: &[Item], client_message: &[u8]) -> anyhow::Result<Vec<u8>>
     for range in &ranges {
         let upper = &range.upper;
         // Ranges must be adjacent and ascending.
-        if lower.ts > upper.ts
-            || (lower.ts == upper.ts && lower.prefix.as_slice() > upper.prefix.as_slice())
+        if lower.ts > upper.ts || (lower.ts == upper.ts && prefix_gt(&lower.prefix, &upper.prefix))
         {
             return Err(anyhow!("ranges out of order"));
         }
@@ -259,6 +258,21 @@ fn split_bound(a: &Item, b: &Item) -> Bound {
         // `b.1[..=32]` out of bounds and panic.
         prefix: b.1[..common.min(31) + 1].to_vec(),
     }
+}
+
+/// Whether prefix `a` sorts after `b` under the protocol's implicit
+/// zero-padding: bounds of different lengths compare as if the shorter one
+/// were padded with zero bytes (a bare `slice >` allowed a short prefix to
+/// sort above a longer one that is actually larger).
+fn prefix_gt(a: &[u8], b: &[u8]) -> bool {
+    for i in 0..a.len().max(b.len()) {
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
+        if x != y {
+            return x > y;
+        }
+    }
+    false
 }
 
 #[cfg(test)]
