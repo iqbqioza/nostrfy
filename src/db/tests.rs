@@ -3863,6 +3863,52 @@ fn removing_corrupt_event_cleans_primary_indexes() {
 }
 
 #[test]
+fn corrupt_event_cleanup_is_bounded_by_the_scan_cap() {
+    // A corrupt event's index cleanup must not walk an arbitrarily large
+    // table while the caller's write transaction is open: past the cap the
+    // dangling index entries are left behind (harmless, the scans verify
+    // existence) instead of blocking every queued write.
+    use crate::db::store::{CORRUPT_CLEANUP_SCAN_CAP, created_key};
+    let expiry = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let store = crate::db::store::Store::open(&config(), expiry, 128).unwrap();
+    let id = [9u8; 32];
+    let created = 1_700_000_000u64;
+    let mut wtxn = store.env.write_txn().unwrap();
+    store.events.put(&mut wtxn, &id, b"{not-json").unwrap();
+    // Fill `by_created` with unrelated keys that sort before the corrupt
+    // event's key, so the walk hits the cap before finding it.
+    for i in 0..CORRUPT_CLEANUP_SCAN_CAP {
+        store
+            .by_created
+            .put(&mut wtxn, &created_key(i as u64, &[1u8; 32]), b"")
+            .unwrap();
+    }
+    store
+        .by_created
+        .put(&mut wtxn, &created_key(created, &id), b"")
+        .unwrap();
+    wtxn.commit().unwrap();
+
+    let mut wtxn = store.env.write_txn().unwrap();
+    store.remove_event(&mut wtxn, &id).unwrap();
+    wtxn.commit().unwrap();
+
+    let rtxn = store.env.read_txn().unwrap();
+    assert!(
+        store.events.get(&rtxn, &id).unwrap().is_none(),
+        "the corrupt event itself is removed"
+    );
+    assert!(
+        store
+            .by_created
+            .get(&rtxn, &created_key(created, &id))
+            .unwrap()
+            .is_some(),
+        "the capped walk leaves the dangling index entry behind"
+    );
+}
+
+#[test]
 fn group_and_role_snapshots_survive_restart() {
     // NIP-29/43 state must survive restarts without replaying history:
     // persist a snapshot, then load + restore it into fresh stores.
