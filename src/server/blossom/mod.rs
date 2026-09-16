@@ -650,6 +650,18 @@ async fn get_blob(
             } else {
                 (StatusCode::OK, base_headers, body).into_response()
             };
+            if ranged && honored {
+                // A 206 must not be cached as if it were the full blob:
+                // drop the immutable cache header and mark the Range
+                // variance (the same URL can serve different bytes).
+                response
+                    .headers_mut()
+                    .remove(axum::http::header::CACHE_CONTROL);
+                response.headers_mut().insert(
+                    axum::http::header::VARY,
+                    axum::http::HeaderValue::from_static("Range"),
+                );
+            }
             if ranged
                 && honored
                 && let Some(Ok(Some((start, end)))) = range
@@ -668,10 +680,12 @@ async fn get_blob(
             response
         }
         Ok(None) => error(StatusCode::NOT_FOUND, "blob not found"),
-        Err(e) => error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("storage error: {e}"),
-        ),
+        Err(e) => {
+            // Keep the backend detail (S3 XML, OS messages) in the log:
+            // the response only carries a generic message.
+            log::error!("blossom storage error: {e}");
+            error(StatusCode::INTERNAL_SERVER_ERROR, "storage error")
+        }
     }
 }
 
@@ -731,10 +745,8 @@ async fn head_blob(
         },
         Ok(None) => return error(StatusCode::NOT_FOUND, "blob not found"),
         Err(e) => {
-            return error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("storage error: {e}"),
-            );
+            log::error!("blossom storage error: {e}");
+            return error(StatusCode::INTERNAL_SERVER_ERROR, "storage error");
         }
     };
     let ranged = matches!(range, Some(Ok(Some(_))));
@@ -907,10 +919,12 @@ async fn put_blob(relay: Arc<Relay>, headers: HeaderMap, body: Body, verb: &str)
                 .into_response()
         }
 
-        Err(e) => error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("storage error: {e}"),
-        ),
+        Err(e) => {
+            // Keep the backend detail (S3 XML, OS messages) in the log:
+            // the response only carries a generic message.
+            log::error!("blossom storage error: {e}");
+            error(StatusCode::INTERNAL_SERVER_ERROR, "storage error")
+        }
     }
 }
 
@@ -939,6 +953,10 @@ async fn spool_upload(
     let mut file = match tokio::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
+        // The spool may hold a blob that is never published (a rejected or
+        // abandoned upload): keep it unreadable to other local users
+        // instead of relying on the process umask.
+        .mode(0o600)
         .open(&path)
         .await
     {
@@ -1216,10 +1234,12 @@ async fn delete_blob(
     match state.store.delete(&pubkey, &sha).await {
         Ok(true) => StatusCode::OK.into_response(),
         Ok(false) => error(StatusCode::NOT_FOUND, "blob not found"),
-        Err(e) => error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("storage error: {e}"),
-        ),
+        Err(e) => {
+            // Keep the backend detail (S3 XML, OS messages) in the log:
+            // the response only carries a generic message.
+            log::error!("blossom storage error: {e}");
+            error(StatusCode::INTERNAL_SERVER_ERROR, "storage error")
+        }
     }
 }
 

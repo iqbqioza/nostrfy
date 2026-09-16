@@ -201,11 +201,15 @@ pub async fn rpc_handler(
             let pubkey = pubkey.to_ascii_lowercase();
             {
                 let mut access = relay.access.write().await;
-                if !access
+                if let Some(entry) = access
                     .blocked_pubkeys
-                    .iter()
-                    .any(|(p, _)| p.eq_ignore_ascii_case(&pubkey))
+                    .iter_mut()
+                    .find(|(p, _)| p.eq_ignore_ascii_case(&pubkey))
                 {
+                    // Re-banning updates the stored reason: `listbannedpubkeys`
+                    // must reflect the latest call, not the first one.
+                    entry.1 = reason.to_string();
+                } else {
                     access
                         .blocked_pubkeys
                         .push((pubkey.to_string(), reason.to_string()));
@@ -219,6 +223,11 @@ pub async fn rpc_handler(
             let Some(pubkey) = params.first().and_then(Value::as_str) else {
                 return rpc_err("invalid params");
             };
+            // Same validation as `banpubkey`: an unban must name a pubkey
+            // (any string used to return a success reply).
+            if !is_pubkey(pubkey) {
+                return rpc_err("invalid pubkey");
+            }
             {
                 let mut access = relay.access.write().await;
                 access
@@ -275,6 +284,10 @@ pub async fn rpc_handler(
             let Some(pubkey) = params.first().and_then(Value::as_str) else {
                 return rpc_err("invalid params");
             };
+            // Same validation as `allowpubkey`.
+            if !is_pubkey(pubkey) {
+                return rpc_err("invalid pubkey");
+            }
             {
                 let mut access = relay.access.write().await;
                 access

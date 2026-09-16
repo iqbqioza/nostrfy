@@ -989,7 +989,7 @@ fn load_relay_pubkeys(cfg: &Config) -> Result<crate::db::store::RelayPubkeyLists
     let rtxn = env.read_txn()?;
     let access = env
         .open_database::<heed::types::Bytes, heed::types::Bytes>(&rtxn, Some("access"))?
-        .expect("access table created above");
+        .ok_or_else(|| anyhow::anyhow!("access table was not created"))?;
     drop(rtxn);
     crate::db::store::migrate_access_pubkeys(&env, &access)?;
     let rtxn = env.read_txn()?;

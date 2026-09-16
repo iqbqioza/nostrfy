@@ -622,10 +622,14 @@ pub async fn api_monthly_handler(
                         Json(json!({ "error": "server is busy, try again shortly" })),
                     );
                 };
-                let (events, more) = relay
+                let Some((events, more)) = relay
                     .db
                     .api_query(vec![probe.clone()], fetch, now, true)
-                    .await;
+                    .await
+                else {
+                    drop(_permit);
+                    return db_unavailable();
+                };
                 drop(_permit);
                 exhausted = !more;
                 let has_group_events = events.iter().any(nip29::is_group_event);
@@ -709,7 +713,9 @@ pub async fn api_monthly_handler(
             "until": end,
         }))
         .expect("static filter");
-        let (events, more) = relay.db.api_count(vec![filter], count_limit, now).await;
+        let Some((events, more)) = relay.db.api_count(vec![filter], count_limit, now).await else {
+            return db_unavailable();
+        };
         approximate |= more;
         // The same visibility rules as the unauthenticated API: protected
         // events, gift wraps and private/hidden group content are withheld.
@@ -801,7 +807,9 @@ pub async fn api_count_handler(
     // agree with the visible rows of a `no_p` query).
     let no_tags = excluded_tags(&params);
     let nip78 = enabled_nip78_auth_active(&relay).await;
-    let (events, more) = relay.db.api_count(vec![filter], count_limit, now).await;
+    let Some((events, more)) = relay.db.api_count(vec![filter], count_limit, now).await else {
+        return db_unavailable();
+    };
     let has_group_events = events.iter().any(nip29::is_group_event);
     let groups = if has_group_events {
         Some(relay.groups.read().await)
@@ -843,7 +851,9 @@ pub async fn api_kinds_handler(
     let count_limit = relay.config.read().await.limits.max_count;
     let now = unix_now();
     let filter: Filter = serde_json::from_value(json!({ "authors": [hex_pk] })).expect("static");
-    let (events, more) = relay.db.api_count(vec![filter], count_limit, now).await;
+    let Some((events, more)) = relay.db.api_count(vec![filter], count_limit, now).await else {
+        return db_unavailable();
+    };
     let has_group_events = events.iter().any(nip29::is_group_event);
     let groups = if has_group_events {
         Some(relay.groups.read().await)
@@ -938,7 +948,9 @@ pub async fn api_daily_handler(
             "until": day_start + 86400 - 1,
         }))
         .expect("static filter");
-        let (events, more) = relay.db.api_count(vec![filter], count_limit, now).await;
+        let Some((events, more)) = relay.db.api_count(vec![filter], count_limit, now).await else {
+            return db_unavailable();
+        };
         approximate |= more;
         let has_group_events = events.iter().any(nip29::is_group_event);
         let groups = if has_group_events {
@@ -1040,12 +1052,14 @@ pub async fn api_stats_handler(
     let no_tags = excluded_tags(&params);
     let nip78 = enabled_nip78_auth_active(&relay).await;
 
-    let (events, more) = {
+    let Some((events, more)) = ({
         let _permit = permit!();
         relay
             .db
             .api_count(vec![filter.clone()], count_limit, now)
             .await
+    }) else {
+        return db_unavailable();
     };
     let has_group_events = events.iter().any(nip29::is_group_event);
     let groups = if has_group_events {
@@ -1075,14 +1089,20 @@ pub async fn api_stats_handler(
         let mut fetch = 64usize;
         for _ in 0..4 {
             let _permit = permit!();
-            let (first, _) = relay
+            let Some((first, _)) = relay
                 .db
                 .api_query(vec![filter.clone()], fetch, now, true)
-                .await;
-            let (last, _) = relay
+                .await
+            else {
+                return db_unavailable();
+            };
+            let Some((last, _)) = relay
                 .db
                 .api_query(vec![filter.clone()], fetch, now, false)
-                .await;
+                .await
+            else {
+                return db_unavailable();
+            };
             drop(_permit);
             let stats_groups = relay.groups.read().await;
             if first_visible.is_none() {
@@ -1212,7 +1232,9 @@ pub async fn api_hourly_handler(
             "until": h_start + 3600 - 1,
         }))
         .expect("static filter");
-        let (events, more) = relay.db.api_count(vec![filter], count_limit, now).await;
+        let Some((events, more)) = relay.db.api_count(vec![filter], count_limit, now).await else {
+            return db_unavailable();
+        };
         approximate |= more;
         let has_group_events = events.iter().any(nip29::is_group_event);
         let groups = if has_group_events {
@@ -1607,6 +1629,16 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
+/// 503 for a database read that failed fast or timed out: an empty `200`
+/// result would be indistinguishable from "no events" (and a count of 0
+/// from "overloaded").
+fn db_unavailable() -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({ "error": "database is overloaded, try again shortly" })),
+    )
+}
+
 async fn query_and_respond(
     relay: &Arc<Relay>,
     filters: Vec<Filter>,
@@ -1676,10 +1708,13 @@ async fn query_and_respond(
     let mut events: Vec<Event> = Vec::new();
     let mut db_more = true;
     for _ in 0..4 {
-        let (batch, more) = relay
+        let Some((batch, more)) = relay
             .db
             .api_query(filters.clone(), fetch, now, ascending)
-            .await;
+            .await
+        else {
+            return db_unavailable();
+        };
         events = batch;
         db_more = more;
         let has_group_events = events.iter().any(nip29::is_group_event);

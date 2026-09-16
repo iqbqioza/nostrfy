@@ -872,16 +872,18 @@ impl Relay {
                 None,
             );
         }
-        let outcome = self.db.put(event.clone(), now).await;
-        if persist_first_seen
-            && matches!(
-                outcome,
-                PutOutcome::Stored | PutOutcome::Replaced | PutOutcome::Ephemeral
-            )
-            && let Some(pubkey) = event.pubkey_bytes()
-        {
-            self.db.touch_first_seen_batch(vec![(pubkey, now)]).await;
-        }
+        // The first-seen reservation rides along with the put: applied in
+        // the same write transaction (one commit/fsync) only when the event
+        // actually stores.
+        let first_seen = if persist_first_seen {
+            event.pubkey_bytes().map(|pubkey| (pubkey, now))
+        } else {
+            None
+        };
+        let outcome = self
+            .db
+            .put_with_first_seen(event.clone(), now, first_seen)
+            .await;
         let (nip9, nip43, nip29_enabled) =
             (cfg.nip_enabled(9), cfg.nip_enabled(43), cfg.nip_enabled(29));
         drop(access);

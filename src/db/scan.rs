@@ -319,6 +319,12 @@ struct ItemCollector {
     items: NegItems,
     cap: usize,
     boundary: Option<u64>,
+    /// Hard stop including the same-created_at tie continuation (mirrors
+    /// `EventCollector::tie_cap`): a timestamp tie may exceed `cap` to keep
+    /// a page together, but never beyond twice it. Without this a flood of
+    /// events sharing one timestamp would be materialized up to the whole
+    /// candidate budget for a tiny `max_items`.
+    tie_cap: usize,
 }
 
 impl ItemCollector {
@@ -327,13 +333,14 @@ impl ItemCollector {
             items: Vec::new(),
             cap,
             boundary: None,
+            tie_cap: cap.saturating_mul(2),
         }
     }
 }
 
 impl ScanCollector for ItemCollector {
     fn full(&self) -> bool {
-        self.items.len() >= self.cap && self.boundary.is_none()
+        self.items.len() >= self.tie_cap
     }
     fn cap(&self) -> usize {
         self.cap
@@ -857,6 +864,13 @@ impl Store {
                 let Ok(decoded) = hex::decode(id) else {
                     continue;
                 };
+                if decoded.len() > ID_LEN {
+                    // NIP-01 id prefixes are at most 64 hex chars: a longer
+                    // entry can never match an event id, so skip it instead
+                    // of silently truncating it to 32 bytes (which would
+                    // widen the range and return unrelated events).
+                    continue;
+                }
                 if decoded.len() == ID_LEN {
                     // The exact-id set is bounded by the filter member cap
                     // (`MAX_FILTER_MEMBERS`); the budget guard is defensive.
@@ -1220,39 +1234,65 @@ impl Store {
             });
         }
         let mut last_emitted: Option<([u8; 8], [u8; 32])> = None;
-        loop {
-            // The index keys are `(prefix..., created_at, id)`, so the
-            // newest head is the one with the largest (created_at, id)
-            // pair, not the largest full key.
-            let mut best: Option<(usize, [u8; 8], [u8; 32])> = None;
-            for (i, head) in heads.iter_mut().enumerate() {
-                if head.next_key.is_none() {
-                    match head.iter.next() {
-                        Some(Ok((key, _))) => {
-                            let (created, id) = index_tail(key)?;
-                            head.next_key = Some((key.to_vec(), created, id));
-                        }
-                        Some(Err(e)) => return Err(e.into()),
-                        None => {}
-                    }
+        // A heap of the current head of every range replaces the per-emission
+        // linear scan: with up to MAX_FILTER_MEMBERS (512) ranges, picking
+        // the next head linearly cost O(emissions × ranges) on the reader
+        // thread (the audit's M2 of the db-core report).
+        #[derive(PartialEq, Eq)]
+        struct HeadKey {
+            created: [u8; 8],
+            id: [u8; 32],
+            head: usize,
+            ascending: bool,
+        }
+        impl Ord for HeadKey {
+            fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+                let ord = (self.created, self.id).cmp(&(other.created, other.id));
+                if self.ascending { ord.reverse() } else { ord }
+            }
+        }
+        impl PartialOrd for HeadKey {
+            fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+        // Fills the head's next key from its iterator (parsing the
+        // `(created_at, id)` tail once per refill) and returns it.
+        fn refill<'a>(head: &mut Head<'a>) -> Result<Option<([u8; 8], [u8; 32])>> {
+            match head.iter.next() {
+                Some(Ok((key, _))) => {
+                    let (created, id) = index_tail(key)?;
+                    head.next_key = Some((key.to_vec(), created, id));
+                    Ok(Some((created, id)))
                 }
-                if let Some((_, created, id)) = &head.next_key {
-                    let better = if ascending {
-                        best.as_ref()
-                            .is_none_or(|(_, bc, bi)| (*created, *id) < (*bc, *bi))
-                    } else {
-                        best.as_ref()
-                            .is_none_or(|(_, bc, bi)| (*created, *id) > (*bc, *bi))
-                    };
-                    if better {
-                        best = Some((i, *created, *id));
-                    }
+                Some(Err(e)) => Err(e.into()),
+                None => {
+                    head.next_key = None;
+                    Ok(None)
                 }
             }
-            let Some((i, created, id)) = best else {
+        }
+        let mut heap: std::collections::BinaryHeap<HeadKey> = std::collections::BinaryHeap::new();
+        for (i, head) in heads.iter_mut().enumerate() {
+            if let Some((created, id)) = refill(head)? {
+                heap.push(HeadKey {
+                    created,
+                    id,
+                    head: i,
+                    ascending,
+                });
+            }
+        }
+        loop {
+            let Some(top) = heap.pop() else {
                 return Ok(true);
             };
-            let (key, _, _) = heads[i].next_key.as_ref().expect("head was picked");
+            let i = top.head;
+            // The head's cached key must match the popped entry: both are
+            // regenerated together on every refill.
+            let Some((key, created, id)) = heads[i].next_key.take() else {
+                continue;
+            };
             // The same event can appear in several ranges (e.g. a search
             // term union); the merged walk emits in global order, so a
             // repeat of the immediately previous id is the same event —
@@ -1262,7 +1302,14 @@ impl Store {
                 && last_created == created
                 && last_id == id
             {
-                heads[i].next_key = None;
+                if let Some((created, id)) = refill(&mut heads[i])? {
+                    heap.push(HeadKey {
+                        created,
+                        id,
+                        head: i,
+                        ascending,
+                    });
+                }
                 continue;
             }
             last_emitted = Some((created, id));
@@ -1271,7 +1318,14 @@ impl Store {
                 *more = true;
                 return Ok(false);
             }
-            heads[i].next_key = None;
+            if let Some((created, id)) = refill(&mut heads[i])? {
+                heap.push(HeadKey {
+                    created,
+                    id,
+                    head: i,
+                    ascending,
+                });
+            }
         }
     }
 }
@@ -1591,6 +1645,25 @@ mod tests {
         c.sort_relevance(&[], &[]);
         c.truncate_to(3);
         assert_eq!(c.items.len(), 3);
+    }
+
+    #[test]
+    fn item_collector_stops_at_the_tie_cap() {
+        use super::{ItemCollector, ScanCollector};
+        // Every event shares one created_at: the boundary continuation
+        // would otherwise keep collecting (up to the candidate budget) for
+        // a `limit` of 2. The tie cap stops the scan at twice the cap.
+        let mut c = ItemCollector::new(2);
+        let mut pushed = 0;
+        for i in 0..16u8 {
+            if c.full() {
+                break;
+            }
+            assert!(c.push(ev("x", 1000), [i; 32], 2));
+            pushed += 1;
+        }
+        assert!(c.full(), "the tie cap must stop the scan");
+        assert_eq!(pushed, 4, "tie cap is twice the collection cap");
     }
 
     #[test]

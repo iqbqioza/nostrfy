@@ -969,7 +969,7 @@ fn store_blossom_mapping_lifecycle() {
     let alice = "cc".repeat(32);
     let bob = "dd".repeat(32);
     // An empty batch commits nothing and returns no outcomes.
-    assert!(apply_put_batch(&store, &errors, None, &[]).is_empty());
+    assert!(apply_put_batch(&store, &errors, None, &[], &[]).is_empty());
     // A fresh mapping + a mapping that already carries the owner: the
     // duplicate entry must be skipped, and a second owner merges in.
     store
@@ -3231,7 +3231,10 @@ fn api_query_uses_dedicated_reader_and_stays_healthy() {
         // decremented twice, breaking the API after the first request).
         for i in 0..16 {
             let f: Filter = serde_json::from_value(serde_json::json!({"kinds": [1]})).unwrap();
-            let (res, _) = db.api_query(vec![f], 500, now, false).await;
+            let (res, _) = db
+                .api_query(vec![f], 500, now, false)
+                .await
+                .expect("api query");
             assert_eq!(res.len(), 64, "api query {i} must return all events");
         }
 
@@ -3269,11 +3272,17 @@ fn api_count_serves_aggregations_and_stays_healthy() {
         let kinds2: Filter = serde_json::from_value(serde_json::json!({"kinds": [2]})).unwrap();
 
         // Success path: matching events are returned with the `more` flag.
-        let (events, more) = db.api_count(vec![kinds1.clone()], 2000, now).await;
+        let (events, more) = db
+            .api_count(vec![kinds1.clone()], 2000, now)
+            .await
+            .expect("api count");
         assert_eq!(events.len(), 32, "api_count must return the matches");
         assert!(!more);
         // Empty path: no matching events.
-        let (events, more) = db.api_count(vec![kinds2.clone()], 2000, now).await;
+        let (events, more) = db
+            .api_count(vec![kinds2.clone()], 2000, now)
+            .await
+            .expect("api count");
         assert!(events.is_empty());
         assert!(!more);
         // The shared-reader WebSocket path is unaffected by API traffic.
@@ -3293,7 +3302,10 @@ fn api_count_serves_aggregations_and_stays_healthy() {
     .unwrap();
     rt.block_on(async {
         let kinds1: Filter = serde_json::from_value(serde_json::json!({"kinds": [1]})).unwrap();
-        let (events, _) = db.api_count(vec![kinds1], 2000, unix_now()).await;
+        let (events, _) = db
+            .api_count(vec![kinds1], 2000, unix_now())
+            .await
+            .expect("api count");
         assert!(events.is_empty());
     });
     db.shutdown();
@@ -3327,10 +3339,11 @@ fn api_count_fails_fast_under_queue_pressure_and_after_shutdown() {
         // the next aggregation must be refused without reaching the queue.
         db.api_pending
             .fetch_add(2, std::sync::atomic::Ordering::Relaxed);
-        let (events, more) = db.api_count(vec![kinds1.clone()], 2000, now).await;
         assert!(
-            events.is_empty() && !more,
-            "an aggregation at the pending cap must fail fast"
+            db.api_count(vec![kinds1.clone()], 2000, now)
+                .await
+                .is_none(),
+            "an aggregation at the pending cap must fail fast (None, not an empty 200)"
         );
         db.api_pending
             .fetch_sub(2, std::sync::atomic::Ordering::Relaxed);
@@ -3348,26 +3361,36 @@ fn api_count_fails_fast_under_queue_pressure_and_after_shutdown() {
             }));
         }
         for f in futures {
-            let (events, _) = f.await.unwrap();
+            // Fail-fast under pressure is reported as `None`; a served
+            // aggregation returns all matches.
+            let Some((events, _)) = f.await.unwrap() else {
+                continue;
+            };
             assert_eq!(
                 events.len() % 8,
                 0,
-                "a served aggregation returns all matches; a failed one returns none"
+                "a served aggregation returns all matches"
             );
         }
         // The counter recovers: a later call is served normally.
-        let (events, _) = db.api_count(vec![kinds1.clone()], 2000, now).await;
+        let (events, _) = db
+            .api_count(vec![kinds1.clone()], 2000, now)
+            .await
+            .expect("api count");
         assert_eq!(events.len(), 8, "api_count must recover after fail-fast");
         // The WebSocket path is unaffected.
         let (events, _) = db.query(vec![kinds1.clone()], 500, now).await;
         assert_eq!(events.len(), 8);
 
-        // After shutdown the channel is closed: api_count must return an
-        // empty result instead of panicking.
+        // After shutdown the channel is closed: api_count must report the
+        // failure as `None` (a 503, not an empty 200) instead of panicking.
         db.shutdown();
-        let (events, more) = db.api_count(vec![kinds1.clone()], 2000, now).await;
-        assert!(events.is_empty());
-        assert!(!more);
+        assert!(
+            db.api_count(vec![kinds1.clone()], 2000, now)
+                .await
+                .is_none(),
+            "a closed channel must fail the aggregation"
+        );
     });
 }
 
