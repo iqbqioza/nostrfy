@@ -83,6 +83,9 @@ enum Msg {
     Put {
         event: Event,
         now: u64,
+        /// First-seen reservation applied inside the same write transaction
+        /// as the put (see `WriteBatch::first_seen`).
+        first_seen: Option<([u8; 32], u64)>,
         reply: oneshot::Sender<PutOutcome>,
     },
     Query {
@@ -356,6 +359,11 @@ pub struct DbClient {
     /// How many threads serve the WebSocket reader queue (from
     /// `database.reader_threads`); used to fan the shutdown messages out.
     reader_threads: usize,
+    /// The spawned database threads, joined by [`Self::shutdown`] after the
+    /// Shutdown signals: without the join, work queued behind `Shutdown`
+    /// could be dropped without a reply and the final flush could be cut
+    /// short by process exit. Shared behind the `DbClient` clone.
+    threads: Arc<std::sync::Mutex<Vec<std::thread::JoinHandle<()>>>>,
 }
 
 /// An estimate of the heap bytes a queued message pins, used by the
@@ -493,6 +501,7 @@ impl DbClient {
             max_pending_bytes: cfg.max_db_queue_bytes,
             max_api_pending: threads.max_api_pending,
             reader_threads: threads.reader_threads,
+            threads: Arc::new(threads.threads),
         })
     }
 
@@ -503,9 +512,16 @@ impl DbClient {
 
     /// Adjusts the API reader queue cap live (SIGHUP reload). Values below
     /// 1 are clamped to 1 so the API reader can always drain.
+    /// The hard ceiling for the API reader queue: a SIGHUP could otherwise
+    /// set an arbitrarily large value and defeat the fail-fast memory
+    /// guard (each queued API message can hold filters).
+    const MAX_API_PENDING_MSGS: usize = 65_536;
+
     pub fn set_max_api_pending(&self, max: usize) {
-        self.max_api_pending
-            .store(max.max(1), std::sync::atomic::Ordering::Relaxed);
+        self.max_api_pending.store(
+            max.clamp(1, Self::MAX_API_PENDING_MSGS),
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     /// Sends a read-only request to the dedicated reader thread. The
@@ -803,9 +819,12 @@ impl DbClient {
             Ok(Ok(value)) => value,
             // The timeout must not silently turn a query into an empty
             // answer (an empty timeline / a destructive negentropy sync):
-            // report it loudly, and the WebSocket callers that use the
-            // reporting variants respond with an error instead.
+            // report it loudly (and count it, so the errors metric exposes
+            // overload), and the WebSocket callers that use the reporting
+            // variants respond with an error instead.
             _ => {
+                self.errors
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 log::warn!(
                     "database request timed out after {}s (a query result was dropped)",
                     self.timeout_secs
@@ -816,8 +835,25 @@ impl DbClient {
     }
 
     pub async fn put(&self, event: Event, now: u64) -> PutOutcome {
-        self.request_write(|reply| Msg::Put { event, now, reply })
-            .await
+        self.put_with_first_seen(event, now, None).await
+    }
+
+    /// Like [`Self::put`], but records the pubkey's first-seen timestamp in
+    /// the same write transaction (one commit/fsync instead of two for a
+    /// pubkey's first accepted event).
+    pub async fn put_with_first_seen(
+        &self,
+        event: Event,
+        now: u64,
+        first_seen: Option<([u8; 32], u64)>,
+    ) -> PutOutcome {
+        self.request_write(|reply| Msg::Put {
+            event,
+            now,
+            first_seen,
+            reply,
+        })
+        .await
     }
 
     pub async fn query(&self, filters: Vec<Filter>, limit: usize, now: u64) -> (Vec<Event>, bool) {
@@ -894,17 +930,19 @@ impl DbClient {
 
     /// REST API query: served by the dedicated API reader thread so that
     /// `/api/v1` traffic never blocks WebSocket queries. Applies its own
-    /// queue cap: when the API reader's queue is deep, the request fails
-    /// fast with an empty result instead of piling up behind WebSocket
-    /// work. Admission reserves first (add-then-check with rollback) so
-    /// concurrent bursts cannot overshoot the cap without bound.
+    /// queue cap: when the API reader's queue is deep (or the query times
+    /// out), the request fails fast with `None` instead of piling up behind
+    /// WebSocket work — the handlers answer 503, because an empty `200`
+    /// result would be indistinguishable from "no events". Admission
+    /// reserves first (add-then-check with rollback) so concurrent bursts
+    /// cannot overshoot the cap without bound.
     pub async fn api_query(
         &self,
         filters: Vec<Filter>,
         limit: usize,
         now: u64,
         ascending: bool,
-    ) -> (Vec<Event>, bool) {
+    ) -> Option<(Vec<Event>, bool)> {
         let (tx, rx) = oneshot::channel();
         let msg = Msg::Query {
             filters,
@@ -917,20 +955,25 @@ impl DbClient {
         };
         let bytes = msg_bytes(&msg);
         if !self.api_reserve(bytes) {
-            return (Vec::new(), false);
+            return None;
         }
         if self.api_read_tx.send(msg).is_err() {
             self.api_release(bytes);
-            return (Vec::new(), false);
+            return None;
         }
         let out = if self.timeout_secs == 0 {
-            rx.await.unwrap_or_default()
+            rx.await.ok()
         } else {
             tokio::time::timeout(std::time::Duration::from_secs(self.timeout_secs), rx)
                 .await
-                .map(|r| r.unwrap_or_default())
-                .unwrap_or_default()
+                .ok()
+                .and_then(|r| r.ok())
         };
+        if out.is_none() {
+            self.errors
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            log::warn!("REST API query timed out or was dropped");
+        }
         // The API reader thread decrements `api_pending` once it has
         // processed the message (including its panic path), so this path
         // must not decrement again.
@@ -947,7 +990,7 @@ impl DbClient {
         filters: Vec<Filter>,
         limit: usize,
         now: u64,
-    ) -> (Vec<Event>, bool) {
+    ) -> Option<(Vec<Event>, bool)> {
         let (tx, rx) = oneshot::channel();
         let msg = Msg::Count {
             filters,
@@ -957,20 +1000,25 @@ impl DbClient {
         };
         let bytes = msg_bytes(&msg);
         if !self.api_reserve(bytes) {
-            return (Vec::new(), false);
+            return None;
         }
         if self.api_read_tx.send(msg).is_err() {
             self.api_release(bytes);
-            return (Vec::new(), false);
+            return None;
         }
         let out = if self.timeout_secs == 0 {
-            rx.await.unwrap_or_default()
+            rx.await.ok()
         } else {
             tokio::time::timeout(std::time::Duration::from_secs(self.timeout_secs), rx)
                 .await
-                .map(|r| r.unwrap_or_default())
-                .unwrap_or_default()
+                .ok()
+                .and_then(|r| r.ok())
         };
+        if out.is_none() {
+            self.errors
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            log::warn!("REST API count timed out or was dropped");
+        }
         // The API reader thread decrements `api_pending` once it has
         // processed the message (including its panic path), so this path
         // must not decrement again.
@@ -1474,5 +1522,17 @@ impl DbClient {
             let _ = self.read_tx.send(Msg::Shutdown);
         }
         let _ = self.api_read_tx.send(Msg::Shutdown);
+        // Join the threads so the final flush and the shutdown sync finish
+        // before the process exits (messages queued behind `Shutdown` used
+        // to be dropped without a reply).
+        let handles = std::mem::take(
+            &mut *self
+                .threads
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+        for handle in handles {
+            let _ = handle.join();
+        }
     }
 }

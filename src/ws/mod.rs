@@ -59,14 +59,33 @@ pub(crate) struct PendingReq {
 /// scan results.
 const MAX_PENDING_REQS: usize = 4;
 
+/// One queued outgoing frame. EVENT frames carry a fingerprint of their
+/// subscription so a re-REQ (which replaces the subscription, NIP-01) can
+/// drop the old response's queued events before they reach the wire.
+pub(crate) struct OutFrame {
+    pub(crate) message: Message,
+    event_sub: Option<u64>,
+}
+
+/// A stable-enough fingerprint of a subscription id: only equality between
+/// ids of the same connection matters, so a hash collision would merely
+/// drop an unrelated queued event (2^-64 chance with SipHash).
+pub(crate) fn sub_fingerprint(sub_id: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    sub_id.hash(&mut hasher);
+    hasher.finish()
+}
+
 pub struct Conn {
     pub(crate) relay: Arc<Relay>,
     /// The WebSocket endpoint path this connection was established on
     /// (`/`, `/inbox` or `/outbox`); drives the path-specific write policy.
     pub(crate) path: String,
     /// Outgoing messages awaiting a TCP write, drained by the connection
-    /// loop after every select iteration.
-    pub(crate) outgoing: std::collections::VecDeque<Message>,
+    /// loop after every select iteration. EVENT frames carry their
+    /// subscription fingerprint so a re-REQ can purge stale queued events.
+    pub(crate) outgoing: std::collections::VecDeque<OutFrame>,
     /// Bytes currently queued in `outgoing`; the byte cap decides whether a
     /// new message is queued or dropped.
     pub(crate) out_bytes: usize,
@@ -110,10 +129,12 @@ pub struct Conn {
     pub(crate) pending_bytes: usize,
     /// Live-event receiver, created when the first REQ subscribes (before
     /// the query runs, so no stored event can fall into the gap between the
-    /// query and the subscription) and dropped when the last subscription
-    /// closes, so connections without active subscriptions are never woken
-    /// by live events. A duplicate delivery of an event that is both in the
-    /// query result and live is harmless (clients deduplicate by id).
+    /// query and the subscription) and kept for the rest of the
+    /// connection's life: delivery is instead stopped by unregistering the
+    /// connection from the relay's live subscription index when its last
+    /// subscription closes (so idle connections are never woken by live
+    /// events). A duplicate delivery of an event that is both in the query
+    /// result and live is harmless (clients deduplicate by id).
     pub(crate) live: Option<tokio::sync::mpsc::Receiver<LiveBatch>>,
     /// The connection's id in the relay's live subscription index and
     /// delivery-queue map.
@@ -145,6 +166,18 @@ pub struct Conn {
     /// Set when a pending live-response buffer overflows. The connection
     /// loop closes after the current batch so the client can resynchronize.
     pub(crate) live_overflowed: bool,
+    /// Set when a completion-critical frame (OK/EOSE/CLOSED/NEG-*) had to
+    /// be dropped at the last-resort control-queue cap. The peer may be
+    /// waiting on it forever, so the connection loop closes the socket to
+    /// force a clean resynchronization.
+    pub(crate) control_overflowed: bool,
+    /// Cached `/inbox`/`/outbox` write-policy values and the relay pubkey:
+    /// the write policy is checked for every EVENT, so these must not be
+    /// re-read (and cloned) from the config per event. Refreshed with the
+    /// config version like the NIP flags.
+    pub(crate) outbox_write_policy: String,
+    pub(crate) inbox_write_policy: String,
+    pub(crate) relay_pubkey: Option<String>,
     /// Per-connection message/byte counters, flushed into the shared stats
     /// once on disconnect so that a million connections do not hammer the
     /// same cache lines for every single message.
@@ -164,6 +197,10 @@ pub(crate) type LiveBatch = Arc<Vec<(crate::event::Event, Arc<String>)>>;
 
 impl Conn {
     pub(crate) fn send(&mut self, msg: Message) {
+        self.send_tagged(msg, None);
+    }
+
+    pub(crate) fn send_tagged(&mut self, msg: Message, event_sub: Option<u64>) {
         let size = message_size(&msg);
         // 0 = unlimited (the REQ-response budget documents the same meaning).
         let over_byte_cap = self.out_queue_bytes > 0
@@ -177,7 +214,10 @@ impl Conn {
         self.out_bytes += size;
         self.out_msgs += 1;
         self.out_bytes_total += size as u64;
-        self.outgoing.push_back(msg);
+        self.outgoing.push_back(OutFrame {
+            message: msg,
+            event_sub,
+        });
     }
 
     pub(crate) fn send_json(&mut self, value: Value) {
@@ -200,15 +240,42 @@ impl Conn {
     pub(crate) fn send_control(&mut self, value: Value) {
         if self.outgoing.len() >= OUT_QUEUE_LIMIT * 2 {
             self.dropped += 1;
+            self.control_overflowed = true;
             self.relay.stats.bump(&self.relay.stats.buffers_dropped, 1);
             return;
         }
         if let Ok(text) = serde_json::to_string(&value) {
             let size = text.len();
+            // An unset byte cap (`0` = unlimited) disables the normal
+            // ceiling, but completion-critical frames still need one:
+            // NEG-MSG id lists can be large, and without a bound a slow
+            // reader could accumulate them up to the count cap.
+            if self.out_queue_bytes == 0
+                && self.out_bytes.saturating_add(size) > self.control_ceiling()
+            {
+                self.dropped += 1;
+                self.control_overflowed = true;
+                self.relay.stats.bump(&self.relay.stats.buffers_dropped, 1);
+                return;
+            }
             self.out_bytes += size;
             self.out_msgs += 1;
             self.out_bytes_total += size as u64;
-            self.outgoing.push_back(Message::Text(text.into()));
+            self.outgoing.push_back(OutFrame {
+                message: Message::Text(text.into()),
+                event_sub: None,
+            });
+        }
+    }
+
+    /// The absolute byte ceiling for control frames when the configured
+    /// queue cap is disabled: twice the per-connection REQ budget (or a
+    /// fixed 64 MiB when that is unlimited too).
+    fn control_ceiling(&self) -> usize {
+        if self.req_response_bytes > 0 {
+            (self.req_response_bytes as usize).saturating_mul(2)
+        } else {
+            64 * 1024 * 1024
         }
     }
 
@@ -277,6 +344,21 @@ impl Conn {
             // applies the same guard before its EOSE).
             if !dropped.eose_sent && self.subs.contains_key(&dropped.sub_id) {
                 self.finish_pending_req(&dropped);
+            } else if dropped.eose_sent
+                && !dropped.live.is_empty()
+                && self.subs.contains_key(&dropped.sub_id)
+            {
+                // The buffered live events can no longer be delivered, and
+                // the still-open subscription would look healthy while
+                // silently missing them. Close it so the client knows to
+                // resubscribe (and NIP-01 gives CLOSED the same closing
+                // semantics as a client CLOSE, so the subscription is
+                // released here).
+                self.send_closed(
+                    &dropped.sub_id,
+                    "error: live delivery overflow; resubscribe to resync",
+                );
+                self.remove_req_subscription(&dropped.sub_id);
             }
         }
         self.pending_reqs.push_back(pending);
@@ -363,10 +445,17 @@ impl Conn {
                 // sub-id string and the event separately and concatenating
                 // writes straight to the wire.
                 let event_json = serde_json::to_string(event).unwrap_or_default();
-                let sub_json = serde_json::to_string(&front.sub_id).unwrap_or_default();
+                // The sub id's JSON form is cached at REQ time (third slot
+                // of `subs`): reuse it instead of re-serializing it for
+                // every event of the response.
+                let sub_json = self
+                    .subs
+                    .get(&front.sub_id)
+                    .map(|(_, _, sub_json)| sub_json.as_str())
+                    .unwrap_or("\"\"");
                 let mut text = String::with_capacity(event_json.len() + sub_json.len() + 16);
                 text.push_str("[\"EVENT\",");
-                text.push_str(&sub_json);
+                text.push_str(sub_json);
                 text.push(',');
                 text.push_str(&event_json);
                 text.push(']');
@@ -393,7 +482,10 @@ impl Conn {
                 self.out_bytes += size;
                 self.out_msgs += 1;
                 self.out_bytes_total += size as u64;
-                self.outgoing.push_back(Message::Text(text.into()));
+                self.outgoing.push_back(OutFrame {
+                    message: Message::Text(text.into()),
+                    event_sub: Some(sub_fingerprint(&front.sub_id)),
+                });
             }
             if budget_exceeded {
                 let sub_id = front.sub_id.clone();
@@ -460,7 +552,10 @@ impl Conn {
             self.out_bytes += size;
             self.out_msgs += 1;
             self.out_bytes_total += size as u64;
-            self.outgoing.push_back(Message::Text(text.into()));
+            self.outgoing.push_back(OutFrame {
+                message: Message::Text(text.into()),
+                event_sub: Some(sub_fingerprint(&pending.sub_id)),
+            });
         }
     }
 
@@ -487,7 +582,7 @@ impl Conn {
     }
 }
 
-fn message_size(msg: &Message) -> usize {
+pub(crate) fn message_size(msg: &Message) -> usize {
     match msg {
         Message::Text(text) => text.len(),
         Message::Binary(data) | Message::Ping(data) | Message::Pong(data) => data.len(),
@@ -539,6 +634,25 @@ impl Drop for ConnectionGuard {
 }
 
 impl Conn {
+    /// Refreshes the per-connection config caches after a reload: the
+    /// caller only invokes this when `config_version` changed, so the hot
+    /// paths never take the shared config lock. Besides the NIP-40/42/78
+    /// flags this re-reads the queue budgets, which are otherwise cached
+    /// at connect time (a reload must reach existing connections).
+    pub(crate) async fn refresh_config_cache(&mut self) {
+        {
+            let cfg = self.relay.config.read().await;
+            self.expiry_enabled = cfg.nip_enabled(40);
+            self.giftwrap_restricted = cfg.nip_enabled(42);
+            self.nip78_restricted = cfg.nip_enabled(78) && cfg.relay.enabled_nip78_auth;
+            self.out_queue_bytes = cfg.limits.max_out_queue_bytes;
+            self.req_response_bytes = cfg.limits.max_req_response_bytes;
+            self.outbox_write_policy = cfg.server.outbox_write_policy.clone();
+            self.inbox_write_policy = cfg.server.inbox_write_policy.clone();
+        }
+        self.relay_pubkey = self.relay.relay_pubkey();
+    }
+
     /// Handles one inbound frame: bounds it against the message size
     /// limit, counts it and feeds it to the protocol handler. Returns
     /// `true` when the frame exceeded the limit and the connection must
@@ -556,6 +670,13 @@ impl Conn {
             // swallowed until the next select iteration. (Pings are not
             // handled here: tungstenite already queues the pong.)
             Message::Close(_) => return true,
+            // PONG frames are protocol keep-alive traffic: count them like
+            // any other inbound frame (the old catch-all skipped them).
+            Message::Pong(data) => {
+                self.in_msgs += 1;
+                self.in_bytes += data.len() as u64;
+                return false;
+            }
             _ => return false,
         };
         if text.len() > max_msg_size {
@@ -578,7 +699,10 @@ impl Conn {
         }
         let text = String::from_utf8_lossy(data);
         self.in_msgs += 1;
-        self.in_bytes += text.len() as u64;
+        // Count the wire length, not the lossy-decoded length: invalid
+        // UTF-8 expands each bad byte to U+FFFD (up to three bytes), which
+        // would inflate the inbound traffic statistic.
+        self.in_bytes += data.len() as u64;
         self.handle_text(&text).await;
         false
     }
@@ -623,7 +747,7 @@ where
             // canceled by one of the races above (an IP-block notification
             // that does not actually block the peer) must leave the message
             // queued, not silently drop it.
-            let msg = msg.clone();
+            let msg = msg.message.clone();
             let size = message_size(&msg);
             if sender.feed(msg).await.is_err() {
                 return;
@@ -736,6 +860,8 @@ pub async fn handle_connection(
         giftwrap_restricted,
         nip78_restricted,
         idle_timeout,
+        outbox_write_policy,
+        inbox_write_policy,
     ) = {
         let cfg = relay.config.read().await;
         (
@@ -746,8 +872,11 @@ pub async fn handle_connection(
             cfg.nip_enabled(42),
             cfg.nip_enabled(78) && cfg.relay.enabled_nip78_auth,
             cfg.limits.ws_idle_timeout_secs,
+            cfg.server.outbox_write_policy.clone(),
+            cfg.server.inbox_write_policy.clone(),
         )
     };
+    let relay_pubkey = relay.relay_pubkey();
     // Idle connections (no inbound frames) hold their slot forever; when the
     // operator enables the idle timeout the relay closes them, sending a
     // periodic PING so an alive-but-silent subscriber (which auto-responds
@@ -814,6 +943,10 @@ pub async fn handle_connection(
         live: Some(live_rx),
         path,
         outgoing: std::collections::VecDeque::new(),
+        control_overflowed: false,
+        outbox_write_policy,
+        inbox_write_policy,
+        relay_pubkey,
         out_bytes: 0,
         out_queue_bytes,
         req_response_bytes,
@@ -854,6 +987,12 @@ pub async fn handle_connection(
     #[allow(unused_assignments)] // the initial value is overwritten before the first read
     let mut drain_stalled = !conn.outgoing.is_empty();
     'connection: loop {
+        // A completion-critical frame was dropped because the control queue
+        // hit its last-resort cap: the peer could be waiting on that OK or
+        // EOSE forever, so close the socket (a reconnect resynchronizes).
+        if conn.control_overflowed {
+            break;
+        }
         // Drain pending outgoing messages. A slow reader stalls only its
         // own connection (outgoing is bounded, so new messages are dropped).
         // The drain races the connection's liveness signals: a peer that
@@ -970,10 +1109,7 @@ pub async fn handle_connection(
                             .load(std::sync::atomic::Ordering::Relaxed);
                         if version != conn.config_version {
                             conn.config_version = version;
-                            let cfg = conn.relay.config.read().await;
-                            conn.expiry_enabled = cfg.nip_enabled(40);
-                            conn.giftwrap_restricted = cfg.nip_enabled(42);
-                            conn.nip78_restricted = cfg.nip_enabled(78) && cfg.relay.enabled_nip78_auth;
+                            conn.refresh_config_cache().await;
                         }
                     }
                 }
@@ -1073,6 +1209,7 @@ pub async fn handle_connection(
                 // Keep-alive: a healthy client answers with a PONG (an
                 // inbound frame, which resets the idle timeout), so an idle
                 // subscriber stays connected while a dead peer is reaped.
+                conn.out_msgs += 1;
                 let _ = sender.send(Message::Ping(vec![].into())).await;
             }
             _ = flush_wake => {
@@ -1116,10 +1253,7 @@ pub async fn handle_connection(
                             .load(std::sync::atomic::Ordering::Relaxed);
                         if version != conn.config_version {
                             conn.config_version = version;
-                            let cfg = conn.relay.config.read().await;
-                            conn.expiry_enabled = cfg.nip_enabled(40);
-                            conn.giftwrap_restricted = cfg.nip_enabled(42);
-                            conn.nip78_restricted = cfg.nip_enabled(78) && cfg.relay.enabled_nip78_auth;
+                            conn.refresh_config_cache().await;
                         }
                         // The group store lock and its Arc clone are only
                         // taken when the batch actually contains group
@@ -1160,9 +1294,9 @@ pub async fn handle_connection(
 
     // Final flush: deliver any queued messages (e.g. NOTICEs) before
     // closing the connection.
-    while let Some(msg) = conn.outgoing.pop_front() {
-        conn.out_bytes = conn.out_bytes.saturating_sub(message_size(&msg));
-        if sender.send(msg).await.is_err() {
+    while let Some(frame) = conn.outgoing.pop_front() {
+        conn.out_bytes = conn.out_bytes.saturating_sub(message_size(&frame.message));
+        if sender.send(frame.message).await.is_err() {
             break;
         }
     }
@@ -1393,6 +1527,10 @@ mod tests {
             live: Some(live_rx),
             path: "/".into(),
             outgoing: std::collections::VecDeque::new(),
+            control_overflowed: false,
+            outbox_write_policy: String::new(),
+            inbox_write_policy: String::new(),
+            relay_pubkey: None,
             out_bytes: 0,
             out_queue_bytes,
             req_response_bytes: 0,
@@ -1469,7 +1607,7 @@ mod tests {
     fn outgoing_json(conn: &Conn) -> Vec<Value> {
         conn.outgoing
             .iter()
-            .filter_map(|m| match m {
+            .filter_map(|frame| match &frame.message {
                 Message::Text(t) => serde_json::from_str(t).ok(),
                 _ => None,
             })
@@ -2760,6 +2898,7 @@ mod tests {
             let mut conn = build_conn_with(&hex::encode([7u8; 32])).await;
             conn.path = "/inbox".into();
             conn.relay.config.write().await.server.inbox_write_policy = "relay".into();
+            conn.refresh_config_cache().await;
             let relay_pk = conn.relay.relay_pubkey().unwrap();
             let secp = conn.relay.secp();
             let to_relay =
@@ -2828,6 +2967,7 @@ mod tests {
             let mut conn = build_conn_with(&hex::encode([7u8; 32])).await;
             conn.path = "/outbox".into();
             conn.relay.config.write().await.server.outbox_write_policy = "relay".into();
+            conn.refresh_config_cache().await;
             let relay_pk = conn.relay.relay_pubkey().unwrap();
             let secp = conn.relay.secp().clone();
             let relay_event = signed_note_seeded(&secp, 7, "relay event", now, vec![]);
@@ -4092,7 +4232,7 @@ mod tests {
             assert!(
                 conn.outgoing
                     .iter()
-                    .any(|m| m.to_text().is_ok_and(|t| t.contains("NEG-ERR"))),
+                    .any(|m| m.message.to_text().is_ok_and(|t| t.contains("NEG-ERR"))),
                 "the failed replacement must send a NEG-ERR"
             );
             assert!(
@@ -4126,7 +4266,7 @@ mod tests {
             assert!(
                 conn.outgoing
                     .iter()
-                    .any(|m| m.to_text().is_ok_and(|t| t.contains("NEG-ERR"))),
+                    .any(|m| m.message.to_text().is_ok_and(|t| t.contains("NEG-ERR"))),
                 "the oversized response must produce a NEG-ERR"
             );
             assert!(
@@ -4460,7 +4600,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let mut conn = build_conn().await;
-            conn.outgoing.push_back(Message::Text("x".into()));
+            conn.send(Message::Text("x".into()));
             let mut sink = NeverReady;
             let mut idle_sleep = Some(Box::pin(tokio::time::sleep(Duration::from_millis(50))));
             let (_ip_tx, mut ip_rx) = tokio::sync::watch::channel(0u64);
@@ -4496,7 +4636,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let mut conn = build_conn().await;
-            conn.outgoing.push_back(Message::Text("x".into()));
+            conn.send(Message::Text("x".into()));
             let mut sink = NeverReady;
             let mut idle_sleep = None;
             let (_ip_tx, mut ip_rx) = tokio::sync::watch::channel(0u64);

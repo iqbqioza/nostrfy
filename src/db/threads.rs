@@ -65,6 +65,11 @@ pub(crate) struct DbThreads {
     /// [`super::DbClient::set_max_api_pending`], e.g. on SIGHUP reload).
     pub(crate) max_api_pending: Arc<std::sync::atomic::AtomicUsize>,
     pub(crate) reader_threads: usize,
+    /// The spawned database threads, joined by `DbClient::shutdown` after
+    /// the Shutdown signals are sent: without the join a queued write could
+    /// be dropped with no reply (and the process could exit before the
+    /// final flush).
+    pub(crate) threads: std::sync::Mutex<Vec<std::thread::JoinHandle<()>>>,
 }
 
 /// Serves one read-only message on a dedicated reader thread. Returns
@@ -355,6 +360,7 @@ pub(crate) fn spawn(
     // longer blocks every other subscriber's query. LMDB allows many
     // concurrent read transactions, so the threads read the same data
     // safely.
+    let mut handles: Vec<std::thread::JoinHandle<()>> = Vec::with_capacity(reader_threads + 2);
     {
         let read_rx = std::sync::Arc::new(std::sync::Mutex::new(read_rx));
         for _ in 0..reader_threads {
@@ -363,7 +369,7 @@ pub(crate) fn spawn(
             let read_rx = Arc::clone(&read_rx);
             let read_pending = Arc::clone(&read_pending);
             let read_pending_bytes = Arc::clone(&read_pending_bytes);
-            std::thread::spawn(move || {
+            handles.push(std::thread::spawn(move || {
                 'reader: loop {
                     let Some(msg) = read_rx
                         .lock()
@@ -408,7 +414,7 @@ pub(crate) fn spawn(
                         }
                     }
                 }
-            });
+            }));
         }
     }
     // Dedicated REST API reader thread: serves `/api/v1` queries on its own
@@ -418,7 +424,7 @@ pub(crate) fn spawn(
     {
         let api_store = store.clone_for_reader();
         let api_errors = Arc::clone(&errors);
-        std::thread::spawn(move || {
+        handles.push(std::thread::spawn(move || {
             'api_reader: loop {
                 let Some(msg) = api_read_rx.blocking_recv() else {
                     break;
@@ -454,18 +460,29 @@ pub(crate) fn spawn(
                     }
                 }
             }
-        });
+        }));
     }
-    std::thread::spawn(move || {
+    handles.push(std::thread::spawn(move || {
         // One-time rebuild of the lightweight metadata index: an older
         // database has events but no meta entries. The rebuild runs on
         // the writer thread before any puts (the single-writer lock is
         // otherwise idle at startup); scans fall back to the full JSON
         // parse until it completes.
-        if store.meta_needs_rebuild().unwrap_or(false) {
-            match store.rebuild_event_meta() {
+        match store.meta_needs_rebuild() {
+            Ok(true) => match store.rebuild_event_meta() {
                 Ok(n) => log::info!("event metadata index rebuilt ({n} events)"),
-                Err(e) => log::warn!("event metadata index rebuild failed: {e}"),
+                Err(e) => db_error(&thread_errors, &e),
+            },
+            Ok(false) => {}
+            Err(e) => {
+                // A failed check must not silently skip the rebuild (that
+                // would keep serving a database with a missing meta index):
+                // report it and attempt the rebuild anyway.
+                db_error(&thread_errors, &e);
+                match store.rebuild_event_meta() {
+                    Ok(n) => log::info!("event metadata index rebuilt ({n} events)"),
+                    Err(e) => db_error(&thread_errors, &e),
+                }
             }
         }
         // One-time backfill of the NIP-59 gift-wrap recipient index: an
@@ -531,7 +548,7 @@ pub(crate) fn spawn(
                 // drain processed. The guard drops on every exit path of
                 // the drain (including a panic mid-drain), so the
                 // overload-protection counters can never be left elevated.
-                let _pending = PendingGuard {
+                let pending = PendingGuard {
                     msgs: drained_msgs,
                     events: drained_events,
                     bytes: drained_bytes,
@@ -541,7 +558,12 @@ pub(crate) fn spawn(
                 };
                 for msg in msgs {
                     match msg {
-                        Msg::Put { event, now, reply } => {
+                        Msg::Put {
+                            event,
+                            now,
+                            first_seen,
+                            reply,
+                        } => {
                             if batch.pending.is_none() {
                                 match store.env.write_txn() {
                                     Ok(txn) => batch.pending = Some(txn),
@@ -554,6 +576,7 @@ pub(crate) fn spawn(
                                 }
                             }
                             batch.puts.push((event, now));
+                            batch.first_seen.push(first_seen);
                             batch.senders.push(reply);
                         }
                         Msg::PutBatch { events, reply } => {
@@ -561,7 +584,12 @@ pub(crate) fn spawn(
                         }
                         Msg::Shutdown => {
                             flush_everything(&store, &thread_errors, &mut batch);
-                            let _ = store.env.force_sync();
+                            // The shutdown sync is the last chance to flush
+                            // with fsync disabled: a failure must be
+                            // reported, not swallowed.
+                            if let Err(e) = store.env.force_sync() {
+                                db_error(&thread_errors, &e.into());
+                            }
                             return true;
                         }
                         other => {
@@ -988,8 +1016,11 @@ pub(crate) fn spawn(
                 // Flush the batch before blocking again: clients await
                 // their replies, so a pending batch must not wait for the
                 // next message or every requestor deadlocks. The queued-work
-                // accounting is released by the `PendingGuard` when this
-                // closure returns.
+                // accounting is released *before* the flush replies, so a
+                // caller woken by the reply cannot observe a queue that is
+                // still counted as full (a transient fail-fast on an empty
+                // queue). A panic mid-drain still releases via Drop.
+                drop(pending);
                 flush_everything(&store, &thread_errors, &mut batch);
                 false
             }));
@@ -1015,7 +1046,7 @@ pub(crate) fn spawn(
                 }
             }
         }
-    });
+    }));
     Ok(DbThreads {
         tx,
         read_tx,
@@ -1034,5 +1065,6 @@ pub(crate) fn spawn(
         max_pending_events: max_pending_events.max(1),
         max_api_pending: Arc::new(std::sync::atomic::AtomicUsize::new(max_pending_msgs.max(1))),
         reader_threads,
+        threads: std::sync::Mutex::new(handles),
     })
 }

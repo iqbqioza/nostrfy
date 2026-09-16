@@ -755,7 +755,9 @@ async fn ws_handler(State(relay): State<Arc<Relay>>, request: Request) -> Respon
             .headers()
             .get(axum::http::header::ACCEPT)
             .and_then(|v| v.to_str().ok())
-            .is_some_and(|a| a.contains("application/nostr+json"));
+            // Media types are case-insensitive: `APPLICATION/NOSTR+JSON`
+            // must get the JSON document too.
+            .is_some_and(|a| a.to_ascii_lowercase().contains("application/nostr+json"));
         return nip11_doc(relay.clone(), wants_nostr_json).await;
     }
     let path = request.uri().path().to_string();
@@ -847,9 +849,17 @@ async fn stats_writer(relay: Arc<Relay>, mut shutdown: watch::Receiver<bool>) {
 }
 
 /// Writes `data` to `path` atomically (temp file + rename) so a crash in
-/// the middle of a write never leaves a truncated stats file behind.
+/// the middle of a write never leaves a truncated stats file behind. The
+/// temp name is unique per write: a fixed `.tmp` name let two writers
+/// truncate each other's temp.
 fn write_atomic(path: &Path, data: &[u8]) {
-    let tmp = path.with_extension("tmp");
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = path.with_extension(format!("{}.{nanos}.{seq}.tmp", std::process::id()));
     let result = std::fs::write(&tmp, data).and_then(|()| std::fs::rename(&tmp, path));
     if let Err(e) = result {
         error!("cannot write {}: {e}", path.display());

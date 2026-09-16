@@ -173,6 +173,7 @@ pub(crate) fn apply_put_batch(
     thread_errors: &Arc<std::sync::atomic::AtomicU64>,
     mut pending: Option<heed::RwTxn>,
     puts: &[(Event, u64)],
+    first_seen: &[Option<([u8; 32], u64)>],
 ) -> Vec<PutOutcome> {
     if puts.is_empty() {
         if let Some(txn) = pending
@@ -210,9 +211,25 @@ pub(crate) fn apply_put_batch(
         };
         let mut outcomes = Vec::with_capacity(puts.len());
         let mut poisoned = false;
-        for (event, now) in puts {
+        for (i, (event, now)) in puts.iter().enumerate() {
             match store.put_event_in(&mut txn, event, *now) {
-                Ok(out) => outcomes.push(out),
+                Ok(out) => {
+                    // Record the first-seen timestamp in the same commit:
+                    // the pubkey's account-age clock starts only when the
+                    // event actually stored (a rejected first event must
+                    // not pre-warm it).
+                    if matches!(
+                        out,
+                        PutOutcome::Stored | PutOutcome::Replaced | PutOutcome::Ephemeral
+                    ) && let Some((pubkey, ts)) = first_seen.get(i).copied().flatten()
+                        && let Err(e) = store.touch_first_seen(&mut txn, &pubkey, ts)
+                    {
+                        // Non-fatal: the event is stored either way, and a
+                        // missing first-seen only weakens the age gate.
+                        db_error(thread_errors, &e);
+                    }
+                    outcomes.push(out);
+                }
                 Err(e) => {
                     db_error(thread_errors, &e);
                     poisoned = true;
@@ -257,6 +274,10 @@ pub(crate) type PutBatchMsg = (Vec<(Event, u64)>, oneshot::Sender<Vec<PutOutcome
 pub(crate) struct WriteBatch<'tx> {
     pub(crate) pending: Option<heed::RwTxn<'tx>>,
     pub(crate) puts: Vec<(Event, u64)>,
+    /// Per-put first-seen reservation, aligned with `puts`: applied inside
+    /// the same write transaction as the put it belongs to (one commit and
+    /// one fsync instead of two for a pubkey's first accepted event).
+    pub(crate) first_seen: Vec<Option<([u8; 32], u64)>>,
     pub(crate) senders: Vec<oneshot::Sender<PutOutcome>>,
     pub(crate) pending_batches: Vec<PutBatchMsg>,
 }
@@ -265,6 +286,23 @@ pub(crate) struct WriteBatch<'tx> {
 /// `PutBatch`, merging them all into one write transaction (one commit for
 /// events arriving from many connections). Replies are only sent after a
 /// successful commit, so an OK implies durability.
+/// Warns when the kernel refuses large sparse reservations
+/// (`vm.overcommit_memory = 2`): LMDB reserves `map_size` (up to 1 TiB by
+/// default) of address space up front, so the relay may fail to start
+/// there even though physical memory is only used for touched pages.
+fn warn_if_overcommit_strict() {
+    #[cfg(target_os = "linux")]
+    if let Ok(text) = std::fs::read_to_string("/proc/sys/vm/overcommit_memory")
+        && text.trim() == "2"
+    {
+        log::warn!(
+            "vm.overcommit_memory=2 is set: the LMDB map reservation \
+             (database.max_map_size) may be refused; raise the overcommit \
+             ratio or lower the map size"
+        );
+    }
+}
+
 pub(crate) fn flush_everything(
     store: &Store,
     thread_errors: &Arc<std::sync::atomic::AtomicU64>,
@@ -281,12 +319,22 @@ pub(crate) fn flush_everything(
     // Merge the singles and every queued batch into one list; the split
     // points let the outcomes be distributed back in order.
     let mut all: Vec<(Event, u64)> = std::mem::take(&mut batch.puts);
+    let mut first_seen = std::mem::take(&mut batch.first_seen);
     let mut splits: Vec<usize> = vec![all.len()];
     for (events, _) in batch.pending_batches.iter_mut() {
         all.append(events);
         splits.push(all.len());
     }
-    let outcomes = apply_put_batch(store, thread_errors, batch.pending.take(), &all);
+    // The batch events carry no first-seen reservation: pad the aligned
+    // vector to the merged length.
+    first_seen.resize(all.len(), None);
+    let outcomes = apply_put_batch(
+        store,
+        thread_errors,
+        batch.pending.take(),
+        &all,
+        &first_seen,
+    );
     for (s, out) in batch
         .senders
         .drain(..)
@@ -391,6 +439,7 @@ impl Store {
                 .map_size(map_size)
                 .open(&cfg.path)?
         };
+        warn_if_overcommit_strict();
         if cfg.disabled_fsync {
             // SAFETY: `NO_SYNC` is marked unsafe by heed because it trades
             // durability for throughput (LMDB skips the fsync after each
@@ -632,7 +681,13 @@ impl Store {
         let mut wtxn = self.env.write_txn()?;
         let key = format!("sha:{sha256}");
         let existing: Option<BlossomMeta> = match self.blossom.get(&wtxn, key.as_bytes())? {
-            Some(raw) => serde_json::from_slice(raw).ok(),
+            Some(raw) => match serde_json::from_slice(raw) {
+                Ok(meta) => Some(meta),
+                Err(e) => {
+                    log::warn!("corrupt blossom mapping for {sha256}: {e}");
+                    None
+                }
+            },
             None => None,
         };
         let mut meta = existing.unwrap_or_else(|| BlossomMeta {
@@ -672,19 +727,23 @@ impl Store {
                 // Legacy multi-owner blobs appear once per npub directory:
                 // merge the owner into the existing mapping instead of
                 // dropping it (up to the per-blob owner cap).
-                if let Ok(meta) = serde_json::from_slice::<BlossomMeta>(raw)
-                    && !meta.owners.iter().any(|o| o == pubkey)
-                    && meta.owners.len() < MAX_BLOB_OWNERS
-                {
-                    let mut meta = meta;
-                    meta.owners.push(pubkey.clone());
-                    self.blossom
-                        .put(&mut wtxn, key.as_bytes(), &serde_json::to_vec(&meta)?)?;
-                    self.blossom.put(
-                        &mut wtxn,
-                        format!("own:{pubkey}:{sha256}").as_bytes(),
-                        b"",
-                    )?;
+                match serde_json::from_slice::<BlossomMeta>(raw) {
+                    Ok(meta)
+                        if !meta.owners.iter().any(|o| o == pubkey)
+                            && meta.owners.len() < MAX_BLOB_OWNERS =>
+                    {
+                        let mut meta = meta;
+                        meta.owners.push(pubkey.clone());
+                        self.blossom
+                            .put(&mut wtxn, key.as_bytes(), &serde_json::to_vec(&meta)?)?;
+                        self.blossom.put(
+                            &mut wtxn,
+                            format!("own:{pubkey}:{sha256}").as_bytes(),
+                            b"",
+                        )?;
+                    }
+                    Ok(_) => {}
+                    Err(e) => log::warn!("corrupt blossom mapping for {sha256}: {e}"),
                 }
                 continue;
             }
@@ -728,7 +787,13 @@ impl Store {
         let Some(raw) = self.blossom.get(&rtxn, key.as_bytes())? else {
             return Ok(None);
         };
-        Ok(serde_json::from_slice(raw).ok())
+        match serde_json::from_slice(raw) {
+            Ok(meta) => Ok(Some(meta)),
+            Err(e) => {
+                log::warn!("corrupt blossom mapping for {sha256}: {e}");
+                Ok(None)
+            }
+        }
     }
 
     /// Removes one owner from a blob's metadata and its reverse key.
@@ -740,7 +805,13 @@ impl Store {
         let Some(raw) = self.blossom.get(&wtxn, key.as_bytes())? else {
             return Ok(false);
         };
-        let Some(mut meta) = serde_json::from_slice::<BlossomMeta>(raw).ok() else {
+        let Some(mut meta) = (match serde_json::from_slice::<BlossomMeta>(raw) {
+            Ok(meta) => Some(meta),
+            Err(e) => {
+                log::warn!("corrupt blossom mapping for {sha256}: {e}");
+                None
+            }
+        }) else {
             return Ok(false);
         };
         let before = meta.owners.len();

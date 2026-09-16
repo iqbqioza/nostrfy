@@ -1395,6 +1395,15 @@ impl Config {
             if b.max_upload_bytes == 0 {
                 return Err(config_err("blossom.max_upload_bytes must be at least 1"));
             }
+            // The upload budget semaphore grants one permit per byte and a
+            // request takes `max_upload_bytes` of them: above `u32::MAX` the
+            // per-request acquisition is clamped, so the configured
+            // concurrency limit (4 uploads) would no longer hold.
+            if b.max_upload_bytes > u32::MAX as usize {
+                return Err(config_err(
+                    "blossom.max_upload_bytes must not exceed 4294967295",
+                ));
+            }
             match b.storage.as_str() {
                 "local" => {
                     if b.local_path.as_os_str().is_empty() {
@@ -1635,19 +1644,25 @@ pub(crate) fn set_relay_field_in_text(text: &str, field: &str, value: &str) -> S
     // end-of-line), not an unrelated key that merely starts with the
     // field name (unknown keys are warned about but never rejected, so
     // e.g. `private_key_note = "x"` must not be clobbered by genkey).
-    if let Some(offset) = section.lines().position(|l| {
-        l.trim_start().strip_prefix(field).is_some_and(|rest| {
-            rest.is_empty() || rest.starts_with('=') || rest.starts_with([' ', '\t'])
-        })
+    // `split_inclusive` keeps each line's original ending, so a CRLF
+    // config stays CRLF instead of being silently normalized to LF.
+    let lines: Vec<&str> = section.split_inclusive('\n').collect();
+    if let Some(offset) = lines.iter().position(|l| {
+        l.trim_end_matches(['\n', '\r'])
+            .trim_start()
+            .strip_prefix(field)
+            .is_some_and(|rest| {
+                rest.is_empty() || rest.starts_with('=') || rest.starts_with([' ', '\t'])
+            })
     }) {
-        let mut new_section = String::new();
-        for (i, l) in section.lines().enumerate() {
+        let mut new_section = String::with_capacity(section.len() + line.len());
+        for (i, l) in lines.iter().enumerate() {
             if i == offset {
                 let indent: String = l.chars().take_while(|c| c.is_whitespace()).collect();
-                new_section.push_str(&format!("{indent}{line}\n"));
+                let ending = if l.ends_with("\r\n") { "\r\n" } else { "\n" };
+                new_section.push_str(&format!("{indent}{line}{ending}"));
             } else {
                 new_section.push_str(l);
-                new_section.push('\n');
             }
         }
         let mut s = text.to_string();

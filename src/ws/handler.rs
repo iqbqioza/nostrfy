@@ -129,7 +129,7 @@ impl super::Conn {
         self.events_received_local += 1;
         // Path-specific write policy (nostrfy): `/inbox` and `/outbox` are
         // restricted endpoints — see `write_policy_reason`.
-        if let Some(reason) = self.write_policy_reason(&event).await {
+        if let Some(reason) = self.write_policy_reason(&event) {
             self.relay.stats.bump(&self.relay.stats.events_rejected, 1);
             self.send_ok(&event.id, false, &reason);
             return;
@@ -157,94 +157,67 @@ impl super::Conn {
     /// accepts only events carrying a `p` tag — any recipient
     /// (`relay.inbox_write_policy = "any"`) or the relay itself
     /// (`"relay"`). Every other path is unrestricted.
-    pub(crate) async fn write_policy_reason(&self, event: &Event) -> Option<String> {
+    ///
+    /// The policy strings and the relay pubkey are cached on the connection
+    /// (refreshed on config-version changes): this runs once per EVENT, so
+    /// it must not take the shared config lock or clone per call.
+    pub(crate) fn write_policy_reason(&self, event: &Event) -> Option<String> {
         // Fast path: the vast majority of connections are on the default
-        // path — a cheap string comparison rejects them before any clone
-        // (the clones below exist only so the future does not hold `&self`
-        // across the config await; the connection task's future must be
-        // `Send`).
+        // path — a cheap string comparison rejects them first.
         if self.path != "/outbox" && self.path != "/inbox" {
             return None;
         }
-        let path = self.path.clone();
-        let authed = self.authed_pubkeys.clone();
-        let relay = self.relay.clone();
-        match path.as_str() {
-            "/outbox" => {
-                let policy = relay
-                    .config
-                    .read()
-                    .await
-                    .server
-                    .outbox_write_policy
-                    .trim()
-                    .to_string();
-                match policy.as_str() {
-                    "relay" => {
-                        let Some(relay_pk) = relay.relay_pubkey() else {
-                            return Some(
-                                "restricted: the relay has no identity key for /outbox writes"
-                                    .into(),
-                            );
-                        };
-                        if event.pubkey != relay_pk {
-                            return Some(
-                                "restricted: /outbox accepts only events authored by the relay"
-                                    .into(),
-                            );
-                        }
-                        None
+        match self.path.as_str() {
+            "/outbox" => match self.outbox_write_policy.trim() {
+                "relay" => {
+                    let Some(relay_pk) = self.relay_pubkey.as_deref() else {
+                        return Some(
+                            "restricted: the relay has no identity key for /outbox writes".into(),
+                        );
+                    };
+                    if event.pubkey != relay_pk {
+                        return Some(
+                            "restricted: /outbox accepts only events authored by the relay".into(),
+                        );
                     }
-                    _ => {
-                        if !authed.contains(&event.pubkey) {
-                            return Some(
-                                "restricted: /outbox accepts only your own NIP-42-authenticated events"
-                                    .into(),
-                            );
-                        }
-                        None
-                    }
+                    None
                 }
-            }
-            "/inbox" => {
-                let policy = relay
-                    .config
-                    .read()
-                    .await
-                    .server
-                    .inbox_write_policy
-                    .trim()
-                    .to_string();
-                let relay_pk = relay.relay_pubkey();
-                match policy.as_str() {
-                    "relay" => {
-                        let Some(relay_pk) = relay_pk else {
-                            return Some(
-                                "restricted: the relay has no identity key for /inbox writes"
-                                    .into(),
-                            );
-                        };
-                        let addressed_to_relay = event
-                            .tags
-                            .iter()
-                            .any(|t| t.len() >= 2 && t[0] == "p" && t[1] == relay_pk);
-                        if !addressed_to_relay {
-                            return Some(
-                                "restricted: /inbox accepts only events addressed to the relay"
-                                    .into(),
-                            );
-                        }
+                _ => {
+                    if !self.authed_pubkeys.contains(&event.pubkey) {
+                        return Some(
+                            "restricted: /outbox accepts only your own NIP-42-authenticated events"
+                                .into(),
+                        );
                     }
-                    _ => {
-                        if !event.tags.iter().any(|t| t.len() >= 2 && t[0] == "p") {
-                            return Some(
-                                "restricted: /inbox accepts only events carrying a p tag".into(),
-                            );
-                        }
-                    }
+                    None
                 }
-                None
-            }
+            },
+            "/inbox" => match self.inbox_write_policy.trim() {
+                "relay" => {
+                    let Some(relay_pk) = self.relay_pubkey.as_deref() else {
+                        return Some(
+                            "restricted: the relay has no identity key for /inbox writes".into(),
+                        );
+                    };
+                    let addressed_to_relay = event.tags.iter().any(|t| {
+                        t.len() >= 2 && t[0] == "p" && t[1].eq_ignore_ascii_case(relay_pk)
+                    });
+                    if !addressed_to_relay {
+                        return Some(
+                            "restricted: /inbox accepts only events addressed to the relay".into(),
+                        );
+                    }
+                    None
+                }
+                _ => {
+                    if !event.tags.iter().any(|t| t.len() >= 2 && t[0] == "p") {
+                        return Some(
+                            "restricted: /inbox accepts only events carrying a p tag".into(),
+                        );
+                    }
+                    None
+                }
+            },
             _ => None,
         }
     }
@@ -416,7 +389,10 @@ impl super::Conn {
             return;
         }
 
-        let mut stored = filters.clone();
+        // `filters` is no longer needed after the validation above: move it
+        // instead of cloning (the connection keeps its own copy in `subs`,
+        // the scan takes this one).
+        let mut stored = filters;
         if search_disabled {
             for f in &mut stored {
                 f.search = None;
@@ -426,16 +402,19 @@ impl super::Conn {
 
         // Bound the memory held by this connection's subscriptions: each
         // filter is bounded by the message size limit, so without a cap a
-        // connection could pin many megabytes of filter data.
+        // connection could pin many megabytes of filter data. The size is
+        // counted straight from the serializer (no intermediate String).
         let sub_bytes: usize = stored
             .iter()
-            .map(|f| {
-                serde_json::to_string(f)
-                    .map(|s| s.len())
-                    .unwrap_or_default()
-            })
+            .map(json_len)
             .fold(0usize, |acc, n| acc.saturating_add(n));
         let replacing = self.subs.get(sub_id).map(|(_, bytes, _)| *bytes);
+        if replacing.is_some() {
+            // NIP-01: a re-REQ replaces the subscription. EVENT frames of
+            // the old response that are already queued must not be
+            // delivered under the new filter set.
+            self.purge_queued_events_for(sub_id);
+        }
         let next_total = self
             .sub_bytes
             .saturating_sub(replacing.unwrap_or(0))
@@ -529,10 +508,18 @@ impl super::Conn {
         };
         let mut auth_hidden = false;
         {
-            let groups = self.relay.groups.read().await;
+            // The global group-store read lock is only needed when the
+            // result actually contains group events (COUNT and the live
+            // path skip it the same way): holding it across every stored
+            // event of a REQ would block group writes for no reason.
+            let groups = if events.iter().any(nip29::is_group_event) {
+                Some(self.relay.groups.read().await)
+            } else {
+                None
+            };
             for event in events {
-                if !self.visible_to(&groups, &event) {
-                    if hint_eligible && self.auth_hidden_behind(&groups, &event) {
+                if !self.visible_to(groups.as_deref(), &event) {
+                    if hint_eligible && self.auth_hidden_behind(groups.as_deref(), &event) {
                         auth_hidden = true;
                     }
                     continue;
@@ -643,6 +630,24 @@ impl super::Conn {
     /// left untouched (`NEG-CLOSE` releases NEG). Any response still waiting
     /// for the socket is removed with the subscription, so a CLOSE or a
     /// replacement cannot emit stale history after it.
+    /// Drops queued EVENT frames that belong to a subscription being
+    /// replaced (NIP-01 re-REQ): the old response's events must not be
+    /// delivered under the new filter set. The byte accounting is adjusted
+    /// for the removed frames.
+    pub(crate) fn purge_queued_events_for(&mut self, sub_id: &str) {
+        let tag = super::sub_fingerprint(sub_id);
+        let mut removed = 0usize;
+        self.outgoing.retain(|frame| {
+            if frame.event_sub == Some(tag) {
+                removed = removed.saturating_add(super::message_size(&frame.message));
+                false
+            } else {
+                true
+            }
+        });
+        self.out_bytes = self.out_bytes.saturating_sub(removed);
+    }
+
     pub(crate) fn remove_req_subscription(&mut self, sub_id: &str) {
         self.pending_reqs.retain(|pending| pending.sub_id != sub_id);
         if let Some((_, bytes, _)) = self.subs.remove(sub_id) {
@@ -769,17 +774,29 @@ impl super::Conn {
             self.reject_count(sub_id, "invalid: subscription id must not be empty");
             return;
         }
-        let max_sub_id_len = self.relay.config.read().await.limits.max_sub_id_len;
+        // One config snapshot for the whole handler: the count path used to
+        // take the shared read lock five times per COUNT frame.
+        let (max_sub_id_len, nip45, require_auth, max_filters, max_count, search_enabled) = {
+            let cfg = self.relay.config.read().await;
+            (
+                cfg.limits.max_sub_id_len,
+                cfg.nip_enabled(45),
+                cfg.relay.require_auth,
+                cfg.limits.max_filters,
+                cfg.limits.max_count,
+                cfg.nip_enabled(50),
+            )
+        };
         if sub_id.len() > max_sub_id_len {
             self.reject_count(sub_id, "invalid: subscription id too long");
             return;
         }
         // NIP-45: refusals must be answered with a CLOSED message.
-        if !self.relay.config.read().await.nip_enabled(45) {
+        if !nip45 {
             self.reject_count(sub_id, "error: counting is not enabled on this relay");
             return;
         }
-        if self.relay.config.read().await.relay.require_auth && !self.is_authed() {
+        if require_auth && !self.is_authed() {
             self.reject_count(sub_id, "auth-required: please authenticate before counting");
             return;
         }
@@ -792,7 +809,7 @@ impl super::Conn {
         // parsed before the refusal. Without the cap each filter would also
         // get its own full scan budget (~28k filters × 200k candidate
         // examinations on the shared reader thread).
-        if rest.len().saturating_sub(1) > self.relay.config.read().await.limits.max_filters {
+        if rest.len().saturating_sub(1) > max_filters {
             self.reject_count(sub_id, "invalid: too many filters");
             return;
         }
@@ -827,13 +844,13 @@ impl super::Conn {
             self.reject_count(sub_id, "invalid: tag constraint values must be strings");
             return;
         }
-        let count_limit = self.relay.config.read().await.limits.max_count;
+        let count_limit = max_count;
         let mut count_filters = filters.clone();
         // NIP-50: when the search capability is disabled, strip `search` like
         // REQ does — otherwise COUNT would filter by terms a REQ would ignore
         // (count/REQ divergence) and drive search walks for a feature the
         // relay claims not to offer.
-        if !self.relay.config.read().await.nip_enabled(50) {
+        if !search_enabled {
             for f in &mut count_filters {
                 f.search = None;
             }
@@ -959,7 +976,11 @@ impl super::Conn {
             .any(|pk| self.relay.relay_pubkey.as_ref().is_some_and(|r| r == pk) || admin == pk)
     }
 
-    pub(crate) fn auth_hidden_behind(&self, groups: &nip29::GroupStore, event: &Event) -> bool {
+    pub(crate) fn auth_hidden_behind(
+        &self,
+        groups: Option<&nip29::GroupStore>,
+        event: &Event,
+    ) -> bool {
         // NIP-70: protected events are served to any authenticated client.
         if !self.is_authed() && nip70::is_protected(event) {
             return true;
@@ -972,8 +993,9 @@ impl super::Conn {
         }
         // NIP-29: content of a `private` group (or `hidden` metadata) is
         // served to authenticated members. Deleted/ghost/unknown groups are
-        // not AUTH-revealable — their content stays gone for everyone.
-        groups.privacy_gated(event)
+        // not AUTH-revealable — their content stays gone for everyone. The
+        // store is absent when the batch holds no group event.
+        groups.is_some_and(|groups| groups.privacy_gated(event))
     }
 
     /// NIP-59 / NIP-17: gift wraps are signed by random keys, so they may
@@ -1005,8 +1027,10 @@ impl super::Conn {
     }
     /// Whether a stored or live event may be served on this connection
     /// (NIP-70 protected, NIP-59 gift-wrap recipient and NIP-29 group
-    /// access checks).
-    pub(crate) fn visible_to(&self, groups: &nip29::GroupStore, event: &Event) -> bool {
+    /// access checks). `groups` is `None` when the batch contains no group
+    /// event: the expensive group-store lock is skipped then, and the
+    /// NIP-29 check (which can only fail for a group event) does not run.
+    pub(crate) fn visible_to(&self, groups: Option<&nip29::GroupStore>, event: &Event) -> bool {
         // NIP-70: protected events are only served to authenticated clients.
         // The `-` tag constrains *publication* (author-only, enforced on the
         // write path); NIP-43's relay-generated membership metadata carries
@@ -1020,6 +1044,12 @@ impl super::Conn {
         if !self.nip78_visible(event) {
             return false;
         }
+        let Some(groups) = groups else {
+            // No group event in the batch means the group check cannot
+            // change the outcome; a group event without the store would be
+            // a caller bug, so fail closed for it.
+            return !nip29::is_group_event(event);
+        };
         if self.authed_pubkeys.is_empty() {
             groups.visible_to(event, None)
         } else {
@@ -1064,25 +1094,11 @@ impl super::Conn {
         if !self.access_allows_read_sync() {
             return;
         }
-        // NIP-70: protected events are only delivered to authenticated
-        // clients.
-        if !self.is_authed() && nip70::is_protected(event) {
-            return;
-        }
-        // NIP-59: gift wraps are only delivered to their recipients, even
-        // when the batch contains no group events (visible_to is only
-        // reached when the groups lock was taken).
-        if !self.gift_wrap_visible(event) {
-            return;
-        }
-        // NIP-78: application-specific events are only delivered to the
-        // authenticated owner.
-        if !self.nip78_visible(event) {
-            return;
-        }
-        if let Some(groups) = groups
-            && !self.visible_to(groups, event)
-        {
+        // NIP-70/NIP-59/NIP-78/NIP-29: one consolidated visibility check
+        // (the group store is absent when the batch has no group events,
+        // and the earlier per-rule checks duplicated what `visible_to`
+        // already enforces).
+        if !self.visible_to(groups, event) {
             return;
         }
         // NIP-40: expired stored events are not delivered live; ephemeral
@@ -1095,22 +1111,15 @@ impl super::Conn {
         {
             return;
         }
-        let matching: Vec<String> = self
-            .subs
-            .iter()
-            .filter(|(_, (filters, _, _))| filters.iter().any(|f| f.matches(event)))
-            .map(|(sub_id, _)| sub_id.clone())
-            .collect();
-        if matching.is_empty() {
-            return;
-        }
-        // The event JSON is shared (encoded once by the live bus) and the
-        // sub id JSON is cached per subscription: the wrap below only
-        // concatenates strings.
-        for sub_id in matching {
-            let Some((_, _, sub_json)) = self.subs.get(&sub_id) else {
+        // Build each frame under a borrow of `subs` (no sub-id clone, no
+        // second hash lookup) and defer the direct sends until the borrow
+        // ends: `send` takes `&mut self`, so it cannot run inside the
+        // iteration.
+        let mut direct: Vec<(Message, u64)> = Vec::new();
+        for (sub_id, (filters, _, sub_json)) in self.subs.iter() {
+            if !filters.iter().any(|f| f.matches(event)) {
                 continue;
-            };
+            }
             let mut out = String::with_capacity(event_json.len() + sub_json.len() + 16);
             out.push_str("[\"EVENT\",");
             out.push_str(sub_json);
@@ -1122,7 +1131,7 @@ impl super::Conn {
             // stored response is still pumping, hold the live event in the
             // pending response so it is queued after the EOSE; sending it
             // directly would let it overtake the remaining stored events.
-            if let Some(idx) = self.pending_reqs.iter().position(|p| p.sub_id == sub_id) {
+            if let Some(idx) = self.pending_reqs.iter().position(|p| p.sub_id == *sub_id) {
                 let size = out.len();
                 let pending = &mut self.pending_reqs[idx];
                 let over = pending.live.len() >= super::OUT_QUEUE_LIMIT
@@ -1135,11 +1144,34 @@ impl super::Conn {
                     break;
                 } else {
                     pending.live_bytes += size;
-                    pending.live.push_back(std::mem::take(&mut out));
+                    pending.live.push_back(out);
                 }
             } else {
-                self.send(Message::Text(std::mem::take(&mut out).into()));
+                direct.push((Message::Text(out.into()), super::sub_fingerprint(sub_id)));
             }
         }
+        for (msg, tag) in direct {
+            self.send_tagged(msg, Some(tag));
+        }
     }
+}
+
+/// The JSON serialization size of a value without allocating the string:
+/// the per-subscription filter byte budget only needs the length, and
+/// serializing through a counting writer avoids the intermediate `String`.
+fn json_len<T: serde::Serialize>(value: &T) -> usize {
+    struct Counter(usize);
+    impl std::io::Write for Counter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(buf.len());
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter(0);
+    serde_json::to_writer(&mut counter, value)
+        .map(|()| counter.0)
+        .unwrap_or_default()
 }

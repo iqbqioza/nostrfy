@@ -336,8 +336,17 @@ pub(crate) fn rewrite_inbox_outbox(value: &mut Value) -> Result<()> {
             *entry = json!([s]);
         }
         if let Some(arr) = entry.as_array_mut() {
+            // Dedup against a set of the existing strings: the previous
+            // `arr.iter().any(|v| v == &json!(pk))` allocated a Value per
+            // candidate and rescanned the whole array (O(n²)).
+            let mut existing: std::collections::HashSet<String> = arr
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_string)
+                .collect();
             for pk in pubkeys {
-                if !arr.iter().any(|v| v == &json!(pk)) {
+                if !existing.contains(&pk) {
+                    existing.insert(pk.clone());
                     arr.push(json!(pk));
                 }
             }

@@ -136,12 +136,10 @@ impl super::Conn {
             self.neg_err(&sub_id, "error: NEG-OPEN message must be hex");
             return;
         };
-        let Ok(initial) = hex::decode(initial) else {
-            self.neg_err(&sub_id, "error: NEG-OPEN message must be hex");
-            return;
-        };
         // NIP-42: an auth-requiring relay applies the same policy to
-        // negentropy subscriptions as to REQ subscriptions.
+        // negentropy subscriptions as to REQ subscriptions. Checked before
+        // the hex decode so an unauthenticated peer cannot force a
+        // half-megabyte decode with a rejected frame.
         if self.relay.config.read().await.relay.require_auth && !self.is_authed() {
             self.neg_err(&sub_id, "auth-required: please authenticate before syncing");
             return;
@@ -154,8 +152,22 @@ impl super::Conn {
             self.neg_err(&sub_id, "restricted: you are not allowed to sync");
             return;
         }
+        let Ok(initial) = hex::decode(initial) else {
+            self.neg_err(&sub_id, "error: NEG-OPEN message must be hex");
+            return;
+        };
 
-        let max_items = self.relay.config.read().await.limits.max_neg_items;
+        let mut max_items = self.relay.config.read().await.limits.max_neg_items;
+        // Unauthenticated peers get a smaller per-query cap: the
+        // per-connection budget is `2 × max_items`, and with the default
+        // 100k items (~8 MiB held) times up to `max_connections` anonymous
+        // clients the relay-wide exposure would be tens of GB. An
+        // authenticated sync keeps the configured cap (large public syncs
+        // can still authenticate).
+        const UNAUTH_NEG_ITEMS: usize = 10_000;
+        if !self.is_authed() {
+            max_items = max_items.min(UNAUTH_NEG_ITEMS);
+        }
         let max_subs = self.relay.config.read().await.limits.max_subscriptions;
         // NIP-77: a NEG-OPEN for an already open id replaces it, so it
         // must not count against the cap — only new subscriptions are
@@ -200,7 +212,9 @@ impl super::Conn {
             self.neg_err(&sub_id, "error: database timeout, please retry");
             return;
         };
-        if more || items.len() > max_items {
+        // The scan's collect cap is `max_items`, so the collected count can
+        // never exceed it: `more` alone marks a query too large to answer.
+        if more {
             // NIP-77: the maximum number of processable records may be
             // returned as the fourth element. NEG-ERR closes the id.
             self.remove_neg_subscription(&sub_id);
