@@ -559,6 +559,60 @@ impl DbClient {
         &self.read_txs[index]
     }
 
+    /// Reserves one reader-queue slot plus the message's estimated payload
+    /// bytes (add-then-check with rollback). Returns `false` when a cap is
+    /// exceeded, so the caller fails fast. Every read path must reserve its
+    /// bytes through here: the reader thread releases *both* counters on
+    /// completion, so an unreserved byte count underflows
+    /// `pending_read_bytes` to `usize::MAX` and every later byte-checked
+    /// read fails fast for the rest of the process.
+    fn reserve_read(&self, bytes: usize) -> bool {
+        let reads = self
+            .pending_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(1);
+        let pending_bytes = if bytes > 0 {
+            self.pending_read_bytes
+                .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed)
+                .saturating_add(bytes)
+        } else {
+            self.pending_read_bytes
+                .load(std::sync::atomic::Ordering::Relaxed)
+        };
+        let over_bytes = self.max_pending_bytes > 0 && pending_bytes > self.max_pending_bytes;
+        if reads > self.max_pending_msgs || over_bytes {
+            self.release_read(bytes);
+            self.errors
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return false;
+        }
+        true
+    }
+
+    /// Reserves a reader slot and payload bytes without the cap check:
+    /// startup loads must not fail fast (an empty security state is
+    /// fail-open), but the reader still releases both counters, so the
+    /// reservation must be recorded to keep the accounting exact.
+    fn reserve_read_force(&self, bytes: usize) {
+        self.pending_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if bytes > 0 {
+            self.pending_read_bytes
+                .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Releases a read reservation whose message could not be sent. A
+    /// queued message is released by the reader thread instead.
+    fn release_read(&self, bytes: usize) {
+        self.pending_reads
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        if bytes > 0 {
+            self.pending_read_bytes
+                .fetch_sub(bytes, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     /// Startup-only read: neither fails fast on a momentarily full queue
     /// nor applies the response timeout. The persisted access control
     /// (deny/allow lists, Blossom allowlist) must not silently degrade to
@@ -572,13 +626,12 @@ impl DbClient {
     ) -> R {
         let (tx, rx) = oneshot::channel();
         let msg = make(tx);
-        self.pending_reads
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let bytes = msg_bytes(&msg);
+        self.reserve_read_force(bytes);
         if self.read_channel().send(msg).is_err() {
             // The reader thread's receiver is gone: the relay is shutting
             // down or the thread died. There is no state to load.
-            self.pending_reads
-                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            self.release_read(bytes);
             log::error!("database reader is gone; cannot load persisted state");
             return R::default();
         }
@@ -607,11 +660,10 @@ impl DbClient {
     ) -> Option<R> {
         let (tx, rx) = oneshot::channel();
         let msg = make(tx);
-        self.pending_reads
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let bytes = msg_bytes(&msg);
+        self.reserve_read_force(bytes);
         if self.read_channel().send(msg).is_err() {
-            self.pending_reads
-                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            self.release_read(bytes);
             log::error!("database reader is gone; cannot rebuild startup state");
             return None;
         }
@@ -639,31 +691,23 @@ impl DbClient {
             .and_then(|r| r.ok())
     }
 
-    /// Reader-queue variant of [`Self::send_request`]: reserves in
-    /// `pending_reads` (add-then-check with rollback) and reports
-    /// fail-fast as `None`. The reader thread releases the slot on
-    /// completion, so this path must not decrement it.
+    /// Reader-queue variant of [`Self::send_request`]: reserves a slot and
+    /// the payload bytes (add-then-check with rollback) and reports
+    /// fail-fast as `None`. The reader thread releases both on completion,
+    /// so this path must not release them.
     fn send_request_read<R>(
         &self,
         make: impl FnOnce(oneshot::Sender<R>) -> Msg,
         channel: &mpsc::UnboundedSender<Msg>,
     ) -> Option<oneshot::Receiver<R>> {
         let (tx, rx) = oneshot::channel();
-        let reads = self
-            .pending_reads
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            .saturating_add(1);
-        if reads > self.max_pending_msgs {
-            self.pending_reads
-                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-            self.errors
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let msg = make(tx);
+        let bytes = msg_bytes(&msg);
+        if !self.reserve_read(bytes) {
             return None;
         }
-        let msg = make(tx);
         if channel.send(msg).is_err() {
-            self.pending_reads
-                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            self.release_read(bytes);
             return None;
         }
         Some(rx)
@@ -770,30 +814,10 @@ impl DbClient {
                 return None;
             }
         } else {
-            // Reader path: separate counter with the same message cap so a
+            // Reader path: a separate counter with the same message cap so a
             // REQ flood fails fast instead of growing unbounded and (via the
             // old shared counter) blocking the writes.
-            let reads = self
-                .pending_reads
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                .saturating_add(1);
-            let pending_bytes = if bytes > 0 {
-                self.pending_read_bytes
-                    .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed)
-                    .saturating_add(bytes)
-            } else {
-                self.pending_read_bytes
-                    .load(std::sync::atomic::Ordering::Relaxed)
-            };
-            if reads > self.max_pending_msgs || over_bytes(pending_bytes) {
-                self.pending_reads
-                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                if bytes > 0 {
-                    self.pending_read_bytes
-                        .fetch_sub(bytes, std::sync::atomic::Ordering::Relaxed);
-                }
-                self.errors
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if !self.reserve_read(bytes) {
                 return None;
             }
         }

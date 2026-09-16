@@ -4028,3 +4028,43 @@ fn reader_queue_byte_cap_fails_fast() {
         db.shutdown();
     });
 }
+
+#[test]
+fn startup_rebuild_queries_keep_the_reader_byte_accounting_balanced() {
+    // Regression (#96 over #94): the NIP-29/43 rebuild queries go through
+    // `request_read_startup`, which reserved only the count. The reader
+    // thread releases both counters on completion, so the payload bytes
+    // were subtracted without ever being added: `pending_read_bytes`
+    // underflowed to `usize::MAX` and every later byte-checked read (the
+    // REQ scan path, `size_on_disk`, the account-age `first_seen_batch`)
+    // failed fast for the rest of the process.
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let cfg = config();
+        let errors = Arc::new(Default::default());
+        let db = DbClient::open(&cfg, true, Arc::clone(&errors), 30, 128, 4096, 262144).unwrap();
+        let now = unix_now();
+        let e = event(1, "account-age probe", now, vec![]);
+        assert_eq!(db.put(e.clone(), now).await, PutOutcome::Stored);
+
+        // The startup rebuild query (a filter with payload bytes).
+        let kinds: Vec<u64> = (9000..=9022).collect();
+        let f: Filter = serde_json::from_value(serde_json::json!({ "kinds": kinds })).unwrap();
+        let page = db.query_full_startup(vec![f], 100, now, true).await;
+        assert!(page.is_some(), "the startup query must answer");
+
+        // The byte-checked read path must still work afterwards.
+        let small: Filter = serde_json::from_value(serde_json::json!({"kinds": [1]})).unwrap();
+        let (out, _) = db.query(vec![small], 10, now).await;
+        assert_eq!(
+            out.len(),
+            1,
+            "reads must not fail after a startup rebuild query"
+        );
+        // A fail-fast read returns an empty vec here; a working one answers
+        // exactly one status per requested pubkey.
+        let status = db.first_seen_batch(vec![e.pubkey_bytes().unwrap()]).await;
+        assert_eq!(status.len(), 1, "first-seen reads must still answer");
+        db.shutdown();
+    });
+}
