@@ -326,7 +326,11 @@ pub struct DbClient {
     /// separate thread that never takes the write lock, so reads keep
     /// working even when the writer is stalled (a slow disk or an external
     /// lock holder cannot take the relay down for readers).
-    read_tx: mpsc::UnboundedSender<Msg>,
+    /// One channel per reader thread: `read_rr` round-robins requests so
+    /// one long scan cannot stall the others (they no longer share a
+    /// receiver behind a blocking Mutex).
+    read_txs: Vec<mpsc::UnboundedSender<Msg>>,
+    read_rr: Arc<std::sync::atomic::AtomicUsize>,
     /// Dedicated channel for REST API queries: served by its own reader
     /// thread, so a flood of `/api/v1` requests can never queue up behind
     /// (or in front of) WebSocket REQ/COUNT/NEG queries on the shared
@@ -370,9 +374,6 @@ pub struct DbClient {
     max_pending_events: usize,
     max_pending_bytes: usize,
     max_api_pending: Arc<std::sync::atomic::AtomicUsize>,
-    /// How many threads serve the WebSocket reader queue (from
-    /// `database.reader_threads`); used to fan the shutdown messages out.
-    reader_threads: usize,
     /// The spawned database threads, joined by [`Self::shutdown`] after the
     /// Shutdown signals: without the join, work queued behind `Shutdown`
     /// could be dropped without a reply and the final flush could be cut
@@ -498,7 +499,8 @@ impl DbClient {
         )?;
         Ok(DbClient {
             tx: threads.tx,
-            read_tx: threads.read_tx,
+            read_txs: threads.read_txs,
+            read_rr: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             api_read_tx: threads.api_read_tx,
             errors: threads.errors,
             expiry: threads.expiry,
@@ -514,7 +516,6 @@ impl DbClient {
             max_pending_events: threads.max_pending_events,
             max_pending_bytes: cfg.max_db_queue_bytes,
             max_api_pending: threads.max_api_pending,
-            reader_threads: threads.reader_threads,
             threads: Arc::new(threads.threads),
         })
     }
@@ -542,7 +543,17 @@ impl DbClient {
     /// writer-queue counters are not part of the gate: the reader threads
     /// exist so reads keep working while the writer is stalled.
     async fn request_read<R: Default>(&self, make: impl FnOnce(oneshot::Sender<R>) -> Msg) -> R {
-        self.request_with_checked(make, &self.read_tx, false).await
+        let channel = self.read_channel();
+        self.request_with_checked(make, channel, false).await
+    }
+
+    /// Round-robin over the per-thread reader channels.
+    fn read_channel(&self) -> &mpsc::UnboundedSender<Msg> {
+        let index = self
+            .read_rr
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            % self.read_txs.len();
+        &self.read_txs[index]
     }
 
     /// Startup-only read: neither fails fast on a momentarily full queue
@@ -560,7 +571,7 @@ impl DbClient {
         let msg = make(tx);
         self.pending_reads
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if self.read_tx.send(msg).is_err() {
+        if self.read_channel().send(msg).is_err() {
             // The reader thread's receiver is gone: the relay is shutting
             // down or the thread died. There is no state to load.
             self.pending_reads
@@ -595,7 +606,7 @@ impl DbClient {
         let msg = make(tx);
         self.pending_reads
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if self.read_tx.send(msg).is_err() {
+        if self.read_channel().send(msg).is_err() {
             self.pending_reads
                 .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             log::error!("database reader is gone; cannot rebuild startup state");
@@ -614,7 +625,8 @@ impl DbClient {
         &self,
         make: impl FnOnce(oneshot::Sender<R>) -> Msg,
     ) -> Option<R> {
-        let rx = self.send_request_read(make, &self.read_tx)?;
+        let channel = self.read_channel();
+        let rx = self.send_request_read(make, channel)?;
         if self.timeout_secs == 0 {
             return rx.await.ok();
         }
@@ -1613,10 +1625,9 @@ impl DbClient {
 
     pub fn shutdown(&self) {
         let _ = self.tx.send(Msg::Shutdown);
-        // One per reader thread (the WebSocket reader pool is shared
-        // behind a mutex; each thread consumes one shutdown message).
-        for _ in 0..self.reader_threads {
-            let _ = self.read_tx.send(Msg::Shutdown);
+        // One per reader thread (each owns its receiver).
+        for tx in &self.read_txs {
+            let _ = tx.send(Msg::Shutdown);
         }
         let _ = self.api_read_tx.send(Msg::Shutdown);
         // Join the threads so the final flush and the shutdown sync finish
