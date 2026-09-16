@@ -642,6 +642,12 @@ impl Relay {
         self.relay_pubkey.clone()
     }
 
+    /// Borrowed form of [`Self::relay_pubkey`]: the per-event validation
+    /// paths only compare against it and must not clone the string.
+    pub fn relay_pubkey_ref(&self) -> Option<&str> {
+        self.relay_pubkey.as_deref()
+    }
+
     pub fn secp(&self) -> &Secp256k1<secp256k1::All> {
         &self.secp
     }
@@ -1194,22 +1200,36 @@ impl Relay {
         nip29_enabled: bool,
     ) -> bool {
         if nip9 && event.kind == nip09::DELETION_KIND {
-            let removed = self
+            match self
                 .db
-                .apply_deletion(
+                .apply_deletion_checked(
                     nip09::deletion_targets(&event),
                     nip09::deletion_addresses(&event),
                     Some(event.pubkey.clone()),
                     event.created_at,
                 )
-                .await;
-            self.stats.bump(&self.stats.events_deleted, removed as u64);
+                .await
+            {
+                Some(removed) => self.stats.bump(&self.stats.events_deleted, removed as u64),
+                None => {
+                    // The deletion event stored but its side effect was
+                    // dropped (writer overload): make it visible instead of
+                    // reporting a silent success.
+                    log::error!("NIP-09 deletion side effect was not applied");
+                    self.stats.bump(&self.stats.db_errors, 1);
+                }
+            }
             // NIP-59: gift wraps are signed by random keys, so their
             // recipient cannot delete them via NIP-09; the relay
             // deletes wraps addressed to the deleter instead.
             if let Some(pubkey) = event.pubkey_bytes() {
-                let purged = self.db.delete_gift_wraps_to(pubkey).await;
-                self.stats.bump(&self.stats.events_deleted, purged as u64);
+                match self.db.delete_gift_wraps_to_checked(pubkey).await {
+                    Some(purged) => self.stats.bump(&self.stats.events_deleted, purged as u64),
+                    None => {
+                        log::error!("NIP-59 gift-wrap purge was not applied");
+                        self.stats.bump(&self.stats.db_errors, 1);
+                    }
+                }
             }
         }
         if nip43 && event.kind == nip43::LEAVE {
@@ -1277,7 +1297,17 @@ impl Relay {
     /// instead of restoring the stale state.
     async fn vanish_pubkey(&self, pubkey: [u8; 32], until_created: u64) {
         let pubkey_hex = hex::encode(pubkey);
-        let removed = self.db.apply_vanish(pubkey, until_created).await;
+        let removed = match self.db.apply_vanish_checked(pubkey, until_created).await {
+            Some(removed) => removed,
+            None => {
+                // The vanish was accepted (OK) but its side effect was
+                // dropped: the marker is not stored, so the pubkey would
+                // come back. Surface the failure in the logs and metrics.
+                log::error!("NIP-62 vanish side effect was not applied");
+                self.stats.bump(&self.stats.db_errors, 1);
+                return;
+            }
+        };
         self.stats.bump(&self.stats.events_deleted, removed as u64);
         if self.config.read().await.nip_enabled(29) {
             if removed > 0 {

@@ -38,29 +38,15 @@ pub fn conditions_allow(conditions: &str, kind: u64, created_at: u64) -> bool {
             continue;
         }
         let (key, result) = if let Some(value) = cond.strip_prefix("kind=") {
-            // The `|` pipe is a nostrfy extension kept for compatibility;
-            // the spec form is repeated `kind=` conditions.
+            // NIP-26 defines only `kind=`, `created_at<` and `created_at>`:
+            // the old `|` extension and the `>=`/`<=` operators accepted
+            // conditions other relays treat as unknown (and therefore
+            // false), so they are rejected here too. `created_at>=X` still
+            // fails: it matches the `created_at>` prefix with a value that
+            // does not parse.
             (
                 ("kind", "="),
-                value
-                    .split('|')
-                    .any(|k| k.parse::<u64>().map(|k| k == kind).unwrap_or(false)),
-            )
-        } else if let Some(value) = cond.strip_prefix("created_at>=") {
-            (
-                ("created_at", ">="),
-                value
-                    .parse::<u64>()
-                    .map(|v| created_at >= v)
-                    .unwrap_or(false),
-            )
-        } else if let Some(value) = cond.strip_prefix("created_at<=") {
-            (
-                ("created_at", "<="),
-                value
-                    .parse::<u64>()
-                    .map(|v| created_at <= v)
-                    .unwrap_or(false),
+                value.parse::<u64>().map(|k| k == kind).unwrap_or(false),
             )
         } else if let Some(value) = cond.strip_prefix("created_at>") {
             (
@@ -138,7 +124,13 @@ mod tests {
     fn conditions() {
         assert!(conditions_allow("kind=1", 1, 1_600_000_000));
         assert!(!conditions_allow("kind=1", 2, 1_600_000_000));
-        assert!(conditions_allow("kind=1|2", 2, 1_600_000_000));
+        // The `|` extension is gone: the spec form is repeated `kind=`.
+        assert!(!conditions_allow("kind=1|2", 2, 1_600_000_000));
+        assert!(!conditions_allow(
+            "created_at>=1600000000",
+            1,
+            1_600_000_000
+        ));
         // NIP-26: same-field conditions are OR-combined (the spec's own
         // example `kind=0&kind=1` must allow either kind).
         assert!(conditions_allow("kind=0&kind=1", 0, 1_600_000_000));

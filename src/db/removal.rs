@@ -101,6 +101,13 @@ impl Store {
         // Disk-full guard: a removal still writes (the deleted marker),
         // so the same SIGBUS protection as the put path applies.
         self.disk_full_error()?;
+        // Fail closed: a deletion must be scoped to a requester (author /
+        // delegator) or to a group. The old signature allowed both to be
+        // `None`, which skipped every authorization check and would delete
+        // arbitrary events if a future caller passed neither.
+        if request_pubkey.is_none() && group.is_none() {
+            return Ok(0);
+        }
         let mut wtxn = self.env.write_txn()?;
         let mut removed = 0usize;
 
@@ -125,6 +132,12 @@ impl Store {
             if event.kind == nip09::DELETION_KIND {
                 continue;
             }
+            // NIP-09: only events created at or before the request are
+            // covered (the `a`-tag path enforces the same bound; a
+            // future-dated target must not be deletable).
+            if event.created_at > request_created {
+                continue;
+            }
             if let Some(pubkey) = request_pubkey
                 && !pubkeys_equal(&event.pubkey, pubkey)
                 && !delegated_by(&event, pubkey)
@@ -139,6 +152,16 @@ impl Store {
                     .map(str::to_string)
                     .as_deref()
                     != Some(gid)
+            {
+                continue;
+            }
+            // NIP-29's relay-signed metadata (39000-39005) is managed by
+            // the relay: a group admin's 9005 must not delete it even
+            // within their own group (the group check above would pass for
+            // its own gid).
+            if group.is_some()
+                && (crate::nips::nip29::GROUP_META..=crate::nips::nip29::GROUP_PINS)
+                    .contains(&event.kind)
             {
                 continue;
             }
@@ -307,6 +330,11 @@ impl Store {
             last_key = Some(entries.last().unwrap().0.clone());
             for (_, id) in entries {
                 if self.events.get(&wtxn, &id)?.is_some() {
+                    // Tombstone the id: a purged group's history must not
+                    // be re-publishable (the same content id would
+                    // otherwise be accepted after the group is re-created
+                    // as a public group, exposing the old private history).
+                    self.deleted.put(&mut wtxn, &id, b"")?;
                     self.remove_event(&mut wtxn, &id)?;
                     removed += 1;
                 }

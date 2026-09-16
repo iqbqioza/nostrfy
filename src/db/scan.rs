@@ -224,6 +224,12 @@ fn score(event: &Event, terms: &[String], weights: &[f64]) -> f64 {
 
 impl ScanCollector for EventCollector {
     fn full(&self) -> bool {
+        if !self.boundary_ok {
+            // COUNT/NIP-45: the count must be exact up to `cap`, but the
+            // collection must not exceed it across filters (the per-filter
+            // quotas alone let a multi-filter COUNT sum past the cap).
+            return self.events.len() >= self.cap;
+        }
         // The tie continuation may exceed `cap`, but only up to `tie_cap`.
         self.events.len() >= self.tie_cap
     }
@@ -567,12 +573,16 @@ impl Store {
         // filter must not be starved by an earlier one's matches). COUNT
         // keeps the old single-budget bound: it only needs enough candidates
         // to make the count exact or report it as approximate.
-        let collect_cap = if has_search {
+        let collect_cap = if count_mode {
+            // COUNT has no relevance ranking, so the search multiplier
+            // would only inflate the materialized set (and its 2× tie cap):
+            // a mixed search+plain COUNT could hold 16×max_count full
+            // events. `more` reports the truncation instead.
+            max_limit
+        } else if has_search {
             max_limit
                 .saturating_mul(SEARCH_BUDGET_MULTIPLIER)
                 .min(SEARCH_BUDGET_MAX)
-        } else if count_mode {
-            max_limit
         } else {
             let caps = filters.iter().fold(0usize, |acc, filter| {
                 acc.saturating_add(filter_collect_cap(filter, max_limit, hidden_slack))
@@ -678,7 +688,10 @@ impl Store {
         // the candidates examined across all filters, so a REQ with many
         // filters cannot multiply the budget (e.g. 20 filters x 200k
         // examinations) and stall the reader thread.
-        let mut examined = 0usize;
+        // A `Cell` (not `&mut`): the gather loops for id prefixes must
+        // charge the shared work budget too, and the `consider` closure
+        // already borrows it.
+        let examined = std::cell::Cell::new(0usize);
         // `more` is true when a scan stopped because of a limit instead of
         // exhausting the matching records (NIP-67 EOSE completeness hint).
         let mut more = false;
@@ -693,11 +706,14 @@ impl Store {
                 && !search.trim().is_empty()
             {
                 for t in crate::nips::nip50::terms(search) {
+                    // Check the cap *before* the push: the post-push check
+                    // let every filter add one extra term (32 + filters - 1)
+                    // and each term drives a `DF_SAMPLE`-wide index walk.
+                    if all_terms.len() >= SEARCH_MAX_TERMS {
+                        break;
+                    }
                     if !all_terms.contains(&t) {
                         all_terms.push(t);
-                        if all_terms.len() >= SEARCH_MAX_TERMS {
-                            break;
-                        }
                     }
                 }
             }
@@ -772,7 +788,7 @@ impl Store {
                 &scan,
                 &mut collect,
                 budget,
-                &mut examined,
+                &examined,
                 &mut more,
                 light,
                 &all_dfs,
@@ -819,7 +835,7 @@ impl Store {
         scan: &FilterScan<'_>,
         collect: &mut Collect<'_, C>,
         budget: usize,
-        examined: &mut usize,
+        examined: &std::cell::Cell<usize>,
         more: &mut bool,
         light: bool,
         all_dfs: &[u64],
@@ -902,7 +918,12 @@ impl Store {
                         if key.len() != ID_LEN {
                             return Err(anyhow!("corrupt event key ({} bytes)", key.len()));
                         }
-                        if candidates.len() >= budget {
+                        // Charge the shared work budget: an id-prefix
+                        // gather is a range walk like any other, and
+                        // without this a REQ could run `max_filters` full
+                        // budgets (20 × 200k) of uncounted cursor work.
+                        examined.set(examined.get() + 1);
+                        if examined.get() > budget {
                             *more = true;
                             break 'gather;
                         }
@@ -1213,10 +1234,11 @@ impl Store {
         type RevIter<'a> = Box<dyn Iterator<Item = heed::Result<(&'a [u8], &'a [u8])>> + 'a>;
         struct Head<'a> {
             iter: RevIter<'a>,
-            /// The next key with its parsed `(created_at, id)` tail: the
-            /// tail is parsed once per refill instead of once per head per
-            /// iteration.
-            next_key: Option<(Vec<u8>, [u8; 8], [u8; 32])>,
+            /// The next entry's parsed `(created_at, id)` tail: parsed once
+            /// per refill instead of once per head per iteration, and only
+            /// the id is kept (the full key is never needed again, so the
+            /// per-emission `key.to_vec()` allocation is gone).
+            next_key: Option<([u8; 8], [u8; 32])>,
         }
         let mut heads: Vec<Head<'_>> = Vec::with_capacity(ranges.len());
         for (start, end) in ranges {
@@ -1262,7 +1284,7 @@ impl Store {
             match head.iter.next() {
                 Some(Ok((key, _))) => {
                     let (created, id) = index_tail(key)?;
-                    head.next_key = Some((key.to_vec(), created, id));
+                    head.next_key = Some((created, id));
                     Ok(Some((created, id)))
                 }
                 Some(Err(e)) => Err(e.into()),
@@ -1290,7 +1312,7 @@ impl Store {
             let i = top.head;
             // The head's cached key must match the popped entry: both are
             // regenerated together on every refill.
-            let Some((key, created, id)) = heads[i].next_key.take() else {
+            let Some((created, id)) = heads[i].next_key.take() else {
                 continue;
             };
             // The same event can appear in several ranges (e.g. a search
@@ -1313,8 +1335,7 @@ impl Store {
                 continue;
             }
             last_emitted = Some((created, id));
-            let id = &key[key.len() - ID_LEN..];
-            if !consider(id)? {
+            if !consider(&id)? {
                 *more = true;
                 return Ok(false);
             }
@@ -1405,7 +1426,7 @@ fn consider_event<C: ScanCollector>(
     out: &mut C,
     limit: usize,
     budget: usize,
-    examined: &mut usize,
+    examined: &std::cell::Cell<usize>,
     light: bool,
 ) -> Result<bool> {
     if out.full() {
@@ -1416,8 +1437,8 @@ fn consider_event<C: ScanCollector>(
     // Work budget: give up after examining `budget` candidates so a
     // filter matching nothing cannot walk an entire index range and stall
     // the reader thread (which also serves WebSocket REQ/COUNT/NEG).
-    *examined += 1;
-    if *examined > budget {
+    examined.set(examined.get() + 1);
+    if examined.get() > budget {
         return Ok(false);
     }
     if seen.contains(id) {
@@ -1461,7 +1482,7 @@ fn consider_event<C: ScanCollector>(
         let Ok(event) = serde_json::from_slice::<NegLight>(raw) else {
             return Ok(true);
         };
-        if !is_deliverable(ctx, &event, filter, terms, now)? {
+        if !is_deliverable(ctx, &event, &id, filter, terms, now)? {
             return Ok(true);
         }
         // Only record the event as seen when it was actually collected, like
@@ -1478,7 +1499,7 @@ fn consider_event<C: ScanCollector>(
     let Ok(event) = serde_json::from_slice::<Event>(raw) else {
         return Ok(true);
     };
-    if !is_deliverable(ctx, &event, filter, terms, now)? {
+    if !is_deliverable(ctx, &event, &id, filter, terms, now)? {
         return Ok(true);
     }
     // Only record the event as seen when it was actually collected: an event
@@ -1495,14 +1516,14 @@ fn consider_event<C: ScanCollector>(
 fn is_deliverable<E: crate::filter::EventFields>(
     ctx: &ScanContext<'_>,
     event: &E,
+    id: &[u8],
     filter: &Filter,
     terms: &[String],
     now: u64,
 ) -> Result<bool> {
-    let Some(id) = hex::decode(event.id()).ok() else {
-        return Ok(false);
-    };
-    let Some(id): Option<[u8; 32]> = id.try_into().ok() else {
+    // The id bytes come from the index key (`consider_event` already holds
+    // them): decoding `event.id()` again allocated a Vec per candidate.
+    let Ok(id) = <[u8; 32]>::try_from(id) else {
         return Ok(false);
     };
     if ctx.deleted.get(ctx.rtxn, &id)?.is_some() {

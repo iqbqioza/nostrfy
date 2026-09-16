@@ -601,11 +601,11 @@ pub async fn api_monthly_handler(
             // The whole period: probe the oldest *visible* stored event, so
             // a hidden earliest event cannot leak its age through the
             // range start. The probe is a bounded ascending window scan.
-            let probe: Filter = serde_json::from_value(json!({
-                "authors": [hex_pk],
-                "kinds": [kind],
-            }))
-            .expect("static filter");
+            let probe = Filter {
+                authors: Some(vec![hex_pk.clone()]),
+                kinds: Some(vec![kind]),
+                ..Default::default()
+            };
             let mut start_ts = None;
             // Whether the probe saw every matching event (`more == false`):
             // a probe cut short cannot prove there is no visible event,
@@ -706,13 +706,13 @@ pub async fn api_monthly_handler(
         // last) would be counted.
         let start = month_start(y, m).max(since);
         let end = month_start_of_next(y, m).saturating_sub(1).min(until);
-        let filter: Filter = serde_json::from_value(json!({
-            "authors": [hex_pk],
-            "kinds": [kind],
-            "since": start,
-            "until": end,
-        }))
-        .expect("static filter");
+        let filter = Filter {
+            authors: Some(vec![hex_pk.clone()]),
+            kinds: Some(vec![kind]),
+            since: Some(start),
+            until: Some(end),
+            ..Default::default()
+        };
         let Some((events, more)) = relay.db.api_count(vec![filter], count_limit, now).await else {
             return db_unavailable();
         };
@@ -850,7 +850,10 @@ pub async fn api_kinds_handler(
     };
     let count_limit = relay.config.read().await.limits.max_count;
     let now = unix_now();
-    let filter: Filter = serde_json::from_value(json!({ "authors": [hex_pk] })).expect("static");
+    let filter = Filter {
+        authors: Some(vec![hex_pk.clone()]),
+        ..Default::default()
+    };
     let Some((events, more)) = relay.db.api_count(vec![filter], count_limit, now).await else {
         return db_unavailable();
     };
@@ -902,6 +905,14 @@ pub async fn api_daily_handler(
         Ok(pk) => pk,
         Err(e) => return error_response(StatusCode::BAD_REQUEST, &e.to_string()),
     };
+    // `since`/`until` are accepted by `/query` and `/monthly` but silently
+    // ignored here: reject them instead of returning a misleading result.
+    if params.since.is_some() || params.until.is_some() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "since/until are not supported by this endpoint",
+        );
+    }
 
     let now = unix_now();
     let (year, month) = match (params.year, params.month) {
@@ -941,13 +952,13 @@ pub async fn api_daily_handler(
             );
         };
         let day_start = start + day * 86400;
-        let filter: Filter = serde_json::from_value(json!({
-            "authors": [hex_pk],
-            "kinds": [kind],
-            "since": day_start,
-            "until": day_start + 86400 - 1,
-        }))
-        .expect("static filter");
+        let filter = Filter {
+            authors: Some(vec![hex_pk.clone()]),
+            kinds: Some(vec![kind]),
+            since: Some(day_start),
+            until: Some(day_start + 86400 - 1),
+            ..Default::default()
+        };
         let Some((events, more)) = relay.db.api_count(vec![filter], count_limit, now).await else {
             return db_unavailable();
         };
@@ -1048,7 +1059,10 @@ pub async fn api_stats_handler(
     }
     let count_limit = relay.config.read().await.limits.max_count;
     let now = unix_now();
-    let filter: Filter = serde_json::from_value(json!({ "authors": [hex_pk] })).expect("static");
+    let filter = Filter {
+        authors: Some(vec![hex_pk.clone()]),
+        ..Default::default()
+    };
     let no_tags = excluded_tags(&params);
     let nip78 = enabled_nip78_auth_active(&relay).await;
 
@@ -1168,6 +1182,15 @@ pub async fn api_hourly_handler(
         Ok(pk) => pk,
         Err(e) => return error_response(StatusCode::BAD_REQUEST, &e.to_string()),
     };
+    // `since`/`until` are accepted by `/query` and `/monthly` but silently
+    // ignored here: reject them instead of returning a misleading result.
+    if params.since.is_some() || params.until.is_some() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "since/until are not supported by this endpoint",
+        );
+    }
+
     let now = unix_now();
     let (year, month) = match (params.year, params.month) {
         (_, Some(m)) if !(1..=12).contains(&m) => {
@@ -1225,13 +1248,13 @@ pub async fn api_hourly_handler(
             );
         };
         let h_start = day_start + h * 3600;
-        let filter: Filter = serde_json::from_value(json!({
-            "authors": [hex_pk],
-            "kinds": [kind],
-            "since": h_start,
-            "until": h_start + 3600 - 1,
-        }))
-        .expect("static filter");
+        let filter = Filter {
+            authors: Some(vec![hex_pk.clone()]),
+            kinds: Some(vec![kind]),
+            since: Some(h_start),
+            until: Some(h_start + 3600 - 1),
+            ..Default::default()
+        };
         let Some((events, more)) = relay.db.api_count(vec![filter], count_limit, now).await else {
             return db_unavailable();
         };
@@ -1376,7 +1399,11 @@ const AGGREGATE_SAMPLE: usize = 20_000;
 /// Anonymous visibility of a lightweight aggregate record: the same
 /// NIP-70/NIP-59/NIP-78/NIP-29 rules as [`api_visible`], evaluated without
 /// loading the event content.
-fn aggregate_visible(item: &crate::db::NegItem, groups: &nip29::GroupStore, nip78: bool) -> bool {
+fn aggregate_visible(
+    item: &crate::db::NegItem,
+    groups: Option<&nip29::GroupStore>,
+    nip78: bool,
+) -> bool {
     // NIP-70: protected events are never served to anonymous readers.
     if item.protected {
         return false;
@@ -1392,8 +1419,9 @@ fn aggregate_visible(item: &crate::db::NegItem, groups: &nip29::GroupStore, nip7
         return false;
     }
     // NIP-29: private/hidden group content is withheld from non-members.
+    // The store is absent when the sample holds no group item.
     if let Some(gid) = &item.gid
-        && !groups.visible_gid(gid, item.meta, None)
+        && !groups.is_some_and(|groups| groups.visible_gid(gid, item.meta, None))
     {
         return false;
     }
@@ -1428,25 +1456,29 @@ pub async fn api_relay_kinds_handler(
     let nip78 = enabled_nip78_auth_active(&relay).await;
     let mut counts: HashMap<u64, u64> = HashMap::new();
     {
-        let groups = relay.groups.read().await;
+        // The group-store lock is only needed when the sample actually
+        // contains group items (mirrors the REQ path).
+        let groups = if items.iter().any(|item| item.gid.is_some()) {
+            Some(relay.groups.read().await)
+        } else {
+            None
+        };
         for item in &items {
-            if aggregate_visible(item, &groups, nip78) {
+            if aggregate_visible(item, groups.as_deref(), nip78) {
                 *counts.entry(item.kind).or_default() += 1;
             }
         }
     }
     drop(_permit);
     let limit = params.limit.unwrap_or(20).min(100);
-    let mut kinds: Vec<Value> = counts
+    // Sort on tuples: indexing into a `Value` for every comparison was the
+    // hot part of the aggregation.
+    let mut kinds: Vec<(u64, u64)> = counts.into_iter().collect();
+    kinds.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let mut kinds: Vec<Value> = kinds
         .into_iter()
         .map(|(kind, count)| json!({ "kind": kind, "count": count }))
         .collect();
-    kinds.sort_by(|a, b| {
-        b["count"]
-            .as_u64()
-            .cmp(&a["count"].as_u64())
-            .then_with(|| a["kind"].as_u64().cmp(&b["kind"].as_u64()))
-    });
     kinds.truncate(limit);
     (
         StatusCode::OK,
@@ -1481,25 +1513,27 @@ pub async fn api_top_authors_handler(
     let nip78 = enabled_nip78_auth_active(&relay).await;
     let mut counts: HashMap<&str, u64> = HashMap::new();
     {
-        let groups = relay.groups.read().await;
+        // Group-store lock only when the sample has group items.
+        let groups = if items.iter().any(|item| item.gid.is_some()) {
+            Some(relay.groups.read().await)
+        } else {
+            None
+        };
         for item in &items {
-            if aggregate_visible(item, &groups, nip78) {
+            if aggregate_visible(item, groups.as_deref(), nip78) {
                 *counts.entry(item.pubkey.as_str()).or_default() += 1;
             }
         }
     }
     drop(_permit);
     let limit = params.limit.unwrap_or(20).min(100);
-    let mut authors: Vec<Value> = counts
+    // Tuple sort (see the kinds aggregation above).
+    let mut authors: Vec<(&str, u64)> = counts.into_iter().collect();
+    authors.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    let mut authors: Vec<Value> = authors
         .into_iter()
         .map(|(pubkey, count)| json!({ "pubkey": pubkey, "count": count }))
         .collect();
-    authors.sort_by(|a, b| {
-        b["count"]
-            .as_u64()
-            .cmp(&a["count"].as_u64())
-            .then_with(|| a["pubkey"].as_str().cmp(&b["pubkey"].as_str()))
-    });
     authors.truncate(limit);
     (
         StatusCode::OK,

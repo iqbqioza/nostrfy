@@ -272,11 +272,22 @@ enum Msg {
         reply: oneshot::Sender<(bool, bool)>,
     },
     /// Lists the blob hashes uploaded by a pubkey (reverse index), capped
-    /// at `limit` entries.
+    /// at `limit` entries. Test-only since BUD-12 paging uses the
+    /// uploaded-order index (see [`Msg::BlossomListPage`]).
+    #[cfg(test)]
     BlossomList {
         pubkey: String,
         limit: usize,
         reply: oneshot::Sender<Vec<String>>,
+    },
+    /// BUD-12 page of an owner's blobs from the uploaded-order index,
+    /// strictly before `(after_uploaded, after_sha)`, newest first.
+    BlossomListPage {
+        pubkey: String,
+        after_uploaded: Option<u64>,
+        after_sha: Option<String>,
+        limit: usize,
+        reply: oneshot::Sender<Vec<(String, crate::db::store::BlossomMeta)>>,
     },
     /// Adds many Blossom mappings in one transaction (auto-migration);
     /// the reply carries whether the commit succeeded.
@@ -649,10 +660,19 @@ impl DbClient {
     /// NIP-09 deletion, NIP-29 group state, NIP-43 leave). The overload
     /// fail-fast still rejects new writes while the queue is deep.
     async fn request_write<R: Default>(&self, make: impl FnOnce(oneshot::Sender<R>) -> Msg) -> R {
-        let Some(rx) = self.send_request(make, &self.tx) else {
-            return R::default();
-        };
-        rx.await.unwrap_or_default()
+        self.request_write_checked(make).await.unwrap_or_default()
+    }
+
+    /// Like [`Self::request_write`], but reports a fail-fast (overload) or a
+    /// lost writer as `None` instead of a default value: callers that must
+    /// not silently skip a side effect (NIP-09 deletion, NIP-62 vanish,
+    /// gift-wrap purge) surface the failure instead.
+    async fn request_write_checked<R>(
+        &self,
+        make: impl FnOnce(oneshot::Sender<R>) -> Msg,
+    ) -> Option<R> {
+        let rx = self.send_request(make, &self.tx)?;
+        rx.await.ok()
     }
 
     /// Overload check, queued-work accounting and send. Returns the reply
@@ -1201,6 +1221,7 @@ impl DbClient {
         }
     }
 
+    #[cfg(test)]
     pub async fn apply_deletion(
         &self,
         targets: Vec<String>,
@@ -1208,7 +1229,21 @@ impl DbClient {
         request_pubkey: Option<String>,
         request_created: u64,
     ) -> usize {
-        self.request_write(|reply| Msg::Delete {
+        self.apply_deletion_checked(targets, addresses, request_pubkey, request_created)
+            .await
+            .unwrap_or(0)
+    }
+
+    /// Like [`Self::apply_deletion`], reporting a fail-fast/lost writer as
+    /// `None` so the caller does not treat a skipped deletion as success.
+    pub async fn apply_deletion_checked(
+        &self,
+        targets: Vec<String>,
+        addresses: Vec<nip09::Address>,
+        request_pubkey: Option<String>,
+        request_created: u64,
+    ) -> Option<usize> {
+        self.request_write_checked(|reply| Msg::Delete {
             targets,
             addresses,
             request_pubkey,
@@ -1249,8 +1284,21 @@ impl DbClient {
             .await
     }
 
+    #[cfg(test)]
     pub async fn apply_vanish(&self, pubkey: [u8; 32], until_created: u64) -> usize {
-        self.request_write(|reply| Msg::Vanish {
+        self.apply_vanish_checked(pubkey, until_created)
+            .await
+            .unwrap_or(0)
+    }
+
+    /// Like [`Self::apply_vanish`], reporting a fail-fast/lost writer as
+    /// `None`.
+    pub async fn apply_vanish_checked(
+        &self,
+        pubkey: [u8; 32],
+        until_created: u64,
+    ) -> Option<usize> {
+        self.request_write_checked(|reply| Msg::Vanish {
             pubkey: pubkey.to_vec(),
             until_created,
             reply,
@@ -1259,8 +1307,15 @@ impl DbClient {
     }
 
     /// NIP-59: deletes `kind:1059` gift wraps p-tagging `pubkey`.
+    #[cfg(test)]
     pub async fn delete_gift_wraps_to(&self, pubkey: [u8; 32]) -> usize {
-        self.request_write(|reply| Msg::GiftWrapPurge {
+        self.delete_gift_wraps_to_checked(pubkey).await.unwrap_or(0)
+    }
+
+    /// Like [`Self::delete_gift_wraps_to`], reporting a fail-fast/lost
+    /// writer as `None`.
+    pub async fn delete_gift_wraps_to_checked(&self, pubkey: [u8; 32]) -> Option<usize> {
+        self.request_write_checked(|reply| Msg::GiftWrapPurge {
             pubkey: pubkey.to_vec(),
             reply,
         })
@@ -1466,10 +1521,30 @@ impl DbClient {
     }
 
     /// Lists the blob hashes uploaded by a pubkey, capped at `limit`
-    /// entries (see `Store::list_blossom_shas`).
+    /// entries (see `Store::list_blossom_shas`). Test-only since BUD-12
+    /// paging uses the uploaded-order index.
+    #[cfg(test)]
     pub async fn blossom_list(&self, pubkey: &str, limit: usize) -> Vec<String> {
         self.request_read(|reply| Msg::BlossomList {
             pubkey: pubkey.to_string(),
+            limit,
+            reply,
+        })
+        .await
+    }
+
+    /// BUD-12 page (see [`Msg::BlossomListPage`]).
+    pub async fn blossom_list_page(
+        &self,
+        pubkey: &str,
+        after_uploaded: Option<u64>,
+        after_sha: Option<&str>,
+        limit: usize,
+    ) -> Vec<(String, crate::db::store::BlossomMeta)> {
+        self.request_read(|reply| Msg::BlossomListPage {
+            pubkey: pubkey.to_string(),
+            after_uploaded,
+            after_sha: after_sha.map(str::to_string),
             limit,
             reply,
         })

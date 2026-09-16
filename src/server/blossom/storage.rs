@@ -210,6 +210,21 @@ impl BlobStore {
             }
             return Err(e);
         }
+        if existed && let Some(meta) = self.db.blossom_load(sha256).await {
+            // A re-upload keeps the original mapping (add_owner only
+            // appends the owner): answer with the stored values so the PUT
+            // descriptor agrees with GET/list.
+            return Ok((
+                Descriptor {
+                    sha256: sha256.to_string(),
+                    size: meta.size,
+                    mime: meta.mime,
+                    uploaded: meta.uploaded,
+                    pubkey: pubkey.to_string(),
+                },
+                existed,
+            ));
+        }
         Ok((
             Descriptor {
                 sha256: sha256.to_string(),
@@ -390,6 +405,7 @@ impl BlobStore {
     /// Blobs uploaded by `pubkey` (hex), via the persisted reverse index,
     /// resolving at most `limit` descriptors: cursors past the window yield
     /// an empty page (see the `GET /list` handler).
+    #[cfg(test)]
     pub(crate) async fn list(&self, pubkey: &str, limit: usize) -> Vec<Descriptor> {
         let mut out = Vec::new();
         for sha in self.db.blossom_list(pubkey, limit).await {
@@ -398,6 +414,34 @@ impl BlobStore {
             }
         }
         out
+    }
+
+    /// BUD-12 page from the uploaded-order index: one database round trip
+    /// for the whole page (the metadata is loaded inside the reader's
+    /// transaction) instead of a lookup per blob.
+    pub(crate) async fn list_page(
+        &self,
+        pubkey: &str,
+        after_uploaded: Option<u64>,
+        after_sha: Option<&str>,
+        limit: usize,
+    ) -> Vec<Descriptor> {
+        self.db
+            .blossom_list_page(pubkey, after_uploaded, after_sha, limit)
+            .await
+            .into_iter()
+            .map(|(sha256, meta)| Descriptor {
+                sha256,
+                size: meta.size,
+                mime: meta.mime,
+                uploaded: meta.uploaded,
+                pubkey: meta
+                    .owners
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| pubkey.to_string()),
+            })
+            .collect()
     }
 }
 
@@ -412,7 +456,10 @@ pub(crate) fn npub_from_dir(dir: &Path) -> anyhow::Result<String> {
         return Ok(hex::encode(pk));
     }
     if name.len() == 64 && hex::decode(name).is_ok() {
-        return Ok(name.to_string());
+        // Normalize: GET resolves blobs with a lowercased name, so an
+        // uppercase legacy directory must be stored lowercased or its
+        // blobs stay unreachable.
+        return Ok(name.to_ascii_lowercase());
     }
     Err(anyhow!("not an npub directory name: {name}"))
 }
@@ -789,7 +836,10 @@ impl LocalStore {
                 if !file.file_type().await.is_ok_and(|ft| ft.is_file()) {
                     continue;
                 }
-                let name = file.file_name().to_string_lossy().into_owned();
+                // The meta pass stores lowercase hashes: a legacy
+                // uppercase file name must be normalized or the derived
+                // entry would not match (and GET lowercases too).
+                let name = file.file_name().to_string_lossy().to_ascii_lowercase();
                 if name.len() != 64 || hex::decode(&name).is_err() || via_meta.contains(&name) {
                     continue;
                 }

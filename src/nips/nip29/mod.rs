@@ -255,12 +255,14 @@ impl GroupStore {
         self.ghost = snap.ghost;
     }
 
-    /// Whether another group may be created. The deleted markers count
-    /// toward the budget: they are kept forever (a deleted group must not
-    /// be resurrectable), so an unbounded number of distinct deletions
-    /// must not grow the store without limit either.
+    /// Whether another group may be created. The deleted and ghost markers
+    /// count toward the budget: they are kept forever (a deleted group must
+    /// not be resurrectable), so an unbounded number of distinct deletions
+    /// (or rebuild-discovered ghosts) must not grow the store without limit
+    /// either.
     fn at_capacity(&self) -> bool {
-        self.max_groups > 0 && self.groups.len() + self.deleted.len() >= self.max_groups
+        self.max_groups > 0
+            && self.groups.len() + self.deleted.len() + self.ghost.len() >= self.max_groups
     }
     pub fn group(&self, id: &str) -> Option<&Group> {
         self.groups.get(id)
@@ -461,17 +463,21 @@ impl GroupStore {
                 // overwriting the member's roles, so the *final* state
                 // decides: simulate it (e.g. `["p", A, "mod"], ["p", A]`
                 // ends with A demoted even though a grant is present).
-                let mut final_roles: HashMap<&str, bool> = group
-                    .members
-                    .iter()
-                    .map(|(pk, roles)| (pk.as_str(), !roles.is_empty()))
-                    .collect();
+                // Simulate only the p-tag targets: cloning the whole member
+                // map (up to MAX_MEMBERS = 10k entries) for every 9000
+                // event was O(members) memory/CPU per moderation event.
+                let mut overrides: HashMap<&str, bool> = HashMap::new();
                 for tag in event.tags.iter().filter(|t| t.len() >= 2 && t[0] == P) {
                     let pk = tag[1].as_str();
                     let has_roles = tag[2..].iter().any(|r| !r.is_empty());
-                    final_roles.insert(pk, has_roles);
+                    overrides.insert(pk, has_roles);
                 }
-                let retains_admin = final_roles.values().any(|admin| *admin);
+                let retains_admin = group.members.iter().any(|(pk, roles)| {
+                    overrides
+                        .get(pk.as_str())
+                        .copied()
+                        .unwrap_or(!roles.is_empty())
+                }) || overrides.values().any(|has| *has);
                 if !retains_admin {
                     bail!("restricted: the group must retain at least one admin");
                 }
@@ -587,7 +593,23 @@ impl GroupStore {
             }
             9001 => {
                 if let Some(group) = self.groups.get_mut(gid) {
-                    for pk in tag_values(event, P) {
+                    // The last-admin invariant is validated under a read
+                    // lock before the store; re-check it here under the
+                    // write lock, or two concurrent 9001 events removing
+                    // each other's admin could both pass validation and
+                    // leave the group admin-less.
+                    let removing: Vec<&str> = tag_values(event, P).collect();
+                    let retains_admin = group
+                        .members
+                        .iter()
+                        .any(|(pk, roles)| !roles.is_empty() && !removing.contains(&pk.as_str()));
+                    if !retains_admin {
+                        // Drop the removal: the event itself still stores,
+                        // but the group keeps its last admin (the relay key
+                        // can manage the group regardless).
+                        return Vec::new();
+                    }
+                    for pk in removing {
                         group.members.remove(pk);
                     }
                 }
@@ -640,9 +662,11 @@ impl GroupStore {
                 // consistent.
                 let child_added: Vec<String> =
                     tag_values(event, "child").map(str::to_string).collect();
+                let added_set: std::collections::HashSet<&str> =
+                    child_added.iter().map(String::as_str).collect();
                 let mut child_removed: Vec<String> = Vec::new();
                 for child in &children_before {
-                    if !child_added.iter().any(|c| c == child) {
+                    if !added_set.contains(child.as_str()) {
                         child_removed.push(child.clone());
                     }
                 }

@@ -174,7 +174,7 @@ impl super::Relay {
         if cfg.nip_enabled(29) {
             // Group metadata events MUST be signed by the relay's own key.
             if (nip29::GROUP_META..=nip29::GROUP_PINS).contains(&event.kind)
-                && Some(event.pubkey.as_str()) != self.relay_pubkey().as_deref()
+                && Some(event.pubkey.as_str()) != self.relay_pubkey_ref()
             {
                 return Precheck::Reject(
                     "blocked: group metadata must be published by the relay".into(),
@@ -196,9 +196,9 @@ impl super::Relay {
                     // key (NIP-29: "the relay master key or ... group
                     // admins"), so the operator can recover an admin-less
                     // group.
-                    match self.relay_pubkey() {
+                    match self.relay_pubkey_ref() {
                         Some(relay_pk) => groups
-                            .validate_write_for_relay(event, Some(&relay_pk))
+                            .validate_write_for_relay(event, Some(relay_pk))
                             .err()
                             .map(|e| e.to_string()),
                         None => groups.validate_write(event).err().map(|e| e.to_string()),
@@ -437,9 +437,7 @@ impl super::Relay {
         // relay never generates claims, so a client-signed 28935 is bogus and
         // must not be broadcast to subscribers that could mistake it for a
         // relay-issued claim. Unconditional like the NIP-42 AUTH rule above.
-        if event.kind == nip43::INVITE
-            && Some(event.pubkey.as_str()) != self.relay_pubkey().as_deref()
-        {
+        if event.kind == nip43::INVITE && Some(event.pubkey.as_str()) != self.relay_pubkey_ref() {
             bail!("blocked: invite responses must be published by the relay");
         }
 
@@ -455,7 +453,7 @@ impl super::Relay {
                     | nip43::ADD_USER
                     | nip43::REMOVE_USER
             )
-            && Some(event.pubkey.as_str()) != self.relay_pubkey().as_deref()
+            && Some(event.pubkey.as_str()) != self.relay_pubkey_ref()
         {
             bail!("blocked: relay metadata must be published by the relay");
         }
