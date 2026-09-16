@@ -526,11 +526,24 @@ impl Store {
         let Some(by_word) = self.by_word else {
             return vec![0; terms.len()];
         };
+        /// Document frequencies stay usable for this many seconds (relevance
+        /// scores are approximate by nature, so a stale df is acceptable).
+        const DF_CACHE_SECS: u64 = 300;
+        /// Entry bound: beyond it expired entries are dropped (and the cache
+        /// cleared if still full) so the map stays bounded.
+        const DF_CACHE_MAX: usize = 4096;
+        let now = crate::util::unix_now();
+        let mut cache = self.df_cache.lock().unwrap_or_else(|p| p.into_inner());
         terms
             .iter()
             .map(|term| {
                 if term.len() > WORD_INDEX_MAX {
                     return 0;
+                }
+                if let Some(&(df, expires)) = cache.get(term)
+                    && expires > now
+                {
+                    return df;
                 }
                 let mut start = term.as_bytes().to_vec();
                 start.push(0x00);
@@ -554,6 +567,13 @@ impl Store {
                         }
                     }
                 }
+                if cache.len() >= DF_CACHE_MAX {
+                    cache.retain(|_, (_, expires)| *expires > now);
+                    if cache.len() >= DF_CACHE_MAX {
+                        cache.clear();
+                    }
+                }
+                cache.insert(term.clone(), (df, now.saturating_add(DF_CACHE_SECS)));
                 df
             })
             .collect()

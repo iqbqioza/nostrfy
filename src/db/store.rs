@@ -408,6 +408,11 @@ pub(crate) struct Store {
     /// Ceiling for the memory map (bytes): the map is opened at this size
     /// and never resized at runtime.
     pub(crate) map_max_size: u64,
+    /// Short-lived cache of NIP-50 document frequencies (term -> (df,
+    /// expires_at)). Each miss walks up to `DF_SAMPLE` index entries, and
+    /// a popular query repeats over many requests; the scores tolerate a
+    /// few minutes of staleness.
+    pub(crate) df_cache: Arc<std::sync::Mutex<std::collections::HashMap<String, (u64, u64)>>>,
 }
 
 /// `(created_at, id, protected, group_id, is_meta)` records returned by the
@@ -561,6 +566,7 @@ impl Store {
             max_indexed_words: max_indexed_words.max(1),
             indexed_words,
             map_max_size,
+            df_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         })
     }
 
@@ -629,6 +635,7 @@ impl Store {
             max_indexed_words: self.max_indexed_words,
             indexed_words: self.indexed_words,
             map_max_size: self.map_max_size,
+            df_cache: Arc::clone(&self.df_cache),
         }
     }
 
