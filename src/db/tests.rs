@@ -4068,3 +4068,124 @@ fn startup_rebuild_queries_keep_the_reader_byte_accounting_balanced() {
         db.shutdown();
     });
 }
+
+#[test]
+fn vanish_pubkeys_each_reports_database_failure() {
+    // The NIP-29/43 rebuilds resume from the vanished-pubkey set; a failed
+    // read used to be reported as an empty set (`Some(())`), resurrecting
+    // vanished members/roles. A dead reader must be a hard failure.
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let cfg = config();
+        let db = DbClient::open(
+            &cfg,
+            true,
+            Arc::new(Default::default()),
+            30,
+            128,
+            4096,
+            262144,
+        )
+        .unwrap();
+        let pk = [7u8; 32];
+        assert!(
+            db.apply_vanish_checked(pk, 1_700_000_000).await.is_some(),
+            "the vanish marker must be written"
+        );
+        let mut seen: Vec<Vec<u8>> = Vec::new();
+        assert!(
+            db.vanish_pubkeys_each(|key| seen.push(key.to_vec()))
+                .await
+                .is_some(),
+            "a healthy read reports success"
+        );
+        assert_eq!(seen, vec![pk.to_vec()]);
+        db.shutdown();
+        assert!(
+            db.vanish_pubkeys_each(|_| {}).await.is_none(),
+            "a failed read must report failure instead of an empty list"
+        );
+    });
+}
+
+#[test]
+fn vanish_reports_whether_group_state_was_removed() {
+    // NIP-62: only a removed NIP-29 state event (moderation/join/leave)
+    // requires the derived group state to be rebuilt; deleting ordinary
+    // posts must not trigger the full-history scan.
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let db = DbClient::open(
+            &config(),
+            true,
+            Arc::new(Default::default()),
+            30,
+            128,
+            4096,
+            262144,
+        )
+        .unwrap();
+        let now = unix_now();
+        // Two distinct authors: a vanished key cannot publish again.
+        let authored = |kind: u64, pk: &str, created: u64| {
+            let mut e = event(kind, "x", created, vec![]);
+            e.pubkey = pk.to_string();
+            e.id = nip01::compute_id(&e);
+            e
+        };
+        let pk_note = "aa".repeat(32);
+        let pk_mod = "bb".repeat(32);
+        assert_eq!(
+            db.put(authored(1, &pk_note, now), now).await,
+            PutOutcome::Stored
+        );
+        assert_eq!(
+            db.apply_vanish_checked([0xaa; 32], now).await,
+            Some((1, false)),
+            "an ordinary post must not require a group state rebuild"
+        );
+        assert_eq!(
+            db.put(authored(9000, &pk_mod, now + 1), now + 1).await,
+            PutOutcome::Stored
+        );
+        assert_eq!(
+            db.apply_vanish_checked([0xbb; 32], now + 1).await,
+            Some((1, true)),
+            "a removed moderation event must require a rebuild"
+        );
+        db.shutdown();
+    });
+}
+
+#[test]
+fn search_limit_applies_to_the_union_of_indexed_and_overflow_matches() {
+    // A limit reached while walking the indexed term ranges must not skip
+    // the overflow-only matches: both ranges belong to the same merged
+    // walk, so the newest union member wins the single slot.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        2, // max_indexed_words: the third token is overflow-only
+        4096,
+        262144,
+    )
+    .unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let now = unix_now();
+        let indexed = event(1, "late old", now - 10, vec![]);
+        let overflow = event(1, "x y late", now, vec![]);
+        assert_eq!(db.put(indexed.clone(), now).await, PutOutcome::Stored);
+        assert_eq!(db.put(overflow.clone(), now).await, PutOutcome::Stored);
+        let f: Filter = serde_json::from_value(serde_json::json!({"search": "late"})).unwrap();
+        let (res, _) = db.query(vec![f], 1, now).await;
+        assert_eq!(res.len(), 1, "the limit must return one union member");
+        assert_eq!(
+            res[0].id, overflow.id,
+            "the newer overflow match must win the union slot"
+        );
+    });
+    db.shutdown();
+}

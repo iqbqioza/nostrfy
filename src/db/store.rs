@@ -957,7 +957,10 @@ impl Store {
         let prefix = format!("{BLOSSOM_ORDER_PREFIX}{pubkey}:");
         let mut upper_buf: Vec<u8> = Vec::new();
         if let (Some(uploaded), Some(sha)) = (after_uploaded, after_sha) {
-            upper_buf = format!("{prefix}{uploaded:020}{sha}").into_bytes();
+            // The cursor must reproduce the key's `:` separator: without it
+            // the exclusive bound lands inside the previous key and the same
+            // page is served again. The index stores lowercase hex.
+            upper_buf = format!("{prefix}{uploaded:020}:{}", sha.to_ascii_lowercase()).into_bytes();
         }
         let upper: std::ops::Bound<&[u8]> = if upper_buf.is_empty() {
             // The whole owner range: `bls:<pubkey>:` up to the next prefix.
@@ -978,18 +981,24 @@ impl Store {
             }
             let (key, _) = item?;
             let rest = &key[prefix.len()..];
-            if rest.len() != 20 + ID_LEN {
+            // `<uploaded:020>:<sha256 hex>`; anything else does not come
+            // from the uploaded-order index (e.g. the sharded `own:` rows a
+            // legacy database may still carry) and must be skipped.
+            if rest.len() != 20 + 1 + 64 {
                 continue;
             }
-            let sha = String::from_utf8_lossy(&rest[20..]);
-            let Some(meta) = self.load_blossom_mapping(&sha)? else {
+            let sha = &rest[21..];
+            let Ok(sha) = std::str::from_utf8(sha) else {
+                continue;
+            };
+            let Some(meta) = self.load_blossom_mapping(sha)? else {
                 // A stale order key (mapping deleted): skip it.
                 continue;
             };
             if !meta.owners.iter().any(|o| o == pubkey) {
                 continue;
             }
-            out.push((sha.into_owned(), meta));
+            out.push((sha.to_string(), meta));
         }
         Ok(out)
     }

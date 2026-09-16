@@ -82,10 +82,10 @@ fn handle_read_msg(store: &Store, errors: &Arc<std::sync::atomic::AtomicU64>, ms
             reply,
         } => {
             let page = match store.vanish_pubkeys_page(after.as_deref(), limit) {
-                Ok(page) => page,
+                Ok(page) => Some(page),
                 Err(e) => {
                     db_error(errors, &e);
-                    Vec::new()
+                    None
                 }
             };
             let _ = reply.send(page);
@@ -649,10 +649,10 @@ pub(crate) fn spawn(
                                 } => {
                                     let page =
                                         match store.vanish_pubkeys_page(after.as_deref(), limit) {
-                                            Ok(page) => page,
+                                            Ok(page) => Some(page),
                                             Err(e) => {
                                                 db_error(&thread_errors, &e);
-                                                Vec::new()
+                                                None
                                             }
                                         };
                                     let _ = reply.send(page);
@@ -871,14 +871,14 @@ pub(crate) fn spawn(
                                     until_created,
                                     reply,
                                 } => {
-                                    let n = match store.apply_vanish(&pubkey, until_created) {
-                                        Ok(n) => n,
+                                    let outcome = match store.apply_vanish(&pubkey, until_created) {
+                                        Ok(outcome) => outcome,
                                         Err(e) => {
                                             db_error(&thread_errors, &e);
-                                            0
+                                            (0, false)
                                         }
                                     };
-                                    let _ = reply.send(n);
+                                    let _ = reply.send(outcome);
                                 }
                                 Msg::GiftWrapPurge { pubkey, reply } => {
                                     let n = match store.delete_gift_wraps_to(&pubkey) {

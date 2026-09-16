@@ -522,6 +522,11 @@ impl Default for DaemonConfig {
 /// also tells the operator which key to use next time).
 const LEGACY_ALIASES: &[(&str, &str, &str, &str)] = &[
     ("relay", "enable_git", "relay", "enabled_git"),
+    // These two lived under `[server]` before the RPC settings moved to
+    // `[rpc]`: without the alias an upgraded config silently lost its
+    // management credentials (NIP-86 became unusable).
+    ("server", "management_token", "rpc", "management_token"),
+    ("server", "admin_pubkey", "rpc", "admin_pubkey"),
     ("server", "require_auth", "relay", "require_auth"),
     (
         "server",
@@ -618,11 +623,20 @@ const LEGACY_ALIASES: &[(&str, &str, &str, &str)] = &[
 /// overflowing value failed the whole config load), so an alias must not
 /// silently wrap one into a huge number. On failure the value degrades to
 /// the safe default (0) — the config validation rejects the resulting
-/// zero limits, and 0 means "disabled" for the policy knobs.
+/// zero limits, and 0 means "disabled" for the policy knobs — but the
+/// failure is warned about: 0 silently disables policies like PoW or the
+/// publish rate limit, and the deprecation warning says the value is
+/// applied.
 fn alias_int<T: TryFrom<i64> + Default>(v: &toml::Value) -> T {
-    v.as_integer()
-        .and_then(|i| T::try_from(i).ok())
-        .unwrap_or_default()
+    match v.as_integer().and_then(|i| T::try_from(i).ok()) {
+        Some(value) => value,
+        None => {
+            log::warn!(
+                "invalid value {v} for a deprecated config key; the field's default is used"
+            );
+            T::default()
+        }
+    }
 }
 
 /// A boolean legacy alias: a non-boolean value is warned about instead of
@@ -678,9 +692,15 @@ fn apply_legacy_aliases(raw: &str, cfg: &mut Config) -> Vec<String> {
             continue;
         }
         warnings.push(format!(
-            "config key [{old_section}].{old_key} is deprecated; use [{new_section}].{new_key} instead — the value is still applied"
+            "config key [{old_section}].{old_key} is deprecated; use [{new_section}].{new_key} instead — the value is applied when it is valid"
         ));
         match (*old_section, *old_key) {
+            ("server", "management_token") => {
+                cfg.rpc.management_token = v.as_str().unwrap_or_default().to_string()
+            }
+            ("server", "admin_pubkey") => {
+                cfg.rpc.admin_pubkey = v.as_str().unwrap_or_default().to_string()
+            }
             ("relay", "enable_git") => {
                 cfg.relay.enabled_git = alias_bool(v, "relay.enable_git", &mut warnings)
             }
@@ -2251,6 +2271,53 @@ map_max_size = 1073741824
             cfg.database.max_map_size, 1_073_741_824,
             "database.map_max_size must migrate"
         );
+    }
+
+    #[test]
+    fn legacy_server_rpc_credentials_migrate() {
+        // Before the RPC settings moved to `[rpc]` they lived under
+        // `[server]`: an upgraded config must keep its management
+        // credentials instead of silently disabling NIP-86.
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir()
+            .join("nostrfy-config-alias-test")
+            .join(format!("{:x}-server-rpc-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("nostrfy.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "[server]\nmanagement_token = \"tok\"\nadmin_pubkey = \"{}\"\n",
+                "AB".repeat(32)
+            ),
+        )
+        .unwrap();
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.rpc.management_token, "tok");
+        assert_eq!(
+            cfg.rpc.admin_pubkey,
+            "ab".repeat(32),
+            "the identity key is normalized at the config boundary"
+        );
+    }
+
+    #[test]
+    fn invalid_legacy_integer_falls_back_to_the_default() {
+        // A negative/overflowing legacy integer must not wrap into a huge
+        // value (nor panic): the safe default is used, with a warning.
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir()
+            .join("nostrfy-config-alias-test")
+            .join(format!("{:x}-bad-int-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("nostrfy.toml");
+        std::fs::write(&path, "[limits]\nrequire_pow = 300\n").unwrap();
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.relay.require_pow, 0, "an out-of-range value is dropped");
     }
 
     #[test]

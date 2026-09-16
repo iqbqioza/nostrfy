@@ -1520,6 +1520,15 @@ async fn reload_handler(
                                 old.limits.max_connections != new_config.limits.max_connections,
                             ),
                             (
+                                // The accept-layer per-IP cap is captured at
+                                // startup (the WebSocket handshake reads it
+                                // live), so a reload must not leave the two
+                                // layers disagreeing silently.
+                                "limits.max_connections_per_ip",
+                                old.limits.max_connections_per_ip
+                                    != new_config.limits.max_connections_per_ip,
+                            ),
+                            (
                                 "limits.http_read_timeout_secs",
                                 old.limits.http_read_timeout_secs
                                     != new_config.limits.http_read_timeout_secs,
@@ -1648,6 +1657,8 @@ async fn reload_handler(
                         new_config.limits.live_batch_interval_ms =
                             old.limits.live_batch_interval_ms;
                         new_config.limits.max_connections = old.limits.max_connections;
+                        new_config.limits.max_connections_per_ip =
+                            old.limits.max_connections_per_ip;
                         new_config.limits.http_read_timeout_secs =
                             old.limits.http_read_timeout_secs;
                         new_config.limits.max_connections_per_sec_per_ip =

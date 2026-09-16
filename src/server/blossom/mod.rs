@@ -968,10 +968,24 @@ async fn put_blob(relay: Arc<Relay>, headers: HeaderMap, body: Body, verb: &str)
     }
 }
 
+/// Minimum sustained throughput an upload must maintain to keep its
+/// permit. The per-chunk idle timeout alone lets a client trickle one byte
+/// per window forever, and the upload budget allows four concurrent
+/// uploads: four drip connections would then refuse every other upload
+/// indefinitely. 64 KiB/s accommodates slow mobile links while bounding a
+/// stalled upload to `max_upload / 64 KiB` seconds.
+const MIN_UPLOAD_RATE_BYTES_PER_SEC: u64 = 64 * 1024;
+
+/// Hard ceiling for one upload's total body time: the rate-derived budget
+/// is capped so a very large `max_upload_bytes` cannot license an hours-long
+/// permit hold.
+const MAX_UPLOAD_TOTAL_SECS: u64 = 900;
+
 /// Spools an upload to disk while hashing it. The request body is never
 /// materialized in one `Bytes` allocation, and the size limit is enforced
 /// while reading rather than after the extractor has buffered the body.
-/// `idle_timeout` bounds the wait for the next chunk, so a stalled upload
+/// `idle_timeout` bounds the wait for the next chunk and the rate-derived
+/// total deadline bounds the whole body, so a stalled or trickled upload
 /// (slow-loris) cannot pin an upload permit or a temp file forever.
 async fn spool_upload(
     body: Body,
@@ -1014,10 +1028,25 @@ async fn spool_upload(
     let mut stream = body.into_data_stream();
     let mut hash = Sha256::new();
     let mut size = 0u64;
+    // Total body budget: the rate-derived time (at least one idle window,
+    // so a tiny `max_upload` does not abort immediately), capped hard.
+    let rate_budget = std::time::Duration::from_secs(
+        (max_upload as u64 / MIN_UPLOAD_RATE_BYTES_PER_SEC).clamp(1, MAX_UPLOAD_TOTAL_SECS),
+    );
+    let total_deadline = tokio::time::Instant::now() + rate_budget.max(idle_timeout);
     loop {
-        let chunk = match tokio::time::timeout(idle_timeout, stream.next()).await {
-            // No chunk within the idle window: the client stalled. Abort
-            // so the upload permit and the temp file are released.
+        let now = tokio::time::Instant::now();
+        if now >= total_deadline {
+            return Err(Box::new(error(
+                StatusCode::REQUEST_TIMEOUT,
+                "upload too slow: the body did not finish in time",
+            )));
+        }
+        let wait = idle_timeout.min(total_deadline - now);
+        let chunk = match tokio::time::timeout(wait, stream.next()).await {
+            // No chunk within the idle window (or the total deadline): the
+            // client stalled. Abort so the upload permit and the temp file
+            // are released.
             Err(_) => {
                 return Err(Box::new(error(
                     StatusCode::REQUEST_TIMEOUT,
@@ -1774,6 +1803,38 @@ mod tests {
         relay.db.shutdown();
     }
 
+    #[tokio::test]
+    async fn trickled_upload_body_is_bounded_by_the_total_deadline() {
+        // One byte per idle window passes the per-chunk check, but the
+        // rate-derived total deadline (64 KiB => 1 second here) must abort
+        // it: otherwise four drip connections pin every upload permit
+        // forever.
+        let stream = futures_util::stream::unfold(0u32, |i| async move {
+            if i >= 40 {
+                return None;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            Some((
+                Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"x")),
+                i + 1,
+            ))
+        });
+        let started = std::time::Instant::now();
+        let result = spool_upload(
+            Body::from_stream(stream),
+            64 * 1024,
+            std::time::Duration::from_secs(1),
+            None,
+        )
+        .await;
+        let response = result.expect_err("a trickled body must be aborted");
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the total deadline must stop the upload"
+        );
+    }
+
     #[test]
     fn auth_event_validation_follows_bud11() {
         let secp = Secp256k1::new();
@@ -2220,6 +2281,7 @@ mod tests {
         let relay = build_blossom_relay(0).await;
         let (headers, pk) = auth_headers(relay.secp(), "list");
         let state = state_of(&relay).await.expect("blossom state");
+        let mut shas = Vec::new();
         for i in 0..5 {
             let sha = sha256_hex(format!("blob-{i}").as_bytes());
             state
@@ -2227,34 +2289,80 @@ mod tests {
                 .put(&pk, &sha, format!("blob-{i}").as_bytes(), "text/plain")
                 .await
                 .unwrap();
+            shas.push(sha);
         }
-        let query = |limit: Option<&str>| {
+        let query = |limit: Option<&str>, cursor: Option<&str>| {
             let mut map = std::collections::HashMap::new();
             if let Some(l) = limit {
                 map.insert("limit".to_string(), l.to_string());
             }
+            if let Some(c) = cursor {
+                map.insert("cursor".to_string(), c.to_string());
+            }
             axum::extract::Query(map)
+        };
+        let page = |resp: axum::response::Response| async move {
+            let body = axum::body::to_bytes(resp.into_body(), 256 * 1024)
+                .await
+                .unwrap();
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()
         };
         let resp = list(
             State(relay.clone()),
             headers.clone(),
             AxPath(pk.clone()),
-            query(Some("9999999")),
+            query(Some("9999999"), None),
         )
         .await;
-        let body = axum::body::to_bytes(resp.into_body(), 256 * 1024)
-            .await
-            .unwrap();
-        let items: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(
-            items.as_array().unwrap().len() <= 1000,
-            "huge limit must be capped"
+        let items = page(resp).await;
+        let page_shas: Vec<String> = items
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["sha256"].as_str().unwrap().to_string())
+            .collect();
+        assert!(page_shas.len() <= 1000, "huge limit must be capped");
+        assert_eq!(
+            page_shas.len(),
+            shas.len(),
+            "every uploaded blob must be listed (uploaded-order index)"
         );
-        let resp = list(State(relay.clone()), headers, AxPath(pk), query(None)).await;
-        let body = axum::body::to_bytes(resp.into_body(), 256 * 1024)
-            .await
-            .unwrap();
-        let items: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        for sha in &shas {
+            assert!(page_shas.contains(sha), "missing blob {sha}");
+        }
+        // Cursor paging: each page must make progress and never repeat a
+        // blob. Before the key-format fix the cursor landed inside the same
+        // key, so page 2 re-served page 1 (or the pages were empty).
+        let first = list(
+            State(relay.clone()),
+            headers.clone(),
+            AxPath(pk.clone()),
+            query(Some("2"), None),
+        )
+        .await;
+        let first = page(first).await;
+        let first = first.as_array().unwrap();
+        assert_eq!(first.len(), 2, "limit 2 must return two blobs");
+        let cursor = first.last().unwrap()["sha256"].as_str().unwrap();
+        let second = list(
+            State(relay.clone()),
+            headers.clone(),
+            AxPath(pk.clone()),
+            query(Some("2"), Some(cursor)),
+        )
+        .await;
+        let second = page(second).await;
+        let second = second.as_array().unwrap();
+        assert_eq!(second.len(), 2, "the cursor must advance to the next page");
+        for item in second {
+            let sha = item["sha256"].as_str().unwrap();
+            assert!(
+                !first.iter().any(|f| f["sha256"] == sha),
+                "a paged blob must not repeat on the next page"
+            );
+        }
+        let resp = list(State(relay.clone()), headers, AxPath(pk), query(None, None)).await;
+        let items = page(resp).await;
         assert!(
             items.as_array().unwrap().len() <= 100,
             "default page must be bounded"

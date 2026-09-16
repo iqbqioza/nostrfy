@@ -570,6 +570,29 @@ impl GroupStore {
             }
             9000 => {
                 if let Some(group) = self.groups.get_mut(gid) {
+                    // Re-check the last-admin invariant under the write
+                    // lock, like the 9001 arm below: two concurrent 9000
+                    // demotions can both pass the read-side validation and
+                    // otherwise leave the group admin-less.
+                    {
+                        let mut overrides: HashMap<&str, bool> = HashMap::new();
+                        for tag in event.tags.iter().filter(|t| t.len() >= 2 && t[0] == P) {
+                            let has_roles = tag[2..].iter().any(|r| !r.is_empty());
+                            overrides.insert(tag[1].as_str(), has_roles);
+                        }
+                        let retains_admin = group.members.iter().any(|(pk, roles)| {
+                            overrides
+                                .get(pk.as_str())
+                                .copied()
+                                .unwrap_or(!roles.is_empty())
+                        }) || overrides.values().any(|has| *has);
+                        if !retains_admin {
+                            // Drop the demotion: the event itself still
+                            // stores, but the group keeps its last admin
+                            // (the relay key can manage the group anyway).
+                            return Vec::new();
+                        }
+                    }
                     // NIP-29: roles are carried as the elements after the
                     // pubkey in each `p` tag (["p", <pubkey>, <role>...]).
                     // The listed roles replace the user's previous roles
@@ -987,7 +1010,11 @@ impl GroupStore {
         let mut vanished: std::collections::HashSet<String> = std::collections::HashSet::new();
         if db
             .vanish_pubkeys_each(|key| {
+                // Both hex spellings: stored JOIN/9000 tags may predate the
+                // lowercase normalization and would otherwise slip past the
+                // vanish exclusion (resurrecting the member).
                 vanished.insert(hex::encode(key));
+                vanished.insert(hex::encode_upper(key));
             })
             .await
             .is_none()

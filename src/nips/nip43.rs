@@ -233,7 +233,9 @@ impl RoleStore {
         let mut vanished: std::collections::HashSet<String> = std::collections::HashSet::new();
         if db
             .vanish_pubkeys_each(|key| {
+                // Both hex spellings (see the NIP-29 rebuild).
                 vanished.insert(hex::encode(key));
+                vanished.insert(hex::encode_upper(key));
             })
             .await
             .is_none()

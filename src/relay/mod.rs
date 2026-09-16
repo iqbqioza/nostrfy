@@ -974,46 +974,35 @@ impl Relay {
         if events.iter().any(|e| self.has_state_effects(e)) {
             return self.accept_batch_mixed(events, authed).await;
         }
-        self.accept_batch_non_group(events, authed, None, None)
+        // The fast path needs the same prefetched `previous` references as
+        // the mixed path: without them the precheck issues one database
+        // round trip per reference (unbounded amplification) and rejects
+        // sibling references it cannot resolve yet.
+        let known = self.batch_known_prefixes(&events).await;
+        self.accept_batch_non_group(events, authed, Some(&known), None)
             .await
     }
 
-    /// Whether accepting `event` has post-commit effects that later events
-    /// of the same batch must observe before their own prechecks: NIP-29
-    /// group state and NIP-43 role mutations, NIP-62 vanish requests and
-    /// relay command events (kind:1 signed by the relay's own key, which
-    /// can change the running config).
-    fn has_state_effects(&self, event: &Event) -> bool {
-        (nip29::MOD_MIN..=nip29::MOD_MAX).contains(&event.kind)
-            || event.kind == nip29::JOIN
-            || event.kind == nip29::LEAVE
-            || nip62::is_vanish(event)
-            || (event.kind == 1 && self.relay_pubkey.as_deref() == Some(event.pubkey.as_str()))
-    }
-
-    /// Hybrid path for a batch containing state-mutating events: maximal
-    /// runs of stateless events are committed as batches, the mutating
-    /// events are processed one at a time in order. The signature
-    /// verification of the whole batch runs once, in parallel, and both
-    /// paths reuse the verdicts.
-    async fn accept_batch_mixed(&self, events: Vec<Event>, authed: &[String]) -> PendingBatch {
-        // Check every `previous` tag reference of the whole batch in one
-        // database round trip: a single event must not be able to
-        // amplify into thousands of database requests. Dedup with a set
-        // so that a batch full of distinct `previous` tags (up to
-        // max_tags per event) cannot turn the dedup itself quadratic.
-        // The collection is additionally capped: without a bound a
-        // single batch (EVENT_BATCH * 32 events x max_tags references)
-        // could pin megabytes of prefixes and force millions of LMDB
-        // range probes inside one read transaction, stalling the
-        // reader. References past the cap are treated as unknown, so
-        // the affected events fail closed instead of stalling the relay.
+    /// The batch's pre-resolved `previous` tag references plus every
+    /// sibling event id prefix, collected in one database round trip. The
+    /// precheck must not issue one lookup per reference (a single event can
+    /// carry thousands) and must accept references to sibling events that
+    /// are not committed yet.
+    async fn batch_known_prefixes(&self, events: &[Event]) -> std::collections::HashSet<Vec<u8>> {
+        // Dedup with a set so that a batch full of distinct `previous` tags
+        // (up to max_tags per event) cannot turn the dedup itself quadratic.
+        // The collection is additionally capped: without a bound a single
+        // batch (EVENT_BATCH * 32 events x max_tags references) could pin
+        // megabytes of prefixes and force millions of LMDB range probes
+        // inside one read transaction, stalling the reader. References past
+        // the cap are treated as unknown, so the affected events fail closed
+        // instead of stalling the relay.
         const MAX_PREVIOUS_PREFIXES: usize = 1024;
         let mut prefixes: Vec<Vec<u8>> = Vec::new();
         let mut seen_prefixes: std::collections::HashSet<Vec<u8>> =
             std::collections::HashSet::new();
         let mut previous_capped = false;
-        'collect: for event in &events {
+        'collect: for event in events {
             for prefix in nip29::previous_tags(event) {
                 if prefixes.len() >= MAX_PREVIOUS_PREFIXES {
                     previous_capped = true;
@@ -1046,13 +1035,36 @@ impl Relay {
         // References to sibling events of the same batch are valid: an
         // earlier event of the batch is a legitimate `previous` target even
         // though it is not committed to the database yet.
-        for event in &events {
+        for event in events {
             if let Ok(id_bytes) = hex::decode(&event.id) {
                 for len in 1..=id_bytes.len() {
                     known.insert(id_bytes[..len].to_vec());
                 }
             }
         }
+        known
+    }
+
+    /// Whether accepting `event` has post-commit effects that later events
+    /// of the same batch must observe before their own prechecks: NIP-29
+    /// group state and NIP-43 role mutations, NIP-62 vanish requests and
+    /// relay command events (kind:1 signed by the relay's own key, which
+    /// can change the running config).
+    fn has_state_effects(&self, event: &Event) -> bool {
+        (nip29::MOD_MIN..=nip29::MOD_MAX).contains(&event.kind)
+            || event.kind == nip29::JOIN
+            || event.kind == nip29::LEAVE
+            || nip62::is_vanish(event)
+            || (event.kind == 1 && self.relay_pubkey.as_deref() == Some(event.pubkey.as_str()))
+    }
+
+    /// Hybrid path for a batch containing state-mutating events: maximal
+    /// runs of stateless events are committed as batches, the mutating
+    /// events are processed one at a time in order. The signature
+    /// verification of the whole batch runs once, in parallel, and both
+    /// paths reuse the verdicts.
+    async fn accept_batch_mixed(&self, events: Vec<Event>, authed: &[String]) -> PendingBatch {
+        let known = self.batch_known_prefixes(&events).await;
         // One parallel pass for the whole batch: the sequential singletons
         // below must not re-verify each signature inline.
         let verified = crate::relay::validate::verify_signatures_parallel(&events, self.secp());
@@ -1384,20 +1396,26 @@ impl Relay {
     /// instead of restoring the stale state.
     async fn vanish_pubkey(&self, pubkey: [u8; 32], until_created: u64) {
         let pubkey_hex = hex::encode(pubkey);
-        let removed = match self.db.apply_vanish_checked(pubkey, until_created).await {
-            Some(removed) => removed,
-            None => {
-                // The vanish was accepted (OK) but its side effect was
-                // dropped: the marker is not stored, so the pubkey would
-                // come back. Surface the failure in the logs and metrics.
-                log::error!("NIP-62 vanish side effect was not applied");
-                self.stats.bump(&self.stats.db_errors, 1);
-                return;
-            }
-        };
+        let (removed, group_state_removed) =
+            match self.db.apply_vanish_checked(pubkey, until_created).await {
+                Some(outcome) => outcome,
+                None => {
+                    // The vanish was accepted (OK) but its side effect was
+                    // dropped: the marker is not stored, so the pubkey would
+                    // come back. Surface the failure in the logs and metrics.
+                    log::error!("NIP-62 vanish side effect was not applied");
+                    self.stats.bump(&self.stats.db_errors, 1);
+                    return;
+                }
+            };
         self.stats.bump(&self.stats.events_deleted, removed as u64);
         if self.config.read().await.nip_enabled(29) {
-            if removed > 0 {
+            if group_state_removed {
+                // A moderation/join/leave event was removed: the derived
+                // state (settings, pins, members, invites) must be rebuilt
+                // from the surviving history. Ordinary posts do not affect
+                // it, so they take the cheap path below instead of scanning
+                // the whole group history under the group write lock.
                 let cap = self.config.read().await.relay.max_groups;
                 let mut fresh = GroupStore::with_cap(cap);
                 let rebuilt = {
@@ -1425,10 +1443,10 @@ impl Relay {
                 }
                 self.persist_groups().await;
             } else {
-                // A replayed vanish (already honored) or one that removed
-                // nothing: the live state only needs the vanished pubkey
-                // dropped from its memberships, and only a real change is
-                // worth a snapshot write.
+                // A replayed vanish, one that removed nothing, or one that
+                // only deleted ordinary posts: the live state only needs the
+                // vanished pubkey dropped from its memberships, and only a
+                // real change is worth a snapshot write.
                 let changed = {
                     let mut groups = self.groups.write().await;
                     let mut changed = false;
@@ -2763,6 +2781,87 @@ mod tests {
         }
         relay.db.shutdown();
         fsync_off_relay.db.shutdown();
+    }
+
+    #[test]
+    fn sibling_previous_references_resolve_in_one_batch() {
+        // A batch of `h`-tagged posts where the second references the first
+        // via `previous`: the fast path must resolve the sibling against the
+        // batch's prefetched set (the event is not committed yet). Before
+        // the prefetch was restored this was rejected as "unknown previous
+        // tag" and every reference cost its own database round trip.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            use crate::db::PutOutcome;
+
+            let relay = build_relay().await;
+            let now = crate::util::unix_now();
+            let secp = secp256k1::Secp256k1::new();
+            let kp = |seed: u8| secp256k1::Keypair::from_seckey_slice(&secp, &[seed; 32]).unwrap();
+            let signed = |seed: u8, kind: u64, content: &str, tags: Vec<Vec<String>>| {
+                let keypair = kp(seed);
+                let mut e = crate::event::Event {
+                    id: String::new(),
+                    pubkey: secp256k1::XOnlyPublicKey::from_keypair(&keypair)
+                        .0
+                        .to_string(),
+                    created_at: now,
+                    kind,
+                    tags,
+                    content: content.into(),
+                    sig: String::new(),
+                };
+                e.id = crate::nips::nip01::compute_id(&e);
+                let id = e.id_bytes().unwrap();
+                e.sig = secp.sign_schnorr_no_aux_rand(&id, &keypair).to_string();
+                e
+            };
+            let h = |tags: Vec<Vec<String>>| {
+                let mut tags = tags;
+                tags.insert(0, vec!["h".into(), "g-prev".into()]);
+                tags
+            };
+            let mut results = relay
+                .accept_events_batch(vec![signed(7, 9007, "", h(vec![]))], &[])
+                .await;
+            assert!(matches!(results.remove(0).1, PutOutcome::Stored));
+
+            let first = signed(7, 1, "first", h(vec![]));
+            let prefix = first.id[..8].to_string();
+            let second = signed(
+                7,
+                1,
+                "second",
+                h(vec![vec!["previous".into(), prefix.clone()]]),
+            );
+            let first_id = first.id.clone();
+            let second_id = second.id.clone();
+            let results = relay.accept_events_batch(vec![first, second], &[]).await;
+            assert_eq!(results[0].0, first_id);
+            assert!(
+                matches!(results[0].1, PutOutcome::Stored),
+                "the referenced sibling itself must store: {results:?}"
+            );
+            assert_eq!(results[1].0, second_id);
+            assert!(
+                matches!(results[1].1, PutOutcome::Stored),
+                "a sibling previous reference must resolve against the batch: {results:?}"
+            );
+            // A reference outside the batch and outside the database still
+            // fails closed.
+            let unknown = signed(
+                7,
+                1,
+                "unknown",
+                h(vec![vec!["previous".into(), "ab".repeat(4)]]),
+            );
+            let results = relay.accept_events_batch(vec![unknown], &[]).await;
+            assert!(
+                matches!(results[0].1, PutOutcome::Invalid(_)),
+                "an unknown previous reference must be rejected: {results:?}"
+            );
+            relay.db.shutdown();
+        });
     }
 
     #[test]

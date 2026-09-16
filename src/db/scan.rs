@@ -1061,28 +1061,21 @@ impl Store {
                 // correct — a relay big enough for "nostr" to reach the
                 // sampling cap must still find notes containing it.
                 if !ranges.is_empty() {
-                    if !self.walk_merged(rtxn, by_word, &ranges, ascending, &mut consider, more)? {
-                        return Ok(false);
-                    }
                     // The word index only stores the first
                     // `max_indexed_words` tokens of each event; long events
-                    // also carry an overflow marker, and this walk checks
-                    // their full content so a term past the index cap is
-                    // still found (NIP-50 searches the whole content).
+                    // also carry one overflow marker, and their full content
+                    // must be checked so a term past the index cap is still
+                    // found (NIP-50 searches the whole content). The marker
+                    // range joins the merged walk: run separately, a limit
+                    // reached in the normal ranges would skip it and drop
+                    // newer overflow-only matches from the union.
                     let start = word_key(WORD_OVERFLOW, since, &[0u8; ID_LEN]);
                     let end = crate::db::store::range_end(
                         word_key(WORD_OVERFLOW, until.saturating_add(1), &[0u8; ID_LEN]),
                         until,
                     );
-                    if !self.walk_created_range(
-                        rtxn,
-                        by_word,
-                        &start,
-                        &end,
-                        ascending,
-                        &mut consider,
-                        more,
-                    )? {
+                    ranges.push((start, end));
+                    if !self.walk_merged(rtxn, by_word, &ranges, ascending, &mut consider, more)? {
                         return Ok(false);
                     }
                     return Ok(out.full());

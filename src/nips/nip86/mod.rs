@@ -374,6 +374,13 @@ pub async fn rpc_handler(
                     _ => cfg.relay.icon = value.to_string(),
                 }
             }
+            // Bump the config version like a SIGHUP reload does: the NIP-11
+            // document caches its static part against this version, so
+            // without the bump clients would see the old name/description/
+            // icon until the next reload or restart.
+            relay
+                .config_version
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             // Persist the change to the config file so it survives a SIGHUP
             // reload and a restart (without persistence the reload handler
             // would silently revert it). The lock is released first: the
@@ -1213,5 +1220,20 @@ mod tests {
         assert!(!ct_eq("", "x"));
         assert!(!ct_eq("x", ""));
         assert!(ct_eq("", ""));
+    }
+
+    #[tokio::test]
+    async fn changerelayname_refreshes_the_nip11_cache() {
+        // The NIP-11 document caches its static part against the relay's
+        // config version; the management RPC must bump it like a SIGHUP
+        // reload, or the old value is served until the next restart.
+        let relay = build_admin_relay().await;
+        let before = relay.relay_info_document().await;
+        let resp = rpc_call(&relay, "changerelayname", vec![json!("after-change")]).await;
+        assert!(rpc_ok_of(resp).await);
+        let after = relay.relay_info_document().await;
+        assert_eq!(after["name"], "after-change");
+        assert_ne!(before["name"], after["name"]);
+        relay.db.shutdown();
     }
 }

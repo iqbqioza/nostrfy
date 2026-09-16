@@ -128,7 +128,9 @@ enum Msg {
     VanishPubkeysPage {
         after: Option<Vec<u8>>,
         limit: usize,
-        reply: oneshot::Sender<Vec<Vec<u8>>>,
+        /// `None` when the table could not be read: the caller must fail
+        /// closed instead of treating an error as "no vanished pubkeys".
+        reply: oneshot::Sender<Option<Vec<Vec<u8>>>>,
     },
     /// NIP-77: query returning only `(created_at, id)` records so that large
     /// negentropy ranges do not materialize every full event in memory.
@@ -173,7 +175,9 @@ enum Msg {
         /// NIP-62: events up to this created_at (the request's `.created_at`)
         /// are deleted.
         until_created: u64,
-        reply: oneshot::Sender<usize>,
+        /// `(removed events, whether a NIP-29 state event was among them)`:
+        /// only the latter requires the group state to be rebuilt.
+        reply: oneshot::Sender<(usize, bool)>,
     },
     /// NIP-59: delete gift wraps addressed to a pubkey (on NIP-09 deletion).
     GiftWrapPurge {
@@ -402,6 +406,12 @@ fn msg_bytes(msg: &Msg) -> usize {
             filters.iter().map(filter_heap_bytes).sum()
         }
         Msg::NegQuery { filter, .. } => filter_heap_bytes(filter),
+        // Group/role snapshots are the dominant writer payload after
+        // events: each `persist_groups`/`persist_roles` clones the whole
+        // live state, and without an estimate a queue of them could reach
+        // gigabytes while `max_db_queue_bytes` ignored them entirely.
+        Msg::SaveGroups { snapshot, .. } => groups_snapshot_bytes(snapshot),
+        Msg::SaveRoles { snapshot, .. } => roles_snapshot_bytes(snapshot),
         Msg::Delete {
             targets,
             addresses,
@@ -438,6 +448,85 @@ fn event_heap_bytes(event: &Event) -> usize {
         .saturating_add(event.id.len())
         .saturating_add(event.pubkey.len())
         .saturating_add(event.sig.len())
+}
+
+/// Rough heap estimate of a queued NIP-29 group snapshot: member maps,
+/// role sets, settings strings, pins, invites and the deleted/ghost
+/// markers. Only used for the queue byte cap, so an estimate is enough.
+fn groups_snapshot_bytes(snapshot: &crate::nips::nip29::GroupsSnapshot) -> usize {
+    let groups: usize = snapshot
+        .groups
+        .values()
+        .map(|group| {
+            let members: usize = group
+                .members
+                .iter()
+                .map(|(pubkey, roles)| {
+                    pubkey.len() + roles.iter().map(std::string::String::len).sum::<usize>()
+                })
+                .sum();
+            let settings = group.settings.name.len()
+                + group.settings.about.len()
+                + group.settings.picture.len()
+                + group.settings.banner.len();
+            let pins: usize = group
+                .pins
+                .iter()
+                .map(|(tag, value)| tag.len() + value.len())
+                .sum();
+            let invites: usize = group.invites.iter().map(std::string::String::len).sum();
+            members
+                .saturating_add(settings)
+                .saturating_add(pins)
+                .saturating_add(invites)
+                .saturating_add(group.parent.as_deref().map_or(0, str::len))
+                .saturating_add(
+                    group
+                        .children
+                        .iter()
+                        .map(std::string::String::len)
+                        .sum::<usize>(),
+                )
+        })
+        .sum();
+    groups
+        .saturating_add(
+            snapshot
+                .deleted
+                .iter()
+                .map(std::string::String::len)
+                .sum::<usize>(),
+        )
+        .saturating_add(
+            snapshot
+                .ghost
+                .iter()
+                .map(std::string::String::len)
+                .sum::<usize>(),
+        )
+}
+
+/// Rough heap estimate of a queued NIP-43 role snapshot (role definitions
+/// and the per-pubkey assignment lists).
+fn roles_snapshot_bytes(snapshot: &crate::nips::nip43::RolesSnapshot) -> usize {
+    let roles: usize = snapshot
+        .roles
+        .values()
+        .map(|role| {
+            role.label.len()
+                + role.description.len()
+                + role.color.len()
+                + role.order.map_or(0, |_| 8)
+        })
+        .sum();
+    let assignments: usize = snapshot
+        .assignments
+        .iter()
+        .map(|(pubkey, roles)| {
+            pubkey.len() + roles.iter().map(std::string::String::len).sum::<usize>()
+        })
+        .sum();
+    roles.saturating_add(assignments)
 }
 
 /// The heap bytes a filter owns: the id/author/kind/search strings and the
@@ -1334,13 +1423,17 @@ impl DbClient {
         const PAGE: usize = 4096;
         let mut after: Option<Vec<u8>> = None;
         loop {
+            // Startup-style read: neither fail-fast nor timeout may degrade
+            // a failed page to "no vanished pubkeys" — the rebuilds would
+            // then resurrect vanished identities (fail-open).
             let page = self
-                .request_read(|reply| Msg::VanishPubkeysPage {
+                .request_read_startup(|reply| Msg::VanishPubkeysPage {
                     after: after.clone(),
                     limit: PAGE,
                     reply,
                 })
-                .await;
+                .await // the reader must reply
+                .and_then(|page| page)?;
             for key in &page {
                 f(key);
             }
@@ -1355,16 +1448,19 @@ impl DbClient {
     pub async fn apply_vanish(&self, pubkey: [u8; 32], until_created: u64) -> usize {
         self.apply_vanish_checked(pubkey, until_created)
             .await
+            .map(|(removed, _)| removed)
             .unwrap_or(0)
     }
 
     /// Like [`Self::apply_vanish`], reporting a fail-fast/lost writer as
-    /// `None`.
+    /// `None`. The second element of the tuple is true when the removed
+    /// history contained a NIP-29 state event, so the group state must be
+    /// rebuilt (a plain post deletion does not change the derived state).
     pub async fn apply_vanish_checked(
         &self,
         pubkey: [u8; 32],
         until_created: u64,
-    ) -> Option<usize> {
+    ) -> Option<(usize, bool)> {
         self.request_write_checked(|reply| Msg::Vanish {
             pubkey: pubkey.to_vec(),
             until_created,

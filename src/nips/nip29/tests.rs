@@ -1358,3 +1358,67 @@ fn group_members_are_bounded() {
     store.apply(&big, "", 1, false, false);
     assert_eq!(store.group("g1").unwrap().members.len(), super::MAX_MEMBERS);
 }
+
+#[test]
+fn apply_keeps_the_last_admin_on_9000_demotion() {
+    // The read-side validation can be raced by two concurrent 9000
+    // demotions; `apply` re-checks the resulting member map under the write
+    // lock like the 9001 arm, so the group never loses its last admin.
+    let mut store = GroupStore::default();
+    store.apply(
+        &event(CREATE_GROUP, ADMIN, Some("g1"), vec![]),
+        "relay",
+        1,
+        false,
+        false,
+    );
+    // A demotion that would leave no admin is dropped: ADMIN stays.
+    store.apply(
+        &event(
+            9000,
+            ADMIN,
+            Some("g1"),
+            vec![vec!["p".into(), ADMIN.into()]],
+        ),
+        "relay",
+        2,
+        false,
+        false,
+    );
+    assert!(
+        store.group("g1").unwrap().is_admin(ADMIN),
+        "the last admin must survive a raced demotion"
+    );
+    // Granting a second admin first allows the original to be demoted.
+    store.apply(
+        &event(
+            9000,
+            ADMIN,
+            Some("g1"),
+            vec![vec!["p".into(), ADMIN2.into(), "mod".into()]],
+        ),
+        "relay",
+        3,
+        false,
+        false,
+    );
+    assert!(store.group("g1").unwrap().is_admin(ADMIN2));
+    store.apply(
+        &event(
+            9000,
+            ADMIN,
+            Some("g1"),
+            vec![vec!["p".into(), ADMIN.into()]],
+        ),
+        "relay",
+        4,
+        false,
+        false,
+    );
+    let group = store.group("g1").unwrap();
+    assert!(!group.is_admin(ADMIN), "the demotion applies once covered");
+    assert!(
+        group.is_admin(ADMIN2),
+        "the remaining admin keeps the group manageable"
+    );
+}
