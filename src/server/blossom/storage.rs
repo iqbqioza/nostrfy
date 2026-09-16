@@ -116,7 +116,7 @@ impl BlobStore {
 
     /// Reserves `size` bytes against the local free-space floor for the
     /// duration of an upload (no-op on S3). The guard releases on drop.
-    fn reserve_space(&self, size: u64) -> Result<SpaceReservation<'_>> {
+    pub(crate) fn reserve_space(&self, size: u64) -> Result<SpaceReservation<'_>> {
         if let Storage::Local(s) = &self.storage {
             s.reserve(size)?;
         }
@@ -199,8 +199,16 @@ impl BlobStore {
         path: &Path,
         size: u64,
         mime: &str,
+        already_reserved: bool,
     ) -> Result<(Descriptor, bool)> {
-        let _space = self.reserve_space(size)?;
+        // The upload path reserves the maximum body size before spooling
+        // (so the spool itself cannot push the disk under the free-space
+        // floor); the copy/test paths reserve the exact size here.
+        let _space = if already_reserved {
+            None
+        } else {
+            Some(self.reserve_space(size)?)
+        };
         let _blob_guard = self.blob_lock(sha256).await;
         let uploaded = crate::util::unix_now() as i64;
         let existing = self.db.blossom_load(sha256).await;
@@ -506,7 +514,7 @@ fn legacy_npub_of(pubkey: &str) -> String {
 // ----- local storage --------------------------------------------------------
 
 /// Releases a BlobStore space reservation on drop.
-struct SpaceReservation<'a> {
+pub(crate) struct SpaceReservation<'a> {
     store: &'a BlobStore,
     size: u64,
 }

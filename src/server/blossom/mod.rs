@@ -886,6 +886,15 @@ async fn put_blob(relay: Arc<Relay>, headers: HeaderMap, body: Body, verb: &str)
     // slow-loris protection for bodies).
     let idle_secs = relay.config.read().await.limits.http_read_timeout_secs;
     let idle_timeout = std::time::Duration::from_secs(if idle_secs == 0 { 60 } else { idle_secs });
+    // Reserve the maximum upload size BEFORE spooling: the spool writes
+    // into the store's own filesystem, and reserving only at `put_file`
+    // (after the body was already written) let four concurrent uploads
+    // push the disk below `min_free_bytes` while the LMDB writer could
+    // still map and commit into the exhausted filesystem.
+    let _spool_space = match state.store.reserve_space(max_upload as u64) {
+        Ok(guard) => guard,
+        Err(_) => return error(StatusCode::INSUFFICIENT_STORAGE, "storage is full"),
+    };
     // Spool on the blob filesystem when possible: the final store is then a
     // rename (no second full write). A missing/uncreatable directory falls
     // back to the system temp dir.
@@ -928,7 +937,7 @@ async fn put_blob(relay: Arc<Relay>, headers: HeaderMap, body: Body, verb: &str)
     );
     let result = state
         .store
-        .put_file(&pubkey, &sha, &path, size, &mime)
+        .put_file(&pubkey, &sha, &path, size, &mime, true)
         .await;
     match tokio::fs::remove_file(&path).await {
         Ok(()) => cleanup.disarm(),

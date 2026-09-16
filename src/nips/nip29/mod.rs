@@ -232,6 +232,32 @@ pub(crate) struct GroupsSnapshot {
     pub ghost: HashSet<String>,
 }
 
+/// Verifies that a rebuild page delivered every event of its boundary
+/// second. The scan collector has hard caps (twice the page size for
+/// same-timestamp ties, 64 MiB of content) that can cut a second while
+/// still reporting `more`; stepping the cursor past it would silently drop
+/// the unexamined events (and, for the ghost pass, fail open). The second
+/// is re-queried with a wider limit and the completeness is accepted only
+/// when that query answered with fewer than its own request limit and no
+/// more events than the page delivered. Any doubt fails closed.
+pub(crate) async fn boundary_second_complete(
+    db: &crate::db::DbClient,
+    mut filter: crate::filter::Filter,
+    boundary: u64,
+    delivered: usize,
+) -> bool {
+    const VERIFY_LIMIT: usize = 150_000;
+    filter.since = Some(boundary);
+    filter.until = Some(boundary);
+    let Some((verify, _)) = db
+        .query_full_startup(vec![filter], VERIFY_LIMIT, unix_now(), true)
+        .await
+    else {
+        return false;
+    };
+    verify.len() < VERIFY_LIMIT && verify.len() <= delivered
+}
+
 impl GroupStore {
     pub fn with_cap(max_groups: usize) -> GroupStore {
         GroupStore {
@@ -1063,7 +1089,7 @@ impl GroupStore {
             // instead of degrading to an empty page; an empty page must only
             // ever mean "no more events".
             let Some((mut page, more)) = db
-                .query_full_startup(vec![filter], PAGE, unix_now(), true)
+                .query_full_startup(vec![filter.clone()], PAGE, unix_now(), true)
                 .await
             else {
                 log::error!(
@@ -1083,6 +1109,19 @@ impl GroupStore {
                     page.len()
                 );
                 return false;
+            }
+            if full && more {
+                // The collector's hard caps can cut the boundary second
+                // while the page still looks complete (it reports `more`).
+                let boundary = page.last().map(|e| e.created_at).unwrap_or(0);
+                let delivered = page.iter().filter(|e| e.created_at == boundary).count();
+                if !boundary_second_complete(db, filter.clone(), boundary, delivered).await {
+                    log::error!(
+                        "group state rebuild aborted: the boundary second {boundary} is not \
+                         fully collected; refusing to persist an incomplete group store"
+                    );
+                    return false;
+                }
             }
             page.sort_by(|a, b| {
                 (a.created_at, group_rank(a.kind), a.kind, &a.id).cmp(&(
@@ -1138,7 +1177,7 @@ impl GroupStore {
                 serde_json::from_value(json!({ "kinds": meta_kinds })).expect("static filter");
             filter.until = until;
             let Some((page, more)) = db
-                .query_full_startup(vec![filter], PAGE, unix_now(), false)
+                .query_full_startup(vec![filter.clone()], PAGE, unix_now(), false)
                 .await
             else {
                 log::error!(
@@ -1163,6 +1202,17 @@ impl GroupStore {
                     page.len()
                 );
                 return false;
+            }
+            if full && more {
+                let delivered = page.iter().filter(|e| e.created_at == min_created).count();
+                if !boundary_second_complete(db, filter.clone(), min_created, delivered).await {
+                    log::error!(
+                        "group state rebuild aborted: the metadata boundary second \
+                         {min_created} is not fully collected; the ghost detection is \
+                         incomplete"
+                    );
+                    return false;
+                }
             }
             for event in &page {
                 if let Some(gid) = crate::nips::nip29::group_id_d(event) {
