@@ -956,15 +956,22 @@ impl GroupStore {
         // deleted the author's own JOIN, but an admin's put-user or the
         // relay's own JOIN-time put-user survive): skip the events that
         // would add a vanished pubkey to a group.
-        let Some(vanished) = db.vanish_pubkeys().await else {
+        // Streamed into the set in bounded pages (a relay with millions of
+        // vanish markers must not materialize them all at once).
+        let mut vanished: std::collections::HashSet<String> = std::collections::HashSet::new();
+        if db
+            .vanish_pubkeys_each(|key| {
+                vanished.insert(hex::encode(key));
+            })
+            .await
+            .is_none()
+        {
             log::error!(
                 "group state rebuild aborted: the vanished-pubkey list is unavailable; \
                  refusing to persist an incomplete group store"
             );
             return false;
-        };
-        let vanished: std::collections::HashSet<String> =
-            vanished.into_iter().map(hex::encode).collect();
+        }
         // Every group id referenced by the surviving events: any of them
         // that did not make it into `groups` (its create event was
         // deleted by a vanish / NIP-09 / expiry) becomes a ghost — its

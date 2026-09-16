@@ -474,13 +474,22 @@ struct S3Chunks {
         Box<dyn futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send>,
     >,
     remaining: u64,
+    /// Fires when no chunk arrived within the deadline: the streaming S3
+    /// client has no total timeout (to avoid truncating large blobs), so a
+    /// stalled connection would otherwise pin the download permit forever.
+    stall: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
 }
+
+/// How long a single S3 stream chunk may take before the download is
+/// aborted.
+const S3_STREAM_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 impl S3Chunks {
     fn new(resp: reqwest::Response, remaining: u64) -> S3Chunks {
         S3Chunks {
             stream: Box::pin(resp.bytes_stream()),
             remaining,
+            stall: None,
         }
     }
 }
@@ -492,13 +501,30 @@ impl futures_util::Stream for S3Chunks {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
+        use std::future::Future;
         if self.remaining == 0 {
             return std::task::Poll::Ready(None);
         }
         let this = &mut *self;
+        // The stall timer is (re)armed on every poll where the inner stream
+        // is pending and cleared whenever a chunk arrives.
+        match this.stall.as_mut() {
+            Some(sleep) => {
+                if sleep.as_mut().poll(cx).is_ready() {
+                    return std::task::Poll::Ready(Some(Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "s3 stream stalled",
+                    ))));
+                }
+            }
+            None => {
+                this.stall = Some(Box::pin(tokio::time::sleep(S3_STREAM_READ_TIMEOUT)));
+            }
+        }
         let chunk = std::task::ready!(this.stream.as_mut().poll_next(cx));
         match chunk {
             Some(Ok(bytes)) => {
+                this.stall = None;
                 let take = (bytes.len() as u64).min(this.remaining) as usize;
                 this.remaining -= take as u64;
                 if take == 0 {
@@ -506,7 +532,10 @@ impl futures_util::Stream for S3Chunks {
                 }
                 std::task::Poll::Ready(Some(Ok(bytes.slice(..take))))
             }
-            Some(Err(e)) => std::task::Poll::Ready(Some(Err(std::io::Error::other(e)))),
+            Some(Err(e)) => {
+                this.stall = None;
+                std::task::Poll::Ready(Some(Err(std::io::Error::other(e))))
+            }
             None => std::task::Poll::Ready(None),
         }
     }
@@ -1038,7 +1067,21 @@ impl Drop for TempUploadCleanup {
         let Some(path) = self.path.take() else {
             return;
         };
-        if let Err(e) = std::fs::remove_file(&path)
+        // Removing a large spool can block the worker for a while: hand it
+        // to the runtime when one is available (Drop runs on the handler
+        // task), and fall back to a sync removal otherwise.
+        if tokio::runtime::Handle::try_current().is_ok() {
+            tokio::spawn(async move {
+                if let Err(e) = tokio::fs::remove_file(&path).await
+                    && e.kind() != std::io::ErrorKind::NotFound
+                {
+                    log::warn!(
+                        "cannot remove temporary Blossom upload {}: {e}",
+                        path.display()
+                    );
+                }
+            });
+        } else if let Err(e) = std::fs::remove_file(&path)
             && e.kind() != std::io::ErrorKind::NotFound
         {
             log::warn!(
@@ -1447,6 +1490,7 @@ mod tests {
         let stream = S3Chunks {
             stream: Box::pin(futures_util::stream::iter(chunks)),
             remaining: 7,
+            stall: None,
         };
         let mut out = Vec::new();
         futures_util::pin_mut!(stream);

@@ -76,19 +76,19 @@ pub(crate) struct DbThreads {
 /// `true` when the thread must shut down.
 fn handle_read_msg(store: &Store, errors: &Arc<std::sync::atomic::AtomicU64>, msg: Msg) -> bool {
     match msg {
-        Msg::VanishPubkeys { reply } => {
-            let mut out: Vec<Vec<u8>> = Vec::new();
-            if let Ok(rtxn) = store.env.read_txn()
-                && let Ok(iter) = store.vanish.iter(&rtxn)
-            {
-                for item in iter {
-                    match item {
-                        Ok((k, _)) => out.push(k.to_vec()),
-                        Err(_) => break,
-                    }
+        Msg::VanishPubkeysPage {
+            after,
+            limit,
+            reply,
+        } => {
+            let page = match store.vanish_pubkeys_page(after.as_deref(), limit) {
+                Ok(page) => page,
+                Err(e) => {
+                    db_error(errors, &e);
+                    Vec::new()
                 }
-            }
-            let _ = reply.send(out);
+            };
+            let _ = reply.send(page);
             false
         }
         Msg::Query {
@@ -588,7 +588,18 @@ pub(crate) fn spawn(
                     events_counter: Arc::clone(&thread_pending_events),
                     bytes_counter: Arc::clone(&thread_pending_bytes),
                 };
-                for msg in msgs {
+                // Coalesce state snapshots within one drain: each write
+                // clones and serializes the whole group/role state, but only
+                // the newest snapshot in the drain is observable. Earlier
+                // ones still get their reply (the mutation is durable via
+                // the newest write).
+                let last_groups = msgs
+                    .iter()
+                    .rposition(|m| matches!(m, Msg::SaveGroups { .. }));
+                let last_roles = msgs
+                    .iter()
+                    .rposition(|m| matches!(m, Msg::SaveRoles { .. }));
+                for (msg_index, msg) in msgs.into_iter().enumerate() {
                     match msg {
                         Msg::Put {
                             event,
@@ -632,8 +643,20 @@ pub(crate) fn spawn(
                                 // A read-only list request can only arrive
                                 // on the reader channel; this arm keeps the
                                 // writer's match exhaustive.
-                                Msg::VanishPubkeys { reply } => {
-                                    let _ = reply.send(Vec::new());
+                                Msg::VanishPubkeysPage {
+                                    after,
+                                    limit,
+                                    reply,
+                                } => {
+                                    let page =
+                                        match store.vanish_pubkeys_page(after.as_deref(), limit) {
+                                            Ok(page) => page,
+                                            Err(e) => {
+                                                db_error(&thread_errors, &e);
+                                                Vec::new()
+                                            }
+                                        };
+                                    let _ = reply.send(page);
                                 }
                                 Msg::BlossomMigrationDone { reply } => {
                                     let done = match store.blossom_migration_done() {
@@ -937,13 +960,17 @@ pub(crate) fn spawn(
                                     let _ = reply.send(());
                                 }
                                 Msg::SaveGroups { snapshot, reply } => {
-                                    if let Err(e) = store.save_groups(&snapshot) {
+                                    if Some(msg_index) == last_groups
+                                        && let Err(e) = store.save_groups(&snapshot)
+                                    {
                                         db_error(&thread_errors, &e);
                                     }
                                     let _ = reply.send(());
                                 }
                                 Msg::SaveRoles { snapshot, reply } => {
-                                    if let Err(e) = store.save_roles(&snapshot) {
+                                    if Some(msg_index) == last_roles
+                                        && let Err(e) = store.save_roles(&snapshot)
+                                    {
                                         db_error(&thread_errors, &e);
                                     }
                                     let _ = reply.send(());

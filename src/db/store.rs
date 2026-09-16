@@ -1012,6 +1012,31 @@ impl Store {
         Ok(count)
     }
 
+    /// One page of vanished pubkeys, ordered by key, strictly after
+    /// `after`. Paging keeps the startup collection bounded: materializing
+    /// every key at once cost hundreds of MB on a relay with millions of
+    /// vanish markers.
+    pub(crate) fn vanish_pubkeys_page(
+        &self,
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<Vec<u8>>> {
+        let rtxn = self.env.read_txn()?;
+        let range = match after {
+            Some(key) => (std::ops::Bound::Excluded(key), std::ops::Bound::Unbounded),
+            None => (std::ops::Bound::Unbounded, std::ops::Bound::Unbounded),
+        };
+        let mut out = Vec::new();
+        for item in self.vanish.range(&rtxn, &range)? {
+            let (key, _) = item?;
+            out.push(key.to_vec());
+            if out.len() >= limit {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
     /// Persists the relay pubkey access lists ((pubkey, reason) pairs for
     /// the deny and allow lists) under a single fixed key, so the CLI
     /// commands (`nostrfy relay allow/deny`) and the running server share

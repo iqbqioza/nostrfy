@@ -229,15 +229,21 @@ impl RoleStore {
     pub async fn rebuild(&mut self, db: &DbClient, relay_pubkey: &str) -> bool {
         // A vanished pubkey must not be resurrected as a role holder by a
         // pre-vanish membership list.
-        let Some(vanished) = db.vanish_pubkeys().await else {
+        // Streamed in bounded pages (see the NIP-29 rebuild).
+        let mut vanished: std::collections::HashSet<String> = std::collections::HashSet::new();
+        if db
+            .vanish_pubkeys_each(|key| {
+                vanished.insert(hex::encode(key));
+            })
+            .await
+            .is_none()
+        {
             log::error!(
                 "role state rebuild aborted: the vanished-pubkey list is unavailable; \
                  refusing to persist an incomplete role store"
             );
             return false;
-        };
-        let vanished: std::collections::HashSet<String> =
-            vanished.into_iter().map(hex::encode).collect();
+        }
         // Role definitions and membership lists are replaceable, so at most
         // one version per address is stored and the ascending scan order is
         // the only order needed. Pages never split a timestamp (the scan
