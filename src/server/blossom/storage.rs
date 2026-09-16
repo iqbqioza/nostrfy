@@ -724,6 +724,14 @@ impl LocalStore {
         // instead of copied (the upload already wrote it once). Any rename
         // failure (EXDEV, permissions, a planted directory at the target)
         // falls back to the copy path below.
+        //
+        // The spool was closed with `flush()` only (a no-op for tokio
+        // files), so fsync it before the rename publishes the name: the
+        // LMDB mapping that references the sha is already durable, and a
+        // crash must not leave a truncated blob at the final path.
+        let file = tokio::fs::File::open(source).await?;
+        file.sync_all().await?;
+        drop(file);
         if tokio::fs::rename(source, self.rooted_path(npub, sha256))
             .await
             .is_ok()
