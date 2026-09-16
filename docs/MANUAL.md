@@ -217,7 +217,7 @@ To generate a secret key, use the `nostrfy genkey` command (see [5. Command Refe
 | `max_neg_items` | Max records per NIP-77 negentropy sync | `100000` |
 | `max_out_queue_bytes` | Per-connection outgoing queue cap (bytes; `0` = unlimited) | `262144` |
 | `ws_idle_timeout_secs` | Close idle connections after this many seconds (0 = off) | `300` |
-| `http_read_timeout_secs` | Seconds to complete an HTTP request head (0 = disabled; slow-loris defense, applies to WS upgrades too) | `30` |
+| `http_read_timeout_secs` | Seconds to complete an HTTP request head or NIP-86 POST body (0 = disabled; slow-loris defense, applies to WS upgrades too) | `30` |
 | `max_connections_per_sec_per_ip` | Max new connections per second per source IP (0 = unlimited) | `0` |
 | `max_req_response_bytes` | Byte budget for one REQ response (0 = unlimited; over it the subscription is closed with `CLOSED`) | `33554432` (32 MiB) |
 | `max_sub_bytes` | Total subscription filter bytes per connection | `1048576` |

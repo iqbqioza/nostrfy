@@ -214,7 +214,8 @@ socket_recv_buffer_kb = 64
 
 # Seconds a connection has to deliver a complete HTTP request head (the
 # request line and headers) before it is closed: closes slow-loris sockets
-# that trickle bytes without ever completing a request. Applies to WebSocket
+# that trickle bytes without ever completing a request. The same deadline
+# bounds the NIP-86 POST body read (408 on timeout). Applies to WebSocket
 # upgrades too. Requires a restart to change.
 http_read_timeout_secs = 30
 
