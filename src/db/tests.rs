@@ -4156,3 +4156,36 @@ fn vanish_reports_whether_group_state_was_removed() {
         db.shutdown();
     });
 }
+
+#[test]
+fn search_limit_applies_to_the_union_of_indexed_and_overflow_matches() {
+    // A limit reached while walking the indexed term ranges must not skip
+    // the overflow-only matches: both ranges belong to the same merged
+    // walk, so the newest union member wins the single slot.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        2, // max_indexed_words: the third token is overflow-only
+        4096,
+        262144,
+    )
+    .unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let now = unix_now();
+        let indexed = event(1, "late old", now - 10, vec![]);
+        let overflow = event(1, "x y late", now, vec![]);
+        assert_eq!(db.put(indexed.clone(), now).await, PutOutcome::Stored);
+        assert_eq!(db.put(overflow.clone(), now).await, PutOutcome::Stored);
+        let f: Filter = serde_json::from_value(serde_json::json!({"search": "late"})).unwrap();
+        let (res, _) = db.query(vec![f], 1, now).await;
+        assert_eq!(res.len(), 1, "the limit must return one union member");
+        assert_eq!(
+            res[0].id, overflow.id,
+            "the newer overflow match must win the union slot"
+        );
+    });
+    db.shutdown();
+}

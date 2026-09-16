@@ -10,6 +10,14 @@ use anyhow::anyhow;
 
 use crate::error::Result;
 
+/// Header wait for streamed S3 requests (GET/HEAD): an unresponsive
+/// endpoint must not hold a download or upload permit forever.
+const S3_HEADER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Total time for one S3 PUT with a streamed body: generous for large
+/// blobs, but a stalled endpoint must not pin the upload permit forever.
+const S3_PUT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
 #[derive(Clone)]
 pub(crate) struct S3Client {
     endpoint: String,
@@ -183,10 +191,14 @@ impl S3Client {
         for (name, value) in extra_headers {
             builder = builder.header(*name, *value);
         }
-        builder
-            .send()
-            .await
-            .map_err(|e| anyhow!(format!("s3 request failed: {e}")))
+        // Bound the header wait: the streaming client has no total timeout
+        // (bodies may be large), but an unresponsive endpoint must not hold
+        // a Blossom permit or connection forever.
+        match tokio::time::timeout(S3_HEADER_TIMEOUT, builder.send()).await {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(e)) => Err(anyhow!(format!("s3 request failed: {e}"))),
+            Err(_) => Err(anyhow!("s3 request timed out waiting for a response")),
+        }
     }
 
     async fn send(
@@ -328,18 +340,26 @@ impl S3Client {
             Some(mime),
             &[("Content-Length", &size.to_string())],
         );
-        let response = self
-            .http_stream
-            .put(url)
-            .header("x-amz-date", &amz_date)
-            .header("x-amz-content-sha256", payload_hash)
-            .header("Authorization", authorization)
-            .header("Content-Type", mime)
-            .header("Content-Length", size)
-            .body(reqwest::Body::wrap_stream(stream))
-            .send()
-            .await
-            .map_err(|e| anyhow!(format!("s3 request failed: {e}")))?;
+        // Total bound for the upload: generous for large blobs, but a
+        // stalled endpoint must not pin the upload permit forever.
+        let response = match tokio::time::timeout(
+            S3_PUT_TIMEOUT,
+            self.http_stream
+                .put(url)
+                .header("x-amz-date", &amz_date)
+                .header("x-amz-content-sha256", payload_hash)
+                .header("Authorization", authorization)
+                .header("Content-Type", mime)
+                .header("Content-Length", size)
+                .body(reqwest::Body::wrap_stream(stream))
+                .send(),
+        )
+        .await
+        {
+            Ok(Ok(response)) => response,
+            Ok(Err(e)) => return Err(anyhow!(format!("s3 request failed: {e}"))),
+            Err(_) => return Err(anyhow!("s3 put timed out")),
+        };
         if !response.status().is_success() {
             return Err(anyhow!(format!("s3 put failed: {}", response.status())));
         }

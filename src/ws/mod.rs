@@ -338,28 +338,29 @@ impl Conn {
             // "more" hint instead of claiming a complete result (the
             // subscription itself stays open).
             dropped.truncated_or_more = true;
-            // Only a response whose EOSE has not gone out needs the closing
-            // EOSE. A response that already ended (EOSE sent, live events
-            // still buffered) must not get a second EOSE, and a CLOSEd
-            // subscription must not receive anything further (the pump
-            // applies the same guard before its EOSE).
-            if !dropped.eose_sent && self.subs.contains_key(&dropped.sub_id) {
-                self.finish_pending_req(&dropped);
-            } else if dropped.eose_sent
-                && !dropped.live.is_empty()
-                && self.subs.contains_key(&dropped.sub_id)
-            {
-                // The buffered live events can no longer be delivered, and
-                // the still-open subscription would look healthy while
-                // silently missing them. Close it so the client knows to
-                // resubscribe (and NIP-01 gives CLOSED the same closing
-                // semantics as a client CLOSE, so the subscription is
-                // released here).
-                self.send_closed(
-                    &dropped.sub_id,
-                    "error: live delivery overflow; resubscribe to resync",
-                );
-                self.remove_req_subscription(&dropped.sub_id);
+            // A CLOSEd subscription must not receive anything further (the
+            // pump applies the same guard before its EOSE).
+            if self.subs.contains_key(&dropped.sub_id) {
+                if !dropped.live.is_empty() {
+                    // Buffered live events can no longer be delivered
+                    // (whether or not the EOSE went out), and the
+                    // still-open subscription would look healthy while
+                    // silently missing them — including ephemeral events
+                    // that a re-REQ cannot recover. Close it so the client
+                    // resubscribes (NIP-01 gives CLOSED the same closing
+                    // semantics as a client CLOSE, so the subscription is
+                    // released here).
+                    self.send_closed(
+                        &dropped.sub_id,
+                        "error: live delivery overflow; resubscribe to resync",
+                    );
+                    self.remove_req_subscription(&dropped.sub_id);
+                } else if !dropped.eose_sent {
+                    // Only a response whose EOSE has not gone out needs the
+                    // closing EOSE; one that already ended must not get a
+                    // second one.
+                    self.finish_pending_req(&dropped);
+                }
             }
         }
         self.pending_reqs.push_back(pending);
@@ -4979,6 +4980,59 @@ mod tests {
                     .iter()
                     .any(|m| m[0] == "EOSE" && m[1] == "gone"),
                 "a CLOSEd subscription must not receive an EOSE"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn pending_req_cutoff_closes_a_subscription_with_pre_eose_live_events() {
+        // Live events buffered before the EOSE cannot be delivered once the
+        // response is cut off: without a CLOSED the subscription would look
+        // healthy while silently missing them (ephemeral events are not
+        // recoverable by a re-REQ).
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            conn.subs
+                .insert("s0".into(), (Vec::new(), 0, "\"s0\"".into()));
+            let mut live = std::collections::VecDeque::new();
+            live.push_back("[\"EVENT\",\"s0\",{}]".to_string());
+            conn.enqueue_pending_req(PendingReq {
+                sub_id: "s0".into(),
+                events: Default::default(),
+                eose_hint: true,
+                truncated_or_more: false,
+                auth_hint: false,
+                sent_bytes: 0,
+                live,
+                live_bytes: 0,
+                eose_sent: false,
+            });
+            for i in 1..=MAX_PENDING_REQS {
+                conn.subs
+                    .insert(format!("s{i}"), (Vec::new(), 0, String::new()));
+                conn.enqueue_pending_req(PendingReq {
+                    sub_id: format!("s{i}"),
+                    events: Default::default(),
+                    eose_hint: true,
+                    truncated_or_more: false,
+                    auth_hint: false,
+                    sent_bytes: 0,
+                    live: Default::default(),
+                    live_bytes: 0,
+                    eose_sent: false,
+                });
+            }
+            assert!(
+                outgoing_json(&conn)
+                    .iter()
+                    .any(|m| m[0] == "CLOSED" && m[1] == "s0"),
+                "dropping buffered live events must close the subscription"
+            );
+            assert!(
+                !conn.subs.contains_key("s0"),
+                "the closed subscription must be released"
             );
             conn.relay.db.shutdown();
         });

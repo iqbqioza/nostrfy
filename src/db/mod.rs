@@ -406,6 +406,12 @@ fn msg_bytes(msg: &Msg) -> usize {
             filters.iter().map(filter_heap_bytes).sum()
         }
         Msg::NegQuery { filter, .. } => filter_heap_bytes(filter),
+        // Group/role snapshots are the dominant writer payload after
+        // events: each `persist_groups`/`persist_roles` clones the whole
+        // live state, and without an estimate a queue of them could reach
+        // gigabytes while `max_db_queue_bytes` ignored them entirely.
+        Msg::SaveGroups { snapshot, .. } => groups_snapshot_bytes(snapshot),
+        Msg::SaveRoles { snapshot, .. } => roles_snapshot_bytes(snapshot),
         Msg::Delete {
             targets,
             addresses,
@@ -442,6 +448,85 @@ fn event_heap_bytes(event: &Event) -> usize {
         .saturating_add(event.id.len())
         .saturating_add(event.pubkey.len())
         .saturating_add(event.sig.len())
+}
+
+/// Rough heap estimate of a queued NIP-29 group snapshot: member maps,
+/// role sets, settings strings, pins, invites and the deleted/ghost
+/// markers. Only used for the queue byte cap, so an estimate is enough.
+fn groups_snapshot_bytes(snapshot: &crate::nips::nip29::GroupsSnapshot) -> usize {
+    let groups: usize = snapshot
+        .groups
+        .values()
+        .map(|group| {
+            let members: usize = group
+                .members
+                .iter()
+                .map(|(pubkey, roles)| {
+                    pubkey.len() + roles.iter().map(std::string::String::len).sum::<usize>()
+                })
+                .sum();
+            let settings = group.settings.name.len()
+                + group.settings.about.len()
+                + group.settings.picture.len()
+                + group.settings.banner.len();
+            let pins: usize = group
+                .pins
+                .iter()
+                .map(|(tag, value)| tag.len() + value.len())
+                .sum();
+            let invites: usize = group.invites.iter().map(std::string::String::len).sum();
+            members
+                .saturating_add(settings)
+                .saturating_add(pins)
+                .saturating_add(invites)
+                .saturating_add(group.parent.as_deref().map_or(0, str::len))
+                .saturating_add(
+                    group
+                        .children
+                        .iter()
+                        .map(std::string::String::len)
+                        .sum::<usize>(),
+                )
+        })
+        .sum();
+    groups
+        .saturating_add(
+            snapshot
+                .deleted
+                .iter()
+                .map(std::string::String::len)
+                .sum::<usize>(),
+        )
+        .saturating_add(
+            snapshot
+                .ghost
+                .iter()
+                .map(std::string::String::len)
+                .sum::<usize>(),
+        )
+}
+
+/// Rough heap estimate of a queued NIP-43 role snapshot (role definitions
+/// and the per-pubkey assignment lists).
+fn roles_snapshot_bytes(snapshot: &crate::nips::nip43::RolesSnapshot) -> usize {
+    let roles: usize = snapshot
+        .roles
+        .values()
+        .map(|role| {
+            role.label.len()
+                + role.description.len()
+                + role.color.len()
+                + role.order.map_or(0, |_| 8)
+        })
+        .sum();
+    let assignments: usize = snapshot
+        .assignments
+        .iter()
+        .map(|(pubkey, roles)| {
+            pubkey.len() + roles.iter().map(std::string::String::len).sum::<usize>()
+        })
+        .sum();
+    roles.saturating_add(assignments)
 }
 
 /// The heap bytes a filter owns: the id/author/kind/search strings and the
