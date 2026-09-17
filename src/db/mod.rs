@@ -210,7 +210,9 @@ enum Msg {
     /// Persists the access control lists (NIP-86 runtime bans/allowlists).
     SaveAccess {
         access: crate::config::AccessControl,
-        reply: oneshot::Sender<()>,
+        /// Whether the commit succeeded: the NIP-86 methods must not
+        /// report success while the ban/allowlist only lives in memory.
+        reply: oneshot::Sender<bool>,
     },
     /// Loads the persisted access control lists.
     LoadAccess {
@@ -228,7 +230,7 @@ enum Msg {
     SaveRelayPubkeys {
         deny: Vec<(String, String)>,
         allow: Vec<(String, String)>,
-        reply: oneshot::Sender<()>,
+        reply: oneshot::Sender<bool>,
     },
     /// Persists the Blossom upload allowlist.
     SaveBlossomAllow {
@@ -1528,20 +1530,27 @@ impl DbClient {
     }
 
     /// Persists the access control lists (NIP-86 runtime bans/allowlists).
-    pub async fn save_access(&self, access: crate::config::AccessControl) {
-        let _ = self
-            .request_write(|reply| Msg::SaveAccess { access, reply })
-            .await;
+    /// Persists the access control lists; the reply reports whether the
+    /// commit succeeded (the NIP-86 methods surface a failure instead of
+    /// claiming a change that is only in memory).
+    pub async fn save_access(&self, access: crate::config::AccessControl) -> bool {
+        self.request_write(|reply| Msg::SaveAccess { access, reply })
+            .await
     }
 
     /// Persists the relay pubkey access lists ((pubkey, reason) pairs for
     /// the deny and allow lists) under their dedicated LMDB key.
-    pub async fn save_relay_pubkeys(&self, deny: &[(String, String)], allow: &[(String, String)]) {
+    /// Persists the relay pubkey lists; the reply reports whether the
+    /// commit succeeded.
+    pub async fn save_relay_pubkeys(
+        &self,
+        deny: &[(String, String)],
+        allow: &[(String, String)],
+    ) -> bool {
         let deny = deny.to_vec();
         let allow = allow.to_vec();
-        let _ = self
-            .request_write(|reply| Msg::SaveRelayPubkeys { deny, allow, reply })
-            .await;
+        self.request_write(|reply| Msg::SaveRelayPubkeys { deny, allow, reply })
+            .await
     }
 
     /// Persists the Blossom upload allowlist under its dedicated LMDB key

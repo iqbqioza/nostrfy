@@ -297,16 +297,24 @@ impl BlobStore {
         ))
     }
 
-    /// Resolves a blob by its sha256 straight from LMDB.
-    pub(crate) async fn find(&self, sha256: &str) -> Option<Descriptor> {
-        let meta = self.db.blossom_load(sha256).await?;
-        Some(Descriptor {
-            sha256: meta.sha256,
-            size: meta.size,
-            mime: meta.mime,
-            uploaded: meta.uploaded,
-            pubkey: meta.owners.into_iter().next()?,
-        })
+    /// Resolves a blob by its sha256 straight from LMDB. A database
+    /// failure is reported as `Err`, never as `Ok(None)`: an existing blob
+    /// must not 404 on overload (the handlers answer 503 instead).
+    pub(crate) async fn find(&self, sha256: &str) -> crate::error::Result<Option<Descriptor>> {
+        let Some(meta) = self.db.blossom_load_checked(sha256).await else {
+            return Err(anyhow::anyhow!(
+                "database unavailable while loading the blob mapping"
+            ));
+        };
+        Ok(meta.and_then(|meta| {
+            Some(Descriptor {
+                sha256: meta.sha256,
+                size: meta.size,
+                mime: meta.mime,
+                uploaded: meta.uploaded,
+                pubkey: meta.owners.into_iter().next()?,
+            })
+        }))
     }
 
     /// Opens a blob by hash, trying every owner in upload order. The first
@@ -469,7 +477,7 @@ impl BlobStore {
     pub(crate) async fn list(&self, pubkey: &str, limit: usize) -> Vec<Descriptor> {
         let mut out = Vec::new();
         for sha in self.db.blossom_list(pubkey, limit).await {
-            if let Some(desc) = self.find(&sha).await {
+            if let Ok(Some(desc)) = self.find(&sha).await {
                 out.push(desc);
             }
         }
@@ -1278,7 +1286,7 @@ mod tests {
         let db = s.put(&b, &sha, bytes, "text/plain").await.unwrap();
         assert_eq!(db.pubkey, b);
 
-        assert_eq!(s.find(&sha).await.unwrap().pubkey, a);
+        assert_eq!(s.find(&sha).await.unwrap().unwrap().pubkey, a);
         assert!(s.has(&a, &sha).await);
         assert!(s.has(&b, &sha).await);
         assert!(!s.has(&pk(3), &sha).await);
@@ -1293,7 +1301,7 @@ mod tests {
 
         // One owner deletes: the other owner's copy survives.
         assert!(s.delete(&b, &sha).await.unwrap());
-        assert!(s.find(&sha).await.is_some());
+        assert!(s.find(&sha).await.unwrap().is_some());
         assert!(read_all(&s, &npub_a, &sha).await.is_some());
         assert!(read_all(&s, &npub_b, &sha).await.is_none());
         assert!(!s.has(&b, &sha).await);
@@ -1303,7 +1311,7 @@ mod tests {
 
         // The last owner's delete removes the mapping.
         assert!(s.delete(&a, &sha).await.unwrap());
-        assert!(s.find(&sha).await.is_none());
+        assert!(s.find(&sha).await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -1387,7 +1395,7 @@ mod tests {
                 "no file may be written for the refused upload"
             );
             assert!(
-                full.find(&sha).await.is_none(),
+                full.find(&sha).await.unwrap().is_none(),
                 "no mapping may be left for the refused upload"
             );
             // The disabled guard (0) lets the upload through.
@@ -1533,7 +1541,7 @@ mod tests {
                 "the blob must not be readable through the symlink"
             );
             assert!(
-                s.find(&sha).await.is_none(),
+                s.find(&sha).await.unwrap().is_none(),
                 "the failed upload must roll back its owner mapping (no orphan)"
             );
             let _ = std::fs::remove_dir_all(&external);
@@ -1583,7 +1591,7 @@ mod tests {
             // A failed re-upload must keep the uploader's pre-existing,
             // valid mapping (the blob from the second put is still there).
             assert!(
-                s.find(&sha).await.is_some(),
+                s.find(&sha).await.unwrap().is_some(),
                 "a failed re-upload must not roll back the existing mapping"
             );
             std::fs::remove_file(&external).unwrap();
@@ -1617,7 +1625,7 @@ mod tests {
                 "the migration must not map files through a symlinked directory"
             );
             assert!(
-                s.find(&"ab".repeat(32)).await.is_none(),
+                s.find(&"ab".repeat(32)).await.unwrap().is_none(),
                 "no mapping may reference the external file"
             );
             let _ = std::fs::remove_dir_all(&external);
@@ -1654,8 +1662,8 @@ mod tests {
                 .unwrap();
             let mapped = s.auto_migrate_legacy().await.unwrap();
             assert_eq!(mapped, 0, "the migration must not map symlinked blob files");
-            assert!(s.find(&"ab".repeat(32)).await.is_none());
-            assert!(s.find(&"cd".repeat(32)).await.is_none());
+            assert!(s.find(&"ab".repeat(32)).await.unwrap().is_none());
+            assert!(s.find(&"cd".repeat(32)).await.unwrap().is_none());
             let _ = std::fs::remove_file(&external);
             let _ = std::fs::remove_file(&meta);
             s.db.shutdown();
@@ -1699,7 +1707,7 @@ mod tests {
         .unwrap();
         let s = BlobStore::new("local", &dir, 0, None, db).await.unwrap();
         let sha = "cd".repeat(32);
-        assert_eq!(s.find(&sha).await.unwrap().pubkey, pk(1));
+        assert_eq!(s.find(&sha).await.unwrap().unwrap().pubkey, pk(1));
         assert!(s.has(&pk(1), &sha).await);
         assert!(s.has(&pk(2), &sha).await);
         assert_eq!(s.list(&pk(1), 10_000).await.len(), 2);
@@ -1738,7 +1746,7 @@ mod tests {
         assert_eq!(s.list(&pk(2), 10_000).await.len(), 1);
         // 一人削除してももう一人は残る
         assert!(s.delete(&pk(1), &sha).await.unwrap());
-        assert!(s.find(&sha).await.is_some());
+        assert!(s.find(&sha).await.unwrap().is_some());
         let _ = std::fs::remove_dir_all(&dir);
         let _ = db_path;
     }

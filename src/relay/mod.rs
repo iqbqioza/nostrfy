@@ -669,15 +669,18 @@ impl Relay {
     /// concurrent mutations could read snapshots in one order (older first)
     /// but queue their writes in the other, so the stale lists are the last
     /// ones committed and the newer entry is lost after a restart.
-    pub async fn persist_access(&self) {
+    /// Returns whether both writes committed: the NIP-86 methods surface
+    /// a failure instead of reporting a change that is only in memory.
+    pub async fn persist_access(&self) -> bool {
         let _guard = self.persist_access_lock.lock().await;
         let access = self.access.read().await.clone();
         let deny = access.blocked_pubkeys.clone();
         let allow = access.allowed_pubkeys.clone();
-        self.db.save_access(access).await;
+        let saved = self.db.save_access(access).await;
         // The pubkey lists are excluded from the `access` blob: keep them
         // in their own LMDB key so the CLI and NIP-86 share one source.
-        self.db.save_relay_pubkeys(&deny, &allow).await;
+        let lists_saved = self.db.save_relay_pubkeys(&deny, &allow).await;
+        saved && lists_saved
     }
 
     /// Registers a new WebSocket connection from `ip` if it does not exceed

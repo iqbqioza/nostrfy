@@ -941,16 +941,24 @@ pub(crate) fn spawn(
                                     let _ = reply.send(banned);
                                 }
                                 Msg::SaveAccess { access, reply } => {
-                                    if let Err(e) = store.save_access(&access) {
-                                        db_error(&thread_errors, &e);
-                                    }
-                                    let _ = reply.send(());
+                                    let ok = match store.save_access(&access) {
+                                        Ok(()) => true,
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            false
+                                        }
+                                    };
+                                    let _ = reply.send(ok);
                                 }
                                 Msg::SaveRelayPubkeys { deny, allow, reply } => {
-                                    if let Err(e) = store.save_relay_pubkeys(&deny, &allow) {
-                                        db_error(&thread_errors, &e);
-                                    }
-                                    let _ = reply.send(());
+                                    let ok = match store.save_relay_pubkeys(&deny, &allow) {
+                                        Ok(()) => true,
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            false
+                                        }
+                                    };
+                                    let _ = reply.send(ok);
                                 }
                                 Msg::SaveBlossomAllow { entries, reply } => {
                                     if let Err(e) = store.save_blossom_allow(&entries) {
