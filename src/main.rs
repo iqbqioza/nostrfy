@@ -33,7 +33,9 @@ fn main() {
 
     let mut cli = Cli::parse();
     if let Err(e) = cli.prepare() {
-        eprintln!("error: {e}");
+        // Log through the logger (which falls back to stderr before a file
+        // backend is installed) so the reason survives daemonization.
+        log::error!("error: {e}");
         std::process::exit(1);
     }
 
@@ -41,8 +43,10 @@ fn main() {
     // must be created after daemonization because the fork inherits the
     // runtime context of the parent thread.
     let rt = tokio::runtime::Runtime::new().expect("cannot create tokio runtime");
-    if let Err(e) = rt.block_on(cli.serve()) {
-        eprintln!("error: {e}");
+    if rt.block_on(cli.serve_logged()).is_err() {
+        // `serve_logged` already logged the reason (to the log file after
+        // daemonization, to stderr in the foreground); only the exit status
+        // is left.
         std::process::exit(1);
     }
 }

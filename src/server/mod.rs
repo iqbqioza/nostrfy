@@ -35,7 +35,7 @@ use crate::nips::nip11::stats_handler;
 use crate::nips::nip86;
 use crate::relay::Relay;
 use crate::stats::Stats;
-use crate::util::unix_now;
+use crate::util::{TrustedProxy, accounting_ip, client_ip, normalize_ip, unix_now};
 use crate::ws::handle_connection;
 use api::{
     api_count_handler, api_daily_handler, api_follows_handler, api_handler, api_hourly_handler,
@@ -562,7 +562,14 @@ pub async fn run_server(config_path: PathBuf, config: Config, db: DbClient) -> R
         }));
     }
 
-    let (header_timeout, max_connections, max_connections_per_ip, per_sec_per_ip, recv_buf_kb) = {
+    let (
+        header_timeout,
+        max_connections,
+        max_connections_per_ip,
+        per_sec_per_ip,
+        trusted_proxies,
+        recv_buf_kb,
+    ) = {
         let cfg = relay.config.read().await;
         (
             // 0 = disabled (the documented convention): hyper treats
@@ -572,7 +579,17 @@ pub async fn run_server(config_path: PathBuf, config: Config, db: DbClient) -> R
                 .then(|| std::time::Duration::from_secs(cfg.limits.http_read_timeout_secs)),
             cfg.limits.max_connections,
             cfg.limits.max_connections_per_ip,
-            IpConnLimiter::new(cfg.limits.max_connections_per_sec_per_ip),
+            IpConnLimiter::new(cfg.limits.max_connections_per_sec_per_ip).map(Arc::new),
+            // Validation already rejected malformed entries; a stray
+            // unparsable one (unvalidated reload path) is simply not trusted
+            // (fail closed).
+            std::sync::Arc::<[TrustedProxy]>::from(
+                cfg.server
+                    .trusted_proxies
+                    .iter()
+                    .filter_map(|entry| TrustedProxy::parse(entry))
+                    .collect::<Vec<_>>(),
+            ),
             cfg.limits.socket_recv_buffer_kb,
         )
     };
@@ -583,22 +600,37 @@ pub async fn run_server(config_path: PathBuf, config: Config, db: DbClient) -> R
         max_connections_per_ip,
         header_timeout,
         per_sec_per_ip,
+        trusted_proxies,
         recv_buf_kb,
         shutdown_rx,
     )
     .await;
 
     let _ = shutdown_tx.send(true);
-    for task in tasks {
-        task.await.ok();
+    // Signal the WebSocket drain before joining the background tasks: the
+    // WS teardown then overlaps the joins instead of running after them, so
+    // the total shutdown stays close to the longest single step. The
+    // database stays up until the drain wait below ends.
+    relay.signal_drain();
+    // Bound the background-task joins: a task stuck in a long database walk
+    // (e.g. a mid-flight `purge_expired`) must not delay the process exit
+    // without limit. Aborting drops the loop at its next await point; the
+    // database is stopped afterwards.
+    let join_grace = std::time::Duration::from_secs(5);
+    if !join_tasks_bounded(&mut tasks, join_grace).await {
+        warn!(
+            "background tasks did not stop within {}s; aborted them",
+            join_grace.as_secs()
+        );
     }
     // Graceful WebSocket drain: the upgraded connection tasks are detached
     // from the HTTP connections `serve_limited` tracks, so signal them
     // explicitly and give them a bounded window to flush their pending
     // event batches before the database is stopped. Without this wait the
     // process would exit with accepted-but-uncommitted events (and no OKs).
-    relay.signal_drain();
-    let ws_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    // The window covers the WebSocket teardown grace (5 s, see
+    // `ws::handler`) plus a margin for the final flush and close.
+    let ws_deadline = std::time::Instant::now() + std::time::Duration::from_secs(7);
     while relay
         .stats
         .connections_active
@@ -620,6 +652,29 @@ async fn await_shutdown(mut rx: watch::Receiver<bool>) {
             break;
         }
     }
+}
+
+/// Awaits every background-task handle with a bound. Returns `true` when all
+/// finished within `grace`; on expiry the tasks are aborted, so a task stuck
+/// in a long database walk (e.g. a mid-flight `purge_expired`) cannot delay
+/// the shutdown without limit. Aborting drops the task at its next await
+/// point.
+async fn join_tasks_bounded(
+    tasks: &mut [tokio::task::JoinHandle<()>],
+    grace: std::time::Duration,
+) -> bool {
+    let joined = tokio::time::timeout(grace, async {
+        for task in tasks.iter_mut() {
+            let _ = task.await;
+        }
+    })
+    .await;
+    if joined.is_err() {
+        for task in tasks.iter() {
+            task.abort();
+        }
+    }
+    joined.is_ok()
 }
 
 /// Returns `true` when the request is a valid WebSocket handshake: the
@@ -843,11 +898,15 @@ async fn ws_handler(State(relay): State<Arc<Relay>>, request: Request) -> Respon
             // its whole lifetime, so the global and per-IP caps count the
             // connection exactly once. The handover is synchronous (the
             // request is still being served), so the accept guard cannot
-            // have released it yet.
+            // have released it yet. A trusted-proxy deployment carries the
+            // derived per-IP slot in the separate `ClientIpGuard`; it is
+            // moved into the WebSocket task below so the slot survives the
+            // HTTP request.
             let slot = parts
                 .extensions
                 .remove::<Arc<crate::conn::ConnSlot>>()
                 .and_then(|slot| slot.handover());
+            let client_slot = parts.extensions.remove::<Arc<ClientIpGuard>>();
             // Start with small read/write buffers (they grow on demand) so
             // that hundreds of thousands of idle connections do not pin
             // megabytes each.
@@ -875,7 +934,10 @@ async fn ws_handler(State(relay): State<Arc<Relay>>, request: Request) -> Respon
                 .max_message_size(max_msg)
                 .max_frame_size(max_msg)
                 .max_write_buffer_size(max_write)
-                .on_upgrade(move |socket| {
+                .on_upgrade(move |socket| async move {
+                    // Holds the derived per-IP slot for the whole WebSocket
+                    // lifetime (released when the connection task ends).
+                    let _client_slot = client_slot;
                     handle_connection(
                         socket,
                         relay,
@@ -885,6 +947,7 @@ async fn ws_handler(State(relay): State<Arc<Relay>>, request: Request) -> Respon
                         path,
                         slot,
                     )
+                    .await
                 })
                 .into_response()
         }
@@ -1024,14 +1087,27 @@ async fn purge_loop(relay: Arc<Relay>, mut shutdown: watch::Receiver<bool>) {
     loop {
         tokio::select! {
             _ = ticker.tick() => {
-                let removed = relay.db.purge_expired(unix_now()).await;
-                if removed > 0 {
-                    info!("purged {removed} expired events");
-                    // The purge may have removed group moderation events
-                    // (NIP-40 expiration): the derived group state must not
-                    // keep authorizing members whose grant expired. The
-                    // rebuild is coalesced and runs in the background.
-                    relay.mark_group_state_stale().await;
+                // The purge can be a long walk over the expiry index: race it
+                // against the shutdown signal so a stop is not stuck behind a
+                // mid-flight purge (the join timeout in `run_server` bounds
+                // the worst case, but this lets a clean shutdown complete
+                // promptly instead of aborting the task).
+                let purge = relay.db.purge_expired(unix_now());
+                tokio::select! {
+                    (removed, state_changed) = purge => {
+                        if removed > 0 {
+                            info!("purged {removed} expired events");
+                        }
+                        if state_changed {
+                            // The purge removed group/role state events
+                            // (NIP-40 expiration): the derived state must
+                            // not keep authorizing members whose grant
+                            // expired. The rebuild is coalesced and runs in
+                            // the background.
+                            relay.mark_group_state_stale().await;
+                        }
+                    }
+                    _ = shutdown.changed() => break,
                 }
             }
             _ = shutdown.changed() => break,
@@ -1042,19 +1118,27 @@ async fn purge_loop(relay: Arc<Relay>, mut shutdown: watch::Receiver<bool>) {
 /// Per-IP connection-rate limiter: a host may open at most
 /// `max_per_sec` connections per sliding second; excess sockets are
 /// refused immediately. Bounded at 10,000 tracked IPs (the map is
-/// cleared, not grown, when the bound is reached).
+/// evicted, not grown, when the bound is reached).
 struct IpConnLimiter {
     max_per_sec: u64,
-    seen: std::sync::Mutex<
-        std::collections::HashMap<std::net::IpAddr, std::collections::VecDeque<u64>>,
-    >,
+    seen: std::sync::Mutex<SeenIps>,
+}
+
+#[derive(Default)]
+struct SeenIps {
+    windows: std::collections::HashMap<std::net::IpAddr, std::collections::VecDeque<u64>>,
+    /// The last time the full map was walked to evict expired windows. The
+    /// walk is O(10k) and the map cannot shrink within a second (every
+    /// window lives one second), so pruning at most once per second keeps
+    /// the per-accept cost constant while the fail-closed refusal holds.
+    last_prune: u64,
 }
 
 impl IpConnLimiter {
     fn new(max_per_sec: u64) -> Option<Self> {
         (max_per_sec > 0).then_some(IpConnLimiter {
             max_per_sec,
-            seen: std::sync::Mutex::new(std::collections::HashMap::new()),
+            seen: std::sync::Mutex::new(SeenIps::default()),
         })
     }
 
@@ -1064,7 +1148,7 @@ impl IpConnLimiter {
         let mut seen = self.seen.lock().unwrap_or_else(|p| p.into_inner());
         // Already-tracked ips are always enforced: a full map can never
         // disable the limit for tracked ips.
-        if let Some(window) = seen.get_mut(&ip) {
+        if let Some(window) = seen.windows.get_mut(&ip) {
             while window.front().is_some_and(|t| now.saturating_sub(*t) >= 1) {
                 window.pop_front();
             }
@@ -1076,17 +1160,40 @@ impl IpConnLimiter {
         }
         // New ip: never clear the whole map (a clear would reset every
         // window and permanently disable the per-IP limit): expired
-        // windows are evicted first. A still-full map refuses the new ip
-        // (fail closed): passing it through let a host with more than
-        // MAX_TRACKED_IPS addresses bypass the limiter entirely.
-        if seen.len() >= MAX_TRACKED_IPS {
-            seen.retain(|_, w| w.front().is_some_and(|t| now.saturating_sub(*t) < 1));
-            if seen.len() >= MAX_TRACKED_IPS {
+        // windows are evicted first, at most once per second (the retain
+        // walks up to 10k entries; doing it on every accept while the map
+        // is full turned a capacity probe into a per-connection pause). A
+        // still-full map refuses the new ip (fail closed): passing it
+        // through let a host with more than MAX_TRACKED_IPS addresses
+        // bypass the limiter entirely.
+        if seen.windows.len() >= MAX_TRACKED_IPS {
+            if now.saturating_sub(seen.last_prune) >= 1 {
+                seen.last_prune = now;
+                seen.windows
+                    .retain(|_, w| w.front().is_some_and(|t| now.saturating_sub(*t) < 1));
+            }
+            if seen.windows.len() >= MAX_TRACKED_IPS {
                 return false;
             }
         }
-        seen.entry(ip).or_default().push_back(now);
+        seen.windows.entry(ip).or_default().push_back(now);
         true
+    }
+}
+
+/// A per-IP connection slot acquired at the request layer for a trusted
+/// proxy peer (the client address is only known once the request head has
+/// been read). Released when the request ends, or moved into the detached
+/// WebSocket task by `ws_handler` so the upgraded connection keeps its slot
+/// for its whole lifetime.
+struct ClientIpGuard {
+    counter: Arc<crate::conn::IpConnCounter>,
+    ip: std::net::IpAddr,
+}
+
+impl Drop for ClientIpGuard {
+    fn drop(&mut self) {
+        self.counter.release(self.ip);
     }
 }
 
@@ -1098,6 +1205,14 @@ impl IpConnLimiter {
 /// sockets that never complete a request head. On shutdown the accept
 /// loop stops, active connections get a graceful-shutdown signal, and
 /// stragglers are aborted after a bounded grace period.
+///
+/// When `trusted_proxies` is non-empty, a connection whose TCP peer
+/// matches one is a reverse proxy: its per-IP accounting uses the client
+/// address from `X-Forwarded-For` (the per-request middleware below, since
+/// the header is only known with the request head), so a proxy deployment
+/// is not capped at `max_connections_per_ip` under the proxy's single
+/// address. Untrusted peers keep the accept-time accounting on their own
+/// address, and their header is ignored (fail closed).
 #[allow(clippy::too_many_arguments)]
 async fn serve_limited(
     listener: tokio::net::TcpListener,
@@ -1105,7 +1220,8 @@ async fn serve_limited(
     max_connections: usize,
     max_per_ip: usize,
     header_timeout: Option<std::time::Duration>,
-    per_sec_per_ip: Option<IpConnLimiter>,
+    per_sec_per_ip: Option<Arc<IpConnLimiter>>,
+    trusted_proxies: Arc<[TrustedProxy]>,
     recv_buf_kb: u32,
     mut shutdown: watch::Receiver<bool>,
 ) {
@@ -1139,13 +1255,23 @@ async fn serve_limited(
                 };
                 // The address is normalized like every other per-IP
                 // accounting: a dual-stack listener reports IPv4 peers as
-                // ::ffff:a.b.c.d, which must not dodge the caps.
-                let peer_ip = crate::util::normalize_ip(peer.ip());
-                // Per-IP connection rate limit (slow-loris / socket flood).
-                if let Some(limiter) = &per_sec_per_ip
-                    && !limiter.allow(peer_ip, crate::util::unix_now())
-                {
-                    continue;
+                // ::ffff:a.b.c.d, which must not dodge the caps. IPv6
+                // peers are aggregated by /64 so one host cannot rotate
+                // suffixes to dodge them.
+                let raw_ip = normalize_ip(peer.ip());
+                // A peer matching `server.trusted_proxies` is a reverse
+                // proxy: its own address must not consume the per-IP caps
+                // (every client shares it), so the per-IP checks run in the
+                // request middleware under the forwarded client address.
+                let trusted = trusted_proxies.iter().any(|proxy| proxy.contains(raw_ip));
+                let accounting = accounting_ip(raw_ip);
+                if !trusted {
+                    // Per-IP connection rate limit (slow-loris / socket flood).
+                    if let Some(limiter) = &per_sec_per_ip
+                        && !limiter.allow(accounting, unix_now())
+                    {
+                        continue;
+                    }
                 }
                 // Connection cap: refuse the socket outright at the cap so
                 // established-but-idle sockets cannot pin file descriptors.
@@ -1156,18 +1282,22 @@ async fn serve_limited(
                 // not only WebSocket upgrades. The slot is released by the
                 // task guard on every exit path (including a panic), or by
                 // the WebSocket layer after a handover.
-                if !ip_counter.try_acquire(peer_ip, max_per_ip) {
+                if !trusted && !ip_counter.try_acquire(accounting, max_per_ip) {
                     continue;
                 }
                 active.fetch_add(1, Ordering::Relaxed);
                 // The accept-layer slot for this connection: the global and
                 // per-IP counts stay reserved until the HTTP task ends, or
                 // until a WebSocket upgrade hands the slot over to the
-                // detached WebSocket task (`crate::conn::ConnSlot`).
+                // detached WebSocket task (`crate::conn::ConnSlot`). For a
+                // trusted proxy only the global count is reserved here (the
+                // middleware acquires the per-IP slot under the forwarded
+                // address); releasing the never-acquired peer key is a
+                // no-op.
                 let slot = crate::conn::ConnSlot::new(
                     Arc::clone(&active),
                     Arc::clone(&ip_counter),
-                    peer_ip,
+                    accounting,
                 );
 
                 // Keep per-connection kernel buffers small so that hundreds
@@ -1193,23 +1323,83 @@ async fn serve_limited(
                 let app = app.clone();
                 let mut drain_rx = drain_rx.clone();
                 let io = hyper_util::rt::TokioIo::new(stream);
-                // Inject the peer address as ConnectInfo (the axum
+                // Inject the client address as ConnectInfo (the axum
                 // `ConnectInfo` extractor reads this extension) and the
-                // accept-layer slot. The WebSocket handler removes and takes
-                // over the slot when the request upgrades, so the WS
-                // connection keeps exactly one reserved slot (no second
-                // counter, no double release).
+                // accept-layer slot. For an untrusted peer the client is the
+                // peer itself; for a trusted proxy it is derived from
+                // `X-Forwarded-For` (falling back to the peer). The
+                // middleware also enforces the per-IP caps for trusted
+                // proxy peers, where the real client address is available.
+                // The WebSocket handler removes and takes over the slot when
+                // the request upgrades, so the WS connection keeps exactly
+                // one reserved slot (no second counter, no double release).
                 let slot_handle = Arc::clone(&slot);
+                let proxies = Arc::clone(&trusted_proxies);
+                let per_sec = per_sec_per_ip.clone();
+                let ip_counter_handle = Arc::clone(&ip_counter);
                 let svc = app.layer(axum::middleware::from_fn(
                     move |mut req: axum::extract::Request,
                           next: axum::middleware::Next| {
                         let peer = peer;
                         let slot = Arc::clone(&slot_handle);
+                        let proxies = Arc::clone(&proxies);
+                        let per_sec = per_sec.clone();
+                        let ip_counter = Arc::clone(&ip_counter_handle);
                         async move {
-                            req.extensions_mut()
-                                .insert(axum::extract::ConnectInfo(peer));
+                            let raw_ip = normalize_ip(peer.ip());
+                            let client = if trusted {
+                                client_ip(
+                                    raw_ip,
+                                    req.headers()
+                                        .get("x-forwarded-for")
+                                        .and_then(|value| value.to_str().ok()),
+                                    &proxies,
+                                )
+                            } else {
+                                raw_ip
+                            };
+                            req.extensions_mut().insert(axum::extract::ConnectInfo(
+                                std::net::SocketAddr::new(client, peer.port()),
+                            ));
+                            let mut request_guard = None;
+                            if trusted {
+                                // The accept layer skipped the per-IP caps
+                                // for this proxy; enforce them under the
+                                // real client address (aggregated by /64 for
+                                // IPv6). A refused request is answered with
+                                // 429 and `Connection: close` instead of the
+                                // accept-layer drop, because the TCP socket
+                                // is already established.
+                                let accounting = accounting_ip(client);
+                                if let Some(limiter) = &per_sec
+                                    && !limiter.allow(accounting, unix_now())
+                                {
+                                    return StatusCode::TOO_MANY_REQUESTS.into_response();
+                                }
+                                if !ip_counter.try_acquire(accounting, max_per_ip) {
+                                    return StatusCode::TOO_MANY_REQUESTS.into_response();
+                                }
+                                // Two handles to the guard: one in the
+                                // request extensions (removed and moved into
+                                // the WebSocket task by `ws_handler`) and one
+                                // held here. The extension clone alone is not
+                                // enough: axum may drop the request parts
+                                // after extraction, before a slow handler
+                                // ends, which would release the slot early.
+                                let guard = Arc::new(ClientIpGuard {
+                                    counter: Arc::clone(&ip_counter),
+                                    ip: accounting,
+                                });
+                                req.extensions_mut().insert(Arc::clone(&guard));
+                                request_guard = Some(guard);
+                            }
                             req.extensions_mut().insert(slot);
-                            next.run(req).await
+                            let response = next.run(req).await;
+                            // Released on every exit path; for a WebSocket
+                            // the extension handle keeps it alive in the
+                            // upgraded connection task.
+                            drop(request_guard);
+                            response
                         }
                     },
                 ));
@@ -1366,6 +1556,10 @@ async fn reload_handler(
                             ("server.host", old.server.host != new_config.server.host),
                             ("server.port", old.server.port != new_config.server.port),
                             ("server.ws_paths", old.server.ws_paths != new_config.server.ws_paths),
+                            (
+                                "server.trusted_proxies",
+                                old.server.trusted_proxies != new_config.server.trusted_proxies,
+                            ),
                             (
                                 "server.metrics_enabled",
                                 old.server.metrics_enabled != new_config.server.metrics_enabled,
@@ -1597,6 +1791,7 @@ async fn reload_handler(
                         new_config.server.host = old.server.host.clone();
                         new_config.server.port = old.server.port;
                         new_config.server.ws_paths = old.server.ws_paths.clone();
+                        new_config.server.trusted_proxies = old.server.trusted_proxies.clone();
                         new_config.server.metrics_enabled = old.server.metrics_enabled;
                         new_config.rpc.max_admin_body_bytes = old.rpc.max_admin_body_bytes;
                         new_config.relay.private_key = old.relay.private_key.clone();
@@ -2120,6 +2315,23 @@ mod tests {
         header_timeout: Option<Duration>,
         per_sec: Option<IpConnLimiter>,
     ) -> (SocketAddr, watch::Sender<bool>, tokio::task::JoinHandle<()>) {
+        serve_limited_with_proxies(
+            max_connections,
+            max_per_ip,
+            header_timeout,
+            per_sec,
+            Vec::new(),
+        )
+        .await
+    }
+
+    async fn serve_limited_with_proxies(
+        max_connections: usize,
+        max_per_ip: usize,
+        header_timeout: Option<Duration>,
+        per_sec: Option<IpConnLimiter>,
+        trusted: Vec<TrustedProxy>,
+    ) -> (SocketAddr, watch::Sender<bool>, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (tx, rx) = watch::channel(false);
@@ -2129,7 +2341,8 @@ mod tests {
             max_connections,
             max_per_ip,
             header_timeout,
-            per_sec,
+            per_sec.map(Arc::new),
+            Arc::from(trusted),
             16,
             rx,
         ));
@@ -2244,6 +2457,200 @@ mod tests {
         handle.await.unwrap();
     }
 
+    /// One `GET /` with an optional `X-Forwarded-For` header; the connection
+    /// closes after the response, so the whole head is read.
+    async fn http_get_with_xff(addr: SocketAddr, xff: Option<&str>) -> Vec<u8> {
+        let mut s = TcpStream::connect(addr).await.unwrap();
+        let forwarded = xff.map_or(String::new(), |xff| format!("X-Forwarded-For: {xff}\r\n"));
+        s.write_all(
+            format!("GET / HTTP/1.1\r\nHost: t\r\n{forwarded}Connection: close\r\n\r\n").as_bytes(),
+        )
+        .await
+        .unwrap();
+        read_to_eof(s, Duration::from_secs(3)).await
+    }
+
+    /// Reads whatever arrives within `within`, without waiting for EOF.
+    async fn read_available(s: &mut TcpStream, within: Duration) -> Vec<u8> {
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 4096];
+        let deadline = tokio::time::sleep(within);
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                n = s.read(&mut tmp) => match n {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                },
+                _ = &mut deadline => break,
+            }
+        }
+        buf
+    }
+
+    /// A router whose requests park until the returned semaphore is
+    /// released, so several connections can be kept in flight at once.
+    fn gated_app() -> (axum::Router, Arc<tokio::sync::Semaphore>) {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::get({
+                let gate = Arc::clone(&gate);
+                move || {
+                    let gate = Arc::clone(&gate);
+                    async move {
+                        let permit = gate.acquire().await.expect("the gate is open");
+                        permit.forget();
+                        "ok"
+                    }
+                }
+            }),
+        );
+        (app, gate)
+    }
+
+    #[tokio::test]
+    async fn serve_limited_caps_forwarded_clients_of_trusted_proxies() {
+        // In a trusted-proxy deployment the per-IP cap must count the
+        // forwarded client, not the proxy: two connections from the same
+        // client are capped even though they share the proxy's TCP
+        // address, and a different client gets its own slot.
+        let (app, gate) = gated_app();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = watch::channel(false);
+        let handle = tokio::spawn(serve_limited(
+            listener,
+            app,
+            10,
+            1,
+            Some(Duration::from_secs(30)),
+            None,
+            Arc::from(vec![TrustedProxy::parse("127.0.0.1/32").unwrap()]),
+            16,
+            rx,
+        ));
+        // The first client's request stays in flight, holding its slot.
+        let mut first = TcpStream::connect(addr).await.unwrap();
+        first
+            .write_all(
+                b"GET / HTTP/1.1\r\nHost: t\r\nX-Forwarded-For: 203.0.113.9\r\n\
+                  Connection: keep-alive\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        // A second connection for the same forwarded client is refused with
+        // 429 (the HTTP layer must not drop the already-established socket).
+        let refused = http_get_with_xff(addr, Some("203.0.113.9")).await;
+        assert!(
+            String::from_utf8_lossy(&refused).contains("429"),
+            "the forwarded client must be capped: {:?}",
+            String::from_utf8_lossy(&refused)
+        );
+        // A different forwarded client is admitted and parks in the handler.
+        let mut other = TcpStream::connect(addr).await.unwrap();
+        other
+            .write_all(
+                b"GET / HTTP/1.1\r\nHost: t\r\nX-Forwarded-For: 203.0.113.10\r\n\
+                  Connection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let pending = read_available(&mut other, Duration::from_millis(400)).await;
+        assert!(
+            !String::from_utf8_lossy(&pending).contains("429"),
+            "a different forwarded client must not be capped"
+        );
+        // Opening the gate completes both requests; the slots are released
+        // (the guard held by the in-flight request must not leak).
+        gate.add_permits(8);
+        let first_body = read_to_eof(first, Duration::from_secs(3)).await;
+        assert!(String::from_utf8_lossy(&first_body).contains("200 OK"));
+        let other_body = read_to_eof(other, Duration::from_secs(3)).await;
+        assert!(String::from_utf8_lossy(&other_body).contains("200 OK"));
+        tx.send(true).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn serve_limited_ignores_forwarded_for_from_untrusted_peers() {
+        // Without `server.trusted_proxies` the header is attacker-controlled:
+        // two connections from the same peer stay capped however they vary
+        // `X-Forwarded-For`.
+        let (app, gate) = gated_app();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = watch::channel(false);
+        let handle = tokio::spawn(serve_limited(
+            listener,
+            app,
+            10,
+            1,
+            Some(Duration::from_secs(30)),
+            None,
+            Arc::from(Vec::new()),
+            16,
+            rx,
+        ));
+        let mut first = TcpStream::connect(addr).await.unwrap();
+        first
+            .write_all(
+                b"GET / HTTP/1.1\r\nHost: t\r\nX-Forwarded-For: 203.0.113.9\r\n\
+                  Connection: keep-alive\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        // A spoofed, different address in the header must not lift the cap:
+        // the peer is the accounting key and the second connection is
+        // dropped at the accept layer (same as today).
+        let refused = http_get_with_xff(addr, Some("203.0.113.10")).await;
+        assert!(
+            refused.is_empty(),
+            "an untrusted peer must not change its accounting with X-Forwarded-For"
+        );
+        gate.add_permits(4);
+        let first_body = read_to_eof(first, Duration::from_secs(3)).await;
+        assert!(String::from_utf8_lossy(&first_body).contains("200 OK"));
+        tx.send(true).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn serve_limited_rate_limits_forwarded_clients_of_trusted_proxies() {
+        // The per-IP connection rate limiter must key on the forwarded
+        // client too, otherwise every client behind the proxy shares one
+        // window.
+        let (addr, tx, handle) = serve_limited_with_proxies(
+            10,
+            0,
+            Some(Duration::from_secs(30)),
+            IpConnLimiter::new(1),
+            vec![TrustedProxy::parse("127.0.0.1/32").unwrap()],
+        )
+        .await;
+        let first = http_get_with_xff(addr, Some("203.0.113.9")).await;
+        assert!(
+            String::from_utf8_lossy(&first).contains("200 OK"),
+            "the first forwarded connection must be served"
+        );
+        // The same client within the same second is refused with 429.
+        let refused = http_get_with_xff(addr, Some("203.0.113.9")).await;
+        assert!(
+            String::from_utf8_lossy(&refused).contains("429"),
+            "the forwarded address must feed the rate limiter"
+        );
+        // Another client has its own window.
+        let other = http_get_with_xff(addr, Some("203.0.113.10")).await;
+        assert!(
+            String::from_utf8_lossy(&other).contains("200 OK"),
+            "a different forwarded client must pass"
+        );
+        tx.send(true).unwrap();
+        handle.await.unwrap();
+    }
+
     #[tokio::test]
     async fn ws_connection_holds_the_per_ip_slot_after_upgrade() {
         // Regression: the accept layer and the WebSocket layer used to
@@ -2265,6 +2672,7 @@ mod tests {
             1,
             Some(Duration::from_secs(30)),
             None,
+            Arc::from(Vec::new()),
             16,
             rx,
         ));
@@ -2425,6 +2833,30 @@ mod tests {
         handle.await.unwrap();
     }
 
+    #[tokio::test]
+    async fn shutdown_task_join_is_bounded_and_aborts_stuck_tasks() {
+        // The background-task join used to be unbounded: a task inside a
+        // long `purge_expired` (or any stuck future) delayed the shutdown
+        // forever. The bounded join must return, and the stuck task must be
+        // aborted (its next await point cancels).
+        let mut tasks: Vec<tokio::task::JoinHandle<()>> =
+            vec![tokio::spawn(async { std::future::pending::<()>().await })];
+        let started = std::time::Instant::now();
+        assert!(
+            !join_tasks_bounded(&mut tasks, Duration::from_millis(100)).await,
+            "a stuck task must hit the join bound"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the join must not wait for the stuck task"
+        );
+        let err = tasks.remove(0).await.unwrap_err();
+        assert!(err.is_cancelled(), "the stuck task must be aborted");
+        // Finished tasks return `true` well before the grace.
+        let mut quick: Vec<tokio::task::JoinHandle<()>> = vec![tokio::spawn(async {})];
+        assert!(join_tasks_bounded(&mut quick, Duration::from_secs(5)).await);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn bind_listener_sets_reuseaddr() {
@@ -2484,7 +2916,7 @@ mod tests {
             }
         }
         assert!(
-            limiter.seen.lock().unwrap().len() <= 10_000,
+            limiter.seen.lock().unwrap().windows.len() <= 10_000,
             "the tracked-IP map must not exceed its bound"
         );
         assert!(accepted <= 10_000, "the limiter must not bypass the cap");
@@ -2494,6 +2926,40 @@ mod tests {
         assert!(!limiter.allow(extra, 1_700_000_000));
         // Once the windows expire, eviction resumes tracking.
         assert!(limiter.allow(extra, 1_700_000_002));
+    }
+
+    #[test]
+    fn ip_conn_limiter_prunes_at_most_once_per_second() {
+        let limiter = IpConnLimiter::new(1).unwrap();
+        let now = 1_700_000_000u64;
+        for i in 0..10_000u32 {
+            let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, (i >> 8) as u8, i as u8));
+            assert!(limiter.allow(ip, now));
+        }
+        // The first full-map refusal triggers the one walk for this second.
+        let extra: std::net::IpAddr = "198.51.100.9".parse().unwrap();
+        assert!(!limiter.allow(extra, now));
+        assert_eq!(
+            limiter.seen.lock().unwrap().last_prune,
+            now,
+            "the full map must be pruned on the first refusal"
+        );
+        // Further refusals within the same second do not re-walk the map
+        // (the windows cannot have expired yet), but still fail closed.
+        let other: std::net::IpAddr = "198.51.100.10".parse().unwrap();
+        assert!(!limiter.allow(other, now));
+        {
+            let seen = limiter.seen.lock().unwrap();
+            assert_eq!(
+                seen.last_prune, now,
+                "the O(10k) retain must not run on every accept"
+            );
+            assert_eq!(seen.windows.len(), 10_000);
+        }
+        // A second later the expired windows are evicted and new IPs are
+        // tracked again.
+        assert!(limiter.allow(extra, now + 1));
+        assert_eq!(limiter.seen.lock().unwrap().last_prune, now + 1);
     }
 
     #[test]

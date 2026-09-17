@@ -56,6 +56,102 @@ impl EventFields for Event {
     }
 }
 
+/// A precomputed index over a filter's `#`-prefixed tag constraints: the
+/// value set of each constraint, so matching an event is
+/// `O(event tags + filter values)` instead of the quadratic
+/// `O(filter values × event tags)` of a per-value linear scan. An
+/// unauthenticated REQ may carry `MAX_FILTER_TAG_VALUES` (512) values and
+/// a stored event up to `max_tags` (2000) tags, which measured ~0.85 s of
+/// reader CPU per frame with the linear scan; the plan turns that into one
+/// pass over the event's tags.
+#[derive(Debug, Default)]
+pub struct TagMatchPlan {
+    /// The value set of each `#name` constraint, in first-seen order.
+    constraints: Vec<(String, std::collections::HashSet<String>)>,
+    /// Constraint index by tag name (without the leading `#`); one entry
+    /// per constraint (the tag map's keys are unique).
+    by_name: std::collections::HashMap<String, usize>,
+    /// A constraint with no values (`[]`, or a non-string attribute) can
+    /// never be satisfied — the same result the linear scan's `any` over
+    /// an empty iterator produces — so the whole filter matches nothing.
+    impossible: bool,
+}
+
+impl TagMatchPlan {
+    /// Builds the plan from a filter's tag attribute map. Unknown
+    /// (non-`#`) keys are ignored, like [`Filter::matches`].
+    fn new(tags: &serde_json::Map<String, Value>) -> Self {
+        let mut plan = TagMatchPlan::default();
+        for (name, value) in tags {
+            let Some(tag_name) = name.strip_prefix('#') else {
+                continue;
+            };
+            let values: std::collections::HashSet<String> =
+                tag_values(value).map(str::to_string).collect();
+            if values.is_empty() {
+                plan.impossible = true;
+                return plan;
+            }
+            plan.by_name
+                .insert(tag_name.to_string(), plan.constraints.len());
+            plan.constraints.push((tag_name.to_string(), values));
+        }
+        plan
+    }
+
+    /// Whether an event satisfies every tag constraint of the filter.
+    /// One pass over the event's tags marks the constraints they satisfy
+    /// (the constraint index is looked up by tag name), so the old
+    /// `values × tags` product is gone.
+    pub fn matches<E: EventFields>(&self, ev: &E) -> bool {
+        if self.impossible {
+            return false;
+        }
+        if self.constraints.is_empty() {
+            return true;
+        }
+        // A filter that passed `too_many_members` has at most
+        // `MAX_FILTER_TAG_VALUES` non-empty constraints; a
+        // caller-constructed filter beyond that bound falls back to the
+        // linear scan (correct for any size) rather than overflow the
+        // fixed-size satisfaction bitmap below.
+        if self.constraints.len() > MAX_FILTER_TAG_VALUES {
+            return self.matches_linear(ev);
+        }
+        let mut satisfied = [0u64; MAX_FILTER_TAG_VALUES.div_ceil(64)];
+        let mut remaining = self.constraints.len();
+        for tag in ev.tags() {
+            // NIP-01: only the first value of a tag is indexed (`tag[1]`).
+            if tag.len() < 2 {
+                continue;
+            }
+            let Some(&index) = self.by_name.get(tag[0].as_str()) else {
+                continue;
+            };
+            let (_, values) = &self.constraints[index];
+            if satisfied[index / 64] & (1 << (index % 64)) == 0 && values.contains(tag[1].as_str())
+            {
+                satisfied[index / 64] |= 1 << (index % 64);
+                remaining -= 1;
+                if remaining == 0 {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// The pre-plan matcher: `O(values × event tags)`, used only for
+    /// unvalidated filters beyond the tracked-constraint bound.
+    fn matches_linear<E: EventFields>(&self, ev: &E) -> bool {
+        self.constraints.iter().all(|(name, values)| {
+            ev.tags()
+                .iter()
+                .any(|t| t.len() >= 2 && t[0] == *name && values.contains(t[1].as_str()))
+        })
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Filter {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -84,6 +180,13 @@ pub struct Filter {
     /// event against them).
     #[serde(skip)]
     pub search_terms: std::sync::Arc<std::sync::OnceLock<Vec<String>>>,
+    /// Lazily built tag-constraint index (see [`TagMatchPlan`]): the
+    /// linear tag scan was `O(filter values × event tags)`, a CPU-DoS
+    /// vector on the live path. Built on first match and shared with the
+    /// filter's clones, on the same immutable-after-parse contract as
+    /// `search` above.
+    #[serde(skip)]
+    pub(crate) tag_plan: std::sync::Arc<std::sync::OnceLock<TagMatchPlan>>,
 }
 
 impl Filter {
@@ -139,7 +242,26 @@ impl Filter {
     }
 
     /// Performs an in-memory match (used for live events and final checks).
+    /// The tag constraints are matched through the precomputed
+    /// [`TagMatchPlan`] (see [`Filter::matches_with`] to pass one in).
     pub fn matches<E: EventFields>(&self, ev: &E) -> bool {
+        self.matches_with(ev, self.tag_plan())
+    }
+
+    /// The precomputed tag-constraint index of this filter, built on first
+    /// match and shared with every clone (`tags` is immutable after the
+    /// filter is put to use, like `search`). A caller matching many events
+    /// against one filter holds the reference and reuses it through
+    /// [`Filter::matches_with`] instead of re-reading the cache per event.
+    pub fn tag_plan(&self) -> &TagMatchPlan {
+        self.tag_plan.get_or_init(|| TagMatchPlan::new(&self.tags))
+    }
+
+    /// [`Filter::matches`] with an explicitly supplied tag plan: identical
+    /// semantics, but the hot live path can hoist the plan out of its
+    /// per-event loop. `plan` must have been built from this filter's
+    /// `tags` (see [`Filter::tag_plan`]).
+    pub fn matches_with<E: EventFields>(&self, ev: &E, plan: &TagMatchPlan) -> bool {
         if let Some(ids) = &self.ids {
             // `ids` entries may be full ids or prefixes: strict NIP-01
             // requires exact 64-char lowercase hex, but prefixes are an
@@ -222,27 +344,14 @@ impl Filter {
                 return false;
             }
         }
-        self.tags.iter().all(|(name, value)| {
-            // NIP-01: tag constraints are `#`-prefixed; any other key is an
-            // unknown filter field and is ignored (a typo like `"kind"` must
-            // not silently turn the whole filter into an impossible query).
-            if !name.starts_with('#') {
-                return true;
-            }
-            // Note: tag values compare exactly (case-sensitive), unlike
-            // `ids`/`authors` which decode hex case-insensitively. An
-            // uppercase `#e`/`#p` value therefore matches nothing on either
-            // path — consistent, but clients should send lowercase hex.
-            // NIP-01: only the first value of a tag is indexed (`tag[1]`);
-            // further elements are metadata (relay hints, markers) and never
-            // match a filter on their own.
-            let tag_name = name.strip_prefix('#').unwrap_or(name);
-            tag_values(value).any(|v| {
-                ev.tags()
-                    .iter()
-                    .any(|t| t.len() >= 2 && t[0] == tag_name && t.get(1).is_some_and(|x| x == v))
-            })
-        })
+        // NIP-01: tag constraints are `#`-prefixed; any other key is an
+        // unknown filter field and is ignored (a typo like `"kind"` must
+        // not silently turn the whole filter into an impossible query).
+        // Tag values compare exactly (case-sensitive), unlike
+        // `ids`/`authors` which decode hex case-insensitively. An
+        // uppercase `#e`/`#p` value therefore matches nothing on either
+        // path — consistent, but clients should send lowercase hex.
+        plan.matches(ev)
     }
 
     pub fn has_search(&self) -> bool {
@@ -468,6 +577,106 @@ mod tests {
         assert!(f.matches(&e));
         let f: Filter = serde_json::from_value(serde_json::json!({"#t": ["go"]})).unwrap();
         assert!(!f.matches(&e));
+    }
+
+    /// An [`EventFields`] wrapper that counts how often the event's tags
+    /// are walked, so the tag-match complexity is asserted deterministically
+    /// (a work counter, not a wall-clock measurement).
+    struct CountedTags<'a> {
+        event: &'a Event,
+        tag_calls: std::cell::Cell<usize>,
+    }
+
+    impl EventFields for CountedTags<'_> {
+        fn id(&self) -> &str {
+            &self.event.id
+        }
+        fn pubkey(&self) -> &str {
+            &self.event.pubkey
+        }
+        fn kind(&self) -> u64 {
+            self.event.kind
+        }
+        fn created_at(&self) -> u64 {
+            self.event.created_at
+        }
+        fn tags(&self) -> &[Vec<String>] {
+            self.tag_calls.set(self.tag_calls.get() + 1);
+            &self.event.tags
+        }
+        fn content(&self) -> &str {
+            &self.event.content
+        }
+    }
+
+    #[test]
+    fn tag_match_walks_event_tags_once_for_many_filter_values() {
+        // Regression (CPU DoS): the tag scan was O(filter values × event
+        // tags) — 512 values against a 2000-tag event did ~1M comparisons
+        // per event. The precomputed plan walks the event's tags once; the
+        // old code called `tags()` once per filter value, so the work
+        // counter here fails deterministically without timing.
+        let event = ev(
+            1,
+            (0..2000)
+                .map(|i| vec![format!("t{i}"), "value".into()])
+                .collect(),
+        );
+        let values: Vec<String> = (0..MAX_FILTER_TAG_VALUES)
+            .map(|i| format!("{i:064x}"))
+            .collect();
+        let f: Filter = serde_json::from_value(serde_json::json!({"#e": values})).unwrap();
+        let counted = CountedTags {
+            event: &event,
+            tag_calls: std::cell::Cell::new(0),
+        };
+        assert!(!f.matches(&counted), "no `e` tag matches");
+        assert!(
+            counted.tag_calls.get() <= 2,
+            "the event's tags must be walked once, not once per filter value \
+             (walked {} times)",
+            counted.tag_calls.get()
+        );
+        // The plan is shared with clones (the live path clones filters into
+        // subscriptions) and still matches a hit.
+        let clone = f.clone();
+        let hit = ev(
+            1,
+            vec![vec![
+                "e".into(),
+                format!("{:064x}", MAX_FILTER_TAG_VALUES - 1),
+            ]],
+        );
+        assert!(clone.matches(&hit));
+    }
+
+    #[test]
+    fn tag_match_plan_covers_all_constraint_shapes() {
+        // The plan must agree with the linear semantics: multiple
+        // constraints, later tag values ignored, empty attributes
+        // unsatisfiable, non-tag keys ignored.
+        let e = ev(
+            1,
+            vec![
+                vec!["e".into(), "aa".into(), "bb".into()],
+                vec!["p".into(), "cc".into()],
+            ],
+        );
+        let hit: Filter =
+            serde_json::from_value(serde_json::json!({"#e": ["aa"], "#p": ["cc"], "foo": ["bar"]}))
+                .unwrap();
+        assert!(hit.matches(&e));
+        let miss_p: Filter =
+            serde_json::from_value(serde_json::json!({"#e": ["aa"], "#p": ["dd"]})).unwrap();
+        assert!(!miss_p.matches(&e));
+        let second_value: Filter =
+            serde_json::from_value(serde_json::json!({"#e": ["bb"]})).unwrap();
+        assert!(!second_value.matches(&e), "only tag[1] is indexed");
+        let empty: Filter = serde_json::from_value(serde_json::json!({"#e": []})).unwrap();
+        assert!(!empty.matches(&e), "an empty attribute matches nothing");
+        let unknown: Filter =
+            serde_json::from_value(serde_json::json!({"unknown": ["aa"]})).unwrap();
+        assert!(unknown.matches(&e), "unknown non-tag keys are ignored");
     }
 
     #[test]

@@ -204,6 +204,16 @@ pub struct ServerConfig {
     /// events authored by the relay's own pubkey (which requires
     /// `relay.private_key`), making `/outbox` a pure relay outbox.
     pub outbox_write_policy: String,
+    /// Trusted reverse-proxy addresses or CIDR ranges (e.g.
+    /// `["127.0.0.1/32", "::1/128"]`). When the TCP peer matches one, the
+    /// client address used by the per-IP caps, the per-IP connection rate
+    /// limit, `blockip` and the connection logs is taken from the
+    /// right-most untrusted `X-Forwarded-For` entry (falling back to the
+    /// peer when the header is absent or malformed). Empty (the default)
+    /// trusts no proxy. Never list an address that clients can reach
+    /// directly: they could then spoof `X-Forwarded-For` and bypass the
+    /// per-IP limits. Read at startup — changing it requires a restart.
+    pub trusted_proxies: Vec<String>,
 }
 
 /// NIP-86 management RPC settings: the separate management port, the
@@ -429,6 +439,7 @@ impl Default for ServerConfig {
             ws_paths: "root".into(),
             inbox_write_policy: "any".into(),
             outbox_write_policy: "any".into(),
+            trusted_proxies: Vec::new(),
         }
     }
 }
@@ -1059,6 +1070,18 @@ impl Config {
                 self.server.outbox_write_policy
             )));
         }
+        // Trusted proxies: each entry must be a single IP or CIDR range.
+        // A wildcard range (`/0`) is rejected outright: trusting every peer
+        // would let any client spoof `X-Forwarded-For` and dodge the per-IP
+        // limits.
+        for entry in &self.server.trusted_proxies {
+            if crate::util::TrustedProxy::parse(entry).is_none() {
+                return Err(config_err(format!(
+                    "server.trusted_proxies entries must be an IP address or CIDR range \
+                     (e.g. \"127.0.0.1/32\" or \"10.0.0.0/8\"), got {entry:?}"
+                )));
+            }
+        }
         // Host split hostnames must be bare hostnames: a scheme, path or
         // port in the config would never match a request Host header and
         // silently hide the split routes (or, worse, the whole API).
@@ -1206,6 +1229,10 @@ impl Config {
             ("limits.max_tag_value_bytes", l.max_tag_value_bytes),
             ("limits.max_sub_id_len", l.max_sub_id_len),
             ("rpc.max_admin_body_bytes", self.rpc.max_admin_body_bytes),
+            // A zero here means "unlimited" in the group store, which turns
+            // an attacker's group-id churn into unbounded memory: reject it
+            // (the cap is the protection, not an optional nicety).
+            ("relay.max_groups", self.relay.max_groups),
         ];
         let db_nonzero = [
             ("database.db_buffer_size", self.database.db_buffer_size),
@@ -1335,11 +1362,22 @@ impl Config {
             ),
             ("limits.max_sub_bytes", l.max_sub_bytes, 64 << 20),
             ("limits.max_limit", l.max_limit, 100_000),
+            // NIP-77 holds the whole sync window in memory; a very large
+            // cap makes one NEG-OPEN an out-of-memory trigger.
+            ("limits.max_neg_items", l.max_neg_items, 1_000_000),
             ("limits.max_api_fetch", l.max_api_fetch, 100_000),
             (
                 "blossom.max_upload_bytes",
                 self.blossom.max_upload_bytes,
                 1024 << 20,
+            ),
+            // The REQ byte budget is intentionally allowed to be large
+            // (paged responses drain through the outgoing queue); only an
+            // absurd value is worth a warning.
+            (
+                "limits.max_req_response_bytes",
+                l.max_req_response_bytes as usize,
+                512 << 20,
             ),
         ] {
             if value > sane {
@@ -1349,12 +1387,24 @@ impl Config {
                 );
             }
         }
-        if l.max_req_response_bytes > 512 << 20 {
-            log::warn!(
-                "config.limits.max_req_response_bytes = {} is extraordinarily large; memory \
-                 protection is effectively disabled",
-                l.max_req_response_bytes
-            );
+        // Hard ceilings for clear mistakes: a value above these bounds can
+        // only be a typo (the units were mistaken, e.g. bytes for records)
+        // and would let one request exhaust memory. `0` keeps its documented
+        // "disabled" meaning where it has one.
+        for (name, value, ceiling) in [
+            ("limits.max_neg_items", l.max_neg_items, 10_000_000usize),
+            (
+                "limits.max_req_response_bytes",
+                usize::try_from(l.max_req_response_bytes).unwrap_or(usize::MAX),
+                2usize << 30,
+            ),
+        ] {
+            if value > ceiling {
+                return Err(config_err(format!(
+                    "config.{name} = {value} exceeds the hard ceiling of {ceiling}; lower it \
+                     (memory protection is otherwise effectively disabled)"
+                )));
+            }
         }
         // The byte cap is the only bound that accounts for maximum-size
         // queued messages; a huge value (or 0, which disables it) leaves the
@@ -1968,6 +2018,7 @@ fn known_config_keys() -> &'static [(&'static str, &'static [&'static str])] {
                 "ws_paths",
                 "inbox_write_policy",
                 "outbox_write_policy",
+                "trusted_proxies",
                 "metrics_enabled",
                 "management_token",
                 "admin_pubkey",
@@ -3035,6 +3086,43 @@ max_log_files = 2
     }
 
     #[test]
+    fn validation_rejects_bad_trusted_proxies() {
+        let mut cfg = Config::default();
+        assert!(
+            cfg.server.trusted_proxies.is_empty(),
+            "default must trust no proxy"
+        );
+        assert!(cfg.validate().is_ok());
+        for value in [
+            "127.0.0.1",
+            "127.0.0.1/32",
+            "10.0.0.0/8",
+            "::1",
+            "2001:db8::/32",
+        ] {
+            cfg.server.trusted_proxies = vec![value.into()];
+            assert!(cfg.validate().is_ok(), "{value} must be valid");
+        }
+        for bad in [
+            "",
+            "not-an-ip",
+            "10.0.0.0/33",
+            "2001:db8::/129",
+            "0.0.0.0/0",
+            "::/0",
+        ] {
+            cfg.server.trusted_proxies = vec![bad.into()];
+            assert!(
+                cfg.validate().is_err(),
+                "{bad:?} must be rejected as a trusted proxy"
+            );
+        }
+        // A wildcard entry smuggled next to a valid one is still rejected.
+        cfg.server.trusted_proxies = vec!["127.0.0.1/32".into(), "0.0.0.0/0".into()];
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
     fn relay_reject_ephemeral_defaults_and_parses() {
         let cfg = Config::default();
         assert!(!cfg.relay.reject_ephemeral, "default must be false");
@@ -3121,6 +3209,9 @@ max_log_files = 2
             |c: &mut Config| c.limits.max_sub_id_len = 0,
             |c: &mut Config| c.limits.max_api_queue_msgs = 0,
             |c: &mut Config| c.rpc.max_admin_body_bytes = 0,
+            // `relay.max_groups = 0` used to mean "unlimited", which lets
+            // group-id churn grow memory without bound: rejected now.
+            |c: &mut Config| c.relay.max_groups = 0,
             // The stats writer used to clamp this to 1 silently; the CLI
             // staleness threshold derives from it, so 0 must be rejected.
             |c: &mut Config| c.daemon.stats_interval_secs = 0,
@@ -3161,6 +3252,36 @@ max_log_files = 2
              (otherwise the documented offset ceiling is unusable at the default limit)"
         );
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn validation_rejects_absurd_hard_ceilings() {
+        // `max_neg_items` above the hard ceiling can only be a unit typo
+        // (bytes for records): one NEG-OPEN would hold the whole window in
+        // memory. Values above the soft sanity bound still validate (warn).
+        let mut cfg = Config::default();
+        cfg.limits.max_neg_items = 10_000_001;
+        assert!(
+            cfg.validate().is_err(),
+            "max_neg_items beyond the hard ceiling must be rejected"
+        );
+        cfg.limits.max_neg_items = 1_000_001;
+        assert!(
+            cfg.validate().is_ok(),
+            "a merely large max_neg_items is a warned choice, not an error"
+        );
+        // Same for the REQ response byte budget.
+        let mut cfg = Config::default();
+        cfg.limits.max_req_response_bytes = (2usize << 30) as u64 + 1;
+        assert!(
+            cfg.validate().is_err(),
+            "max_req_response_bytes beyond the hard ceiling must be rejected"
+        );
+        cfg.limits.max_req_response_bytes = 512 << 20;
+        assert!(
+            cfg.validate().is_ok(),
+            "the documented sanity bound itself must validate"
+        );
     }
 
     #[test]

@@ -26,6 +26,122 @@ const OUT_QUEUE_LIMIT: usize = 4096;
 /// batch (the batch shares a single write commit).
 pub(crate) const EVENT_BATCH: usize = 64;
 
+/// Relay-wide byte budget for materialized REQ responses. The per-response
+/// (`limits.max_req_response_bytes`) and per-connection (`pending_reqs`,
+/// `max_out_queue_bytes`) caps alone still allow
+/// `max_connections × MAX_PENDING_REQS × max_req_response_bytes` of pinned
+/// memory (hundreds of GiB with the documented defaults); every response
+/// reserves its materialized size here before it is queued for the pump,
+/// and the reservation is released when the response completes, is
+/// replaced/closed, or its connection drops (including a panic, through
+/// [`PendingReq`]'s `Drop`). Responses that do not fit fail fast with a
+/// retryable CLOSED instead of pinning the events.
+pub(crate) struct PendingResponseBudget {
+    /// Bytes currently reserved across the relay's connections.
+    used: std::sync::atomic::AtomicU64,
+}
+
+impl PendingResponseBudget {
+    fn new() -> Self {
+        PendingResponseBudget {
+            used: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// The bytes currently reserved (tests and diagnostics).
+    #[cfg(test)]
+    pub(crate) fn used(&self) -> u64 {
+        self.used.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Reserves `bytes` against `limit` (`0` = unlimited), returning the
+    /// amount actually reserved (`Some(0)` when nothing had to be
+    /// accounted, e.g. an empty response or an unlimited budget). `None`
+    /// means the reservation would exceed the relay-wide budget: the
+    /// caller must refuse the response instead of materializing it. The
+    /// caller stores the returned amount and passes it to [`Self::release`]
+    /// on drop, so an unaccounted reservation is never subtracted from
+    /// other connections' bytes.
+    pub(crate) fn try_reserve(&self, bytes: u64, limit: u64) -> Option<u64> {
+        if bytes == 0 || limit == 0 {
+            return Some(0);
+        }
+        let mut current = self.used.load(std::sync::atomic::Ordering::Relaxed);
+        loop {
+            if current.saturating_add(bytes) > limit {
+                return None;
+            }
+            match self.used.compare_exchange_weak(
+                current,
+                current + bytes,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(bytes),
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    /// Releases a reservation. Saturating, so a spurious extra release
+    /// cannot wrap the counter and disable the budget.
+    pub(crate) fn release(&self, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        let _ = self.used.fetch_update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |current| Some(current.saturating_sub(bytes)),
+        );
+    }
+}
+
+/// Relay-wide pending-response budget as a multiple of the per-response
+/// byte budget. The default (32 MiB × 16 = 512 MiB) bounds the relay-wide
+/// pinned-response memory while leaving room for many concurrent
+/// full-size responses; the previous per-connection caps had no global
+/// bound at all.
+pub(crate) const PENDING_RESPONSE_BUDGET_FACTOR: u64 = 16;
+
+/// Sizes the relay-wide budget from `limits.max_req_response_bytes`; when
+/// the per-response budget is disabled (`0` = unlimited) the documented
+/// default is used, so the relay-wide bound still exists.
+pub(crate) fn pending_response_budget_bytes(per_response: u64) -> u64 {
+    /// The documented default of `limits.max_req_response_bytes`.
+    const DEFAULT_PER_RESPONSE: u64 = 32 * 1024 * 1024;
+    let per_response = if per_response == 0 {
+        DEFAULT_PER_RESPONSE
+    } else {
+        per_response
+    };
+    per_response.saturating_mul(PENDING_RESPONSE_BUDGET_FACTOR)
+}
+
+/// The pending-response budget of one relay. `Arc::as_ptr` identifies the
+/// relay allocation (every `Conn` holds a clone of the same allocation),
+/// so several relays in one process (tests) do not share a budget. The
+/// registry holds a `Weak` reference: once every connection (and pending
+/// response) of a relay is gone the counter is freed, so a later relay
+/// allocated at the same address gets a fresh budget instead of a stale
+/// counter, and the registry cannot keep budgets alive.
+fn pending_response_budget(relay: &Arc<Relay>) -> Arc<PendingResponseBudget> {
+    static BUDGETS: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<usize, std::sync::Weak<PendingResponseBudget>>>,
+    > = std::sync::OnceLock::new();
+    let key = Arc::as_ptr(relay) as usize;
+    let mut budgets = BUDGETS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    if let Some(existing) = budgets.get(&key).and_then(std::sync::Weak::upgrade) {
+        return existing;
+    }
+    let budget = Arc::new(PendingResponseBudget::new());
+    budgets.insert(key, Arc::downgrade(&budget));
+    budget
+}
+
 /// A REQ response waiting to be pumped to the socket in bounded chunks:
 /// the scan result is held here and moved into the capped outgoing queue
 /// as the socket drains, instead of being queued all at once (which could
@@ -51,6 +167,22 @@ pub(crate) struct PendingReq {
     /// Whether the EOSE (and any AUTH challenge before it) has been queued;
     /// afterwards the pump only drains `live`.
     pub(crate) eose_sent: bool,
+    /// The relay-wide budget this response's materialized bytes were
+    /// reserved against (`None` when no reservation was taken, e.g. test
+    /// fixtures).
+    pub(crate) budget: Option<Arc<PendingResponseBudget>>,
+    /// The bytes reserved in `budget` for `events`; released on drop so
+    /// every path (pump completion, live overflow, CLOSE/replacement,
+    /// connection drop or panic) unaccounts exactly once.
+    pub(crate) reserved: u64,
+}
+
+impl Drop for PendingReq {
+    fn drop(&mut self) {
+        if let Some(budget) = &self.budget {
+            budget.release(self.reserved);
+        }
+    }
 }
 
 /// Upper bound on queued REQ responses per connection: beyond this the
@@ -95,6 +227,10 @@ pub struct Conn {
     /// Byte budget for a single REQ response (`limits.max_req_response_bytes`,
     /// cached once per connection; 0 = unlimited).
     pub(crate) req_response_bytes: u64,
+    /// The relay-wide pending-response byte budget shared by every
+    /// connection; each materialized response reserves its size against it
+    /// and over-budget responses fail with a retryable CLOSED.
+    pub(crate) pending_budget: Arc<PendingResponseBudget>,
     /// REQ responses awaiting the pump: the scan results are moved into
     /// the capped outgoing queue in chunks as the socket drains.
     pub(crate) pending_reqs: std::collections::VecDeque<PendingReq>,
@@ -990,6 +1126,7 @@ pub async fn handle_connection(
             },
         );
     let mut conn = Conn {
+        pending_budget: pending_response_budget(&relay),
         relay,
         conn_id,
         subscriptions_held,
@@ -1589,6 +1726,7 @@ mod tests {
                 },
             );
         Conn {
+            pending_budget: pending_response_budget(&relay),
             relay,
             conn_id,
             subscriptions_held: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -4689,6 +4827,8 @@ mod tests {
                 live: Default::default(),
                 live_bytes: 0,
                 eose_sent: false,
+                budget: None,
+                reserved: 0,
             });
             // A live event for the same subscription arrives mid-response:
             // it must be held for the post-EOSE stream.
@@ -4968,6 +5108,8 @@ mod tests {
                 live: Default::default(),
                 live_bytes: 0,
                 eose_sent: false,
+                budget: None,
+                reserved: 0,
             });
             conn.pump_pending_reqs();
             let msgs = outgoing_json(&conn);
@@ -5010,6 +5152,8 @@ mod tests {
                 live: Default::default(),
                 live_bytes: 0,
                 eose_sent: false,
+                budget: None,
+                reserved: 0,
             });
             conn.pump_pending_reqs();
             let msgs = outgoing_json(&conn);
@@ -5054,6 +5198,8 @@ mod tests {
                 live: Default::default(),
                 live_bytes: 0,
                 eose_sent: false,
+                budget: None,
+                reserved: 0,
             });
             conn.subs
                 .insert("b".into(), (Vec::new(), 0, "\"b\"".into()));
@@ -5069,6 +5215,8 @@ mod tests {
                 live: Default::default(),
                 live_bytes: 0,
                 eose_sent: false,
+                budget: None,
+                reserved: 0,
             });
             conn.pump_pending_reqs();
             let msgs = outgoing_json(&conn);
@@ -5124,6 +5272,8 @@ mod tests {
                     live: Default::default(),
                     live_bytes: 0,
                     eose_sent: false,
+                    budget: None,
+                    reserved: 0,
                 });
             }
             assert_eq!(
@@ -5191,6 +5341,8 @@ mod tests {
                 live,
                 live_bytes: 0,
                 eose_sent: true,
+                budget: None,
+                reserved: 0,
             });
             for i in 1..=MAX_PENDING_REQS {
                 conn.subs
@@ -5205,6 +5357,8 @@ mod tests {
                     live: Default::default(),
                     live_bytes: 0,
                     eose_sent: false,
+                    budget: None,
+                    reserved: 0,
                 });
             }
 
@@ -5229,6 +5383,8 @@ mod tests {
                 live: Default::default(),
                 live_bytes: 0,
                 eose_sent: false,
+                budget: None,
+                reserved: 0,
             });
             for i in 0..MAX_PENDING_REQS {
                 conn.enqueue_pending_req(PendingReq {
@@ -5241,6 +5397,8 @@ mod tests {
                     live: Default::default(),
                     live_bytes: 0,
                     eose_sent: false,
+                    budget: None,
+                    reserved: 0,
                 });
             }
             assert!(
@@ -5276,6 +5434,8 @@ mod tests {
                 live,
                 live_bytes: 0,
                 eose_sent: false,
+                budget: None,
+                reserved: 0,
             });
             for i in 1..=MAX_PENDING_REQS {
                 conn.subs
@@ -5290,6 +5450,8 @@ mod tests {
                     live: Default::default(),
                     live_bytes: 0,
                     eose_sent: false,
+                    budget: None,
+                    reserved: 0,
                 });
             }
             assert!(
@@ -5329,6 +5491,8 @@ mod tests {
                 live: Default::default(),
                 live_bytes: 0,
                 eose_sent: false,
+                budget: None,
+                reserved: 0,
             });
 
             conn.remove_req_subscription("stale");
@@ -5449,6 +5613,8 @@ mod tests {
                 live,
                 live_bytes: 0,
                 eose_sent: false,
+                budget: None,
+                reserved: 0,
             });
 
             let event = signed_note(conn.relay.secp(), "overflow", unix_now(), vec![]);
@@ -5537,6 +5703,8 @@ mod tests {
                 live: Default::default(),
                 live_bytes: 0,
                 eose_sent: false,
+                budget: None,
+                reserved: 0,
             });
             conn.pump_pending_reqs();
             let msgs = outgoing_json(&conn);
@@ -5651,6 +5819,8 @@ mod tests {
                 live: Default::default(),
                 live_bytes: 0,
                 eose_sent: false,
+                budget: None,
+                reserved: 0,
             });
             conn.pump_pending_reqs();
             assert!(
@@ -5677,6 +5847,8 @@ mod tests {
                 live: Default::default(),
                 live_bytes: 0,
                 eose_sent: false,
+                budget: None,
+                reserved: 0,
             });
             let mut second = std::collections::VecDeque::new();
             second.push_back(signed_note(conn.relay.secp(), "new", now - 1, vec![]));
@@ -5690,6 +5862,8 @@ mod tests {
                 live: Default::default(),
                 live_bytes: 0,
                 eose_sent: false,
+                budget: None,
+                reserved: 0,
             });
             assert_eq!(conn.pending_reqs.len(), 1, "the stale response is dropped");
             conn.pump_pending_reqs();
@@ -5743,6 +5917,8 @@ mod tests {
                 live: Default::default(),
                 live_bytes: 0,
                 eose_sent: false,
+                budget: None,
+                reserved: 0,
             });
             conn.pump_pending_reqs();
             let msgs = outgoing_json(&conn);
@@ -6036,7 +6212,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let mut conn = build_conn().await;
-            conn.auth_attempts = 16;
+            conn.auth_attempts = 256;
             let id = "ab".repeat(32);
             conn.handle_auth(&[json!({"id": id})]).await;
             let msgs = outgoing_json(&conn);
@@ -6208,6 +6384,427 @@ mod tests {
                 "completion ACK must remain queued under outgoing byte backpressure"
             );
             conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn pending_response_budget_rejects_and_releases() {
+        // The relay-wide budget bounds the total memory pinned by
+        // materialized responses across connections: a response that does
+        // not fit fails fast with a retryable CLOSED instead of pinning
+        // events, and the reservation is returned when the response
+        // completes, is closed, or its connection drops (the latter two
+        // through `PendingReq`'s Drop, which the panic path relies on too).
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let now = unix_now();
+            for i in 0..2 {
+                let ev = signed_note(conn.relay.secp(), &format!("e{i}"), now - i as u64, vec![]);
+                conn.relay.db.put(ev, now).await;
+            }
+            let budget = Arc::clone(&conn.pending_budget);
+            let limit = pending_response_budget_bytes(conn.req_response_bytes);
+            assert!(limit > 0);
+            // Fill the budget as if other connections held responses.
+            assert!(
+                budget.try_reserve(limit, limit).is_some(),
+                "the budget accepts its full size"
+            );
+            conn.handle_req(&[json!("sub"), json!({"kinds": [1]})])
+                .await;
+            let msgs = outgoing_json(&conn);
+            assert!(
+                msgs.iter().any(|m| m[0] == "CLOSED"
+                    && m[1] == "sub"
+                    && m[2].as_str().unwrap_or("").contains("overloaded")),
+                "an over-budget response must fail fast with CLOSED: {msgs:?}"
+            );
+            assert!(conn.pending_reqs.is_empty(), "no response may be queued");
+            assert!(
+                !conn.subs.contains_key("sub"),
+                "the over-budget subscription must be released"
+            );
+            assert_eq!(
+                budget.used(),
+                limit,
+                "the refused response must not reserve anything"
+            );
+
+            // The other connection's response completes: the same REQ now
+            // succeeds, and completing its own response returns the bytes.
+            budget.release(limit);
+            conn.handle_req(&[json!("sub"), json!({"kinds": [1]})])
+                .await;
+            assert!(
+                budget.used() > 0,
+                "the materialized response must be reserved"
+            );
+            assert!(conn.subs.contains_key("sub"));
+            conn.pump_pending_reqs();
+            assert!(conn.pending_reqs.is_empty(), "the response completed");
+            assert_eq!(budget.used(), 0, "completion must release the reservation");
+
+            // A CLOSE of a still-pending response releases it too.
+            conn.handle_req(&[json!("sub2"), json!({"kinds": [1]})])
+                .await;
+            assert!(budget.used() > 0);
+            conn.handle_close(&[json!("sub2")]);
+            assert_eq!(
+                budget.used(),
+                0,
+                "CLOSE must release the pending reservation"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn pending_response_budget_accounts_and_saturates() {
+        let budget = PendingResponseBudget::new();
+        assert_eq!(budget.used(), 0);
+        // An unlimited budget (and an empty response) accepts without
+        // accounting, so nothing may be released later.
+        assert_eq!(budget.try_reserve(1_000, 0), Some(0));
+        assert_eq!(budget.used(), 0);
+        assert_eq!(budget.try_reserve(0, 10), Some(0));
+        // A bounded budget accounts exactly and refuses over-budget
+        // reservations.
+        assert_eq!(budget.try_reserve(6, 10), Some(6));
+        assert_eq!(budget.try_reserve(5, 10), None);
+        assert_eq!(budget.used(), 6);
+        budget.release(4);
+        assert_eq!(budget.used(), 2);
+        // A spurious release cannot wrap past zero (which would disable
+        // the budget).
+        budget.release(u64::MAX);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn pending_response_budget_sizes_from_config() {
+        assert_eq!(pending_response_budget_bytes(1_000), 16_000);
+        assert_eq!(
+            pending_response_budget_bytes(0),
+            32 * 1024 * 1024 * PENDING_RESPONSE_BUDGET_FACTOR,
+            "a disabled per-response budget still gets the relay-wide default"
+        );
+    }
+
+    #[test]
+    fn multi_key_auth_is_not_refused_by_the_attempt_cap() {
+        // Regression: the AUTH attempt cap (16) was lower than the
+        // distinct-key cap (64) while counting successful auths, so a
+        // multi-key client was refused mid-way. Successes still count as
+        // attempts, but the cap is comfortably above the key cap.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let now = unix_now();
+            for seed in 1..=17u8 {
+                let auth = signed_auth_seeded(conn.relay.secp(), seed, "test-challenge", now);
+                conn.handle_auth(&[serde_json::to_value(&auth).unwrap()])
+                    .await;
+                let ok = outgoing_json(&conn)
+                    .iter()
+                    .rev()
+                    .find(|m| m[0] == "OK" && m[1] == auth.id)
+                    .cloned()
+                    .unwrap_or_else(|| panic!("AUTH seed {seed} must be answered with OK"));
+                assert_eq!(ok[2], true, "seed {seed} must authenticate: {ok:?}");
+            }
+            assert_eq!(conn.authed_pubkeys.len(), 17);
+
+            // NIP-42: a parsed AUTH frame with no recoverable id is still
+            // answered with OK (empty id) and an `invalid:` reason, never a
+            // NOTICE.
+            conn.handle_auth(&[json!({"not": "an event"})]).await;
+            let msgs = outgoing_json(&conn);
+            let malformed = msgs
+                .iter()
+                .rev()
+                .find(|m| {
+                    m[0] == "OK"
+                        && m[1] == ""
+                        && m[2] == false
+                        && m[3].as_str().unwrap_or("").starts_with("invalid:")
+                })
+                .expect("a malformed AUTH must be answered with OK \"\"");
+            assert!(
+                !msgs.iter().any(|m| m[0] == "NOTICE"),
+                "a parsed AUTH must never get a NOTICE"
+            );
+            // A missing event object is a parsed AUTH frame too.
+            conn.handle_auth(&[]).await;
+            assert!(
+                outgoing_json(&conn).iter().any(|m| m[0] == "OK"
+                    && m[1] == ""
+                    && m[2] == false
+                    && m[3].as_str().unwrap_or("").contains("requires an event")),
+                "an AUTH without an event object must be answered with OK"
+            );
+            assert!(malformed[3].as_str().unwrap().contains("malformed"));
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn req_multiple_filters_keep_their_own_limits() {
+        // Regression: the visible truncation cut the *union* at the sum of
+        // the limits, so a filter with many matches consumed a later
+        // filter's quota. Each filter's `limit` must be honored on its own
+        // (the scan's per-filter attribution), with the EOSE reporting
+        // "more" for the events that did not fit.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let now = unix_now();
+            let a1 = signed_note(
+                conn.relay.secp(),
+                "a1",
+                now,
+                vec![vec!["t".into(), "a".into()]],
+            );
+            let a2 = signed_note(
+                conn.relay.secp(),
+                "a2",
+                now - 1,
+                vec![vec!["t".into(), "a".into()]],
+            );
+            let b1 = signed_note(
+                conn.relay.secp(),
+                "b1",
+                now - 2,
+                vec![vec!["t".into(), "b".into()]],
+            );
+            let b2 = signed_note(
+                conn.relay.secp(),
+                "b2",
+                now - 3,
+                vec![vec!["t".into(), "b".into()]],
+            );
+            for e in [&a1, &a2, &b1, &b2] {
+                conn.relay.db.put(e.clone(), now).await;
+            }
+            conn.handle_req(&[
+                json!("sub"),
+                json!({"#t": ["a"], "limit": 1}),
+                json!({"#t": ["b"], "limit": 1}),
+            ])
+            .await;
+            conn.pump_pending_reqs();
+            let contents: Vec<String> = outgoing_json(&conn)
+                .iter()
+                .filter(|m| m[0] == "EVENT" && m[1] == "sub")
+                .map(|m| m[2]["content"].as_str().unwrap().to_string())
+                .collect();
+            assert_eq!(
+                contents,
+                vec!["a1".to_string(), "b1".to_string()],
+                "each filter must keep its own limit (the old union cut dropped b1)"
+            );
+            let eose = outgoing_json(&conn)
+                .into_iter()
+                .find(|m| m[0] == "EOSE" && m[1] == "sub")
+                .expect("the response must end in an EOSE");
+            assert_eq!(
+                eose[2],
+                json!(["more"]),
+                "matches that did not fit must carry the more hint"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    /// Waits (bounded) for `ready` to hold, polling at 10 ms.
+    async fn wait_for(mut ready: impl FnMut() -> bool, what: &str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !ready() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// The next JSON text frame of a tungstenite client, skipping PING/
+    /// PONG/other frames; fails on close, error, or a 5-second silence.
+    async fn ws_next_json<S>(ws: &mut S) -> Value
+    where
+        S: futures_util::Stream<
+                Item = Result<
+                    tokio_tungstenite::tungstenite::Message,
+                    tokio_tungstenite::tungstenite::Error,
+                >,
+            > + Unpin,
+    {
+        let deadline = tokio::time::sleep(Duration::from_secs(5));
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                msg = futures_util::StreamExt::next(ws) => match msg {
+                    Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) => {
+                        return serde_json::from_str(text.as_str())
+                            .expect("a server text frame must be JSON");
+                    }
+                    Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_)))
+                    | Some(Err(_))
+                    | None => panic!("the websocket closed before the expected reply"),
+                    Some(Ok(_)) => {}
+                },
+                _ = &mut deadline => panic!("timed out waiting for a websocket reply"),
+            }
+        }
+    }
+
+    #[test]
+    fn websocket_end_to_end_publish_and_drain() {
+        // Full-stack harness: a real axum WebSocket listener serving
+        // `handle_connection`, a real tokio-tungstenite client, an EVENT
+        // round trip with DB visibility, then `signal_drain()` and every
+        // accounting structure back to baseline.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_relay_with("").await;
+            let app = axum::Router::new()
+                .route(
+                    "/",
+                    axum::routing::any(
+                        |ws: axum::extract::ws::WebSocketUpgrade,
+                         axum::extract::State(relay): axum::extract::State<Arc<Relay>>| async move {
+                            ws.on_upgrade(move |socket| async move {
+                                crate::ws::handle_connection(
+                                    socket,
+                                    relay,
+                                    std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                                    "/".to_string(),
+                                    None,
+                                )
+                                .await;
+                            })
+                        },
+                    ),
+                )
+                .with_state(Arc::clone(&relay));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+
+            let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/"))
+                .await
+                .expect("the WebSocket connects");
+
+            // A REQ opens the subscription whose accounting must return to
+            // baseline after the drain.
+            futures_util::SinkExt::send(
+                &mut ws,
+                tokio_tungstenite::tungstenite::Message::Text(
+                    json!(["REQ", "e2e", {"kinds": [1]}]).to_string().into(),
+                ),
+            )
+            .await
+            .unwrap();
+            // The first frame is the NIP-42 challenge (the default is
+            // `send_auth_challenge = true`); skip until the EOSE.
+            let mut saw_eose = false;
+            for _ in 0..4 {
+                let msg = ws_next_json(&mut ws).await;
+                if msg[0] == "EOSE" && msg[1] == "e2e" {
+                    saw_eose = true;
+                    break;
+                }
+            }
+            assert!(saw_eose, "the subscription must be answered with EOSE");
+
+            // Publish an EVENT and wait for its OK.
+            let event = signed_note(relay.secp(), "e2e hello", unix_now(), vec![]);
+            futures_util::SinkExt::send(
+                &mut ws,
+                tokio_tungstenite::tungstenite::Message::Text(
+                    json!(["EVENT", event]).to_string().into(),
+                ),
+            )
+            .await
+            .unwrap();
+            let mut accepted = false;
+            for _ in 0..4 {
+                let msg = ws_next_json(&mut ws).await;
+                if msg[0] == "OK" && msg[1] == event.id {
+                    assert_eq!(msg[2], true, "the event must be accepted: {msg:?}");
+                    accepted = true;
+                    break;
+                }
+            }
+            assert!(accepted, "the EVENT must be acknowledged");
+
+            // DB visibility: the OK is only sent after the batch commit.
+            let (stored, _) = relay
+                .db
+                .query_req(
+                    vec![serde_json::from_value(json!({"ids": [event.id]})).unwrap()],
+                    1,
+                    unix_now(),
+                )
+                .await;
+            assert!(
+                stored.iter().any(|e| e.id == event.id),
+                "the accepted event must be stored"
+            );
+
+            assert_eq!(
+                relay
+                    .stats
+                    .connections_active
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                1,
+                "the connection is active"
+            );
+            assert_eq!(
+                relay
+                    .stats
+                    .subscriptions_active
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                1,
+                "the subscription is active"
+            );
+
+            // Drain: the connection loop tears down and releases every
+            // accounting structure within a bounded deadline.
+            relay.signal_drain();
+            wait_for(
+                || {
+                    relay
+                        .stats
+                        .connections_active
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        == 0
+                        && relay
+                            .stats
+                            .subscriptions_active
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                            == 0
+                        && relay
+                            .sub_index
+                            .read()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .candidates(&event)
+                            .is_empty()
+                        && relay
+                            .conn_queues
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .is_empty()
+                },
+                "all connection and subscription accounting to return to baseline",
+            )
+            .await;
+
+            drop(ws);
+            server.abort();
+            relay.db.shutdown();
         });
     }
 }

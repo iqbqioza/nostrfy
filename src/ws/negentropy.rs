@@ -284,6 +284,13 @@ impl super::Conn {
         // memory on a single connection. A NEG-OPEN for an already open id
         // first closes the existing subscription (NIP-77), so its items are
         // accounted out before the new set is admitted.
+        // Scope note: this (like `MAX_NEG_MSG_ROUNDS`/`MAX_NEG_OPENS`
+        // above) is a per-connection cap. The relay-wide
+        // `PendingResponseBudget` accounts materialized stored REQ
+        // responses only — NEG replies are completion-critical control
+        // frames that bypass the outgoing byte caps — so no global NEG
+        // budget exists; the per-connection item/round/open caps plus the
+        // `neg_backpressured` outgoing check are what bound NEG memory.
         let total_cap = max_items.saturating_mul(2);
         let old_len = self
             .neg

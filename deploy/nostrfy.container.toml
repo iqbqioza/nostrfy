@@ -42,6 +42,11 @@ metrics_enabled = true
 ws_paths = "root"
 inbox_write_policy = "any"
 outbox_write_policy = "any"
+# Client addresses behind Fly's proxy are not visible without the
+# X-Forwarded-For address of the edge: list Fly's private network range
+# (fdaa::/16) or leave empty to trust no proxy. Never list an address
+# clients can reach directly.
+trusted_proxies = []
 
 [rpc]
 management_token = ""
@@ -70,6 +75,7 @@ group_late_publish_secs = 3600
 max_api_concurrent = 8
 max_api_limit = 5000
 max_api_offset = 50000
+max_api_fetch = 55001
 max_api_search_bytes = 2048
 max_out_queue_bytes = 262144
 ws_idle_timeout_secs = 300

@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use super::store::WriteBatch;
 use super::store::{Store, flush_everything};
@@ -600,6 +600,13 @@ pub(crate) fn spawn(
                 let last_roles = msgs
                     .iter()
                     .rposition(|m| matches!(m, Msg::SaveRoles { .. }));
+                // Replies of the snapshots coalesced into the newest one:
+                // they are answered with the newest commit's outcome, so an
+                // earlier caller never reports durability the newest commit
+                // did not establish (and never sees a false failure when the
+                // newest write covered its mutation).
+                let mut coalesced_group_replies: Vec<oneshot::Sender<bool>> = Vec::new();
+                let mut coalesced_role_replies: Vec<oneshot::Sender<bool>> = Vec::new();
                 for (msg_index, msg) in msgs.into_iter().enumerate() {
                     match msg {
                         Msg::Put {
@@ -846,6 +853,9 @@ pub(crate) fn spawn(
                                     group,
                                     reply,
                                 } => {
+                                    // A failed walk replies `None` so the
+                                    // checked callers see the failure
+                                    // instead of an indistinguishable zero.
                                     let n = match store.apply_deletion_group(
                                         &targets,
                                         &addresses,
@@ -853,10 +863,10 @@ pub(crate) fn spawn(
                                         request_created,
                                         group.as_deref(),
                                     ) {
-                                        Ok(n) => n,
+                                        Ok(n) => Some(n),
                                         Err(e) => {
                                             db_error(&thread_errors, &e);
-                                            0
+                                            None
                                         }
                                     };
                                     let _ = reply.send(n);
@@ -876,21 +886,24 @@ pub(crate) fn spawn(
                                     until_created,
                                     reply,
                                 } => {
+                                    // A failed walk replies `None`: no marker
+                                    // was written, so the checked caller must
+                                    // not report the vanish as applied.
                                     let outcome = match store.apply_vanish(&pubkey, until_created) {
-                                        Ok(outcome) => outcome,
+                                        Ok(outcome) => Some(outcome),
                                         Err(e) => {
                                             db_error(&thread_errors, &e);
-                                            (0, false)
+                                            None
                                         }
                                     };
                                     let _ = reply.send(outcome);
                                 }
                                 Msg::GiftWrapPurge { pubkey, reply } => {
                                     let n = match store.delete_gift_wraps_to(&pubkey) {
-                                        Ok(n) => n,
+                                        Ok(n) => Some(n),
                                         Err(e) => {
                                             db_error(&thread_errors, &e);
-                                            0
+                                            None
                                         }
                                     };
                                     let _ = reply.send(n);
@@ -976,26 +989,48 @@ pub(crate) fn spawn(
                                     let _ = reply.send(ok);
                                 }
                                 Msg::SaveGroups { snapshot, reply } => {
-                                    if Some(msg_index) == last_groups
-                                        && let Err(e) = store.save_groups(&snapshot)
-                                    {
-                                        db_error(&thread_errors, &e);
+                                    if Some(msg_index) == last_groups {
+                                        let ok = match store.save_groups(&snapshot) {
+                                            Ok(()) => true,
+                                            Err(e) => {
+                                                db_error(&thread_errors, &e);
+                                                false
+                                            }
+                                        };
+                                        for earlier in coalesced_group_replies.drain(..) {
+                                            let _ = earlier.send(ok);
+                                        }
+                                        let _ = reply.send(ok);
+                                    } else {
+                                        coalesced_group_replies.push(reply);
                                     }
-                                    let _ = reply.send(());
                                 }
                                 Msg::SaveRoles { snapshot, reply } => {
-                                    if Some(msg_index) == last_roles
-                                        && let Err(e) = store.save_roles(&snapshot)
-                                    {
-                                        db_error(&thread_errors, &e);
+                                    if Some(msg_index) == last_roles {
+                                        let ok = match store.save_roles(&snapshot) {
+                                            Ok(()) => true,
+                                            Err(e) => {
+                                                db_error(&thread_errors, &e);
+                                                false
+                                            }
+                                        };
+                                        for earlier in coalesced_role_replies.drain(..) {
+                                            let _ = earlier.send(ok);
+                                        }
+                                        let _ = reply.send(ok);
+                                    } else {
+                                        coalesced_role_replies.push(reply);
                                     }
-                                    let _ = reply.send(());
                                 }
                                 Msg::ClearGroupsSnapshot { reply } => {
-                                    if let Err(e) = store.clear_groups_snapshot() {
-                                        db_error(&thread_errors, &e);
-                                    }
-                                    let _ = reply.send(());
+                                    let ok = match store.clear_groups_snapshot() {
+                                        Ok(()) => true,
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            false
+                                        }
+                                    };
+                                    let _ = reply.send(ok);
                                 }
                                 Msg::BlossomAddOwner {
                                     sha256,
@@ -1050,11 +1085,15 @@ pub(crate) fn spawn(
                                     let _ = reply.send(());
                                 }
                                 Msg::PurgeExpired { now, reply } => {
+                                    // The public API returns a plain tuple (a
+                                    // purge self-heals on the next run), so a
+                                    // failed pass reports zero removals and no
+                                    // state rebuild.
                                     let n = match store.purge_expired(now) {
                                         Ok(n) => n,
                                         Err(e) => {
                                             db_error(&thread_errors, &e);
-                                            0
+                                            (0, false)
                                         }
                                     };
                                     let _ = reply.send(n);

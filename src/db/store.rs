@@ -121,12 +121,16 @@ pub(crate) const GROUPS: &str = "groups";
 /// NIP-43 role state snapshot (`roles:snapshot`), persisted for the same
 /// reason as [`GROUPS`].
 pub(crate) const ROLES: &str = "roles";
-/// NIP-29 group purge markers: `sha256(gid) -> purge cut (BE u64)`. One
-/// record per purged group id instead of one tombstone per purged event:
-/// re-published events older than the cut are rejected (see
-/// [`Store::purge_group`] and [`Store::put`]). A create/purge cycle
-/// therefore grows this table by one fixed 32-byte key, not by the group's
-/// (unbounded) event count.
+/// NIP-29 group purge markers: `sha256(gid) -> purge time (BE u64) || cut
+/// (BE u64)`. One record per purged group id instead of one tombstone per
+/// purged event: an `h`-tagged re-publication with `created_at <= cut` is
+/// rejected, and a `kind:9007` re-create is rejected only while its
+/// `created_at` is *before* the purge time (a legitimate re-create passes
+/// even when future-dated purged content pushed the cut forward). A
+/// create/purge cycle therefore grows this table by one fixed 32-byte key,
+/// not by the group's (unbounded) event count. Markers written before the
+/// value carried two fields hold the cut alone and are read as
+/// `(cut, cut)`.
 pub(crate) const PURGED_GROUPS: &str = "purged_groups";
 pub(crate) const CREATED_LEN: usize = 8;
 pub(crate) const ID_LEN: usize = 32;
@@ -275,14 +279,32 @@ pub(crate) fn apply_put_batch(
             // it and their OK would be a lie.
             return vec![PutOutcome::Invalid("database error".into()); puts.len()];
         }
-        match txn.commit() {
+        // Test-only fault injection: treat the next commit as a full map so
+        // the rollback path below is exercised without filling a real
+        // environment (the map floor is 16 MiB). The open transaction is
+        // dropped (aborted) with the returned batch.
+        #[cfg(test)]
+        let commit = if store
+            .fail_next_commit
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            Err(heed::Error::Mdb(heed::MdbError::MapFull))
+        } else {
+            txn.commit()
+        };
+        #[cfg(not(test))]
+        let commit = txn.commit();
+        match commit {
             Ok(()) => {
                 return outcomes;
             }
             Err(heed::Error::Mdb(heed::MdbError::MapFull)) => {
                 if !store.grow_map() {
                     // The map cannot grow further: the batch cannot be
-                    // committed, so every reply is revoked.
+                    // committed, so every reply is revoked. Count the
+                    // failure as well: `grow_map` only logs, and the
+                    // relay's health metrics must see a full map.
+                    thread_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     return vec![PutOutcome::Invalid("database error".into()); puts.len()];
                 }
                 // Retry the whole batch in the larger map.
@@ -433,6 +455,12 @@ pub(crate) struct Store {
     /// a popular query repeats over many requests; the scores tolerate a
     /// few minutes of staleness.
     pub(crate) df_cache: Arc<std::sync::Mutex<std::collections::HashMap<String, (u64, u64)>>>,
+    /// Test-only one-shot fault injection: the next `apply_put_batch`
+    /// commit is treated as a `MapFull` failure so the rollback path
+    /// (every put in the batch is revoked) is testable without filling a
+    /// real 16 MiB (map floor) environment.
+    #[cfg(test)]
+    pub(crate) fail_next_commit: std::sync::atomic::AtomicBool,
 }
 
 /// `(created_at, id, protected, group_id, is_meta)` records returned by the
@@ -595,6 +623,8 @@ impl Store {
             indexed_words,
             map_max_size,
             df_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            #[cfg(test)]
+            fail_next_commit: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -665,6 +695,8 @@ impl Store {
             indexed_words: self.indexed_words,
             map_max_size: self.map_max_size,
             df_cache: Arc::clone(&self.df_cache),
+            #[cfg(test)]
+            fail_next_commit: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -1311,8 +1343,19 @@ pub(crate) fn tag_range(name: u8, value: &[u8], since: u64, until: u64) -> (Vec<
 /// that timestamp entirely.
 pub(crate) fn range_end(mut key: Vec<u8>, until: u64) -> Vec<u8> {
     if until == u64::MAX {
-        let id_start = key.len() - ID_LEN;
-        key[id_start..].fill(0xff);
+        // Callers always pass a key with a full 32-byte id tail, but a
+        // short (corrupt) one must not underflow `len - ID_LEN` and panic
+        // the writer mid-removal. Filling the whole key is the safe
+        // fallback: it still sorts above every well-formed key with that
+        // prefix (0xff is the largest byte), so the range is not silently
+        // collapsed to empty and the removal is not dropped.
+        match key.len().checked_sub(ID_LEN) {
+            Some(id_start) => key[id_start..].fill(0xff),
+            None => {
+                log::warn!("range_end called with a short {}-byte key", key.len());
+                key.fill(0xff);
+            }
+        }
         key.push(0);
     }
     key
@@ -1388,6 +1431,36 @@ pub(crate) fn purged_group_key(gid: &str) -> [u8; 32] {
     Sha256::digest(gid.as_bytes()).into()
 }
 
+/// Encodes a [`PURGED_GROUPS`] marker value: `(purge time, cut)`, both BE
+/// u64. The purge time bounds the `kind:9007` re-create exception (only a
+/// create *before* the purge is rejected); the cut bounds `h`-tagged
+/// re-publications (`created_at <= cut` is rejected), and includes the
+/// newest removed event's timestamp so same-second and future-dated
+/// purged content cannot be replayed.
+pub(crate) fn encode_purged_group_marker(purge_now: u64, cut: u64) -> [u8; 16] {
+    let mut value = [0u8; 16];
+    value[..8].copy_from_slice(&purge_now.to_be_bytes());
+    value[8..].copy_from_slice(&cut.to_be_bytes());
+    value
+}
+
+/// Decodes a [`PURGED_GROUPS`] marker value into `(purge time, cut)`.
+/// Legacy 8-byte markers (written before the value carried the purge time)
+/// count as `(cut, cut)`: the purge time is unknown, so reusing the cut
+/// keeps the re-create exception as strict as before, and malformed short
+/// values block nothing (`(0, 0)`).
+pub(crate) fn decode_purged_group_marker(raw: &[u8]) -> (u64, u64) {
+    let u64_at = |bytes: &[u8]| u64::from_be_bytes(bytes.try_into().expect("checked length"));
+    if raw.len() >= 16 {
+        (u64_at(&raw[..8]), u64_at(&raw[8..16]))
+    } else if raw.len() >= 8 {
+        let cut = u64_at(&raw[..8]);
+        (cut, cut)
+    } else {
+        (0, 0)
+    }
+}
+
 /// Tombstone key for an `a`-tag (address) deletion, stored in the
 /// [`DELETED`] table. Event ids are exactly 32 bytes, so the one-byte prefix
 /// keeps the two key spaces disjoint. The `d` tag is normalized like the
@@ -1410,8 +1483,11 @@ impl Store {
     // ----- event persistence -----
 
     /// Whether a NIP-29 purge marker blocks `event`: any `h`-tagged event
-    /// whose `created_at` is strictly before the group's purge cut is a
-    /// re-publication of purged history (see [`PURGED_GROUPS`]).
+    /// with `created_at <= cut` is a re-publication of purged history (see
+    /// [`PURGED_GROUPS`]). The `kind:9007` re-create is the exception: it
+    /// is compared against the purge time alone, so a legitimate re-create
+    /// at (or after) the purge passes even when future-dated purged content
+    /// pushed the cut past it.
     fn purged_groups_blocks(&self, wtxn: &heed::RwTxn, event: &Event) -> Result<bool> {
         if !event.tags.iter().any(|tag| tag.len() >= 2 && tag[0] == "h") {
             return Ok(false);
@@ -1428,11 +1504,13 @@ impl Store {
             let Some(raw) = self.purged_groups.get(wtxn, &purged_group_key(&tag[1]))? else {
                 continue;
             };
-            let cut = raw
-                .get(..8)
-                .map(|bytes| u64::from_be_bytes(bytes.try_into().expect("checked length")))
-                .unwrap_or(0);
-            if event.created_at < cut {
+            let (purge_now, cut) = decode_purged_group_marker(raw);
+            let blocked = if event.kind == crate::nips::nip29::CREATE_GROUP {
+                event.created_at < purge_now
+            } else {
+                event.created_at <= cut
+            };
+            if blocked {
                 return Ok(true);
             }
         }
@@ -1503,12 +1581,13 @@ impl Store {
         // NIP-29: a purged group's history must not re-enter the database
         // after the id is re-created (a re-create installs default-public
         // settings, exposing old private posts). One marker per group id
-        // records the purge cut; events created before it are rejected.
-        // Only events carrying an `h` tag are checked, so ordinary traffic
-        // pays one tag scan at most. The strict comparison lets the
-        // legitimate re-create (and posts made in the purge second) pass:
-        // a purge requires group-admin/relay-key access, so the residual
-        // same-second window is not externally triggerable.
+        // records the purge time and the cut; `h`-tagged events with
+        // `created_at <= cut` are rejected, including same-second and
+        // future-dated events removed by the purge. Only the `kind:9007`
+        // re-create compares against the purge time instead, so it passes
+        // even when the cut was pushed forward. Only events carrying an
+        // `h` tag are checked, so ordinary traffic pays one tag scan at
+        // most.
         if self.purged_groups_blocks(wtxn, event)? {
             return Ok(PutOutcome::PreviouslyDeleted);
         }

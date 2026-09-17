@@ -38,6 +38,14 @@ metrics_enabled = true
 ws_paths = "root"
 inbox_write_policy = "any"
 outbox_write_policy = "any"
+# Reverse-proxy client addresses. List ONLY the proxy's addresses/CIDRs
+# (empty = trust no proxy). Behind nginx/Caddy on the same host this is
+# loopback; behind a cloud load balancer / tunnel it is the balancer's
+# source range. With this set, nostrfy derives the client IP from the LAST
+# untrusted X-Forwarded-For entry for the per-IP caps, the connection rate
+# limit, blockip and the logs. Never add an address that clients can reach
+# directly: they could spoof the header and bypass the per-IP limits.
+trusted_proxies = ["127.0.0.1/32", "::1/128"]
 
 [rpc]
 management_token = ""
@@ -66,7 +74,9 @@ group_late_publish_secs = 3600
 max_api_concurrent = 8
 max_api_limit = 5000
 max_api_offset = 50000
-max_api_fetch = 10000
+# Must cover max_api_offset + max_api_limit + 1, or offsets the offset
+# ceiling advertises are rejected as over the fetch window.
+max_api_fetch = 55001
 max_api_search_bytes = 2048
 max_out_queue_bytes = 262144
 ws_idle_timeout_secs = 300
@@ -94,7 +104,9 @@ max_db_queue_events = 262144
 max_db_queue_bytes = 268435456
 
 [daemon]
-# Foreground mode under systemd: these are unused but must be non-empty.
+# The systemd unit runs foreground mode, which still writes pid_file (removed
+# on exit) and stats_file, so `nostrfy stats`/`stop` work; log_file is only
+# used in daemon mode (systemd captures stderr in the journal).
 pid_file = "/var/lib/nostrfy/nostrfy.pid"
 log_file = "/var/lib/nostrfy/nostrfy.log"
 stats_file = "/var/lib/nostrfy/nostrfy.stats.json"

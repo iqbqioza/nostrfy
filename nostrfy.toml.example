@@ -99,7 +99,8 @@ new_pubkey_min_age_secs = 0
 max_events_per_min_per_pubkey = 0
 
 # Cap on the in-memory NIP-29 group store (active groups + deleted-group
-# markers). Creates beyond it are rejected; 0 = unlimited.
+# markers). Creates beyond it are rejected; must be at least 1 (0 would be
+# unlimited, which lets group-id churn exhaust memory).
 max_groups = 1000
 
 # Require every connection to perform the NIP-42 AUTH flow before REQ and
@@ -173,6 +174,21 @@ inbox_write_policy = "any"
 #   relay - only events authored by the relay's own pubkey are accepted
 #           (requires relay.private_key)
 outbox_write_policy = "any"
+
+# Trusted reverse-proxy addresses or CIDR ranges (empty = trust no proxy).
+# When the TCP peer matches one, the client address used for the per-IP
+# connection caps, the per-IP connect rate limit, NIP-86 blockip and the
+# connection logs comes from the right-most untrusted `X-Forwarded-For`
+# entry (absent/malformed falls back to the peer). IPv6 clients are
+# accounted by their /64 prefix. Set this when nginx, Caddy, a cloud load
+# balancer or a tunnel terminates TLS in front: without it every client is
+# seen as the proxy's address, the default max_connections_per_ip = 64
+# caps the whole relay at 64 clients, and blockip blocks the proxy.
+#   trusted_proxies = ["127.0.0.1/32", "::1/128"]   # proxy on this host
+# WARNING: never list an address clients can reach directly — they could
+# then spoof the header and bypass the per-IP limits. Fixed at startup:
+# changing it requires a restart.
+trusted_proxies = []
 
 # -----------------------------------------------------------------------------
 # Management API (NIP-86)
@@ -256,7 +272,9 @@ max_tag_value_bytes = 1024
 max_created_at_future_secs = 3600
 
 # NIP-77: maximum number of records a single NEG-OPEN may process; queries
-# exceeding this are rejected with a NEG-ERR carrying the cap.
+# exceeding this are rejected with a NEG-ERR carrying the cap. The whole
+# sync window is held in memory: above 1,000,000 warns, above 10,000,000 is
+# rejected as a unit-typo mistake.
 max_neg_items = 100000
 
 # Maximum total bytes of subscription filters held per connection.
@@ -320,7 +338,8 @@ live_buffer = 65536
 # socket in bounded chunks as it drains, so a slow reader cannot pin more
 # than max_out_queue_bytes in the queue — or more than this budget per
 # response. Beyond the budget the subscription is closed with
-# `CLOSED ... response too large`. 0 disables the budget.
+# `CLOSED ... response too large`. 0 disables the budget. Above 512 MiB
+# warns; above 2 GiB is rejected (one response could exhaust memory).
 max_req_response_bytes = 33554432
 
 # -----------------------------------------------------------------------------

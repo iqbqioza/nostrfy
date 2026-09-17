@@ -239,7 +239,7 @@ impl RoleStore {
     /// key are honored (NIP-43: these MUST be signed by the `self` pubkey).
     ///
     /// Returns `false` when the rebuild could not be completed (the database
-    /// did not answer, or the scan budget was exhausted mid-page): the
+    /// did not answer, or a page boundary could not be verified): the
     /// caller must not persist or serve a partially-rebuilt role store and
     /// aborts startup. The history is streamed in ascending pages and
     /// applied as it arrives, so memory stays bounded by one page.
@@ -288,18 +288,14 @@ impl RoleStore {
             if page.is_empty() {
                 break;
             }
-            let full = page.len() >= PAGE;
-            if !full && more {
-                log::error!(
-                    "role state rebuild aborted: the scan budget was exhausted with {} events \
-                     in the page, so the history is incomplete",
-                    page.len()
-                );
-                return false;
-            }
-            if full && more {
-                // The collector's hard caps can cut the boundary second
-                // while the page still reports `more`.
+            if more {
+                // The collector stopped early: the count cap with a full
+                // page, but also the 64 MiB byte cap or the work budget
+                // with a short page. Verify the boundary second (the newest
+                // here) and continue past it instead of failing the whole
+                // rebuild; a boundary that cannot be verified (a store
+                // error, or a second larger than the verify budget) stays
+                // fatal (fail-closed).
                 let boundary = page.last().map(|e| e.created_at).unwrap_or(0);
                 let delivered = page.iter().filter(|e| e.created_at == boundary).count();
                 if !crate::nips::nip29::boundary_second_complete(
@@ -371,7 +367,9 @@ impl RoleStore {
                     _ => {}
                 }
             }
-            if !full {
+            if !more {
+                // The collector reported no truncation: every remaining
+                // event was collected.
                 break;
             }
             match max_created {

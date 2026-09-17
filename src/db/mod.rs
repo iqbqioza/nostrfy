@@ -162,7 +162,9 @@ enum Msg {
         request_created: u64,
         /// NIP-29 9005 moderation: restrict deletion to events of this group.
         group: Option<String>,
-        reply: oneshot::Sender<usize>,
+        /// `None` when the removal walk failed: the checked callers must not
+        /// treat a skipped deletion as success.
+        reply: oneshot::Sender<Option<usize>>,
     },
     /// NIP-29 `kind:9008`: purge every stored event of a deleted group, so a
     /// later re-creation of the id cannot expose the old history.
@@ -178,14 +180,18 @@ enum Msg {
         /// NIP-62: events up to this created_at (the request's `.created_at`)
         /// are deleted.
         until_created: u64,
-        /// `(removed events, whether a NIP-29 state event was among them)`:
-        /// only the latter requires the group state to be rebuilt.
-        reply: oneshot::Sender<(usize, bool)>,
+        /// `Some((removed events, whether a NIP-29/NIP-43 state event was
+        /// among them))`, or `None` when the walk failed (no marker is
+        /// written, so the checked caller does not report success): only a
+        /// removed state event requires the derived state to be rebuilt.
+        reply: oneshot::Sender<Option<(usize, bool)>>,
     },
     /// NIP-59: delete gift wraps addressed to a pubkey (on NIP-09 deletion).
     GiftWrapPurge {
         pubkey: Vec<u8>,
-        reply: oneshot::Sender<usize>,
+        /// `None` when the walk failed: the checked caller must not treat a
+        /// skipped purge as success.
+        reply: oneshot::Sender<Option<usize>>,
     },
     PrefixExists {
         prefix: Vec<u8>,
@@ -243,25 +249,28 @@ enum Msg {
         reply: oneshot::Sender<bool>,
     },
     /// Persists the NIP-29 group state snapshot (write-through on every
-    /// group mutation).
+    /// group mutation). The reply reports whether the commit succeeded, so
+    /// the relay cannot treat an uncommitted save as durable.
     SaveGroups {
         snapshot: crate::nips::nip29::GroupsSnapshot,
-        reply: oneshot::Sender<()>,
+        reply: oneshot::Sender<bool>,
     },
     /// Loads the persisted NIP-29 group state snapshot.
     LoadGroups {
         reply: oneshot::Sender<Option<crate::nips::nip29::GroupsSnapshot>>,
     },
     /// Drops the persisted NIP-29 group state snapshot (a post-vanish
-    /// rebuild failure must not leave a stale snapshot behind).
+    /// rebuild failure must not leave a stale snapshot behind). The reply
+    /// reports whether the commit succeeded: an overload fail-fast must not
+    /// silently skip this fail-closed clear.
     ClearGroupsSnapshot {
-        reply: oneshot::Sender<()>,
+        reply: oneshot::Sender<bool>,
     },
     /// Persists the NIP-43 role state snapshot (write-through on every
-    /// role mutation).
+    /// role mutation). The reply reports whether the commit succeeded.
     SaveRoles {
         snapshot: crate::nips::nip43::RolesSnapshot,
-        reply: oneshot::Sender<()>,
+        reply: oneshot::Sender<bool>,
     },
     /// Loads the persisted NIP-43 role state snapshot.
     LoadRoles {
@@ -320,9 +329,12 @@ enum Msg {
     BlossomMarkMigration {
         reply: oneshot::Sender<()>,
     },
+    /// NIP-40 expiration purge: `(removed events, whether a NIP-29/NIP-43
+    /// state event was among them)`. The second field lets the caller
+    /// rebuild the derived state only when it actually changed.
     PurgeExpired {
         now: u64,
-        reply: oneshot::Sender<usize>,
+        reply: oneshot::Sender<(usize, bool)>,
     },
     DatabaseSize {
         reply: oneshot::Sender<u64>,
@@ -1018,6 +1030,10 @@ impl DbClient {
         .await
     }
 
+    /// Plain query used by tests: production paths use [`Self::query_req`]
+    /// (WS visibility slack), [`Self::query_full_startup`] (fail-closed) or
+    /// the reported variants.
+    #[cfg(test)]
     pub async fn query(&self, filters: Vec<Filter>, limit: usize, now: u64) -> (Vec<Event>, bool) {
         self.query_directed(filters, limit, now, false, 0).await
     }
@@ -1381,8 +1397,9 @@ impl DbClient {
             .unwrap_or(0)
     }
 
-    /// Like [`Self::apply_deletion`], reporting a fail-fast/lost writer as
-    /// `None` so the caller does not treat a skipped deletion as success.
+    /// Like [`Self::apply_deletion`], reporting a fail-fast/lost writer or
+    /// a failed removal walk as `None` so the caller does not treat a
+    /// skipped deletion as success.
     pub async fn apply_deletion_checked(
         &self,
         targets: Vec<String>,
@@ -1390,7 +1407,7 @@ impl DbClient {
         request_pubkey: Option<String>,
         request_created: u64,
     ) -> Option<usize> {
-        self.request_write_checked(|reply| Msg::Delete {
+        self.request_write(|reply| Msg::Delete {
             targets,
             addresses,
             request_pubkey,
@@ -1403,8 +1420,23 @@ impl DbClient {
 
     /// NIP-29 `kind:9005`: deletes the `e`-tag targets but only when they
     /// belong to `group`, so a group admin cannot delete another group's
-    /// events.
+    /// events. Test-only: production callers must use the checked variant
+    /// so a dropped side effect is not reported as success.
+    #[cfg(test)]
     pub async fn apply_group_deletion(&self, targets: Vec<String>, group: String) -> usize {
+        self.apply_group_deletion_checked(targets, group)
+            .await
+            .unwrap_or(0)
+    }
+
+    /// Like [`Self::apply_group_deletion`], reporting a fail-fast/lost
+    /// writer or a failed removal walk as `None` so the caller does not
+    /// treat a skipped deletion as success.
+    pub async fn apply_group_deletion_checked(
+        &self,
+        targets: Vec<String>,
+        group: String,
+    ) -> Option<usize> {
         self.request_write(|reply| Msg::Delete {
             targets,
             addresses: Vec::new(),
@@ -1462,16 +1494,18 @@ impl DbClient {
             .unwrap_or(0)
     }
 
-    /// Like [`Self::apply_vanish`], reporting a fail-fast/lost writer as
-    /// `None`. The second element of the tuple is true when the removed
-    /// history contained a NIP-29 state event, so the group state must be
-    /// rebuilt (a plain post deletion does not change the derived state).
+    /// Like [`Self::apply_vanish`], reporting a fail-fast/lost writer or a
+    /// failed removal walk as `None` (in which case no vanish marker was
+    /// written, so the re-delivered request must finish the removal). The
+    /// second element of the tuple is true when the removed history
+    /// contained a NIP-29/NIP-43 state event, so the derived state must be
+    /// rebuilt (a plain post deletion does not change it).
     pub async fn apply_vanish_checked(
         &self,
         pubkey: [u8; 32],
         until_created: u64,
     ) -> Option<(usize, bool)> {
-        self.request_write_checked(|reply| Msg::Vanish {
+        self.request_write(|reply| Msg::Vanish {
             pubkey: pubkey.to_vec(),
             until_created,
             reply,
@@ -1486,9 +1520,9 @@ impl DbClient {
     }
 
     /// Like [`Self::delete_gift_wraps_to`], reporting a fail-fast/lost
-    /// writer as `None`.
+    /// writer or a failed removal walk as `None`.
     pub async fn delete_gift_wraps_to_checked(&self, pubkey: [u8; 32]) -> Option<usize> {
-        self.request_write_checked(|reply| Msg::GiftWrapPurge {
+        self.request_write(|reply| Msg::GiftWrapPurge {
             pubkey: pubkey.to_vec(),
             reply,
         })
@@ -1572,13 +1606,13 @@ impl DbClient {
     }
 
     /// Persists the NIP-29 group state snapshot (write-through: call after
-    /// every group mutation). Fire-and-forget like the other saves: the
-    /// writer always replies, and a failed commit only logs (the next
-    /// mutation retries the full snapshot).
-    pub async fn save_groups(&self, snapshot: crate::nips::nip29::GroupsSnapshot) {
-        let _ = self
-            .request_write(|reply| Msg::SaveGroups { snapshot, reply })
-            .await;
+    /// every group mutation). The returned bool reports whether the commit
+    /// succeeded: on `false` (including an overload fail-fast or a lost
+    /// writer) the caller must keep the state pending and retry instead of
+    /// treating the snapshot as durable.
+    pub async fn save_groups(&self, snapshot: crate::nips::nip29::GroupsSnapshot) -> bool {
+        self.request_write(|reply| Msg::SaveGroups { snapshot, reply })
+            .await
     }
 
     /// Loads the persisted NIP-29 group state snapshot at startup.
@@ -1592,20 +1626,20 @@ impl DbClient {
 
     /// Drops the persisted NIP-29 group state snapshot: the next startup
     /// rebuilds from the surviving events instead of restoring state that
-    /// predates a vanish. Fire-and-forget like the save.
-    pub async fn clear_groups_snapshot(&self) {
-        let _ = self
-            .request_write(|reply| Msg::ClearGroupsSnapshot { reply })
-            .await;
+    /// predates a vanish. The returned bool reports whether the commit
+    /// succeeded: on `false` the caller must not assume the fail-closed
+    /// clear happened (the next startup could restore the stale snapshot).
+    pub async fn clear_groups_snapshot(&self) -> bool {
+        self.request_write(|reply| Msg::ClearGroupsSnapshot { reply })
+            .await
     }
 
     /// Persists the NIP-43 role state snapshot (write-through: call after
-    /// every role mutation). Same fire-and-forget semantics as
+    /// every role mutation). Same commit-success semantics as
     /// [`Self::save_groups`].
-    pub async fn save_roles(&self, snapshot: crate::nips::nip43::RolesSnapshot) {
-        let _ = self
-            .request_write(|reply| Msg::SaveRoles { snapshot, reply })
-            .await;
+    pub async fn save_roles(&self, snapshot: crate::nips::nip43::RolesSnapshot) -> bool {
+        self.request_write(|reply| Msg::SaveRoles { snapshot, reply })
+            .await
     }
 
     /// Loads the persisted NIP-43 role state snapshot at startup (see
@@ -1773,7 +1807,10 @@ impl DbClient {
             .await;
     }
 
-    pub async fn purge_expired(&self, now: u64) -> usize {
+    /// NIP-40 expiration purge: `(removed events, whether a NIP-29/NIP-43
+    /// state event was among them)`. The caller rebuilds the derived state
+    /// only when the second field is true.
+    pub async fn purge_expired(&self, now: u64) -> (usize, bool) {
         self.request_write(|reply| Msg::PurgeExpired { now, reply })
             .await
     }

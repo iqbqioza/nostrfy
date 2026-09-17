@@ -250,7 +250,7 @@ fn expired_events_are_filtered() {
             )
             .await;
         assert!(res.is_empty());
-        assert_eq!(db.purge_expired(now).await, 1);
+        assert_eq!(db.purge_expired(now).await, (1, false));
 
         // Query filtering must use the earliest value when multiple
         // expiration tags are present, matching storage and purge semantics.
@@ -270,8 +270,54 @@ fn expired_events_are_filtered() {
             )
             .await;
         assert!(res.is_empty());
-        assert_eq!(db.purge_expired(now).await, 1);
+        assert_eq!(db.purge_expired(now).await, (1, false));
     });
+}
+
+#[test]
+fn purge_expired_reports_group_state_removals() {
+    // NIP-40: removing an expired NIP-29/NIP-43 state event must tell the
+    // caller to rebuild the derived state; an ordinary expired post must
+    // not.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        db.set_expiry_enabled(false);
+        let mut moderation = event(9000, "mod", now - 100, vec![]);
+        moderation.tags = vec![
+            vec!["h".into(), "group-exp".into()],
+            vec!["expiration".into(), (now - 50).to_string()],
+        ];
+        let mut role = event(
+            crate::nips::nip43::MEMBERSHIP_LIST,
+            "members",
+            now - 100,
+            vec![],
+        );
+        role.tags = vec![vec!["expiration".into(), (now - 50).to_string()]];
+        let mut post = event(1, "post", now - 100, vec![]);
+        post.tags = vec![vec!["expiration".into(), (now - 50).to_string()]];
+        for e in [&moderation, &role, &post] {
+            assert_eq!(db.put(e.clone(), now).await, PutOutcome::Stored);
+        }
+        db.set_expiry_enabled(true);
+        assert_eq!(
+            db.purge_expired(now).await,
+            (3, true),
+            "a removed NIP-29/NIP-43 state event must request a rebuild"
+        );
+    });
+    db.shutdown();
 }
 
 #[test]
@@ -549,6 +595,41 @@ fn deletion_requests_are_never_deleted() {
             1
         );
     });
+}
+
+#[test]
+fn deletion_by_e_tag_ignores_the_request_timestamp() {
+    // NIP-09's created_at cut applies to `a` (addressable) targets only. The
+    // relay accepts events up to 3600 s in the future, so applying the cut
+    // to `e` targets made a clock-skewed post undeletable while its deletion
+    // was acknowledged.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let pk = "0000000000000000000000000000000000000000000000000000000000000000";
+        let skewed = event(1, "clock skewed", now + 500, vec![]);
+        assert_eq!(db.put(skewed.clone(), now).await, PutOutcome::Stored);
+        assert_eq!(
+            db.apply_deletion(vec![skewed.id.clone()], vec![], Some(pk.into()), now)
+                .await,
+            1,
+            "an e target is deleted regardless of its created_at"
+        );
+        let f: Filter = serde_json::from_value(serde_json::json!({"ids": [skewed.id]})).unwrap();
+        let (res, _) = db.query(vec![f], 10, now).await;
+        assert!(res.is_empty(), "the skewed target must be gone");
+    });
+    db.shutdown();
 }
 
 #[test]
@@ -877,6 +958,51 @@ fn map_grows_beyond_initial_size() {
             "the bulk writes must allocate new pages"
         );
     });
+}
+
+#[test]
+fn failed_commit_revokes_every_put_in_the_batch() {
+    // A commit failure (MapFull) must roll the whole batch back: every put
+    // is answered Invalid, nothing becomes queryable, and the failure is
+    // counted. The map floor is 16 MiB, so the test-only fault hook makes
+    // the next commit fail instead of filling a real environment.
+    let store = crate::db::store::Store::open(
+        &config(),
+        Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        128,
+    )
+    .unwrap();
+    let errors = Arc::new(Default::default());
+    let now = 1_700_000_000u64;
+    let puts: Vec<(Arc<Event>, u64)> = (0..3)
+        .map(|i| (Arc::new(event(1, &format!("batch-{i}"), now, vec![])), now))
+        .collect();
+    let ids: Vec<[u8; 32]> = puts
+        .iter()
+        .map(|(e, _)| e.id_bytes().expect("valid id"))
+        .collect();
+    store
+        .fail_next_commit
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let first_seen = vec![None; puts.len()];
+    let outcomes = crate::db::store::apply_put_batch(&store, &errors, None, &puts, &first_seen);
+    assert_eq!(outcomes.len(), puts.len());
+    assert!(
+        outcomes.iter().all(|o| matches!(o, PutOutcome::Invalid(_))),
+        "every put in the failed batch must be revoked: {outcomes:?}"
+    );
+    let rtxn = store.env.read_txn().unwrap();
+    for id in &ids {
+        assert!(
+            store.events.get(&rtxn, id).unwrap().is_none(),
+            "a failed batch must not leave events behind"
+        );
+    }
+    assert_eq!(
+        errors.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "the commit failure must be counted"
+    );
 }
 
 #[test]
@@ -1601,13 +1727,15 @@ fn purged_group_history_cannot_be_republished() {
             PutOutcome::PreviouslyDeleted
         );
         // Events created after the cut pass (the re-create and new posts).
+        // The bound is inclusive of the purge second, so a same-second post
+        // is blocked; only strictly newer events pass.
         let fresh = event(
             1,
             "after the purge",
-            now,
+            now + 1,
             vec![vec!["h".into(), "group-9".into()]],
         );
-        assert_eq!(db.put(fresh, now).await, PutOutcome::Stored);
+        assert_eq!(db.put(fresh, now + 1).await, PutOutcome::Stored);
         // Unrelated groups and untagged events are unaffected: fresh events
         // (same age range as the purged one) are still accepted.
         let other_new = event(
@@ -1625,12 +1753,194 @@ fn purged_group_history_cannot_be_republished() {
         let fresh = event(
             1,
             "after the purge",
-            now,
+            now + 1,
             vec![vec!["h".into(), "group-9".into()]],
         );
         assert_eq!(db.put(fresh, now + 1).await, PutOutcome::PreviouslyDeleted);
     });
     db.shutdown();
+}
+
+#[test]
+fn purge_marker_blocks_same_second_and_future_dated_replays() {
+    // #121 regression: the marker used a strict `<` against the purge time,
+    // so an event purged in the purge second (or a future-dated event the
+    // relay accepted) could be replayed after a re-create. The cut now
+    // covers every removed event's timestamp inclusively, while the
+    // kind:9007 re-create compares against the purge time only.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let tagged = |content: &str, created: u64, kind: u64| {
+            event(
+                kind,
+                content,
+                created,
+                vec![vec!["h".into(), "group-marker".into()]],
+            )
+        };
+        let old = tagged("old", now - 100, 1);
+        let same = tagged("same second", now, 1);
+        let future = tagged("future dated", now + 1_000, 1);
+        for e in [&old, &same, &future] {
+            assert_eq!(db.put(e.clone(), now).await, PutOutcome::Stored);
+        }
+        assert_eq!(db.group_purge("group-marker".into(), now).await, 3);
+
+        // Every removed generation is rejected on replay: older, same
+        // second and future dated alike.
+        for e in [&old, &same, &future] {
+            assert_eq!(
+                db.put(e.clone(), now).await,
+                PutOutcome::PreviouslyDeleted,
+                "a purged event must not be replayable"
+            );
+        }
+        // A re-create at the purge second passes even though the
+        // future-dated removed event pushed the cut past it.
+        let recreate = tagged("re-create", now, 9007);
+        assert_eq!(db.put(recreate, now).await, PutOutcome::Stored);
+        // A post between the purge and the removed future event is blocked
+        // by the raised cut; one past it passes.
+        let inside = tagged("inside the cut", now + 500, 1);
+        assert_eq!(
+            db.put(inside, now + 500).await,
+            PutOutcome::PreviouslyDeleted
+        );
+        let after = tagged("after the cut", now + 2_000, 1);
+        assert_eq!(db.put(after, now + 2_000).await, PutOutcome::Stored);
+    });
+    db.shutdown();
+}
+
+#[test]
+fn group_purge_marker_merges_and_keeps_one_record() {
+    // The marker value is `(purge time, cut)`: one fixed record per group,
+    // merged on re-purge by keeping the furthest purge time and cut, and
+    // readable after a reopen (legacy 8-byte markers mean `(cut, cut)`).
+    use crate::db::store::{
+        Store, decode_purged_group_marker, encode_purged_group_marker, purged_group_key,
+    };
+    let store = Store::open(
+        &config(),
+        Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        128,
+    )
+    .unwrap();
+    let now = 1_700_000_000u64;
+    let gid = "marker-merge";
+    let tagged = |content: &str, created: u64| {
+        event(1, content, created, vec![vec!["h".into(), gid.into()]])
+    };
+    for (i, created) in [now - 100, now - 10, now].into_iter().enumerate() {
+        let e = tagged(&format!("m{i}"), created);
+        let mut wtxn = store.env.write_txn().unwrap();
+        assert_eq!(
+            store.put_event_in(&mut wtxn, &e, now).unwrap(),
+            PutOutcome::Stored
+        );
+        wtxn.commit().unwrap();
+    }
+    assert_eq!(store.purge_group(gid, now).unwrap(), 3);
+    let key = purged_group_key(gid);
+    {
+        let rtxn = store.env.read_txn().unwrap();
+        assert_eq!(store.purged_groups.len(&rtxn).unwrap(), 1);
+        let raw = store.purged_groups.get(&rtxn, &key).unwrap().unwrap();
+        assert_eq!(raw.len(), 16, "the marker carries (purge time, cut)");
+        assert_eq!(decode_purged_group_marker(raw), (now, now));
+    }
+    // A future-dated event is removed by a later purge and raises the cut.
+    let future = tagged("future", now + 300);
+    let mut wtxn = store.env.write_txn().unwrap();
+    assert_eq!(
+        store.put_event_in(&mut wtxn, &future, now).unwrap(),
+        PutOutcome::Stored
+    );
+    wtxn.commit().unwrap();
+    assert_eq!(store.purge_group(gid, now).unwrap(), 1);
+    // A later purge with a smaller `now` keeps the larger purge time/cut.
+    assert_eq!(store.purge_group(gid, now - 50).unwrap(), 0);
+    let rtxn = store.env.read_txn().unwrap();
+    assert_eq!(store.purged_groups.len(&rtxn).unwrap(), 1);
+    let raw = store.purged_groups.get(&rtxn, &key).unwrap().unwrap();
+    assert_eq!(
+        decode_purged_group_marker(raw),
+        (now, now + 300),
+        "the purge time and cut must not regress"
+    );
+    // Round trip and the legacy 8-byte marker read as `(cut, cut)`.
+    assert_eq!(
+        decode_purged_group_marker(&encode_purged_group_marker(7, 9)),
+        (7, 9)
+    );
+    assert_eq!(decode_purged_group_marker(&7u64.to_be_bytes()), (7, 7));
+}
+
+#[test]
+fn purge_marker_survives_reopen() {
+    // Durability: the marker is persisted with the database, so a restart
+    // cannot let the purged history back in.
+    let cfg = config();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let now = unix_now();
+        let tagged = |content: &str, created: u64| {
+            event(
+                1,
+                content,
+                created,
+                vec![vec!["h".into(), "reopen-group".into()]],
+            )
+        };
+        let old = tagged("old", now - 10);
+        let same = tagged("same", now);
+        {
+            let db = DbClient::open(
+                &cfg,
+                true,
+                Arc::new(Default::default()),
+                0,
+                128,
+                4096,
+                262144,
+            )
+            .unwrap();
+            for e in [&old, &same] {
+                assert_eq!(db.put(e.clone(), now).await, PutOutcome::Stored);
+            }
+            assert_eq!(db.group_purge("reopen-group".into(), now).await, 2);
+            db.shutdown();
+        }
+        let db = DbClient::open(
+            &cfg,
+            true,
+            Arc::new(Default::default()),
+            0,
+            128,
+            4096,
+            262144,
+        )
+        .unwrap();
+        for e in [&old, &same] {
+            assert_eq!(
+                db.put(e.clone(), now).await,
+                PutOutcome::PreviouslyDeleted,
+                "the persisted marker must block the replay after a restart"
+            );
+        }
+        db.shutdown();
+    });
 }
 
 #[test]
@@ -2442,7 +2752,7 @@ fn events_stored_while_nip40_was_disabled_are_purged_on_reenable() {
         db.set_expiry_enabled(true);
         assert_eq!(
             db.purge_expired(now).await,
-            1,
+            (1, false),
             "the event stored while disabled must be purged"
         );
         let f: Filter = serde_json::from_value(serde_json::json!({"ids": [ev.id]})).unwrap();
@@ -3405,7 +3715,7 @@ fn purged_replaceable_can_be_re_published() {
         assert_eq!(db.put(v1.clone(), now).await, PutOutcome::Stored);
         assert_eq!(db.put(v2.clone(), now).await, PutOutcome::Replaced);
         // Later, the purge removes v2 and must clear the slot.
-        assert_eq!(db.purge_expired(now + 10).await, 1);
+        assert_eq!(db.purge_expired(now + 10).await, (1, false));
         assert_eq!(
             db.put(v1.clone(), now).await,
             PutOutcome::Stored,
@@ -4187,6 +4497,109 @@ fn corrupt_event_cleanup_is_bounded_by_the_scan_cap() {
             .is_some(),
         "the capped walk leaves the dangling index entry behind"
     );
+}
+
+#[test]
+fn corrupt_short_keys_do_not_panic_the_removal_walks() {
+    // Bitrot can leave index keys shorter than an id. The walks used to
+    // slice `key[key.len() - ID_LEN..]`, panicking the writer and silently
+    // dropping the removal; they must skip the corrupt key and still remove
+    // the valid entries. The checked DbClient API is exercised over the
+    // corrupted tables (a failed walk would report None / zero).
+    use crate::db::store::{ID_LEN, Store, tag_key};
+    let cfg = config();
+    let now = 1_700_000_000u64;
+    // NIP-40 disabled while seeding: an already-expired event is still
+    // stored (and indexed) so the purge walk can run over it.
+    let store = Store::open(
+        &cfg,
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        128,
+    )
+    .unwrap();
+    let authored = |kind: u64, content: &str, pk: &str, created: u64, tags: Vec<Vec<String>>| {
+        let mut e = event(kind, content, created, tags);
+        e.pubkey = pk.to_string();
+        e.id = nip01::compute_id(&e);
+        e
+    };
+    let gid = "corrupt-group";
+    let h_event = authored(
+        1,
+        "h",
+        &"11".repeat(32),
+        now,
+        vec![vec!["h".into(), gid.into()]],
+    );
+    let author_event = authored(1, "author", &"00".repeat(32), now, vec![]);
+    let exp_event = authored(
+        1,
+        "expiring",
+        &"22".repeat(32),
+        now - 100,
+        vec![vec!["expiration".into(), (now - 50).to_string()]],
+    );
+    let mut wtxn = store.env.write_txn().unwrap();
+    for e in [&h_event, &author_event, &exp_event] {
+        assert_eq!(
+            store.put_event_in(&mut wtxn, e, now).unwrap(),
+            PutOutcome::Stored
+        );
+    }
+    // by_tag (purge walk): a short key inside the group's range. It keeps
+    // the tag prefix and diverges inside the created field, so it sorts
+    // after the range start and before the valid key.
+    let mut short_tag = tag_key(b'h', gid.as_bytes(), 0, &[0u8; ID_LEN]);
+    let prefix = 1 + 1 + 4 + gid.len();
+    short_tag.truncate(prefix + 8);
+    *short_tag.last_mut().unwrap() = 0xff;
+    assert!(short_tag.len() < ID_LEN);
+    store.by_tag.put(&mut wtxn, &short_tag, b"").unwrap();
+    // by_pubkey (vanish walk): the 32-byte pubkey prefix means a key
+    // shorter than ID_LEN sorts outside the range, so insert a corrupt
+    // 40-byte key that extracts a bogus id (the walk must skip it).
+    let mut short_pubkey = vec![0u8; 40];
+    short_pubkey[ID_LEN + 7] = 1;
+    store.by_pubkey.put(&mut wtxn, &short_pubkey, b"").unwrap();
+    // expiry (purge walk): a 9-byte key with a timestamp below `now` and a
+    // byte above the range start.
+    let mut short_expiry = vec![0u8; 8];
+    short_expiry.push(0xff);
+    assert!(short_expiry.len() < ID_LEN);
+    store.expiry.put(&mut wtxn, &short_expiry, b"").unwrap();
+    wtxn.commit().unwrap();
+    drop(store);
+
+    let db = DbClient::open(
+        &cfg,
+        false,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        assert_eq!(
+            db.group_purge(gid.into(), now).await,
+            1,
+            "the valid event is still purged"
+        );
+        assert_eq!(
+            db.apply_vanish_checked([0u8; 32], now).await,
+            Some((1, false)),
+            "the valid event is still vanished"
+        );
+        db.set_expiry_enabled(true);
+        assert_eq!(
+            db.purge_expired(now).await,
+            (1, false),
+            "the valid expired event is still purged"
+        );
+    });
+    db.shutdown();
 }
 
 #[test]
