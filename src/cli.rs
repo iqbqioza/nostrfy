@@ -1889,9 +1889,22 @@ name = \"nostrfy\"\n",
         wait_for_ready_within(&cfg, None, Duration::from_secs(1)).unwrap();
         drop(wildcard);
 
-        // A free (closed) port fails with a clear message.
-        let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let free_port = free.local_addr().unwrap().port();
+        // A free (closed) port fails with a clear message. Use a fixed
+        // non-ephemeral port: a freshly released ephemeral port can be
+        // re-bound by a concurrently running test's `bind(..:0)` in the
+        // window before the probe, and the probe would then connect to
+        // that foreign listener and wrongly report readiness (observed on
+        // the FreeBSD CI runner). Ports in the 8765-8795 range are never
+        // handed out by `bind(..:0)` on Linux or FreeBSD, so nothing but
+        // this test can occupy one.
+        let mut picked = None;
+        for port in 8765..=8795u16 {
+            if let Ok(listener) = std::net::TcpListener::bind(("127.0.0.1", port)) {
+                picked = Some((listener, port));
+                break;
+            }
+        }
+        let (free, free_port) = picked.expect("a fixed test port must be bindable");
         drop(free);
         cfg.server.host = "127.0.0.1".into();
         cfg.server.port = free_port;
