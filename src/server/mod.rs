@@ -441,13 +441,19 @@ pub async fn run_server(config_path: PathBuf, config: Config, db: DbClient) -> R
     // when no snapshot was ever written (pre-persistence database) fall
     // back to replaying the stored moderation events, then persist the
     // result so later restarts skip the replay.
-    if relay.config.read().await.nip_enabled(29) {
-        match relay.db.load_groups().await {
-            Some(snap) => {
-                relay.groups.write().await.restore(snap);
-                info!("NIP-29 group state restored from the database snapshot");
-            }
-            None => {
+    // The group store gates read visibility (private/hidden groups) even
+    // when NIP-29 is disabled: restoring the persisted snapshot must not
+    // depend on the toggle, or disabling the NIP would make stored private
+    // content world-readable until it is re-enabled. The replay/rebuild
+    // migration only runs when the NIP is enabled.
+    let groups_enabled = relay.config.read().await.nip_enabled(29);
+    match relay.db.load_groups().await {
+        Some(snap) => {
+            relay.groups.write().await.restore(snap);
+            info!("NIP-29 group state restored from the database snapshot");
+        }
+        None => {
+            if groups_enabled {
                 if !relay.groups.write().await.rebuild(&relay.db).await {
                     return Err(anyhow::anyhow!(
                         "NIP-29 group state rebuild failed: refusing to start with an \
@@ -457,12 +463,12 @@ pub async fn run_server(config_path: PathBuf, config: Config, db: DbClient) -> R
                 relay.persist_groups().await;
             }
         }
-        if relay.has_relay_key() {
-            info!(
-                "NIP-29 groups enabled (relay key {})",
-                relay.relay_pubkey().unwrap_or_default()
-            );
-        }
+    }
+    if groups_enabled && relay.has_relay_key() {
+        info!(
+            "NIP-29 groups enabled (relay key {})",
+            relay.relay_pubkey().unwrap_or_default()
+        );
     }
 
     // Same lifecycle for the NIP-43 role store: snapshot first, replay
@@ -1576,6 +1582,12 @@ async fn reload_handler(
                                 "configuration reload rejected because startup-only settings \
                                  changed; restart is required to apply them"
                             );
+                            // The database-backed lists are independent of the
+                            // config file: re-read them even though the file
+                            // change was rejected, or a CLI ban/allowlist
+                            // update would not be applied while the CLI still
+                            // reports success.
+                            relay.reload_db_state().await;
                             continue;
                         }
                         db.set_expiry_enabled(new_config.nip_enabled(40));

@@ -107,6 +107,31 @@ impl BlobStore {
     /// A directory on the blob filesystem where uploads may be spooled, so
     /// the final store is a rename instead of a second full write (None for
     /// S3, which keeps the system temp directory).
+    /// Removes spool files left behind by a crash (the Drop cleanup cannot
+    /// run on SIGKILL/power loss) so they do not accumulate until the disk
+    /// is full. Only this process's prefix is touched, and a removal
+    /// failure is ignored (best effort).
+    pub(crate) fn sweep_stale_spools(&self) {
+        let mut dirs = vec![std::env::temp_dir()];
+        if let Some(dir) = self.spool_dir() {
+            dirs.push(dir);
+        }
+        for dir in dirs {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                if entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("nostrfy-blossom-")
+                {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+    }
+
     pub(crate) fn spool_dir(&self) -> Option<PathBuf> {
         match &self.storage {
             Storage::Local(s) => Some(s.root.join(".spool")),
@@ -211,7 +236,15 @@ impl BlobStore {
         };
         let _blob_guard = self.blob_lock(sha256).await;
         let uploaded = crate::util::unix_now() as i64;
-        let existing = self.db.blossom_load(sha256).await;
+        // A failed read must not be mistaken for "no mapping yet": the
+        // rollback below would then delete a valid pre-existing owner
+        // mapping (the blob becomes unreachable) when the storage write
+        // fails.
+        let Some(existing) = self.db.blossom_load_checked(sha256).await else {
+            return Err(anyhow!(
+                "database unavailable while loading the blob mapping"
+            ));
+        };
         let existed = existing.is_some();
         let was_owner = existing.is_some_and(|m| m.owners.iter().any(|o| o == pubkey));
         if !self

@@ -249,13 +249,16 @@ pub(crate) async fn boundary_second_complete(
     const VERIFY_LIMIT: usize = 150_000;
     filter.since = Some(boundary);
     filter.until = Some(boundary);
-    let Some((verify, _)) = db
+    let Some((verify, more)) = db
         .query_full_startup(vec![filter], VERIFY_LIMIT, unix_now(), true)
         .await
     else {
         return false;
     };
-    verify.len() < VERIFY_LIMIT && verify.len() <= delivered
+    // `more` is the only signal that the verify query itself was cut short
+    // (byte cap or work budget): if it is set the second may hold events
+    // beyond what both queries returned, so the check must fail closed.
+    !more && verify.len() < VERIFY_LIMIT && verify.len() <= delivered
 }
 
 impl GroupStore {
@@ -600,7 +603,12 @@ impl GroupStore {
                     // lock, like the 9001 arm below: two concurrent 9000
                     // demotions can both pass the read-side validation and
                     // otherwise leave the group admin-less.
-                    {
+                    if !ignore_capacity {
+                        // Runtime only: a rebuild replays stored history in
+                        // a deterministic order that can differ from the
+                        // arrival order (same second, id order), and
+                        // dropping a demotion that was valid when accepted
+                        // would resurrect the admin after a restart.
                         let mut overrides: HashMap<&str, bool> = HashMap::new();
                         for tag in event.tags.iter().filter(|t| t.len() >= 2 && t[0] == P) {
                             let has_roles = tag[2..].iter().any(|r| !r.is_empty());
@@ -656,10 +664,12 @@ impl GroupStore {
                         .members
                         .iter()
                         .any(|(pk, roles)| !roles.is_empty() && !removing.contains(&pk.as_str()));
-                    if !retains_admin {
-                        // Drop the removal: the event itself still stores,
-                        // but the group keeps its last admin (the relay key
-                        // can manage the group regardless).
+                    if !ignore_capacity && !retains_admin {
+                        // Drop the removal at runtime: the event itself
+                        // still stores, but the group keeps its last admin
+                        // (the relay key can manage the group regardless).
+                        // A rebuild must replay what was stored instead
+                        // (see the 9000 arm).
                         return Vec::new();
                     }
                     for pk in removing {
@@ -955,6 +965,19 @@ impl GroupStore {
     /// Whether the content of a group may be served to `authed`. `is_meta`
     /// distinguishes relay-generated metadata events (kinds 39000-39005),
     /// which `hidden` groups additionally withhold from non-members.
+    /// Group ids that must stay hidden across a rebuild: the live groups
+    /// (which the vanish may have removed), the existing ghosts and the
+    /// delete tombstones. A rebuild must carry them so a second vanish
+    /// rebuild cannot un-ghost a group whose state is already gone.
+    pub fn hidden_group_ids(&self) -> Vec<String> {
+        self.groups
+            .keys()
+            .cloned()
+            .chain(self.ghost.iter().cloned())
+            .chain(self.deleted.iter().cloned())
+            .collect()
+    }
+
     /// Marks every `previous` group id that the (rebuilt) store no longer
     /// knows — and that was not explicitly deleted — as a ghost: its
     /// create/state is gone, so on a keyless relay its surviving posts
