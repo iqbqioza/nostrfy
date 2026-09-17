@@ -1,12 +1,13 @@
 //! Command-line interface: configuration handling, daemon
 //! management and the foreground server entry point.
 
+use std::net::ToSocketAddrs;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
 use daemonize::Daemonize;
-use log::{error, info};
+use log::{error, info, warn};
 
 use crate::config::{Config, DEFAULT_CONFIG};
 use anyhow::anyhow;
@@ -217,13 +218,25 @@ impl Cli {
 
         match daemon.execute() {
             // Parent: the daemon has forked and the first child exited.
-            // Report the pid (read from the pid file, which the daemon
-            // writes just after the first child exits) and terminate, so the
-            // foreground `nostrfy start`/`restart` returns with a clear
-            // message instead of silently.
+            // Report the pid and terminate, so the foreground `nostrfy
+            // start`/`restart` returns with a clear message. The daemon
+            // child may die later while binding the port or opening the
+            // database (its stderr is /dev/null), so do not report success
+            // until the listener actually accepts a connection.
             daemonize::Outcome::Parent(result) => {
                 result.map_err(|e| config_err(format!("failed to daemonize: {e}")))?;
-                match wait_for_pid_file(&cfg.daemon.pid_file) {
+                let pid = wait_for_pid_file(&cfg.daemon.pid_file);
+                if let Err(e) = wait_for_ready(cfg, pid) {
+                    // A dead child must not leave its pid file behind: the
+                    // next `start` would refuse to run (and `stop` would
+                    // signal a recycled pid) until it is cleaned up. The
+                    // reason for the death is in the daemon log.
+                    if pid.is_none_or(|pid| !process_alive(pid)) {
+                        let _ = std::fs::remove_file(&cfg.daemon.pid_file);
+                    }
+                    return Err(e);
+                }
+                match pid {
                     Some(pid) => print_line(&format!("nostrfy started (pid {pid})")),
                     None => print_line("nostrfy started"),
                 }
@@ -245,7 +258,10 @@ impl Cli {
     }
 
     fn stop(&self) -> Result<()> {
-        let pid = match running_pid(&self.load_config()?.daemon.pid_file) {
+        // The config may have been broken by the very edit that made a
+        // restart necessary: a running daemon must still be stoppable.
+        let pid_file = self.stop_pid_file();
+        let pid = match running_pid(&pid_file) {
             Some(pid) => pid,
             None => {
                 print_line("nostrfy is not running");
@@ -260,11 +276,43 @@ impl Cli {
                 std::io::Error::last_os_error()
             )));
         }
-        if !wait_for_stop(&self.load_config()?.daemon.pid_file) {
+        if !wait_for_stop(&pid_file) {
             return Err(anyhow!(format!("daemon (pid {pid}) did not stop in time")));
         }
         print_line("nostrfy stopped");
         Ok(())
+    }
+
+    /// The pid file `stop`/`restart` use. Normally it comes from the parsed
+    /// config; when the config cannot be parsed (e.g. it was edited into an
+    /// invalid state), fall back to a lenient scan of the raw TOML for just
+    /// `daemon.pid_file`, and finally to the compiled-in default. The chosen
+    /// source is logged so `stop`/`restart` are never silently pointing at
+    /// the wrong process.
+    fn stop_pid_file(&self) -> PathBuf {
+        match self.load_config() {
+            Ok(cfg) => cfg.daemon.pid_file,
+            Err(e) => {
+                warn!(
+                    "cannot load {} ({e}); using a lenient daemon.pid_file lookup",
+                    self.config.display()
+                );
+                if let Some(path) = lenient_pid_file(&self.config) {
+                    warn!(
+                        "using daemon.pid_file extracted from the raw config: {}",
+                        path.display()
+                    );
+                    path
+                } else {
+                    let path = resolve_config_path(&self.config, Path::new("./nostrfy.pid"));
+                    warn!(
+                        "no usable daemon.pid_file in the raw config; using the default {}",
+                        path.display()
+                    );
+                    path
+                }
+            }
+        }
     }
 
     fn stats(&self) -> Result<()> {
@@ -274,6 +322,28 @@ impl Cli {
         }
         let raw = std::fs::read_to_string(&cfg.daemon.stats_file)?;
         let value: serde_json::Value = serde_json::from_str(&raw)?;
+        // The file is only refreshed while the daemon runs. `written_at`
+        // (Unix seconds) is the snapshot's own timestamp; a stats file from
+        // before the field existed falls back to the file's modification
+        // time, so a fresh snapshot is not rejected just for lacking the
+        // marker.
+        let written_at = value
+            .get("written_at")
+            .and_then(serde_json::Value::as_u64)
+            .or_else(|| {
+                std::fs::metadata(&cfg.daemon.stats_file)
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+            });
+        if let Some(reason) = stats_stale_reason(
+            &cfg,
+            running_pid(&cfg.daemon.pid_file).is_some(),
+            written_at,
+        ) {
+            return Err(config_err(reason));
+        }
         print_line(&serde_json::to_string_pretty(&value)?);
         Ok(())
     }
@@ -775,6 +845,68 @@ fn wait_for_pid_file(path: &Path) -> Option<u32> {
     None
 }
 
+/// Waits up to 10 seconds for the freshly daemonized child to accept a TCP
+/// connection on the configured `server.host:server.port`. Once the daemon
+/// has forked, the parent has no other way to observe startup: the child's
+/// stderr points at /dev/null, so a bind/DB failure would otherwise be
+/// reported as `nostrfy started`. `server.api_host` needs no separate
+/// probe: it splits the same port by Host header, so one listener serves
+/// both names.
+fn wait_for_ready(cfg: &Config, pid: Option<u32>) -> Result<()> {
+    wait_for_ready_within(cfg, pid, Duration::from_secs(10))
+}
+
+fn wait_for_ready_within(cfg: &Config, pid: Option<u32>, timeout: Duration) -> Result<()> {
+    // A wildcard bind address is not connectable: probe loopback, which the
+    // wildcard listener also accepts.
+    let host = match cfg.server.host.trim() {
+        "" | "0.0.0.0" => "127.0.0.1".to_string(),
+        "::" | "[::]" => "::1".to_string(),
+        other => other.trim_matches(['[', ']']).to_string(),
+    };
+    let deadline = Instant::now() + timeout;
+    loop {
+        // A child that already exited can never become ready (and an
+        // unwritable pid file must not make us wait for the whole timeout).
+        if !child_alive(&cfg.daemon.pid_file, pid) {
+            return Err(config_err(format!(
+                "nostrfy exited before it became ready; see {} for the error",
+                cfg.daemon.log_file.display()
+            )));
+        }
+        let addrs: Vec<std::net::SocketAddr> = (host.as_str(), cfg.server.port)
+            .to_socket_addrs()
+            .map(|addrs| addrs.collect())
+            .unwrap_or_default();
+        for addr in addrs {
+            if std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok() {
+                return Ok(());
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(config_err(format!(
+                "nostrfy did not become ready within {timeout:?}: nothing is listening on \
+                 {}:{} (see {} for the daemon's error)",
+                cfg.server.host,
+                cfg.server.port,
+                cfg.daemon.log_file.display()
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Whether the freshly forked child is still alive. Before the pid file
+/// appears the child is assumed to be starting; once the file exists, a
+/// dead pid means the child exited (the daemonize crate neither truncates
+/// the file on exit nor removes it).
+fn child_alive(pid_file: &Path, pid: Option<u32>) -> bool {
+    match pid {
+        Some(pid) => process_alive(pid),
+        None => !pid_file.exists() || running_pid(pid_file).is_some(),
+    }
+}
+
 fn init_config(path: &Path) -> Result<()> {
     Config::write_default(path)?;
     print_line(&format!("wrote {}", path.display()));
@@ -870,6 +1002,96 @@ fn absolutize(path: &Path) -> PathBuf {
             .unwrap_or_else(|_| PathBuf::from("."))
             .join(path)
     }
+}
+
+/// Resolves a path from the config file against the config file's directory,
+/// exactly like [`Config::absolutize_paths`] does for the normal loader (the
+/// daemon runs with CWD `/`, so a config-relative pid file must not depend on
+/// the caller's cwd).
+fn resolve_config_path(config_path: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    let base = match config_path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => {
+            std::fs::canonicalize(parent).unwrap_or_else(|_| PathBuf::from(parent))
+        }
+        _ => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+    };
+    base.join(path)
+}
+
+/// Extracts `daemon.pid_file` from the raw config text without parsing the
+/// whole file, so `stop`/`restart` still find the daemon when an unrelated
+/// edit left the TOML unparseable. Only a simple `pid_file = "..."` inside
+/// the `[daemon]` table is recognized (comments and inline comments are
+/// stripped); anything fancier falls back to the default path.
+fn lenient_pid_file(config_path: &Path) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(config_path).ok()?;
+    let mut in_daemon = false;
+    for line in text.lines() {
+        // Strip comments before looking for a section header or assignment
+        // (handles `[daemon] # comment` and `pid_file = "x" # comment`).
+        let line = line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(section) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            in_daemon = section.trim() == "daemon";
+            continue;
+        }
+        if !in_daemon {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if key.trim() != "pid_file" {
+            continue;
+        }
+        let value = value.trim();
+        let value = value
+            .strip_prefix('"')
+            .and_then(|v| v.strip_suffix('"'))
+            .or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
+            .unwrap_or("");
+        if value.is_empty() {
+            return None;
+        }
+        return Some(resolve_config_path(config_path, Path::new(value)));
+    }
+    None
+}
+
+/// `None` when a parsed stats snapshot may be printed as current; otherwise
+/// why it must be rejected. The stats file is only refreshed while the daemon
+/// runs, so without this check `nostrfy stats` presents the counters of a
+/// dead (or hung) daemon as live data.
+fn stats_stale_reason(cfg: &Config, running: bool, written_at: Option<u64>) -> Option<String> {
+    if !running {
+        return Some(format!(
+            "the daemon is not running; {} only holds a stale snapshot",
+            cfg.daemon.stats_file.display()
+        ));
+    }
+    let Some(written_at) = written_at else {
+        return Some(format!(
+            "{} has no written_at timestamp and its modification time is unreadable; \
+             statistics are stale",
+            cfg.daemon.stats_file.display()
+        ));
+    };
+    let age = crate::util::unix_now().saturating_sub(written_at);
+    // Three write intervals of slack: one missed write is a hiccup, three in
+    // a row mean the writer is gone.
+    let max_age = cfg.daemon.stats_interval_secs.saturating_mul(3).max(1);
+    if age > max_age {
+        return Some(format!(
+            "statistics are stale (written {age}s ago, more than {max_age}s = 3 x \
+             daemon.stats_interval_secs); is the daemon running?"
+        ));
+    }
+    None
 }
 
 fn running_pid(pid_file: &Path) -> Option<u32> {
@@ -1339,5 +1561,127 @@ name = \"nostrfy\"\n",
         );
         assert!(deny.iter().any(|(p, _)| p == &hex));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lenient_pid_file_survives_a_broken_config() {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir()
+            .join("nostrfy-lenient-pid-test")
+            .join(format!("{:x}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("nostrfy.toml");
+
+        // Unparseable TOML (unclosed table header) with a valid daemon
+        // section: `stop` must still find the pid file.
+        std::fs::write(
+            &config_path,
+            "[server\nport = 8080\n\n[daemon]\npid_file = \"/tmp/nostrfy-lenient.pid\" # c\n",
+        )
+        .unwrap();
+        assert!(Config::load(&config_path).is_err());
+        assert_eq!(
+            lenient_pid_file(&config_path).as_deref(),
+            Some(Path::new("/tmp/nostrfy-lenient.pid"))
+        );
+
+        // A pid_file outside [daemon] (e.g. a deprecated spelling) must not
+        // be picked up by the lenient scan.
+        std::fs::write(&config_path, "[server]\npid_file = \"/tmp/wrong.pid\"\n").unwrap();
+        assert!(lenient_pid_file(&config_path).is_none());
+
+        // Relative paths resolve against the config directory, matching the
+        // normal loader.
+        std::fs::write(&config_path, "[daemon]\npid_file = \"run.pid\"\n").unwrap();
+        let pid = lenient_pid_file(&config_path).unwrap();
+        assert_eq!(pid.file_name().unwrap(), "run.pid");
+        assert_eq!(
+            pid.parent().unwrap(),
+            std::fs::canonicalize(&dir).unwrap(),
+            "relative pid files must be anchored to the config directory"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stats_staleness_detection() {
+        let mut cfg = Config::default();
+        cfg.daemon.stats_interval_secs = 5;
+        cfg.daemon.stats_file = PathBuf::from("/tmp/nostrfy-stats.json");
+        let now = crate::util::unix_now();
+
+        assert!(
+            stats_stale_reason(&cfg, true, Some(now)).is_none(),
+            "a fresh snapshot of a running daemon is printable"
+        );
+        assert!(
+            stats_stale_reason(&cfg, true, Some(now.saturating_sub(10))).is_none(),
+            "one missed write interval is still within the 3x slack"
+        );
+        let reason = stats_stale_reason(&cfg, true, Some(now.saturating_sub(60))).unwrap();
+        assert!(reason.contains("stale"), "{reason}");
+        let reason = stats_stale_reason(&cfg, false, Some(now)).unwrap();
+        assert!(reason.contains("not running"), "{reason}");
+        let reason = stats_stale_reason(&cfg, true, None).unwrap();
+        assert!(reason.contains("stale"), "{reason}");
+    }
+
+    #[test]
+    fn readiness_probe_detects_a_listener_and_its_absence() {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut cfg = Config::default();
+        cfg.daemon.pid_file =
+            std::env::temp_dir().join(format!("nostrfy-ready-{:x}-{id}.pid", std::process::id()));
+        let _ = std::fs::remove_file(&cfg.daemon.pid_file);
+
+        // A live listener is detected.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        cfg.server.host = "127.0.0.1".into();
+        cfg.server.port = listener.local_addr().unwrap().port();
+        wait_for_ready_within(&cfg, None, Duration::from_secs(1)).unwrap();
+
+        // A wildcard bind is probed over loopback.
+        let wildcard = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+        cfg.server.host = "0.0.0.0".into();
+        cfg.server.port = wildcard.local_addr().unwrap().port();
+        wait_for_ready_within(&cfg, None, Duration::from_secs(1)).unwrap();
+        drop(wildcard);
+
+        // A free (closed) port fails with a clear message.
+        let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let free_port = free.local_addr().unwrap().port();
+        drop(free);
+        cfg.server.host = "127.0.0.1".into();
+        cfg.server.port = free_port;
+        let err = wait_for_ready_within(&cfg, None, Duration::from_millis(300)).unwrap_err();
+        assert!(err.to_string().contains("did not become ready"), "{err}");
+    }
+
+    #[test]
+    fn readiness_probe_rejects_a_dead_child_on_an_occupied_port() {
+        // The child dies on bind while a foreign process already holds the
+        // port: the connect succeeds, but the stale pid file pointing at a
+        // dead pid must turn that into a failure (not a false "started").
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut cfg = Config::default();
+        cfg.server.host = "127.0.0.1".into();
+        cfg.server.port = listener.local_addr().unwrap().port();
+        cfg.daemon.pid_file = std::env::temp_dir().join(format!(
+            "nostrfy-ready-dead-{:x}-{id}.pid",
+            std::process::id()
+        ));
+        std::fs::write(&cfg.daemon.pid_file, "999999999\n").unwrap();
+
+        let err = wait_for_ready_within(&cfg, None, Duration::from_secs(1)).unwrap_err();
+        assert!(
+            err.to_string().contains("exited before it became ready"),
+            "{err}"
+        );
+        let _ = std::fs::remove_file(&cfg.daemon.pid_file);
     }
 }

@@ -460,14 +460,20 @@ impl Store {
                 // 17 named tables, plus the word index when search is on.
                 .max_dbs(cfg.max_dbs.max(18))
                 // Every reader thread can hold a concurrent read transaction,
-                // and the writer/API/startup paths take slots too: a
-                // `max_readers` below the thread count makes LMDB fail
-                // queries with MDB_READERS_FULL (surfacing as silent empty
-                // scans). Raise the effective floor instead of trusting the
-                // configured value alone.
+                // the writer/API/startup paths take slots too, and some read
+                // paths nest a second transaction inside the first
+                // (`list_blossom_page` resolves each sha while its outer walk
+                // transaction is open). A `max_readers` below that makes LMDB
+                // fail queries with MDB_READERS_FULL (surfacing as silent
+                // empty scans). Raise the effective floor instead of trusting
+                // the configured value alone: two slots per reader thread
+                // plus the writer/API/startup paths.
                 .max_readers(
-                    cfg.max_readers
-                        .max(cfg.reader_threads.clamp(1, 64) as u32 + 2),
+                    cfg.max_readers.max(
+                        (cfg.reader_threads.clamp(1, 64) as u32)
+                            .saturating_mul(2)
+                            .saturating_add(3),
+                    ),
                 )
                 .map_size(map_size)
                 .open(&cfg.path)?
@@ -870,8 +876,21 @@ impl Store {
     /// Loads a blob's metadata (None when unknown).
     pub(crate) fn load_blossom_mapping(&self, sha256: &str) -> Result<Option<BlossomMeta>> {
         let rtxn = self.env.read_txn()?;
+        self.load_blossom_mapping_in(&rtxn, sha256)
+    }
+
+    /// [`Self::load_blossom_mapping`] inside an existing read transaction:
+    /// `list_blossom_page` resolves the sha of every walked entry, and a
+    /// nested read transaction per entry would consume a second LMDB reader
+    /// slot (the floor in `open` accounts for the nesting, but sharing the
+    /// walk's transaction avoids it entirely).
+    fn load_blossom_mapping_in(
+        &self,
+        rtxn: &heed::RoTxn<'_>,
+        sha256: &str,
+    ) -> Result<Option<BlossomMeta>> {
         let key = format!("sha:{sha256}");
-        let Some(raw) = self.blossom.get(&rtxn, key.as_bytes())? else {
+        let Some(raw) = self.blossom.get(rtxn, key.as_bytes())? else {
             return Ok(None);
         };
         match serde_json::from_slice(raw) {
@@ -991,7 +1010,7 @@ impl Store {
             let Ok(sha) = std::str::from_utf8(sha) else {
                 continue;
             };
-            let Some(meta) = self.load_blossom_mapping(sha)? else {
+            let Some(meta) = self.load_blossom_mapping_in(&rtxn, sha)? else {
                 // A stale order key (mapping deleted): skip it.
                 continue;
             };
@@ -1012,27 +1031,69 @@ impl Store {
     /// Builds the uploaded-order index from the existing mappings (one-time
     /// backfill for databases written before the index existed).
     pub(crate) fn rebuild_blossom_order(&self) -> Result<usize> {
-        let rtxn = self.env.read_txn()?;
-        let mut wtxn = self.env.write_txn()?;
+        const CHUNK: usize = 4096;
+        self.disk_full_error()?;
         let mut count = 0usize;
-        for item in self.blossom.iter(&rtxn)? {
-            let (key, raw) = item?;
-            let key = String::from_utf8_lossy(key);
-            let Some(sha) = key.strip_prefix("sha:") else {
-                continue;
+        // Resume from the last mapping key processed: resuming from the
+        // owner entries could split one mapping's owner list across chunks
+        // and lose the owners after the cut.
+        let mut last: Option<Vec<u8>> = None;
+        loop {
+            // One bounded read + one bounded write transaction per chunk
+            // (like `rebuild_event_meta`): a huge table must not pin one
+            // unbounded write transaction, and a MapFull aborts only the
+            // current chunk instead of the whole rebuild. The completion
+            // marker is written last, so a crash mid-rebuild leaves the
+            // rebuild pending and a retry rewrites the same idempotent keys.
+            let chunk: Vec<(Vec<u8>, String, i64, String)> = {
+                let rtxn = self.env.read_txn()?;
+                let range = (
+                    last.as_deref()
+                        .map(std::ops::Bound::Excluded)
+                        .unwrap_or(std::ops::Bound::Unbounded),
+                    std::ops::Bound::Unbounded,
+                );
+                let mut out = Vec::with_capacity(CHUNK);
+                for item in self.blossom.range(&rtxn, &range)? {
+                    let (key, raw) = item?;
+                    let key_text = String::from_utf8_lossy(key);
+                    let Some(sha) = key_text.strip_prefix("sha:") else {
+                        continue;
+                    };
+                    let Ok(meta) = serde_json::from_slice::<BlossomMeta>(raw) else {
+                        continue;
+                    };
+                    for owner in &meta.owners {
+                        out.push((key.to_vec(), owner.clone(), meta.uploaded, sha.to_string()));
+                    }
+                    // The chunk may exceed CHUNK by one mapping's owners
+                    // (bounded by `MAX_BLOB_OWNERS`), but it always ends on
+                    // a mapping boundary.
+                    if out.len() >= CHUNK {
+                        break;
+                    }
+                }
+                out
             };
-            let Ok(meta) = serde_json::from_slice::<BlossomMeta>(raw) else {
-                continue;
-            };
-            for owner in &meta.owners {
+            if chunk.is_empty() {
+                break;
+            }
+            last = Some(chunk.last().expect("non-empty chunk").0.clone());
+            let mut wtxn = self.env.write_txn()?;
+            for (_, owner, uploaded, sha) in &chunk {
                 self.blossom.put(
                     &mut wtxn,
-                    blossom_order_key(owner, meta.uploaded, sha).as_bytes(),
+                    blossom_order_key(owner, *uploaded, sha).as_bytes(),
                     b"",
                 )?;
                 count += 1;
             }
+            wtxn.commit()?;
+            if chunk.len() < CHUNK {
+                break;
+            }
         }
+        let mut wtxn = self.env.write_txn()?;
         self.index_meta.put(&mut wtxn, b"blossom_order", b"1")?;
         wtxn.commit()?;
         Ok(count)

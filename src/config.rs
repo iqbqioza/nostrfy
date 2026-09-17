@@ -276,7 +276,9 @@ pub struct LimitsConfig {
     /// `offset + limit + 1`, and every row is a full event in memory).
     /// Requests whose window exceeds this bound are rejected with `400`
     /// instead of pinning that much memory per concurrent request.
-    /// `0` = no bound.
+    /// The default (55_001) covers the default `max_api_offset` plus
+    /// `max_api_limit` plus one, so the advertised offset window stays
+    /// serviceable without tuning; `0` = no bound.
     pub max_api_fetch: usize,
     /// REST API: maximum length of the `search` query parameter in bytes
     /// (0 = no bound).
@@ -464,7 +466,12 @@ impl Default for LimitsConfig {
             max_api_queue_msgs: 512,
             max_api_limit: 5_000,
             max_api_offset: 50_000,
-            max_api_fetch: 10_000,
+            // offset + limit + 1 (50_000 + 5_000 + 1), so the largest
+            // offset allowed by `max_api_offset` is actually servable:
+            // the server rejects a query whose over-fetch window exceeds
+            // `max_api_fetch` with 400 even when the offset itself is
+            // within `max_api_offset`.
+            max_api_fetch: 55_001,
             max_api_search_bytes: 2_048,
             max_out_queue_bytes: 256 * 1024,
             ws_idle_timeout_secs: 300,
@@ -1272,6 +1279,25 @@ impl Config {
                 "daemon.pid_file, daemon.log_file and daemon.stats_file must not be empty",
             ));
         }
+        // `stats_interval_secs = 0` used to be silently clamped to 1 by the
+        // stats writer; reject it instead so the configured value and the
+        // actual write cadence can never disagree (the staleness check of
+        // `nostrfy stats` derives its threshold from this value).
+        if self.daemon.stats_interval_secs == 0 {
+            return Err(config_err(
+                "daemon.stats_interval_secs must be at least 1 (got 0)",
+            ));
+        }
+        // The rotation keeps up to `max_log_files` backups and each
+        // rotation shifts them up while holding the logger mutex, so an
+        // absurd value turns every rotation into a long rename/stat walk.
+        // 0 would disable backups entirely (a single oversized file), which
+        // `max_log_size_bytes = 0` already expresses for "no rotation".
+        if !(1..=1000).contains(&self.daemon.max_log_files) {
+            return Err(config_err(
+                "daemon.max_log_files must be between 1 and 1000",
+            ));
+        }
 
         // LiveKit configuration must be complete when enabled (fail-closed
         // at runtime: capability is unadvertised and minting 404s — but a
@@ -1341,11 +1367,26 @@ impl Config {
                 self.database.max_db_queue_bytes
             );
         }
-        if l.max_api_fetch > 0 && l.max_api_limit > 0 && l.max_api_fetch <= l.max_api_limit {
+        // The API's fetch window (`hard_cap = min(offset + limit + 1,
+        // max_api_fetch)`) makes `max_api_fetch` the real ceiling on how
+        // deep pagination can go: a value at or below `max_api_offset`
+        // rejects requests the offset ceiling advertises as valid, and one
+        // at or below `max_api_limit` rejects even an offset-0 request at
+        // the maximum limit. Both are warned about together (not rejected:
+        // an operator may deliberately serve a narrower window than
+        // `max_api_offset` allows) so the pair stays coherent — the default
+        // is `max_api_offset + max_api_limit + 1`.
+        if l.max_api_fetch > 0
+            && ((l.max_api_limit > 0 && l.max_api_fetch <= l.max_api_limit)
+                || (l.max_api_offset > 0 && l.max_api_fetch <= l.max_api_offset))
+        {
             log::warn!(
-                "config.limits.max_api_fetch ({}) is not larger than limits.max_api_limit ({}): \
-                 /api/v1 requests at the maximum limit will be rejected as over the fetch window",
+                "config.limits.max_api_fetch ({}) does not cover limits.max_api_offset ({}) + \
+                 limits.max_api_limit ({}): /api/v1 requests near the offset ceiling will be \
+                 rejected as over the fetch window; set max_api_fetch to at least \
+                 max_api_offset + max_api_limit + 1",
                 l.max_api_fetch,
+                l.max_api_offset,
                 l.max_api_limit
             );
         }
@@ -3080,6 +3121,13 @@ max_log_files = 2
             |c: &mut Config| c.limits.max_sub_id_len = 0,
             |c: &mut Config| c.limits.max_api_queue_msgs = 0,
             |c: &mut Config| c.rpc.max_admin_body_bytes = 0,
+            // The stats writer used to clamp this to 1 silently; the CLI
+            // staleness threshold derives from it, so 0 must be rejected.
+            |c: &mut Config| c.daemon.stats_interval_secs = 0,
+            // 0 backups and an absurd ceiling are both rejected; the
+            // rotation loop shifts at most 1000 generations.
+            |c: &mut Config| c.daemon.max_log_files = 0,
+            |c: &mut Config| c.daemon.max_log_files = 1001,
         ] {
             let mut cfg = Config::default();
             set(&mut cfg);
@@ -3093,6 +3141,26 @@ max_log_files = 2
             cfg.validate().is_ok(),
             "max_out_queue_bytes = 0 must mean unlimited, not a validation error"
         );
+        // `max_api_fetch = 0` and `max_api_offset = 0` are documented as
+        // "no bound" and must stay valid.
+        let mut cfg = Config::default();
+        cfg.limits.max_api_fetch = 0;
+        cfg.limits.max_api_offset = 0;
+        assert!(
+            cfg.validate().is_ok(),
+            "0 must mean no bound for the API caps"
+        );
+    }
+
+    #[test]
+    fn default_api_fetch_covers_the_documented_offset_window() {
+        let cfg = Config::default();
+        assert!(
+            cfg.limits.max_api_fetch > cfg.limits.max_api_offset + cfg.limits.max_api_limit,
+            "the default fetch window must serve the largest offset at the largest limit \
+             (otherwise the documented offset ceiling is unusable at the default limit)"
+        );
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]

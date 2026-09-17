@@ -16,6 +16,17 @@ pub const PAYLOAD_TAG: &str = "payload";
 pub const URL_TAG: &str = "u";
 pub const METHOD_TAG: &str = "method";
 
+/// Extracts the base64 event from an `Authorization` header value carrying
+/// the NIP-98 `Nostr` scheme. HTTP auth-schemes are case-insensitive
+/// (RFC 9110), and clients send `Nostr`, `nostr` and `NOSTR`: a
+/// case-sensitive prefix comparison rejected the non-canonical spellings.
+/// Returns `None` for another scheme (`Bearer`, ...) or a scheme with no
+/// token.
+pub fn strip_nostr_scheme(value: &str) -> Option<&str> {
+    let (scheme, token) = value.split_once(' ')?;
+    scheme.eq_ignore_ascii_case("Nostr").then_some(token)
+}
+
 /// Verifies an encoded NIP-98 event. When `expected_pubkey` is given the
 /// event must be authored by it; when `require_payload` is set the event
 /// must carry a `payload` tag (NIP-86 requires it); when
@@ -193,6 +204,22 @@ mod tests {
 
     fn encode(ev: &Event) -> String {
         base64::engine::general_purpose::STANDARD.encode(serde_json::to_string(ev).unwrap())
+    }
+
+    #[test]
+    fn nostr_scheme_is_case_insensitive() {
+        // RFC 9110: auth-schemes are case-insensitive, and clients send the
+        // NIP-98 scheme as `Nostr`, `nostr` or `NOSTR`.
+        assert_eq!(strip_nostr_scheme("Nostr abc"), Some("abc"));
+        assert_eq!(strip_nostr_scheme("nostr abc"), Some("abc"));
+        assert_eq!(strip_nostr_scheme("NOSTR abc"), Some("abc"));
+        assert_eq!(strip_nostr_scheme("NoStR abc"), Some("abc"));
+        // Only the first space separates the scheme from the token.
+        assert_eq!(strip_nostr_scheme("Nostr a b"), Some("a b"));
+        // Other schemes and malformed values are not a NIP-98 authorization.
+        assert_eq!(strip_nostr_scheme("Bearer abc"), None);
+        assert_eq!(strip_nostr_scheme("Nostr"), None);
+        assert_eq!(strip_nostr_scheme(""), None);
     }
 
     #[test]

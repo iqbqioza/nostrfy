@@ -251,14 +251,16 @@ fn handle_read_msg(store: &Store, errors: &Arc<std::sync::atomic::AtomicU64>, ms
             false
         }
         Msg::BlossomLoad { sha256, reply } => {
-            let meta = match store.load_blossom_mapping(&sha256) {
-                Ok(meta) => meta,
-                Err(e) => {
-                    db_error(errors, &e);
-                    None
+            // A store error must not be reported as "no mapping": dropping
+            // the reply sender makes reporting callers (`request_read_result`
+            // / `blossom_load_checked`) see a failure, while the unchecked
+            // `blossom_load` path keeps its default-None semantics.
+            match store.load_blossom_mapping(&sha256) {
+                Ok(meta) => {
+                    let _ = reply.send(meta);
                 }
-            };
-            let _ = reply.send(meta);
+                Err(e) => db_error(errors, &e),
+            }
             false
         }
         #[cfg(test)]
@@ -284,16 +286,16 @@ fn handle_read_msg(store: &Store, errors: &Arc<std::sync::atomic::AtomicU64>, ms
             limit,
             reply,
         } => {
-            let page =
-                match store.list_blossom_page(&pubkey, after_uploaded, after_sha.as_deref(), limit)
-                {
-                    Ok(page) => page,
-                    Err(e) => {
-                        db_error(errors, &e);
-                        Vec::new()
-                    }
-                };
-            let _ = reply.send(page);
+            match store.list_blossom_page(&pubkey, after_uploaded, after_sha.as_deref(), limit) {
+                Ok(page) => {
+                    let _ = reply.send(page);
+                }
+                // Drop the reply on a store error (like `BlossomLoad`): the
+                // checked caller must be able to distinguish a failed page
+                // read from a genuinely empty page instead of reporting an
+                // existing inventory as empty.
+                Err(e) => db_error(errors, &e),
+            }
             false
         }
         Msg::BlossomMigrationDone { reply } => {
@@ -335,8 +337,8 @@ fn handle_read_msg(store: &Store, errors: &Arc<std::sync::atomic::AtomicU64>, ms
             false
         }
         #[cfg(test)]
-        Msg::MapSize { reply } => {
-            let _ = reply.send(store.env.info().map_size as u64);
+        Msg::LastPage { reply } => {
+            let _ = reply.send(store.env.info().last_page_number as u64);
             false
         }
         Msg::Shutdown => true,
@@ -668,14 +670,16 @@ pub(crate) fn spawn(
                                     let _ = reply.send(done);
                                 }
                                 Msg::BlossomLoad { sha256, reply } => {
-                                    let meta = match store.load_blossom_mapping(&sha256) {
-                                        Ok(meta) => meta,
-                                        Err(e) => {
-                                            db_error(&thread_errors, &e);
-                                            None
+                                    // See the reader arm: drop the reply
+                                    // sender on a store error instead of
+                                    // sending `None` (which would conflate
+                                    // failure with "no mapping").
+                                    match store.load_blossom_mapping(&sha256) {
+                                        Ok(meta) => {
+                                            let _ = reply.send(meta);
                                         }
-                                    };
-                                    let _ = reply.send(meta);
+                                        Err(e) => db_error(&thread_errors, &e),
+                                    }
                                 }
                                 Msg::BlossomListPage {
                                     pubkey,
@@ -684,19 +688,20 @@ pub(crate) fn spawn(
                                     limit,
                                     reply,
                                 } => {
-                                    let page = match store.list_blossom_page(
+                                    match store.list_blossom_page(
                                         &pubkey,
                                         after_uploaded,
                                         after_sha.as_deref(),
                                         limit,
                                     ) {
-                                        Ok(page) => page,
-                                        Err(e) => {
-                                            db_error(&thread_errors, &e);
-                                            Vec::new()
+                                        Ok(page) => {
+                                            let _ = reply.send(page);
                                         }
-                                    };
-                                    let _ = reply.send(page);
+                                        // Drop the reply on error: the checked
+                                        // caller must see a failure, not an
+                                        // empty inventory (see the reader arm).
+                                        Err(e) => db_error(&thread_errors, &e),
+                                    }
                                 }
                                 #[cfg(test)]
                                 Msg::BlossomList {
@@ -961,10 +966,14 @@ pub(crate) fn spawn(
                                     let _ = reply.send(ok);
                                 }
                                 Msg::SaveBlossomAllow { entries, reply } => {
-                                    if let Err(e) = store.save_blossom_allow(&entries) {
-                                        db_error(&thread_errors, &e);
-                                    }
-                                    let _ = reply.send(());
+                                    let ok = match store.save_blossom_allow(&entries) {
+                                        Ok(()) => true,
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            false
+                                        }
+                                    };
+                                    let _ = reply.send(ok);
                                 }
                                 Msg::SaveGroups { snapshot, reply } => {
                                     if Some(msg_index) == last_groups
@@ -1054,8 +1063,8 @@ pub(crate) fn spawn(
                                     let _ = reply.send(store.size_on_disk());
                                 }
                                 #[cfg(test)]
-                                Msg::MapSize { reply } => {
-                                    let _ = reply.send(store.env.info().map_size as u64);
+                                Msg::LastPage { reply } => {
+                                    let _ = reply.send(store.env.info().last_page_number as u64);
                                 }
                                 Msg::TouchFirstSeen { entries, reply } => {
                                     if let Err(e) = store.disk_full_error() {

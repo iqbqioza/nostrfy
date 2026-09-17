@@ -2,6 +2,14 @@
 //!
 //! A `delegation` tag `["delegation", <pubkey>, <conditions>, <sig>]` lets a
 //! delegator authorize another key to publish events matching the conditions.
+//!
+//! The pre-1.0 nostrfy extensions `kind=a|b` and `created_at>=`/`<=` were
+//! removed for strict spec conformance and are intentionally unsupported:
+//! NIP-26 defines only `kind=`, `created_at<` and `created_at>`, so tokens
+//! using the old grammar fail closed (an unrecognized condition never
+//! matches). Restoring them would accept conditions other relays treat as
+//! unknown, so that would be a deliberate protocol extension, not a
+//! compatibility fix.
 
 use secp256k1::Secp256k1;
 use sha2::{Digest, Sha256};

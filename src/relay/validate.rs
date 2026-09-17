@@ -748,14 +748,37 @@ mod tests {
             relay
                 .vanish_pubkey(hex::decode(&creator_pk).unwrap().try_into().unwrap(), now)
                 .await;
+            // The rebuild is coalesced into a background worker (repeated
+            // vanishes must not each run a full scan): wait for it to swap
+            // in the rebuilt store and persist the fresh snapshot.
+            let mut snapshot = None;
+            for _ in 0..600 {
+                let gone = relay.groups.read().await.group("g1").is_none();
+                let pending = relay
+                    .groups_rebuild
+                    .pending
+                    .load(std::sync::atomic::Ordering::SeqCst);
+                if gone
+                    && !pending
+                    && let Some(snap) = relay.db.load_groups().await
+                {
+                    snapshot = Some(snap);
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
             assert!(
                 relay.groups.read().await.group("g1").is_none(),
                 "state derived from the vanished creator must be gone"
             );
-            let snapshot = relay.db.load_groups().await.expect("snapshot persisted");
+            let snapshot = snapshot.expect("the rebuilt snapshot must be persisted");
             assert!(
                 snapshot.groups.is_empty(),
                 "the persisted snapshot must not resurrect the group"
+            );
+            assert!(
+                snapshot.ghost.contains("g1"),
+                "the group lost with its create must be ghosted in the snapshot"
             );
             relay.db.shutdown();
         });

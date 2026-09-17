@@ -108,6 +108,30 @@ fn normalize_pubkey(value: &str) -> Option<String> {
     }
 }
 
+/// The kind:1111 reply text for a relay allow/deny command. A failed
+/// persistence is reported as an error instead of `ok:`: the change is
+/// applied in memory, but reporting success would hide that it silently
+/// disappears on the next restart.
+fn access_reply(cmd: &Command, already: bool, persisted: bool) -> String {
+    let noun = match cmd {
+        Command::RelayAllow(_) => "allowed",
+        Command::RelayDeny(_) => "denied",
+        _ => unreachable!("access_reply is only used for /relay allow|deny"),
+    };
+    if already {
+        format!("ok: {} is already {noun}", cmd.verb())
+    } else if persisted {
+        format!("ok: {} {}", cmd.verb(), cmd.pubkey())
+    } else {
+        format!(
+            "error: {} {} was applied in memory but could not be persisted; it will be \
+             lost on restart",
+            cmd.verb(),
+            cmd.pubkey()
+        )
+    }
+}
+
 impl Relay {
     /// Runs the command-event side effect for a stored kind:1 event:
     /// recognizes the admin pubkey (`relay.pubkey`) and
@@ -162,7 +186,8 @@ impl Relay {
 
     /// Executes a parsed command and returns the result text for the
     /// kind:1111 reply. The access and allowlist mutations are persisted
-    /// immediately, so they survive a restart (like the CLI commands).
+    /// immediately, so they survive a restart (like the CLI commands); a
+    /// failed persistence is reported as an error rather than `ok:`.
     pub(crate) async fn execute_command(&self, cmd: &Command) -> String {
         match cmd {
             Command::RelayAllow(pk) => {
@@ -173,12 +198,8 @@ impl Relay {
                     access.allowed_pubkeys.push((pk.clone(), String::new()));
                 }
                 drop(access);
-                self.persist_access().await;
-                if already {
-                    format!("ok: {} is already allowed", cmd.verb())
-                } else {
-                    format!("ok: {} {}", cmd.verb(), cmd.pubkey())
-                }
+                let persisted = self.persist_access().await;
+                access_reply(cmd, already, persisted)
             }
             Command::RelayDeny(pk) => {
                 let mut access = self.access.write().await;
@@ -188,12 +209,8 @@ impl Relay {
                     access.blocked_pubkeys.push((pk.clone(), String::new()));
                 }
                 drop(access);
-                self.persist_access().await;
-                if already {
-                    format!("ok: {} is already denied", cmd.verb())
-                } else {
-                    format!("ok: {} {}", cmd.verb(), cmd.pubkey())
-                }
+                let persisted = self.persist_access().await;
+                access_reply(cmd, already, persisted)
             }
             Command::BlossomAllow(pk) => {
                 let mut allow = self.blossom_allow.write().await;
@@ -348,5 +365,26 @@ mod tests {
                 "must report an error for {bad:?}"
             );
         }
+    }
+
+    #[test]
+    fn access_reply_reports_persistence_failure() {
+        let hex = "aa".repeat(32);
+        assert_eq!(
+            access_reply(&Command::RelayAllow(hex.clone()), false, true),
+            format!("ok: /relay allow {hex}")
+        );
+        assert_eq!(
+            access_reply(&Command::RelayAllow(hex.clone()), true, true),
+            "ok: /relay allow is already allowed"
+        );
+        assert_eq!(
+            access_reply(&Command::RelayDeny(hex.clone()), true, true),
+            "ok: /relay deny is already denied"
+        );
+        // A failed persist must not be reported as success.
+        let text = access_reply(&Command::RelayDeny(hex.clone()), false, false);
+        assert!(text.starts_with("error:"), "{text}");
+        assert!(text.contains(&hex), "{text}");
     }
 }

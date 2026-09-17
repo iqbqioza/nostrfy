@@ -232,10 +232,12 @@ enum Msg {
         allow: Vec<(String, String)>,
         reply: oneshot::Sender<bool>,
     },
-    /// Persists the Blossom upload allowlist.
+    /// Persists the Blossom upload allowlist; the reply reports whether the
+    /// commit succeeded (the CLI/command path must not report a persisted
+    /// allowlist change that only lives in memory).
     SaveBlossomAllow {
         entries: Vec<String>,
-        reply: oneshot::Sender<()>,
+        reply: oneshot::Sender<bool>,
     },
     /// Persists the NIP-29 group state snapshot (write-through on every
     /// group mutation).
@@ -322,8 +324,11 @@ enum Msg {
     DatabaseSize {
         reply: oneshot::Sender<u64>,
     },
+    /// Last used LMDB page number. The map is opened at its fixed ceiling
+    /// and never resized, so tests assert real page growth instead of the
+    /// constant `map_size`.
     #[cfg(test)]
-    MapSize {
+    LastPage {
         reply: oneshot::Sender<u64>,
     },
     Shutdown,
@@ -1554,12 +1559,13 @@ impl DbClient {
     }
 
     /// Persists the Blossom upload allowlist under its dedicated LMDB key
-    /// (the same key `nostrfy blossom allow/deny` writes).
-    pub async fn save_blossom_allow(&self, entries: &[String]) {
+    /// (the same key `nostrfy blossom allow/deny` writes). Returns whether
+    /// the commit succeeded, so the caller never reports a persisted
+    /// allowlist change that only lives in memory.
+    pub async fn save_blossom_allow(&self, entries: &[String]) -> bool {
         let entries = entries.to_vec();
-        let _ = self
-            .request_write(|reply| Msg::SaveBlossomAllow { entries, reply })
-            .await;
+        self.request_write(|reply| Msg::SaveBlossomAllow { entries, reply })
+            .await
     }
 
     /// Persists the NIP-29 group state snapshot (write-through: call after
@@ -1720,15 +1726,18 @@ impl DbClient {
         .await
     }
 
-    /// BUD-12 page (see [`Msg::BlossomListPage`]).
-    pub async fn blossom_list_page(
+    /// BUD-12 page with failure reporting: `None` when the request failed
+    /// fast, timed out, or the reader could not read the store (the reply
+    /// sender is dropped on a store error). A listing failure must be
+    /// answered as a server error, not as an empty inventory.
+    pub async fn blossom_list_page_checked(
         &self,
         pubkey: &str,
         after_uploaded: Option<u64>,
         after_sha: Option<&str>,
         limit: usize,
-    ) -> Vec<(String, crate::db::store::BlossomMeta)> {
-        self.request_read(|reply| Msg::BlossomListPage {
+    ) -> Option<Vec<(String, crate::db::store::BlossomMeta)>> {
+        self.request_read_result(|reply| Msg::BlossomListPage {
             pubkey: pubkey.to_string(),
             after_uploaded,
             after_sha: after_sha.map(str::to_string),
@@ -1770,10 +1779,11 @@ impl DbClient {
         self.request_read(|reply| Msg::DatabaseSize { reply }).await
     }
 
-    /// Current memory map size in bytes (used by tests to verify growth).
+    /// Last used LMDB page number (used by tests to verify real database
+    /// growth: `map_size` is a fixed upfront reservation).
     #[cfg(test)]
-    pub async fn map_size_now(&self) -> u64 {
-        self.request_read(|reply| Msg::MapSize { reply }).await
+    pub async fn last_page_now(&self) -> u64 {
+        self.request_read(|reply| Msg::LastPage { reply }).await
     }
 
     pub fn shutdown(&self) {

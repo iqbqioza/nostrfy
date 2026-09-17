@@ -16,11 +16,12 @@
 #   nostrfy genkey   generate a relay secret key and write it into
 #                    relay.private_key (confirms overwrite if set)
 #
-# Sending SIGHUP to the daemon reloads this file at runtime: most limits,
-# the server auth settings, the NIP toggles and the REST API concurrency
-# ceiling apply immediately. A few settings are captured at startup and
-# require a restart (see docs/CONFIGURATION.md for the exact list). An
-# invalid reloaded file is rejected (the old configuration stays in force).
+# Sending SIGHUP to the daemon reloads this file at runtime: most settings
+# (the limits, the server auth settings, the NIP toggles, the REST API
+# concurrency ceiling, ...) apply immediately, while a few are captured at
+# startup and keep their running values (each changed one is warned about;
+# see docs/CONFIGURATION.md for the exact list). An invalid reloaded file is
+# rejected as a whole (the old configuration stays in force).
 # =============================================================================
 
 # -----------------------------------------------------------------------------
@@ -203,7 +204,10 @@ max_connections = 10000
 max_connections_per_ip = 64
 
 # Maximum number of new connections a single source IP may open per second
-# (sliding window; sockets beyond it are refused immediately). 0 = unlimited.
+# (sliding window; sockets beyond it are refused immediately). The limiter
+# tracks at most 10000 source IPs: while its map is full of still-active
+# windows a previously unseen IP is refused (fail closed), so a host with a
+# large address pool cannot bypass the limit. 0 = unlimited.
 max_connections_per_sec_per_ip = 0
 
 # Maximum size in bytes of a single incoming WebSocket message.
@@ -247,7 +251,8 @@ max_tags = 2000
 max_tag_value_bytes = 1024
 
 # Events whose created_at is more than this many seconds in the future are
-# silently dropped with an OK `mute:` prefix instead of rejected.
+# rejected with `invalid: event creation date is in the future` (the NIP-01
+# example for this case; they are not silently dropped or muted).
 max_created_at_future_secs = 3600
 
 # NIP-77: maximum number of records a single NEG-OPEN may process; queries
@@ -281,8 +286,9 @@ max_api_offset = 50000
 
 # Maximum rows one `/api/v1` query may prefetch for pagination (0 = no
 # bound). The over-fetch window is `offset + limit + 1` and every row is a
-# full event in memory; larger windows are rejected with a 400.
-max_api_fetch = 10000
+# full event in memory; larger windows are rejected with a 400. The default
+# covers the default offset window: max_api_offset + max_api_limit + 1.
+max_api_fetch = 55001
 
 # Maximum length in bytes of the API `search` query parameter (0 = no bound).
 # Longer values are rejected with a 400.
@@ -392,17 +398,20 @@ pid_file = "./nostrfy.pid"
 # Log file (stdout/stderr of the daemon).
 log_file = "./nostrfy.log"
 
-# File written periodically with the relay statistics (read by `nostrfy stats`).
+# File written periodically with the relay statistics (read by `nostrfy
+# stats`, which rejects a snapshot older than 3x stats_interval_secs or
+# whose daemon is no longer running).
 stats_file = "./nostrfy.stats.json"
 
-# Interval in seconds between statistics file writes.
+# Interval in seconds between statistics file writes (must be at least 1;
+# 0 is rejected at startup, not silently clamped).
 stats_interval_secs = 5
 
 # Rotate the log file when it grows past this many bytes (0 disables
 # rotation). The current file is renamed to .1 and older backups shift up.
 max_log_size_bytes = 52428800
 
-# Number of rotated log backups to keep.
+# Number of rotated log backups to keep (must be between 1 and 1000).
 max_log_files = 5
 
 # -----------------------------------------------------------------------------

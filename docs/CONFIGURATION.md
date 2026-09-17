@@ -270,7 +270,7 @@ The changes take effect immediately and are persisted (same lists as `nostrfy re
 | `max_api_queue_msgs` | integer | `512` | Max queued `/api/v1` requests for the API reader (fail-fast beyond this) |
 | `max_api_limit` | integer | `5000` | Ceiling for the API `limit` parameter (`0` = no bound) |
 | `max_api_offset` | integer | `50000` | Ceiling for the API `offset` parameter (`0` = no bound) |
-| `max_api_fetch` | integer | `10000` | Max rows one API query may prefetch for pagination (`0` = no bound; windows beyond it get `400`) |
+| `max_api_fetch` | integer | `55001` | Max rows one API query may prefetch for pagination (`0` = no bound; windows beyond `offset + limit + 1` get `400`). The default covers `max_api_offset` + `max_api_limit` + 1 |
 | `max_api_search_bytes` | integer | `2048` | Max bytes of the API `search` parameter (`0` = no bound) |
 
 ### Live fan-out
@@ -296,7 +296,7 @@ The changes take effect immediately and are persisted (same lists as `nostrfy re
 
 **`http_read_timeout_secs`** — Seconds a connection has to deliver a complete HTTP request head (the request line and headers) before it is closed. This closes slow-loris sockets that trickle bytes without ever completing a request — the attack would otherwise pin file descriptors and memory. Applies to every HTTP connection, WebSocket upgrades included (an upgrade request is a normal HTTP request head). The same deadline bounds the NIP-86 `POST` body read (a body that delivers no byte within the window is answered with `408 Request Timeout`), and Blossom uploads use it as their per-chunk idle timeout. `0` disables the timeout.
 
-**`max_connections_per_sec_per_ip`** — Maximum number of new connections a single source IP may open per second (sliding window). Sockets beyond the window are refused immediately. `0` = unlimited.
+**`max_connections_per_sec_per_ip`** — Maximum number of new connections a single source IP may open per second (sliding window). Sockets beyond the window are refused immediately. The limiter tracks at most 10,000 source IPs; when that map is full of still-active windows, a previously unseen IP is **refused** (fail closed) instead of passed through — a host with more than 10,000 active addresses cannot bypass the limit, and already-tracked IPs are always enforced. `0` = unlimited.
 
 **`max_filters`** — The maximum number of filters a single REQ (or COUNT) may carry. Violations get a `CLOSED ... too many filters` reply. This also bounds scanning work per REQ.
 
@@ -334,7 +334,7 @@ The changes take effect immediately and are persisted (same lists as `nostrfy re
 
 **`max_api_offset`** — The ceiling for the API's `offset` parameter. Requests above it are rejected with a `400` explaining the limit. `0` = no bound.
 
-**`max_api_fetch`** — The ceiling for the rows one `/api/v1` query may prefetch. Pagination over hidden rows needs an over-fetch window of `offset + limit + 1`, and every fetched row is a full event held in memory (up to `max_api_concurrent` requests at once), so a window beyond this bound is rejected with a `400` instead of pinning that much memory. Raise it (and `max_api_offset`) to serve deeper pages. `0` = no bound.
+**`max_api_fetch`** — The ceiling for the rows one `/api/v1` query may prefetch. Pagination over hidden rows needs an over-fetch window of `offset + limit + 1`, and every fetched row is a full event held in memory (up to `max_api_concurrent` requests at once), so a window beyond this bound is rejected with a `400` instead of pinning that much memory. The effective ceiling is `min(offset + limit + 1, max_api_fetch)`, so a value at or below `max_api_offset` makes offsets that `max_api_offset` advertises unreachable, and one at or below `max_api_limit` rejects even an offset-0 query at the maximum limit; `nostrfy check`/startup warns when either is the case. The default (`55001`) is `max_api_offset + max_api_limit + 1`, so the documented window works out of the box. Raise it (and `max_api_offset`) to serve deeper pages. `0` = no bound.
 
 **`max_api_search_bytes`** — The maximum length (bytes) of the API's `search` parameter. Longer values are rejected with a `400`. `0` = no bound.
 
@@ -348,6 +348,7 @@ The changes take effect immediately and are persisted (same lists as `nostrfy re
 - **`max_out_queue_bytes`** protects against slow readers; REQ responses are never dropped by it (see key details).
 - **`new_pubkey_min_age_secs`**: the first-seen timestamp is only recorded when an event actually stores, so failed first events cannot pre-warm the account-age clock.
 - **`max_api_limit`** clamps silently; **`max_api_offset`**, **`max_api_fetch`** and **`max_api_search_bytes`** reject with a clear `400` error message.
+- **Filter member caps are fixed** (not configurable): a single filter may carry at most **512 `ids`, `authors` or `kinds` entries**, and the `#...` tag constraint values share a separate **512-value combined budget** across all tag attributes of that filter. The in-memory match and scan are linear in these arrays, so a larger filter would allow quadratic work per event. Over-cap filters are refused with `CLOSED ... invalid: too many ids, authors, kinds or tag values in a filter` (COUNT and NIP-77 syncs refuse them the same way).
 - COUNT with hidden events (NIP-70/59/29) reports the *visible* count, preserving privacy.
 
 ---
@@ -417,9 +418,9 @@ The changes take effect immediately and are persisted (same lists as `nostrfy re
 | `pid_file` | string | `"./nostrfy.pid"` | PID file path |
 | `log_file` | string | `"./nostrfy.log"` | Log file path |
 | `stats_file` | string | `"./nostrfy.stats.json"` | Statistics file path |
-| `stats_interval_secs` | integer | `5` | Statistics write interval (seconds) |
+| `stats_interval_secs` | integer | `5` | Statistics write interval (seconds, must be ≥ 1) |
 | `max_log_size_bytes` | integer | `52428800` (50 MB) | Log rotation size (`0` = no rotation) |
-| `max_log_files` | integer | `5` | Rotated log generations to keep |
+| `max_log_files` | integer | `5` | Rotated log generations to keep (1-1000) |
 
 ### Key details
 
@@ -427,13 +428,13 @@ The changes take effect immediately and are persisted (same lists as `nostrfy re
 
 **`log_file`** — Where the daemon writes its log. Rotated when it grows past `max_log_size_bytes`.
 
-**`stats_file`** — Where live statistics are written (atomically, via temp-file + rename) every `stats_interval_secs` seconds. Read by `nostrfy stats`; the same data is served at `/relay/stats`.
+**`stats_file`** — Where live statistics are written (atomically, via temp-file + rename) every `stats_interval_secs` seconds. Read by `nostrfy stats`; the same data is served at `/relay/stats`. Every snapshot carries a `written_at` Unix timestamp: `nostrfy stats` refuses to print a snapshot older than 3× `stats_interval_secs` (or whose daemon is no longer running) and exits nonzero instead of presenting stale counters as live.
 
-**`stats_interval_secs`** — How often the statistics file is refreshed (≥ 1).
+**`stats_interval_secs`** — How often the statistics file is refreshed (must be ≥ 1; `0` is rejected at startup, not silently clamped). `nostrfy stats` uses three times this value as its staleness threshold.
 
 **`max_log_size_bytes`** — Rotate the log when it reaches this size (`0` = never rotate). The current file becomes `.1`, older backups shift up.
 
-**`max_log_files`** — How many rotated generations to keep (`.1`, `.2`, ... `.N`); older backups are discarded.
+**`max_log_files`** — How many rotated generations to keep (`.1`, `.2`, ... `.N`; must be between 1 and 1000); older backups are discarded.
 
 ### Behavior notes
 
@@ -549,6 +550,8 @@ Each `allow`/`deny` writes the database and reloads the running daemon (SIGHUP),
 | blocked IPs must parse | `access.blocked_ips contains an invalid IP address: "..."` |
 | `map_size` ≤ `max_map_size` | `database.map_size must not exceed database.max_map_size` |
 | Core limits must be ≥ 1 | `limits.max_connections must be at least 1 (got 0)` |
+| `daemon.stats_interval_secs` must be ≥ 1 | `daemon.stats_interval_secs must be at least 1 (got 0)` |
+| `daemon.max_log_files` must be 1-1000 | `daemon.max_log_files must be between 1 and 1000` |
 | Paths must not be empty | `database.path must not be empty` |
 
 Unknown keys or sections produce **warnings** (not errors), so typos are visible:
@@ -562,17 +565,20 @@ Unknown keys or sections produce **warnings** (not errors), so typos are visible
 
 ## 10. Reloading at runtime (SIGHUP)
 
-Editing the file and sending `kill -HUP $(cat nostrfy.pid)` reloads it **without a restart**. Most settings take effect immediately; a few are fixed at startup:
+Editing the file and sending `kill -HUP $(cat nostrfy.pid)` reloads it **without a restart**. The reload is **not all-or-nothing**: every setting that can be applied live is applied, even when the same file also changes a startup-only setting. Startup-only settings keep their running values; each changed one is warned about (`<key> changed in the reloaded config but the routes are fixed at startup; a restart is required to apply it`), and a changed `relay.private_key` is warned about and ignored because the signing key is fixed at startup. A file that **fails validation** is rejected as a whole (the error is logged and the old configuration stays in force).
 
 | Applies on SIGHUP | Requires `nostrfy restart` |
 | --- | --- |
-| `relay.name`, `description`, `pubkey`, `contact`, `icon`, `post_policy`, `public_url`, `relay.reject_ephemeral`, `relay.enabled_git`, `relay.enabled_nip78_auth` | `relay.private_key` |
-| most of `[limits]` (the restart-column entries below apply on restart only) | `relay.livekit_*`, `relay.enabled_nips` / `disabled_nips` |
-| — | `database.path`, `database.purge_interval_secs`, `database.map_size`, `database.max_map_size`, `database.search_index`, `database.meta_index`, `database.reader_threads`, `database.disabled_fsync`, `database.db_request_timeout_secs`, `database.max_db_queue_msgs`, `database.max_db_queue_events`, `database.max_db_queue_bytes`, `database.max_indexed_words`, `daemon.max_log_size_bytes`, `max_log_files`, `stats_interval_secs`, `limits.live_buffer`, `live_batch_size`, `live_batch_interval_ms`, `socket_recv_buffer_kb`, `max_connections`, `max_connections_per_ip`, `http_read_timeout_secs`, `max_connections_per_sec_per_ip`, `rpc.max_admin_body_bytes`, `relay.max_groups`, `blossom.host`, `blossom.storage`, `blossom.local_path`, `blossom.max_upload_bytes`, `blossom.min_free_bytes`, `blossom.s3_*` |
+| Relay identity and policies: `relay.name`, `description`, `pubkey`, `contact`, `icon`, `post_policy`, `public_url`, `reject_ephemeral`, `enabled_git`, `enabled_nip78_auth`, `require_auth`, `send_auth_challenge`, `require_pow`, `new_pubkey_min_age_secs`, `max_events_per_min_per_pubkey` | `relay.private_key` (warned about and ignored), `relay.livekit_url`/`livekit_api_key`/`livekit_api_secret`, `relay.enabled_nips`/`disabled_nips`, `relay.max_groups` |
+| `rpc.management_token`, `rpc.admin_pubkey`, `blossom.restrict_uploads`, `access.restrict_relay` | `rpc.max_admin_body_bytes` |
+| Most of `[limits]`: `max_ws_message_bytes`, `max_filters`, `max_subscriptions`, `max_limit`, `max_count`, `max_sub_id_len`, `max_content_bytes`, `max_tags`, `max_tag_value_bytes`, `max_created_at_future_secs`, `max_neg_items`, `max_sub_bytes`, `group_late_publish_secs`, the API bounds (`max_api_concurrent`, `max_api_queue_msgs`, `max_api_limit`, `max_api_offset`, `max_api_fetch`, `max_api_search_bytes`), `max_out_queue_bytes`, `max_req_response_bytes`, `ws_idle_timeout_secs` | `limits.live_buffer`, `limits.live_batch_size`, `limits.live_batch_interval_ms`, `limits.socket_recv_buffer_kb`, `limits.max_connections`, `limits.max_connections_per_ip`, `limits.http_read_timeout_secs`, `limits.max_connections_per_sec_per_ip` (they shape the accept loop built at startup) |
+| — | `database.path`, `database.purge_interval_secs`, `database.map_size`, `database.max_map_size`, `database.max_dbs`, `database.max_readers`, `database.search_index`, `database.meta_index`, `database.reader_threads`, `database.disabled_fsync`, `database.db_request_timeout_secs`, `database.max_db_queue_msgs`, `database.max_db_queue_events`, `database.max_db_queue_bytes`, `database.max_indexed_words` |
+| — | `daemon.max_log_size_bytes`, `daemon.max_log_files`, `daemon.stats_interval_secs`, `daemon.log_file`, `daemon.pid_file` |
+| — | `blossom.host`, `blossom.storage`, `blossom.local_path`, `blossom.max_upload_bytes`, `blossom.min_free_bytes`, `blossom.s3_*` |
 
-`[access]` is **not** applied by a reload: the access lists are seeded once at startup and then managed at runtime via NIP-86.
+`[access]` kind/IP lists (`blocked_kinds`, `allowed_kinds`, `blocked_ips`) are **not** applied by a reload: they are seeded once at startup and then managed at runtime via NIP-86, and the runtime state wins (a config edit is warned about and ignored). `restrict_relay` is config-owned and does apply on SIGHUP.
 
-The log warns when one of the restart-required settings changed (`... a restart is required to apply it`). A few startup-captured settings (`relay.max_groups`, the LMDB map size floor) are not checked by the reload.
+The log warns when one of the restart-required settings changed (`... a restart is required to apply it`); the running value is kept so the in-memory config never claims a behavior the process does not have.
 
 ---
 
@@ -634,8 +640,8 @@ max_sub_bytes = 524288
 group_late_publish_secs = 604800
 max_api_concurrent = 32
 max_api_limit = 500
-max_api_offset = 10000
-max_api_fetch = 10000
+max_api_offset = 50000
+max_api_fetch = 55001
 max_api_search_bytes = 1024
 http_read_timeout_secs = 30
 max_connections_per_sec_per_ip = 0

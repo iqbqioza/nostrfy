@@ -37,6 +37,23 @@ pub struct Role {
     pub order: Option<i64>,
 }
 
+/// NIP-43: the optional `color` tag is "a `hue` value from `0` to `360` for
+/// the role". An empty string is allowed and means the tag is omitted;
+/// anything else must be a plain integer in range, or clients would receive
+/// a role color they cannot interpret. Validated at the RPC boundary
+/// (`NIP-86 createrole`/`editrole`) before the role is stored or published.
+pub fn check_role_color(color: &str) -> anyhow::Result<()> {
+    if color.is_empty() {
+        return Ok(());
+    }
+    match color.parse::<u32>() {
+        Ok(hue) if hue <= 360 => Ok(()),
+        _ => Err(anyhow::anyhow!(
+            "role color must be a hue value from 0 to 360"
+        )),
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct RoleStore {
     pub roles: HashMap<String, Role>,
@@ -377,6 +394,23 @@ fn tag_value<'a>(event: &'a Event, name: &str) -> Option<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn role_color_must_be_a_hue_in_range() {
+        // NIP-43: `color` is a hue from 0 to 360; the empty string means
+        // the optional tag is omitted.
+        assert!(check_role_color("").is_ok());
+        assert!(check_role_color("0").is_ok());
+        assert!(check_role_color("37").is_ok());
+        assert!(check_role_color("360").is_ok());
+        // Out of range or not a plain integer: rejected (the relay would
+        // otherwise publish a color clients cannot interpret).
+        assert!(check_role_color("361").is_err());
+        assert!(check_role_color("-1").is_err());
+        assert!(check_role_color("1.5").is_err());
+        assert!(check_role_color("red").is_err());
+        assert!(check_role_color("37px").is_err());
+    }
 
     #[test]
     fn role_lifecycle() {

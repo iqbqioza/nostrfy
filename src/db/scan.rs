@@ -103,6 +103,19 @@ fn event_size_estimate(event: &Event) -> usize {
         + 64
 }
 
+/// A cheap upper-bound-ish estimate of a negentropy record's heap footprint:
+/// the strings [`ItemCollector`] clones per record. The count caps alone
+/// let a NEG/aggregate scan materialize huge gift-wrap recipient lists, so
+/// the byte budget (see [`COLLECT_BYTE_CAP`]) counts them here too.
+fn neg_item_size_estimate(item: &NegItem) -> usize {
+    item.pubkey.len()
+        + item.gid.as_deref().map_or(0, str::len)
+        + item
+            .wrap_recipients
+            .as_ref()
+            .map_or(0, |recipients| recipients.iter().map(String::len).sum())
+}
+
 /// Upper bound on the number of query terms used for a search: the word
 /// index walk and the relevance ranking both stop here, so a pathological
 /// query (e.g. a 1000-byte search string) cannot fan out into hundreds of
@@ -360,22 +373,38 @@ struct ItemCollector {
     /// events sharing one timestamp would be materialized up to the whole
     /// candidate budget for a tiny `max_items`.
     tie_cap: usize,
+    /// Estimated heap bytes of the collected records (see
+    /// [`COLLECT_BYTE_CAP`]). The count caps alone let NEG/aggregate
+    /// requests materialize up to `2 * max_items` huge gift-wrap recipient
+    /// lists, bypassing the event collector's byte budget.
+    bytes: usize,
+    /// The byte ceiling of this collector; [`Self::new`] uses
+    /// [`COLLECT_BYTE_CAP`], tests pass a small value.
+    byte_cap: usize,
 }
 
 impl ItemCollector {
     fn new(cap: usize) -> Self {
+        Self::with_byte_cap(cap, COLLECT_BYTE_CAP)
+    }
+
+    fn with_byte_cap(cap: usize, byte_cap: usize) -> Self {
         ItemCollector {
             items: Vec::new(),
             cap,
             boundary: None,
             tie_cap: cap.saturating_mul(2),
+            bytes: 0,
+            byte_cap,
         }
     }
 }
 
 impl ScanCollector for ItemCollector {
     fn full(&self) -> bool {
-        self.items.len() >= self.tie_cap
+        // The byte budget is the real memory guard (mirroring
+        // `EventCollector`): `tie_cap` bounds only the record count.
+        self.bytes >= self.byte_cap || self.items.len() >= self.tie_cap
     }
     fn cap(&self) -> usize {
         self.cap
@@ -413,7 +442,7 @@ impl ScanCollector for ItemCollector {
         } else {
             None
         };
-        self.items.push(NegItem {
+        let item = NegItem {
             created: event.created_at,
             id,
             kind: event.kind,
@@ -423,7 +452,9 @@ impl ScanCollector for ItemCollector {
             gid,
             meta,
             wrap_recipients,
-        });
+        };
+        self.bytes = self.bytes.saturating_add(neg_item_size_estimate(&item));
+        self.items.push(item);
         true
     }
     fn push_light(&mut self, event: &NegLight, id: [u8; 32], limit: usize) -> bool {
@@ -458,7 +489,7 @@ impl ScanCollector for ItemCollector {
         } else {
             None
         };
-        self.items.push(NegItem {
+        let item = NegItem {
             created: event.created_at(),
             id,
             kind: event.kind(),
@@ -468,7 +499,9 @@ impl ScanCollector for ItemCollector {
             gid,
             meta,
             wrap_recipients,
-        });
+        };
+        self.bytes = self.bytes.saturating_add(neg_item_size_estimate(&item));
+        self.items.push(item);
         true
     }
     fn sort_key(&mut self) {
@@ -533,50 +566,77 @@ impl Store {
         /// cleared if still full) so the map stays bounded.
         const DF_CACHE_MAX: usize = 4096;
         let now = crate::util::unix_now();
-        let mut cache = self.df_cache.lock().unwrap_or_else(|p| p.into_inner());
-        terms
-            .iter()
-            .map(|term| {
+        // Resolve the cached frequencies under a short lock, then count the
+        // misses *outside* it: the walk below touches up to `DF_SAMPLE`
+        // index entries per term, and holding the cache mutex across it
+        // serialized every search on the reader threads behind the slowest.
+        let mut resolved: Vec<Option<u64>> = Vec::with_capacity(terms.len());
+        {
+            let cache = self.df_cache.lock().unwrap_or_else(|p| p.into_inner());
+            for term in terms {
                 if term.len() > WORD_INDEX_MAX {
-                    return 0;
+                    resolved.push(Some(0));
+                    continue;
                 }
-                if let Some(&(df, expires)) = cache.get(term)
-                    && expires > now
-                {
-                    return df;
+                match cache.get(term) {
+                    Some(&(df, expires)) if expires > now => resolved.push(Some(df)),
+                    _ => resolved.push(None),
                 }
-                let mut start = term.as_bytes().to_vec();
-                start.push(0x00);
-                let mut end = term.as_bytes().to_vec();
-                end.push(0x01);
-                let range = (
-                    std::ops::Bound::Included(start.as_slice()),
-                    std::ops::Bound::Excluded(end.as_slice()),
-                );
-                let mut df = 0u64;
-                if let Ok(iter) = by_word.range(rtxn, &range) {
-                    for item in iter {
-                        match item {
-                            Ok(_) => {
-                                df += 1;
-                                if df >= DF_SAMPLE {
-                                    break;
+            }
+        }
+        // Count each missing term once (duplicates share the result).
+        let mut computed: std::collections::HashMap<&str, u64> = std::collections::HashMap::new();
+        for (term, slot) in terms.iter().zip(resolved.iter_mut()) {
+            if slot.is_some() {
+                continue;
+            }
+            let df = match computed.get(term.as_str()) {
+                Some(&df) => df,
+                None => {
+                    let mut start = term.as_bytes().to_vec();
+                    start.push(0x00);
+                    let mut end = term.as_bytes().to_vec();
+                    end.push(0x01);
+                    let range = (
+                        std::ops::Bound::Included(start.as_slice()),
+                        std::ops::Bound::Excluded(end.as_slice()),
+                    );
+                    let mut df = 0u64;
+                    if let Ok(iter) = by_word.range(rtxn, &range) {
+                        for item in iter {
+                            match item {
+                                Ok(_) => {
+                                    df += 1;
+                                    if df >= DF_SAMPLE {
+                                        break;
+                                    }
                                 }
+                                Err(_) => break,
                             }
-                            Err(_) => break,
                         }
                     }
+                    computed.insert(term.as_str(), df);
+                    df
                 }
+            };
+            *slot = Some(df);
+        }
+        // Publish under a short lock, keeping the bounded-cache semantics:
+        // expired entries are dropped when the map is full, and the whole
+        // map is cleared only if it is still full afterwards.
+        {
+            let mut cache = self.df_cache.lock().unwrap_or_else(|p| p.into_inner());
+            for (term, df) in computed {
                 if cache.len() >= DF_CACHE_MAX {
                     cache.retain(|_, (_, expires)| *expires > now);
                     if cache.len() >= DF_CACHE_MAX {
                         cache.clear();
                     }
                 }
-                cache.insert(term.clone(), (df, now.saturating_add(DF_CACHE_SECS)));
-                df
-            })
-            .collect()
+                cache.insert(term.to_string(), (df, now.saturating_add(DF_CACHE_SECS)));
+            }
+        }
+        resolved.into_iter().map(|df| df.unwrap_or(0)).collect()
     }
 
     /// The inverse document frequency weight of each search term from its
@@ -1043,16 +1103,17 @@ impl Store {
                     if *df >= DF_SAMPLE || word.len() > WORD_INDEX_MAX {
                         continue;
                     }
-                    let start = {
-                        let mut v = word.as_bytes().to_vec();
-                        v.push(0x00);
-                        v
-                    };
-                    let end = {
-                        let mut v = word.as_bytes().to_vec();
-                        v.push(0x01);
-                        v
-                    };
+                    // Bound each term range by the filter's time window like
+                    // the pubkey/kind walks: without it the walk starts at
+                    // the newest match of the term and burns the shared work
+                    // budget on out-of-window entries before reaching the
+                    // window (a narrow `since`/`until` could even truncate
+                    // the query to nothing).
+                    let start = word_key(word, since, &[0u8; ID_LEN]);
+                    let end = crate::db::store::range_end(
+                        word_key(word, until.saturating_add(1), &[0u8; ID_LEN]),
+                        until,
+                    );
                     ranges.push((start, end));
                 }
                 // Every term was common: the index walk has no range to
@@ -1727,6 +1788,41 @@ mod tests {
         }
         assert!(c.full(), "the tie cap must stop the scan");
         assert_eq!(pushed, 4, "tie cap is twice the collection cap");
+    }
+
+    #[test]
+    fn item_collector_stops_at_the_byte_cap() {
+        use super::{ItemCollector, NegLight, ScanCollector};
+        use crate::nips::nip62::GIFT_WRAP_KIND;
+        // The record caps alone let a NEG/aggregate scan clone huge gift-wrap
+        // recipient lists up to `2 * cap`; the byte budget is the real guard,
+        // mirroring the event collector.
+        let recipient = "aa".repeat(32); // 64 bytes
+        let mut wrap = ev("w", 1);
+        wrap.kind = GIFT_WRAP_KIND;
+        wrap.tags = vec![vec!["p".into(), recipient.clone()]];
+        let mut c = ItemCollector::with_byte_cap(10, 64);
+        assert!(!c.full());
+        assert!(c.push(wrap, [0x01u8; 32], 10));
+        assert!(c.full(), "the recipient list must reach the byte cap");
+        // The light path shares the same budget.
+        let mut c = ItemCollector::with_byte_cap(10, 64);
+        let light = NegLight {
+            id: "a".repeat(64),
+            pubkey: "b".repeat(64),
+            created_at: 1,
+            kind: GIFT_WRAP_KIND,
+            tags: vec![vec!["p".into(), recipient]],
+        };
+        assert!(c.push_light(&light, [0x02u8; 32], 10));
+        assert!(c.full(), "the light path must respect the byte cap");
+        // A record under the cap does not stop the scan.
+        let mut c = ItemCollector::with_byte_cap(10, 1_000);
+        let mut small = ev("s", 1);
+        small.kind = GIFT_WRAP_KIND;
+        small.tags = vec![];
+        assert!(c.push(small, [0x03u8; 32], 10));
+        assert!(!c.full());
     }
 
     #[test]

@@ -300,8 +300,75 @@ fn parent_side_adoption_moves_the_child_from_its_old_parent() {
 }
 
 #[test]
-fn vanish_rebuild_recreates_membership_of_private_groups() {
-    // ...
+fn vanish_rebuild_does_not_recreate_membership_of_private_groups() {
+    // A vanished pubkey must not be resurrected as a member by the rebuild:
+    // an admin's stored 9000 put-user (or a surviving JOIN) would otherwise
+    // replay the vanished user back into a private group, restoring their
+    // access to all surviving content.
+    use crate::db::DbClient;
+    use crate::nips::nip01;
+    use std::sync::Arc;
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = std::env::temp_dir()
+        .join("nostrfy-nip29-vanish-membership")
+        .join(format!("{:x}-{id}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&path);
+    let cfg = crate::config::DatabaseConfig {
+        path,
+        // Small mappings: the test VM cannot afford several default-sized
+        // (1 GB / 1 TiB) LMDB reservations at once, and the test stores a
+        // handful of events.
+        map_size: 16 * 1024 * 1024,
+        max_map_size: 32 * 1024 * 1024,
+        ..Default::default()
+    };
+    let db = DbClient::open(
+        &cfg,
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let now = 1_700_000_000;
+        let mut events = vec![
+            event(CREATE_GROUP, ADMIN, Some("g1"), vec![]),
+            event(9002, ADMIN, Some("g1"), vec![vec!["private".into()]]),
+            event(
+                9000,
+                ADMIN,
+                Some("g1"),
+                vec![vec![P.into(), OTHER.into(), "mod".into()]],
+            ),
+            event(JOIN, OTHER, Some("g1"), vec![]),
+        ];
+        for ev in &mut events {
+            ev.created_at = now;
+            ev.id = nip01::compute_id(ev);
+            assert_eq!(db.put(ev.clone(), now).await, crate::db::PutOutcome::Stored);
+        }
+        // OTHER vanishes: the JOIN is removed, but the admin's 9000
+        // survives (it is authored by ADMIN) and must not re-add them.
+        let vanished: [u8; 32] = hex::decode(OTHER).unwrap().try_into().unwrap();
+        db.apply_vanish(vanished, now).await;
+
+        let mut store = GroupStore::default();
+        assert!(store.rebuild(&db).await, "the rebuild must complete");
+        let group = store.group("g1").expect("the group survives");
+        assert!(
+            !group.is_member(OTHER),
+            "a vanished pubkey must not be re-added to a private group"
+        );
+        assert!(
+            !store.visible_to(&event(1, OTHER, Some("g1"), vec![]), Some(OTHER)),
+            "a vanished member must not regain private-group reads"
+        );
+    });
 }
 
 fn seeded() -> GroupStore {
@@ -753,6 +820,41 @@ fn subgroups() {
 }
 
 #[test]
+fn create_adopts_a_group_that_declared_it_as_a_child() {
+    // A parent may list a not-yet-existing group as a child (a
+    // placeholder); the child's create then links up to it so both sides
+    // of the parent/child pair agree.
+    let mut store = GroupStore::with_cap(10);
+    let create1 = event(CREATE_GROUP, ADMIN, Some("g1"), vec![]);
+    store.apply(&create1, "relay", 1, false, false);
+    let declare = event(
+        9002,
+        ADMIN,
+        Some("g1"),
+        vec![vec!["child".into(), "g2".into()]],
+    );
+    store.apply(&declare, "relay", 1, false, false);
+    let create2 = event(CREATE_GROUP, ADMIN, Some("g2"), vec![]);
+    let out = store.apply(&create2, "relay", 1, true, false);
+    assert_eq!(store.group("g2").unwrap().parent.as_deref(), Some("g1"));
+    assert!(
+        out.iter().any(|e| e.kind == GROUP_META
+            && e.tags
+                .iter()
+                .any(|t| t.len() >= 2 && t[0] == D && t[1] == "g1")),
+        "the adopting parent's metadata is republished"
+    );
+
+    // An uncapped store skips the scan (n creates would make it O(n²)): the
+    // placeholder link stays one-sided until an explicit edit.
+    let mut uncapped = GroupStore::default();
+    uncapped.apply(&create1, "relay", 1, false, false);
+    uncapped.apply(&declare, "relay", 1, false, false);
+    uncapped.apply(&create2, "relay", 1, false, false);
+    assert_eq!(uncapped.group("g2").unwrap().parent, None);
+}
+
+#[test]
 fn deleted_group_content_is_hidden() {
     let mut store = seeded();
     let edit = event(9002, ADMIN, Some("g1"), vec![vec!["private".into()]]);
@@ -773,20 +875,46 @@ fn deleted_group_content_is_hidden() {
 }
 
 #[test]
-fn private_groups_hide_from_non_members() {
+fn private_groups_hide_messages_but_not_metadata() {
+    // NIP-29: `private` restricts the group's MESSAGES to members, while
+    // `hidden` hides the relay-generated metadata from non-members. The
+    // two are independent: private metadata stays visible, hidden messages
+    // stay readable.
     let mut store = seeded();
+    let outsider = "d".repeat(64);
+    let msg = event(1, ADMIN, Some("g1"), vec![]);
+
+    // private: messages gated, metadata visible.
     let edit = event(9002, ADMIN, Some("g1"), vec![vec!["private".into()]]);
     store.apply(&edit, "", 1, false, false);
-    let msg = event(1, ADMIN, Some("g1"), vec![]);
-    let outsider = "d".repeat(64);
-    assert!(!store.visible_to(&msg, Some(&outsider)));
+    assert!(
+        !store.visible_to(&msg, Some(&outsider)),
+        "private messages are members-only"
+    );
     assert!(store.visible_to(&msg, Some(ADMIN)));
-    // OTHER is a member and may read private groups.
     assert!(store.visible_to(&msg, Some(OTHER)));
     let meta = store.apply(&msg, "", 1, true, false);
     for m in &meta {
-        assert!(!store.visible_to(m, Some(&outsider)));
+        assert!(
+            store.visible_to(m, Some(&outsider)),
+            "private metadata stays visible to non-members"
+        );
     }
+
+    // hidden: metadata gated, messages readable.
+    let edit = event(9002, ADMIN, Some("g1"), vec![vec!["hidden".into()]]);
+    store.apply(&edit, "", 1, false, false);
+    let meta = store.apply(&msg, "", 1, true, false);
+    for m in &meta {
+        assert!(
+            !store.visible_to(m, Some(&outsider)),
+            "hidden metadata is withheld from non-members"
+        );
+    }
+    assert!(
+        store.visible_to(&msg, Some(&outsider)),
+        "hidden messages stay readable"
+    );
 }
 
 #[test]
@@ -950,6 +1078,139 @@ fn rebuild_ghosts_group_whose_only_surviving_events_are_relay_metadata() {
         assert!(
             !store.visible_gid("g1", true, None),
             "the ghosted group's metadata is withheld"
+        );
+    });
+}
+
+#[test]
+fn rebuild_ghosts_a_group_whose_only_surviving_events_are_ordinary_posts() {
+    // A group whose create/settings were lost (vanish, NIP-09, expiry)
+    // leaves only ordinary `h`-tagged posts behind. They are invisible to
+    // the moderation and metadata walks, so the snapshot-less rebuild must
+    // still find them (bounded full-history pass) and ghost the group; a
+    // missing ghost would make the (possibly private) content readable.
+    use crate::db::DbClient;
+    use crate::nips::nip01;
+    use std::sync::Arc;
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = std::env::temp_dir()
+        .join("nostrfy-nip29-ghost-post")
+        .join(format!("{:x}-{id}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&path);
+    let cfg = crate::config::DatabaseConfig {
+        path,
+        // Small mappings: the test VM cannot afford several default-sized
+        // (1 GB / 1 TiB) LMDB reservations at once, and the test stores a
+        // handful of events.
+        map_size: 16 * 1024 * 1024,
+        max_map_size: 32 * 1024 * 1024,
+        ..Default::default()
+    };
+    let db = DbClient::open(
+        &cfg,
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let now = 1_700_000_000;
+        let mut post = event(1, OTHER, Some("g1"), vec![]);
+        post.created_at = now;
+        post.id = nip01::compute_id(&post);
+        assert_eq!(
+            db.put(post.clone(), now).await,
+            crate::db::PutOutcome::Stored
+        );
+        // A post outside any group must not seed a ghost.
+        let mut plain = event(1, OTHER, None, vec![]);
+        plain.created_at = now;
+        plain.id = nip01::compute_id(&plain);
+        assert_eq!(db.put(plain, now).await, crate::db::PutOutcome::Stored);
+
+        let mut store = GroupStore::default();
+        assert!(store.rebuild(&db).await, "the rebuild must complete");
+        assert!(
+            store.ghost.contains("g1"),
+            "a post-only group must be ghosted"
+        );
+        assert!(
+            !store.visible_gid("g1", false, None),
+            "the ghosted group's posts are withheld"
+        );
+    });
+}
+
+#[test]
+fn rebuild_ghosts_a_deleted_group_whose_purge_never_completed() {
+    // A stored 9008 normally means the purge removed the group's events
+    // (including the 9008 itself). If h-tagged survivors remain, the purge
+    // never completed: the rebuild must ghost the id instead of leaving a
+    // delete tombstone that a fresh create could clear over the old,
+    // un-purged history.
+    use crate::db::DbClient;
+    use crate::nips::nip01;
+    use std::sync::Arc;
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = std::env::temp_dir()
+        .join("nostrfy-nip29-ghost-unpurged-delete")
+        .join(format!("{:x}-{id}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&path);
+    let cfg = crate::config::DatabaseConfig {
+        path,
+        // Small mappings: the test VM cannot afford several default-sized
+        // (1 GB / 1 TiB) LMDB reservations at once, and the test stores a
+        // handful of events.
+        map_size: 16 * 1024 * 1024,
+        max_map_size: 32 * 1024 * 1024,
+        ..Default::default()
+    };
+    let db = DbClient::open(
+        &cfg,
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let now = 1_700_000_000;
+        // The create, the delete and an ordinary post all survive: this is
+        // the state a failed purge (+ snapshot loss) leaves behind.
+        let mut events = vec![
+            event(CREATE_GROUP, ADMIN, Some("g1"), vec![]),
+            event(DELETE_GROUP, ADMIN, Some("g1"), vec![]),
+            event(1, OTHER, Some("g1"), vec![]),
+        ];
+        for ev in &mut events {
+            ev.created_at = now;
+            ev.id = nip01::compute_id(ev);
+            assert_eq!(db.put(ev.clone(), now).await, crate::db::PutOutcome::Stored);
+        }
+        let mut store = GroupStore::default();
+        assert!(store.rebuild(&db).await, "the rebuild must complete");
+        assert!(
+            store.deleted.contains("g1"),
+            "the replayed 9008 leaves the delete tombstone"
+        );
+        assert!(
+            store.ghost.contains("g1"),
+            "surviving h-tagged events prove the purge never completed"
+        );
+        let recreate = event(CREATE_GROUP, OTHER, Some("g1"), vec![]);
+        assert_eq!(
+            store.validate_write(&recreate).unwrap_err().to_string(),
+            "blocked: the group has been deleted",
+            "the un-purged id must stay un-recreatable"
         );
     });
 }
@@ -1204,6 +1465,45 @@ fn relay_key_can_restore_an_adminless_group() {
 }
 
 #[test]
+fn relay_key_can_reparent_subgroups() {
+    // The relay's own key is the group master key: it must be able to set
+    // a parent (or adopt a child) without holding an explicit role in
+    // either group, or an operator could not repair orphaned subgroups.
+    let mut store = seeded();
+    let create2 = event(CREATE_GROUP, OTHER, Some("g2"), vec![]);
+    store.apply(&create2, "", 1, false, false);
+    let relay_pk = "ff".repeat(64);
+
+    // A regular key that is not an admin of g2 is rejected.
+    let reparent = event(
+        9002,
+        &relay_pk,
+        Some("g1"),
+        vec![vec!["parent".into(), "g2".into()]],
+    );
+    assert!(store.validate_write(&reparent).is_err());
+    assert!(
+        store
+            .validate_write_for_relay(&reparent, Some(&relay_pk))
+            .is_ok(),
+        "the relay master key may reparent without a group role"
+    );
+    // The same holds for adopting a child through the parent's list.
+    let adopt = event(
+        9002,
+        &relay_pk,
+        Some("g2"),
+        vec![vec!["child".into(), "g1".into()]],
+    );
+    assert!(
+        store
+            .validate_write_for_relay(&adopt, Some(&relay_pk))
+            .is_ok(),
+        "the relay master key may adopt a child without a role in it"
+    );
+}
+
+#[test]
 fn parent_side_adopt_requires_child_admin() {
     // A parent admin must not hijack an orphan group by listing it: the
     // author must also administer the child (the child's own 9002 remains
@@ -1255,6 +1555,42 @@ fn deleted_group_id_can_be_recreated() {
         store.group("g1").is_some(),
         "a fresh create must resurrect the id"
     );
+}
+
+#[test]
+fn groups_snapshot_without_ghost_deserializes() {
+    // Snapshots written before the ghost marker lack the field: it must
+    // default to empty instead of failing the load (a failed load would
+    // silently discard the whole persisted state and force a rebuild).
+    let json = r#"{"groups":{},"deleted":["g1"]}"#;
+    let snap: GroupsSnapshot = serde_json::from_str(json).unwrap();
+    assert!(snap.groups.is_empty());
+    assert!(snap.deleted.contains("g1"));
+    assert!(snap.ghost.is_empty());
+}
+
+#[test]
+fn ghosted_group_id_cannot_be_recreated() {
+    // A ghost's create event was lost while survivors may still be stored;
+    // a fresh create must not resurrect it as a default-public group (that
+    // would expose the survivors). Unlike `deleted`, whose events the relay
+    // purged, a ghost is never cleared by a create.
+    let mut store = seeded();
+    store.mark_ghost("g1");
+    let recreate = event(CREATE_GROUP, ADMIN, Some("g1"), vec![]);
+    assert_eq!(
+        store.validate_write(&recreate).unwrap_err().to_string(),
+        "blocked: the group has been deleted",
+        "a ghosted id must reject even a create"
+    );
+    // Even a direct apply (history replay bypassing validation) must not
+    // clear the ghost.
+    store.apply(&recreate, "", 1, false, false);
+    assert!(
+        store.ghost.contains("g1"),
+        "apply's create arm must not clear a ghost"
+    );
+    assert!(!store.visible_gid("g1", false, None));
 }
 
 #[test]

@@ -58,17 +58,72 @@ impl log::Log for Logger {
 
 /// Installs the delegating logger as the process-wide logger (idempotent).
 /// The maximum level honours the `RUST_LOG` environment variable (default
-/// `info`), matching the previous env_logger behaviour.
+/// `info`), matching the previous env_logger behaviour; see
+/// [`parse_max_level`] for the accepted directive forms.
 pub fn init() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         let _ = log::set_logger(&LOGGER);
         let level = std::env::var("RUST_LOG")
             .ok()
-            .and_then(|v| v.parse::<log::LevelFilter>().ok())
+            .map(|v| parse_max_level(&v))
             .unwrap_or(log::LevelFilter::Info);
         log::set_max_level(level);
     });
+}
+
+/// The global maximum level for a `RUST_LOG` value. Full env_logger
+/// directive semantics are out of scope — the process is a single binary,
+/// `nostrfy`, whose records all carry the `nostrfy` or `nostrfy::module`
+/// target — so this supports the documented forms: a bare level (`debug`),
+/// comma-separated directives (`nostrfy=debug,nostrfy::server=trace`) and
+/// a bare crate/module name (env_logger's shorthand for `=trace`). When a
+/// specific directive matches the crate, the most specific (longest) target
+/// wins over the bare default; a target that does not name this crate is
+/// ignored, because it cannot filter `nostrfy` records and treating it as
+/// the global level would silently change the relay's log volume. Without
+/// any usable directive the default is `info`.
+fn parse_max_level(value: &str) -> log::LevelFilter {
+    fn matches_crate(target: &str) -> bool {
+        target == "nostrfy" || target.starts_with("nostrfy::")
+    }
+    let mut bare: Option<log::LevelFilter> = None;
+    let mut targeted: Option<(usize, log::LevelFilter)> = None;
+    for directive in value.split(',') {
+        let directive = directive.trim();
+        if directive.is_empty() {
+            continue;
+        }
+        match directive.split_once('=') {
+            None => match directive.parse::<log::LevelFilter>() {
+                Ok(level) => bare = Some(level),
+                // A bare target (`RUST_LOG=nostrfy`) is env_logger's
+                // shorthand for the most verbose level for that target.
+                Err(_) if matches_crate(directive) => {
+                    targeted = Some((directive.len(), log::LevelFilter::Trace));
+                }
+                Err(_) => {}
+            },
+            Some((target, level)) => {
+                let target = target.trim();
+                if !matches_crate(target) {
+                    continue;
+                }
+                let Ok(level) = level.trim().parse::<log::LevelFilter>() else {
+                    continue;
+                };
+                // Ties go to the later directive (env_logger applies the
+                // last matching directive).
+                if targeted.is_none_or(|(len, _)| target.len() >= len) {
+                    targeted = Some((target.len(), level));
+                }
+            }
+        }
+    }
+    targeted
+        .map(|(_, level)| level)
+        .or(bare)
+        .unwrap_or(log::LevelFilter::Info)
 }
 
 /// Installs a rotating file backend (used in daemon mode).
@@ -115,13 +170,32 @@ impl FileLogger {
         if self.max_size == 0 || state.size < self.max_size {
             return;
         }
-        // Shift the backups up: `.N-1` -> `.N`, `.1` -> `.2`, etc.
-        for i in (1..self.max_files).rev() {
+        // Shift the backups up: `.N-1` -> `.N`, `.1` -> `.2`, etc. Only the
+        // generations that actually exist are touched: the old loop probed
+        // every index below `max_log_files`, so a large configured ceiling
+        // turned each rotation into thousands of stat/rename calls while
+        // holding the logger mutex. Enumerating the directory is O(files).
+        let dir = match self.path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent,
+            _ => Path::new("."),
+        };
+        let mut existing: Vec<u32> = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|entry| backup_index(&self.path, &entry.path()))
+            .collect();
+        existing.sort_unstable();
+        // Descending so `.N` is moved before `.N-1` overwrites it. A
+        // generation above the current ceiling is left in place (the same
+        // as before) until a later shift overwrites it.
+        for i in existing.into_iter().rev() {
+            if i >= self.max_files {
+                continue;
+            }
             let from = backup_path(&self.path, i);
             let to = backup_path(&self.path, i + 1);
-            if from.exists()
-                && let Err(e) = std::fs::rename(&from, &to)
-            {
+            if let Err(e) = std::fs::rename(&from, &to) {
                 eprintln!("cannot rotate log backup {}: {e}", from.display());
             }
         }
@@ -161,6 +235,19 @@ fn backup_path(path: &Path, n: u32) -> PathBuf {
     let mut os = path.as_os_str().to_owned();
     os.push(format!(".{n}"));
     PathBuf::from(os)
+}
+
+/// The backup generation a directory entry represents for `path`
+/// (`nostrfy.log.3` -> `3`), or `None` for any other file.
+fn backup_index(path: &Path, candidate: &Path) -> Option<u32> {
+    let name = path.file_name()?.to_str()?;
+    candidate
+        .file_name()?
+        .to_str()?
+        .strip_prefix(name)?
+        .strip_prefix('.')?
+        .parse()
+        .ok()
 }
 
 impl log::Log for FileLogger {
@@ -323,6 +410,73 @@ mod tests {
         // Backups exist and are bounded.
         assert!(path.with_file_name("nostrfy.log.1").exists() || backup_path(&path, 1).exists());
         assert!(!backup_path(&path, 4).exists(), "only 3 backups are kept");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rust_log_parses_bare_levels_and_directives() {
+        use log::LevelFilter;
+        assert_eq!(parse_max_level("debug"), LevelFilter::Debug);
+        assert_eq!(parse_max_level("off"), LevelFilter::Off);
+        // The documented directive form: nostrfy=debug.
+        assert_eq!(parse_max_level("nostrfy=debug"), LevelFilter::Debug);
+        assert_eq!(parse_max_level("nostrfy::server=trace"), LevelFilter::Trace);
+        // A bare crate/module name is env_logger's shorthand for trace.
+        assert_eq!(parse_max_level("nostrfy"), LevelFilter::Trace);
+        // The most specific matching directive wins over the bare default.
+        assert_eq!(
+            parse_max_level("nostrfy=info,nostrfy::server=trace"),
+            LevelFilter::Trace
+        );
+        assert_eq!(
+            parse_max_level("nostrfy::server=trace,nostrfy=info"),
+            LevelFilter::Trace
+        );
+        // Unrelated targets cannot change the relay's level.
+        assert_eq!(parse_max_level("hyper=debug"), LevelFilter::Info);
+        assert_eq!(parse_max_level("info,hyper=debug"), LevelFilter::Info);
+        // Garbage keeps the default.
+        assert_eq!(parse_max_level("not-a-level"), LevelFilter::Info);
+        assert_eq!(parse_max_level("nostrfy=not-a-level"), LevelFilter::Info);
+        // Later directives win on ties.
+        assert_eq!(
+            parse_max_level("nostrfy=debug,nostrfy=info"),
+            LevelFilter::Info
+        );
+    }
+
+    #[test]
+    fn rotation_shifts_only_existing_backups_with_a_large_ceiling() {
+        // Regression: the shift loop probed every index below
+        // `max_log_files`, so a large configured ceiling made each rotation
+        // walk thousands of names under the logger mutex. Existing backups
+        // must still shift up across a gap.
+        let dir = std::env::temp_dir().join("nostrfy-log-large-ceiling-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("nostrfy.log");
+        std::fs::write(&path, "current").unwrap();
+        std::fs::write(backup_path(&path, 1), "one").unwrap();
+        // A gap at .2 and a high existing generation from an earlier run.
+        std::fs::write(backup_path(&path, 3), "three").unwrap();
+
+        let logger = FileLogger::open(path.clone(), 4, 1000).unwrap();
+        {
+            let mut state = logger.inner.lock().unwrap();
+            state.size = 100; // force a rotation on the next record
+        }
+        let record = log::Record::builder()
+            .args(format_args!("rotate now"))
+            .level(log::Level::Info)
+            .build();
+        logger.log(&record);
+
+        assert!(
+            backup_path(&path, 1).exists(),
+            "the current file becomes .1"
+        );
+        assert!(backup_path(&path, 2).exists(), ".1 must shift to .2");
+        assert!(backup_path(&path, 4).exists(), ".3 must shift to .4");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
