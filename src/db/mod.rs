@@ -1664,6 +1664,21 @@ impl DbClient {
     }
 
     /// Loads a Blossom blob's persisted metadata.
+    /// Like [`Self::blossom_load`], but distinguishes a database failure
+    /// (`None`) from "no mapping" (`Some(None)`): the upload path must not
+    /// treat a failed read as "no owner yet" and later roll back a valid
+    /// mapping, and a lookup failure must not be reported as 404.
+    pub async fn blossom_load_checked(
+        &self,
+        sha256: &str,
+    ) -> Option<Option<crate::db::store::BlossomMeta>> {
+        self.request_read_result(|reply| Msg::BlossomLoad {
+            sha256: sha256.to_string(),
+            reply,
+        })
+        .await
+    }
+
     pub async fn blossom_load(&self, sha256: &str) -> Option<crate::db::store::BlossomMeta> {
         self.request_read(|reply| Msg::BlossomLoad {
             sha256: sha256.to_string(),

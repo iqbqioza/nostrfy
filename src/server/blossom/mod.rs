@@ -1374,6 +1374,10 @@ pub(crate) async fn build_state(cfg: &Config, _relay: &Relay) -> Option<Arc<Blos
     .await
     {
         Ok(store) => {
+            // Remove spool files a crash (SIGKILL/power loss) left behind:
+            // their Drop cleanup never ran and they would otherwise
+            // accumulate until the disk is full.
+            store.sweep_stale_spools();
             let state = Arc::new(BlossomState {
                 store,
                 host: cfg.blossom.host.clone(),

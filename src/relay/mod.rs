@@ -1429,7 +1429,7 @@ impl Relay {
                     // their surviving ordinary posts must not become
                     // world-readable on a keyless relay (no relay-signed
                     // metadata survives to mark them). Ghost them.
-                    let previous: Vec<String> = groups.groups.keys().cloned().collect();
+                    let previous = groups.hidden_group_ids();
                     let ok = fresh.rebuild(&self.db).await;
                     if ok {
                         fresh.ghost_missing(previous);
