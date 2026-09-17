@@ -168,6 +168,9 @@ enum Msg {
     /// later re-creation of the id cannot expose the old history.
     GroupPurge {
         group: String,
+        /// The purge cut recorded in the group's marker: re-published events
+        /// created before it are rejected (see `Store::purge_group`).
+        now: u64,
         reply: oneshot::Sender<usize>,
     },
     Vanish {
@@ -1415,8 +1418,8 @@ impl DbClient {
 
     /// NIP-29 `kind:9008`: purges every stored event tagged with the deleted
     /// group id.
-    pub async fn group_purge(&self, group: String) -> usize {
-        self.request_write(|reply| Msg::GroupPurge { group, reply })
+    pub async fn group_purge(&self, group: String, now: u64) -> usize {
+        self.request_write(|reply| Msg::GroupPurge { group, now, reply })
             .await
     }
 

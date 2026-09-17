@@ -358,7 +358,7 @@ The changes take effect immediately and are persisted (same lists as `nostrfy re
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
 | `path` | string | `"./data"` | Database directory (LMDB) |
-| `max_dbs` | integer | `32` | LMDB max named databases (must be ≥ 18) |
+| `max_dbs` | integer | `32` | LMDB max named databases (must be ≥ 19) |
 | `max_readers` | integer | `128` | LMDB max concurrent readers (must be ≥ 8) |
 | `map_size` | integer | `1073741824` (1 GB) | Floor for the memory map size (bytes) |
 | `max_map_size` | integer | `1099511627776` (1 TB) | Memory-map ceiling (bytes) |
@@ -374,7 +374,7 @@ The changes take effect immediately and are persisted (same lists as `nostrfy re
 
 **`path`** — The directory holding the LMDB database files. Relative paths are resolved against the config file's directory, so they stay valid after the daemon changes its working directory. Do not point two relay instances at the same directory.
 
-**`max_dbs`** — LMDB's maximum number of named databases. The relay uses 18 when `search_index = true` (17 tables plus the word index) and 17 otherwise; values below 18 are raised to 18 so the word index can always be created.
+**`max_dbs`** — LMDB's maximum number of named databases. The relay uses 19 when `search_index = true` (18 tables plus the word index) and 18 otherwise; values below 19 are raised to 19 so the word index can always be created.
 
 **`max_readers`** — LMDB's maximum number of concurrent read transactions. Must be ≥ 8; the relay uses three threads (writer, reader, API reader).
 

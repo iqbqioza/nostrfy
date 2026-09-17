@@ -1,6 +1,6 @@
 [package]
 name = "nostrfy"
-version = "0.1.11"
+version = "0.1.12"
 edition = "2024"
 description = "A minimal and stable Nostr relay server"
 license = "MIT"

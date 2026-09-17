@@ -1495,7 +1495,7 @@ fn group_purge_removes_only_that_groups_events() {
         for e in [&g1, &g2, &plain] {
             assert_eq!(db.put(e.clone(), now).await, PutOutcome::Stored);
         }
-        assert_eq!(db.group_purge("group-1".into()).await, 1);
+        assert_eq!(db.group_purge("group-1".into(), now).await, 1);
         let f: Filter = serde_json::from_value(serde_json::json!({"#h": ["group-1"]})).unwrap();
         let (res, _) = db.query(vec![f], 500, now).await;
         assert!(res.is_empty(), "the purged group must have no events");
@@ -1505,6 +1505,80 @@ fn group_purge_removes_only_that_groups_events() {
         let f: Filter = serde_json::from_value(serde_json::json!({"kinds": [1]})).unwrap();
         let (res, _) = db.query(vec![f], 500, now).await;
         assert_eq!(res.len(), 2, "the other group and the plain event survive");
+    });
+    db.shutdown();
+}
+
+#[test]
+fn purged_group_history_cannot_be_republished() {
+    // NIP-29: the per-group purge marker (one record, not one tombstone per
+    // purged event) blocks a re-broadcast of the purged history after the
+    // id is re-created, while genuinely newer events pass.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let old = event(
+            1,
+            "purged history",
+            now - 100,
+            vec![vec!["h".into(), "group-9".into()]],
+        );
+        let other = event(
+            1,
+            "other group",
+            now - 100,
+            vec![vec!["h".into(), "group-8".into()]],
+        );
+        let plain = event(1, "no group", now - 100, vec![]);
+        for e in [&old, &other, &plain] {
+            assert_eq!(db.put(e.clone(), now).await, PutOutcome::Stored);
+        }
+        assert_eq!(db.group_purge("group-9".into(), now).await, 1);
+        // The purged event is gone and a re-broadcast is refused without a
+        // per-event tombstone.
+        assert_eq!(
+            db.put(old.clone(), now).await,
+            PutOutcome::PreviouslyDeleted
+        );
+        // Events created after the cut pass (the re-create and new posts).
+        let fresh = event(
+            1,
+            "after the purge",
+            now,
+            vec![vec!["h".into(), "group-9".into()]],
+        );
+        assert_eq!(db.put(fresh, now).await, PutOutcome::Stored);
+        // Unrelated groups and untagged events are unaffected: fresh events
+        // (same age range as the purged one) are still accepted.
+        let other_new = event(
+            1,
+            "other group new",
+            now - 50,
+            vec![vec!["h".into(), "group-8".into()]],
+        );
+        let plain_new = event(1, "no group new", now - 50, vec![]);
+        assert_eq!(db.put(other_new, now).await, PutOutcome::Stored);
+        assert_eq!(db.put(plain_new, now).await, PutOutcome::Stored);
+        // A second purge moves the cut: the previously accepted event is
+        // removed and its replay is blocked too.
+        assert_eq!(db.group_purge("group-9".into(), now + 1).await, 1);
+        let fresh = event(
+            1,
+            "after the purge",
+            now,
+            vec![vec!["h".into(), "group-9".into()]],
+        );
+        assert_eq!(db.put(fresh, now + 1).await, PutOutcome::PreviouslyDeleted);
     });
     db.shutdown();
 }

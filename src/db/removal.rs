@@ -3,7 +3,7 @@
 
 use super::store::{
     CREATED_LEN, GIFT_WRAP_INDEX, ID_LEN, Store, created_key, delegated_by, deleted_address_key,
-    dtag_key_safe, pubkey_key, replaceable_key, tag_key,
+    dtag_key_safe, pubkey_key, purged_group_key, replaceable_key, tag_key,
 };
 use crate::error::Result;
 use crate::event::Event;
@@ -336,8 +336,36 @@ impl Store {
     /// `gid` (the `h` tag). A fresh create on the same id installs a public
     /// group, so without the purge the old (possibly private) history would
     /// suddenly be served under the new settings.
-    pub(crate) fn purge_group(&self, gid: &str) -> Result<usize> {
+    ///
+    /// `now` is the purge cut recorded in [`PURGED_GROUPS`]: any later
+    /// replay of an event for this gid that was created before the cut is
+    /// rejected at the put path, so the purged history cannot re-enter the
+    /// database after a re-create. One marker covers the whole group (a
+    /// create/purge cycle no longer writes a tombstone per purged event,
+    /// which grew the database by the group's whole history). The marker is
+    /// written and committed *first*: a put queued behind the purge sees it,
+    /// and a crash mid-purge leaves the (fail-closed) cut rather than a
+    /// window where re-published events are accepted.
+    pub(crate) fn purge_group(&self, gid: &str, now: u64) -> Result<usize> {
         self.disk_full_error()?;
+        {
+            let mut wtxn = self.env.write_txn()?;
+            let key = purged_group_key(gid);
+            // Merge with an earlier purge of the same id: the furthest cut
+            // covers every already-rejected generation.
+            let cut = self
+                .purged_groups
+                .get(&wtxn, &key)?
+                .and_then(|raw| {
+                    raw.get(..8)
+                        .map(|bytes| u64::from_be_bytes(bytes.try_into().expect("checked length")))
+                })
+                .unwrap_or(0)
+                .max(now);
+            self.purged_groups
+                .put(&mut wtxn, &key, &cut.to_be_bytes())?;
+            wtxn.commit()?;
+        }
         let start = tag_key(b'h', gid.as_bytes(), 0, &[0u8; ID_LEN]);
         let end = tag_key(b'h', gid.as_bytes(), u64::MAX, &[0xffu8; ID_LEN]);
         let mut last_key: Option<Vec<u8>> = None;
@@ -345,8 +373,7 @@ impl Store {
         loop {
             // A fresh write transaction per chunk: a group's history is
             // unbounded, and one transaction across the whole purge pinned
-            // the writer while a MapFull aborted everything. The per-event
-            // tombstones commit with their chunk.
+            // the writer while a MapFull aborted everything.
             let mut wtxn = self.env.write_txn()?;
             let lower = match &last_key {
                 Some(k) => std::ops::Bound::Excluded(k.as_slice()),
@@ -367,14 +394,6 @@ impl Store {
             last_key = Some(entries.last().unwrap().0.clone());
             for (_, id) in entries {
                 if self.events.get(&wtxn, &id)?.is_some() {
-                    // Tombstone the id: a purged group's history must not
-                    // be re-publishable (the same content id would
-                    // otherwise be accepted after the group is re-created
-                    // as a public group, exposing the old private history).
-                    // The tombstone is permanent: the `deleted` table has
-                    // no retention/pruning path, and pruning it would
-                    // reopen exactly that re-publication window.
-                    self.deleted.put(&mut wtxn, &id, b"")?;
                     self.remove_event(&mut wtxn, &id)?;
                     removed += 1;
                 }
