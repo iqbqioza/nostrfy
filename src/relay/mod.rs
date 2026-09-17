@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use secp256k1::{Keypair, Secp256k1, XOnlyPublicKey};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicIsize, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, AtomicUsize, Ordering};
 use tokio::sync::RwLock;
 use tokio::sync::mpsc;
 
@@ -108,6 +108,11 @@ pub struct Relay {
     /// fresh store under the same lock. `persist_groups` uses
     /// `GroupsRebuild::persist_lock`.
     persist_roles_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+    /// Debounced NIP-29/NIP-43 snapshot persistence: the hot mutation paths
+    /// set a dirty flag and let one background worker clone+save at most
+    /// once per [`SNAPSHOT_PERSIST_INTERVAL_MS`], instead of paying the
+    /// O(total state) clone+serialize on every event.
+    snapshot_persist: std::sync::Arc<SnapshotPersist>,
     /// Serializes the Blossom allowlist snapshot capture and write (NIP-86
     /// or the `/blossom allow|deny` command events, and the SIGHUP reload):
     /// without it a command that captured an older snapshot can queue its
@@ -311,12 +316,14 @@ impl GroupsRebuild {
     /// stale snapshot from landing after a newer one.
     ///
     /// The snapshot carries the database's group-state generation
-    /// (`DbClient::state_stamp`) so a later restore can reject a snapshot
-    /// that predates a removal. The stamp is read *before* the capture and
-    /// re-checked after it: a removal committed in between advances the
-    /// generation past the one the captured state can claim, so the
-    /// snapshot is dropped. An unavailable stamp read drops the snapshot
-    /// too (fail-closed): its currency cannot be established.
+    /// (`DbClient::state_stamp`) and derived-state sequence
+    /// (`DbClient::state_seq`) so a later restore can reject a snapshot
+    /// that predates a state removal or a state event. The generation is
+    /// read *before* the capture and re-checked after it: a state change
+    /// committed in between advances past the one the captured state can
+    /// claim, so the snapshot is dropped. An unavailable generation read
+    /// drops the snapshot too (fail-closed): its currency cannot be
+    /// established.
     ///
     /// Returns whether the intended write committed. On `false` the caller
     /// must keep the state pending (fail-closed): a failed clear leaves the
@@ -326,7 +333,7 @@ impl GroupsRebuild {
         if self.pending.load(Ordering::SeqCst) {
             return db.clear_groups_snapshot().await;
         }
-        let Some(stamp) = db.state_stamp().await else {
+        let Some((stamp, seq)) = read_state_generation(db).await else {
             // The generation is unknown: a snapshot whose currency cannot
             // be established must not be saved. Keep the state pending so
             // every retry stays fail-closed.
@@ -341,17 +348,18 @@ impl GroupsRebuild {
         if self.pending.load(Ordering::SeqCst) {
             return db.clear_groups_snapshot().await;
         }
-        match db.state_stamp().await {
+        match read_state_generation(db).await {
             // A group-state removal committed between the stamp read and
-            // the capture: the in-memory snapshot predates it and must not
-            // claim the newer generation.
-            Some(current) if current > stamp => {
-                self.pending.store(true, Ordering::SeqCst);
+            // the capture (or a state event was stored after it): the
+            // in-memory snapshot predates it and must not claim the newer
+            // generation. The old snapshot stays on disk with its older
+            // generation, so the next startup rejects it and rebuilds.
+            Some((current_stamp, current_seq)) if current_stamp > stamp || current_seq > seq => {
                 log::error!(
                     "the group state generation advanced while the snapshot was captured; \
-                     dropping it so the next restart rebuilds from the surviving events"
+                     dropping this save so the next startup rebuilds from the surviving events"
                 );
-                return db.clear_groups_snapshot().await;
+                return false;
             }
             // Same fail-closed rule as the first read.
             None => {
@@ -365,7 +373,97 @@ impl GroupsRebuild {
             Some(_) => {}
         }
         snapshot.stamp = stamp;
+        snapshot.seq = seq;
         db.save_groups(snapshot).await
+    }
+}
+
+/// Reads the database's derived-state generation: `(stamp, seq)`. `None`
+/// when either read failed: a snapshot whose currency cannot be established
+/// must not be saved.
+async fn read_state_generation(db: &DbClient) -> Option<(u64, u64)> {
+    let stamp = db.state_stamp().await?;
+    let seq = db.state_seq().await?;
+    Some((stamp, seq))
+}
+
+/// Bound on the role mutations buffered while a rebuild scan runs. The scan
+/// does not hold `roles.write()`, so NIP-86 mutations and NIP-43 leaves
+/// accepted meanwhile apply to the live store and are captured here for
+/// replay on the fresh one; a burst larger than this cannot be replayed
+/// safely, so the worker discards the fresh store and rebuilds again later
+/// (the live store keeps serving, and `persist_roles` keeps refusing while
+/// the rebuild is dirty). Mirrors [`GROUPS_REBUILD_BUFFER_MAX`].
+const ROLES_REBUILD_BUFFER_MAX: usize = 4096;
+
+/// A role mutation accepted while a rebuild scan was in flight, replayed
+/// onto the fresh store once the scan completes. The high-level action
+/// (not the published event) is buffered, so a mutation is replayed only
+/// when it actually changed the store.
+#[derive(Debug, Clone)]
+enum BufferedRoleMutation {
+    /// `create_role` / `edit_role` (both install the role definition).
+    Create {
+        id: String,
+        label: String,
+        description: String,
+        color: String,
+        order: Option<i64>,
+    },
+    Delete {
+        id: String,
+    },
+    Assign {
+        pubkey: String,
+        role: String,
+    },
+    Unassign {
+        pubkey: String,
+        role: String,
+    },
+    /// `apply_leave_request` / a vanish dropping the pubkey's assignments.
+    RemovePubkey {
+        pubkey: String,
+    },
+}
+
+/// Role mutations accepted while a rebuild scan is in flight (see
+/// [`ROLES_REBUILD_BUFFER_MAX`]). The local `Mutex` serializes the capture
+/// with the worker's take-and-swap, so no mutation can slip between the
+/// two.
+#[derive(Default)]
+struct RolesRebuildBuffer {
+    /// A scan is in flight: role mutations are captured here.
+    scanning: bool,
+    /// Captured mutations, bounded by [`ROLES_REBUILD_BUFFER_MAX`].
+    mutations: Vec<BufferedRoleMutation>,
+    /// The buffer is full: the worker must discard the fresh store and
+    /// rebuild later instead of applying a partial set.
+    overflow: bool,
+}
+
+/// Applies one captured mutation to a freshly rebuilt store.
+fn replay_role_mutation(store: &mut RoleStore, mutation: &BufferedRoleMutation) {
+    match mutation {
+        BufferedRoleMutation::Create {
+            id,
+            label,
+            description,
+            color,
+            order,
+        } => store.create(id, label, description, color, *order),
+        BufferedRoleMutation::Delete { id } => {
+            store.delete(id);
+        }
+        BufferedRoleMutation::Assign { pubkey, role } => {
+            store.assign(pubkey, role);
+        }
+        BufferedRoleMutation::Unassign { pubkey, role } => {
+            store.unassign(pubkey, role);
+        }
+        BufferedRoleMutation::RemovePubkey { pubkey } => {
+            store.remove_pubkey(pubkey);
+        }
     }
 }
 
@@ -374,14 +472,15 @@ impl GroupsRebuild {
 /// Kept in an `Arc` so the background worker can run without borrowing the
 /// relay.
 ///
-/// Deliberately minimal (no interval floor or event buffer like
-/// [`GroupsRebuild`]): role mutations are rare and the role state is small.
 /// The marking path replaces the live store with an empty one **before** the
 /// rebuild runs (revocation): the removed event may have defined a role or
 /// granted a membership, and keeping the old grants authorized until the scan
 /// completes would leave the deleted grant accepted. The stored snapshot
-/// keeps its older generation stamp, so the next startup rejects it and
-/// rebuilds from the surviving events.
+/// keeps its older generation, so the next startup rejects it and rebuilds
+/// from the surviving events. Mutations accepted while the scan runs are
+/// buffered and replayed onto the fresh store before the swap (see
+/// [`RolesRebuildBuffer`]), so a mutation applied to the fail-closed empty
+/// store is not lost when the rebuilt store replaces it.
 #[derive(Default)]
 struct RolesRebuild {
     /// At least one role-state removal happened since the last completed
@@ -392,6 +491,57 @@ struct RolesRebuild {
     /// A worker task owns (or is about to own) the rebuild loop: triggers
     /// only set the flags.
     running: std::sync::atomic::AtomicBool,
+    /// Mutations accepted while the scan runs (see [`RolesRebuildBuffer`]).
+    buffer: tokio::sync::Mutex<RolesRebuildBuffer>,
+}
+
+impl RolesRebuild {
+    /// Releases the buffering window after a failed or aborted scan. The
+    /// buffered mutations were applied to the live store, which stays
+    /// authoritative; the fresh store is discarded.
+    async fn leave_buffering(&self) {
+        let mut buffer = self.buffer.lock().await;
+        buffer.scanning = false;
+        buffer.mutations.clear();
+        buffer.overflow = false;
+    }
+
+    /// Applies the buffered mutations to `fresh` and swaps it into the live
+    /// store, atomically against the mutation capture (both hold the buffer
+    /// lock). Returns false when the buffer overflowed or a removal landed
+    /// while the scan ran: the fresh store is discarded and the dirty flag
+    /// stays set so the worker rebuilds again instead of swapping a state
+    /// that predates the lost mutations.
+    async fn finish_rebuild(&self, roles: &RwLock<RoleStore>, mut fresh: RoleStore) -> bool {
+        let mut buffer = self.buffer.lock().await;
+        let buffered = std::mem::take(&mut buffer.mutations);
+        let overflow = buffer.overflow;
+        buffer.overflow = false;
+        buffer.scanning = false;
+        drop(buffer);
+        if overflow {
+            self.dirty.store(true, Ordering::SeqCst);
+            log::warn!(
+                "role state rebuild discarded: the mutation buffer overflowed during the \
+                 scan; rebuilding again"
+            );
+            return false;
+        }
+        let mut store = roles.write().await;
+        for mutation in &buffered {
+            replay_role_mutation(&mut fresh, mutation);
+        }
+        *store = fresh;
+        if self.dirty.load(Ordering::SeqCst) {
+            // A removal landed while the scan ran (or during the swap): the
+            // fresh store may predate it and the swap may have reinstated a
+            // removed grant. Restore the fail-closed empty store and let
+            // the worker rebuild again.
+            *store = RoleStore::default();
+            return false;
+        }
+        true
+    }
 }
 
 /// Marks the role state stale, revokes the live grants and schedules the
@@ -450,6 +600,15 @@ async fn roles_rebuild_worker(
         if !state.dirty.swap(false, Ordering::SeqCst) {
             break;
         }
+        // Enter the buffering window *before* the scan starts: a mutation
+        // accepted meanwhile is captured and replayed onto the fresh store,
+        // so it cannot be lost when the rebuilt store replaces the live one.
+        {
+            let mut buffer = state.buffer.lock().await;
+            buffer.scanning = true;
+            buffer.mutations.clear();
+            buffer.overflow = false;
+        }
         let mut fresh = RoleStore::default();
         // The scan must not outlive a shutdown: abort it at its next await
         // and keep the state dirty, so the live store stays fail-closed.
@@ -457,6 +616,7 @@ async fn roles_rebuild_worker(
             rebuilt = fresh.rebuild(&db, &relay_pubkey) => rebuilt,
             _ = drain.changed() => {
                 state.dirty.store(true, Ordering::SeqCst);
+                state.leave_buffering().await;
                 log::warn!(
                     "role state rebuild aborted by shutdown; keeping the live role store \
                      empty (fail-closed) so the next startup rebuilds from the surviving \
@@ -468,8 +628,10 @@ async fn roles_rebuild_worker(
         if !rebuilt {
             // Keep the fail-closed empty store and leave the state dirty:
             // the next role-state removal schedules another attempt, and a
-            // restart rebuilds from the surviving events.
+            // restart rebuilds from the surviving events. The buffered
+            // mutations were applied to the live store, which stays.
             state.dirty.store(true, Ordering::SeqCst);
+            state.leave_buffering().await;
             log::error!(
                 "role state rebuild failed; keeping the live role store empty (fail-closed) \
                  and retrying on the next role-state removal"
@@ -481,15 +643,14 @@ async fn roles_rebuild_worker(
             // A role-state removal committed while the scan ran: the fresh
             // store may predate it. Keep the fail-closed live store and
             // rebuild again.
+            state.leave_buffering().await;
             continue;
         }
-        *roles.write().await = fresh;
-        if state.dirty.load(Ordering::SeqCst) {
-            // A removal landed between the pre-swap check and the swap: the
-            // fresh store may predate it and the swap may have reinstated
-            // the removed grant. Put the fail-closed empty store back and
-            // rebuild again.
-            *roles.write().await = RoleStore::default();
+        // Replay the mutations accepted during the scan onto the fresh
+        // store and swap it in, atomically against the mutation capture.
+        // An overflow discards the fresh store and rebuilds again instead
+        // of swapping a state that predates the lost mutations.
+        if !state.finish_rebuild(&roles, fresh).await {
             continue;
         }
         // Persist the fresh store under the mutation-serializing lock. A
@@ -497,7 +658,7 @@ async fn roles_rebuild_worker(
         // state is not established yet) and a removal clears the store
         // again; the loop then rebuilds with the surviving state.
         let _persist = persist_lock.lock().await;
-        if !persist_fresh_roles(&db, &roles).await {
+        if !persist_fresh_roles(&db, &roles, &state).await {
             log::error!(
                 "could not persist the rebuilt role state; the stored snapshot keeps its \
                  older stamp so the next startup rebuilds from the surviving events"
@@ -514,12 +675,16 @@ async fn roles_rebuild_worker(
     }
 }
 
-/// Saves the live role store with the database's current generation stamp.
-/// The rebuild worker calls this after it swapped a fresh store and holds
-/// the single-flight claim: the worker re-checks the dirty flag around the
-/// swap, so the store is not stale here.
-async fn persist_fresh_roles(db: &DbClient, roles: &RwLock<RoleStore>) -> bool {
-    let Some(stamp) = db.state_stamp().await else {
+/// Saves the live role store with the database's current generation stamp
+/// and sequence. The rebuild worker calls this after it swapped a fresh
+/// store and holds the single-flight claim: the worker re-checks the dirty
+/// flag around the swap, so the store is not stale here.
+async fn persist_fresh_roles(
+    db: &DbClient,
+    roles: &RwLock<RoleStore>,
+    state: &RolesRebuild,
+) -> bool {
+    let Some((stamp, seq)) = read_state_generation(db).await else {
         log::error!(
             "cannot read the state generation; keeping the persisted NIP-43 role \
              snapshot so the next startup rebuilds from the surviving events"
@@ -527,7 +692,68 @@ async fn persist_fresh_roles(db: &DbClient, roles: &RwLock<RoleStore>) -> bool {
         return false;
     };
     let mut snapshot = roles.read().await.snapshot();
+    // A removal that landed after the swap check replaced the live store
+    // with the fail-closed empty one: saving it with the current generation
+    // would make the next startup accept state that predates the removal.
+    if state.dirty.load(Ordering::SeqCst) {
+        return false;
+    }
     snapshot.stamp = stamp;
+    snapshot.seq = seq;
+    db.save_roles(snapshot).await
+}
+
+/// Captures and saves the live role store under the mutation-serializing
+/// lock (used by [`Relay::persist_roles`] and the debounced snapshot
+/// worker).
+///
+/// The snapshot carries the database's state generation
+/// (`DbClient::state_stamp`) and derived-state sequence
+/// (`DbClient::state_seq`) so a later restore can reject a snapshot that
+/// predates a NIP-09 deletion of a role-state event or a role-state event
+/// itself. The generation is read *before* the capture: a change committed
+/// in between leaves the snapshot with the older generation, so the startup
+/// comparison rejects it. An unavailable generation read leaves the
+/// pre-existing snapshot untouched (its currency cannot be established).
+///
+/// While a role rebuild is dirty/running the store is known stale (or owned
+/// by the worker): the write is refused so the stale store cannot be
+/// stamped with the already-advanced generation (which would make the next
+/// startup accept it). Returns whether the write committed.
+async fn persist_roles_now(
+    db: &DbClient,
+    roles: &RwLock<RoleStore>,
+    state: &RolesRebuild,
+    lock: &tokio::sync::Mutex<()>,
+) -> bool {
+    let _guard = lock.lock().await;
+    // A stale store must never overwrite the stored snapshot: while a
+    // removal is pending a rebuild (`dirty`) or a worker owns the state
+    // (`running`), the live store is the fail-closed empty store or a
+    // store that may predate the removal, and stamping it with the
+    // already-advanced generation would make the next startup accept it.
+    // The stored snapshot keeps its older generation, so startup rejects it
+    // and rebuilds from the surviving events.
+    let stale = || state.dirty.load(Ordering::SeqCst) || state.running.load(Ordering::SeqCst);
+    if stale() {
+        return false;
+    }
+    let Some((stamp, seq)) = read_state_generation(db).await else {
+        log::error!(
+            "cannot read the state generation; keeping the persisted NIP-43 role \
+             snapshot so the next startup rebuilds from the surviving events"
+        );
+        return false;
+    };
+    let mut snapshot = roles.read().await.snapshot();
+    // Re-check after the capture: a removal that landed while the store
+    // was being captured must not have its pre-removal grants stamped
+    // with the removal's generation.
+    if stale() {
+        return false;
+    }
+    snapshot.stamp = stamp;
+    snapshot.seq = seq;
     db.save_roles(snapshot).await
 }
 
@@ -765,6 +991,120 @@ async fn groups_rebuild_worker(
     state.running.store(false, Ordering::SeqCst);
     if state.dirty.load(Ordering::SeqCst) && !*drain.borrow() {
         schedule_groups_rebuild(db, groups, config, state, drain);
+    }
+}
+
+/// Minimum time between two debounced snapshot passes. A burst of group or
+/// role mutations coalesces into one clone+serialize per store instead of
+/// one per event; correctness never depends on the debounce, because every
+/// state event advances the database sequence (`DbClient::state_seq`) and a
+/// snapshot that was skipped (or a crash before the worker ran) is rejected
+/// at startup and rebuilt from the surviving events.
+const SNAPSHOT_PERSIST_INTERVAL_MS: u64 = 1_000;
+
+/// Debounced persistence of the NIP-29 group and NIP-43 role snapshots.
+/// The mutation paths only set a dirty flag and schedule the single
+/// background worker, so the O(total state) clone+serialize stays off the
+/// event path (see [`SNAPSHOT_PERSIST_INTERVAL_MS`]). Rare fail-closed
+/// paths (a pre-delete ghost, a stale-state clear or the rebuild workers)
+/// keep using the immediate `persist_groups`/`persist_roles` calls.
+#[derive(Default)]
+struct SnapshotPersist {
+    /// A group/role mutation happened since the last debounced pass.
+    groups_dirty: AtomicBool,
+    roles_dirty: AtomicBool,
+    /// A worker task owns (or is about to own) the debounce loop.
+    running: AtomicBool,
+}
+
+impl SnapshotPersist {
+    fn any_dirty(&self) -> bool {
+        self.groups_dirty.load(Ordering::SeqCst) || self.roles_dirty.load(Ordering::SeqCst)
+    }
+}
+
+/// The handles the debounced snapshot worker needs. Bundled into one value
+/// so the scheduler and the worker stay under the argument-count lint as the
+/// set of persisted stores grows.
+struct SnapshotPersistCtx {
+    db: DbClient,
+    groups: Arc<RwLock<GroupStore>>,
+    groups_rebuild: Arc<GroupsRebuild>,
+    roles: Arc<RwLock<RoleStore>>,
+    roles_rebuild: Arc<RolesRebuild>,
+    persist_roles_lock: Arc<tokio::sync::Mutex<()>>,
+    state: Arc<SnapshotPersist>,
+}
+
+/// Marks the store dirty and wakes the single debounce worker. A mutation
+/// that arrives after the worker's last dirty check but before it releases
+/// the `running` claim schedules a new worker (the worker re-checks before
+/// exiting), so a dirty flag cannot be lost.
+fn schedule_snapshot_persist(ctx: SnapshotPersistCtx, drain: tokio::sync::watch::Receiver<bool>) {
+    if *drain.borrow() {
+        return;
+    }
+    if ctx.state.running.swap(true, Ordering::SeqCst) {
+        // A worker is already draining; its loop re-checks the dirty flags
+        // before it exits, so this request is covered.
+        return;
+    }
+    tokio::spawn(snapshot_persist_worker(ctx, drain));
+}
+
+/// The debounce worker: waits out one coalescing interval (aborted by
+/// shutdown), then saves each dirty store at most once. Skipping a save is
+/// always safe (the database sequence detects the staleness at startup), so
+/// a drain stops the loop after one final best-effort pass.
+async fn snapshot_persist_worker(
+    ctx: SnapshotPersistCtx,
+    mut drain: tokio::sync::watch::Receiver<bool>,
+) {
+    let SnapshotPersistCtx {
+        db,
+        groups,
+        groups_rebuild,
+        roles,
+        roles_rebuild,
+        persist_roles_lock,
+        state,
+    } = ctx;
+    loop {
+        // The coalescing window: every mutation arriving before it elapses
+        // folds into this pass. A shutdown aborts the wait and still
+        // attempts one final save (best-effort: correctness does not depend
+        // on it, see [`SNAPSHOT_PERSIST_INTERVAL_MS`]).
+        if !*drain.borrow() {
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_millis(
+                    SNAPSHOT_PERSIST_INTERVAL_MS,
+                )) => {}
+                _ = drain.changed() => {}
+            }
+        }
+        if state.groups_dirty.swap(false, Ordering::SeqCst) {
+            groups_rebuild.persist(&db, &groups).await;
+        }
+        if state.roles_dirty.swap(false, Ordering::SeqCst) {
+            persist_roles_now(&db, &roles, &roles_rebuild, &persist_roles_lock).await;
+        }
+        if *drain.borrow() {
+            break;
+        }
+        if state.any_dirty() {
+            continue;
+        }
+        state.running.store(false, Ordering::SeqCst);
+        if state.any_dirty() {
+            // A mutation set a dirty flag between the check and the
+            // release: either re-claim the loop or let the scheduler that
+            // saw `running == false` own it.
+            if state.running.swap(true, Ordering::SeqCst) {
+                break;
+            }
+            continue;
+        }
+        break;
     }
 }
 
@@ -1027,6 +1367,7 @@ impl Relay {
             publish_rate_pruned_at: std::sync::atomic::AtomicU64::new(0),
             persist_access_lock: tokio::sync::Mutex::new(()),
             persist_roles_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            snapshot_persist: std::sync::Arc::new(SnapshotPersist::default()),
             persist_blossom_allow_lock: tokio::sync::Mutex::new(()),
             ip_blocks_tx: tokio::sync::watch::channel(0).0,
             config_version: AtomicU64::new(0),
@@ -1989,10 +2330,10 @@ impl Relay {
         self.broadcast(event).await.is_ok()
     }
 
-    /// Persists the live NIP-29 group state (write-through: call after
-    /// every mutation so restarts restore without replaying history).
-    /// Fire-and-forget: a failed commit only logs (the next mutation
-    /// retries the full snapshot).
+    /// Persists the live NIP-29 group state immediately. The hot mutation
+    /// path uses the debounced [`Self::schedule_groups_persist`] instead;
+    /// this immediate form is kept for the fail-closed paths (a pre-delete
+    /// ghost, a stale-state clear, the rebuild worker) and tests.
     ///
     /// Stale state is never persisted: while a post-vanish/NIP-09/expiry
     /// rebuild is pending the snapshot is dropped instead, so the next
@@ -2015,51 +2356,67 @@ impl Relay {
     /// capture snapshots in one order and queue their writes in the other.
     ///
     /// The snapshot carries the database's state generation
-    /// (`DbClient::state_stamp`) so a later restore can reject a snapshot
-    /// that predates a NIP-09 deletion of a role-state event. The stamp is
-    /// read *before* the capture: a removal committed in between advances
-    /// the generation past the one the captured state can claim, so the
-    /// startup comparison rejects it. An unavailable stamp read leaves the
-    /// pre-existing snapshot untouched (its currency cannot be
-    /// established): the next startup then rejects that older stamp and
-    /// rebuilds from the surviving events.
+    /// (`DbClient::state_stamp`) and derived-state sequence
+    /// (`DbClient::state_seq`) so a later restore can reject a snapshot
+    /// that predates a NIP-09 deletion of a role-state event or a
+    /// role-state event itself. The generation is read *before* the
+    /// capture: a change committed in between leaves the snapshot with the
+    /// older generation and the startup comparison rejects it. An
+    /// unavailable read leaves the pre-existing snapshot untouched (its
+    /// currency cannot be established): the next startup then rejects that
+    /// older generation and rebuilds from the surviving events.
     ///
     /// While a role rebuild is dirty/running the store is known stale (or
     /// owned by the worker): the write is refused so the stale store cannot
     /// be stamped with the already-advanced generation (which would make the
-    /// next startup accept it). Returns whether the write committed.
+    /// next startup accept it). Returns whether the write committed. The
+    /// hot mutation paths use the debounced [`Self::schedule_roles_persist`]
+    /// instead; this immediate form is kept for the rebuild worker and the
+    /// fail-closed paths.
     pub(crate) async fn persist_roles(&self) -> bool {
-        let _guard = self.persist_roles_lock.lock().await;
-        // A stale store must never overwrite the stored snapshot: while a
-        // removal is pending a rebuild (`dirty`) or a worker owns the state
-        // (`running`), the live store is the fail-closed empty store or a
-        // store that may predate the removal, and stamping it with the
-        // already-advanced generation would make the next startup accept it.
-        // The stored snapshot keeps its older stamp, so startup rejects it
-        // and rebuilds from the surviving events.
-        let stale = || {
-            self.roles_rebuild.dirty.load(Ordering::SeqCst)
-                || self.roles_rebuild.running.load(Ordering::SeqCst)
-        };
-        if stale() {
-            return false;
+        persist_roles_now(
+            &self.db,
+            &self.roles,
+            &self.roles_rebuild,
+            &self.persist_roles_lock,
+        )
+        .await
+    }
+
+    /// Marks the group snapshot dirty and wakes the debounced worker (see
+    /// [`SnapshotPersist`]). The hot mutation paths use this instead of
+    /// [`Self::persist_groups`]: the clone+serialize is coalesced into one
+    /// background pass, and a skipped save is detected at startup through
+    /// the database sequence.
+    fn schedule_groups_persist(&self) {
+        self.snapshot_persist
+            .groups_dirty
+            .store(true, Ordering::SeqCst);
+        schedule_snapshot_persist(self.snapshot_persist_ctx(), self.subscribe_drain());
+    }
+
+    /// The worker/scheduler handles for this relay.
+    fn snapshot_persist_ctx(&self) -> SnapshotPersistCtx {
+        SnapshotPersistCtx {
+            db: self.db.clone(),
+            groups: Arc::clone(&self.groups),
+            groups_rebuild: Arc::clone(&self.groups_rebuild),
+            roles: Arc::clone(&self.roles),
+            roles_rebuild: Arc::clone(&self.roles_rebuild),
+            persist_roles_lock: Arc::clone(&self.persist_roles_lock),
+            state: Arc::clone(&self.snapshot_persist),
         }
-        let Some(stamp) = self.db.state_stamp().await else {
-            log::error!(
-                "cannot read the state generation; keeping the persisted NIP-43 role \
-                 snapshot so the next startup rebuilds from the surviving events"
-            );
-            return false;
-        };
-        let mut snapshot = self.roles.read().await.snapshot();
-        // Re-check after the capture: a removal that landed while the store
-        // was being captured must not have its pre-removal grants stamped
-        // with the removal's generation.
-        if stale() {
-            return false;
-        }
-        snapshot.stamp = stamp;
-        self.db.save_roles(snapshot).await
+    }
+
+    /// Marks the role snapshot dirty and wakes the debounced worker (same
+    /// contract as [`Self::schedule_groups_persist`]). The immediate
+    /// [`Self::persist_roles`] remains for the rebuild worker and the
+    /// fail-closed paths.
+    pub(crate) fn schedule_roles_persist(&self) {
+        self.snapshot_persist
+            .roles_dirty
+            .store(true, Ordering::SeqCst);
+        schedule_snapshot_persist(self.snapshot_persist_ctx(), self.subscribe_drain());
     }
 
     /// Whether `event` may remove events the NIP-29/NIP-43 derived state is
@@ -2314,12 +2671,19 @@ impl Relay {
         // NIP-43 role assignments hold pubkeys too: a vanished author
         // must not keep its roles.
         if self.config.read().await.nip_enabled(43) {
-            let changed = {
-                let mut roles = self.roles.write().await;
-                roles.assignments.remove(&pubkey_hex).is_some()
-            };
+            let changed = self
+                .mutate_roles(
+                    BufferedRoleMutation::RemovePubkey {
+                        pubkey: pubkey_hex.clone(),
+                    },
+                    |roles| {
+                        let changed = roles.assignments.remove(&pubkey_hex).is_some();
+                        (changed, changed)
+                    },
+                )
+                .await;
             if changed {
-                self.persist_roles().await;
+                self.schedule_roles_persist();
             }
         }
     }
@@ -2407,11 +2771,10 @@ impl Relay {
             }
         }
         let generated = self.apply_group_state(event, now).await;
-        // Write-through persistence: restarts restore from the snapshot
-        // instead of replaying history.
-        if !self.persist_groups().await {
-            log::error!("could not persist the group state");
-        }
+        // Debounced persistence: restarts restore from the snapshot instead
+        // of replaying history, and a skipped save is detected at startup
+        // through the state sequence (`DbClient::state_seq`).
+        self.schedule_groups_persist();
 
         if event.kind == 9005 {
             // Group moderation delete-event: admins may delete events, but
@@ -2663,13 +3026,17 @@ impl PendingBatch {
 #[cfg(test)]
 mod tests {
     use super::BufferedGroupEvent;
+    use super::BufferedRoleMutation;
     use super::GROUPS_REBUILD_BUFFER_MAX;
     use super::LiveQueue;
+    use super::ROLES_REBUILD_BUFFER_MAX;
     use super::Relay;
     use super::StampClock;
     use super::enqueue_live_batch;
     use super::signal_live_resync;
     use super::validate::contains_secret_key;
+    use crate::nips::nip43::RoleStore;
+    use std::sync::atomic::Ordering;
 
     /// Builds a relay with an empty database.
     async fn build_relay() -> std::sync::Arc<Relay> {
@@ -3136,6 +3503,10 @@ mod tests {
         let key = "01".repeat(32);
         let relay = build_role_relay(Some(&key)).await;
         assert!(relay.create_role("mod", "Mod", "", "", None).await);
+        // The mutation path debounces its snapshot save: persist the
+        // pre-marking snapshot explicitly so the refusal below has a stored
+        // snapshot to protect.
+        assert!(relay.persist_roles().await);
         let saved = relay.db.load_roles().await.expect("snapshot");
         assert!(saved.roles.contains_key("mod"));
 
@@ -3169,6 +3540,229 @@ mod tests {
         assert_eq!(
             persisted.stamp, saved.stamp,
             "the refused persist must not re-stamp the snapshot"
+        );
+        relay.db.shutdown();
+    }
+
+    #[test]
+    fn snapshot_below_the_state_sequence_is_rejected_and_rebuilt() {
+        // (a) A snapshot saved at sequence N must not be restored once the
+        // database advanced to N+1 (a state event was stored): the startup
+        // comparison rejects it and the replay rebuild reconstructs the
+        // state from the surviving events. The stamp alone cannot detect a
+        // put, so the sequence is what protects a skipped debounced save.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_relay().await;
+            let now = crate::util::unix_now();
+            let secp = secp256k1::Secp256k1::new();
+            let admin = secp256k1::Keypair::from_seckey_slice(&secp, &[4u8; 32]).unwrap();
+            let create = signed_group_event(
+                &secp,
+                &admin,
+                crate::nips::nip29::CREATE_GROUP,
+                "g1",
+                vec![],
+                now,
+            );
+            assert!(matches!(
+                relay.accept_event(create.clone(), &[], None).await,
+                crate::db::PutOutcome::Stored
+            ));
+            // The snapshot claims the state before the event: sequence 0.
+            let mut snapshot = relay.groups.read().await.snapshot();
+            snapshot.stamp = relay.db.state_stamp().await.expect("stamp");
+            snapshot.seq = 0;
+            assert!(relay.db.save_groups(snapshot).await);
+
+            // The stored event advanced the sequence to 1.
+            let seq = relay.db.state_seq().await.expect("seq");
+            assert_eq!(seq, 1, "the group event must advance the sequence");
+            let stamp = relay.db.state_stamp().await.expect("stamp");
+            let saved = relay.db.load_groups().await.expect("snapshot");
+            let mut restored = crate::nips::nip29::GroupStore::with_cap(0);
+            assert!(
+                !restored.restore_checked(saved, stamp, seq),
+                "a snapshot below the current sequence must be rejected"
+            );
+            assert!(
+                restored.group("g1").is_none(),
+                "the rejected snapshot must not be applied"
+            );
+
+            // The rebuild path (what startup runs instead) recovers it.
+            let mut rebuilt = crate::nips::nip29::GroupStore::with_cap(0);
+            assert!(
+                rebuilt.rebuild(&relay.db).await,
+                "the replay rebuild must succeed"
+            );
+            assert!(
+                rebuilt.group("g1").is_some(),
+                "the state event must be rebuilt from the surviving events"
+            );
+            relay.db.shutdown();
+        });
+    }
+
+    #[tokio::test]
+    async fn debounced_snapshot_converges_and_restores_after_reopen() {
+        // (b) The debounced worker must eventually save the latest state
+        // with the database's sequence, and a restart (a new open of the
+        // same database) must accept it and restore the state. Correctness
+        // does not depend on the save landing (the sequence rejects a
+        // skipped save), but a landing save must carry the current
+        // sequence.
+        let relay = build_relay().await;
+        let database = relay.config.read().await.database.clone();
+        let now = crate::util::unix_now();
+        let secp = secp256k1::Secp256k1::new();
+        let admin = secp256k1::Keypair::from_seckey_slice(&secp, &[4u8; 32]).unwrap();
+        let create = signed_group_event(
+            &secp,
+            &admin,
+            crate::nips::nip29::CREATE_GROUP,
+            "g1",
+            vec![],
+            now,
+        );
+        assert!(matches!(
+            relay.db.put(create.clone(), now).await,
+            crate::db::PutOutcome::Stored
+        ));
+        relay
+            .groups
+            .write()
+            .await
+            .apply(&create, "", now, false, false);
+        relay.schedule_groups_persist();
+
+        let mut persisted = None;
+        for _ in 0..600 {
+            if let Some(snap) = relay.db.load_groups().await
+                && snap.seq == relay.db.state_seq().await.unwrap_or(u64::MAX)
+            {
+                persisted = Some(snap);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let persisted = persisted.expect("the debounced save must converge");
+        assert!(persisted.groups.contains_key("g1"));
+        relay.db.shutdown();
+
+        // Crash-style check: open the same database fresh and restore.
+        let db = crate::db::DbClient::open(
+            &database,
+            true,
+            std::sync::Arc::new(Default::default()),
+            0,
+            128,
+            4096,
+            262144,
+        )
+        .unwrap();
+        let saved = db.load_groups().await.expect("snapshot after reopen");
+        let seq = db.state_seq().await.expect("seq");
+        assert_eq!(
+            saved.seq, seq,
+            "the reopened snapshot must carry the latest sequence"
+        );
+        let mut store = crate::nips::nip29::GroupStore::with_cap(0);
+        assert!(
+            store.restore_checked(saved, db.state_stamp().await.expect("stamp"), seq),
+            "a snapshot at the current sequence must restore"
+        );
+        assert!(store.group("g1").is_some());
+        db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn role_mutation_during_a_rebuild_survives_the_swap() {
+        // (c) A mutation accepted while the rebuild scan runs lands on the
+        // fail-closed live store; it must be replayed onto the freshly
+        // rebuilt store instead of being lost by the swap.
+        let key = "01".repeat(32);
+        let relay = build_role_relay(Some(&key)).await;
+        let member = "aa".repeat(32);
+        assert!(relay.create_role("king", "King", "", "", None).await);
+        // The scan is in flight: enter its buffering window.
+        relay.roles_rebuild.buffer.lock().await.scanning = true;
+        assert!(relay.assign_role(&member, "king").await);
+        {
+            let buffer = relay.roles_rebuild.buffer.lock().await;
+            assert_eq!(
+                buffer.mutations.len(),
+                1,
+                "the accepted mutation must be captured for replay"
+            );
+        }
+        // The scan completed: it found the stored role definition but
+        // predates the assignment.
+        let mut fresh = RoleStore::default();
+        fresh.create("king", "King", "", "", None);
+        assert!(
+            relay
+                .roles_rebuild
+                .finish_rebuild(&relay.roles, fresh)
+                .await,
+            "the fresh store must be swapped in"
+        );
+        assert!(
+            relay.roles.read().await.is_member_of(&member),
+            "the buffered mutation must survive the swap"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn role_rebuild_buffer_overflow_forces_a_retry() {
+        // A full buffer must not replay a partial mutation set: the worker
+        // discards the fresh store, keeps the fail-closed live store and
+        // marks the state dirty for another rebuild.
+        let key = "01".repeat(32);
+        let relay = build_role_relay(Some(&key)).await;
+        let member = "aa".repeat(32);
+        assert!(relay.create_role("king", "King", "", "", None).await);
+        {
+            let mut buffer = relay.roles_rebuild.buffer.lock().await;
+            buffer.scanning = true;
+            buffer.mutations.clear();
+            buffer.overflow = false;
+            while buffer.mutations.len() < ROLES_REBUILD_BUFFER_MAX {
+                buffer
+                    .mutations
+                    .push(BufferedRoleMutation::Delete { id: "x".into() });
+            }
+        }
+        assert!(relay.assign_role(&member, "king").await);
+        {
+            let buffer = relay.roles_rebuild.buffer.lock().await;
+            assert!(
+                buffer.overflow,
+                "an overflowing buffer must force the worker to discard the scan"
+            );
+            assert_eq!(
+                buffer.mutations.len(),
+                ROLES_REBUILD_BUFFER_MAX,
+                "no partial mutation set may be kept"
+            );
+        }
+        let mut fresh = RoleStore::default();
+        fresh.create("king", "King", "", "", None);
+        assert!(
+            !relay
+                .roles_rebuild
+                .finish_rebuild(&relay.roles, fresh)
+                .await,
+            "an overflow must discard the fresh store"
+        );
+        assert!(
+            relay.roles_rebuild.dirty.load(Ordering::SeqCst),
+            "the overflow must mark the state dirty for another rebuild"
+        );
+        assert!(
+            relay.roles.read().await.is_member_of(&member),
+            "the live store keeps the applied mutation"
         );
         relay.db.shutdown();
     }

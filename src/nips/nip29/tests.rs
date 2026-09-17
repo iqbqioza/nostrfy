@@ -1568,6 +1568,7 @@ fn groups_snapshot_without_ghost_deserializes() {
     assert!(snap.deleted.contains("g1"));
     assert!(snap.ghost.is_empty());
     assert_eq!(snap.stamp, 0, "legacy snapshots have no generation stamp");
+    assert_eq!(snap.seq, 0, "legacy snapshots have no state sequence");
 }
 
 #[test]
@@ -1592,7 +1593,7 @@ fn stale_snapshot_generation_is_rejected_at_restore() {
     let mut stale = store.snapshot();
     stale.stamp = 6;
     assert!(
-        !store.restore_checked(stale, 7),
+        !store.restore_checked(stale, 7, 7),
         "a snapshot from before the current generation must be rejected"
     );
     assert!(
@@ -1602,8 +1603,40 @@ fn stale_snapshot_generation_is_rejected_at_restore() {
 
     let mut current = store.snapshot();
     current.stamp = 7;
-    assert!(store.restore_checked(current, 7));
+    current.seq = 7;
+    assert!(store.restore_checked(current, 7, 7));
     assert!(store.group("g1").is_some());
+}
+
+#[test]
+fn stale_snapshot_sequence_is_rejected_at_restore() {
+    // The sequence tracks accepted state events, not just removals: a
+    // snapshot below the current sequence predates an event (a debounced
+    // save may have skipped it) and must be rebuilt instead of restored.
+    let mut store = GroupStore::default();
+    store.apply(
+        &event(CREATE_GROUP, ADMIN, Some("g1"), vec![]),
+        "relay",
+        1,
+        false,
+        false,
+    );
+    let mut snapshot = store.snapshot();
+    snapshot.seq = 3;
+    let mut restored = GroupStore::default();
+    assert!(
+        !restored.restore_checked(snapshot, 0, 4),
+        "a snapshot below the current sequence must be rejected"
+    );
+    assert!(
+        restored.group("g1").is_none(),
+        "a rejected snapshot is not applied"
+    );
+
+    let mut snapshot = store.snapshot();
+    snapshot.seq = 4;
+    assert!(restored.restore_checked(snapshot, 0, 4));
+    assert!(restored.group("g1").is_some());
 }
 
 #[test]

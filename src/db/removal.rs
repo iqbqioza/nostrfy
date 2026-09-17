@@ -7,12 +7,12 @@ use super::db_error;
 use super::store::{
     CREATED_LEN, GIFT_WRAP_INDEX, ID_LEN, Store, created_key, decode_pending_purge,
     decode_purged_group_marker, delegated_by, deleted_address_key, dtag_key_safe,
-    encode_pending_purge, encode_purged_group_marker, pubkey_key, purged_group_key,
-    replaceable_key, tag_key,
+    encode_pending_purge, encode_purged_group_marker, is_group_state_kind, pubkey_key,
+    purged_group_key, replaceable_key, tag_key,
 };
 use crate::error::Result;
 use crate::event::Event;
-use crate::nips::{nip09, nip29, nip43};
+use crate::nips::nip09;
 
 /// Bounds how many index entries a removal pass materializes at once: a
 /// vanished pubkey's full history, every expired id or every version of
@@ -29,24 +29,6 @@ fn pubkeys_equal(a: &str, b: &str) -> bool {
         (Ok(a), Ok(b)) => a == b,
         _ => a == b,
     }
-}
-
-/// Whether removing a `kind` event can change the derived NIP-29 group
-/// state or NIP-43 role state, so a removal containing one must make the
-/// caller rebuild from the surviving events. Ordinary posts do not.
-fn is_group_state_kind(kind: u64) -> bool {
-    (nip29::MOD_MIN..=nip29::MOD_MAX).contains(&kind)
-        || kind == nip29::JOIN
-        || kind == nip29::LEAVE
-        || matches!(
-            kind,
-            nip43::ROLE_DEFINITION
-                | nip43::MEMBERSHIP_LIST
-                | nip43::ADD_USER
-                | nip43::REMOVE_USER
-                | nip43::JOIN
-                | nip43::LEAVE
-        )
 }
 
 /// One [`REMOVAL_CHUNK`]-sized page of `(index key, event id)` pairs from

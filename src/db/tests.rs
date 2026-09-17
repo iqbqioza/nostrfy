@@ -5440,6 +5440,98 @@ fn state_stamp_advances_with_group_state_removals() {
 }
 
 #[test]
+fn state_seq_advances_with_group_and_role_puts_but_not_ordinary_events() {
+    // The derived-state sequence (consumed by the snapshot currency check)
+    // advances in the same commit as every NIP-29/NIP-43 state-relevant
+    // put, so a debounced snapshot write that was skipped is detectable at
+    // startup; an ordinary post leaves it untouched.
+    let cfg = config();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let now = unix_now();
+    rt.block_on(async {
+        let db = DbClient::open(
+            &cfg,
+            true,
+            Arc::new(Default::default()),
+            0,
+            128,
+            4096,
+            262144,
+        )
+        .unwrap();
+        assert_eq!(
+            db.state_seq().await,
+            Some(0),
+            "a fresh database starts at sequence 0"
+        );
+        let authored = |kind: u64, pk: &str, created: u64| {
+            let mut e = event(kind, "x", created, vec![]);
+            e.pubkey = pk.to_string();
+            e.id = nip01::compute_id(&e);
+            e
+        };
+
+        // An ordinary post does not advance the state sequence.
+        assert_eq!(
+            db.put(authored(1, &"aa".repeat(32), now), now).await,
+            PutOutcome::Stored
+        );
+        assert_eq!(db.state_seq().await, Some(0));
+
+        // NIP-29 moderation and join/leave events do.
+        assert_eq!(
+            db.put(authored(9000, &"bb".repeat(32), now), now).await,
+            PutOutcome::Stored
+        );
+        assert_eq!(db.state_seq().await, Some(1));
+        assert_eq!(
+            db.put(
+                authored(crate::nips::nip29::JOIN, &"cc".repeat(32), now),
+                now
+            )
+            .await,
+            PutOutcome::Stored
+        );
+        assert_eq!(db.state_seq().await, Some(2));
+
+        // NIP-43 role-state events do too.
+        assert_eq!(
+            db.put(
+                authored(crate::nips::nip43::ROLE_DEFINITION, &"dd".repeat(32), now),
+                now
+            )
+            .await,
+            PutOutcome::Stored
+        );
+        assert_eq!(db.state_seq().await, Some(3));
+
+        // A duplicate put does not: the sequence tracks stored events.
+        let duplicate = authored(9000, &"bb".repeat(32), now);
+        assert!(matches!(
+            db.put(duplicate, now).await,
+            PutOutcome::Duplicate(_)
+        ));
+        assert_eq!(db.state_seq().await, Some(3));
+        db.shutdown();
+    });
+    // The sequence is persistent: a restart reports the same value.
+    let db = DbClient::open(
+        &cfg,
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    rt.block_on(async {
+        assert_eq!(db.state_seq().await, Some(3));
+    });
+    db.shutdown();
+}
+
+#[test]
 fn nip09_deleting_a_group_state_event_advances_the_stamp() {
     // A NIP-09 deletion removes NIP-29/NIP-43 state events without going
     // through vanish/expiry/purge: the derived-state stamp must advance in

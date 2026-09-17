@@ -297,6 +297,8 @@ The file is content-addressed by its SHA-256: fetch it via the exact hash return
 
 **Fix**: re-upload the exact bytes: the upload publishes the object and the existing mapping then resolves. If the owner cap refuses the re-upload, have one of the mapping's listed owners delete the blob through the Blossom API (BUD-02 `DELETE`) and upload again; a mapping with no reachable owner or a lost object needs an operator-side cleanup of the blob directory/mapping.
 
+**Monitoring**: every lookup that proves the object missing while the mapping exists — a definitive local `NotFound` or an S3 `404` under **all** owners (an owner error leaves the state unknown and is not counted) — increments the `nostrfy_blossom_missing_objects` counter (JSON snapshot: `blossom_missing_objects`). A growing value means the file tree / bucket and the LMDB mapping are drifting apart: here is the alerting signal. Reconciliation is intentionally lazy: the relay never diffs objects against the mapping at startup or in the background — that scan is unbounded (it would have to walk the mapping index or the whole blob tree) and would flag every not-yet-mapped object of a legacy store still being migrated. A missing object is healed only by re-uploading the exact bytes (which republishes the object and keeps the existing owners) or by deleting the blob through the API; the mapping itself is never removed automatically.
+
 ## 4. Search, Groups, Auth
 
 ### 4-1. Search returns 0 results / unexpected results

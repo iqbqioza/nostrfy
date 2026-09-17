@@ -1586,6 +1586,7 @@ pub(crate) async fn build_state(cfg: &Config, relay: &Relay) -> Option<Arc<Bloss
         cfg.blossom.min_free_bytes,
         s3,
         relay.db.clone(),
+        relay.stats.clone(),
     )
     .await
     {

@@ -42,6 +42,11 @@ pub struct Stats {
     /// from a previous process). A growing value on every restart means
     /// uploads are being interrupted before publication.
     pub blossom_orphan_spools_swept: AtomicU64,
+    /// Blob lookups where the sha→owner mapping exists but the object is
+    /// gone from every owning location (a definitive NotFound / S3 404).
+    /// Incremented best effort; reconciliation is intentionally lazy (a
+    /// re-upload heals the blob), so the counter is a signal, not a queue.
+    pub blossom_missing_objects: AtomicU64,
 }
 
 impl Stats {
@@ -108,6 +113,9 @@ impl Stats {
             "blossom_orphan_spools_swept": self
                 .blossom_orphan_spools_swept
                 .load(Ordering::Relaxed),
+            // Mapped-but-missing blobs (see the Prometheus metric of the
+            // same name): the mapping exists but the object is gone.
+            "blossom_missing_objects": self.blossom_missing_objects.load(Ordering::Relaxed),
             // Logger write/rotation failures: a nonzero value means log
             // records are being lost (the log file is not the source of
             // truth for these counters).
@@ -253,6 +261,12 @@ impl Stats {
             self.blossom_orphan_spools_swept.load(Ordering::Relaxed),
         );
         metric(
+            "nostrfy_blossom_missing_objects",
+            "Blob lookups where the mapping exists but the object is missing from every owner.",
+            "counter",
+            self.blossom_missing_objects.load(Ordering::Relaxed),
+        );
+        metric(
             "nostrfy_log_errors",
             "Log file write/rotation failures since start (log records are being lost).",
             "counter",
@@ -287,10 +301,16 @@ mod tests {
     fn prometheus_output_is_well_formed() {
         let stats = Stats::new();
         stats.bump(&stats.events_accepted, 3);
+        stats.bump(&stats.blossom_missing_objects, 2);
         let text = stats.as_prometheus();
         assert!(text.contains("nostrfy_events_accepted 3\n"));
         assert!(text.contains("# TYPE nostrfy_events_accepted counter\n"));
         assert!(text.contains("# TYPE nostrfy_uptime_seconds gauge\n"));
+        assert!(
+            text.contains("# TYPE nostrfy_blossom_missing_objects counter\n")
+                && text.contains("nostrfy_blossom_missing_objects 2\n"),
+            "the mapped-but-missing Blossom counter must be exposed"
+        );
         assert!(
             text.contains("# TYPE nostrfy_log_errors counter\n"),
             "the logger failure counter must be exposed for alerting"
@@ -308,6 +328,18 @@ mod tests {
             assert!(value.parse::<f64>().is_ok(), "value parses: {line}");
             assert!(!name.contains(' '), "name has no spaces: {line}");
         }
+    }
+
+    #[test]
+    fn json_snapshot_carries_the_blossom_missing_objects_counter() {
+        let stats = Stats::new();
+        stats.bump(&stats.blossom_missing_objects, 4);
+        let json = stats.as_json();
+        assert_eq!(
+            json.get("blossom_missing_objects").and_then(Value::as_u64),
+            Some(4),
+            "the mapped-but-missing Blossom counter must be in the JSON snapshot"
+        );
     }
 
     #[test]

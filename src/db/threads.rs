@@ -428,6 +428,17 @@ fn handle_read_msg(store: &Store, errors: &Arc<std::sync::atomic::AtomicU64>, ms
             let _ = reply.send(stamp);
             false
         }
+        Msg::StateSeq { reply } => {
+            let seq = match store.state_seq() {
+                Ok(seq) => Some(seq),
+                Err(e) => {
+                    db_error(errors, &e);
+                    None
+                }
+            };
+            let _ = reply.send(seq);
+            false
+        }
         #[cfg(test)]
         Msg::LastPage { reply } => {
             let _ = reply.send(store.env.info().last_page_number as u64);
@@ -1261,6 +1272,16 @@ pub(crate) fn spawn(
                                         }
                                     };
                                     let _ = reply.send(stamp);
+                                }
+                                Msg::StateSeq { reply } => {
+                                    let seq = match store.state_seq() {
+                                        Ok(seq) => Some(seq),
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            None
+                                        }
+                                    };
+                                    let _ = reply.send(seq);
                                 }
                                 Msg::DatabaseSize { reply } => {
                                     let _ = reply.send(store.size_on_disk());

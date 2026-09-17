@@ -263,6 +263,15 @@ pub(crate) struct GroupsSnapshot {
     /// was introduced; older snapshots deserialize as 0.
     #[serde(default)]
     pub stamp: u64,
+    /// The database's derived-state sequence the snapshot was taken at
+    /// (see `DbClient::state_seq`): a restore must reject a snapshot whose
+    /// sequence is below the current one, because it predates a
+    /// NIP-29/NIP-43 state event (a debounced or skipped snapshot write
+    /// leaves the old sequence behind, making the newer state detectable).
+    /// Present in snapshots written after the sequence was introduced;
+    /// older snapshots deserialize as 0.
+    #[serde(default)]
+    pub seq: u64,
 }
 
 /// Verifies that a rebuild page delivered every event of its boundary
@@ -312,8 +321,10 @@ impl GroupStore {
             deleted: self.deleted.clone(),
             ghost: self.ghost.clone(),
             // Filled by the persist path, which reads the database's
-            // group-state generation (`DbClient::state_stamp`).
+            // group-state generation (`DbClient::state_stamp` and
+            // `DbClient::state_seq`).
             stamp: 0,
+            seq: 0,
         }
     }
 
@@ -338,13 +349,21 @@ impl GroupStore {
         snapshot_stamp >= current_stamp
     }
 
-    /// Restores `snap` only when it does not predate the database's
-    /// `current_stamp`. Returns false without touching the store when the
-    /// snapshot is stale, so the caller runs the existing rebuild path
-    /// (fail-closed): restoring it would resurrect state a removal
-    /// invalidated.
-    pub(crate) fn restore_checked(&mut self, snap: GroupsSnapshot, current_stamp: u64) -> bool {
-        if !Self::snapshot_is_current(snap.stamp, current_stamp) {
+    /// Restores `snap` only when it does not predate either the database's
+    /// `current_stamp` (a state-event removal advanced it) or `current_seq`
+    /// (a state event was stored). Returns false without touching the store
+    /// when the snapshot is stale, so the caller runs the existing rebuild
+    /// path (fail-closed): restoring it would resurrect state a removal
+    /// invalidated, or lose a state event the snapshot predates.
+    pub(crate) fn restore_checked(
+        &mut self,
+        snap: GroupsSnapshot,
+        current_stamp: u64,
+        current_seq: u64,
+    ) -> bool {
+        if !Self::snapshot_is_current(snap.stamp, current_stamp)
+            || !Self::snapshot_is_current(snap.seq, current_seq)
+        {
             return false;
         }
         self.restore(snap);

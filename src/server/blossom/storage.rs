@@ -12,8 +12,10 @@
 
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::db::DbClient;
+use crate::stats::Stats;
 use anyhow::anyhow;
 
 use crate::error::Result;
@@ -108,6 +110,10 @@ pub(crate) enum MigrationOutcome {
 pub(crate) struct BlobStore {
     storage: Storage,
     db: DbClient,
+    /// The relay's shared counters; the blossom code bumps
+    /// `blossom_missing_objects` through this handle (the stats writer
+    /// cannot poll it without reaching into the store).
+    stats: Arc<Stats>,
     upload_locks: Vec<tokio::sync::Mutex<()>>,
     /// Stale spool files removed by the startup sweep (see
     /// [`Self::sweep_stale_spools`]): each one is a temporary upload that
@@ -132,6 +138,7 @@ impl BlobStore {
         min_free_bytes: u64,
         s3: Option<S3Config>,
         db: DbClient,
+        stats: Arc<Stats>,
     ) -> Result<BlobStore> {
         let storage = match storage {
             "local" => Storage::Local(LocalStore::new(local_path, min_free_bytes).await?),
@@ -147,6 +154,7 @@ impl BlobStore {
         Ok(BlobStore {
             storage,
             db,
+            stats,
             upload_locks: (0..Self::UPLOAD_LOCK_COUNT)
                 .map(|_| tokio::sync::Mutex::new(()))
                 .collect(),
@@ -309,6 +317,28 @@ impl BlobStore {
             .await
     }
 
+    /// Classifies a failed owner-mapping commit. The pre-check in
+    /// [`Self::put_file`] is not atomic with the add, so a concurrent
+    /// upload can win the last owner slot and make the database refuse
+    /// this add. Re-reading the mapping then shows a full owner list
+    /// without the uploader in it — a client-visible conflict (HTTP 409),
+    /// not a storage fault. Any other state stays a genuine failure: an
+    /// unavailable database (the re-read fails) must not be misreported
+    /// as a cap conflict, and neither must a commit failure when the
+    /// uploader is already an owner.
+    async fn owner_limit_on_failed_commit(
+        &self,
+        sha256: &str,
+        pubkey: &str,
+    ) -> Option<anyhow::Error> {
+        let meta = self.db.blossom_load_checked(sha256).await??;
+        if !meta.owners.iter().any(|o| o == pubkey) && meta.owners.len() >= MAX_BLOB_OWNERS {
+            Some(anyhow::Error::new(BlobOwnerLimit))
+        } else {
+            None
+        }
+    }
+
     /// Stores a blob: the object is published first (fsync + rename +
     /// directory fsync) and the LMDB mapping is committed only after it is
     /// durable. A crash in between leaves an invisible, overwritable orphan
@@ -337,7 +367,10 @@ impl BlobStore {
             .commit_owner(sha256, mime, bytes.len() as u64, uploaded, pubkey)
             .await
         {
-            return Err(anyhow!("blossom mapping write failed"));
+            return Err(self
+                .owner_limit_on_failed_commit(sha256, pubkey)
+                .await
+                .unwrap_or_else(|| anyhow!("blossom mapping write failed")));
         }
         Ok(Descriptor {
             sha256: sha256.to_string(),
@@ -411,10 +444,15 @@ impl BlobStore {
             .commit_owner(sha256, mime, size, uploaded, pubkey)
             .await
         {
-            return Err(anyhow!(
-                "blossom mapping write failed; the published object is an invisible orphan \
-                 that a later upload of the same bytes overwrites"
-            ));
+            return Err(self
+                .owner_limit_on_failed_commit(sha256, pubkey)
+                .await
+                .unwrap_or_else(|| {
+                    anyhow!(
+                        "blossom mapping write failed; the published object is an invisible \
+                         orphan that a later upload of the same bytes overwrites"
+                    )
+                }));
         }
         if existed && let Some(meta) = self.db.blossom_load(sha256).await {
             // A re-upload keeps the original mapping (add_owner only
@@ -484,11 +522,13 @@ impl BlobStore {
             return Ok(None);
         };
         let mut last_error: Option<anyhow::Error> = None;
+        let mut missing = false;
         for owner in &meta.owners {
             match self.open_stream(owner, sha256, start, len).await {
                 Ok(Some(stream)) => return Ok(Some((stream, owner.clone()))),
-                // Missing under this owner: try the next copy.
-                Ok(None) => {}
+                // Missing under this owner (a definitive local NotFound, or
+                // an S3 404): try the next copy.
+                Ok(None) => missing = true,
                 Err(e) => {
                     log::warn!("blossom: opening {sha256} for owner {owner} failed: {e}");
                     last_error = Some(e);
@@ -497,7 +537,17 @@ impl BlobStore {
         }
         match last_error {
             Some(e) => Err(e),
-            None => Ok(None),
+            None => {
+                if missing {
+                    // The mapping exists but every owner's object is
+                    // definitively gone: count the mapped-but-missing blob
+                    // (best effort, no behavior change — the mapping is
+                    // kept and a re-upload heals it). An owner error above
+                    // means the state is unknown, so it is not counted.
+                    self.stats.bump(&self.stats.blossom_missing_objects, 1);
+                }
+                Ok(None)
+            }
         }
     }
 
@@ -1573,7 +1623,9 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("nostrfy-blossom-test-{tmp}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let s = BlobStore::new("local", &dir, 0, None, db).await.unwrap();
+        let s = BlobStore::new("local", &dir, 0, None, db, Stats::new())
+            .await
+            .unwrap();
         (s, db_path)
     }
 
@@ -1649,6 +1701,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mapped_missing_object_is_counted() {
+        // A mapping can outlive its object (an out-of-band delete, or a
+        // pre-publish-first build's mapping): the lookup must count the
+        // mapped-but-missing blob (best effort) without changing behavior.
+        let (s, _db_path) = store("missing-object").await;
+        let a = pk(1);
+        let sha = "9a".repeat(32);
+        s.put(&a, &sha, b"gone soon", "text/plain").await.unwrap();
+        let before = s
+            .stats
+            .blossom_missing_objects
+            .load(std::sync::atomic::Ordering::Relaxed);
+        // Remove the object behind the mapping's back.
+        let dir = std::env::temp_dir().join(format!(
+            "nostrfy-blossom-test-missing-object-{}",
+            std::process::id()
+        ));
+        tokio::fs::remove_file(dir.join(npub_of(&a)).join(&sha))
+            .await
+            .unwrap();
+        assert!(s.open_stream_any(&sha, 0, 1).await.unwrap().is_none());
+        assert_eq!(
+            s.stats
+                .blossom_missing_objects
+                .load(std::sync::atomic::Ordering::Relaxed),
+            before + 1,
+            "a mapped-but-missing object must be counted"
+        );
+        // A missing mapping is not a missing object.
+        assert!(
+            s.open_stream_any(&"bb".repeat(32), 0, 1)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            s.stats
+                .blossom_missing_objects
+                .load(std::sync::atomic::Ordering::Relaxed),
+            before + 1,
+            "an unmapped hash must not be counted"
+        );
+        // A reachable object is not counted either.
+        s.put(&a, &sha, b"gone soon", "text/plain").await.unwrap();
+        assert!(s.open_stream_any(&sha, 0, 1).await.unwrap().is_some());
+        assert_eq!(
+            s.stats
+                .blossom_missing_objects
+                .load(std::sync::atomic::Ordering::Relaxed),
+            before + 1,
+            "a successful lookup must not be counted"
+        );
+        s.db.shutdown();
+    }
+
+    #[tokio::test]
     async fn local_put_is_atomic() {
         // The final file must be written via a temp file + rename: no
         // `.tmp` leftovers, and the blob is served from its final path.
@@ -1688,6 +1796,7 @@ mod tests {
                 u64::MAX,
                 None,
                 s.db.clone(),
+                Stats::new(),
             )
             .await
             .unwrap();
@@ -1711,6 +1820,7 @@ mod tests {
                 0,
                 None,
                 s.db.clone(),
+                Stats::new(),
             )
             .await
             .unwrap();
@@ -1996,7 +2106,9 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         {
-            let s = BlobStore::new("local", &dir, 0, None, db).await.unwrap();
+            let s = BlobStore::new("local", &dir, 0, None, db, Stats::new())
+                .await
+                .unwrap();
             let sha = "cd".repeat(32);
             s.put(&pk(1), &sha, b"x", "image/png").await.unwrap();
             s.put(&pk(2), &sha, b"x", "image/png").await.unwrap();
@@ -2020,7 +2132,9 @@ mod tests {
             262144,
         )
         .unwrap();
-        let s = BlobStore::new("local", &dir, 0, None, db).await.unwrap();
+        let s = BlobStore::new("local", &dir, 0, None, db, Stats::new())
+            .await
+            .unwrap();
         let sha = "cd".repeat(32);
         assert_eq!(s.find(&sha).await.unwrap().unwrap().pubkey, pk(1));
         assert!(s.has(&pk(1), &sha).await.unwrap());
@@ -2049,7 +2163,9 @@ mod tests {
             )
             .unwrap();
         }
-        let s = BlobStore::new("local", &dir, 0, None, db).await.unwrap();
+        let s = BlobStore::new("local", &dir, 0, None, db, Stats::new())
+            .await
+            .unwrap();
         let (_tx, drain) = tokio::sync::watch::channel(false);
         let migrated = s.auto_migrate_legacy(drain).await.unwrap();
         assert_eq!(
@@ -2092,7 +2208,9 @@ mod tests {
             br#"{"size":1,"mime":"text/plain","uploaded":1787000000}"#,
         )
         .unwrap();
-        let s = BlobStore::new("local", &dir, 0, None, db).await.unwrap();
+        let s = BlobStore::new("local", &dir, 0, None, db, Stats::new())
+            .await
+            .unwrap();
 
         // Already draining: nothing is scanned, nothing is mapped and the
         // marker stays unset.
@@ -2182,6 +2300,62 @@ mod tests {
                 .is_ok()
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn raced_owner_cap_commit_is_classified_as_a_conflict() {
+        // The put_file pre-check is not atomic with the add: a concurrent
+        // upload can win the last owner slot between them. The re-read
+        // after the failed add must then surface the typed conflict
+        // (HTTP 409); a genuine failure (unavailable database, or the
+        // uploader already an owner) must stay generic (HTTP 500).
+        let (s, _db_path) = store("owner-cap-race").await;
+        let sha = "5b".repeat(32);
+        let bytes = b"raced";
+        for i in 0..MAX_BLOB_OWNERS {
+            assert!(
+                s.db.blossom_add_owner(
+                    &sha,
+                    "text/plain",
+                    bytes.len() as u64,
+                    1,
+                    &pk(i as u8 + 10),
+                )
+                .await
+            );
+        }
+        // The raced loser's add is refused by the database cap.
+        assert!(
+            !s.commit_owner(&sha, "text/plain", bytes.len() as u64, 1, &pk(99))
+                .await
+        );
+        let err = s
+            .owner_limit_on_failed_commit(&sha, &pk(99))
+            .await
+            .expect("a full owner list must classify as the owner limit");
+        assert!(
+            err.downcast_ref::<BlobOwnerLimit>().is_some(),
+            "the raced cap must surface as BlobOwnerLimit: {err}"
+        );
+        // An uploader already in the owner list is not a cap conflict.
+        assert!(
+            s.owner_limit_on_failed_commit(&sha, &pk(10))
+                .await
+                .is_none()
+        );
+        // A failed commit for an unmapped blob is not a cap conflict.
+        assert!(
+            s.owner_limit_on_failed_commit(&"aa".repeat(32), &pk(99))
+                .await
+                .is_none()
+        );
+        // A stopped database must not be misreported as a client conflict.
+        s.db.shutdown();
+        assert!(
+            s.owner_limit_on_failed_commit(&sha, &pk(99))
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]

@@ -418,32 +418,40 @@ fn host_route_allowed(api_host: &str, blossom_host: &str, host: &str, path: &str
 }
 
 /// Restores the persisted NIP-29 group state at startup, comparing the
-/// snapshot's stamp against the database's current group-state generation
-/// (`DbClient::state_stamp`). A snapshot from before a group-state removal
-/// must not be restored (it would resurrect state a purge/vanish
-/// invalidated), and a stamp the database cannot answer is treated the
-/// same way: fail closed and rebuild from the surviving events. A legacy
-/// snapshot (stamp 0) is accepted while the generation is still 0. The
-/// rebuild path only runs when the NIP is enabled; with NIP-29 disabled
-/// the store stays empty exactly as when no snapshot exists (the next
-/// start with the NIP re-enabled rebuilds).
+/// snapshot's stamp and sequence against the database's current group-state
+/// generation (`DbClient::state_stamp`, `DbClient::state_seq`). A snapshot
+/// from before a group-state removal (stamp) or state event (seq) must not
+/// be restored (it would resurrect state a purge/vanish invalidated, or
+/// predate an accepted event), and a generation the database cannot answer
+/// is treated the same way: fail closed and rebuild from the surviving
+/// events. A legacy snapshot (stamp and seq 0) is accepted while both
+/// counters are still 0. The rebuild path only runs when the NIP is
+/// enabled; with NIP-29 disabled the store stays empty exactly as when no
+/// snapshot exists (the next start with the NIP re-enabled rebuilds).
 async fn restore_group_state(relay: &Relay, groups_enabled: bool) -> Result<()> {
     let Some(snapshot) = relay.db.load_groups().await else {
         return rebuild_group_state(relay, groups_enabled).await;
     };
-    match relay.db.state_stamp().await {
-        Some(stamp) => {
-            if relay.groups.write().await.restore_checked(snapshot, stamp) {
+    let stamp = relay.db.state_stamp().await;
+    let seq = relay.db.state_seq().await;
+    match (stamp, seq) {
+        (Some(stamp), Some(seq)) => {
+            if relay
+                .groups
+                .write()
+                .await
+                .restore_checked(snapshot, stamp, seq)
+            {
                 info!("NIP-29 group state restored from the database snapshot");
                 return Ok(());
             }
             error!(
                 "the persisted NIP-29 group snapshot predates the database's group-state \
-                 generation {stamp}; refusing to restore it and rebuilding from the \
-                 surviving events instead"
+                 generation (stamp {stamp}, seq {seq}); refusing to restore it and rebuilding \
+                 from the surviving events instead"
             );
         }
-        None => {
+        _ => {
             // The generation is unknown, so the snapshot's currency cannot
             // be established: restoring it could resurrect state a removal
             // invalidated.
@@ -545,29 +553,31 @@ pub async fn run_server(config_path: PathBuf, config: Config, db: DbClient) -> R
 
     // Same lifecycle for the NIP-43 role store: snapshot first, replay
     // migration only when nothing usable was ever persisted. The snapshot's
-    // stamp is compared against the database's state generation
-    // (`DbClient::state_stamp`), which a NIP-09 deletion of a role-state
-    // event advances: a snapshot from before such a removal must not be
-    // restored (it would resurrect a deleted grant), and an unreadable
-    // generation fails closed the same way. Both cases fall through to the
-    // replay migration below, which rebuilds from the surviving events.
+    // stamp and sequence are compared against the database's state
+    // generation (`DbClient::state_stamp`, `DbClient::state_seq`), which a
+    // NIP-09 deletion of a role-state event or a role-state event itself
+    // advances: a snapshot from before such a change must not be restored
+    // (it would resurrect a deleted grant or predate a state event), and an
+    // unreadable generation fails closed the same way. Both cases fall
+    // through to the replay migration below, which rebuilds from the
+    // surviving events.
     if relay.config.read().await.nip_enabled(43) {
         let needs_rebuild = match relay.db.load_roles().await {
-            Some(snap) => match relay.db.state_stamp().await {
-                Some(stamp) => {
-                    if relay.roles.write().await.restore_checked(snap, stamp) {
+            Some(snap) => match (relay.db.state_stamp().await, relay.db.state_seq().await) {
+                (Some(stamp), Some(seq)) => {
+                    if relay.roles.write().await.restore_checked(snap, stamp, seq) {
                         info!("NIP-43 role state restored from the database snapshot");
                         false
                     } else {
                         error!(
                             "the persisted NIP-43 role snapshot predates the database's state \
-                             generation {stamp}; refusing to restore it and rebuilding from \
-                             the surviving events instead"
+                             generation (stamp {stamp}, seq {seq}); refusing to restore it and \
+                             rebuilding from the surviving events instead"
                         );
                         true
                     }
                 }
-                None => {
+                _ => {
                     // The generation is unknown, so the snapshot's currency
                     // cannot be established: restoring it could resurrect a
                     // deleted grant.

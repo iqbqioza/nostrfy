@@ -313,7 +313,9 @@ max_api_fetch = 55001
 max_api_search_bytes = 2048
 
 # Maximum bytes of outgoing messages queued per connection before new ones
-# are dropped (protects memory against slow readers). 0 = unlimited.
+# are dropped (protects memory against slow readers). 0 disables this
+# configured cap, but a safety ceiling derived from max_req_response_bytes
+# (2x, or 64 MiB when max_req_response_bytes is also 0) still applies.
 max_out_queue_bytes = 262144
 
 # Seconds a connection may stay idle (no inbound frames) before it is closed.

@@ -223,7 +223,7 @@ Set this whenever a reverse proxy (nginx, Caddy, a cloud load balancer, Cloudfla
 | `max_ws_message_bytes` | integer | `1048576` | Max bytes per WebSocket message/frame |
 | `buffer_size` | integer | `2048` | Initial per-connection WebSocket buffer (bytes; legacy location of `database.db_buffer_size`) |
 | `socket_recv_buffer_kb` | integer | `64` | Per-connection kernel receive buffer (KiB, `0` = kernel default; the kernel may double it). Larger values let a fast publisher's burst absorb into one batch while the relay commits; the buffer uses real memory only while data is queued |
-| `max_out_queue_bytes` | integer | `262144` | Per-connection outgoing queue cap (bytes; `0` = unlimited) |
+| `max_out_queue_bytes` | integer | `262144` | Per-connection outgoing queue cap (bytes; `0` disables the configured cap, but a safety ceiling derived from `max_req_response_bytes` still applies) |
 | `ws_idle_timeout_secs` | integer | `300` | Close idle connections after this long (`0` = never) |
 | `http_read_timeout_secs` | integer | `30` | Seconds to deliver a complete HTTP request head (and the NIP-86 POST body) before the connection is closed (`0` = disabled; slow-loris defense — applies to WebSocket upgrades too) |
 | `max_connections_per_sec_per_ip` | integer | `0` | Max new connections per second per source IP (`0` = unlimited) |
@@ -295,7 +295,7 @@ Set this whenever a reverse proxy (nginx, Caddy, a cloud load balancer, Cloudfla
 
 **`max_ws_message_bytes`** — The maximum size of a single WebSocket message/frame in bytes. Oversized frames are rejected at the protocol layer and the connection is closed with a `message too large` notice. Also the effective ceiling for any single event.
 
-**`max_out_queue_bytes`** — The per-connection cap on queued outgoing bytes, protecting memory against slow readers (`0` = unlimited). REQ responses are pumped through the queue in bounded chunks (see `max_req_response_bytes`), so they cannot pin more than the cap either; EOSE and CLOSED messages are tiny and take the uncapped path. Live traffic is dropped when full (recoverable by re-subscribing).
+**`max_out_queue_bytes`** — The per-connection cap on queued outgoing bytes, protecting memory against slow readers. `0` disables the *configured* cap, but a safety ceiling still applies: twice `max_req_response_bytes` (or 64 MiB when that is also `0`), so a queue of frames up to `max_ws_message_bytes` can never pin gigabytes per connection. REQ responses are pumped through the queue in bounded chunks (see `max_req_response_bytes`), so they cannot pin more than the cap either; EOSE and CLOSED messages are tiny and take the uncapped path. Live traffic is dropped when full (recoverable by re-subscribing).
 
 **`max_req_response_bytes`** — Byte budget for a single REQ response (the stored events delivered for one subscription). The response is pumped into the capped outgoing queue in chunks as the socket drains; when the budget is exceeded the subscription is closed with `CLOSED ... blocked: response too large; narrow the filter or paginate` and the client can re-request with a narrower filter. `0` disables the budget. A connection may queue at most four pending responses; older ones are cut off with their EOSE. Values above 512 MiB are warned about, and anything above 2 GiB is rejected as a clear mistake (one response could exhaust memory).
 
@@ -352,7 +352,7 @@ Set this whenever a reverse proxy (nginx, Caddy, a cloud load balancer, Cloudfla
 ### Behavior notes
 
 - **`max_created_at_future_secs`** uses the NIP-01 `invalid:` prefix — the event is rejected as invalid (the NIP-01 example for this case).
-- **`max_out_queue_bytes`** protects against slow readers; REQ responses are never dropped by it (see key details).
+- **`max_out_queue_bytes`** protects against slow readers; REQ responses are never dropped by it (see key details). When it is `0`, the safety ceiling (twice `max_req_response_bytes`, or 64 MiB when that is also `0`) still bounds the queue.
 - **`new_pubkey_min_age_secs`**: the first-seen timestamp is only recorded when an event actually stores, so failed first events cannot pre-warm the account-age clock.
 - **`max_api_limit`** clamps silently; **`max_api_offset`**, **`max_api_fetch`** and **`max_api_search_bytes`** reject with a clear `400` error message.
 - **Filter member caps are fixed** (not configurable): a single filter may carry at most **512 `ids`, `authors` or `kinds` entries**, and the `#...` tag constraint values share a separate **512-value combined budget** across all tag attributes of that filter. The in-memory match and scan are linear in these arrays, so a larger filter would allow quadratic work per event. Over-cap filters are refused with `CLOSED ... invalid: too many ids, authors, kinds or tag values in a filter` (COUNT and NIP-77 syncs refuse them the same way).

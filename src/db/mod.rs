@@ -348,6 +348,12 @@ enum Msg {
     StateStamp {
         reply: oneshot::Sender<Option<u64>>,
     },
+    /// The derived-state sequence (see `Store::state_seq`). `None` when the
+    /// read failed: the caller fails closed instead of treating a missing
+    /// sequence as free to overwrite.
+    StateSeq {
+        reply: oneshot::Sender<Option<u64>>,
+    },
     DatabaseSize {
         reply: oneshot::Sender<u64>,
     },
@@ -1668,11 +1674,12 @@ impl DbClient {
             .await
     }
 
-    /// Persists the NIP-29 group state snapshot (write-through: call after
-    /// every group mutation). The returned bool reports whether the commit
-    /// succeeded: on `false` (including an overload fail-fast or a lost
-    /// writer) the caller must keep the state pending and retry instead of
-    /// treating the snapshot as durable.
+    /// Persists the NIP-29 group state snapshot. The relay's hot mutation
+    /// path debounces this call through a background worker; the fail-closed
+    /// paths (and tests) save immediately. The returned bool reports whether
+    /// the commit succeeded: on `false` (including an overload fail-fast or a
+    /// lost writer) the caller must keep the state pending and retry instead
+    /// of treating the snapshot as durable.
     pub async fn save_groups(&self, snapshot: crate::nips::nip29::GroupsSnapshot) -> bool {
         self.request_write(|reply| Msg::SaveGroups { snapshot, reply })
             .await
@@ -1697,9 +1704,9 @@ impl DbClient {
             .await
     }
 
-    /// Persists the NIP-43 role state snapshot (write-through: call after
-    /// every role mutation). Same commit-success semantics as
-    /// [`Self::save_groups`].
+    /// Persists the NIP-43 role state snapshot (same commit-success
+    /// semantics as [`Self::save_groups`]; the relay debounces the hot
+    /// mutation path).
     pub async fn save_roles(&self, snapshot: crate::nips::nip43::RolesSnapshot) -> bool {
         self.request_write(|reply| Msg::SaveRoles { snapshot, reply })
             .await
@@ -1897,6 +1904,17 @@ impl DbClient {
     /// when the database could not answer: the caller fails closed.
     pub async fn state_stamp(&self) -> Option<u64> {
         self.request_read_startup(|reply| Msg::StateStamp { reply })
+            .await
+            .flatten()
+    }
+
+    /// The derived-state sequence: monotonic, bumped inside the write
+    /// transaction of every NIP-29/NIP-43 state-relevant event put, so a
+    /// caller can persist it with a state snapshot and compare it at startup
+    /// to detect that the stored snapshot predates a state event. `None`
+    /// when the database could not answer: the caller fails closed.
+    pub async fn state_seq(&self) -> Option<u64> {
+        self.request_read_startup(|reply| Msg::StateSeq { reply })
             .await
             .flatten()
     }

@@ -267,7 +267,8 @@ pub struct Conn {
     /// new message is queued or dropped.
     pub(crate) out_bytes: usize,
     /// Per-connection byte cap for the outgoing queue (`limits.max_out_queue_bytes`,
-    /// cached once per connection).
+    /// cached once per connection; `0` = unset, in which case the safety
+    /// ceiling of [`Conn::out_queue_cap`] applies instead).
     pub(crate) out_queue_bytes: usize,
     /// Byte budget for a single REQ response (`limits.max_req_response_bytes`,
     /// cached once per connection; 0 = unlimited).
@@ -397,10 +398,14 @@ impl Conn {
     /// (live delivery) must react instead of assuming it was queued.
     pub(crate) fn send_tagged(&mut self, msg: Message, event_sub: Option<u64>) -> bool {
         let size = message_size(&msg);
-        // 0 = unlimited (the REQ-response budget documents the same meaning).
-        let over_byte_cap = self.out_queue_bytes > 0
-            && !self.outgoing.is_empty()
-            && self.out_bytes.saturating_add(size) > self.out_queue_bytes;
+        // The configured cap, or the control ceiling when it is unset
+        // (`0` = "no configured cap", not "no bound": without the ceiling
+        // OUT_QUEUE_LIMIT frames of up to `max_ws_message_bytes` could pin
+        // ~4 GiB per connection). The first frame of an empty queue is
+        // never dropped, so a single frame above the cap is still
+        // delivered; the queue then cannot grow past the cap again.
+        let over_byte_cap =
+            !self.outgoing.is_empty() && self.out_bytes.saturating_add(size) > self.out_queue_cap();
         if self.outgoing.len() >= OUT_QUEUE_LIMIT || over_byte_cap {
             self.dropped += 1;
             self.relay.stats.bump(&self.relay.stats.buffers_dropped, 1);
@@ -483,6 +488,17 @@ impl Conn {
             (self.req_response_bytes as usize).saturating_mul(2)
         } else {
             64 * 1024 * 1024
+        }
+    }
+
+    /// The effective byte cap of the outgoing queue: the configured
+    /// `limits.max_out_queue_bytes`, or [`Self::control_ceiling`] when
+    /// that is unset (`0` = "no configured cap", not "no bound").
+    fn out_queue_cap(&self) -> usize {
+        if self.out_queue_bytes > 0 {
+            self.out_queue_bytes
+        } else {
+            self.control_ceiling()
         }
     }
 
@@ -6467,6 +6483,44 @@ mod tests {
                 "a dropped completion-critical frame must mark the connection \
                  for close so the peer can resynchronize"
             );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn unset_out_queue_bytes_still_enforces_the_control_ceiling() {
+        // `max_out_queue_bytes = 0` is "no configured cap", not "no
+        // bound": without the safety ceiling (twice the REQ-response
+        // budget) OUT_QUEUE_LIMIT frames of up to `max_ws_message_bytes`
+        // could pin ~4 GiB per connection.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            conn.out_queue_bytes = 0;
+            conn.req_response_bytes = 100;
+            assert_eq!(conn.control_ceiling(), 200);
+            // The first frame of an empty queue is never dropped (a single
+            // event larger than the ceiling is not lost).
+            assert!(conn.send_tagged(Message::Text("a".repeat(150).into()), None));
+            let dropped_before = conn
+                .relay
+                .stats
+                .buffers_dropped
+                .load(std::sync::atomic::Ordering::Relaxed);
+            // The next frame crosses the ceiling: dropped and counted.
+            assert!(!conn.send_tagged(Message::Text("b".repeat(150).into()), None));
+            assert_eq!(conn.outgoing.len(), 1, "only the first frame is queued");
+            assert_eq!(
+                conn.relay
+                    .stats
+                    .buffers_dropped
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                dropped_before + 1,
+                "the ceiling drop must be counted"
+            );
+            // A frame that keeps the queue below the ceiling still fits.
+            assert!(conn.send_tagged(Message::Text("c".repeat(20).into()), None));
+            assert_eq!(conn.outgoing.len(), 2);
             conn.relay.db.shutdown();
         });
     }

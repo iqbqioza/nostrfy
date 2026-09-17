@@ -150,6 +150,31 @@ pub(crate) const VANISH_PENDING: &str = "vanish_pending";
 /// inside the write transaction of every group-state-relevant removal, so
 /// the stamp and the removals commit atomically.
 pub(crate) const STATE_STAMP_KEY: &[u8] = b"state_stamp";
+/// [`INDEX_META`] key of the derived-state sequence: bumped inside the same
+/// write transaction as every NIP-29/NIP-43 state-relevant event put, so a
+/// persisted snapshot can record the exact state generation it was taken
+/// at. A snapshot whose `seq` is below the current sequence predates a
+/// state event and must not be restored (see [`is_group_state_kind`]).
+pub(crate) const STATE_SEQ_KEY: &[u8] = b"state_seq";
+
+/// Whether a `kind` event feeds the derived NIP-29 group state or NIP-43
+/// role state. Such events bump [`STATE_SEQ_KEY`] when they store, and
+/// removing one bumps [`STATE_STAMP_KEY`], so both snapshot restore checks
+/// can detect a snapshot that predates the event.
+pub(crate) fn is_group_state_kind(kind: u64) -> bool {
+    (crate::nips::nip29::MOD_MIN..=crate::nips::nip29::MOD_MAX).contains(&kind)
+        || kind == crate::nips::nip29::JOIN
+        || kind == crate::nips::nip29::LEAVE
+        || matches!(
+            kind,
+            crate::nips::nip43::ROLE_DEFINITION
+                | crate::nips::nip43::MEMBERSHIP_LIST
+                | crate::nips::nip43::ADD_USER
+                | crate::nips::nip43::REMOVE_USER
+                | crate::nips::nip43::JOIN
+                | crate::nips::nip43::LEAVE
+        )
+}
 pub(crate) const CREATED_LEN: usize = 8;
 pub(crate) const ID_LEN: usize = 32;
 pub(crate) const TAG_VALUE_MAX: usize = 1024;
@@ -459,7 +484,7 @@ pub(crate) struct Store {
     /// Started-but-unfinished NIP-62 vanishes (see [`VANISH_PENDING`]).
     pub(crate) vanish_pending: Database<Bytes, Bytes>,
     /// One-time index migration markers (see [`INDEX_META`]) plus the
-    /// derived-state stamp (`state_stamp`).
+    /// derived-state stamp and sequence (`state_stamp`, `state_seq`).
     pub(crate) index_meta: Database<Bytes, Bytes>,
     /// NIP-40 expiration handling is only active when the NIP is enabled.
     /// Shared with the relay so that a config reload can toggle it at runtime.
@@ -1623,15 +1648,41 @@ impl Store {
     /// observe one without the other). Callers invoke this only when the
     /// transaction actually removed a group-state event.
     pub(crate) fn bump_state_stamp(&self, wtxn: &mut heed::RwTxn) -> Result<()> {
+        self.bump_meta_counter(wtxn, STATE_STAMP_KEY)
+    }
+
+    /// The persistent derived-state sequence: 0 when no state-relevant
+    /// event was ever stored. See [`STATE_SEQ_KEY`].
+    pub(crate) fn state_seq(&self) -> Result<u64> {
+        let rtxn = self.env.read_txn()?;
+        Ok(self
+            .index_meta
+            .get(&rtxn, STATE_SEQ_KEY)?
+            .and_then(|raw| raw.get(..8))
+            .map(|bytes| u64::from_be_bytes(bytes.try_into().expect("checked length")))
+            .unwrap_or(0))
+    }
+
+    /// Bumps the derived-state sequence inside an open write transaction,
+    /// so the sequence and the state-relevant put commit atomically: a
+    /// snapshot claiming the sequence can never be persisted for a state
+    /// event whose put did not commit. Callers invoke this only when the
+    /// transaction actually stored a NIP-29/NIP-43 state-relevant event.
+    pub(crate) fn bump_state_seq(&self, wtxn: &mut heed::RwTxn) -> Result<()> {
+        self.bump_meta_counter(wtxn, STATE_SEQ_KEY)
+    }
+
+    /// Increments one 8-byte `INDEX_META` counter in place (0 when absent),
+    /// saturating at `u64::MAX`.
+    fn bump_meta_counter(&self, wtxn: &mut heed::RwTxn, key: &[u8]) -> Result<()> {
         let next = self
             .index_meta
-            .get(wtxn, STATE_STAMP_KEY)?
+            .get(wtxn, key)?
             .and_then(|raw| raw.get(..8))
             .map(|bytes| u64::from_be_bytes(bytes.try_into().expect("checked length")))
             .unwrap_or(0)
             .saturating_add(1);
-        self.index_meta
-            .put(wtxn, STATE_STAMP_KEY, &next.to_be_bytes())?;
+        self.index_meta.put(wtxn, key, &next.to_be_bytes())?;
         Ok(())
     }
 
@@ -1830,6 +1881,12 @@ impl Store {
         let raw = serde_json::to_vec(event)?;
         self.events.put(wtxn, &id, &raw)?;
         self.put_indexes(wtxn, event, &id, &pubkey)?;
+        // The derived-state sequence advances in the same commit as the
+        // state-relevant event it describes: a snapshot can claim a
+        // generation only when the events behind it are durable.
+        if is_group_state_kind(event.kind) {
+            self.bump_state_seq(wtxn)?;
+        }
         Ok(outcome)
     }
 

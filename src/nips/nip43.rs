@@ -73,6 +73,13 @@ pub(crate) struct RolesSnapshot {
     /// introduced; older snapshots deserialize as 0.
     #[serde(default)]
     pub stamp: u64,
+    /// The database's derived-state sequence the snapshot was taken at
+    /// (see `DbClient::state_seq`): a restore must reject a snapshot whose
+    /// sequence is below the current one, because it predates a
+    /// NIP-29/NIP-43 state event. Present in snapshots written after the
+    /// sequence was introduced; older snapshots deserialize as 0.
+    #[serde(default)]
+    pub seq: u64,
 }
 
 impl RoleStore {
@@ -88,9 +95,10 @@ impl RoleStore {
         RolesSnapshot {
             roles: self.roles.clone(),
             assignments: self.assignments.clone(),
-            // Filled by the persist path, which reads the database's state
-            // generation (`DbClient::state_stamp`).
+            // Filled by the persist path, which reads the database's
+            // generation (`DbClient::state_stamp` and `DbClient::state_seq`).
             stamp: 0,
+            seq: 0,
         }
     }
 
@@ -111,13 +119,21 @@ impl RoleStore {
         snapshot_stamp >= current_stamp
     }
 
-    /// Restores `snap` only when it does not predate the database's
-    /// `current_stamp`. Returns false without touching the store when the
-    /// snapshot is stale, so the caller runs the existing rebuild path
-    /// (fail-closed): restoring it would resurrect state a removal
-    /// invalidated.
-    pub(crate) fn restore_checked(&mut self, snap: RolesSnapshot, current_stamp: u64) -> bool {
-        if !Self::snapshot_is_current(snap.stamp, current_stamp) {
+    /// Restores `snap` only when it does not predate either the database's
+    /// `current_stamp` (a role-state removal advanced it) or `current_seq`
+    /// (a role-state event was stored). Returns false without touching the
+    /// store when the snapshot is stale, so the caller runs the existing
+    /// rebuild path (fail-closed): restoring it would resurrect a deleted
+    /// grant or lose a role-state event the snapshot predates.
+    pub(crate) fn restore_checked(
+        &mut self,
+        snap: RolesSnapshot,
+        current_stamp: u64,
+        current_seq: u64,
+    ) -> bool {
+        if !Self::snapshot_is_current(snap.stamp, current_stamp)
+            || !Self::snapshot_is_current(snap.seq, current_seq)
+        {
             return false;
         }
         self.restore(snap);
@@ -479,17 +495,18 @@ mod tests {
         let json = r#"{"roles":{"mod":{"label":"Mod","description":"","color":"","order":null}},"assignments":{"abc":["mod"]}}"#;
         let snap: RolesSnapshot = serde_json::from_str(json).unwrap();
         assert_eq!(snap.stamp, 0, "legacy snapshots have no generation stamp");
+        assert_eq!(snap.seq, 0, "legacy snapshots have no state sequence");
 
         // Once a removal advanced the generation the legacy snapshot is
         // stale and the startup path must rebuild instead.
         let mut store = RoleStore::default();
-        assert!(!store.restore_checked(snap, 1));
+        assert!(!store.restore_checked(snap, 1, 0));
         assert!(store.roles.is_empty(), "a rejected snapshot is not applied");
 
         // At generation 0 (no removal ever happened) it is current.
         let snap: RolesSnapshot = serde_json::from_str(json).unwrap();
         let mut store = RoleStore::default();
-        assert!(store.restore_checked(snap, 0));
+        assert!(store.restore_checked(snap, 0, 0));
         assert!(store.roles.contains_key("mod"));
         assert!(store.is_member_of("abc"));
     }
@@ -514,7 +531,7 @@ mod tests {
         stale.roles.clear();
         stale.assignments.clear();
         assert!(
-            !store.restore_checked(stale, 7),
+            !store.restore_checked(stale, 7, 7),
             "a snapshot from before the current generation must be rejected"
         );
         assert!(
@@ -524,8 +541,37 @@ mod tests {
 
         let mut current = store.snapshot();
         current.stamp = 7;
-        assert!(store.restore_checked(current, 7));
+        current.seq = 7;
+        assert!(store.restore_checked(current, 7, 7));
         assert!(store.roles.contains_key("king"));
+    }
+
+    #[test]
+    fn stale_role_snapshot_sequence_is_rejected_at_restore() {
+        // The sequence tracks accepted role-state events, not just removals:
+        // a snapshot taken before the event advanced the sequence must not
+        // be restored, because the debounced persistence may have skipped
+        // the save that would have carried the event's state.
+        let mut store = RoleStore::default();
+        store.create("king", "king", "", "", None);
+        let mut snapshot = store.snapshot();
+        snapshot.stamp = 0;
+        snapshot.seq = 4;
+        let mut restored = RoleStore::default();
+        assert!(
+            !restored.restore_checked(snapshot, 0, 5),
+            "a snapshot below the current sequence must be rejected"
+        );
+        assert!(
+            restored.roles.is_empty(),
+            "a rejected snapshot is not applied"
+        );
+
+        let mut snapshot = store.snapshot();
+        snapshot.stamp = 0;
+        snapshot.seq = 5;
+        assert!(restored.restore_checked(snapshot, 0, 5));
+        assert!(restored.roles.contains_key("king"));
     }
 
     #[test]
