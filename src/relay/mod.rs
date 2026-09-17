@@ -78,6 +78,11 @@ pub struct Relay {
     groups_rebuild: std::sync::Arc<GroupsRebuild>,
     /// NIP-43 role definitions and member assignments.
     pub roles: Arc<RwLock<RoleStore>>,
+    /// The coalesced NIP-43 role rebuild that follows a NIP-09 deletion,
+    /// NIP-62 vanish or NIP-40 expiry of a role-state event: while stale,
+    /// the live store is the fail-closed empty store and `persist_roles`
+    /// must not save it (see [`RolesRebuild`]).
+    roles_rebuild: std::sync::Arc<RolesRebuild>,
     /// Limits concurrent `/api/v1` queries so a flood of REST traffic
     /// fails fast (503) instead of piling up behind WebSocket work. The
     /// limit is adjustable at runtime (SIGHUP config reload).
@@ -99,8 +104,10 @@ pub struct Relay {
     persist_access_lock: tokio::sync::Mutex<()>,
     /// Serializes `persist_roles` snapshot capture and write (same hazard
     /// as `persist_access_lock`: a stale role snapshot must not overwrite a
-    /// newer one). `persist_groups` uses `GroupsRebuild::persist_lock`.
-    persist_roles_lock: tokio::sync::Mutex<()>,
+    /// newer one). Shared with the role rebuild worker, which persists the
+    /// fresh store under the same lock. `persist_groups` uses
+    /// `GroupsRebuild::persist_lock`.
+    persist_roles_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
     /// Serializes the Blossom allowlist snapshot capture and write (NIP-86
     /// or the `/blossom allow|deny` command events, and the SIGHUP reload):
     /// without it a command that captured an older snapshot can queue its
@@ -360,6 +367,168 @@ impl GroupsRebuild {
         snapshot.stamp = stamp;
         db.save_groups(snapshot).await
     }
+}
+
+/// Coordination state for the coalesced NIP-43 role rebuild that follows a
+/// NIP-09 deletion, NIP-62 vanish or NIP-40 expiry of a role-state event.
+/// Kept in an `Arc` so the background worker can run without borrowing the
+/// relay.
+///
+/// Deliberately minimal (no interval floor or event buffer like
+/// [`GroupsRebuild`]): role mutations are rare and the role state is small.
+/// The marking path replaces the live store with an empty one **before** the
+/// rebuild runs (revocation): the removed event may have defined a role or
+/// granted a membership, and keeping the old grants authorized until the scan
+/// completes would leave the deleted grant accepted. The stored snapshot
+/// keeps its older generation stamp, so the next startup rejects it and
+/// rebuilds from the surviving events.
+#[derive(Default)]
+struct RolesRebuild {
+    /// At least one role-state removal happened since the last completed
+    /// rebuild: the live store is the fail-closed empty store and
+    /// `persist_roles` must not save it. The worker drains it before a scan
+    /// and restores it when the scan fails.
+    dirty: std::sync::atomic::AtomicBool,
+    /// A worker task owns (or is about to own) the rebuild loop: triggers
+    /// only set the flags.
+    running: std::sync::atomic::AtomicBool,
+}
+
+/// Marks the role state stale, revokes the live grants and schedules the
+/// coalesced background rebuild (single-flight via the `running` flag).
+fn schedule_roles_rebuild(
+    db: DbClient,
+    roles: std::sync::Arc<RwLock<RoleStore>>,
+    relay_pubkey: String,
+    persist_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+    state: std::sync::Arc<RolesRebuild>,
+    drain: tokio::sync::watch::Receiver<bool>,
+) {
+    if *drain.borrow() {
+        return;
+    }
+    if state.running.swap(true, Ordering::SeqCst) {
+        // A worker is already draining; its loop re-checks the dirty flag
+        // before it exits, so this request is covered.
+        return;
+    }
+    tokio::spawn(roles_rebuild_worker(
+        db,
+        roles,
+        relay_pubkey,
+        persist_lock,
+        state,
+        drain,
+    ));
+}
+
+/// The coalesced role rebuild worker. Holds the single-flight token, drains
+/// the dirty flag and swaps a freshly rebuilt store into the live one.
+///
+/// The scan runs **without** the roles lock: a full-history paged scan must
+/// not stall role authorization, and the live store is the fail-closed empty
+/// store meanwhile. The swap and the persist happen under the short final
+/// locks. The worker observes the relay's drain signal: it refuses to start a
+/// scan after shutdown and aborts an in-flight scan at its next await. Either
+/// way the live store stays fail-closed and the dirty flag stays set, so the
+/// next startup rebuilds from the surviving events.
+async fn roles_rebuild_worker(
+    db: DbClient,
+    roles: std::sync::Arc<RwLock<RoleStore>>,
+    relay_pubkey: String,
+    persist_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+    state: std::sync::Arc<RolesRebuild>,
+    mut drain: tokio::sync::watch::Receiver<bool>,
+) {
+    loop {
+        // Shutdown: stop before starting another scan. The removal that
+        // dirtied the state already cleared the live store, so the next
+        // startup rebuilds from the surviving events.
+        if *drain.borrow() {
+            break;
+        }
+        if !state.dirty.swap(false, Ordering::SeqCst) {
+            break;
+        }
+        let mut fresh = RoleStore::default();
+        // The scan must not outlive a shutdown: abort it at its next await
+        // and keep the state dirty, so the live store stays fail-closed.
+        let rebuilt = tokio::select! {
+            rebuilt = fresh.rebuild(&db, &relay_pubkey) => rebuilt,
+            _ = drain.changed() => {
+                state.dirty.store(true, Ordering::SeqCst);
+                log::warn!(
+                    "role state rebuild aborted by shutdown; keeping the live role store \
+                     empty (fail-closed) so the next startup rebuilds from the surviving \
+                     events"
+                );
+                break;
+            }
+        };
+        if !rebuilt {
+            // Keep the fail-closed empty store and leave the state dirty:
+            // the next role-state removal schedules another attempt, and a
+            // restart rebuilds from the surviving events.
+            state.dirty.store(true, Ordering::SeqCst);
+            log::error!(
+                "role state rebuild failed; keeping the live role store empty (fail-closed) \
+                 and retrying on the next role-state removal"
+            );
+            state.running.store(false, Ordering::SeqCst);
+            return;
+        }
+        if state.dirty.load(Ordering::SeqCst) {
+            // A role-state removal committed while the scan ran: the fresh
+            // store may predate it. Keep the fail-closed live store and
+            // rebuild again.
+            continue;
+        }
+        *roles.write().await = fresh;
+        if state.dirty.load(Ordering::SeqCst) {
+            // A removal landed between the pre-swap check and the swap: the
+            // fresh store may predate it and the swap may have reinstated
+            // the removed grant. Put the fail-closed empty store back and
+            // rebuild again.
+            *roles.write().await = RoleStore::default();
+            continue;
+        }
+        // Persist the fresh store under the mutation-serializing lock. A
+        // mutation that lands in the meantime is refused persistence (the
+        // state is not established yet) and a removal clears the store
+        // again; the loop then rebuilds with the surviving state.
+        let _persist = persist_lock.lock().await;
+        if !persist_fresh_roles(&db, &roles).await {
+            log::error!(
+                "could not persist the rebuilt role state; the stored snapshot keeps its \
+                 older stamp so the next startup rebuilds from the surviving events"
+            );
+        }
+    }
+    state.running.store(false, Ordering::SeqCst);
+    // A removal that arrived after the loop's last dirty check (while
+    // `running` was still set) saw a running worker and did not spawn one:
+    // re-check and reschedule. A signaled drain keeps the state dirty
+    // (fail-closed) instead so the next startup rebuilds.
+    if state.dirty.load(Ordering::SeqCst) && !*drain.borrow() {
+        schedule_roles_rebuild(db, roles, relay_pubkey, persist_lock, state, drain);
+    }
+}
+
+/// Saves the live role store with the database's current generation stamp.
+/// The rebuild worker calls this after it swapped a fresh store and holds
+/// the single-flight claim: the worker re-checks the dirty flag around the
+/// swap, so the store is not stale here.
+async fn persist_fresh_roles(db: &DbClient, roles: &RwLock<RoleStore>) -> bool {
+    let Some(stamp) = db.state_stamp().await else {
+        log::error!(
+            "cannot read the state generation; keeping the persisted NIP-43 role \
+             snapshot so the next startup rebuilds from the surviving events"
+        );
+        return false;
+    };
+    let mut snapshot = roles.read().await.snapshot();
+    snapshot.stamp = stamp;
+    db.save_roles(snapshot).await
 }
 
 /// Marks the group state stale and schedules the coalesced background
@@ -852,11 +1021,12 @@ impl Relay {
             ))),
             groups_rebuild: std::sync::Arc::new(GroupsRebuild::default()),
             roles: Arc::new(RwLock::new(RoleStore::default())),
+            roles_rebuild: std::sync::Arc::new(RolesRebuild::default()),
             api_limit: ApiLimiter::new(api_max_concurrent),
             publish_rate: std::sync::Mutex::new(HashMap::new()),
             publish_rate_pruned_at: std::sync::atomic::AtomicU64::new(0),
             persist_access_lock: tokio::sync::Mutex::new(()),
-            persist_roles_lock: tokio::sync::Mutex::new(()),
+            persist_roles_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             persist_blossom_allow_lock: tokio::sync::Mutex::new(()),
             ip_blocks_tx: tokio::sync::watch::channel(0).0,
             config_version: AtomicU64::new(0),
@@ -1234,7 +1404,12 @@ impl Relay {
         authed: &[String],
         known_prefixes: Option<&std::collections::HashSet<Vec<u8>>>,
     ) -> PutOutcome {
-        self.accept_event_verified(event, authed, known_prefixes, None)
+        let known = known_prefixes.map(|known| crate::relay::validate::KnownPrevious {
+            known,
+            // The single-event path never caps its per-reference lookups.
+            capped: false,
+        });
+        self.accept_event_verified(event, authed, known.as_ref(), None)
             .await
     }
 
@@ -1246,7 +1421,7 @@ impl Relay {
         &self,
         event: Event,
         authed: &[String],
-        known_prefixes: Option<&std::collections::HashSet<Vec<u8>>>,
+        known_prefixes: Option<&crate::relay::validate::KnownPrevious<'_>>,
         verified: Option<bool>,
     ) -> PutOutcome {
         let now = unix_now();
@@ -1407,17 +1582,25 @@ impl Relay {
         // the mixed path: without them the precheck issues one database
         // round trip per reference (unbounded amplification) and rejects
         // sibling references it cannot resolve yet.
-        let known = self.batch_known_prefixes(&events).await;
+        let (known, previous_capped) = self.batch_known_prefixes(&events).await;
+        let known = crate::relay::validate::KnownPrevious {
+            known: &known,
+            capped: previous_capped,
+        };
         self.accept_batch_non_group(events, authed, Some(&known), None)
             .await
     }
 
     /// The batch's pre-resolved `previous` tag references plus every
-    /// sibling event id prefix, collected in one database round trip. The
-    /// precheck must not issue one lookup per reference (a single event can
-    /// carry thousands) and must accept references to sibling events that
-    /// are not committed yet.
-    async fn batch_known_prefixes(&self, events: &[Event]) -> std::collections::HashSet<Vec<u8>> {
+    /// sibling event id prefix, collected in one database round trip, and
+    /// whether the reference collection hit its cap. The precheck must not
+    /// issue one lookup per reference (a single event can carry thousands)
+    /// and must accept references to sibling events that are not committed
+    /// yet.
+    async fn batch_known_prefixes(
+        &self,
+        events: &[Event],
+    ) -> (std::collections::HashSet<Vec<u8>>, bool) {
         // Dedup with a set so that a batch full of distinct `previous` tags
         // (up to max_tags per event) cannot turn the dedup itself quadratic.
         // The collection is additionally capped: without a bound a single
@@ -1425,7 +1608,9 @@ impl Relay {
         // megabytes of prefixes and force millions of LMDB range probes
         // inside one read transaction, stalling the reader. References past
         // the cap are treated as unknown, so the affected events fail closed
-        // instead of stalling the relay.
+        // instead of stalling the relay; the caller is told the prefetch was
+        // capped so their rejections are reported as retryable instead of
+        // blaming the reference.
         const MAX_PREVIOUS_PREFIXES: usize = 1024;
         let mut prefixes: Vec<Vec<u8>> = Vec::new();
         let mut seen_prefixes: std::collections::HashSet<Vec<u8>> =
@@ -1471,7 +1656,7 @@ impl Relay {
                 }
             }
         }
-        known
+        (known, previous_capped)
     }
 
     /// Whether accepting `event` has post-commit effects that later events
@@ -1494,7 +1679,11 @@ impl Relay {
     /// verification of the whole batch runs once, in parallel, and both
     /// paths reuse the verdicts.
     async fn accept_batch_mixed(&self, events: Vec<Event>, authed: &[String]) -> PendingBatch {
-        let known = self.batch_known_prefixes(&events).await;
+        let (known_set, previous_capped) = self.batch_known_prefixes(&events).await;
+        let known = crate::relay::validate::KnownPrevious {
+            known: &known_set,
+            capped: previous_capped,
+        };
         // One parallel pass for the whole batch: the sequential singletons
         // below must not re-verify each signature inline.
         let verified = crate::relay::validate::verify_signatures_parallel(&events, self.secp());
@@ -1559,7 +1748,7 @@ impl Relay {
         &self,
         events: Vec<Event>,
         authed: &[String],
-        known_prefixes: Option<&std::collections::HashSet<Vec<u8>>>,
+        known_prefixes: Option<&crate::relay::validate::KnownPrevious<'_>>,
         verified: Option<&[bool]>,
     ) -> PendingBatch {
         let now = unix_now();
@@ -1824,10 +2013,52 @@ impl Relay {
     /// [`Self::persist_groups`]). The lock keeps a stale snapshot from
     /// overwriting a newer one: two concurrent mutations could otherwise
     /// capture snapshots in one order and queue their writes in the other.
-    /// Returns whether the write committed.
+    ///
+    /// The snapshot carries the database's state generation
+    /// (`DbClient::state_stamp`) so a later restore can reject a snapshot
+    /// that predates a NIP-09 deletion of a role-state event. The stamp is
+    /// read *before* the capture: a removal committed in between advances
+    /// the generation past the one the captured state can claim, so the
+    /// startup comparison rejects it. An unavailable stamp read leaves the
+    /// pre-existing snapshot untouched (its currency cannot be
+    /// established): the next startup then rejects that older stamp and
+    /// rebuilds from the surviving events.
+    ///
+    /// While a role rebuild is dirty/running the store is known stale (or
+    /// owned by the worker): the write is refused so the stale store cannot
+    /// be stamped with the already-advanced generation (which would make the
+    /// next startup accept it). Returns whether the write committed.
     pub(crate) async fn persist_roles(&self) -> bool {
         let _guard = self.persist_roles_lock.lock().await;
-        let snapshot = self.roles.read().await.snapshot();
+        // A stale store must never overwrite the stored snapshot: while a
+        // removal is pending a rebuild (`dirty`) or a worker owns the state
+        // (`running`), the live store is the fail-closed empty store or a
+        // store that may predate the removal, and stamping it with the
+        // already-advanced generation would make the next startup accept it.
+        // The stored snapshot keeps its older stamp, so startup rejects it
+        // and rebuilds from the surviving events.
+        let stale = || {
+            self.roles_rebuild.dirty.load(Ordering::SeqCst)
+                || self.roles_rebuild.running.load(Ordering::SeqCst)
+        };
+        if stale() {
+            return false;
+        }
+        let Some(stamp) = self.db.state_stamp().await else {
+            log::error!(
+                "cannot read the state generation; keeping the persisted NIP-43 role \
+                 snapshot so the next startup rebuilds from the surviving events"
+            );
+            return false;
+        };
+        let mut snapshot = self.roles.read().await.snapshot();
+        // Re-check after the capture: a removal that landed while the store
+        // was being captured must not have its pre-removal grants stamped
+        // with the removal's generation.
+        if stale() {
+            return false;
+        }
+        snapshot.stamp = stamp;
         self.db.save_roles(snapshot).await
     }
 
@@ -1894,15 +2125,45 @@ impl Relay {
     /// snapshot is dropped immediately: it predates the removals, so a
     /// crash before the rebuild completes must not restore it. The accept
     /// path never blocks on the rebuild scan (see `groups_rebuild_worker`).
+    ///
+    /// The NIP-43 role state is derived from the same event kinds (the role
+    /// kinds are part of `is_group_state_kind`), so the live role grants are
+    /// revoked and rebuilt too (see [`Self::mark_roles_stale`]).
     pub(crate) async fn mark_group_state_stale(&self) {
         self.groups_rebuild.dirty.store(true, Ordering::SeqCst);
         self.groups_rebuild.pending.store(true, Ordering::SeqCst);
+        // Revoke the role grants before the (possibly slow) group snapshot
+        // clear: a role definition or membership list may be what was
+        // removed, and the live store must stop authorizing its grants now.
+        self.mark_roles_stale().await;
         self.persist_groups().await;
         schedule_groups_rebuild(
             self.db.clone(),
             Arc::clone(&self.groups),
             Arc::clone(&self.config),
             Arc::clone(&self.groups_rebuild),
+            self.subscribe_drain(),
+        );
+    }
+
+    /// Marks the live NIP-43 role store stale and schedules the coalesced
+    /// background rebuild. The store is replaced with an empty one *under
+    /// the write lock in this path* (revocation): the removed event may have
+    /// defined a role or granted a membership, and the NIP-43 JOIN path and
+    /// the RPC check the live store, so keeping the old grants until the
+    /// scan completes would keep authorizing them. The persisted snapshot
+    /// keeps its older generation stamp, so the next startup rejects it and
+    /// rebuilds from the surviving events; `persist_roles` refuses to
+    /// overwrite it until the rebuild completes.
+    async fn mark_roles_stale(&self) {
+        self.roles_rebuild.dirty.store(true, Ordering::SeqCst);
+        *self.roles.write().await = RoleStore::default();
+        schedule_roles_rebuild(
+            self.db.clone(),
+            Arc::clone(&self.roles),
+            self.relay_pubkey().unwrap_or_default(),
+            Arc::clone(&self.persist_roles_lock),
+            Arc::clone(&self.roles_rebuild),
             self.subscribe_drain(),
         );
     }
@@ -2693,6 +2954,317 @@ mod tests {
 
         relay.db.shutdown();
         keyless.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn persist_roles_stamps_the_snapshot_and_fails_closed_without_a_stamp() {
+        // The role snapshot carries the database generation (`state_stamp`)
+        // so a later restore can reject it. When the generation cannot be
+        // read, the persist must fail without overwriting the pre-existing
+        // snapshot: that snapshot keeps its older stamp, so the startup
+        // comparison rejects it and the replay migration rebuilds.
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir()
+            .join("nostrfy-role-stamp-test")
+            .join(format!("{:x}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        let mut cfg = crate::config::Config::default();
+        cfg.database.path = path;
+        cfg.database.map_size = 16 * 1024 * 1024;
+        cfg.database.max_map_size = 64 * 1024 * 1024;
+        let database = cfg.database.clone();
+        let db = crate::db::DbClient::open(
+            &database,
+            true,
+            std::sync::Arc::new(Default::default()),
+            0,
+            128,
+            4096,
+            262144,
+        )
+        .unwrap();
+        let config = std::sync::Arc::new(tokio::sync::RwLock::new(cfg));
+        let relay = Relay::new(
+            config,
+            db,
+            crate::stats::Stats::new(),
+            "",
+            crate::relay::LiveBusConfig {
+                buffer: 1024,
+                batch_interval_ms: 10,
+                batch_size: 64,
+            },
+        )
+        .await;
+
+        relay.roles.write().await.create("mod", "Mod", "", "", None);
+        assert!(relay.persist_roles().await, "the stamp is readable");
+        let saved = relay.db.load_roles().await.expect("snapshot");
+        assert_eq!(saved.stamp, relay.db.state_stamp().await.expect("stamp"));
+        assert!(saved.roles.contains_key("mod"));
+
+        // The database is gone: the generation cannot be read, so the
+        // fresh in-memory state must not overwrite the saved snapshot.
+        relay.db.shutdown();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        relay
+            .roles
+            .write()
+            .await
+            .create("ghost", "Ghost", "", "", None);
+        assert!(
+            !relay.persist_roles().await,
+            "an unreadable stamp must fail the persist"
+        );
+
+        // Reopen the same database: the pre-existing snapshot is intact
+        // (the ghost role was never written) and keeps its older stamp.
+        let db = crate::db::DbClient::open(
+            &database,
+            true,
+            std::sync::Arc::new(Default::default()),
+            0,
+            128,
+            4096,
+            262144,
+        )
+        .unwrap();
+        let persisted = db.load_roles().await.expect("snapshot");
+        assert!(!persisted.roles.contains_key("ghost"));
+        assert_eq!(persisted.stamp, saved.stamp);
+        db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn nip09_deletion_of_a_role_definition_revokes_and_rebuilds_survivors() {
+        // NIP-09: deleting a relay-signed role-state event must revoke the
+        // grants derived from it immediately (the marking path clears the
+        // live store fail-closed) and the background rebuild must restore
+        // only the grants whose role definition survived.
+        let key = "01".repeat(32);
+        let relay = build_role_relay(Some(&key)).await;
+        // NIP-09 must be enabled for the deletion side effect to run.
+        relay.config.write().await.relay.enabled_nips = vec![9, 43];
+
+        let a = "aa".repeat(32);
+        let b = "bb".repeat(32);
+        assert!(relay.create_role("r1", "R1", "", "", None).await);
+        assert!(relay.create_role("r2", "R2", "", "", None).await);
+        assert!(relay.assign_role(&a, "r1").await);
+        assert!(relay.assign_role(&b, "r2").await);
+        assert!(relay.roles.read().await.is_member_of(&a));
+        assert!(relay.roles.read().await.is_member_of(&b));
+
+        // The r1 definition's stored event id (the relay published it on
+        // create) is the deletion target.
+        let filter: crate::filter::Filter =
+            serde_json::from_value(serde_json::json!({"kinds": [33534]})).unwrap();
+        let (stored, _) = relay
+            .db
+            .query(vec![filter], 10, crate::util::unix_now())
+            .await;
+        let role_event = stored
+            .iter()
+            .find(|event| {
+                event
+                    .tags
+                    .iter()
+                    .any(|tag| tag.len() >= 2 && tag[0] == "d" && tag[1] == "r1")
+            })
+            .expect("the r1 definition must be stored")
+            .clone();
+
+        // NIP-09: only the author may delete, so the relay signs with its own
+        // key.
+        let secp = secp256k1::Secp256k1::new();
+        let relay_key = secp256k1::Keypair::from_seckey_slice(&secp, &[1u8; 32]).unwrap();
+        let mut deletion = crate::event::Event {
+            id: String::new(),
+            pubkey: secp256k1::XOnlyPublicKey::from_keypair(&relay_key)
+                .0
+                .to_string(),
+            created_at: crate::util::unix_now(),
+            kind: crate::nips::nip09::DELETION_KIND,
+            tags: vec![vec!["e".into(), role_event.id.clone()]],
+            content: String::new(),
+            sig: String::new(),
+        };
+        deletion.id = crate::nips::nip01::compute_id(&deletion);
+        deletion.sig = secp
+            .sign_schnorr_no_aux_rand(&deletion.id_bytes().unwrap(), &relay_key)
+            .to_string();
+        assert!(matches!(
+            relay.accept_event(deletion, &[], None).await,
+            crate::db::PutOutcome::Stored
+        ));
+
+        // The deleted role's grant is revoked before the rebuild completes
+        // (the live store was cleared fail-closed), and the rebuild never
+        // resurrects it: only r2 (whose definition survived) authorizes.
+        assert!(
+            !relay.roles.read().await.is_member_of(&a),
+            "the deleted role's grant must be revoked"
+        );
+        assert!(
+            wait_for_roles_rebuild_worker(&relay).await,
+            "the role rebuild must finish"
+        );
+        let roles = relay.roles.read().await;
+        assert!(!roles.roles.contains_key("r1"));
+        assert!(roles.roles.contains_key("r2"));
+        assert!(
+            !roles.is_member_of(&a),
+            "the deleted role's grant must not resurface"
+        );
+        assert!(
+            roles.is_member_of(&b),
+            "the surviving role's grant must be restored"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn persist_roles_during_staleness_keeps_the_stored_snapshot() {
+        // A persist while the role state is stale must not overwrite the
+        // stored snapshot with the fail-closed empty store (or a store that
+        // predates the removal): the stored snapshot keeps its older
+        // generation stamp, so the next startup rejects it and rebuilds
+        // from the surviving events. The drain keeps the rebuild from
+        // running, so the staleness is the only reason the write is
+        // refused (the database is reachable).
+        let key = "01".repeat(32);
+        let relay = build_role_relay(Some(&key)).await;
+        assert!(relay.create_role("mod", "Mod", "", "", None).await);
+        let saved = relay.db.load_roles().await.expect("snapshot");
+        assert!(saved.roles.contains_key("mod"));
+
+        relay.signal_drain();
+        relay.mark_roles_stale().await;
+        assert!(
+            !relay.persist_roles().await,
+            "a persist while the role state is stale must be refused"
+        );
+        // A mutation accepted while stale must not sneak through the gate
+        // either.
+        relay
+            .roles
+            .write()
+            .await
+            .create("ghost", "Ghost", "", "", None);
+        assert!(
+            !relay.persist_roles().await,
+            "a post-marking mutation must not be saved while stale"
+        );
+
+        let persisted = relay.db.load_roles().await.expect("snapshot");
+        assert!(
+            persisted.roles.contains_key("mod"),
+            "the stored snapshot must be untouched"
+        );
+        assert!(
+            !persisted.roles.contains_key("ghost"),
+            "the stale store must not overwrite the snapshot"
+        );
+        assert_eq!(
+            persisted.stamp, saved.stamp,
+            "the refused persist must not re-stamp the snapshot"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn failed_role_rebuild_keeps_the_store_empty_and_dirty() {
+        // A failed rebuild must keep the live store fail-closed (empty) and
+        // the dirty flag set, so the next removal retries and the next
+        // startup rebuilds from the surviving events.
+        let key = "01".repeat(32);
+        let relay = build_role_relay(Some(&key)).await;
+        assert!(relay.create_role("mod", "Mod", "", "", None).await);
+        relay.db.shutdown();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        relay.mark_roles_stale().await;
+        assert!(
+            relay.roles.read().await.roles.is_empty(),
+            "the marking path must revoke the live grants immediately"
+        );
+        assert!(
+            wait_for_roles_rebuild_worker(&relay).await,
+            "the failed worker must finish"
+        );
+        assert!(
+            relay
+                .roles_rebuild
+                .dirty
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "a failed rebuild must preserve the dirty flag"
+        );
+        assert!(
+            relay.roles.read().await.roles.is_empty(),
+            "a failed rebuild must leave the fail-closed empty store"
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_prevents_new_role_rebuilds() {
+        // Shutdown must not start a role rebuild scan whose result cannot be
+        // persisted: the live store stays fail-closed (empty) and dirty, and
+        // the next startup rebuilds from the surviving events.
+        let key = "01".repeat(32);
+        let relay = build_role_relay(Some(&key)).await;
+        assert!(relay.create_role("mod", "Mod", "", "", None).await);
+        relay.signal_drain();
+        relay.mark_roles_stale().await;
+        assert!(
+            !relay
+                .roles_rebuild
+                .running
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "a drained relay must not spawn a role rebuild worker"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            relay.roles.read().await.roles.is_empty(),
+            "a drained relay must not run a rebuild scan"
+        );
+        assert!(
+            relay
+                .roles_rebuild
+                .dirty
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "the unchanged state must stay dirty so the next startup rebuilds"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn drain_stops_the_role_rebuild_worker() {
+        // A worker that is already scheduled must observe the drain before
+        // its first scan and exit: the live store stays fail-closed. The
+        // signal is sent before the spawned worker gets its first poll (the
+        // test runtime is single-threaded and `mark_roles_stale` yields no
+        // pending await), so the drain is visible at the loop head.
+        let key = "01".repeat(32);
+        let relay = build_role_relay(Some(&key)).await;
+        assert!(relay.create_role("mod", "Mod", "", "", None).await);
+        relay.mark_roles_stale().await;
+        relay.signal_drain();
+        assert!(
+            wait_for_roles_rebuild_worker(&relay).await,
+            "the draining worker must finish"
+        );
+        assert!(
+            relay.roles.read().await.roles.is_empty(),
+            "a draining worker must not restore the live store"
+        );
+        assert!(
+            relay
+                .roles_rebuild
+                .dirty
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "the aborted state must stay dirty so the next startup rebuilds"
+        );
+        relay.db.shutdown();
     }
 
     #[tokio::test]
@@ -3567,6 +4139,76 @@ mod tests {
     }
 
     #[test]
+    fn capped_previous_prefetch_reports_a_retryable_rejection() {
+        // A batch whose `previous` references exceed the prefetch cap: the
+        // references past the cap are absent from `known` through no fault
+        // of the client, so the precheck must report the miss as a
+        // retryable rate limit instead of claiming the reference is
+        // unknown. The event is still rejected and no per-reference lookup
+        // is added.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            use crate::db::PutOutcome;
+
+            let relay = build_relay().await;
+            let now = crate::util::unix_now();
+            let secp = secp256k1::Secp256k1::new();
+            let keypair = secp256k1::Keypair::from_seckey_slice(&secp, &[7u8; 32]).unwrap();
+            let signed = |kind: u64, content: &str, tags: Vec<Vec<String>>| {
+                let mut e = crate::event::Event {
+                    id: String::new(),
+                    pubkey: secp256k1::XOnlyPublicKey::from_keypair(&keypair)
+                        .0
+                        .to_string(),
+                    created_at: now,
+                    kind,
+                    tags,
+                    content: content.into(),
+                    sig: String::new(),
+                };
+                e.id = crate::nips::nip01::compute_id(&e);
+                let id = e.id_bytes().unwrap();
+                e.sig = secp.sign_schnorr_no_aux_rand(&id, &keypair).to_string();
+                e
+            };
+            let h = |tags: Vec<Vec<String>>| {
+                let mut tags = tags;
+                tags.insert(0, vec!["h".into(), "g-capped".into()]);
+                tags
+            };
+            let mut results = relay
+                .accept_events_batch(vec![signed(9007, "", h(vec![]))], &[])
+                .await;
+            assert!(matches!(results.remove(0).1, PutOutcome::Stored));
+
+            // 1025 distinct, uncommitted references: the prefetch stops at
+            // 1024 and reports the cap.
+            let mut previous = vec!["previous".to_string()];
+            previous.extend((0..1025).map(|i| format!("{i:08x}")));
+            let event = signed(1, "capped", h(vec![previous]));
+            let (_, capped) = relay
+                .batch_known_prefixes(std::slice::from_ref(&event))
+                .await;
+            assert!(capped, "the prefetch must report the cap");
+            let results = relay.accept_events_batch(vec![event], &[]).await;
+            match &results[0].1 {
+                PutOutcome::Invalid(m) => {
+                    assert!(
+                        m.contains("rate-limited") && m.contains("retry"),
+                        "a capped-prefetch miss must be retryable: {m}"
+                    );
+                    assert!(
+                        !m.contains("unknown previous"),
+                        "a capped-prefetch miss must not blame the reference: {m}"
+                    );
+                }
+                other => panic!("the capped event must be rejected: {other:?}"),
+            }
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
     fn mixed_batch_applies_state_mutations_between_runs_in_order() {
         // A batch with `h`-tagged posts around group-state mutations: each
         // post must be prechecked against the state *at its position* —
@@ -4060,11 +4702,27 @@ mod tests {
         e
     }
 
-    /// Waits until no rebuild worker is running (successful or failed).
+    /// Waits until no group rebuild worker is running (successful or
+    /// failed).
     async fn wait_for_rebuild_worker(relay: &Relay) -> bool {
         for _ in 0..600 {
             if !relay
                 .groups_rebuild
+                .running
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    /// Waits until no role rebuild worker is running (successful or failed).
+    async fn wait_for_roles_rebuild_worker(relay: &Relay) -> bool {
+        for _ in 0..600 {
+            if !relay
+                .roles_rebuild
                 .running
                 .load(std::sync::atomic::Ordering::SeqCst)
             {

@@ -544,30 +544,57 @@ pub async fn run_server(config_path: PathBuf, config: Config, db: DbClient) -> R
     }
 
     // Same lifecycle for the NIP-43 role store: snapshot first, replay
-    // migration only when nothing was ever persisted. The role snapshot has
-    // no generation stamp (unlike the group snapshot), so this restore stays
-    // unconditional: there is no database-side value to compare it against.
+    // migration only when nothing usable was ever persisted. The snapshot's
+    // stamp is compared against the database's state generation
+    // (`DbClient::state_stamp`), which a NIP-09 deletion of a role-state
+    // event advances: a snapshot from before such a removal must not be
+    // restored (it would resurrect a deleted grant), and an unreadable
+    // generation fails closed the same way. Both cases fall through to the
+    // replay migration below, which rebuilds from the surviving events.
     if relay.config.read().await.nip_enabled(43) {
-        match relay.db.load_roles().await {
-            Some(snap) => {
-                relay.roles.write().await.restore(snap);
-                info!("NIP-43 role state restored from the database snapshot");
-            }
-            None => {
-                if !relay
-                    .roles
-                    .write()
-                    .await
-                    .rebuild(&relay.db, &relay.relay_pubkey().unwrap_or_default())
-                    .await
-                {
-                    return Err(anyhow::anyhow!(
-                        "NIP-43 role state rebuild failed: refusing to start with an \
-                         incomplete role store"
-                    ));
+        let needs_rebuild = match relay.db.load_roles().await {
+            Some(snap) => match relay.db.state_stamp().await {
+                Some(stamp) => {
+                    if relay.roles.write().await.restore_checked(snap, stamp) {
+                        info!("NIP-43 role state restored from the database snapshot");
+                        false
+                    } else {
+                        error!(
+                            "the persisted NIP-43 role snapshot predates the database's state \
+                             generation {stamp}; refusing to restore it and rebuilding from \
+                             the surviving events instead"
+                        );
+                        true
+                    }
                 }
-                relay.persist_roles().await;
+                None => {
+                    // The generation is unknown, so the snapshot's currency
+                    // cannot be established: restoring it could resurrect a
+                    // deleted grant.
+                    error!(
+                        "cannot read the database's state generation; refusing to restore \
+                         the persisted NIP-43 role snapshot and rebuilding from the \
+                         surviving events"
+                    );
+                    true
+                }
+            },
+            None => true,
+        };
+        if needs_rebuild {
+            if !relay
+                .roles
+                .write()
+                .await
+                .rebuild(&relay.db, &relay.relay_pubkey().unwrap_or_default())
+                .await
+            {
+                return Err(anyhow::anyhow!(
+                    "NIP-43 role state rebuild failed: refusing to start with an \
+                     incomplete role store"
+                ));
             }
+            relay.persist_roles().await;
         }
     }
 

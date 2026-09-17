@@ -164,6 +164,7 @@ impl Store {
         // transactions so a huge request never pins one commit.
         for chunk in targets.chunks(REMOVAL_CHUNK) {
             let mut wtxn = self.env.write_txn()?;
+            let mut chunk_state_removed = false;
             for target in chunk {
                 let Ok(id) = hex::decode(target) else {
                     continue;
@@ -218,8 +219,17 @@ impl Store {
                     continue;
                 }
                 self.deleted.put(&mut wtxn, &id, b"")?;
+                // The derived NIP-29/NIP-43 state is built from these kinds
+                // (see `is_group_state_kind`): the stamp must advance in the
+                // same removal transaction, or a crash after this commit
+                // could restore a snapshot that still authorizes the
+                // deleted grant.
+                chunk_state_removed |= is_group_state_kind(event.kind);
                 self.remove_event(&mut wtxn, &id)?;
                 removed += 1;
+            }
+            if chunk_state_removed {
+                self.bump_state_stamp(&mut wtxn)?;
             }
             wtxn.commit()?;
         }
@@ -289,6 +299,7 @@ impl Store {
                     break;
                 }
                 last_key = Some(entries.last().unwrap().0.clone());
+                let mut chunk_state_removed = false;
                 for (key, value) in entries {
                     // key = kind(8) + pubkey(32) + dlen(4) + d
                     if key.len() < CREATED_LEN + ID_LEN + 4 {
@@ -332,8 +343,17 @@ impl Store {
                         delegated_any = true;
                     }
                     self.deleted.put(&mut wtxn, id, b"")?;
+                    // Every slot under this range is keyed by `address.kind`
+                    // (the walk only filters pubkey/d), so its kind decides
+                    // whether the derived state must be invalidated. Bumped
+                    // in the same transaction as the removal (see the
+                    // `e`-tag path).
+                    chunk_state_removed |= is_group_state_kind(address.kind);
                     self.remove_event(&mut wtxn, id)?;
                     removed += 1;
+                }
+                if chunk_state_removed {
+                    self.bump_state_stamp(&mut wtxn)?;
                 }
                 wtxn.commit()?;
             }

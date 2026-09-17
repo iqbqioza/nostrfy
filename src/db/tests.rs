@@ -3928,11 +3928,7 @@ fn api_count_fails_fast_under_queue_pressure_and_after_shutdown() {
             let Some((events, _)) = f.await.unwrap() else {
                 continue;
             };
-            assert_eq!(
-                events.len() % 8,
-                0,
-                "a served aggregation returns all matches"
-            );
+            assert_eq!(events.len(), 8, "a served aggregation returns all matches");
         }
         // The counter recovers: a later call is served normally.
         let (events, _) = db
@@ -5439,6 +5435,103 @@ fn state_stamp_advances_with_group_state_removals() {
     .unwrap();
     rt.block_on(async {
         assert_eq!(db.state_stamp().await, Some(3));
+    });
+    db.shutdown();
+}
+
+#[test]
+fn nip09_deleting_a_group_state_event_advances_the_stamp() {
+    // A NIP-09 deletion removes NIP-29/NIP-43 state events without going
+    // through vanish/expiry/purge: the derived-state stamp must advance in
+    // the same removal transaction, or a crash after the deletion could
+    // restore a snapshot that still authorizes the deleted grant.
+    let cfg = config();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let now = unix_now();
+    rt.block_on(async {
+        let db = DbClient::open(
+            &cfg,
+            true,
+            Arc::new(Default::default()),
+            0,
+            128,
+            4096,
+            262144,
+        )
+        .unwrap();
+        assert_eq!(db.state_stamp().await, Some(0));
+        let pk = "aa".repeat(32);
+        let authored = |kind: u64, tags: Vec<Vec<String>>, created: u64| {
+            let mut e = event(kind, "x", created, tags);
+            e.pubkey = pk.clone();
+            e.id = nip01::compute_id(&e);
+            e
+        };
+
+        // An ordinary post's deletion is not a derived-state change.
+        let post = authored(1, vec![], now);
+        assert_eq!(db.put(post.clone(), now).await, PutOutcome::Stored);
+        assert_eq!(
+            db.apply_deletion(vec![post.id.clone()], vec![], Some(pk.clone()), now)
+                .await,
+            1
+        );
+        assert_eq!(
+            db.state_stamp().await,
+            Some(0),
+            "an ordinary deletion must not bump the stamp"
+        );
+
+        // A role definition removed by an `e`-tag target advances the
+        // generation (NIP-43 role state is derived from it).
+        let role = authored(
+            33534,
+            vec![vec!["-".into()], vec!["d".into(), "king".into()]],
+            now,
+        );
+        assert_eq!(db.put(role.clone(), now).await, PutOutcome::Stored);
+        assert_eq!(
+            db.apply_deletion(vec![role.id.clone()], vec![], Some(pk.clone()), now)
+                .await,
+            1
+        );
+        assert_eq!(db.state_stamp().await, Some(1));
+
+        // The `a`-tag address walk bumps it too (the address is
+        // addressable, so the deletion goes through the replaceable slot
+        // walk rather than the `e`-tag path).
+        let role = authored(
+            33534,
+            vec![vec!["-".into()], vec!["d".into(), "queen".into()]],
+            now,
+        );
+        assert_eq!(db.put(role.clone(), now).await, PutOutcome::Stored);
+        let address = crate::nips::nip09::Address {
+            kind: 33534,
+            pubkey: pk.clone(),
+            d: "queen".into(),
+        };
+        assert_eq!(
+            db.apply_deletion(vec![], vec![address], Some(pk.clone()), u64::MAX)
+                .await,
+            1
+        );
+        assert_eq!(db.state_stamp().await, Some(2));
+        // The stamp is persistent across a restart.
+        db.shutdown();
+    });
+    let db = DbClient::open(
+        &cfg,
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    rt.block_on(async {
+        assert_eq!(db.state_stamp().await, Some(2));
     });
     db.shutdown();
 }

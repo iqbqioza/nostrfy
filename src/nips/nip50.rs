@@ -272,18 +272,24 @@ mod tests {
         for content in contents {
             let words = tokenize(content);
             assert!(
-                matches_terms(content, &words) || words.is_empty(),
-                "every tokenized word must match: {content:?} -> {words:?}"
-            );
-            if let Some(first) = words.first() {
-                assert!(
-                    matches_terms(content, std::slice::from_ref(first)),
-                    "the first tokenized word must match: {content:?} -> {first:?}"
-                );
-            }
-            assert!(
                 !matches_terms(content, &["definitelynotpresent".to_string()]),
                 "an absent term must not match: {content:?}"
+            );
+            if words.is_empty() {
+                // No indexable words (empty content, punctuation only or
+                // numeric/short words): there is nothing for the tokenized
+                // form to match, so the negative check above is the
+                // assertion that applies.
+                continue;
+            }
+            assert!(
+                matches_terms(content, &words),
+                "every tokenized word must match: {content:?} -> {words:?}"
+            );
+            let first = words.first().expect("non-empty");
+            assert!(
+                matches_terms(content, std::slice::from_ref(first)),
+                "the first tokenized word must match: {content:?} -> {first:?}"
             );
         }
         // Numeric-only and one-byte words are not words (the index excludes
