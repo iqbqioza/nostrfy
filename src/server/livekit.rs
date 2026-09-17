@@ -62,7 +62,7 @@ pub(crate) async fn livekit_token(
     let encoded = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Nostr "))
+        .and_then(crate::nips::nip98::strip_nostr_scheme)
         .map(str::to_string);
     let Some(encoded) = encoded else {
         return (

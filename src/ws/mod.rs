@@ -201,7 +201,11 @@ impl Conn {
         self.send_tagged(msg, None);
     }
 
-    pub(crate) fn send_tagged(&mut self, msg: Message, event_sub: Option<u64>) {
+    /// Queues a message, tagged with the subscription fingerprint of the
+    /// response it belongs to (if any). Returns `false` when the frame was
+    /// dropped at the outgoing cap: a caller that cannot lose the frame
+    /// (live delivery) must react instead of assuming it was queued.
+    pub(crate) fn send_tagged(&mut self, msg: Message, event_sub: Option<u64>) -> bool {
         let size = message_size(&msg);
         // 0 = unlimited (the REQ-response budget documents the same meaning).
         let over_byte_cap = self.out_queue_bytes > 0
@@ -210,7 +214,7 @@ impl Conn {
         if self.outgoing.len() >= OUT_QUEUE_LIMIT || over_byte_cap {
             self.dropped += 1;
             self.relay.stats.bump(&self.relay.stats.buffers_dropped, 1);
-            return;
+            return false;
         }
         self.out_bytes += size;
         self.out_msgs += 1;
@@ -219,6 +223,7 @@ impl Conn {
             message: msg,
             event_sub,
         });
+        true
     }
 
     pub(crate) fn send_json(&mut self, value: Value) {
@@ -239,6 +244,17 @@ impl Conn {
     /// attacker flooding inbound frames on a stalled socket — drops are
     /// counted like any other queue drop.
     pub(crate) fn send_control(&mut self, value: Value) {
+        self.send_control_tagged(value, None);
+    }
+
+    /// Like [`Conn::send_control`], but tags the frame with the
+    /// subscription fingerprint of the response it ends (EOSE/CLOSED). A
+    /// re-REQ or CLOSE under the same id purges the still-queued tagged
+    /// frames, so the client can never receive an EOSE or CLOSED belonging
+    /// to a replaced subscription (including a CLOSED queued by an earlier
+    /// failed REQ). The control-queue caps and overflow accounting are
+    /// unchanged.
+    pub(crate) fn send_control_tagged(&mut self, value: Value, event_sub: Option<u64>) {
         if self.outgoing.len() >= OUT_QUEUE_LIMIT * 2 {
             self.dropped += 1;
             self.control_overflowed = true;
@@ -264,7 +280,7 @@ impl Conn {
             self.out_bytes_total += size as u64;
             self.outgoing.push_back(OutFrame {
                 message: Message::Text(text.into()),
-                event_sub: None,
+                event_sub,
             });
         }
     }
@@ -286,9 +302,14 @@ impl Conn {
 
     /// NIP-01 CLOSED: a REQ was rejected or ended, with a machine-readable
     /// reason. Completion-critical: a dropped CLOSED would leave the
-    /// client waiting on a subscription that will never deliver.
+    /// client waiting on a subscription that will never deliver. Tagged
+    /// with the subscription fingerprint so a re-REQ (or CLOSE) under the
+    /// same id purges it before the client sees it.
     pub(crate) fn send_closed(&mut self, sub_id: &str, reason: &str) {
-        self.send_control(json!(["CLOSED", sub_id, reason]));
+        self.send_control_tagged(
+            json!(["CLOSED", sub_id, reason]),
+            Some(sub_fingerprint(sub_id)),
+        );
     }
 
     /// Notifies every active subscription before disconnecting after live
@@ -369,7 +390,9 @@ impl Conn {
     /// Sends the closing EOSE (or the budget CLOSED) of a pending
     /// response. EOSE/CLOSED are tiny, so they take the uncapped path —
     /// the byte cap exists for large payloads, and a dropped EOSE would
-    /// leave the client hanging on a completed subscription.
+    /// leave the client hanging on a completed subscription. The EOSE is
+    /// tagged with the subscription fingerprint so a re-REQ or CLOSE
+    /// purges a still-queued EOSE of the replaced incarnation.
     fn finish_pending_req(&mut self, pending: &PendingReq) {
         let eose = if pending.eose_hint {
             // NIP-67: `"auth"` advertises stored events that match the
@@ -396,7 +419,7 @@ impl Conn {
         } else {
             json!(["EOSE", pending.sub_id])
         };
-        self.send_control(eose);
+        self.send_control_tagged(eose, Some(sub_fingerprint(&pending.sub_id)));
     }
 
     /// Moves the pending REQ responses into the capped outgoing queue in
@@ -491,11 +514,10 @@ impl Conn {
             }
             if budget_exceeded {
                 let sub_id = front.sub_id.clone();
-                self.send_control(json!([
-                    "CLOSED",
-                    sub_id,
-                    "blocked: response too large; narrow the filter or paginate"
-                ]));
+                self.send_closed(
+                    &sub_id,
+                    "blocked: response too large; narrow the filter or paginate",
+                );
                 // The CLOSED ends the subscription: release it exactly
                 // like a client CLOSE (filter bytes, live slot, stats).
                 // REQ namespace only (NIP-77 separate namespace). This
@@ -758,12 +780,17 @@ where
             let msg = msg.message.clone();
             let size = message_size(&msg);
             if sender.feed(msg).await.is_err() {
-                return;
+                // A sink error means the socket is gone: report Stop so the
+                // caller tears the connection down instead of treating the
+                // queue as drained (which would leave the loop spinning on
+                // a dead sink and the connection slot pinned).
+                return false;
             }
             conn.outgoing.pop_front();
             conn.out_bytes = conn.out_bytes.saturating_sub(size);
         }
         let _ = sender.flush().await;
+        true
     };
     let idle = async {
         match idle_sleep {
@@ -772,7 +799,13 @@ where
         }
     };
     let outcome = tokio::select! {
-        _ = drain => DrainOutcome::Drained,
+        drained = drain => {
+            if drained {
+                DrainOutcome::Drained
+            } else {
+                DrainOutcome::Stop
+            }
+        }
         _ = idle => DrainOutcome::Stop,
         changed = ip_blocks_rx.changed() => {
             if changed.is_err() {
@@ -797,6 +830,29 @@ where
     };
     outcome
 }
+
+/// Flushes the queued outgoing frames and closes the sink, bounded by
+/// `grace`. A peer that stopped reading makes `send`/`close` park forever;
+/// without the bound the connection task (and with it the connection slot,
+/// live-index entry and subscription accounting) would never be released.
+/// On expiry the remaining frames are abandoned and the caller still
+/// releases its accounting; otherwise the flushing semantics are unchanged.
+async fn flush_and_close<F>(conn: &mut Conn, sender: &mut F, grace: Duration)
+where
+    F: futures_util::Sink<Message, Error = axum::Error> + Unpin,
+{
+    let teardown = async {
+        while let Some(frame) = conn.outgoing.pop_front() {
+            conn.out_bytes = conn.out_bytes.saturating_sub(message_size(&frame.message));
+            if sender.send(frame.message).await.is_err() {
+                break;
+            }
+        }
+        let _ = sender.close().await;
+    };
+    let _ = tokio::time::timeout(grace, teardown).await;
+}
+
 pub async fn handle_connection(
     mut socket: WebSocket,
     relay: Arc<Relay>,
@@ -875,6 +931,11 @@ pub async fn handle_connection(
     } else {
         None
     };
+    // Bound for the final flush/close and the keep-alive PING send: a peer
+    // that stopped reading must not park the task (and its connection slot,
+    // live-index entry and subscription accounting) forever. It is never
+    // longer than the operator's own idle deadline.
+    let teardown_grace = idle.map_or(Duration::from_secs(2), |d| d.min(Duration::from_secs(5)));
     let mut last_activity = std::time::Instant::now();
     // A single persistent idle deadline (reset in place on every inbound
     // frame): the per-iteration `timeout(remaining)` of the old loop
@@ -901,6 +962,12 @@ pub async fn handle_connection(
     // WebSocket task is detached from the HTTP connection, so the server's
     // HTTP-level drain cannot reach it).
     let mut drain_rx = relay.subscribe_drain();
+    // A `watch` receiver treats the value present at subscription time as
+    // already seen: when the drain was signaled before this connection
+    // subscribed (a connection accepted during shutdown), `changed()` never
+    // fires and the loop would run on instead of flushing. Read the current
+    // value once so the loop takes the teardown path immediately.
+    let drain_signaled = *drain_rx.borrow();
 
     let idle_jitter = Duration::from_millis(conn_id % 2000);
     let idle_sleep: Option<tokio::time::Sleep> =
@@ -973,6 +1040,12 @@ pub async fn handle_connection(
     #[allow(unused_assignments)] // the initial value is overwritten before the first read
     let mut drain_stalled = !conn.outgoing.is_empty();
     'connection: loop {
+        // The relay signaled the drain before this connection subscribed
+        // (see `drain_signaled`): take the same teardown path as the
+        // `drain_rx.changed()` branch so the pending batch is flushed.
+        if drain_signaled {
+            break;
+        }
         // A completion-critical frame was dropped because the control queue
         // hit its last-resort cap: the peer could be waiting on that OK or
         // EOSE forever, so close the socket (a reconnect resynchronizes).
@@ -1195,8 +1268,20 @@ pub async fn handle_connection(
                 // Keep-alive: a healthy client answers with a PONG (an
                 // inbound frame, which resets the idle timeout), so an idle
                 // subscriber stays connected while a dead peer is reaped.
+                // The send is bounded: a peer that stopped reading parks
+                // inside it, and the idle deadline (raced only by the
+                // drain) could not fire here, so a stalled PING closes the
+                // connection instead of pinning it.
                 conn.out_msgs += 1;
-                let _ = sender.send(Message::Ping(vec![].into())).await;
+                if tokio::time::timeout(
+                    teardown_grace,
+                    sender.send(Message::Ping(vec![].into())),
+                )
+                .await
+                .is_err()
+                {
+                    break;
+                }
             }
             _ = flush_wake => {
                 // The outgoing queue holds OKs (or REQ responses) that
@@ -1279,14 +1364,11 @@ pub async fn handle_connection(
     conn.flush_pending_events().await;
 
     // Final flush: deliver any queued messages (e.g. NOTICEs) before
-    // closing the connection.
-    while let Some(frame) = conn.outgoing.pop_front() {
-        conn.out_bytes = conn.out_bytes.saturating_sub(message_size(&frame.message));
-        if sender.send(frame.message).await.is_err() {
-            break;
-        }
-    }
-    let _ = sender.close().await;
+    // closing the connection. Bounded by `teardown_grace`: a peer that
+    // stopped reading must not park the task (and its connection slot and
+    // subscription accounting) forever, so the remaining frames are
+    // abandoned on expiry and the release below still runs.
+    flush_and_close(&mut conn, &mut sender, teardown_grace).await;
 
     // Remove the connection from the live subscription index and the
     // delivery-queue map (the queue sender is dropped with the map entry;
@@ -1666,6 +1748,65 @@ mod tests {
             assert!(
                 !conn.subs.contains_key("sub"),
                 "the over-budget response must release the subscription"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn byte_truncated_response_reports_more_after_a_budget_raise() {
+        // Regression: the scan-time truncation against
+        // `max_req_response_bytes` used to be invisible to the EOSE. A
+        // SIGHUP raising the budget between the truncation and the pump
+        // would then complete the response silently, losing the dropped
+        // events; the EOSE must carry the NIP-67 "more" marker instead.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let now = unix_now();
+            for i in 0..10 {
+                let ev = signed_note(
+                    conn.relay.secp(),
+                    &format!("e{i}-{}", "z".repeat(1_000)),
+                    now - i as u64,
+                    vec![],
+                );
+                conn.relay.db.put(ev, now).await;
+            }
+            conn.req_response_bytes = 5_000;
+            conn.handle_req(&[json!("sub"), json!({"kinds": [1]})])
+                .await;
+            let kept = conn
+                .pending_reqs
+                .front()
+                .expect("pending response")
+                .events
+                .len();
+            assert!(
+                kept < 10,
+                "the response must be truncated to the byte budget, got {kept} events"
+            );
+            // The reload raises the budget before the pump: without the
+            // truncation marker the response would complete as `finish`.
+            conn.req_response_bytes = 1 << 20;
+            conn.pump_pending_reqs();
+            let msgs = outgoing_json(&conn);
+            let eose = msgs
+                .iter()
+                .find(|m| m[0] == "EOSE" && m[1] == "sub")
+                .expect("the response must end in an EOSE");
+            assert_eq!(
+                eose[2],
+                json!(["more"]),
+                "a byte-truncated response must not claim completion"
+            );
+            assert!(
+                !msgs.iter().any(|m| m[0] == "CLOSED" && m[1] == "sub"),
+                "the raised budget means no over-budget CLOSED"
+            );
+            assert!(
+                conn.subs.contains_key("sub"),
+                "the subscription stays open for pagination"
             );
             conn.relay.db.shutdown();
         });
@@ -2831,6 +2972,61 @@ mod tests {
                 other => panic!("live bus did not deliver: {other:?}"),
             }
 
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn expired_ephemeral_events_are_not_delivered_live() {
+        // NIP-40: an expiration tag means the event must not be relayed
+        // after that time, ephemeral kind or not. The ephemeral exemption
+        // only keeps such events out of storage.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let now = unix_now();
+            conn.subs
+                .insert("s".into(), (vec![Filter::default()], 0, "\"s\"".into()));
+
+            let expired = signed_kind_note_seeded(
+                conn.relay.secp(),
+                1,
+                20001,
+                "expired",
+                now - 10,
+                vec![vec!["expiration".into(), (now - 1).to_string()]],
+            );
+            conn.deliver_live(
+                &expired,
+                &serde_json::to_string(&expired).unwrap_or_default(),
+                None,
+            );
+            assert!(
+                !outgoing_json(&conn)
+                    .iter()
+                    .any(|m| m[0] == "EVENT" && m[2]["id"] == expired.id),
+                "an expired ephemeral event must not be delivered live"
+            );
+
+            let alive = signed_kind_note_seeded(
+                conn.relay.secp(),
+                1,
+                20001,
+                "alive",
+                now,
+                vec![vec!["expiration".into(), (now + 3_600).to_string()]],
+            );
+            conn.deliver_live(
+                &alive,
+                &serde_json::to_string(&alive).unwrap_or_default(),
+                None,
+            );
+            assert!(
+                outgoing_json(&conn)
+                    .iter()
+                    .any(|m| m[0] == "EVENT" && m[2]["id"] == alive.id),
+                "a not-yet-expired ephemeral event is still delivered"
+            );
             conn.relay.db.shutdown();
         });
     }
@@ -4578,6 +4774,34 @@ mod tests {
         }
     }
 
+    /// A sink whose writes always fail: models a socket that is already gone.
+    struct FailingSink;
+
+    impl futures_util::Sink<Message> for FailingSink {
+        type Error = axum::Error;
+        fn poll_ready(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn start_send(self: std::pin::Pin<&mut Self>, _item: Message) -> Result<(), Self::Error> {
+            Err(axum::Error::new(std::io::Error::other("sink gone")))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_close(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
     #[test]
     fn blocked_drain_yields_to_the_idle_deadline() {
         // A peer that stops reading must not pin the connection task: the
@@ -4647,6 +4871,66 @@ mod tests {
             .expect("the shutdown signal must end the blocked drain");
             assert!(matches!(outcome, DrainOutcome::Stop));
             assert_eq!(conn.outgoing.len(), 1);
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn drain_reports_a_failing_sink_as_stop() {
+        // A sink error means the socket is gone: the drain must report
+        // Stop so the caller tears the connection down instead of treating
+        // the queue as drained (which would leave the loop spinning on a
+        // dead sink and the connection slot pinned).
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            conn.send(Message::Text("x".into()));
+            let mut sink = FailingSink;
+            let mut idle_sleep = Some(Box::pin(tokio::time::sleep(Duration::from_secs(60))));
+            let (_ip_tx, mut ip_rx) = tokio::sync::watch::channel(0u64);
+            let (_overflow_tx, mut overflow_rx) = tokio::sync::watch::channel(());
+            let (_drain_tx, mut drain_rx) = tokio::sync::watch::channel(false);
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(2),
+                drain_outgoing(
+                    &mut conn,
+                    &mut sink,
+                    &mut idle_sleep,
+                    &mut ip_rx,
+                    &mut overflow_rx,
+                    &mut drain_rx,
+                ),
+            )
+            .await
+            .expect("a failing sink must not park the drain");
+            assert!(matches!(outcome, DrainOutcome::Stop));
+            // The failed frame stays queued (its feed never succeeded).
+            assert_eq!(conn.outgoing.len(), 1);
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn blocked_teardown_completes_on_the_grace_deadline() {
+        // A peer that stopped reading must not pin the connection task
+        // after the loop ends: the final flush/close is bounded by a short
+        // grace, so the task (and its connection slot, live-index entry and
+        // subscription accounting) is released even with a stalled sink.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            conn.send(Message::Text("x".into()));
+            let mut sink = NeverReady;
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                flush_and_close(&mut conn, &mut sink, Duration::from_millis(50)),
+            )
+            .await
+            .expect("the teardown must not park on a stalled sink");
+            // The in-flight frame was popped before the blocked send and
+            // its byte accounting released; the rest is abandoned.
+            assert!(conn.outgoing.is_empty());
+            assert_eq!(conn.out_bytes, 0);
             conn.relay.db.shutdown();
         });
     }
@@ -5062,6 +5346,90 @@ mod tests {
     }
 
     #[test]
+    fn rering_purges_stale_control_frames_for_the_replaced_id() {
+        // Regression: control frames were queued untagged, so a re-REQ
+        // could not purge a CLOSED queued by the previous incarnation (a
+        // failed filters-less REQ) and the client saw its new subscription
+        // closed on the wire.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            conn.handle_req(&[json!("s")]).await;
+            assert!(
+                outgoing_json(&conn)
+                    .iter()
+                    .any(|m| m[0] == "CLOSED" && m[1] == "s"),
+                "the filters-less refusal is queued as a tagged CLOSED"
+            );
+            // The corrected re-REQ must purge the stale CLOSED before
+            // queueing the new response.
+            conn.handle_req(&[json!("s"), json!({"kinds": [1]})]).await;
+            conn.pump_pending_reqs();
+            let msgs = outgoing_json(&conn);
+            assert!(
+                !msgs.iter().any(|m| m[0] == "CLOSED" && m[1] == "s"),
+                "a stale CLOSED must not close the new subscription: {msgs:?}"
+            );
+            assert_eq!(
+                msgs.iter()
+                    .filter(|m| m[0] == "EOSE" && m[1] == "s")
+                    .count(),
+                1,
+                "only the replacement's EOSE is delivered"
+            );
+            assert!(conn.subs.contains_key("s"), "the new subscription is open");
+
+            // CLOSE purges a still-queued EOSE of the id too.
+            conn.outgoing.clear();
+            conn.out_bytes = 0;
+            conn.handle_req(&[json!("s"), json!({"kinds": [1]})]).await;
+            conn.pump_pending_reqs();
+            assert!(
+                outgoing_json(&conn)
+                    .iter()
+                    .any(|m| m[0] == "EOSE" && m[1] == "s"),
+                "the resubscribed response is queued"
+            );
+            conn.handle_close(&[json!("s")]);
+            assert!(
+                !outgoing_json(&conn)
+                    .iter()
+                    .any(|m| m[0] == "EOSE" && m[1] == "s"),
+                "CLOSE must purge the still-queued EOSE of the id"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn purge_adjusts_all_outgoing_counters() {
+        // The removed frames were counted when queued but never reach the
+        // wire: the purge must forget them in every counter, not only
+        // `out_bytes`.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            assert!(conn.send_tagged(
+                Message::Text("[\"EVENT\",\"s\",{}]".into()),
+                Some(sub_fingerprint("s")),
+            ));
+            conn.send_closed("s", "error: stale");
+            conn.send(Message::Text("[\"NOTICE\",\"keep\"]".into()));
+            let (bytes, msgs, total) = (conn.out_bytes, conn.out_msgs, conn.out_bytes_total);
+            assert_eq!(conn.outgoing.len(), 3);
+
+            conn.purge_queued_events_for("s");
+
+            assert_eq!(conn.outgoing.len(), 1, "only the untagged NOTICE remains");
+            let removed_bytes = bytes - conn.out_bytes;
+            assert!(removed_bytes > 0, "the tagged frames carried bytes");
+            assert_eq!(conn.out_msgs, msgs - 2, "both tagged frames are uncounted");
+            assert_eq!(conn.out_bytes_total, total - removed_bytes as u64);
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
     fn pending_live_overflow_marks_connection_for_close() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -5102,6 +5470,48 @@ mod tests {
                             .contains("reconnect and resubscribe")
                 }),
                 "overflow must tell the client to reconnect and resubscribe"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn live_drop_at_the_outgoing_cap_marks_overflow() {
+        // A live event dropped at the outgoing cap (for a subscription
+        // whose stored response already EOSE'd) is unrecoverable —
+        // ephemeral events are not stored anywhere — so the connection
+        // must be closed for resynchronization instead of silently
+        // missing the event.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            conn.subs
+                .insert("s".into(), (vec![Filter::default()], 0, "\"s\"".into()));
+            // One queued frame plus a one-byte cap: the next queued frame
+            // (the live event) is dropped.
+            conn.out_queue_bytes = 1;
+            conn.send(Message::Text("x".into()));
+            assert_eq!(conn.outgoing.len(), 1);
+
+            let event = signed_note(conn.relay.secp(), "live", unix_now(), vec![]);
+            let json = serde_json::to_string(&event).unwrap();
+            conn.deliver_live(&event, &json, None);
+
+            assert!(
+                conn.live_overflowed,
+                "a live drop at the outgoing cap must mark the connection for close"
+            );
+            conn.close_for_live_overflow();
+            assert!(
+                outgoing_json(&conn).iter().any(|message| {
+                    message[0] == "CLOSED"
+                        && message[1] == "s"
+                        && message[2]
+                            .as_str()
+                            .unwrap_or("")
+                            .contains("reconnect and resubscribe")
+                }),
+                "the client must be told to resubscribe"
             );
             conn.relay.db.shutdown();
         });
@@ -5440,6 +5850,60 @@ mod tests {
     }
 
     #[test]
+    fn filters_less_req_and_count_are_closed_when_an_id_is_present() {
+        // NIP-01/NIP-45 refusals: with a subscription id the client gets a
+        // correlated CLOSED carrying an `invalid:` prefix; only when no id
+        // can be echoed is a NOTICE the best reply.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            conn.handle_req(&[json!("sub")]).await;
+            let msgs = outgoing_json(&conn);
+            let closed = msgs
+                .iter()
+                .find(|m| m[0] == "CLOSED" && m[1] == "sub")
+                .expect("a filters-less REQ with an id must be closed");
+            assert!(
+                closed[2].as_str().unwrap_or("").starts_with("invalid:"),
+                "the refusal must carry an invalid: prefix: {closed:?}"
+            );
+            assert!(
+                !msgs.iter().any(|m| m[0] == "NOTICE"),
+                "the id allows a correlated CLOSED instead of a NOTICE"
+            );
+
+            conn.outgoing.clear();
+            conn.out_bytes = 0;
+            conn.handle_req(&[]).await;
+            let msgs = outgoing_json(&conn);
+            assert!(msgs.iter().any(|m| m[0] == "NOTICE"));
+            assert!(!msgs.iter().any(|m| m[0] == "CLOSED"));
+
+            conn.outgoing.clear();
+            conn.out_bytes = 0;
+            conn.handle_count(&[json!("sub")]).await;
+            let msgs = outgoing_json(&conn);
+            let closed = msgs
+                .iter()
+                .find(|m| m[0] == "CLOSED" && m[1] == "sub")
+                .expect("a filters-less COUNT with an id must be closed");
+            assert!(
+                closed[2].as_str().unwrap_or("").starts_with("invalid:"),
+                "the COUNT refusal must carry an invalid: prefix: {closed:?}"
+            );
+            assert!(!msgs.iter().any(|m| m[0] == "NOTICE"));
+
+            conn.outgoing.clear();
+            conn.out_bytes = 0;
+            conn.handle_count(&[]).await;
+            let msgs = outgoing_json(&conn);
+            assert!(msgs.iter().any(|m| m[0] == "NOTICE"));
+            assert!(!msgs.iter().any(|m| m[0] == "CLOSED"));
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
     fn source_ip_blocked_and_change_notification() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -5488,13 +5952,33 @@ mod tests {
                 "the OK must carry a machine-readable reason: {ok:?}"
             );
 
-            // Without an id there is nothing to correlate: NOTICE.
+            // Without an id the OK correlates with the empty id: NIP-01
+            // still requires a response for every EVENT frame.
             conn.outgoing.clear();
             conn.out_bytes = 0;
             conn.handle_text(r#"["EVENT", {"created_at":-1}]"#).await;
             let msgs = outgoing_json(&conn);
-            assert!(msgs.iter().any(|m| m[0] == "NOTICE"));
-            assert!(!msgs.iter().any(|m| m[0] == "OK"));
+            let ok = msgs
+                .iter()
+                .find(|m| m[0] == "OK" && m[1] == "")
+                .expect("a malformed EVENT without an id still gets an OK");
+            assert_eq!(ok[2], false);
+            assert!(
+                ok[3].as_str().unwrap_or("").starts_with("invalid:"),
+                "the OK must carry a machine-readable reason: {ok:?}"
+            );
+            assert!(!msgs.iter().any(|m| m[0] == "NOTICE"));
+
+            // An EVENT frame without an event object likewise gets OK "".
+            conn.outgoing.clear();
+            conn.out_bytes = 0;
+            conn.handle_text(r#"["EVENT"]"#).await;
+            let msgs = outgoing_json(&conn);
+            assert!(
+                msgs.iter()
+                    .any(|m| m[0] == "OK" && m[1] == "" && m[2] == false),
+                "an EVENT without an object must still get an OK"
+            );
 
             // A malformed AUTH with an id likewise gets OK false.
             conn.outgoing.clear();
@@ -5540,6 +6024,75 @@ mod tests {
                 .expect("AUTH must be answered with OK");
             assert_eq!(ok[2], false, "uppercase pubkeys must be rejected");
             assert!(!conn.is_authed(), "no key must be recorded");
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn auth_attempt_cap_still_answers_ok() {
+        // NIP-42: every AUTH must be answered with OK, including the
+        // attempt-cap refusal (a NOTICE leaves the client without a
+        // correlated response).
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            conn.auth_attempts = 16;
+            let id = "ab".repeat(32);
+            conn.handle_auth(&[json!({"id": id})]).await;
+            let msgs = outgoing_json(&conn);
+            let ok = msgs
+                .iter()
+                .find(|m| m[0] == "OK")
+                .expect("the attempt-cap refusal must answer OK");
+            assert_eq!(ok[1], id);
+            assert_eq!(ok[2], false);
+            assert!(
+                ok[3]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("too many AUTH attempts"),
+                "the OK must carry the attempt-cap reason: {ok:?}"
+            );
+            assert!(!msgs.iter().any(|m| m[0] == "NOTICE"));
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn auth_key_cap_rejects_new_keys_without_evicting() {
+        // The distinct-key cap is a DoS guard, not a FIFO eviction: an
+        // eviction would silently invalidate an earlier `OK true`. The new
+        // key is refused with an explicit OK false and the list is kept.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let now = unix_now();
+            conn.authed_pubkeys = (0..64u64).map(|i| format!("{i:064x}")).collect();
+            let auth = signed_auth(conn.relay.secp(), "test-challenge", now);
+            conn.handle_auth(&[serde_json::to_value(&auth).unwrap()])
+                .await;
+            let msgs = outgoing_json(&conn);
+            let ok = msgs
+                .iter()
+                .find(|m| m[0] == "OK" && m[1] == auth.id)
+                .expect("AUTH must be answered with OK");
+            assert_eq!(ok[2], false);
+            assert!(
+                ok[3]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("too many authenticated keys"),
+                "the OK must explain the key cap: {ok:?}"
+            );
+            assert_eq!(conn.authed_pubkeys.len(), 64, "the cap is kept");
+            assert!(
+                conn.authed_pubkeys.contains(&"0".repeat(64)),
+                "the oldest key must not be evicted"
+            );
+            assert!(
+                !conn.authed_pubkeys.contains(&auth.pubkey),
+                "the refused key must not be recorded"
+            );
             conn.relay.db.shutdown();
         });
     }

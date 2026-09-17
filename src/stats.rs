@@ -49,6 +49,12 @@ impl Stats {
 
     pub fn as_json(&self) -> Value {
         json!({
+            // When this snapshot was generated (Unix seconds). `nostrfy
+            // stats` compares it against `daemon.stats_interval_secs` to
+            // reject a stale file instead of printing old counters as live
+            // data; stats files written before the field existed simply
+            // lack it.
+            "written_at": unix_now(),
             "started_at": self.started_at.load(Ordering::Relaxed),
             "uptime_secs": unix_now().saturating_sub(self.started_at.load(Ordering::Relaxed)),
             "connections": {
@@ -200,6 +206,23 @@ impl Stats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn json_snapshot_carries_a_written_at_marker() {
+        // Without the marker the CLI cannot tell a stale file from a live
+        // one and would print hours-old counters as current.
+        let stats = Stats::new();
+        let before = unix_now();
+        let json = stats.as_json();
+        let written_at = json
+            .get("written_at")
+            .and_then(Value::as_u64)
+            .expect("written_at must be present");
+        assert!(
+            written_at >= before && written_at <= unix_now(),
+            "written_at must be the snapshot time (got {written_at})"
+        );
+    }
 
     #[test]
     fn prometheus_output_is_well_formed() {

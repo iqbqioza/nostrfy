@@ -225,20 +225,23 @@ impl super::Conn {
     /// Queues an EVENT message for batched acceptance (generic path).
     pub(crate) async fn queue_event(&mut self, rest: &[Value]) {
         let Some(value) = rest.first() else {
-            self.send_notice("error: EVENT requires an event object");
+            // NIP-01: every received EVENT frame gets an OK, so a
+            // publisher that sent a frame without an event object still
+            // gets a correlated response.
+            self.send_ok("", false, "invalid: EVENT requires an event object");
             return;
         };
         let event: Event = match serde_json::from_value(value.clone()) {
             Ok(event) => event,
             Err(_) => {
-                // NIP-01: every EVENT gets an OK. Correlate with the id when
-                // the malformed object still carries one, so the client can
-                // match the refusal to its publish.
-                if let Some(id) = value.get("id").and_then(Value::as_str) {
-                    self.send_ok(id, false, "invalid: malformed event");
-                } else {
-                    self.send_notice("error: invalid event object");
-                }
+                // NIP-01: every EVENT gets an OK. Correlate with the id
+                // when the malformed object still carries one; otherwise
+                // the empty id is the only correlation the frame allows.
+                self.send_ok(
+                    value.get("id").and_then(Value::as_str).unwrap_or(""),
+                    false,
+                    "invalid: malformed event",
+                );
                 return;
             }
         };
@@ -286,7 +289,7 @@ impl super::Conn {
     }
 
     pub(crate) async fn handle_req(&mut self, rest: &[Value]) {
-        if rest.len() < 2 {
+        if rest.is_empty() {
             self.send_notice("error: REQ requires a subscription id and filters");
             return;
         }
@@ -297,6 +300,13 @@ impl super::Conn {
                 return;
             }
         };
+        if rest.len() < 2 {
+            // NIP-01: a REQ with a subscription id can be refused with a
+            // terminal CLOSED (the client gets a correlated reply); only
+            // without an id is there nothing to echo, so a NOTICE is used.
+            self.reject_req(sub_id, "invalid: REQ requires at least one filter");
+            return;
+        }
 
         let cfg = self.relay.config.read().await;
         let (max_sub_id_len, max_filters, max_subscriptions, max_limit) = (
@@ -409,12 +419,12 @@ impl super::Conn {
             .map(json_len)
             .fold(0usize, |acc, n| acc.saturating_add(n));
         let replacing = self.subs.get(sub_id).map(|(_, bytes, _)| *bytes);
-        if replacing.is_some() {
-            // NIP-01: a re-REQ replaces the subscription. EVENT frames of
-            // the old response that are already queued must not be
-            // delivered under the new filter set.
-            self.purge_queued_events_for(sub_id);
-        }
+        // NIP-01: a REQ replaces the subscription under this id. Every
+        // still-queued frame of the previous incarnation must go — the old
+        // response's events, its EOSE, and any CLOSED queued by an earlier
+        // failed REQ under the same id (which would otherwise close the new
+        // subscription on the wire).
+        self.purge_queued_events_for(sub_id);
         let next_total = self
             .sub_bytes
             .saturating_sub(replacing.unwrap_or(0))
@@ -555,6 +565,7 @@ impl super::Conn {
         // kept, so the pump still hits its exact byte check on it and emits
         // the same `CLOSED ... response too large` the client would
         // otherwise receive: the truncation is never silent.
+        let mut byte_truncated = false;
         if self.req_response_bytes > 0 {
             let mut total = 0u64;
             let mut kept = 0usize;
@@ -565,6 +576,13 @@ impl super::Conn {
                     break;
                 }
             }
+            // Events were dropped because of the byte budget (not because
+            // the scan's limit was reached). The pump's exact byte check
+            // normally turns this into the over-budget CLOSED, but a SIGHUP
+            // that raises `max_req_response_bytes` before the pump would
+            // silently complete the response instead: the EOSE must carry
+            // the pending/"more" marker for exactly these drops.
+            byte_truncated = kept < to_send.len();
             to_send.truncate(kept);
         }
         // The response is queued for the pump instead of being pushed into
@@ -582,7 +600,7 @@ impl super::Conn {
             return;
         };
         pending.events = to_send.into();
-        pending.truncated_or_more = truncated || more;
+        pending.truncated_or_more = truncated || more || byte_truncated;
         pending.auth_hint = auth_hidden;
     }
 
@@ -594,6 +612,10 @@ impl super::Conn {
         // NIP-77: REQ and NEG-OPEN live in separate namespaces, so CLOSE
         // releases only the REQ subscription (`NEG-CLOSE` releases NEG).
         self.remove_req_subscription(sub_id);
+        // NIP-01: the relay must send nothing further for a closed
+        // subscription, so its still-queued frames (EVENT / EOSE /
+        // CLOSED) are dropped rather than delivered after the CLOSE.
+        self.purge_queued_events_for(sub_id);
     }
 
     /// Rejects a REQ with CLOSED, releasing any previous subscription held
@@ -630,24 +652,6 @@ impl super::Conn {
     /// left untouched (`NEG-CLOSE` releases NEG). Any response still waiting
     /// for the socket is removed with the subscription, so a CLOSE or a
     /// replacement cannot emit stale history after it.
-    /// Drops queued EVENT frames that belong to a subscription being
-    /// replaced (NIP-01 re-REQ): the old response's events must not be
-    /// delivered under the new filter set. The byte accounting is adjusted
-    /// for the removed frames.
-    pub(crate) fn purge_queued_events_for(&mut self, sub_id: &str) {
-        let tag = super::sub_fingerprint(sub_id);
-        let mut removed = 0usize;
-        self.outgoing.retain(|frame| {
-            if frame.event_sub == Some(tag) {
-                removed = removed.saturating_add(super::message_size(&frame.message));
-                false
-            } else {
-                true
-            }
-        });
-        self.out_bytes = self.out_bytes.saturating_sub(removed);
-    }
-
     pub(crate) fn remove_req_subscription(&mut self, sub_id: &str) {
         self.pending_reqs.retain(|pending| pending.sub_id != sub_id);
         if let Some((_, bytes, _)) = self.subs.remove(sub_id) {
@@ -667,6 +671,30 @@ impl super::Conn {
         }
     }
 
+    /// Drops the queued frames belonging to a subscription being replaced
+    /// or closed (NIP-01 re-REQ / CLOSE): the old response's events, its
+    /// EOSE and any CLOSED queued for the id must not be delivered under
+    /// the new filter set (or after the client closed the id). The byte,
+    /// message and lifetime-traffic accounting is adjusted for the removed
+    /// frames — they were counted when queued but never reach the wire.
+    pub(crate) fn purge_queued_events_for(&mut self, sub_id: &str) {
+        let tag = super::sub_fingerprint(sub_id);
+        let mut removed_bytes = 0usize;
+        let mut removed_msgs = 0u64;
+        self.outgoing.retain(|frame| {
+            if frame.event_sub == Some(tag) {
+                removed_bytes = removed_bytes.saturating_add(super::message_size(&frame.message));
+                removed_msgs += 1;
+                false
+            } else {
+                true
+            }
+        });
+        self.out_bytes = self.out_bytes.saturating_sub(removed_bytes);
+        self.out_msgs = self.out_msgs.saturating_sub(removed_msgs);
+        self.out_bytes_total = self.out_bytes_total.saturating_sub(removed_bytes as u64);
+    }
+
     /// Releases negentropy state only (NIP-77 separate namespace).
     pub(crate) fn remove_neg_subscription(&mut self, sub_id: &str) {
         if let Some(state) = self.neg.remove(sub_id) {
@@ -682,9 +710,22 @@ impl super::Conn {
         // (a client retries a couple of times at most) and does not close
         // the connection: the client can still read and reconnect.
         const MAX_AUTH_ATTEMPTS: u32 = 16;
+        // Distinct keys recorded per connection. The AUTH attempt cap above
+        // already bounds it in practice; the explicit cap remains a DoS
+        // guard for the per-event visibility scan over the list.
+        const MAX_AUTH_KEYS: usize = 64;
         self.auth_attempts = self.auth_attempts.saturating_add(1);
         if self.auth_attempts > MAX_AUTH_ATTEMPTS {
-            self.send_notice("error: too many AUTH attempts; reconnect to retry");
+            // NIP-42: every AUTH must be answered with OK — including this
+            // attempt-cap refusal. A NOTICE leaves the client without a
+            // correlated response and, per spec, is not how AUTH is
+            // refused. Correlate with the id when the frame carries one.
+            let id = rest
+                .first()
+                .and_then(|v| v.get("id"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            self.send_control(json!(["OK", id, false, "error: too many AUTH attempts"]));
             return;
         }
         let Some(value) = rest.first() else {
@@ -733,15 +774,21 @@ impl super::Conn {
         };
         if accepted {
             // NIP-42: all authenticated pubkeys are treated as authenticated.
-            // Bound the list: repeated AUTHs with the same key are
-            // deduplicated and the number of distinct keys is capped so a
-            // connection cannot grow this vector (or the per-event
-            // visibility scan over it) without limit. At the cap the
-            // oldest key is evicted (FIFO) so every accepted AUTH stays
-            // recorded and the OK reply stays truthful.
+            // Repeated AUTHs with the same key are deduplicated; the
+            // number of distinct keys is capped as a DoS guard. At the cap
+            // the new key is refused with an explicit OK false instead of
+            // evicting the oldest: an eviction would silently invalidate an
+            // earlier `OK true` and, with it, the visibility the client
+            // authenticated for.
             if !self.authed_pubkeys.iter().any(|pk| pk == &event.pubkey) {
-                if self.authed_pubkeys.len() >= 64 {
-                    self.authed_pubkeys.remove(0);
+                if self.authed_pubkeys.len() >= MAX_AUTH_KEYS {
+                    self.send_control(json!([
+                        "OK",
+                        id,
+                        false,
+                        "error: too many authenticated keys; reconnect to retry"
+                    ]));
+                    return;
                 }
                 self.authed_pubkeys.push(event.pubkey.clone());
             }
@@ -762,7 +809,7 @@ impl super::Conn {
     }
 
     pub(crate) async fn handle_count(&mut self, rest: &[Value]) {
-        if rest.len() < 2 {
+        if rest.is_empty() {
             self.send_notice("error: COUNT requires a subscription id and filters");
             return;
         }
@@ -770,6 +817,13 @@ impl super::Conn {
             self.send_notice("error: subscription id must be a string");
             return;
         };
+        if rest.len() < 2 {
+            // NIP-45: a COUNT with a subscription id is refused with the
+            // same CLOSED a filters-less REQ uses (the client can
+            // correlate); only without an id is a NOTICE the best reply.
+            self.reject_count(sub_id, "invalid: COUNT requires at least one filter");
+            return;
+        }
         if sub_id.is_empty() {
             self.reject_count(sub_id, "invalid: subscription id must not be empty");
             return;
@@ -1101,11 +1155,11 @@ impl super::Conn {
         if !self.visible_to(groups, event) {
             return;
         }
-        // NIP-40: expired stored events are not delivered live; ephemeral
-        // kinds are exempt ("an expiration timestamp does not affect
-        // storage of ephemeral events").
+        // NIP-40: an event with a passed expiration timestamp is never
+        // delivered, for every kind. Ephemeral kinds are only exempt from
+        // *storage* (they are never persisted); the expiration tag still
+        // means "do not relay after this time", so it applies here too.
         if self.expiry_enabled
-            && !(20000..30000).contains(&event.kind)
             && let Some(exp) = nip40::expiry(event)
             && exp <= now
         {
@@ -1151,7 +1205,15 @@ impl super::Conn {
             }
         }
         for (msg, tag) in direct {
-            self.send_tagged(msg, Some(tag));
+            if !self.send_tagged(msg, Some(tag)) {
+                // A live event dropped at the outgoing cap is not
+                // recoverable (ephemeral kinds are not stored anywhere),
+                // and the subscription would look healthy while silently
+                // missing it: mark the connection so the caller closes it
+                // with a CLOSED, exactly like a pending-response overflow.
+                self.live_overflowed = true;
+                break;
+            }
         }
     }
 }

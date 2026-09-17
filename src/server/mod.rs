@@ -625,8 +625,9 @@ async fn await_shutdown(mut rx: watch::Receiver<bool>) {
 /// Returns `true` when the request is a valid WebSocket handshake: the
 /// standard upgrade headers must be present (`Upgrade: websocket`,
 /// `Connection: upgrade`, `Sec-WebSocket-Version: 13` and a non-empty
-/// `Sec-WebSocket-Key`), and a proxy-provided `X-Forwarded-Proto` must be
-/// `ws` or `wss`. Anything else is a plain HTTP request.
+/// `Sec-WebSocket-Key`), and a proxy-provided `X-Forwarded-Proto` must name
+/// a WebSocket-capable scheme (`ws`/`wss`, or `http`/`https` when the proxy
+/// terminates TLS). Anything else is a plain HTTP request.
 fn is_websocket_request(headers: &HeaderMap) -> bool {
     let upgrade = headers
         .get(axum::http::header::UPGRADE)
@@ -665,10 +666,14 @@ fn is_websocket_request(headers: &HeaderMap) -> bool {
         .get("x-forwarded-proto")
         .and_then(|v| v.to_str().ok())
     {
-        Some(proto) => {
-            let proto = proto.to_ascii_lowercase();
-            matches!(proto.as_str(), "ws" | "wss" | "http" | "https")
-        }
+        // The header carries one value per proxy hop, comma-separated: the
+        // handshake is recognized when any token names a WebSocket-capable
+        // scheme, so a value appended by another hop cannot disable the
+        // WebSocket detection.
+        Some(proto) => proto
+            .to_ascii_lowercase()
+            .split(',')
+            .any(|t| matches!(t.trim(), "ws" | "wss" | "http" | "https")),
         None => true,
     }
 }
@@ -684,27 +689,34 @@ async fn reject_ws_upgrade(request: Request, next: Next) -> Response {
 }
 
 /// The Blossom server-info document (BUD-01) when the request Host names
-/// the configured Blossom host and the storage backend initialized;
-/// `None` otherwise. Used by the shared root route and by the dedicated
-/// root route of the `inbox-outbox` mode, so the info document stays
-/// available on the Blossom host whatever the WebSocket path selection is.
-/// Takes the Host header value (not the whole request) so the future never
-/// borrows the request across the await.
+/// the configured Blossom host and the storage backend initialized. On the
+/// configured Blossom host the answer is 404 (never the relay's NIP-11
+/// document or a WebSocket upgrade) when the storage is unavailable; `None`
+/// means the Host is not the Blossom host. Used by the shared root route
+/// and by the dedicated root route of the `inbox-outbox` mode, so the info
+/// document stays available on the Blossom host whatever the WebSocket path
+/// selection is. Takes the Host header value (not the whole request) so the
+/// future never borrows the request across the await.
 async fn blossom_root_info(
     relay: Arc<Relay>,
     host_header: Option<&str>,
     is_websocket: bool,
 ) -> Option<Response> {
-    // Without a live Blossom state (storage initialization failed) the
-    // info document must not advertise endpoints that are not mounted.
-    if relay.blossom.read().await.is_none() {
-        return None;
-    }
     let cfg = relay.config.read().await;
     if cfg.blossom.host.trim().is_empty()
         || !blossom::host_is_blossom(&cfg.blossom.host, host_header)
     {
         return None;
+    }
+    // The request Host names the configured Blossom host: fail closed. The
+    // `None` fall-through would serve the relay's NIP-11 document and,
+    // worse, accept WebSocket upgrades on the media host when only
+    // `blossom.host` is configured but the storage initialization failed
+    // (no live `relay.blossom`). Answer 404 instead, upgrades included.
+    // `None` is reserved for "this is not the Blossom host", so callers
+    // can tell the two cases apart.
+    if relay.blossom.read().await.is_none() {
+        return Some(StatusCode::NOT_FOUND.into_response());
     }
     // WebSocket upgrades are never accepted on the Blossom host's root.
     if is_websocket {
@@ -1015,6 +1027,11 @@ async fn purge_loop(relay: Arc<Relay>, mut shutdown: watch::Receiver<bool>) {
                 let removed = relay.db.purge_expired(unix_now()).await;
                 if removed > 0 {
                     info!("purged {removed} expired events");
+                    // The purge may have removed group moderation events
+                    // (NIP-40 expiration): the derived group state must not
+                    // keep authorizing members whose grant expired. The
+                    // rebuild is coalesced and runs in the background.
+                    relay.mark_group_state_stale().await;
                 }
             }
             _ = shutdown.changed() => break,
@@ -1208,21 +1225,25 @@ async fn serve_limited(
                     // the detached WS task instead, so the counts are never
                     // released here while the socket is still served.
                     let _slot = crate::conn::AcceptSlotGuard::new(slot);
-                    let mut builder = hyper_util::server::conn::auto::Builder::new(
-                        hyper_util::rt::TokioExecutor::new(),
-                    );
+                    // HTTP/1 only: the auto builder's version sniff waited
+                    // for up to 24 bytes before the header timer was armed,
+                    // so a silent socket (or an `PRI * HTTP/2.0` prefix) was
+                    // never reaped by `header_read_timeout`; HTTP/2 is also
+                    // undocumented and WebSocket-over-h2 cannot be routed
+                    // (the GET-only upgrade route answers CONNECT with 405).
+                    let mut builder = hyper::server::conn::http1::Builder::new();
                     // Slow-loris defense: a connection must complete its
                     // request head within the window or it is closed
                     // (`None` disables the timeout — the config maps 0 to
-                    // None so the documented "0 = disabled" holds).
+                    // None so the documented "0 = disabled" holds). The
+                    // timer is armed before the first byte is read.
                     builder
-                        .http1()
                         .timer(hyper_util::rt::TokioTimer::new())
                         .header_read_timeout(header_timeout);
-                    // CONNECT protocol needed for HTTP/2 websockets.
-                    builder.http2().enable_connect_protocol();
                     let mut conn = std::pin::pin!(
-                        builder.serve_connection_with_upgrades(io, hyper_service)
+                        builder
+                            .serve_connection(io, hyper_service)
+                            .with_upgrades()
                     );
                     tokio::select! {
                         result = conn.as_mut() => {
@@ -1335,8 +1356,11 @@ async fn reload_handler(
                                  at startup; a restart is required to apply it"
                             );
                         }
-                        // Settings that shape the HTTP router are also fixed
-                        // at startup: a reload cannot rebuild the routes.
+                        // Settings that shape the HTTP router are fixed at
+                        // startup: a reload cannot rebuild the routes. A
+                        // change is warned about and the running value is
+                        // kept below (restart required), so the in-memory
+                        // config never lies about the wire behavior.
                         let static_routes = [
                             ("server.api_host", old.server.api_host != new_config.server.api_host),
                             ("server.host", old.server.host != new_config.server.host),
@@ -1487,10 +1511,11 @@ async fn reload_handler(
                                 old.limits.max_connections != new_config.limits.max_connections,
                             ),
                             (
-                                // The accept-layer per-IP cap is captured at
-                                // startup (the WebSocket handshake reads it
-                                // live), so a reload must not leave the two
-                                // layers disagreeing silently.
+                                // The accept-layer per-IP cap is captured
+                                // when the listener starts and no handshake
+                                // reads it anymore, so the reloaded config
+                                // must not leave `config.read()` claiming a
+                                // cap that is not enforced.
                                 "limits.max_connections_per_ip",
                                 old.limits.max_connections_per_ip
                                     != new_config.limits.max_connections_per_ip,
@@ -1528,8 +1553,6 @@ async fn reload_handler(
                                 old.daemon.pid_file != new_config.daemon.pid_file,
                             ),
                         ];
-                        let restart_required = old.relay.private_key != new_config.relay.private_key
-                            || static_routes.iter().any(|(_, changed)| *changed);
                         for (name, changed) in static_routes {
                             if changed {
                                 warn!(
@@ -1538,19 +1561,12 @@ async fn reload_handler(
                                 );
                             }
                         }
-                        if restart_required {
-                            error!(
-                                "configuration reload rejected because startup-only settings \
-                                 changed; restart is required to apply them"
-                            );
-                            // The database-backed lists are independent of the
-                            // config file: re-read them even though the file
-                            // change was rejected, or a CLI ban/allowlist
-                            // update would not be applied while the CLI still
-                            // reports success.
-                            relay.reload_db_state().await;
-                            continue;
-                        }
+                        // Every changed startup-only setting is rejected
+                        // individually above (warning + value kept below),
+                        // while the live settings are still applied: a
+                        // reload must never be all-or-nothing, or an
+                        // unrelated edit would silently disable a
+                        // CLI-visible change.
                         db.set_expiry_enabled(new_config.nip_enabled(40));
                         api_limit.set_max(new_config.limits.max_api_concurrent);
                         db.set_max_api_pending(new_config.limits.max_api_queue_msgs);
@@ -1570,12 +1586,13 @@ async fn reload_handler(
                                  and persisted in the database; the file change is ignored"
                             );
                         }
-                        // Settings fixed at startup must not diverge from the
-                        // wire: overwriting them in memory while the router,
-                        // database and threads still run the old values would
-                        // leave `config.read()` lying about actual behavior.
-                        // Keep the running values so the in-memory config
-                        // always describes what the relay does.
+                        // Apply-live-keep-startup-only: `new_config`'s live
+                        // settings are applied at the end (config swap,
+                        // database/API limiters), while every startup-only
+                        // setting keeps its running value. Overwriting them
+                        // in memory while the router, database and threads
+                        // still run the old values would leave
+                        // `config.read()` lying about actual behavior.
                         new_config.server.api_host = old.server.api_host.clone();
                         new_config.server.host = old.server.host.clone();
                         new_config.server.port = old.server.port;
@@ -1817,6 +1834,38 @@ mod tests {
         task.await.unwrap();
     }
 
+    #[test]
+    fn ws_detection_accepts_multi_valued_forwarded_proto() {
+        // Regression: a comma-separated X-Forwarded-Proto (one value per
+        // proxy hop) used to compare as a whole, so "https,http" from a
+        // proxy chain disabled WebSocket detection and the handshake was
+        // served as a plain HTTP request.
+        let headers = |proto: &str| {
+            let mut h = HeaderMap::new();
+            h.insert(axum::http::header::UPGRADE, "websocket".parse().unwrap());
+            h.insert(
+                axum::http::header::CONNECTION,
+                "keep-alive, Upgrade".parse().unwrap(),
+            );
+            h.insert(
+                axum::http::header::SEC_WEBSOCKET_VERSION,
+                "13".parse().unwrap(),
+            );
+            h.insert(
+                axum::http::header::SEC_WEBSOCKET_KEY,
+                "abcd".parse().unwrap(),
+            );
+            h.insert("x-forwarded-proto", proto.parse().unwrap());
+            h
+        };
+        assert!(
+            is_websocket_request(&headers("https,http")),
+            "any WebSocket-capable token must be accepted"
+        );
+        assert!(is_websocket_request(&headers("ftp, wss")));
+        assert!(!is_websocket_request(&headers("ftp,spdy")));
+    }
+
     #[tokio::test]
     async fn ws_handler_and_blossom_root_gate() {
         let relay = blossom_relay().await;
@@ -1992,14 +2041,47 @@ mod tests {
                 .await
                 .is_some()
         );
-        // Storage initialization failed: no info document (and therefore no
-        // advertisement of endpoints that are not mounted).
+        // Storage initialization failed: the configured Blossom host fails
+        // closed with a 404 instead of returning `None`, which would let
+        // the root fall through to the relay (NIP-11 document and WebSocket
+        // upgrades) on the media host.
         *relay.blossom.write().await = None;
-        assert!(
-            blossom_root_info(relay.clone(), Some("media.example.com"), false)
-                .await
-                .is_none()
-        );
+        let resp = blossom_root_info(relay.clone(), Some("media.example.com"), false)
+            .await
+            .expect("the configured Blossom host must not fall through");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        // A plain GET on that host gets the 404, not the NIP-11 document…
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/")
+            .header(axum::http::header::HOST, "media.example.com")
+            .body(Body::empty())
+            .unwrap();
+        let response = ws_handler(State(relay.clone()), request).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        // …and a WebSocket upgrade there is refused (never upgraded).
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/")
+            .header(axum::http::header::HOST, "media.example.com")
+            .header(axum::http::header::UPGRADE, "websocket")
+            .header(axum::http::header::CONNECTION, "upgrade")
+            .header(axum::http::header::SEC_WEBSOCKET_VERSION, "13")
+            .header(axum::http::header::SEC_WEBSOCKET_KEY, "abcd")
+            .body(Body::empty())
+            .unwrap();
+        let response = ws_handler(State(relay.clone()), request).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        // The relay host is unaffected: it still gets the NIP-11 document.
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/")
+            .header(axum::http::header::HOST, "relay.example.com")
+            .header(axum::http::header::ACCEPT, "application/nostr+json")
+            .body(Body::empty())
+            .unwrap();
+        let response = ws_handler(State(relay.clone()), request).await;
+        assert_eq!(response.status(), StatusCode::OK);
         relay.db.shutdown();
     }
 
@@ -2263,6 +2345,31 @@ mod tests {
         assert!(
             got.is_empty(),
             "the slow-loris socket must be closed without a response"
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(1500) && elapsed < Duration::from_secs(9),
+            "the timeout must fire near the configured 2s (took {elapsed:?})"
+        );
+        tx.send(true).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn serve_limited_closes_silent_sockets() {
+        // Regression: the auto builder sniffed the HTTP version by reading
+        // up to 24 bytes before arming the header timer, so a socket that
+        // sent nothing (or an HTTP/2 preface) pinned a connection — and its
+        // share of the accept-layer caps — past `http_read_timeout_secs`.
+        // With the HTTP/1 builder the timer is armed on the first read.
+        let (addr, tx, handle) =
+            serve_limited_for_test(10, 0, Some(Duration::from_secs(2)), None).await;
+        let s = TcpStream::connect(addr).await.unwrap();
+        let started = std::time::Instant::now();
+        let got = read_to_eof(s, Duration::from_secs(10)).await;
+        assert!(
+            got.is_empty(),
+            "the silent socket must be closed without a response"
         );
         let elapsed = started.elapsed();
         assert!(

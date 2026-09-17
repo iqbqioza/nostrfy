@@ -35,12 +35,7 @@ impl Store {
     /// implementation had to scan every `p` entry (the store's most expensive
     /// deletion path, reachable from any NIP-09 deletion request) just to
     /// catch hex case variants.
-    fn remove_gift_wraps_for(
-        &self,
-        wtxn: &mut heed::RwTxn<'_>,
-        pubkey: &[u8],
-        removed: &mut usize,
-    ) -> Result<()> {
+    fn remove_gift_wraps_for(&self, pubkey: &[u8], removed: &mut usize) -> Result<()> {
         let start = tag_key(GIFT_WRAP_INDEX, pubkey, 0, &[0u8; ID_LEN]);
         let end = crate::db::store::range_end(
             tag_key(GIFT_WRAP_INDEX, pubkey, u64::MAX, &[0xffu8; ID_LEN]),
@@ -48,13 +43,18 @@ impl Store {
         );
         let mut last_key: Option<Vec<u8>> = None;
         loop {
+            // A fresh write transaction per chunk: one pubkey's wrap index
+            // can hold an unbounded number of entries, and a single
+            // transaction across the whole walk pinned the writer (a
+            // MapFull also aborted the entire purge instead of one chunk).
+            let mut wtxn = self.env.write_txn()?;
             let lower = match &last_key {
                 Some(key) => std::ops::Bound::Excluded(key.as_slice()),
                 None => std::ops::Bound::Included(start.as_slice()),
             };
             let entries: Vec<(Vec<u8>, Vec<u8>)> = self
                 .by_tag
-                .range(wtxn, &(lower, std::ops::Bound::Excluded(end.as_slice())))?
+                .range(&wtxn, &(lower, std::ops::Bound::Excluded(end.as_slice())))?
                 .filter_map(|item| {
                     item.ok()
                         .map(|(key, _)| (key.to_vec(), key[key.len() - ID_LEN..].to_vec()))
@@ -66,17 +66,18 @@ impl Store {
             }
             last_key = Some(entries.last().expect("non-empty chunk").0.clone());
             for (key, id) in entries {
-                if self.events.get(wtxn, &id)?.is_none() {
+                if self.events.get(&wtxn, &id)?.is_none() {
                     // A dangling index entry (the event is already gone):
                     // drop it so later deletions do not keep revisiting it.
-                    self.by_tag.delete(wtxn, &key)?;
+                    self.by_tag.delete(&mut wtxn, &key)?;
                     continue;
                 }
                 // The index is only written for kind:1059 events, so the
                 // entry cannot point at any other kind.
-                self.remove_event(wtxn, &id)?;
+                self.remove_event(&mut wtxn, &id)?;
                 *removed += 1;
             }
+            wtxn.commit()?;
         }
         Ok(())
     }
@@ -108,66 +109,72 @@ impl Store {
         if request_pubkey.is_none() && group.is_none() {
             return Ok(0);
         }
-        let mut wtxn = self.env.write_txn()?;
         let mut removed = 0usize;
 
-        for target in targets {
-            let Ok(id) = hex::decode(target) else {
-                continue;
-            };
-            if id.len() != ID_LEN {
-                continue;
+        // The `e`-tag targets are bounded by the deletion request's own tag
+        // list, but the batch is still split into REMOVAL_CHUNK-sized write
+        // transactions so a huge request never pins one commit.
+        for chunk in targets.chunks(REMOVAL_CHUNK) {
+            let mut wtxn = self.env.write_txn()?;
+            for target in chunk {
+                let Ok(id) = hex::decode(target) else {
+                    continue;
+                };
+                if id.len() != ID_LEN {
+                    continue;
+                }
+                let Some(raw) = self.events.get(&wtxn, &id)? else {
+                    continue;
+                };
+                let Ok(event) = serde_json::from_slice::<Event>(raw) else {
+                    continue;
+                };
+                // NIP-09: only events authored by the request's pubkey are
+                // deleted, and deletion requests cannot be deleted. NIP-26:
+                // the delegator may also delete events published on their
+                // behalf; delegated_by revalidates the target's delegation
+                // signature and conditions before allowing that exception.
+                if event.kind == nip09::DELETION_KIND {
+                    continue;
+                }
+                // NIP-09: only events created at or before the request are
+                // covered (the `a`-tag path enforces the same bound; a
+                // future-dated target must not be deletable).
+                if event.created_at > request_created {
+                    continue;
+                }
+                if let Some(pubkey) = request_pubkey
+                    && !pubkeys_equal(&event.pubkey, pubkey)
+                    && !delegated_by(&event, pubkey)
+                {
+                    continue;
+                }
+                // NIP-29 9005 moderation: restrict to events of the admin's own
+                // group, so a group admin cannot delete another group's content
+                // (or the relay's metadata) by referencing its id.
+                if let Some(gid) = group
+                    && crate::nips::nip29::group_id_any(&event)
+                        .map(str::to_string)
+                        .as_deref()
+                        != Some(gid)
+                {
+                    continue;
+                }
+                // NIP-29's relay-signed metadata (39000-39005) is managed by
+                // the relay: a group admin's 9005 must not delete it even
+                // within their own group (the group check above would pass for
+                // its own gid).
+                if group.is_some()
+                    && (crate::nips::nip29::GROUP_META..=crate::nips::nip29::GROUP_PINS)
+                        .contains(&event.kind)
+                {
+                    continue;
+                }
+                self.deleted.put(&mut wtxn, &id, b"")?;
+                self.remove_event(&mut wtxn, &id)?;
+                removed += 1;
             }
-            let Some(raw) = self.events.get(&wtxn, &id)? else {
-                continue;
-            };
-            let Ok(event) = serde_json::from_slice::<Event>(raw) else {
-                continue;
-            };
-            // NIP-09: only events authored by the request's pubkey are
-            // deleted, and deletion requests cannot be deleted. NIP-26:
-            // the delegator may also delete events published on their
-            // behalf; delegated_by revalidates the target's delegation
-            // signature and conditions before allowing that exception.
-            if event.kind == nip09::DELETION_KIND {
-                continue;
-            }
-            // NIP-09: only events created at or before the request are
-            // covered (the `a`-tag path enforces the same bound; a
-            // future-dated target must not be deletable).
-            if event.created_at > request_created {
-                continue;
-            }
-            if let Some(pubkey) = request_pubkey
-                && !pubkeys_equal(&event.pubkey, pubkey)
-                && !delegated_by(&event, pubkey)
-            {
-                continue;
-            }
-            // NIP-29 9005 moderation: restrict to events of the admin's own
-            // group, so a group admin cannot delete another group's content
-            // (or the relay's metadata) by referencing its id.
-            if let Some(gid) = group
-                && crate::nips::nip29::group_id_any(&event)
-                    .map(str::to_string)
-                    .as_deref()
-                    != Some(gid)
-            {
-                continue;
-            }
-            // NIP-29's relay-signed metadata (39000-39005) is managed by
-            // the relay: a group admin's 9005 must not delete it even
-            // within their own group (the group check above would pass for
-            // its own gid).
-            if group.is_some()
-                && (crate::nips::nip29::GROUP_META..=crate::nips::nip29::GROUP_PINS)
-                    .contains(&event.kind)
-            {
-                continue;
-            }
-            self.deleted.put(&mut wtxn, &id, b"")?;
-            self.remove_event(&mut wtxn, &id)?;
-            removed += 1;
+            wtxn.commit()?;
         }
 
         // NIP-09 `a` tags: remove every version of the referenced
@@ -197,16 +204,16 @@ impl Store {
             // exist right now). Merge with an existing tombstone by keeping
             // the furthest cut.
             let akey = deleted_address_key(address.kind, &pubkey, &address.d);
-            let cut = match self.deleted.get(&wtxn, &akey)? {
-                Some(old) if old.len() >= CREATED_LEN => {
-                    request_created.max(u64::from_be_bytes(old[..CREATED_LEN].try_into().unwrap()))
-                }
-                _ => request_created,
-            };
             let start = replaceable_key(address.kind, &pubkey, "");
             let end = replaceable_key(address.kind.saturating_add(1), &pubkey, "");
             let mut last_key: Option<Vec<u8>> = None;
             loop {
+                // A fresh write transaction per chunk: one address's version
+                // history is unbounded, and a single transaction across it
+                // pinned the writer while a MapFull aborted the whole
+                // deletion. A replay after a crash re-walks the remaining
+                // versions (the removed ones are already gone).
+                let mut wtxn = self.env.write_txn()?;
                 let lower = match &last_key {
                     Some(k) => std::ops::Bound::Excluded(k.as_slice()),
                     None => std::ops::Bound::Included(start.as_slice()),
@@ -267,17 +274,25 @@ impl Store {
                     self.remove_event(&mut wtxn, id)?;
                     removed += 1;
                 }
+                wtxn.commit()?;
             }
             // The address tombstone is only written for an authorized
             // requester: a delegated deletion that matched no version must
             // not leave a tombstone behind (it would block the author's
-            // future publications up to the cut).
+            // future publications up to the cut). It is merged with an
+            // existing tombstone by keeping the furthest cut.
             if author_owns || delegated_any {
+                let mut wtxn = self.env.write_txn()?;
+                let cut = match self.deleted.get(&wtxn, &akey)? {
+                    Some(old) if old.len() >= CREATED_LEN => request_created
+                        .max(u64::from_be_bytes(old[..CREATED_LEN].try_into().unwrap())),
+                    _ => request_created,
+                };
                 self.deleted.put(&mut wtxn, &akey, &cut.to_be_bytes())?;
+                wtxn.commit()?;
             }
         }
 
-        wtxn.commit()?;
         Ok(removed)
     }
 
@@ -323,12 +338,16 @@ impl Store {
     /// suddenly be served under the new settings.
     pub(crate) fn purge_group(&self, gid: &str) -> Result<usize> {
         self.disk_full_error()?;
-        let mut wtxn = self.env.write_txn()?;
         let start = tag_key(b'h', gid.as_bytes(), 0, &[0u8; ID_LEN]);
         let end = tag_key(b'h', gid.as_bytes(), u64::MAX, &[0xffu8; ID_LEN]);
         let mut last_key: Option<Vec<u8>> = None;
         let mut removed = 0usize;
         loop {
+            // A fresh write transaction per chunk: a group's history is
+            // unbounded, and one transaction across the whole purge pinned
+            // the writer while a MapFull aborted everything. The per-event
+            // tombstones commit with their chunk.
+            let mut wtxn = self.env.write_txn()?;
             let lower = match &last_key {
                 Some(k) => std::ops::Bound::Excluded(k.as_slice()),
                 None => std::ops::Bound::Included(start.as_slice()),
@@ -352,13 +371,16 @@ impl Store {
                     // be re-publishable (the same content id would
                     // otherwise be accepted after the group is re-created
                     // as a public group, exposing the old private history).
+                    // The tombstone is permanent: the `deleted` table has
+                    // no retention/pruning path, and pruning it would
+                    // reopen exactly that re-publication window.
                     self.deleted.put(&mut wtxn, &id, b"")?;
                     self.remove_event(&mut wtxn, &id)?;
                     removed += 1;
                 }
             }
+            wtxn.commit()?;
         }
-        wtxn.commit()?;
         Ok(removed)
     }
 
@@ -373,21 +395,24 @@ impl Store {
     /// snapshots on every delivery).
     pub(crate) fn apply_vanish(&self, pubkey: &[u8], until_created: u64) -> Result<(usize, bool)> {
         self.disk_full_error()?;
-        let mut wtxn = self.env.write_txn()?;
-        // Legacy entries (written before the marker carried the timestamp)
-        // have an empty value and count as `until_created = 0`, so they are
-        // upgraded by the next request.
-        if let Some(raw) = self.vanish.get(&wtxn, pubkey)? {
-            let covered = raw
-                .get(..8)
-                .map(|bytes| u64::from_be_bytes(bytes.try_into().expect("checked length")))
-                .unwrap_or(0);
-            if covered >= until_created {
-                return Ok((0, false));
+        // Replay check: a marker covering this request means every event up
+        // to its cut was already removed (the marker is written last, see
+        // below), so there is nothing to do.
+        {
+            let rtxn = self.env.read_txn()?;
+            // Legacy entries (written before the marker carried the timestamp)
+            // have an empty value and count as `until_created = 0`, so they are
+            // upgraded by the next request.
+            if let Some(raw) = self.vanish.get(&rtxn, pubkey)? {
+                let covered = raw
+                    .get(..8)
+                    .map(|bytes| u64::from_be_bytes(bytes.try_into().expect("checked length")))
+                    .unwrap_or(0);
+                if covered >= until_created {
+                    return Ok((0, false));
+                }
             }
         }
-        self.vanish
-            .put(&mut wtxn, pubkey, &until_created.to_be_bytes())?;
 
         let mut removed = 0usize;
         // Whether a NIP-29 state event (moderation/join/leave) was removed:
@@ -406,6 +431,12 @@ impl Store {
         );
         let mut last_key: Option<Vec<u8>> = None;
         loop {
+            // A fresh write transaction per chunk: the author's history is
+            // unbounded, and one transaction across it pinned the writer
+            // while a MapFull aborted the whole vanish. The marker is
+            // written after the walk, so a partial pass is retried by a
+            // re-delivered request.
+            let mut wtxn = self.env.write_txn()?;
             let lower = match &last_key {
                 Some(k) => std::ops::Bound::Excluded(k.as_slice()),
                 None => std::ops::Bound::Included(start.as_slice()),
@@ -452,14 +483,26 @@ impl Store {
                 self.remove_event(&mut wtxn, &id)?;
                 removed += 1;
             }
+            wtxn.commit()?;
         }
 
         // NIP-59 gift wraps addressed to the vanished pubkey: the reserved
         // recipient index (keyed by the decoded pubkey) finds every hex case
         // variant with one narrow range.
-        self.remove_gift_wraps_for(&mut wtxn, pubkey, &mut removed)?;
+        self.remove_gift_wraps_for(pubkey, &mut removed)?;
 
+        // The marker is written last, in its own transaction: a crash or a
+        // failure mid-walk leaves no marker, so a re-delivered request
+        // finishes the removal (already-removed chunks are gone) — the walk
+        // is idempotent and eventual consistency holds. The writer thread
+        // handles one message at a time, so no put can interleave between
+        // the walk and the marker: every put queued behind this vanish
+        // still sees the marker.
+        let mut wtxn = self.env.write_txn()?;
+        self.vanish
+            .put(&mut wtxn, pubkey, &until_created.to_be_bytes())?;
         wtxn.commit()?;
+
         Ok((removed, group_state_removed))
     }
 
@@ -469,10 +512,8 @@ impl Store {
     /// through the normal deletion flow.
     pub(crate) fn delete_gift_wraps_to(&self, pubkey: &[u8]) -> Result<usize> {
         self.disk_full_error()?;
-        let mut wtxn = self.env.write_txn()?;
         let mut removed = 0usize;
-        self.remove_gift_wraps_for(&mut wtxn, pubkey, &mut removed)?;
-        wtxn.commit()?;
+        self.remove_gift_wraps_for(pubkey, &mut removed)?;
         Ok(removed)
     }
 
@@ -488,7 +529,6 @@ impl Store {
         {
             return Ok(0);
         }
-        let mut wtxn = self.env.write_txn()?;
         let since_key = created_key(0, &[0u8; ID_LEN]);
         // NIP-40 semantics are `expiration <= now`: include every key at the
         // current second by using the largest possible event id as the
@@ -497,6 +537,11 @@ impl Store {
         let mut last_key: Option<Vec<u8>> = None;
         let mut removed = 0usize;
         loop {
+            // A fresh write transaction per chunk: the expired backlog is
+            // unbounded, and one transaction across it pinned the writer
+            // while a MapFull aborted the whole purge. Purges run
+            // periodically, so a partial pass simply resumes next time.
+            let mut wtxn = self.env.write_txn()?;
             let lower = match &last_key {
                 Some(k) => std::ops::Bound::Excluded(k.as_slice()),
                 None => std::ops::Bound::Included(since_key.as_slice()),
@@ -528,8 +573,8 @@ impl Store {
                     self.expiry.delete(&mut wtxn, &key)?;
                 }
             }
+            wtxn.commit()?;
         }
-        wtxn.commit()?;
         Ok(removed)
     }
 }

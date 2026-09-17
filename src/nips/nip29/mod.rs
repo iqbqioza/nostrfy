@@ -229,6 +229,11 @@ pub struct GroupStore {
 pub(crate) struct GroupsSnapshot {
     pub groups: HashMap<String, Group>,
     pub deleted: HashSet<String>,
+    /// Present in snapshots written after the ghost marker was introduced:
+    /// older snapshots lack the field, and a missing field must deserialize
+    /// as "no ghosts" instead of failing the whole load (a failed load would
+    /// force a full rebuild and silently discard the rest of the state).
+    #[serde(default)]
     pub ghost: HashSet<String>,
 }
 
@@ -344,6 +349,16 @@ impl GroupStore {
         let Some(gid) = group_id(event) else {
             return Ok(());
         };
+        // A ghosted id must never be resurrected by a create: its create
+        // event is gone while survivors may still be stored, so a fresh
+        // default-public group would expose their (possibly private)
+        // content. The `deleted` tombstone is different: the relay purged
+        // the group's events when the `9008` was applied (and only a
+        // confirmed purge leaves the id as `deleted`), so clearing that
+        // tombstone on a create is safe.
+        if self.ghost.contains(gid) {
+            bail!("blocked: the group has been deleted");
+        }
         if self.deleted.contains(gid) {
             // A deleted id stays closed except for a fresh create: the
             // tombstone blocks every other write, but legitimate re-creation
@@ -426,7 +441,7 @@ impl GroupStore {
                 bail!("restricted: you are not an admin of this group");
             }
             if event.kind == 9002 {
-                validate_edit_metadata(self, gid, group, event)?;
+                validate_edit_metadata(self, gid, group, event, relay_signed)?;
             }
             // NIP-29 allows the relay to limit pins: bound the 9010 list
             // so one event cannot pin unbounded state (the apply side caps
@@ -832,22 +847,53 @@ impl GroupStore {
                 // The referenced events are deleted by the relay itself.
             }
             CREATE_GROUP => {
+                let mut adopted_parent = None;
                 if !self.groups.contains_key(gid) && (ignore_capacity || !self.at_capacity()) {
-                    // A fresh create resurrects the id: clear a previous
-                    // delete tombstone (and ghost marker) so the id is
-                    // reusable. The deleted group's events were purged by
-                    // the relay when the `9008` was applied, so re-creation
-                    // starts from an empty history (no old private content
-                    // can surface under the new, default-public settings).
+                    // A fresh create resurrects an explicitly deleted id:
+                    // clear the delete tombstone so the id is reusable. The
+                    // deleted group's events were purged by the relay when
+                    // the `9008` was applied, so re-creation starts from an
+                    // empty history (no old private content can surface
+                    // under the new, default-public settings). A ghost is
+                    // deliberately NOT cleared: its create was lost while
+                    // survivors may remain stored, so reviving it as a
+                    // default-public group would expose them. Validation
+                    // rejects such creates; this arm stays fail-closed for
+                    // replays that bypass validation.
                     self.deleted.remove(gid);
-                    self.unghost(gid);
                     let mut group = Group::default();
                     group
                         .members
                         .entry(event.pubkey.clone())
                         .or_default()
                         .insert("admin".into());
+                    // A group that already declared this id as a child
+                    // (a placeholder: the child did not exist yet) adopts
+                    // it now, keeping both sides of the parent link
+                    // consistent. The scan is bounded by the group cap;
+                    // with an uncapped store n creates would make it
+                    // O(n²), so adoption is skipped there (the declarer
+                    // keeps the id in its children list).
+                    if self.max_groups > 0 {
+                        adopted_parent = self.groups.iter().find_map(|(id, g)| {
+                            g.children.iter().any(|c| c == gid).then(|| id.clone())
+                        });
+                        if let Some(parent) = &adopted_parent {
+                            group.parent = Some(parent.clone());
+                        }
+                    }
                     self.groups.insert(gid.to_string(), group);
+                    if emit && let Some(parent) = &adopted_parent {
+                        // The adopting parent's stored metadata must name
+                        // the now-existing child: its stored 39000 may have
+                        // been built while the id was only a placeholder.
+                        out.push(build_meta_event(
+                            parent,
+                            self.groups.get(parent),
+                            relay_pubkey,
+                            now,
+                        ));
+                    }
                 }
                 if emit {
                     out.push(build_meta_event(
@@ -959,7 +1005,7 @@ impl GroupStore {
         let is_meta = (GROUP_META..=GROUP_PINS).contains(&event.kind);
         self.groups
             .get(gid)
-            .is_some_and(|g| g.settings.private || (g.settings.hidden && is_meta))
+            .is_some_and(|g| (g.settings.private && !is_meta) || (g.settings.hidden && is_meta))
     }
 
     /// Whether the content of a group may be served to `authed`. `is_meta`
@@ -1010,7 +1056,10 @@ impl GroupStore {
             return true;
         };
         let member = authed.is_some_and(|pk| group.is_member(pk));
-        if group.settings.private && !member {
+        // NIP-29: `private` restricts the group MESSAGES to members; the
+        // metadata stays readable (it is not the private content). `hidden`
+        // additionally hides the relay-generated metadata from non-members.
+        if group.settings.private && !member && !is_meta {
             return false;
         }
         if group.settings.hidden && is_meta && !member {
@@ -1048,18 +1097,44 @@ impl GroupStore {
         out
     }
 
-    /// Rebuilds the in-memory group state from the stored moderation events.
+    /// Rebuilds the in-memory group state from the stored events.
     ///
     /// Returns `false` when the rebuild could not be completed (the database
     /// did not answer, or the scan budget was exhausted mid-page): the
     /// caller must not persist or serve the partially-rebuilt store (missing
     /// groups turn private content world-readable) and aborts startup.
     ///
-    /// The walk streams the history oldest-first in pages and applies each
-    /// page as it arrives, so memory stays bounded by one page instead of
-    /// the whole history (the old implementation materialized and sorted
-    /// every stored group event before applying anything).
+    /// This is the snapshot-less path (a new database, a legacy migration,
+    /// or a crash after a vanish dropped the snapshot): the complete set of
+    /// group ids is unknown, so besides the moderation history the rebuild
+    /// walks the stored events to find the ids referenced by ordinary
+    /// `h`-tagged posts. A group whose create/moderation events are gone —
+    /// while ordinary posts survive — would otherwise be invisible and its
+    /// (possibly private) content would turn world-readable. There is no
+    /// index for "any event with an h tag", so that costs one bounded
+    /// full-history pass; it only runs when no prior id set exists (the
+    /// post-vanish rebuild seeds the ids from the pre-rebuild state instead,
+    /// see [`Self::rebuild_after_vanish`]).
+    ///
+    /// The walks stream the history in pages, so memory stays bounded by
+    /// one page instead of the whole history (the old implementation
+    /// materialized and sorted every stored group event before applying
+    /// anything).
     pub async fn rebuild(&mut self, db: &DbClient) -> bool {
+        self.rebuild_inner(db, None).await
+    }
+
+    /// Rebuilds after a vanish, seeding the ghost detection from `previous`
+    /// (the pre-rebuild [`Self::hidden_group_ids`]): every group id that
+    /// existed before the vanish is known, so any id missing from the
+    /// rebuilt store is ghosted from the seed. The full-history ordinary
+    /// pass of [`Self::rebuild`] is unnecessary here and is skipped: the
+    /// vanish accept path must not pay for a full table scan.
+    pub async fn rebuild_after_vanish(&mut self, db: &DbClient, previous: Vec<String>) -> bool {
+        self.rebuild_inner(db, Some(previous)).await
+    }
+
+    async fn rebuild_inner(&mut self, db: &DbClient, previous: Option<Vec<String>>) -> bool {
         // 9021 JOIN is included so that honored joins survive a restart even
         // on relays without a private key (which never emit the relay-signed
         // 9000 put-user that would otherwise carry the membership).
@@ -1089,11 +1164,6 @@ impl GroupStore {
             );
             return false;
         }
-        // Every group id referenced by the surviving events: any of them
-        // that did not make it into `groups` (its create event was
-        // deleted by a vanish / NIP-09 / expiry) becomes a ghost — its
-        // content is withheld instead of turning world-readable.
-        let mut seen_gids: std::collections::HashSet<String> = std::collections::HashSet::new();
         // Chronological replay: the ascending scan never splits a timestamp
         // across pages (it collects every event at the boundary timestamp),
         // so sorting each page by the state-machine rank and applying it
@@ -1171,9 +1241,6 @@ impl GroupStore {
             });
             let max_created = page.last().map(|event| event.created_at);
             for mut event in page {
-                if let Some(gid) = crate::nips::nip29::group_id(&event) {
-                    seen_gids.insert(gid.to_string());
-                }
                 if event.kind == JOIN && vanished.contains(&event.pubkey) {
                     continue;
                 }
@@ -1198,22 +1265,37 @@ impl GroupStore {
                 _ => break,
             }
         }
-        // The relay-signed metadata (39000-39005: name/picture, the admins
-        // and members lists, pins) survives a vanished creator — and is
-        // not part of the moderation walk above. Include its group ids in
-        // the ghost detection, so a private group whose only surviving
-        // events are its metadata cannot become world-readable after a
-        // restart. Walk it in pages like the moderation walk (newest-first
-        // is fine: only the ids are collected, no events are retained): a
-        // relay hosting many groups can hold far more than one page of
-        // metadata, and a truncated walk would silently fail the ghost
-        // detection open (private metadata world-readable).
-        let meta_kinds: Vec<u64> = (GROUP_META..=GROUP_PINS).collect();
+        // A prior id set (the post-vanish rebuild) makes the ghost detection
+        // exact without touching ordinary events: every id the rebuilt store
+        // no longer knows is ghosted from the seed.
+        if let Some(previous) = previous {
+            self.ghost_missing(previous);
+            return true;
+        }
+        // No prior id set: every group id referenced by a stored event must
+        // be known or ghosted. The moderation walk above only sees the
+        // state events; ordinary `h`-tagged posts (and the relay-signed
+        // metadata, which uses `d` tags) are not covered by any kind filter,
+        // and there is no index for "has an h tag", so this walks the whole
+        // history in bounded pages (newest-first: only the ids are
+        // collected, no events are retained). A relay hosting many groups
+        // can hold far more than one page of posts, and a truncated walk
+        // would fail the ghost detection open (private content
+        // world-readable), so any incompleteness aborts the rebuild.
+        //
+        // The h-tagged survivors are tracked separately: a delete tombstone
+        // is normally safe (the relay purged the group's events, which
+        // includes the 9008 itself), but a surviving h-tagged event proves
+        // the purge never completed, so that id must be ghosted instead of
+        // leaving a tombstone a fresh create could clear.
+        let mut seen_gids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut seen_h_gids: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut until: Option<u64> = None;
         loop {
-            let mut filter: Filter =
-                serde_json::from_value(json!({ "kinds": meta_kinds })).expect("static filter");
-            filter.until = until;
+            let filter = Filter {
+                until,
+                ..Default::default()
+            };
             let Some((page, more)) = db
                 .query_full_startup(vec![filter.clone()], PAGE, unix_now(), false)
                 .await
@@ -1235,8 +1317,8 @@ impl GroupStore {
                 // unexamined events of the same timestamp, leaving their
                 // groups out of the ghost detection (fail-open).
                 log::error!(
-                    "group state rebuild aborted: the metadata scan budget was exhausted with \
-                     {} events in the page, so the ghost detection is incomplete",
+                    "group state rebuild aborted: the ghost-detection scan budget was exhausted \
+                     with {} events in the page, so the ghost detection is incomplete",
                     page.len()
                 );
                 return false;
@@ -1245,7 +1327,7 @@ impl GroupStore {
                 let delivered = page.iter().filter(|e| e.created_at == min_created).count();
                 if !boundary_second_complete(db, filter.clone(), min_created, delivered).await {
                     log::error!(
-                        "group state rebuild aborted: the metadata boundary second \
+                        "group state rebuild aborted: the ghost-detection boundary second \
                          {min_created} is not fully collected; the ghost detection is \
                          incomplete"
                     );
@@ -1253,7 +1335,10 @@ impl GroupStore {
                 }
             }
             for event in &page {
-                if let Some(gid) = crate::nips::nip29::group_id_d(event) {
+                if let Some(gid) = crate::nips::nip29::group_id(event) {
+                    seen_gids.insert(gid.to_string());
+                    seen_h_gids.insert(gid.to_string());
+                } else if let Some(gid) = crate::nips::nip29::group_id_d(event) {
                     seen_gids.insert(gid.to_string());
                 }
             }
@@ -1263,15 +1348,31 @@ impl GroupStore {
             until = Some(min_created - 1);
         }
         for gid in seen_gids {
-            if !self.groups.contains_key(&gid) && !self.deleted.contains(&gid) {
-                self.ghost.insert(gid);
+            if self.groups.contains_key(&gid) {
+                continue;
             }
+            // A deleted id whose events are gone is safe to re-create; one
+            // with h-tagged survivors is not (its purge never completed).
+            if self.deleted.contains(&gid) && !seen_h_gids.contains(&gid) {
+                continue;
+            }
+            self.ghost.insert(gid);
         }
         true
     }
 
-    /// Removes a group id from the ghost set once a fresh CREATE_GROUP
-    /// restores it.
+    /// Fail-closed marker for a group whose stored history may still exist:
+    /// the delete's purge has not been confirmed, so a later create must not
+    /// restate the id as a public group (that would make the un-purged
+    /// history readable) and reads stay withheld. Only a confirmed purge
+    /// clears it again (see `unghost`).
+    pub(crate) fn mark_ghost(&mut self, gid: &str) {
+        self.ghost.insert(gid.to_string());
+    }
+
+    /// Removes a group id from the ghost set once its history is confirmed
+    /// purged: the id returns to the ordinary delete tombstone, which a
+    /// fresh create may clear.
     pub(crate) fn unghost(&mut self, gid: &str) {
         self.ghost.remove(gid);
     }
@@ -1293,11 +1394,16 @@ pub(crate) fn event_code(event: &Event) -> Option<&str> {
 }
 
 /// Validates the subgroup rules of a `kind:9002` edit-metadata event.
+/// `relay_signed` marks an event from the relay's own key, which NIP-29
+/// treats as the group master key: it is an implicit admin of every group
+/// (see `validate_write_for_relay`), so the group-admin requirements below
+/// do not apply to it.
 fn validate_edit_metadata(
     store: &GroupStore,
     gid: &str,
     _group: &Group,
     event: &Event,
+    relay_signed: bool,
 ) -> anyhow::Result<()> {
     // NIP-29: "A kind:9002 MAY carry at most one parent tag". A second
     // parent tag would be silently ignored (only the first is applied), so
@@ -1361,7 +1467,10 @@ fn validate_edit_metadata(
             .groups
             .get(&parent)
             .ok_or_else(|| anyhow!("restricted: parent group does not exist"))?;
-        if !parent_group.is_admin(event.pubkey.as_str()) {
+        // The relay's own key is an implicit admin of every group (NIP-29:
+        // the relay master key may manage groups), so a relay-signed 9002
+        // must be able to reparent or adopt without an explicit role.
+        if !relay_signed && !parent_group.is_admin(event.pubkey.as_str()) {
             bail!("restricted: you are not an admin of the parent group");
         }
     }
@@ -1386,7 +1495,8 @@ fn validate_edit_metadata(
         if _group.children.iter().any(|c| c == child) {
             continue;
         }
-        if let Some(child_group) = store.groups.get(child)
+        if !relay_signed
+            && let Some(child_group) = store.groups.get(child)
             && child_group.parent.as_deref() != Some(gid)
             && !child_group.is_admin(event.pubkey.as_str())
         {

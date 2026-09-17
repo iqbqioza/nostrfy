@@ -57,12 +57,12 @@ pub struct Relay {
     live_batch_interval_ms: u64,
     live_batch_size: usize,
     pub groups: Arc<RwLock<GroupStore>>,
-    /// Set when a post-vanish group rebuild failed: the in-memory state is
-    /// stale (state derived from the vanished author's events may survive),
-    /// so `persist_groups` must not save it — the persisted snapshot is
-    /// dropped instead and the next startup rebuilds from the surviving
-    /// events.
-    groups_rebuild_pending: std::sync::atomic::AtomicBool,
+    /// The coalesced NIP-29 group rebuild that follows a vanish, NIP-09
+    /// deletion or expiry of group-state events: `pending` is set when the
+    /// in-memory state is known stale, so `persist_groups` must not save it
+    /// (the persisted snapshot is dropped instead and the next startup
+    /// rebuilds from the surviving events).
+    groups_rebuild: std::sync::Arc<GroupsRebuild>,
     /// NIP-43 role definitions and member assignments.
     pub roles: Arc<RwLock<RoleStore>>,
     /// Limits concurrent `/api/v1` queries so a flood of REST traffic
@@ -84,6 +84,10 @@ pub struct Relay {
     /// other, or the older snapshot lands last and loses the newer entry
     /// (a ban silently disappearing on the next restart).
     persist_access_lock: tokio::sync::Mutex<()>,
+    /// Serializes `persist_roles` snapshot capture and write (same hazard
+    /// as `persist_access_lock`: a stale role snapshot must not overwrite a
+    /// newer one). `persist_groups` uses `GroupsRebuild::persist_lock`.
+    persist_roles_lock: tokio::sync::Mutex<()>,
     /// NIP-86 blockip/unblockip: every list change notifies each
     /// connection's watcher, so established read-only subscribers (which
     /// never send a frame) are disconnected too — a version counter could
@@ -183,6 +187,179 @@ impl StampClock {
                 Err(actual) => cur = actual,
             }
         }
+    }
+}
+
+/// Minimum seconds between two completed post-vanish group rebuilds. A
+/// vanish is exempt from the publish rate limit, so any keypair can trigger
+/// one; without a floor a burst of vanishes (or an attacker cycling fresh
+/// keys through create-and-vanish) would run a full-history scan per event.
+/// Requests arriving inside the window coalesce into the next scan via the
+/// dirty flag.
+const GROUPS_REBUILD_MIN_INTERVAL_SECS: u64 = 2;
+
+/// Coordination state for the coalesced NIP-29 group rebuild that follows a
+/// vanish (or another removal of group-state-relevant events). Kept in an
+/// `Arc` so the background worker can run without borrowing the relay.
+struct GroupsRebuild {
+    /// At least one removal happened since the last completed rebuild.
+    dirty: std::sync::atomic::AtomicBool,
+    /// A worker task owns (or is about to own) the rebuild loop: triggers
+    /// only set the flags.
+    running: std::sync::atomic::AtomicBool,
+    /// The in-memory state is known stale: persisted snapshots must be
+    /// dropped until a rebuild completes (fail-closed).
+    pending: std::sync::atomic::AtomicBool,
+    /// Unix seconds of the last attempt, the minimum-interval floor.
+    last: std::sync::atomic::AtomicU64,
+    /// Completed scans, for tests asserting that a burst coalesces.
+    rebuilds: std::sync::atomic::AtomicU64,
+    /// Single-flight token: only the task that takes it drains the loop.
+    lock: tokio::sync::Mutex<()>,
+    /// Serializes snapshot capture and write (like `persist_access_lock`):
+    /// without it a mutation that captured an older snapshot could queue its
+    /// write after a newer one and overwrite it, and a snapshot from before
+    /// a vanish could land after the post-vanish clear.
+    persist_lock: tokio::sync::Mutex<()>,
+}
+
+impl Default for GroupsRebuild {
+    fn default() -> Self {
+        GroupsRebuild {
+            dirty: std::sync::atomic::AtomicBool::new(false),
+            running: std::sync::atomic::AtomicBool::new(false),
+            pending: std::sync::atomic::AtomicBool::new(false),
+            last: std::sync::atomic::AtomicU64::new(0),
+            rebuilds: std::sync::atomic::AtomicU64::new(0),
+            lock: tokio::sync::Mutex::new(()),
+            persist_lock: tokio::sync::Mutex::new(()),
+        }
+    }
+}
+
+impl GroupsRebuild {
+    /// Persists the current group state, dropping the snapshot when the
+    /// state is known stale. The re-check *follows* the snapshot: a vanish
+    /// that marked the state stale in between must not have pre-vanish
+    /// state written out. Holding the lock across capture and write keeps a
+    /// stale snapshot from landing after a newer one.
+    async fn persist(&self, db: &DbClient, groups: &RwLock<GroupStore>) {
+        let _guard = self.persist_lock.lock().await;
+        if self.pending.load(Ordering::SeqCst) {
+            db.clear_groups_snapshot().await;
+            return;
+        }
+        let snapshot = groups.read().await.snapshot();
+        if self.pending.load(Ordering::SeqCst) {
+            db.clear_groups_snapshot().await;
+            return;
+        }
+        db.save_groups(snapshot).await;
+    }
+}
+
+/// Marks the group state stale and schedules the coalesced background
+/// rebuild (single-flight via the state's lock and the `running` flag).
+fn schedule_groups_rebuild(
+    db: DbClient,
+    groups: std::sync::Arc<RwLock<GroupStore>>,
+    config: std::sync::Arc<RwLock<Config>>,
+    state: std::sync::Arc<GroupsRebuild>,
+) {
+    if state.running.swap(true, Ordering::SeqCst) {
+        // A worker is already draining; it re-checks the dirty flag before
+        // it exits, so this request is covered.
+        return;
+    }
+    tokio::spawn(groups_rebuild_worker(db, groups, config, state));
+}
+
+/// The coalesced group-state rebuild worker. Holds the single-flight lock,
+/// drains the dirty flag (running at most one scan per
+/// [`GROUPS_REBUILD_MIN_INTERVAL_SECS`]), and swaps in the rebuilt store.
+/// The rebuild still holds `groups.write()` so group events stored while
+/// the scan runs apply to the rebuilt store after the swap instead of being
+/// lost with the discarded one; the vanish accept path only marks the state
+/// dirty, so no request blocks on the scan.
+async fn groups_rebuild_worker(
+    db: DbClient,
+    groups: std::sync::Arc<RwLock<GroupStore>>,
+    config: std::sync::Arc<RwLock<Config>>,
+    state: std::sync::Arc<GroupsRebuild>,
+) {
+    {
+        // Scope the single-flight guard so it is released before the
+        // trailing re-schedule below (which may move `state`).
+        let _single_flight = state.lock.lock().await;
+        loop {
+            if !state.dirty.swap(false, Ordering::SeqCst) {
+                break;
+            }
+            // The first scan runs immediately (`last == 0`); later requests
+            // wait out the remainder of the interval. Requests that arrive
+            // while waiting coalesce into this rebuild (the flag is drained
+            // above, and any later trigger sets it again).
+            let elapsed = unix_now().saturating_sub(state.last.load(Ordering::Relaxed));
+            if elapsed < GROUPS_REBUILD_MIN_INTERVAL_SECS {
+                tokio::time::sleep(std::time::Duration::from_secs(
+                    GROUPS_REBUILD_MIN_INTERVAL_SECS - elapsed,
+                ))
+                .await;
+            }
+            // Read the cap before taking the group lock: the accept paths take
+            // `config.read` and then `groups.read`, so the worker must not hold
+            // `groups.write` while awaiting `config.read`.
+            let cap = config.read().await.relay.max_groups;
+            let mut fresh = GroupStore::with_cap(cap);
+            let rebuilt = {
+                let mut store = groups.write().await;
+                // The ids known before the rebuild seed the ghost detection:
+                // groups the removed events took out of the store are gone from
+                // the rebuilt one, but their surviving ordinary posts must not
+                // become world-readable on a keyless relay.
+                let previous = store.hidden_group_ids();
+                let ok = fresh.rebuild_after_vanish(&db, previous).await;
+                if ok {
+                    *store = fresh;
+                }
+                ok
+            };
+            state
+                .last
+                .store(unix_now(), std::sync::atomic::Ordering::Relaxed);
+            state
+                .rebuilds
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if rebuilt {
+                // Only mark the store current when no further removal arrived
+                // while the scan ran: otherwise the next iteration rebuilds
+                // again and the snapshot stays dropped (fail-closed) until that
+                // rebuild completes.
+                if !state.dirty.load(Ordering::SeqCst) {
+                    state.pending.store(false, Ordering::SeqCst);
+                    if state.dirty.load(Ordering::SeqCst) {
+                        // A removal marked the state stale while the flag was
+                        // being cleared: keep it fail-closed; the loop rebuilds
+                        // again.
+                        state.pending.store(true, Ordering::SeqCst);
+                    }
+                }
+                state.persist(&db, &groups).await;
+            } else {
+                log::error!(
+                    "group state rebuild after a vanish failed; dropping the persisted \
+                 snapshot so the next restart rebuilds from the surviving events"
+                );
+                state.pending.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+    // Release the single-flight claim, then re-check: a trigger that set the
+    // dirty flag between the last swap and this release saw `running ==
+    // true` and did not spawn, so it must not be lost.
+    state.running.store(false, Ordering::SeqCst);
+    if state.dirty.load(Ordering::SeqCst) {
+        schedule_groups_rebuild(db, groups, config, state);
     }
 }
 
@@ -407,12 +584,13 @@ impl Relay {
             groups: Arc::new(RwLock::new(GroupStore::with_cap(
                 config.read().await.relay.max_groups,
             ))),
-            groups_rebuild_pending: std::sync::atomic::AtomicBool::new(false),
+            groups_rebuild: std::sync::Arc::new(GroupsRebuild::default()),
             roles: Arc::new(RwLock::new(RoleStore::default())),
             api_limit: ApiLimiter::new(api_max_concurrent),
             publish_rate: std::sync::Mutex::new(HashMap::new()),
             publish_rate_pruned_at: std::sync::atomic::AtomicU64::new(0),
             persist_access_lock: tokio::sync::Mutex::new(()),
+            persist_roles_lock: tokio::sync::Mutex::new(()),
             ip_blocks_tx: tokio::sync::watch::channel(0).0,
             config_version: AtomicU64::new(0),
             drain_tx: tokio::sync::watch::channel(false).0,
@@ -1015,6 +1193,7 @@ impl Relay {
         (nip29::MOD_MIN..=nip29::MOD_MAX).contains(&event.kind)
             || event.kind == nip29::JOIN
             || event.kind == nip29::LEAVE
+            || event.kind == nip43::LEAVE
             || nip62::is_vanish(event)
             || (event.kind == 1 && self.relay_pubkey.as_deref() == Some(event.pubkey.as_str()))
     }
@@ -1260,6 +1439,15 @@ impl Relay {
         nip29_enabled: bool,
     ) -> bool {
         if nip9 && event.kind == nip09::DELETION_KIND {
+            // NIP-29/NIP-43: a deletion that removes state events
+            // (moderation, join/leave, role state) invalidates the derived
+            // state, exactly like a vanish. The targets are gone once the
+            // deletion applies, so the relevance check must run first; a
+            // failed lookup fails closed (the rebuild runs even if the
+            // targets turn out unrelated). Deleting ordinary posts does not
+            // touch the derived state and takes no rebuild.
+            let touches_group_state =
+                (nip29_enabled || nip43) && self.deletion_touches_group_state(&event).await;
             match self
                 .db
                 .apply_deletion_checked(
@@ -1270,7 +1458,15 @@ impl Relay {
                 )
                 .await
             {
-                Some(removed) => self.stats.bump(&self.stats.events_deleted, removed as u64),
+                Some(removed) => {
+                    self.stats.bump(&self.stats.events_deleted, removed as u64);
+                    if touches_group_state && removed > 0 {
+                        // The live state still holds state derived from the
+                        // deleted events: mark it stale and let the
+                        // coalesced background worker rebuild.
+                        self.mark_group_state_stale().await;
+                    }
+                }
                 None => {
                     // The deletion event stored but its side effect was
                     // dropped (writer overload): make it visible instead of
@@ -1319,27 +1515,117 @@ impl Relay {
     /// Fire-and-forget: a failed commit only logs (the next mutation
     /// retries the full snapshot).
     ///
-    /// A failed post-vanish rebuild marks the live state as stale
-    /// (`groups_rebuild_pending`): the snapshot is dropped instead of
-    /// saved, so the next startup rebuilds from the surviving events
-    /// rather than restoring state that predates the vanish.
+    /// Stale state is never persisted: while a post-vanish/NIP-09/expiry
+    /// rebuild is pending the snapshot is dropped instead, so the next
+    /// startup rebuilds from the surviving events rather than restoring
+    /// state that predates the removals. The snapshot and the write are
+    /// serialized (`GroupsRebuild::persist_lock`) so an older snapshot
+    /// cannot land after a newer one.
     pub(crate) async fn persist_groups(&self) {
-        if self
-            .groups_rebuild_pending
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
-            self.db.clear_groups_snapshot().await;
-            return;
-        }
-        let snapshot = self.groups.read().await.snapshot();
-        self.db.save_groups(snapshot).await;
+        self.groups_rebuild.persist(&self.db, &self.groups).await;
     }
 
     /// Persists the live NIP-43 role state (same lifecycle as
-    /// [`Self::persist_groups`]).
+    /// [`Self::persist_groups`]). The lock keeps a stale snapshot from
+    /// overwriting a newer one: two concurrent mutations could otherwise
+    /// capture snapshots in one order and queue their writes in the other.
     pub(crate) async fn persist_roles(&self) {
+        let _guard = self.persist_roles_lock.lock().await;
         let snapshot = self.roles.read().await.snapshot();
         self.db.save_roles(snapshot).await;
+    }
+
+    /// Whether `event` may remove events the NIP-29/NIP-43 derived state is
+    /// built from (moderation, join/leave and role state kinds). `a`-tag
+    /// addresses carry their kind directly; `e`-tag targets are looked up in
+    /// the database because the deletion removes them. A failed lookup fails
+    /// closed: the state is rebuilt even if the targets turn out unrelated.
+    async fn deletion_touches_group_state(&self, event: &Event) -> bool {
+        fn is_state_kind(kind: u64) -> bool {
+            (nip29::MOD_MIN..=nip29::MOD_MAX).contains(&kind)
+                || kind == nip29::JOIN
+                || kind == nip29::LEAVE
+                || matches!(
+                    kind,
+                    nip43::ROLE_DEFINITION
+                        | nip43::MEMBERSHIP_LIST
+                        | nip43::ADD_USER
+                        | nip43::REMOVE_USER
+                        | nip43::JOIN
+                        | nip43::LEAVE
+                )
+        }
+        if nip09::deletion_addresses(event)
+            .iter()
+            .any(|address| is_state_kind(address.kind))
+        {
+            return true;
+        }
+        let targets = nip09::deletion_targets(event);
+        if targets.is_empty() {
+            return false;
+        }
+        let mut kinds: Vec<u64> = (nip29::MOD_MIN..=nip29::MOD_MAX)
+            .chain([nip29::JOIN, nip29::LEAVE])
+            .collect();
+        kinds.extend([
+            nip43::ROLE_DEFINITION,
+            nip43::MEMBERSHIP_LIST,
+            nip43::ADD_USER,
+            nip43::REMOVE_USER,
+            nip43::JOIN,
+            nip43::LEAVE,
+        ]);
+        let filter = crate::filter::Filter {
+            ids: Some(targets),
+            kinds: Some(kinds),
+            ..Default::default()
+        };
+        match self
+            .db
+            .query_full_startup(vec![filter], 1, unix_now(), false)
+            .await
+        {
+            Some((events, _)) => !events.is_empty(),
+            // The database did not answer: assume the deletion matters.
+            None => true,
+        }
+    }
+
+    /// Marks the in-memory group state as stale after events it derives
+    /// from were removed (NIP-62 vanish, NIP-09 deletion, NIP-40 expiry)
+    /// and schedules the coalesced background rebuild. The persisted
+    /// snapshot is dropped immediately: it predates the removals, so a
+    /// crash before the rebuild completes must not restore it. The accept
+    /// path never blocks on the rebuild scan (see `groups_rebuild_worker`).
+    pub(crate) async fn mark_group_state_stale(&self) {
+        self.groups_rebuild.dirty.store(true, Ordering::SeqCst);
+        self.groups_rebuild.pending.store(true, Ordering::SeqCst);
+        self.persist_groups().await;
+        schedule_groups_rebuild(
+            self.db.clone(),
+            Arc::clone(&self.groups),
+            Arc::clone(&self.config),
+            Arc::clone(&self.groups_rebuild),
+        );
+    }
+
+    /// Whether a `kind:9008` group purge committed. The purge API reports a
+    /// failure as zero removed (indistinguishable from "nothing to purge"),
+    /// so the id is confirmed clean only when no stored `h`-tagged event
+    /// remains. A failed or truncated query fails closed: the id stays
+    /// ghosted rather than becoming re-creatable with its history intact.
+    async fn group_purge_confirmed(&self, gid: &str) -> bool {
+        let filter: crate::filter::Filter =
+            serde_json::from_value(serde_json::json!({ "#h": [gid] })).expect("static filter");
+        match self
+            .db
+            .query_full_startup(vec![filter], 1, unix_now(), false)
+            .await
+        {
+            Some((events, more)) => !more && events.is_empty(),
+            None => false,
+        }
     }
 
     /// NIP-62: deletes every event by `pubkey` and relinks the NIP-29 group
@@ -1350,11 +1636,13 @@ impl Relay {
     /// (settings edits, invites, pins, parent links, create/delete) are gone
     /// from the database, so their derived state must go too, and a group
     /// whose create event was deleted becomes a ghost (content withheld)
-    /// instead of turning world-readable. The rebuild holds the group lock
-    /// so group events arriving meanwhile (already stored) apply to the
-    /// rebuilt store after the swap. If the rebuild fails, the persisted
-    /// snapshot is dropped and the next startup rebuilds (fail-closed)
-    /// instead of restoring the stale state.
+    /// instead of turning world-readable. The rebuild runs in the coalesced
+    /// background worker (see [`Self::mark_group_state_stale`]): repeated
+    /// vanishes do not each pay for a full-history scan. The rebuild holds
+    /// the group lock so group events arriving meanwhile (already stored)
+    /// apply to the rebuilt store after the swap; the persisted snapshot is
+    /// dropped (fail-closed) until it completes, so a crash in between
+    /// rebuilds on the next startup instead of restoring the stale state.
     async fn vanish_pubkey(&self, pubkey: [u8; 32], until_created: u64) {
         let pubkey_hex = hex::encode(pubkey);
         let (removed, group_state_removed) =
@@ -1374,42 +1662,13 @@ impl Relay {
             if group_state_removed {
                 // A moderation/join/leave event was removed: the derived
                 // state (settings, pins, members, invites) must be rebuilt
-                // from the surviving history. Ordinary posts do not affect
-                // it, so they take the cheap path below instead of scanning
-                // the whole group history under the group write lock.
-                let cap = self.config.read().await.relay.max_groups;
-                let mut fresh = GroupStore::with_cap(cap);
-                let rebuilt = {
-                    // Hold the group lock across the rebuild: group events
-                    // that arrive meanwhile have already been stored, so
-                    // they wait here and apply to the rebuilt store after
-                    // the swap instead of being lost with the discarded one.
-                    let mut groups = self.groups.write().await;
-                    // Groups the vanished author's events may have removed:
-                    // after the rebuild they are gone from the store, but
-                    // their surviving ordinary posts must not become
-                    // world-readable on a keyless relay (no relay-signed
-                    // metadata survives to mark them). Ghost them.
-                    let previous = groups.hidden_group_ids();
-                    let ok = fresh.rebuild(&self.db).await;
-                    if ok {
-                        fresh.ghost_missing(previous);
-                        *groups = fresh;
-                    }
-                    ok
-                };
-                if rebuilt {
-                    self.groups_rebuild_pending
-                        .store(false, std::sync::atomic::Ordering::Relaxed);
-                } else {
-                    log::error!(
-                        "group state rebuild after vanish failed; dropping the persisted \
-                         snapshot so the next restart rebuilds from the surviving events"
-                    );
-                    self.groups_rebuild_pending
-                        .store(true, std::sync::atomic::Ordering::Relaxed);
-                }
-                self.persist_groups().await;
+                // from the surviving history. The rebuild is a full-history
+                // scan and vanishes are exempt from the publish rate limit,
+                // so any fresh keypair could otherwise stall every group
+                // write on the group lock; mark the state stale and let the
+                // coalesced background worker rebuild instead (the snapshot
+                // is dropped fail-closed until it completes).
+                self.mark_group_state_stale().await;
             } else {
                 // A replayed vanish, one that removed nothing, or one that
                 // only deleted ordinary posts: the live state only needs the
@@ -1456,6 +1715,19 @@ impl Relay {
         // the future would make it invisible to `until: now` scans and,
         // after a restart, unreplaceable until the wall clock catches up.
         let stamp = self.stamp_floor(now);
+        // A `kind:9008` purge may fail (or the process may crash before it
+        // commits). The delete tombstone alone would let a later create
+        // clear it and expose the un-purged history, so the id is ghosted
+        // *before* the delete is applied and persisted: the persisted
+        // snapshot stays fail-closed even if the purge never completes. The
+        // ghost is downgraded to the ordinary tombstone only after the purge
+        // is confirmed (below).
+        if event.kind == nip29::DELETE_GROUP
+            && let Some(gid) = nip29::group_id(event)
+        {
+            self.groups.write().await.mark_ghost(gid);
+            self.persist_groups().await;
+        }
         let generated = self.groups.write().await.apply(
             event,
             &relay_pubkey,
@@ -1486,9 +1758,22 @@ impl Relay {
         {
             // NIP-29: purge the deleted group's stored events. A fresh
             // create on the same id installs a public group, which would
-            // otherwise expose the old (possibly private) history.
+            // otherwise expose the old (possibly private) history. The
+            // purge reports a failure as zero removed, so success is
+            // confirmed by the state below: only then does the id return to
+            // the ordinary delete tombstone (which a create may clear).
             let removed = self.db.group_purge(gid.to_string()).await;
             self.stats.bump(&self.stats.events_deleted, removed as u64);
+            if self.group_purge_confirmed(gid).await {
+                // The history is gone: the id may be re-created normally.
+                self.groups.write().await.unghost(gid);
+                self.persist_groups().await;
+            } else {
+                log::error!(
+                    "group purge for {gid} was not confirmed; keeping the id ghosted so a \
+                     re-create cannot expose the un-purged history"
+                );
+            }
         }
 
         // One moderation event can generate several versions of the same
@@ -2292,6 +2577,19 @@ mod tests {
                 serde_json::from_value(serde_json::json!({"#h": ["g1"]})).unwrap();
             let (res, _) = relay.db.query(vec![f], 10, now).await;
             assert!(res.is_empty(), "the deleted group's events must be purged");
+            // The purge was confirmed, so the fail-closed ghost was
+            // downgraded to the ordinary tombstone: the id is re-creatable.
+            // (A distinct content gives the re-create a fresh event id; the
+            // purged history's ids stay tombstoned.)
+            let recreate = signed(crate::nips::nip29::CREATE_GROUP, "recreate");
+            assert!(matches!(
+                relay.accept_event(recreate, &[], None).await,
+                crate::db::PutOutcome::Stored
+            ));
+            assert!(
+                relay.groups.read().await.group("g1").is_some(),
+                "a confirmed purge must leave the id re-creatable"
+            );
             relay.db.shutdown();
         });
     }
@@ -2934,5 +3232,307 @@ mod tests {
         let doc = relay.relay_info_document().await;
         assert_eq!(doc["stats"]["events"]["accepted"].as_u64(), Some(5));
         relay.db.shutdown();
+    }
+
+    #[test]
+    fn repeated_vanishes_coalesce_the_rebuild() {
+        // A vanish is exempt from the publish rate limit, so any keypair can
+        // trigger the post-vanish rebuild. The coalesced worker must run one
+        // scan for a burst of vanishes (not one per event) and still
+        // converge on the surviving state.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            use crate::db::PutOutcome;
+
+            let relay = build_relay().await;
+            let now = crate::util::unix_now();
+            let secp = secp256k1::Secp256k1::new();
+            let sign = |seed: u8, gid: &str| {
+                let keypair = secp256k1::Keypair::from_seckey_slice(&secp, &[seed; 32]).unwrap();
+                let mut e = crate::event::Event {
+                    id: String::new(),
+                    pubkey: secp256k1::XOnlyPublicKey::from_keypair(&keypair)
+                        .0
+                        .to_string(),
+                    created_at: now,
+                    kind: crate::nips::nip29::CREATE_GROUP,
+                    tags: vec![vec!["h".into(), gid.into()]],
+                    content: String::new(),
+                    sig: String::new(),
+                };
+                e.id = crate::nips::nip01::compute_id(&e);
+                let id = e.id_bytes().unwrap();
+                e.sig = secp.sign_schnorr_no_aux_rand(&id, &keypair).to_string();
+                e
+            };
+            let gids = ["g0", "g1", "g2", "g3", "g4"];
+            let mut events = Vec::new();
+            for (i, gid) in gids.iter().enumerate() {
+                let ev = sign(30 + i as u8, gid);
+                assert_eq!(relay.db.put(ev.clone(), now).await, PutOutcome::Stored);
+                relay.groups.write().await.apply(&ev, "", now, false, false);
+                events.push(ev);
+            }
+            // All five vanish in a burst: each removes its creator's 9007,
+            // so each is a non-no-op that used to run a full scan inline.
+            for ev in &events {
+                relay
+                    .vanish_pubkey(ev.pubkey_bytes().unwrap(), ev.created_at)
+                    .await;
+            }
+            let mut converged = false;
+            for _ in 0..600 {
+                if !relay
+                    .groups_rebuild
+                    .pending
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    converged = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert!(converged, "the coalesced rebuild must converge");
+            let state = relay.groups.read().await;
+            assert!(state.groups.is_empty(), "every group lost its create");
+            let hidden = state.hidden_group_ids();
+            for gid in gids {
+                assert!(
+                    hidden.iter().any(|id| id == gid),
+                    "{gid} must be ghosted after the rebuild"
+                );
+            }
+            drop(state);
+            let scans = relay
+                .groups_rebuild
+                .rebuilds
+                .load(std::sync::atomic::Ordering::Relaxed);
+            assert!(
+                scans < gids.len() as u64,
+                "a burst of vanishes must coalesce into fewer scans, got {scans}"
+            );
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn concurrent_group_persists_keep_every_group() {
+        // Snapshot capture and write are serialized: without the lock a
+        // mutation that captured an older snapshot could queue its write
+        // after a newer one, silently dropping a group from the persisted
+        // state on the next restart.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_relay().await;
+            let now = crate::util::unix_now();
+            let create = |gid: &str| {
+                let mut e = crate::event::Event {
+                    id: String::new(),
+                    pubkey: "aa".repeat(32),
+                    created_at: now,
+                    kind: crate::nips::nip29::CREATE_GROUP,
+                    tags: vec![vec!["h".into(), gid.into()]],
+                    content: String::new(),
+                    sig: String::new(),
+                };
+                e.id = crate::nips::nip01::compute_id(&e);
+                e
+            };
+            for i in 0..32u32 {
+                let a = format!("a{i:02}");
+                let b = format!("b{i:02}");
+                let ev_a = create(&a);
+                let ev_b = create(&b);
+                let ra = relay.clone();
+                let rb = relay.clone();
+                let (a2, b2) = (a.clone(), b.clone());
+                let ta = tokio::spawn(async move {
+                    ra.groups.write().await.apply(&ev_a, "", now, false, false);
+                    ra.persist_groups().await;
+                });
+                let tb = tokio::spawn(async move {
+                    rb.groups.write().await.apply(&ev_b, "", now, false, false);
+                    rb.persist_groups().await;
+                });
+                ta.await.unwrap();
+                tb.await.unwrap();
+                let snap = relay.db.load_groups().await.expect("snapshot persisted");
+                assert!(
+                    snap.groups.contains_key(&a2) && snap.groups.contains_key(&b2),
+                    "iteration {i} lost a group: {} persisted",
+                    snap.groups.len()
+                );
+            }
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn persist_groups_drops_the_snapshot_while_the_rebuild_is_pending() {
+        // A snapshot from before a vanish must not survive the state being
+        // marked stale (a crash before the rebuild would restore it).
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_relay().await;
+            let now = crate::util::unix_now();
+            let mut create = crate::event::Event {
+                id: String::new(),
+                pubkey: "aa".repeat(32),
+                created_at: now,
+                kind: crate::nips::nip29::CREATE_GROUP,
+                tags: vec![vec!["h".into(), "g1".into()]],
+                content: String::new(),
+                sig: String::new(),
+            };
+            create.id = crate::nips::nip01::compute_id(&create);
+            relay
+                .groups
+                .write()
+                .await
+                .apply(&create, "", now, false, false);
+            relay.persist_groups().await;
+            assert!(relay.db.load_groups().await.is_some());
+
+            relay
+                .groups_rebuild
+                .pending
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            relay.persist_groups().await;
+            assert!(
+                relay.db.load_groups().await.is_none(),
+                "a stale-state snapshot must be dropped, not saved"
+            );
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn has_state_effects_includes_nip43_leave() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_relay().await;
+            let leave = crate::event::Event {
+                id: String::new(),
+                pubkey: "aa".repeat(32),
+                created_at: crate::util::unix_now(),
+                kind: crate::nips::nip43::LEAVE,
+                tags: Vec::new(),
+                content: String::new(),
+                sig: String::new(),
+            };
+            assert!(
+                relay.has_state_effects(&leave),
+                "a NIP-43 LEAVE mutates role state and must order in batches"
+            );
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn deleting_a_moderation_event_revokes_the_derived_group_state() {
+        // NIP-09: deleting the 9002 that made a group private must revoke
+        // the in-memory setting (the state is rebuilt from the survivors),
+        // not merely remove the stored event.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            use crate::db::PutOutcome;
+
+            let relay = build_relay().await;
+            let now = crate::util::unix_now();
+            let secp = secp256k1::Secp256k1::new();
+            let keypair = secp256k1::Keypair::from_seckey_slice(&secp, &[4u8; 32]).unwrap();
+            let pubkey = secp256k1::XOnlyPublicKey::from_keypair(&keypair)
+                .0
+                .to_string();
+            let signed = |kind: u64, tags: Vec<Vec<String>>| {
+                let mut e = crate::event::Event {
+                    id: String::new(),
+                    pubkey: pubkey.clone(),
+                    created_at: now,
+                    kind,
+                    tags,
+                    content: String::new(),
+                    sig: String::new(),
+                };
+                e.id = crate::nips::nip01::compute_id(&e);
+                let id = e.id_bytes().unwrap();
+                e.sig = secp.sign_schnorr_no_aux_rand(&id, &keypair).to_string();
+                e
+            };
+            let mut create = signed(crate::nips::nip29::CREATE_GROUP, Vec::new());
+            create.tags.push(vec!["h".into(), "g1".into()]);
+            create.id = crate::nips::nip01::compute_id(&create);
+            let id = create.id_bytes().unwrap();
+            create.sig = secp.sign_schnorr_no_aux_rand(&id, &keypair).to_string();
+            assert!(matches!(
+                relay.accept_event(create, &[], None).await,
+                PutOutcome::Stored
+            ));
+            let mut edit = signed(9002, vec![vec!["private".into()]]);
+            edit.tags.push(vec!["h".into(), "g1".into()]);
+            edit.id = crate::nips::nip01::compute_id(&edit);
+            let id = edit.id_bytes().unwrap();
+            edit.sig = secp.sign_schnorr_no_aux_rand(&id, &keypair).to_string();
+            let edit_id = edit.id.clone();
+            assert!(matches!(
+                relay.accept_event(edit, &[], None).await,
+                PutOutcome::Stored
+            ));
+            assert!(
+                relay
+                    .groups
+                    .read()
+                    .await
+                    .group("g1")
+                    .unwrap()
+                    .settings
+                    .private
+            );
+            // The author deletes the 9002: the derived setting must go too.
+            let deletion = signed(5, vec![vec!["e".into(), edit_id]]);
+            assert!(matches!(
+                relay.accept_event(deletion, &[], None).await,
+                PutOutcome::Stored
+            ));
+            let mut converged = false;
+            for _ in 0..600 {
+                if !relay
+                    .groups_rebuild
+                    .pending
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    converged = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert!(converged, "the deletion must trigger the rebuild");
+            assert!(
+                !relay
+                    .groups
+                    .read()
+                    .await
+                    .group("g1")
+                    .unwrap()
+                    .settings
+                    .private,
+                "the deleted 9002's private setting must be revoked"
+            );
+            relay.db.shutdown();
+        });
+    }
+
+    #[tokio::test]
+    async fn relay_allow_command_reports_persistence_failure() {
+        let relay = build_relay().await;
+        // The writer is gone: the mutation applies in memory but cannot be
+        // persisted, and the reply must say so instead of `ok:`.
+        relay.db.shutdown();
+        let text = relay
+            .execute_command(&crate::relay::commands::Command::RelayAllow(
+                "aa".repeat(32),
+            ))
+            .await;
+        assert!(text.starts_with("error:"), "{text}");
     }
 }

@@ -401,11 +401,11 @@ cp -a ./data ./data-backup
 
 ## 6. Daemon Operation
 
-### 6-1. `nostrfy stats` says `nostrfy is not running (no stats file)`
+### 6-1. `nostrfy stats` says the daemon is not running or the statistics are stale
 
-**Cause**: The stats file does not exist — the daemon is not running, or it started less than a few seconds ago.
+**Cause**: The stats file does not exist (the daemon never ran), the pid file's process is gone, or the snapshot is older than three `stats_interval_secs` intervals. `nostrfy stats` refuses to print counters that no running daemon is refreshing.
 
-**Fix**: Run `nostrfy start`, wait a few seconds, and try again.
+**Fix**: Run `nostrfy start` (or `restart`), wait at least one `stats_interval_secs`, and try again. If the daemon is running but the snapshot stays stale, check the log for stats-writer errors (e.g. an unwritable `daemon.stats_file`).
 
 ### 6-2. The log grows without bound
 
@@ -415,9 +415,9 @@ cp -a ./data ./data-backup
 
 ### 6-3. Changes to the config do not take effect after reload
 
-**Cause**: You reloaded (SIGHUP) settings that are fixed at startup: `private_key`, `api_host`, `metrics_enabled`, LiveKit settings, and the NIP enable/disable lists.
+**Cause**: You reloaded (SIGHUP) settings that are fixed at startup (e.g. `private_key`, `api_host`, `metrics_enabled`, LiveKit settings, the NIP enable/disable lists). The reload is not all-or-nothing: the live settings in the same file were applied, while each startup-only setting kept its running value.
 
-**Fix**: Use `nostrfy restart`. The log contains a "a restart is required" warning in this case.
+**Fix**: Use `nostrfy restart` for the keys named in the warning. The log contains a "a restart is required to apply it" line per changed startup-only key.
 
 ### 6-4. The relay keeps dying by itself
 

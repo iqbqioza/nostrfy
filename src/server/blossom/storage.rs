@@ -51,6 +51,47 @@ pub(crate) enum BlobStream {
 /// One legacy-migration row: (sha256, mime, size, uploaded, hex pubkey).
 type LegacyEntry = (String, String, u64, i64, String);
 
+/// A failure caused by the database being unavailable, not by the blob
+/// backend. The handlers map it to a retryable 503 instead of a 404 (which
+/// would hide an existing blob) or a 500 (which reads as a storage fault).
+/// The database layer cannot type these failures (its unchecked variants
+/// degrade to defaults), so the checked paths tag them here.
+#[derive(Debug)]
+pub(crate) struct DbUnavailable;
+
+impl std::fmt::Display for DbUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("database unavailable")
+    }
+}
+
+impl std::error::Error for DbUnavailable {}
+
+fn db_unavailable() -> anyhow::Error {
+    anyhow::Error::new(DbUnavailable)
+}
+
+/// A new owner past the per-blob cap. This is a client-visible conflict
+/// (the database refuses the same add), not an internal fault: the handler
+/// answers 409 instead of the generic 500.
+#[derive(Debug)]
+pub(crate) struct BlobOwnerLimit;
+
+impl std::fmt::Display for BlobOwnerLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the blob already has the maximum number of owners")
+    }
+}
+
+impl std::error::Error for BlobOwnerLimit {}
+
+/// Mirror of the per-blob owner cap in the database layer
+/// (`MAX_BLOB_OWNERS` in src/db/store.rs, deliberately not exported).
+/// Pre-checking here only decides the HTTP status; the database still
+/// enforces the real cap, so a drift degrades the status to 500, never
+/// correctness.
+const MAX_BLOB_OWNERS: usize = 64;
+
 /// Blob storage: the LMDB-persisted mapping plus the file backend.
 pub(crate) struct BlobStore {
     storage: Storage,
@@ -104,13 +145,26 @@ impl BlobStore {
         }
     }
 
+    /// Test-only: free bytes on the local blob filesystem. The reservation
+    /// tests set `min_free_bytes` relative to the real free space so the
+    /// floor can be crossed with small fixtures.
+    #[cfg(test)]
+    pub(crate) fn free_space(&self) -> Option<u64> {
+        match &self.storage {
+            Storage::Local(s) => s.free_space(),
+            Storage::S3(_) => None,
+        }
+    }
+
     /// A directory on the blob filesystem where uploads may be spooled, so
     /// the final store is a rename instead of a second full write (None for
     /// S3, which keeps the system temp directory).
     /// Removes spool files left behind by a crash (the Drop cleanup cannot
     /// run on SIGKILL/power loss) so they do not accumulate until the disk
-    /// is full. Only this process's prefix is touched, and a removal
-    /// failure is ignored (best effort).
+    /// is full. Only spools whose owning process is gone are removed: the
+    /// temp directory is shared, and deleting a live process's in-flight
+    /// spool would corrupt its upload (or make it publish a missing body).
+    /// A removal failure is ignored (best effort).
     pub(crate) fn sweep_stale_spools(&self) {
         let mut dirs = vec![std::env::temp_dir()];
         if let Some(dir) = self.spool_dir() {
@@ -121,11 +175,9 @@ impl BlobStore {
                 continue;
             };
             for entry in entries.flatten() {
-                if entry
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with("nostrfy-blossom-")
-                {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name.starts_with(SPOOL_PREFIX) && !spool_owner_alive(&name) {
                     let _ = std::fs::remove_file(entry.path());
                 }
             }
@@ -167,12 +219,13 @@ impl BlobStore {
         let uploaded = crate::util::unix_now() as i64;
         // Whether the uploader already owned the blob BEFORE this upload
         // (read before the add: a failed re-upload of identical bytes must
-        // not roll back their pre-existing, valid mapping).
-        let was_owner = self
-            .db
-            .blossom_load(sha256)
-            .await
-            .is_some_and(|m| m.owners.iter().any(|o| o == pubkey));
+        // not roll back their pre-existing, valid mapping). The checked
+        // read keeps a database failure from being mistaken for "no owner
+        // yet": the rollback below would then delete a valid mapping.
+        let Some(existing) = self.db.blossom_load_checked(sha256).await else {
+            return Err(db_unavailable());
+        };
+        let was_owner = existing.is_some_and(|m| m.owners.iter().any(|o| o == pubkey));
         // The mapping must land first: without it the file would be an
         // unreachable orphan. Abort the upload when the commit fails.
         if !self
@@ -239,14 +292,25 @@ impl BlobStore {
         // A failed read must not be mistaken for "no mapping yet": the
         // rollback below would then delete a valid pre-existing owner
         // mapping (the blob becomes unreachable) when the storage write
-        // fails.
+        // fails. Only a KNOWN previous state may roll back.
         let Some(existing) = self.db.blossom_load_checked(sha256).await else {
-            return Err(anyhow!(
-                "database unavailable while loading the blob mapping"
-            ));
+            return Err(db_unavailable());
         };
         let existed = existing.is_some();
-        let was_owner = existing.is_some_and(|m| m.owners.iter().any(|o| o == pubkey));
+        let was_owner = existing
+            .as_ref()
+            .is_some_and(|m| m.owners.iter().any(|o| o == pubkey));
+        // A new owner past the per-blob cap is refused by the database
+        // anyway; pre-checking turns the resulting commit failure into a
+        // client-visible conflict (409) instead of a 500. The load above is
+        // not atomic with the add, so a concurrent upload can still win the
+        // last slot — the database cap remains the real guard.
+        if let Some(meta) = &existing
+            && !meta.owners.iter().any(|o| o == pubkey)
+            && meta.owners.len() >= MAX_BLOB_OWNERS
+        {
+            return Err(anyhow::Error::new(BlobOwnerLimit));
+        }
         if !self
             .db
             .blossom_add_owner(sha256, mime, size, uploaded, pubkey)
@@ -302,9 +366,7 @@ impl BlobStore {
     /// must not 404 on overload (the handlers answer 503 instead).
     pub(crate) async fn find(&self, sha256: &str) -> crate::error::Result<Option<Descriptor>> {
         let Some(meta) = self.db.blossom_load_checked(sha256).await else {
-            return Err(anyhow::anyhow!(
-                "database unavailable while loading the blob mapping"
-            ));
+            return Err(db_unavailable());
         };
         Ok(meta.and_then(|meta| {
             Some(Descriptor {
@@ -330,7 +392,13 @@ impl BlobStore {
         start: u64,
         len: u64,
     ) -> Result<Option<(BlobStream, String)>> {
-        let Some(meta) = self.db.blossom_load(sha256).await else {
+        // The checked load keeps a database failure distinguishable from
+        // "no mapping" (`Ok(None)`): the handlers answer 503 for the
+        // former and 404 only for the latter.
+        let Some(meta) = self.db.blossom_load_checked(sha256).await else {
+            return Err(db_unavailable());
+        };
+        let Some(meta) = meta else {
             return Ok(None);
         };
         let mut last_error: Option<anyhow::Error> = None;
@@ -351,12 +419,14 @@ impl BlobStore {
         }
     }
 
-    /// Whether `pubkey` has uploaded this blob.
-    pub(crate) async fn has(&self, pubkey: &str, sha256: &str) -> bool {
-        self.db
-            .blossom_load(sha256)
-            .await
-            .is_some_and(|meta| meta.owners.iter().any(|o| o == pubkey))
+    /// Whether `pubkey` has uploaded this blob. A database failure is an
+    /// error, not `false`: the DELETE handler must not answer 403 "only the
+    /// uploader" for a blob it could not check.
+    pub(crate) async fn has(&self, pubkey: &str, sha256: &str) -> Result<bool> {
+        let Some(meta) = self.db.blossom_load_checked(sha256).await else {
+            return Err(db_unavailable());
+        };
+        Ok(meta.is_some_and(|meta| meta.owners.iter().any(|o| o == pubkey)))
     }
 
     /// Opens a streamable reader for the blob, positioned at `start`
@@ -487,16 +557,23 @@ impl BlobStore {
     /// BUD-12 page from the uploaded-order index: one database round trip
     /// for the whole page (the metadata is loaded inside the reader's
     /// transaction) instead of a lookup per blob.
+    ///
+    /// Uses the checked variant so a database failure is a server error
+    /// (503) instead of a misleading empty inventory: the handler must
+    /// not report an existing `/list` as `200 []`.
     pub(crate) async fn list_page(
         &self,
         pubkey: &str,
         after_uploaded: Option<u64>,
         after_sha: Option<&str>,
         limit: usize,
-    ) -> Vec<Descriptor> {
-        self.db
-            .blossom_list_page(pubkey, after_uploaded, after_sha, limit)
+    ) -> Result<Vec<Descriptor>> {
+        let page = self
+            .db
+            .blossom_list_page_checked(pubkey, after_uploaded, after_sha, limit)
             .await
+            .ok_or_else(db_unavailable)?;
+        Ok(page
             .into_iter()
             .map(|(sha256, meta)| Descriptor {
                 sha256,
@@ -509,8 +586,51 @@ impl BlobStore {
                     .cloned()
                     .unwrap_or_else(|| pubkey.to_string()),
             })
-            .collect()
+            .collect())
     }
+}
+
+/// Prefix of the temporary files uploads are spooled into:
+/// `nostrfy-blossom-<pid>-<counter>` (see `mod.rs::spool_upload`).
+pub(crate) const SPOOL_PREFIX: &str = "nostrfy-blossom-";
+
+/// The PID embedded in a spool file name, when it parses.
+fn spool_pid(name: &str) -> Option<u32> {
+    name.strip_prefix(SPOOL_PREFIX)?
+        .split('-')
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// Whether the process that created a spool file is still running. A file
+/// whose name does not carry a parseable PID is treated as alive: the sweep
+/// must never delete a file it cannot attribute (safe fallback). On
+/// non-unix platforms liveness cannot be checked cheaply, so every spool is
+/// kept (the leak is bounded by restarts; deleting a live spool is not).
+fn spool_owner_alive(name: &str) -> bool {
+    match spool_pid(name) {
+        Some(pid) => process_alive(pid),
+        None => true,
+    }
+}
+
+#[cfg(unix)]
+fn process_alive(pid: u32) -> bool {
+    // SAFETY: `kill` with signal 0 performs only the existence/permission
+    // check and delivers nothing.
+    if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
+        return true;
+    }
+    // ESRCH is the only errno that proves the process is gone. EPERM means
+    // it exists under another user; anything else is unknown, and the safe
+    // answer for an unknown PID is "alive" (keep the file).
+    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+#[cfg(not(unix))]
+fn process_alive(_pid: u32) -> bool {
+    true
 }
 
 /// Derives the uploader's hex pubkey from an npub directory name.
@@ -705,6 +825,28 @@ impl LocalStore {
             .fetch_sub(size, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Fsyncs the directory a blob was just renamed into, so the new name
+    /// is durable on disk. Without this, a crash after the (already
+    /// durable) LMDB mapping commit could leave the mapping pointing at a
+    /// file whose directory entry was never written — the blob reads as
+    /// missing until the mapping is manually deleted. Best effort: the
+    /// failure is logged, not fatal, because the state is healable.
+    async fn sync_dir(&self, npub: &str) {
+        #[cfg(unix)]
+        {
+            let dir = self.npub_dir_path(npub);
+            let result = match tokio::fs::File::open(&dir).await {
+                Ok(file) => file.sync_all().await,
+                Err(e) => Err(e),
+            };
+            if let Err(e) = result {
+                log::warn!("blossom: cannot fsync directory {}: {e}", dir.display());
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = npub;
+    }
+
     #[cfg(test)]
     async fn put(
         &self,
@@ -759,6 +901,7 @@ impl LocalStore {
             let _ = tokio::fs::remove_file(&tmp_path).await;
             return Err(e.into());
         }
+        self.sync_dir(npub).await;
         Ok(())
     }
 
@@ -785,6 +928,9 @@ impl LocalStore {
             .await
             .is_ok()
         {
+            // Publish the directory entry durably before the caller
+            // reports success (the mapping commit already landed).
+            self.sync_dir(npub).await;
             return Ok(());
         }
         let tmp_path = self.rooted_path(npub, &format!(".{sha256}.tmp"));
@@ -819,6 +965,7 @@ impl LocalStore {
             let _ = tokio::fs::remove_file(&tmp_path).await;
             return Err(e.into());
         }
+        self.sync_dir(npub).await;
         Ok(())
     }
 
@@ -1287,9 +1434,9 @@ mod tests {
         assert_eq!(db.pubkey, b);
 
         assert_eq!(s.find(&sha).await.unwrap().unwrap().pubkey, a);
-        assert!(s.has(&a, &sha).await);
-        assert!(s.has(&b, &sha).await);
-        assert!(!s.has(&pk(3), &sha).await);
+        assert!(s.has(&a, &sha).await.unwrap());
+        assert!(s.has(&b, &sha).await.unwrap());
+        assert!(!s.has(&pk(3), &sha).await.unwrap());
         assert_eq!(s.list(&a, 10_000).await.len(), 1);
         assert_eq!(s.list(&b, 10_000).await.len(), 1);
         assert_eq!(s.list(&pk(3), 10_000).await.len(), 0);
@@ -1304,8 +1451,8 @@ mod tests {
         assert!(s.find(&sha).await.unwrap().is_some());
         assert!(read_all(&s, &npub_a, &sha).await.is_some());
         assert!(read_all(&s, &npub_b, &sha).await.is_none());
-        assert!(!s.has(&b, &sha).await);
-        assert!(s.has(&a, &sha).await);
+        assert!(!s.has(&b, &sha).await.unwrap());
+        assert!(s.has(&a, &sha).await.unwrap());
         assert_eq!(s.list(&a, 10_000).await.len(), 1);
         assert_eq!(s.list(&b, 10_000).await.len(), 0);
 
@@ -1500,7 +1647,10 @@ mod tests {
             std::os::unix::fs::symlink(&external, local(&s).root.join(&npub)).unwrap();
             // The delete is refused: the external file must survive.
             assert!(s.delete(&a, &sha).await.is_err());
-            assert!(s.has(&a, &sha).await, "failed delete must keep the mapping");
+            assert!(
+                s.has(&a, &sha).await.unwrap(),
+                "failed delete must keep the mapping"
+            );
             assert_eq!(
                 std::fs::read(external.join("victim")).unwrap(),
                 b"keep me",
@@ -1708,8 +1858,8 @@ mod tests {
         let s = BlobStore::new("local", &dir, 0, None, db).await.unwrap();
         let sha = "cd".repeat(32);
         assert_eq!(s.find(&sha).await.unwrap().unwrap().pubkey, pk(1));
-        assert!(s.has(&pk(1), &sha).await);
-        assert!(s.has(&pk(2), &sha).await);
+        assert!(s.has(&pk(1), &sha).await.unwrap());
+        assert!(s.has(&pk(2), &sha).await.unwrap());
         assert_eq!(s.list(&pk(1), 10_000).await.len(), 2);
         assert_eq!(s.list(&pk(2), 10_000).await.len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
@@ -1737,9 +1887,9 @@ mod tests {
         let s = BlobStore::new("local", &dir, 0, None, db).await.unwrap();
         let migrated = s.auto_migrate_legacy().await.unwrap();
         assert_eq!(migrated, 2, "both owners are mapped");
-        assert!(s.has(&pk(1), &sha).await);
+        assert!(s.has(&pk(1), &sha).await.unwrap());
         assert!(
-            s.has(&pk(2), &sha).await,
+            s.has(&pk(2), &sha).await.unwrap(),
             "second owner survives the migration"
         );
         assert_eq!(s.list(&pk(1), 10_000).await.len(), 1);
@@ -1757,6 +1907,112 @@ mod tests {
         let npub = npub_of(&hex);
         assert!(npub.starts_with("npub1"));
         assert_eq!(npub_of(&hex), npub, "stable");
+    }
+
+    #[tokio::test]
+    async fn lookups_report_a_database_failure_as_an_error() {
+        // A stopped database must not be reported as "no mapping": find,
+        // has, open_stream_any and list_page turn it into an error the
+        // handlers map to 503, so an existing blob never 404s (or 403s on
+        // DELETE) on overload.
+        let (s, _db_path) = store("lookup-db-down").await;
+        let sha = "ab".repeat(32);
+        s.db.shutdown();
+        assert!(s.find(&sha).await.is_err());
+        assert!(s.has(&pk(1), &sha).await.is_err());
+        assert!(s.open_stream_any(&sha, 0, 1).await.is_err());
+        assert!(s.list_page(&pk(1), None, None, 10).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn owner_cap_is_reported_as_a_conflict_error() {
+        let (s, _db_path) = store("owner-cap").await;
+        let sha = "cd".repeat(32);
+        let bytes = b"shared";
+        for i in 0..MAX_BLOB_OWNERS {
+            assert!(
+                s.db.blossom_add_owner(
+                    &sha,
+                    "text/plain",
+                    bytes.len() as u64,
+                    1,
+                    &pk(i as u8 + 10),
+                )
+                .await
+            );
+        }
+        // The 65th owner gets the typed conflict error (not a bare commit
+        // failure the handler would report as 500).
+        let path = std::env::temp_dir().join(format!(
+            "nostrfy-blossom-owner-cap-src-{}",
+            std::process::id()
+        ));
+        std::fs::write(&path, bytes).unwrap();
+        let err = s
+            .put_file(&pk(99), &sha, &path, bytes.len() as u64, "text/plain", true)
+            .await
+            .unwrap_err();
+        assert!(
+            err.downcast_ref::<BlobOwnerLimit>().is_some(),
+            "the cap must surface as BlobOwnerLimit: {err}"
+        );
+        // An existing owner may re-upload even at the cap.
+        assert!(
+            s.put_file(&pk(10), &sha, &path, bytes.len() as u64, "text/plain", true)
+                .await
+                .is_ok()
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn spool_pid_parsing() {
+        assert_eq!(spool_pid("nostrfy-blossom-123-0"), Some(123));
+        assert_eq!(spool_pid("nostrfy-blossom-456"), Some(456));
+        assert_eq!(spool_pid("nostrfy-blossom--1"), None);
+        assert_eq!(spool_pid("nostrfy-blossom-abc-1"), None);
+        assert_eq!(spool_pid("nostrfy-blossom-"), None);
+        assert_eq!(spool_pid("unrelated-1-2"), None);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stale_spool_sweep_keeps_live_and_unattributed_files() {
+        let (s, _db_path) = store("sweep-pids").await;
+        let dir = s.spool_dir().expect("local store");
+        std::fs::create_dir_all(&dir).unwrap();
+        let live = dir.join(format!("{}{}-1", SPOOL_PREFIX, std::process::id()));
+        let unknown = dir.join(format!("{SPOOL_PREFIX}notapid-2"));
+        std::fs::write(&live, b"live").unwrap();
+        std::fs::write(&unknown, b"unknown").unwrap();
+        s.sweep_stale_spools();
+        assert!(live.exists(), "a live process's spool must not be swept");
+        assert!(
+            unknown.exists(),
+            "a file without a parseable PID must not be swept"
+        );
+        // A dead process's spool is removed. `true` exits immediately, so
+        // after the wait its PID is gone (barring an immediate reuse).
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let dead_pid = child.id();
+        child.wait().unwrap();
+        let dead = dir.join(format!("{SPOOL_PREFIX}{dead_pid}-3"));
+        std::fs::write(&dead, b"dead").unwrap();
+        s.sweep_stale_spools();
+        assert!(!dead.exists(), "a dead process's spool must be swept");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spool_owner_liveness() {
+        assert!(
+            spool_owner_alive(&format!("{}{}-0", SPOOL_PREFIX, std::process::id())),
+            "our own PID is alive"
+        );
+        assert!(
+            spool_owner_alive(&format!("{SPOOL_PREFIX}abc-0")),
+            "an unparseable PID must be treated as alive (safe fallback)"
+        );
     }
 }
 

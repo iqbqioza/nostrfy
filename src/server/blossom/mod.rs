@@ -252,6 +252,18 @@ fn validate_auth_event(
     if event.kind != 24242 {
         return None;
     }
+    // NIP-01 hex fields are lowercase by convention. An uppercase-hex
+    // pubkey would still verify (Hex parses either case), but the BlobStore
+    // owner indexes are built from the lowercase pubkey — such a token
+    // could upload and then never list or delete its own blobs. Rejecting
+    // all three fields mirrors the WebSocket validation path
+    // (src/relay/validate.rs), so "valid on the wire" has one definition.
+    if event.pubkey != event.pubkey.to_ascii_lowercase()
+        || event.id != event.id.to_ascii_lowercase()
+        || event.sig != event.sig.to_ascii_lowercase()
+    {
+        return None;
+    }
     if crate::nips::nip01::verify(event, secp).is_err() {
         return None;
     }
@@ -304,7 +316,7 @@ fn decode_auth_event(headers: &HeaderMap) -> Option<crate::event::Event> {
     let encoded = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Nostr "))?;
+        .and_then(crate::nips::nip98::strip_nostr_scheme)?;
     let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(encoded)
         .or_else(|_| base64::engine::general_purpose::STANDARD.decode(encoded))
@@ -324,17 +336,25 @@ async fn verify_auth_meta(
     verb: &str,
 ) -> Option<String> {
     let pubkey = validate_auth_event(relay.secp(), event, &state.host, verb, None, unix_now())?;
-    // NIP-86 `banpubkey` applies to authenticated actions on every
-    // endpoint: a blocked pubkey must not upload, delete or list Blossom
-    // blobs either (the WebSocket publish/read paths already enforce it).
-    let blocked = relay
-        .access
-        .read()
-        .await
-        .blocked_pubkeys
-        .iter()
-        .any(|(pk, _)| pk.eq_ignore_ascii_case(&pubkey));
-    if blocked {
+    // The relay's access policy applies to authenticated Blossom actions
+    // too, not only to WebSocket publishing: NIP-86 `banpubkey` (always)
+    // and the `restrict_relay` allowlist (when enabled) must gate
+    // upload/delete/list here as well. `AccessControl::allows_pubkey`
+    // combines the deny list and the allow list, matching the WS path.
+    // The operator keys (the relay's own key and `relay.pubkey`) are
+    // exempt like on the WS path: the operator must not lock themselves
+    // out of the Blossom endpoints with a restrictive allow list (config
+    // and access lock order matches the WS accept path: config first).
+    let allowed = {
+        let cfg = relay.config.read().await;
+        let access = relay.access.read().await;
+        let is_operator = relay
+            .relay_pubkey_ref()
+            .is_some_and(|pk| pk.eq_ignore_ascii_case(&pubkey))
+            || cfg.relay.pubkey.eq_ignore_ascii_case(&pubkey);
+        is_operator || access.allows_pubkey(&pubkey)
+    };
+    if !allowed {
         return None;
     }
     Some(pubkey)
@@ -385,6 +405,23 @@ fn error(status: StatusCode, reason: &str) -> Response {
         reason,
     )
         .into_response()
+}
+
+/// Maps a BlobStore error to the HTTP response. A database lookup failure
+/// is a retryable 503 (the blob may well exist — a 404/403 would lie),
+/// anything else is a storage fault (500). The database-layer errors are
+/// tagged with [`storage::DbUnavailable`] by the checked lookup paths.
+fn store_error(e: anyhow::Error) -> Response {
+    if e.downcast_ref::<storage::DbUnavailable>().is_some() {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "blob lookup unavailable, please retry",
+        );
+    }
+    // Keep the backend detail (S3 XML, OS messages) in the log: the
+    // response only carries a generic message.
+    log::error!("blossom storage error: {e}");
+    error(StatusCode::INTERNAL_SERVER_ERROR, "storage error")
 }
 
 /// Parses a single `Range: bytes=` request (RFC 7233) against `size`.
@@ -597,12 +634,7 @@ async fn get_blob(
     let desc = match state.store.find(&sha).await {
         Ok(Some(desc)) => desc,
         Ok(None) => return error(StatusCode::NOT_FOUND, "blob not found"),
-        Err(_) => {
-            return error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "blob lookup unavailable, please retry",
-            );
-        }
+        Err(e) => return store_error(e),
     };
     let size = desc.size;
     // `size` is a `u64` from a stored (possibly corrupt) descriptor: narrow
@@ -716,12 +748,7 @@ async fn get_blob(
             response
         }
         Ok(None) => error(StatusCode::NOT_FOUND, "blob not found"),
-        Err(e) => {
-            // Keep the backend detail (S3 XML, OS messages) in the log:
-            // the response only carries a generic message.
-            log::error!("blossom storage error: {e}");
-            error(StatusCode::INTERNAL_SERVER_ERROR, "storage error")
-        }
+        Err(e) => store_error(e),
     }
 }
 
@@ -743,12 +770,7 @@ async fn head_blob(
     let desc = match state.store.find(&sha).await {
         Ok(Some(desc)) => desc,
         Ok(None) => return error(StatusCode::NOT_FOUND, "blob not found"),
-        Err(_) => {
-            return error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "blob lookup unavailable, please retry",
-            );
-        }
+        Err(e) => return store_error(e),
     };
     let size = desc.size;
     let Ok(size_usize) = usize::try_from(size) else {
@@ -787,10 +809,7 @@ async fn head_blob(
             storage::BlobStream::S3(resp) => resp.status() == reqwest::StatusCode::PARTIAL_CONTENT,
         },
         Ok(None) => return error(StatusCode::NOT_FOUND, "blob not found"),
-        Err(e) => {
-            log::error!("blossom storage error: {e}");
-            return error(StatusCode::INTERNAL_SERVER_ERROR, "storage error");
-        }
+        Err(e) => return store_error(e),
     };
     let ranged = matches!(range, Some(Ok(Some(_))));
     let status = if ranged && honored {
@@ -900,12 +919,32 @@ async fn put_blob(relay: Arc<Relay>, headers: HeaderMap, body: Body, verb: &str)
     // slow-loris protection for bodies).
     let idle_secs = relay.config.read().await.limits.http_read_timeout_secs;
     let idle_timeout = std::time::Duration::from_secs(if idle_secs == 0 { 60 } else { idle_secs });
-    // Reserve the maximum upload size BEFORE spooling: the spool writes
-    // into the store's own filesystem, and reserving only at `put_file`
-    // (after the body was already written) let four concurrent uploads
-    // push the disk below `min_free_bytes` while the LMDB writer could
-    // still map and commit into the exhausted filesystem.
-    let _spool_space = match state.store.reserve_space(max_upload as u64) {
+    // Sound the declared size before reserving: a Content-Length above the
+    // ceiling can be rejected now, exactly like the BUD-06 preflight does.
+    let declared_len = headers
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    if declared_len.is_some_and(|len| len > max_upload as u64) {
+        return error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "the upload exceeds the configured size limit",
+        );
+    }
+    // Reserve the size the spool will actually write BEFORE spooling: the
+    // spool lives on the store's filesystem, and reserving only at
+    // `put_file` (after the body was already written) let concurrent
+    // uploads push the disk below `min_free_bytes` while the LMDB writer
+    // could still map and commit into the exhausted filesystem. A declared
+    // Content-Length reserves exactly that size (capped at the ceiling):
+    // reserving the full ceiling refused small uploads with 507 whenever
+    // free space was within `max_upload` of the floor, even though the
+    // floor check passed. A chunked body (no Content-Length) keeps the
+    // full-ceiling reservation, since its size is unknown until it ends:
+    // near the floor a chunked upload is refused rather than allowed to
+    // overshoot the reservation.
+    let reserved = declared_len.map_or(max_upload as u64, |len| len.min(max_upload as u64));
+    let _spool_space = match state.store.reserve_space(reserved) {
         Ok(guard) => guard,
         Err(_) => return error(StatusCode::INSUFFICIENT_STORAGE, "storage is full"),
     };
@@ -920,10 +959,11 @@ async fn put_blob(relay: Arc<Relay>, headers: HeaderMap, body: Body, verb: &str)
         },
         None => None,
     };
-    let (path, size, sha) = match spool_upload(body, max_upload, idle_timeout, spool_dir).await {
-        Ok(value) => value,
-        Err(response) => return *response,
-    };
+    let (path, size, sha) =
+        match spool_upload(body, max_upload as u64, reserved, idle_timeout, spool_dir).await {
+            Ok(value) => value,
+            Err(response) => return *response,
+        };
     let mut cleanup = TempUploadCleanup::new(path.clone());
     if let Some(declared) = declared_sha
         && declared != sha
@@ -983,10 +1023,15 @@ async fn put_blob(relay: Arc<Relay>, headers: HeaderMap, body: Body, verb: &str)
         }
 
         Err(e) => {
-            // Keep the backend detail (S3 XML, OS messages) in the log:
-            // the response only carries a generic message.
-            log::error!("blossom storage error: {e}");
-            error(StatusCode::INTERNAL_SERVER_ERROR, "storage error")
+            // A blob already at the owner cap is a client-visible conflict,
+            // not a storage fault (the database refused the same add).
+            if e.downcast_ref::<storage::BlobOwnerLimit>().is_some() {
+                return error(
+                    StatusCode::CONFLICT,
+                    "the blob already has the maximum number of owners",
+                );
+            }
+            store_error(e)
         }
     }
 }
@@ -1007,12 +1052,16 @@ const MAX_UPLOAD_TOTAL_SECS: u64 = 900;
 /// Spools an upload to disk while hashing it. The request body is never
 /// materialized in one `Bytes` allocation, and the size limit is enforced
 /// while reading rather than after the extractor has buffered the body.
+/// `reserved` is the disk space the caller reserved for this upload (the
+/// declared Content-Length, or the ceiling for a chunked body): the spool
+/// refuses to write past it, so the reservation always covers the spool.
 /// `idle_timeout` bounds the wait for the next chunk and the rate-derived
 /// total deadline bounds the whole body, so a stalled or trickled upload
 /// (slow-loris) cannot pin an upload permit or a temp file forever.
 async fn spool_upload(
     body: Body,
-    max_upload: usize,
+    max_upload: u64,
+    reserved: u64,
     idle_timeout: std::time::Duration,
     spool_dir: Option<&std::path::Path>,
 ) -> Result<(std::path::PathBuf, u64, String), Box<Response>> {
@@ -1024,8 +1073,11 @@ async fn spool_upload(
     let mut path = spool_dir
         .map(std::path::Path::to_path_buf)
         .unwrap_or_else(std::env::temp_dir);
+    // The sweep at startup parses the PID out of this name to skip other
+    // processes' in-flight spools (storage::sweep_stale_spools).
     path.push(format!(
-        "nostrfy-blossom-{}-{}",
+        "{}{}-{}",
+        storage::SPOOL_PREFIX,
         std::process::id(),
         TEMP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
@@ -1052,11 +1104,15 @@ async fn spool_upload(
     let mut hash = Sha256::new();
     let mut size = 0u64;
     // Total body budget: the rate-derived time (at least one idle window,
-    // so a tiny `max_upload` does not abort immediately), capped hard.
+    // so a tiny `max_upload` does not abort immediately), capped hard. The
+    // per-chunk idle timeout is capped by the same ceiling: a large
+    // `http_read_timeout_secs` must not override it, or one body could pin
+    // an upload permit for hours.
     let rate_budget = std::time::Duration::from_secs(
-        (max_upload as u64 / MIN_UPLOAD_RATE_BYTES_PER_SEC).clamp(1, MAX_UPLOAD_TOTAL_SECS),
+        (max_upload / MIN_UPLOAD_RATE_BYTES_PER_SEC).clamp(1, MAX_UPLOAD_TOTAL_SECS),
     );
-    let total_deadline = tokio::time::Instant::now() + rate_budget.max(idle_timeout);
+    let total_deadline = tokio::time::Instant::now()
+        + rate_budget.max(idle_timeout.min(std::time::Duration::from_secs(MAX_UPLOAD_TOTAL_SECS)));
     loop {
         let now = tokio::time::Instant::now();
         if now >= total_deadline {
@@ -1089,10 +1145,19 @@ async fn spool_upload(
             }
         };
         size = size.saturating_add(chunk.len() as u64);
-        if size > max_upload as u64 {
+        if size > max_upload {
             return Err(Box::new(error(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "upload exceeds the configured size limit",
+            )));
+        }
+        if size > reserved {
+            // The body overran the space the caller reserved for it (a
+            // body larger than its declared Content-Length): abort instead
+            // of writing past what the disk reservation covers.
+            return Err(Box::new(error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "upload exceeds the declared size",
             )));
         }
         hash.update(&chunk);
@@ -1218,9 +1283,17 @@ async fn head_preflight(relay: Arc<Relay>, headers: HeaderMap, verb: &str) -> Re
             "uploads are restricted to the configured allowlist",
         );
     }
-    // The preflight must reflect the PUT outcome: a full disk would
-    // refuse the upload with 507, so the preflight does too.
-    if state.store.check_space().is_err() {
+    // The preflight must reflect the PUT outcome: the PUT reserves the
+    // declared Content-Length (capped at the ceiling) against the
+    // free-space floor, so a reservation of the same size decides the
+    // preflight. Testing the bare floor instead claimed 200 while the PUT
+    // would have reserved `max_upload` and answered 507. The BUD-06
+    // request always declares X-Content-Length, so there is no "unknown
+    // size" preflight; a PUT without Content-Length reserves the full
+    // ceiling, and the preflight's smaller-or-equal reservation never
+    // promises more than that case. The guard releases on drop (this is a
+    // read-only check).
+    if state.store.reserve_space(len.min(max_upload)).is_err() {
         return error(StatusCode::INSUFFICIENT_STORAGE, "storage is full");
     }
     StatusCode::OK.into_response()
@@ -1276,12 +1349,7 @@ async fn list(
     let (after_uploaded, after_sha) = match cursor {
         Some(sha) => match state.store.find(sha).await {
             Ok(Some(desc)) => (Some(desc.uploaded.max(0) as u64), Some(sha.to_string())),
-            Err(_) => {
-                return error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "blob lookup unavailable, please retry",
-                );
-            }
+            Err(e) => return store_error(e),
             Ok(None) => {
                 let empty: Vec<Value> = Vec::new();
                 return (
@@ -1295,8 +1363,10 @@ async fn list(
     };
     // The page comes from the uploaded-order index (newest first), so every
     // blob of the owner is reachable — the old sha-ordered window hid
-    // everything past its first 5000 entries.
-    let blobs = state
+    // everything past its first 5000 entries. A database failure must be a
+    // 503, not an empty page (the store's empty-page probe distinguishes
+    // them).
+    let blobs = match state
         .store
         .list_page(
             &pubkey,
@@ -1304,7 +1374,11 @@ async fn list(
             after_sha.as_deref(),
             limit.unwrap_or(100),
         )
-        .await;
+        .await
+    {
+        Ok(blobs) => blobs,
+        Err(e) => return store_error(e),
+    };
     let items: Vec<Value> = blobs
         .into_iter()
         .map(|d| {
@@ -1347,30 +1421,25 @@ async fn delete_blob(
     match state.store.find(&sha).await {
         Ok(Some(_)) => {}
         Ok(None) => return error(StatusCode::NOT_FOUND, "blob not found"),
-        Err(_) => {
-            return error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "blob lookup unavailable, please retry",
-            );
-        }
+        Err(e) => return store_error(e),
     }
     // Only an uploader of these bytes may delete their own copy; other
-    // uploaders of identical content keep theirs.
-    if !state.store.has(&pubkey, &sha).await {
-        return error(
-            StatusCode::FORBIDDEN,
-            "only the uploader may delete this blob",
-        );
+    // uploaders of identical content keep theirs. A failed ownership check
+    // must not answer 403: the requester may well be the uploader.
+    match state.store.has(&pubkey, &sha).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return error(
+                StatusCode::FORBIDDEN,
+                "only the uploader may delete this blob",
+            );
+        }
+        Err(e) => return store_error(e),
     }
     match state.store.delete(&pubkey, &sha).await {
         Ok(true) => StatusCode::OK.into_response(),
         Ok(false) => error(StatusCode::NOT_FOUND, "blob not found"),
-        Err(e) => {
-            // Keep the backend detail (S3 XML, OS messages) in the log:
-            // the response only carries a generic message.
-            log::error!("blossom storage error: {e}");
-            error(StatusCode::INTERNAL_SERVER_ERROR, "storage error")
-        }
+        Err(e) => store_error(e),
     }
 }
 
@@ -1550,8 +1619,18 @@ mod tests {
     /// A valid Blossom `Authorization: Nostr <token>` header for `verb`,
     /// returning the header map and the author's hex pubkey.
     fn auth_headers(secp: &Secp256k1<secp256k1::All>, verb: &str) -> (HeaderMap, String) {
+        auth_headers_scoped(secp, verb, None)
+    }
+
+    /// Like [`auth_headers`], but the token carries the body-scoped `x` tag
+    /// required by upload/delete endpoints (BUD-11).
+    fn auth_headers_scoped(
+        secp: &Secp256k1<secp256k1::All>,
+        verb: &str,
+        sha: Option<&str>,
+    ) -> (HeaderMap, String) {
         let now = unix_now();
-        let ev = auth_event(secp, now, verb, Some(now + 600), None, None);
+        let ev = auth_event(secp, now, verb, Some(now + 600), sha, None);
         let token = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(serde_json::to_vec(&ev).unwrap());
         let mut headers = HeaderMap::new();
@@ -1775,6 +1854,243 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn declared_size_reservation_keeps_small_uploads_possible() {
+        // The regression: reserving the full `max_upload` ceiling before
+        // spooling refused every upload while free space was within
+        // `max_upload` of the floor, even when the actual body fit. Hold a
+        // reservation that leaves only 4 MiB of headroom above the floor
+        // (1 MiB `min_free` plus the held bytes): the small declared size
+        // fits, the 20 MiB ceiling does not. Holding the reservation on the
+        // same store makes the headroom exact instead of racing other tests
+        // for the filesystem's free space.
+        let relay = build_blossom_relay(1 << 20).await;
+        let state = state_of(&relay).await.expect("blossom state");
+        let headroom = 4 << 20;
+        let free = state.store.free_space().expect("local store");
+        let held = free.saturating_sub((1 << 20) + headroom);
+        assert!(
+            held > 0,
+            "the test needs a filesystem with free space, got {free}"
+        );
+        let _held = state
+            .store
+            .reserve_space(held)
+            .expect("holding the headroom must fit");
+
+        let data = b"tiny blossom upload";
+        let sha = sha256_hex(data);
+        // The BUD-06 preflight with the same declared size says 200...
+        let (mut headers, _) = auth_headers_scoped(relay.secp(), "upload", Some(&sha));
+        headers.insert("x-sha-256", sha.parse().unwrap());
+        headers.insert("x-content-length", data.len().to_string().parse().unwrap());
+        let resp = head_preflight(relay.clone(), headers, "upload").await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a declared size within the headroom must preflight as OK"
+        );
+        // ...and the PUT reserves the declared size, not the ceiling.
+        let (mut headers, _) = auth_headers_scoped(relay.secp(), "upload", Some(&sha));
+        headers.insert(
+            axum::http::header::CONTENT_LENGTH,
+            data.len().to_string().parse().unwrap(),
+        );
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain".parse().unwrap(),
+        );
+        let resp = upload(
+            State(relay.clone()),
+            headers,
+            Body::from(bytes::Bytes::copy_from_slice(data)),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "the small upload fits the free space and must not 507"
+        );
+
+        // Both paths agree on a declared size that needs the full ceiling:
+        // the headroom cannot cover it, so preflight and PUT both 507.
+        let ceiling = state_of(&relay)
+            .await
+            .expect("blossom state")
+            .max_upload_bytes as u64;
+        let (mut headers, _) = auth_headers_scoped(relay.secp(), "upload", Some(&sha));
+        headers.insert("x-sha-256", sha.parse().unwrap());
+        headers.insert("x-content-length", ceiling.to_string().parse().unwrap());
+        let resp = head_preflight(relay.clone(), headers, "upload").await;
+        assert_eq!(resp.status(), StatusCode::INSUFFICIENT_STORAGE);
+        let (mut headers, _) = auth_headers_scoped(relay.secp(), "upload", Some(&sha));
+        headers.insert(
+            axum::http::header::CONTENT_LENGTH,
+            ceiling.to_string().parse().unwrap(),
+        );
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain".parse().unwrap(),
+        );
+        let resp = upload(
+            State(relay.clone()),
+            headers,
+            Body::from(bytes::Bytes::copy_from_slice(data)),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::INSUFFICIENT_STORAGE);
+
+        // A chunked body (no Content-Length) reserves the full ceiling:
+        // near the floor it is refused rather than allowed to overshoot the
+        // reservation (BUD-06 has no no-length preflight; its declared size
+        // can never promise more than this case).
+        let (headers, _) = auth_headers_scoped(relay.secp(), "upload", Some(&sha));
+        let resp = upload(
+            State(relay.clone()),
+            headers,
+            Body::from(bytes::Bytes::copy_from_slice(data)),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::INSUFFICIENT_STORAGE);
+
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn upload_past_the_owner_cap_is_a_conflict() {
+        // The database refuses the 65th owner of a blob; that commit
+        // failure used to surface as a 500. It is a client-visible
+        // conflict: 409, not "storage error".
+        let relay = build_blossom_relay(0).await;
+        let data = b"shared bytes";
+        let sha = sha256_hex(data);
+        for i in 0..64u8 {
+            let owner = format!("{:02x}", i).repeat(32);
+            assert!(
+                relay
+                    .db
+                    .blossom_add_owner(&sha, "text/plain", data.len() as u64, 1, &owner)
+                    .await
+            );
+        }
+        let (mut headers, _) = auth_headers_scoped(relay.secp(), "upload", Some(&sha));
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain".parse().unwrap(),
+        );
+        let resp = upload(
+            State(relay.clone()),
+            headers,
+            Body::from(bytes::Bytes::from_static(data)),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::CONFLICT,
+            "a full owner list must answer 409, not 500"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn relay_access_policy_applies_to_blossom() {
+        // The relay's allowlist/deny policy gates authenticated Blossom
+        // actions too: a `restrict_relay` allowlist that does not list the
+        // token's author must refuse it (like a WS publish), and the
+        // operator keys stay exempt.
+        let relay = build_blossom_relay(0).await;
+        let (headers, pk) = auth_headers(relay.secp(), "list");
+        let empty = || axum::extract::Query(std::collections::HashMap::new());
+        {
+            let mut access = relay.access.write().await;
+            access.restrict_relay = true;
+            access.allowed_pubkeys.clear();
+        }
+        let resp = list(
+            State(relay.clone()),
+            headers.clone(),
+            AxPath(pk.clone()),
+            empty(),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "a pubkey outside the relay allowlist must not list Blossom blobs"
+        );
+        // Allowing the pubkey admits it.
+        relay
+            .access
+            .write()
+            .await
+            .allowed_pubkeys
+            .push((pk.clone(), String::new()));
+        let resp = list(
+            State(relay.clone()),
+            headers.clone(),
+            AxPath(pk.clone()),
+            empty(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        // The operator (relay.pubkey) is exempt even with an empty list.
+        relay.access.write().await.allowed_pubkeys.clear();
+        relay.config.write().await.relay.pubkey = pk.clone();
+        let resp = list(State(relay.clone()), headers, AxPath(pk), empty()).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "the operator must not lock themselves out of Blossom"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn blob_lookups_answer_503_when_the_database_is_down() {
+        // A failed read must be a retryable 503, never a 404 (GET/HEAD), a
+        // 403 "only the uploader" (DELETE) or an empty 200 page (list): the
+        // blob may well exist and the client must retry.
+        let relay = build_blossom_relay(0).await;
+        let data = b"real blob";
+        let sha = sha256_hex(data);
+        state_of(&relay)
+            .await
+            .expect("blossom state")
+            .store
+            .put(&"aa".repeat(32), &sha, data, "text/plain")
+            .await
+            .unwrap();
+        // Stop the database: every checked lookup now fails.
+        relay.db.shutdown();
+
+        let resp = get_blob(State(relay.clone()), HeaderMap::new(), AxPath(sha.clone())).await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let resp = head_blob(State(relay.clone()), HeaderMap::new(), AxPath(sha.clone())).await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let (headers, _) = auth_headers_scoped(relay.secp(), "delete", Some(&sha));
+        let resp = delete_blob(State(relay.clone()), headers, AxPath(sha.clone())).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a failed ownership check must not answer 403"
+        );
+
+        let (headers, pk) = auth_headers(relay.secp(), "list");
+        let resp = list(
+            State(relay.clone()),
+            headers,
+            AxPath(pk),
+            axum::extract::Query(std::collections::HashMap::new()),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "an empty page on a failed read must not be a 200"
+        );
+    }
+
+    #[tokio::test]
     async fn unauthenticated_upload_is_rejected_before_the_body() {
         let relay = build_blossom_relay(0).await;
         // A body that never yields data: an authentication check placed
@@ -1862,6 +2178,7 @@ mod tests {
         let started = std::time::Instant::now();
         let result = spool_upload(
             Body::from_stream(stream),
+            64 * 1024,
             64 * 1024,
             std::time::Duration::from_secs(1),
             None,
@@ -2042,6 +2359,45 @@ mod tests {
         assert_eq!(
             validate_auth_event(&secp, &ev, host, "upload", Some(&sha), now),
             None
+        );
+    }
+
+    #[test]
+    fn uppercase_hex_auth_fields_are_rejected() {
+        // The owner indexes are lowercase: an uppercase-hex token verifies
+        // cryptographically but could never list or delete the uploads it
+        // authored, so pubkey/id/sig must all be lowercase (mirroring
+        // src/relay/validate.rs).
+        let secp = Secp256k1::new();
+        let now = unix_now();
+        let sha = "a".repeat(64);
+        let host = "media.example.com";
+        let mut ev = auth_event(
+            &secp,
+            now,
+            "upload",
+            Some(now + 300),
+            Some(&sha),
+            Some(host),
+        );
+        // Uppercase all three fields consistently and re-sign, so the
+        // token is valid apart from its case: it must still be rejected.
+        ev.pubkey = ev.pubkey.to_ascii_uppercase();
+        ev.id = crate::nips::nip01::compute_id(&ev);
+        let id = ev.id_bytes().unwrap();
+        let keypair = Keypair::from_seckey_slice(&secp, &[9u8; 32]).unwrap();
+        ev.sig = secp
+            .sign_schnorr_no_aux_rand(&id, &keypair)
+            .to_string()
+            .to_ascii_uppercase();
+        assert!(
+            crate::nips::nip01::verify(&ev, &secp).is_ok(),
+            "the uppercase token must be cryptographically valid, or the test proves nothing"
+        );
+        assert_eq!(
+            validate_auth_event(&secp, &ev, host, "upload", Some(&sha), now),
+            None,
+            "uppercase-hex pubkey/id/sig must be rejected"
         );
     }
 

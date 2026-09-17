@@ -800,6 +800,7 @@ fn map_grows_beyond_initial_size() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
         let n = 3000;
+        let pages_before = db.last_page_now().await;
         for i in 0..n {
             let ev = event(
                 1,
@@ -818,8 +819,13 @@ fn map_grows_beyond_initial_size() {
             serde_json::from_value(serde_json::json!({"kinds": [1], "limit": n})).unwrap();
         let (res, _) = db.query(vec![f], n, now).await;
         assert_eq!(res.len(), n, "all events must be queryable");
-        // And the map grew beyond the initial size.
-        assert!(db.map_size_now().await > 256 * 1024, "map must have grown");
+        // The map is a fixed upfront reservation, so assert real page
+        // growth instead of comparing the constant `map_size` ceiling
+        // against the initial size (which could never fail).
+        assert!(
+            db.last_page_now().await > pages_before,
+            "the bulk writes must allocate new pages"
+        );
     });
 }
 
@@ -1029,6 +1035,87 @@ fn store_blossom_mapping_lifecycle() {
     }
     assert!(store.load_blossom_mapping(&sha2).unwrap().is_none());
     assert!(!store.remove_blossom_owner(&sha2, &bob).unwrap());
+}
+
+#[test]
+fn reader_floor_covers_nested_read_transactions() {
+    // The `max_readers` floor must cover the nested read transactions some
+    // paths take (`list_blossom_page` resolves each sha inside its walk
+    // transaction). A configured `max_readers = 1` used to become
+    // `reader_threads + 2` slots, which the nesting plus the concurrent
+    // reader/API/writer paths can exhaust with MDB_READERS_FULL (surfacing
+    // as silent empty scans). The floor is `2 * reader_threads + 3`.
+    let mut cfg = config();
+    cfg.max_readers = 1;
+    cfg.reader_threads = 2;
+    let store = crate::db::store::Store::open(
+        &cfg,
+        Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        512,
+    )
+    .unwrap();
+    // Holding the full floor open at once must succeed: without the raised
+    // floor the 5th (`reader_threads + 2` + 1) transaction would fail.
+    let mut txns = Vec::new();
+    for i in 0..(2 * cfg.reader_threads + 3) {
+        txns.push(
+            store
+                .env
+                .read_txn()
+                .unwrap_or_else(|e| panic!("reader slot {i} unavailable: {e}")),
+        );
+    }
+    assert_eq!(txns.len(), 7);
+}
+
+#[test]
+fn blossom_order_index_backfills_legacy_mappings() {
+    // Databases written before the uploaded-order index existed have the
+    // `sha:` mappings but no order keys and no marker: the chunked rebuild
+    // must recreate the index and write the marker last.
+    let store = crate::db::store::Store::open(
+        &config(),
+        Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        512,
+    )
+    .unwrap();
+    let alice = "aa".repeat(32);
+    let bob = "bb".repeat(32);
+    let sha_a = "11".repeat(32);
+    let sha_b = "22".repeat(32);
+    store
+        .add_blossom_mappings(&[
+            (sha_a.clone(), "image/png".into(), 3, 100, alice.clone()),
+            (sha_b.clone(), "image/png".into(), 5, 200, bob.clone()),
+            (sha_b.clone(), "image/png".into(), 5, 200, alice.clone()),
+        ])
+        .unwrap();
+    // Drop the order keys and the marker to simulate the pre-index layout.
+    let mut wtxn = store.env.write_txn().unwrap();
+    let order_keys: Vec<Vec<u8>> = store
+        .blossom
+        .iter(&wtxn)
+        .unwrap()
+        .filter_map(|item| item.ok().map(|(key, _)| key.to_vec()))
+        .filter(|key| key.starts_with(b"bls:"))
+        .collect();
+    assert_eq!(order_keys.len(), 3);
+    for key in &order_keys {
+        store.blossom.delete(&mut wtxn, key).unwrap();
+    }
+    store
+        .index_meta
+        .delete(&mut wtxn, b"blossom_order")
+        .unwrap();
+    wtxn.commit().unwrap();
+
+    assert!(store.blossom_order_needs_rebuild().unwrap());
+    assert_eq!(store.rebuild_blossom_order().unwrap(), 3);
+    assert!(!store.blossom_order_needs_rebuild().unwrap());
+    // The rebuilt index serves BUD-12 paging again (newest upload first).
+    let page = store.list_blossom_page(&alice, None, None, 10).unwrap();
+    let shas: Vec<&str> = page.iter().map(|(sha, _)| sha.as_str()).collect();
+    assert_eq!(shas, vec![sha_b.as_str(), sha_a.as_str()]);
 }
 
 #[test]
@@ -2459,6 +2546,49 @@ fn search_ranks_rare_terms_higher() {
 }
 
 #[test]
+fn search_index_walk_respects_time_bounds() {
+    // The word-index walk must honour `since`/`until` like the pubkey/kind
+    // walks: without the range bounds the walk starts at the newest entry
+    // of the term and burns the scan budget on out-of-window events before
+    // reaching the window, so a narrow window can come back empty while
+    // reporting `more`.
+    let store = crate::db::store::Store::open(
+        &config(),
+        Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        512,
+    )
+    .unwrap();
+    let now = 1_700_000_000;
+    let mut wtxn = store.env.write_txn().unwrap();
+    for i in 0..10u64 {
+        let ev = event(1, "windowed term", now + 100 + i, vec![]);
+        assert!(matches!(
+            store.put_event_in(&mut wtxn, &ev, now).unwrap(),
+            PutOutcome::Stored
+        ));
+    }
+    let target = event(1, "windowed term", now, vec![]);
+    assert!(matches!(
+        store.put_event_in(&mut wtxn, &target, now).unwrap(),
+        PutOutcome::Stored
+    ));
+    wtxn.commit().unwrap();
+
+    let filter: Filter = serde_json::from_value(serde_json::json!({
+        "search": "windowed",
+        "since": now - 10,
+        "until": now + 10,
+    }))
+    .unwrap();
+    // Budget 1: the walk may examine a single candidate. With the bounds
+    // applied to the term range, the in-window event is the only candidate.
+    let (events, more) = store.scan(&[filter], now, 10, false, false, 1, 0).unwrap();
+    assert_eq!(events.len(), 1, "the in-window event must be found");
+    assert_eq!(events[0].id, target.id);
+    assert!(!more);
+}
+
+#[test]
 fn created_at_ties_are_not_split_across_pages() {
     // NIP-01 ordering / NIP-67: when the limit cuts inside a group of
     // events sharing the oldest created_at, every event at that
@@ -3686,6 +3816,33 @@ fn reload_loads_report_success() {
         let allow = db.try_load_blossom_allow().await.expect("loads");
         assert!(allow.is_empty());
         db.shutdown();
+    });
+}
+
+#[test]
+fn save_blossom_allow_reports_the_commit_result() {
+    // The reply carries the commit outcome: the caller must not report a
+    // persisted allowlist change that only lives in memory.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let entries = vec!["aa".repeat(32)];
+        assert!(db.save_blossom_allow(&entries).await, "commit reported");
+        assert_eq!(db.try_load_blossom_allow().await.expect("loads"), entries);
+        db.shutdown();
+        assert!(
+            !db.save_blossom_allow(&["bb".repeat(32)]).await,
+            "a dead writer must not report a committed allowlist"
+        );
     });
 }
 

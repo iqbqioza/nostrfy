@@ -1995,6 +1995,71 @@ mod tests {
     }
 
     #[test]
+    fn max_offset_is_serviceable_with_the_released_fetch_window() {
+        // The shipped defaults are `max_api_offset = 50_000`,
+        // `max_api_limit = 5_000` and `max_api_fetch = 55_001`: the fetch
+        // window is sized for offset(max) + limit(max) + 1, so a request at
+        // the maximum offset with the default limit must pass the hard-cap
+        // check (a smaller window, e.g. the old 10_000, 400'd every offset
+        // past ~9_900 even with the small default limit).
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_relay().await;
+            {
+                let mut cfg = relay.config.write().await;
+                cfg.limits.max_api_offset = 50_000;
+                cfg.limits.max_api_limit = 5_000;
+                cfg.limits.max_api_fetch = 55_001;
+            }
+            let (code, Json(resp)) = api_query_handler(
+                State(relay.clone()),
+                Query(ApiParams {
+                    offset: Some(50_000),
+                    ..Default::default()
+                }),
+            )
+            .await;
+            assert_eq!(
+                code,
+                StatusCode::OK,
+                "the maximum offset with the default limit must be serviceable: {resp}"
+            );
+            // At the maximum limit the window is exactly exhausted, and one
+            // step past it is still a clear 400 (never a silently empty
+            // page).
+            let (code, _) = api_query_handler(
+                State(relay.clone()),
+                Query(ApiParams {
+                    offset: Some(50_000),
+                    limit: Some(5_000),
+                    ..Default::default()
+                }),
+            )
+            .await;
+            assert_eq!(code, StatusCode::OK);
+            {
+                let mut cfg = relay.config.write().await;
+                cfg.limits.max_api_fetch = 55_000;
+            }
+            let (code, Json(resp)) = api_query_handler(
+                State(relay.clone()),
+                Query(ApiParams {
+                    offset: Some(50_000),
+                    limit: Some(5_000),
+                    ..Default::default()
+                }),
+            )
+            .await;
+            assert_eq!(
+                code,
+                StatusCode::BAD_REQUEST,
+                "an unservable fetch window must stay a clear 400: {resp}"
+            );
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
     fn param_rejection_keeps_status_and_message() {
         // `bound_params` reports with anyhow, but the HTTP layer must
         // answer with the original status code and message.

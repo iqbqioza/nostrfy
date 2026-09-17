@@ -13,7 +13,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
 
-use crate::nips::nip98;
+use crate::nips::{nip43, nip98};
 use crate::relay::Relay;
 
 const RPC_CONTENT_TYPE: &str = "application/nostr+json+rpc";
@@ -76,6 +76,8 @@ fn check_role_fields(label: &str, description: &str, color: &str) -> anyhow::Res
             "role color exceeds the maximum of {MAX_ROLE_COLOR_LEN} characters"
         ));
     }
+    // NIP-43: a non-empty `color` is a hue from 0 to 360.
+    nip43::check_role_color(color)?;
     Ok(())
 }
 
@@ -215,10 +217,14 @@ pub async fn rpc_handler(
                         .push((pubkey.to_string(), reason.to_string()));
                 }
             }
-            if !relay.persist_access().await {
+            // The in-memory mutation is live even when the write-through
+            // persistence fails, so the audit entry must still be recorded;
+            // the RPC reports the persistence error below.
+            let persisted = relay.persist_access().await;
+            audit!(&relay, &identity, "banpubkey", params);
+            if !persisted {
                 return rpc_err("error: cannot persist the access control state");
             }
-            audit!(&relay, &identity, "banpubkey", params);
             rpc_ok(json!(true))
         }
         "unbanpubkey" => {
@@ -236,10 +242,13 @@ pub async fn rpc_handler(
                     .blocked_pubkeys
                     .retain(|(p, _)| !p.eq_ignore_ascii_case(pubkey));
             }
-            if !relay.persist_access().await {
+            // Same contract as `banpubkey`: the failed persistence is still
+            // an applied in-memory mutation, so it must be audited.
+            let persisted = relay.persist_access().await;
+            audit!(&relay, &identity, "unbanpubkey", params);
+            if !persisted {
                 return rpc_err("error: cannot persist the access control state");
             }
-            audit!(&relay, &identity, "unbanpubkey", params);
             rpc_ok(json!(true))
         }
         "listbannedpubkeys" => {
@@ -280,10 +289,13 @@ pub async fn rpc_handler(
                         .push((pubkey.to_string(), reason.to_string()));
                 }
             }
-            if !relay.persist_access().await {
+            // Same contract as `banpubkey`: audit the applied mutation even
+            // when persisting it failed.
+            let persisted = relay.persist_access().await;
+            audit!(&relay, &identity, "allowpubkey", params);
+            if !persisted {
                 return rpc_err("error: cannot persist the access control state");
             }
-            audit!(&relay, &identity, "allowpubkey", params);
             rpc_ok(json!(true))
         }
         "unallowpubkey" => {
@@ -300,10 +312,13 @@ pub async fn rpc_handler(
                     .allowed_pubkeys
                     .retain(|(p, _)| !p.eq_ignore_ascii_case(pubkey));
             }
-            if !relay.persist_access().await {
+            // Same contract as `banpubkey`: audit the applied mutation even
+            // when persisting it failed.
+            let persisted = relay.persist_access().await;
+            audit!(&relay, &identity, "unallowpubkey", params);
+            if !persisted {
                 return rpc_err("error: cannot persist the access control state");
             }
-            audit!(&relay, &identity, "unallowpubkey", params);
             rpc_ok(json!(true))
         }
         "listallowedpubkeys" => {
@@ -324,14 +339,22 @@ pub async fn rpc_handler(
                 // NIP-86: allowing a kind also un-blocks it (matching the
                 // legacy endpoint), so `disallowkind` can be reverted.
                 access.blocked_kinds.retain(|k| *k != kind);
-                if !access.allowed_kinds.contains(&kind) {
+                // `allowed_kinds` is the config allowlist, which
+                // `allows_kind` treats as exhaustive when non-empty. An
+                // unconditional push would turn a single `allowkind` into a
+                // global allowlist that blocks every other kind (and would
+                // make a later `disallowkind` report the kind as allowed).
+                if !access.allowed_kinds.is_empty() && !access.allowed_kinds.contains(&kind) {
                     access.allowed_kinds.push(kind);
                 }
             }
-            if !relay.persist_access().await {
+            // Same contract as `banpubkey`: audit the applied mutation even
+            // when persisting it failed.
+            let persisted = relay.persist_access().await;
+            audit!(&relay, &identity, "allowkind", params);
+            if !persisted {
                 return rpc_err("error: cannot persist the access control state");
             }
-            audit!(&relay, &identity, "allowkind", params);
             rpc_ok(json!(true))
         }
         "disallowkind" => {
@@ -343,11 +366,18 @@ pub async fn rpc_handler(
                 if !access.blocked_kinds.contains(&kind) {
                     access.blocked_kinds.push(kind);
                 }
+                // A blocked kind must never be listed as allowed: drop it
+                // from the config allowlist (`listallowedkinds` reports that
+                // list, and `disallowkind` must leave a consistent state).
+                access.allowed_kinds.retain(|k| *k != kind);
             }
-            if !relay.persist_access().await {
+            // Same contract as `banpubkey`: audit the applied mutation even
+            // when persisting it failed.
+            let persisted = relay.persist_access().await;
+            audit!(&relay, &identity, "disallowkind", params);
+            if !persisted {
                 return rpc_err("error: cannot persist the access control state");
             }
-            audit!(&relay, &identity, "disallowkind", params);
             rpc_ok(json!(true))
         }
         "listallowedkinds" => {
@@ -539,12 +569,16 @@ pub async fn rpc_handler(
                     access.blocked_ips.push(ip.to_string(), reason.to_string());
                 }
             }
-            if !relay.persist_access().await {
-                return rpc_err("error: cannot persist the access control state");
-            }
+            // The in-memory block is live even when persistence fails, so
+            // existing connections must still be dropped and the mutation
+            // audited; the RPC reports the persistence error below.
+            let persisted = relay.persist_access().await;
             // Drop existing connections from this IP, not just new ones.
             relay.note_ip_blocks_changed();
             audit!(&relay, &identity, "blockip", params);
+            if !persisted {
+                return rpc_err("error: cannot persist the access control state");
+            }
             rpc_ok(json!(true))
         }
         "unblockip" => {
@@ -561,14 +595,18 @@ pub async fn rpc_handler(
                 // `0:0:0:0:0:0:0:1`, v4-mapped versus IPv4).
                 access.blocked_ips.remove(ip);
             }
-            if !relay.persist_access().await {
-                return rpc_err("error: cannot persist the access control state");
-            }
+            // Same contract as `blockip`: the in-memory unblock is live even
+            // when persistence fails, so the version must still be bumped
+            // and the mutation audited.
+            let persisted = relay.persist_access().await;
             // Re-connect checks: unblocking also bumps the version so
             // connections that were blocked mid-flight re-verify (a version
             // bump with an empty list is harmless).
             relay.note_ip_blocks_changed();
             audit!(&relay, &identity, "unblockip", params);
+            if !persisted {
+                return rpc_err("error: cannot persist the access control state");
+            }
             rpc_ok(json!(true))
         }
         "listblockedips" => {
@@ -695,7 +733,7 @@ async fn rpc_authenticated(
         && let Some(auth) = headers
             .get(header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Nostr "))
+            .and_then(nip98::strip_nostr_scheme)
         && let Some(verified) = nip98::verify(
             auth,
             Some(&cfg.rpc.admin_pubkey),
@@ -877,7 +915,9 @@ mod tests {
         let resp = rpc_call(&relay, "listallowedpubkeys", vec![]).await;
         assert_eq!(resp.status(), StatusCode::OK);
 
-        // Kind allow/disallow.
+        // Kind allow/disallow. With no config allowlist active,
+        // `allowkind` must not populate `allowed_kinds` (which would turn
+        // the kind list into a global allowlist and block every other kind).
         let resp = rpc_call(&relay, "allowkind", vec![]).await;
         assert!(rpc_err_of(resp).await.contains("params"));
         let resp = rpc_call(&relay, "allowkind", vec![json!(5)]).await;
@@ -888,6 +928,15 @@ mod tests {
         assert!(rpc_err_of(resp).await.contains("params"));
         let resp = rpc_call(&relay, "disallowkind", vec![json!(5)]).await;
         assert!(rpc_ok_of(resp).await);
+        {
+            let access = relay.access.read().await;
+            assert!(
+                access.allowed_kinds.is_empty(),
+                "allowkind must not activate an empty config allowlist"
+            );
+            assert!(!access.allows_kind(5), "disallowkind must block the kind");
+            assert!(access.allows_kind(1), "other kinds must stay allowed");
+        }
         let resp = rpc_call(&relay, "listallowedkinds", vec![]).await;
         assert_eq!(resp.status(), StatusCode::OK);
 
@@ -942,6 +991,22 @@ mod tests {
         )
         .await;
         assert!(rpc_err_of(resp).await.contains("maximum"));
+        // NIP-43: a color outside the documented 0-360 hue range is rejected
+        // before the role can be stored or published.
+        let resp = rpc_call(
+            &relay,
+            "createrole",
+            vec![json!("r"), json!(""), json!(""), json!("361")],
+        )
+        .await;
+        assert!(rpc_err_of(resp).await.contains("0 to 360"));
+        let resp = rpc_call(
+            &relay,
+            "createrole",
+            vec![json!("r"), json!(""), json!(""), json!("red")],
+        )
+        .await;
+        assert!(rpc_err_of(resp).await.contains("0 to 360"));
         let resp = rpc_call(&relay, "createrole", vec![json!("r1")]).await;
         assert!(rpc_err_of(resp).await.contains("restricted"));
         let resp = rpc_call(&relay, "editrole", vec![]).await;
@@ -1130,6 +1195,154 @@ mod tests {
         let _ = rpc_call(&relay, "banpubkey", vec![json!("not-a-pubkey")]).await;
         assert_eq!(relay.audit.recent().len(), 1);
         relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn kind_allow_disallow_round_trip() {
+        let relay = build_admin_relay().await;
+        // Block, then allow: the kind is usable again and other kinds were
+        // never affected.
+        let resp = rpc_call(&relay, "disallowkind", vec![json!(7)]).await;
+        assert!(rpc_ok_of(resp).await);
+        {
+            let access = relay.access.read().await;
+            assert!(!access.allows_kind(7), "disallowkind must block the kind");
+            assert!(access.allows_kind(1), "other kinds must stay allowed");
+        }
+        let resp = rpc_call(&relay, "allowkind", vec![json!(7)]).await;
+        assert!(rpc_ok_of(resp).await);
+        {
+            let access = relay.access.read().await;
+            assert!(
+                access.allows_kind(7),
+                "allowkind must re-enable a blocked kind"
+            );
+            assert!(
+                access.allowed_kinds.is_empty(),
+                "allowkind must not activate an empty allowlist"
+            );
+            assert!(access.allows_kind(1), "other kinds must stay allowed");
+        }
+        // Disallow again, and the kind disappears from `listallowedkinds`:
+        // a blocked kind must never be reported as allowed.
+        let resp = rpc_call(&relay, "allowkind", vec![json!(7)]).await;
+        assert!(rpc_ok_of(resp).await);
+        let resp = rpc_call(&relay, "disallowkind", vec![json!(7)]).await;
+        assert!(rpc_ok_of(resp).await);
+        {
+            let access = relay.access.read().await;
+            assert!(!access.allows_kind(7));
+            assert!(
+                !access.allowed_kinds.contains(&7),
+                "a blocked kind must not be listed as allowed"
+            );
+        }
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn allowkind_extends_an_active_config_allowlist() {
+        let relay = build_admin_relay().await;
+        // Simulate a config allowlist: `allowed_kinds` is exhaustive while
+        // non-empty, so `allowkind` must extend it or the call would report
+        // success while `allows_kind` still rejects the kind.
+        relay.access.write().await.allowed_kinds = vec![1];
+        assert!(!relay.access.read().await.allows_kind(7));
+        let resp = rpc_call(&relay, "allowkind", vec![json!(7)]).await;
+        assert!(rpc_ok_of(resp).await);
+        {
+            let access = relay.access.read().await;
+            assert!(
+                access.allows_kind(7),
+                "allowkind must extend the active allowlist"
+            );
+            assert!(access.allows_kind(1), "the existing allowlist survives");
+        }
+        let resp = rpc_call(&relay, "disallowkind", vec![json!(7)]).await;
+        assert!(rpc_ok_of(resp).await);
+        {
+            let access = relay.access.read().await;
+            assert!(!access.allows_kind(7));
+            assert!(
+                !access.allowed_kinds.contains(&7),
+                "disallowkind must remove the kind from the allowlist"
+            );
+            assert!(access.allows_kind(1));
+        }
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn failed_persistence_still_notifies_and_audits() {
+        // Every write-through persist fails (the database is gone), but the
+        // in-memory mutation is live: the audit entry (and the blocked-IP
+        // notification) must not be skipped. The RPC still reports the
+        // persistence error so the operator knows a restart loses the change.
+        let relay = build_admin_relay().await;
+        relay.audit.clear();
+        // Watch the IP-block version: `blockip`/`unblockip` must still drop
+        // or re-check existing connections when persistence failed.
+        let mut ip_changes = relay.ip_blocks_tx.subscribe();
+        let before = *ip_changes.borrow_and_update();
+        relay.db.shutdown();
+        let calls: Vec<(&str, Vec<Value>)> = vec![
+            ("banpubkey", vec![json!("aa".repeat(32))]),
+            ("unbanpubkey", vec![json!("cc".repeat(32))]),
+            ("allowpubkey", vec![json!("bb".repeat(32))]),
+            ("unallowpubkey", vec![json!("dd".repeat(32))]),
+            ("allowkind", vec![json!(7)]),
+            ("disallowkind", vec![json!(7)]),
+            ("blockip", vec![json!("127.0.0.9")]),
+            ("unblockip", vec![json!("127.0.0.10")]),
+        ];
+        for (method, params) in &calls {
+            let resp = rpc_call(&relay, method, params.clone()).await;
+            assert!(
+                rpc_err_of(resp).await.contains("persist"),
+                "{method} must report the persistence failure"
+            );
+        }
+        let recent = relay.audit.recent();
+        assert_eq!(
+            recent.len(),
+            calls.len(),
+            "every applied mutation must be audited: {recent:?}"
+        );
+        for (method, _) in &calls {
+            assert!(
+                recent.iter().any(|entry| entry.starts_with(method)),
+                "{method} must be in the audit trail: {recent:?}"
+            );
+        }
+        assert_ne!(
+            before,
+            *ip_changes.borrow_and_update(),
+            "a failed persist must not skip the blocked-IP notification"
+        );
+        // The mutations are live in memory even though persisting failed.
+        let access = relay.access.read().await;
+        assert!(
+            access
+                .blocked_pubkeys
+                .iter()
+                .any(|(p, _)| p == &"aa".repeat(32)),
+            "the ban mutation must be live"
+        );
+        assert!(
+            access
+                .allowed_pubkeys
+                .iter()
+                .any(|(p, _)| p == &"bb".repeat(32)),
+            "the allow mutation must be live"
+        );
+        assert!(
+            access.blocked_kinds.contains(&7),
+            "the disallow mutation must be live"
+        );
+        assert!(
+            access.is_ip_blocked("127.0.0.9".parse().unwrap()),
+            "the block mutation must be live"
+        );
     }
 
     #[tokio::test]

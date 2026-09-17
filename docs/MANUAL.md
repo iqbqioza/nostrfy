@@ -225,6 +225,7 @@ To generate a secret key, use the `nostrfy genkey` command (see [5. Command Refe
 | `max_api_concurrent` | Max concurrent REST API requests | `8` |
 | `max_api_limit` | Ceiling for the API `limit` parameter (0 = unlimited) | `5000` |
 | `max_api_offset` | Ceiling for the API `offset` parameter (0 = unlimited) | `50000` |
+| `max_api_fetch` | Max rows one API query may prefetch for pagination (0 = unlimited; the effective window is `min(offset + limit + 1, max_api_fetch)`, and the default `55001` covers `max_api_offset` + `max_api_limit` + 1) | `55001` |
 | `max_api_search_bytes` | Max `search` bytes for the API (0 = unlimited) | `2048` |
 | `live_batch_interval_ms` / `live_batch_size` | Live fan-out batching (ms / events) | `20` / `32` |
 | `live_buffer` | Live fan-out queue size | `65536` |
@@ -252,9 +253,9 @@ To generate a secret key, use the `nostrfy genkey` command (see [5. Command Refe
 | `pid_file` | PID file path | `./nostrfy.pid` |
 | `log_file` | Log file path | `./nostrfy.log` |
 | `stats_file` | Statistics file path | `./nostrfy.stats.json` |
-| `stats_interval_secs` | Statistics write interval | `5` |
+| `stats_interval_secs` | Statistics write interval (must be ≥ 1) | `5` |
 | `max_log_size_bytes` | Log rotation size (0 = no rotation) | 50 MB |
-| `max_log_files` | Number of rotated log files to keep | `5` |
+| `max_log_files` | Number of rotated log files to keep (1-1000) | `5` |
 
 #### `[access]` — Access control (also changeable at runtime via NIP-86)
 
@@ -751,7 +752,7 @@ The daemon writes to `daemon.log_file`. When the file grows past `max_log_size_b
 tail -f nostrfy.log
 ```
 
-The log level is controlled by the `RUST_LOG` environment variable (e.g. `RUST_LOG=debug`).
+The log level is controlled by the `RUST_LOG` environment variable: a bare level (`RUST_LOG=debug`), a directive for this crate (`RUST_LOG=nostrfy=debug`, including a module such as `nostrfy::server=trace`) or a comma-separated list of both.
 
 ### Statistics
 
@@ -766,6 +767,8 @@ curl http://127.0.0.1:8080/relay/stats
 ```
 
 Shows connections, events received/accepted/rejected, DB size, and more.
+
+`nostrfy stats` only prints current data: every snapshot carries a `written_at` timestamp, and if the daemon's pid file process is gone or the snapshot is older than three `stats_interval_secs` intervals, the command reports that the daemon is not running / the statistics are stale and exits nonzero instead of printing old counters as live. The HTTP `/relay/stats` endpoint always reports the in-process counters and is unaffected.
 
 ### Prometheus metrics
 
@@ -785,9 +788,11 @@ After editing the config file, reload it without a restart:
 kill -HUP $(cat nostrfy.pid)
 ```
 
-Settings that take effect on reload: the relay name/description/pubkey/contact/icon/post-policy, `public_url`, most `[limits]` entries (the restart-only ones are listed below), the NIP toggles (`reject_ephemeral`, `enabled_git`, `enabled_nip78_auth`), NIP-40 on/off and the REST API concurrency ceiling.
+The reload is **not all-or-nothing**: every live setting is applied even when the same edit also changes a startup-only one. Settings that take effect on reload: the relay name/description/pubkey/contact/icon/post-policy, `public_url`, the auth and policy knobs (`reject_ephemeral`, `enabled_git`, `enabled_nip78_auth`, `require_auth`, `send_auth_challenge`, `require_pow`, `new_pubkey_min_age_secs`, `max_events_per_min_per_pubkey`), most `[limits]` entries (the restart-only ones are listed below), the NIP-40 on/off state and the REST API concurrency ceiling, `rpc.management_token`/`admin_pubkey`, `blossom.restrict_uploads` and `access.restrict_relay`.
 
-Settings that require a **restart** (the log warns when one of them changed): `private_key`, `api_host`, `metrics_enabled`, LiveKit settings, `enabled_nips`/`disabled_nips`, `server.host`/`port`/`ws_paths`, `rpc.max_admin_body_bytes`, `database.path`/`purge_interval_secs`/`map_size`/`max_map_size`/`search_index`/`meta_index`/`reader_threads`/`disabled_fsync`/`db_request_timeout_secs`/`max_db_queue_msgs`/`max_db_queue_events`/`max_indexed_words`, `daemon.max_log_size_bytes`/`max_log_files`/`stats_interval_secs`, `limits.live_buffer`/`live_batch_size`/`live_batch_interval_ms`/`socket_recv_buffer_kb`/`max_connections`/`max_connections_per_ip`/`http_read_timeout_secs`/`max_connections_per_sec_per_ip`, all `blossom.*`, and `relay.max_groups` (captured at startup; not covered by the reload warning). See the CONFIGURATION.md SIGHUP table for the full matrix.
+Settings that require a **restart**: each changed one is warned about (`... a restart is required to apply it`) and keeps its running value. They are `private_key` (warned about and ignored), `api_host`, `metrics_enabled`, LiveKit settings, `enabled_nips`/`disabled_nips`, `server.host`/`port`/`ws_paths`, `rpc.max_admin_body_bytes`, `database.path`/`purge_interval_secs`/`map_size`/`max_map_size`/`max_dbs`/`max_readers`/`search_index`/`meta_index`/`reader_threads`/`disabled_fsync`/`db_request_timeout_secs`/`max_db_queue_msgs`/`max_db_queue_events`/`max_db_queue_bytes`/`max_indexed_words`, `daemon.max_log_size_bytes`/`max_log_files`/`stats_interval_secs`/`log_file`/`pid_file`, `limits.live_buffer`/`live_batch_size`/`live_batch_interval_ms`/`socket_recv_buffer_kb`/`max_connections`/`max_connections_per_ip`/`http_read_timeout_secs`/`max_connections_per_sec_per_ip`, all `blossom.*`, and `relay.max_groups`. See the CONFIGURATION.md SIGHUP table for the full matrix.
+
+The `[access]` kind/IP lists are runtime-managed via NIP-86 (a config edit is ignored and warned about); `restrict_relay` applies on reload. A file that fails validation is rejected as a whole: the error is logged and the old configuration stays in force.
 
 ---
 
