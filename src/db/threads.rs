@@ -861,8 +861,8 @@ pub(crate) fn spawn(
                                     };
                                     let _ = reply.send(n);
                                 }
-                                Msg::GroupPurge { group, reply } => {
-                                    let n = match store.purge_group(&group) {
+                                Msg::GroupPurge { group, now, reply } => {
+                                    let n = match store.purge_group(&group, now) {
                                         Ok(n) => n,
                                         Err(e) => {
                                             db_error(&thread_errors, &e);

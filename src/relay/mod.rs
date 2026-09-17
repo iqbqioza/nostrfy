@@ -1759,10 +1759,12 @@ impl Relay {
             // NIP-29: purge the deleted group's stored events. A fresh
             // create on the same id installs a public group, which would
             // otherwise expose the old (possibly private) history. The
-            // purge reports a failure as zero removed, so success is
-            // confirmed by the state below: only then does the id return to
-            // the ordinary delete tombstone (which a create may clear).
-            let removed = self.db.group_purge(gid.to_string()).await;
+            // purge records a per-group cut in the database, so a later
+            // re-broadcast of the purged history stays rejected. The purge
+            // reports a failure as zero removed, so success is confirmed by
+            // the state below: only then does the id return to the ordinary
+            // delete tombstone (which a create may clear).
+            let removed = self.db.group_purge(gid.to_string(), unix_now()).await;
             self.stats.bump(&self.stats.events_deleted, removed as u64);
             if self.group_purge_confirmed(gid).await {
                 // The history is gone: the id may be re-created normally.
@@ -2545,11 +2547,11 @@ mod tests {
             let pubkey = secp256k1::XOnlyPublicKey::from_keypair(&keypair)
                 .0
                 .to_string();
-            let signed = |kind: u64, content: &str| {
+            let signed = |kind: u64, content: &str, created_at: u64| {
                 let mut e = crate::event::Event {
                     id: String::new(),
                     pubkey: pubkey.clone(),
-                    created_at: now,
+                    created_at,
                     kind,
                     tags: vec![vec!["h".into(), "g1".into()]],
                     content: content.into(),
@@ -2561,14 +2563,19 @@ mod tests {
                 e
             };
             // A stored group message (direct DB put: the purge is the target).
-            let msg = signed(1, "secret group message");
-            assert_eq!(relay.db.put(msg, now).await, crate::db::PutOutcome::Stored);
-            let create = signed(crate::nips::nip29::CREATE_GROUP, "");
+            // It predates the purge cut, so a replay after the re-create is
+            // rejected by the per-group purge marker.
+            let msg = signed(1, "secret group message", now - 10);
+            assert_eq!(
+                relay.db.put(msg.clone(), now).await,
+                crate::db::PutOutcome::Stored
+            );
+            let create = signed(crate::nips::nip29::CREATE_GROUP, "", now - 5);
             assert!(matches!(
                 relay.accept_event(create, &[], None).await,
                 crate::db::PutOutcome::Stored
             ));
-            let delete = signed(crate::nips::nip29::DELETE_GROUP, "");
+            let delete = signed(crate::nips::nip29::DELETE_GROUP, "", now);
             assert!(matches!(
                 relay.accept_event(delete, &[], None).await,
                 crate::db::PutOutcome::Stored
@@ -2579,9 +2586,9 @@ mod tests {
             assert!(res.is_empty(), "the deleted group's events must be purged");
             // The purge was confirmed, so the fail-closed ghost was
             // downgraded to the ordinary tombstone: the id is re-creatable.
-            // (A distinct content gives the re-create a fresh event id; the
-            // purged history's ids stay tombstoned.)
-            let recreate = signed(crate::nips::nip29::CREATE_GROUP, "recreate");
+            // The purge marker still rejects a re-broadcast of the purged
+            // history (one cut per group, not one tombstone per event).
+            let recreate = signed(crate::nips::nip29::CREATE_GROUP, "recreate", now + 1);
             assert!(matches!(
                 relay.accept_event(recreate, &[], None).await,
                 crate::db::PutOutcome::Stored
@@ -2589,6 +2596,11 @@ mod tests {
             assert!(
                 relay.groups.read().await.group("g1").is_some(),
                 "a confirmed purge must leave the id re-creatable"
+            );
+            assert_eq!(
+                relay.db.put(msg, now + 1).await,
+                crate::db::PutOutcome::PreviouslyDeleted,
+                "the purged history must not re-enter after the re-create"
             );
             relay.db.shutdown();
         });

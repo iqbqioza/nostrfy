@@ -121,6 +121,13 @@ pub(crate) const GROUPS: &str = "groups";
 /// NIP-43 role state snapshot (`roles:snapshot`), persisted for the same
 /// reason as [`GROUPS`].
 pub(crate) const ROLES: &str = "roles";
+/// NIP-29 group purge markers: `sha256(gid) -> purge cut (BE u64)`. One
+/// record per purged group id instead of one tombstone per purged event:
+/// re-published events older than the cut are rejected (see
+/// [`Store::purge_group`] and [`Store::put`]). A create/purge cycle
+/// therefore grows this table by one fixed 32-byte key, not by the group's
+/// (unbounded) event count.
+pub(crate) const PURGED_GROUPS: &str = "purged_groups";
 pub(crate) const CREATED_LEN: usize = 8;
 pub(crate) const ID_LEN: usize = 32;
 pub(crate) const TAG_VALUE_MAX: usize = 1024;
@@ -404,6 +411,9 @@ pub(crate) struct Store {
     /// Serialized NIP-43 role state snapshot (see
     /// [`crate::nips::nip43::RolesSnapshot`]), same lifecycle as [`Self::groups`].
     pub(crate) roles: Database<Bytes, Bytes>,
+    /// NIP-29 purge markers (see [`PURGED_GROUPS`]): a purged group's
+    /// history must not be re-publishable after the id is re-created.
+    pub(crate) purged_groups: Database<Bytes, Bytes>,
     /// One-time index migration markers (see [`INDEX_META`]).
     pub(crate) index_meta: Database<Bytes, Bytes>,
     /// NIP-40 expiration handling is only active when the NIP is enabled.
@@ -457,8 +467,8 @@ impl Store {
         let map_size = map_max_size as usize;
         let env = unsafe {
             EnvOpenOptions::new()
-                // 17 named tables, plus the word index when search is on.
-                .max_dbs(cfg.max_dbs.max(18))
+                // 18 named tables, plus the word index when search is on.
+                .max_dbs(cfg.max_dbs.max(19))
                 // Every reader thread can hold a concurrent read transaction,
                 // the writer/API/startup paths take slots too, and some read
                 // paths nest a second transaction inside the first
@@ -515,6 +525,7 @@ impl Store {
         let blossom = env.create_database::<Bytes, Bytes>(&mut wtxn, Some(BLOSSOM))?;
         let groups = env.create_database::<Bytes, Bytes>(&mut wtxn, Some(GROUPS))?;
         let roles = env.create_database::<Bytes, Bytes>(&mut wtxn, Some(ROLES))?;
+        let purged_groups = env.create_database::<Bytes, Bytes>(&mut wtxn, Some(PURGED_GROUPS))?;
         let index_meta = env.create_database::<Bytes, Bytes>(&mut wtxn, Some(INDEX_META))?;
         wtxn.commit()?;
         // The word-index limit is persisted with the index it describes: a
@@ -550,7 +561,7 @@ impl Store {
         } else {
             configured_words
         };
-        let tables = if by_word.is_some() { 18 } else { 17 };
+        let tables = if by_word.is_some() { 19 } else { 18 };
         log::info!(
             "database ready at {} ({} tables, map {} MiB)",
             cfg.path.display(),
@@ -577,6 +588,7 @@ impl Store {
             blossom,
             groups,
             roles,
+            purged_groups,
             index_meta,
             expiry_enabled,
             max_indexed_words: max_indexed_words.max(1),
@@ -646,6 +658,7 @@ impl Store {
             blossom: self.blossom,
             groups: self.groups,
             roles: self.roles,
+            purged_groups: self.purged_groups,
             index_meta: self.index_meta,
             expiry_enabled: Arc::clone(&self.expiry_enabled),
             max_indexed_words: self.max_indexed_words,
@@ -1280,7 +1293,13 @@ pub(crate) fn tag_range(name: u8, value: &[u8], since: u64, until: u64) -> (Vec<
         end.extend_from_slice(&[0xffu8; ID_LEN]);
         end.push(0);
     } else {
-        end[..prefix_len + CREATED_LEN].copy_from_slice(&until.saturating_add(1).to_be_bytes());
+        // Replace the `until` field just appended at `prefix_len`: the
+        // exclusive bound is `until + 1`. Copying into `[..prefix_len +
+        // CREATED_LEN]` would target the whole buffer and panic (the slice
+        // length never equals the 8-byte timestamp), aborting every indexed
+        // tag scan that carries an explicit `until`.
+        end[prefix_len..prefix_len + CREATED_LEN]
+            .copy_from_slice(&until.saturating_add(1).to_be_bytes());
         end.extend_from_slice(&[0u8; ID_LEN]);
     }
     (start, end)
@@ -1361,6 +1380,14 @@ fn dtag_fingerprint(value: &str) -> String {
     hex::encode(&digest[..4])
 }
 
+/// The [`PURGED_GROUPS`] key of a group id: a fixed 32-byte digest, so a
+/// group id of any length (tag values reach 1 KiB) fits LMDB's key-size
+/// limit and one marker costs the same regardless of the id.
+pub(crate) fn purged_group_key(gid: &str) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(gid.as_bytes()).into()
+}
+
 /// Tombstone key for an `a`-tag (address) deletion, stored in the
 /// [`DELETED`] table. Event ids are exactly 32 bytes, so the one-byte prefix
 /// keeps the two key spaces disjoint. The `d` tag is normalized like the
@@ -1381,6 +1408,36 @@ pub(crate) fn deleted_address_key(kind: u64, pubkey: &[u8], dtag: &str) -> Vec<u
 }
 impl Store {
     // ----- event persistence -----
+
+    /// Whether a NIP-29 purge marker blocks `event`: any `h`-tagged event
+    /// whose `created_at` is strictly before the group's purge cut is a
+    /// re-publication of purged history (see [`PURGED_GROUPS`]).
+    fn purged_groups_blocks(&self, wtxn: &heed::RwTxn, event: &Event) -> Result<bool> {
+        if !event.tags.iter().any(|tag| tag.len() >= 2 && tag[0] == "h") {
+            return Ok(false);
+        }
+        // No group was ever purged: skip the per-tag hashing entirely (the
+        // common case for relays that never deleted a group).
+        if self.purged_groups.is_empty(wtxn)? {
+            return Ok(false);
+        }
+        for tag in &event.tags {
+            if tag.len() < 2 || tag[0] != "h" {
+                continue;
+            }
+            let Some(raw) = self.purged_groups.get(wtxn, &purged_group_key(&tag[1]))? else {
+                continue;
+            };
+            let cut = raw
+                .get(..8)
+                .map(|bytes| u64::from_be_bytes(bytes.try_into().expect("checked length")))
+                .unwrap_or(0);
+            if event.created_at < cut {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
 
     /// Applies a put inside the given write transaction. Used by the DB
     /// thread to batch consecutive puts into one commit; the transaction
@@ -1441,6 +1498,18 @@ impl Store {
             return Ok(PutOutcome::Invalid("blocked: event has been banned".into()));
         }
         if self.deleted.get(wtxn, &id)?.is_some() {
+            return Ok(PutOutcome::PreviouslyDeleted);
+        }
+        // NIP-29: a purged group's history must not re-enter the database
+        // after the id is re-created (a re-create installs default-public
+        // settings, exposing old private posts). One marker per group id
+        // records the purge cut; events created before it are rejected.
+        // Only events carrying an `h` tag are checked, so ordinary traffic
+        // pays one tag scan at most. The strict comparison lets the
+        // legitimate re-create (and posts made in the purge second) pass:
+        // a purge requires group-admin/relay-key access, so the residual
+        // same-second window is not externally triggerable.
+        if self.purged_groups_blocks(wtxn, event)? {
             return Ok(PutOutcome::PreviouslyDeleted);
         }
         // NIP-01: kinds 20000-29999 are ephemeral: they are delivered to
