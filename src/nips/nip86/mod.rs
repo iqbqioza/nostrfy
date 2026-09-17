@@ -215,7 +215,9 @@ pub async fn rpc_handler(
                         .push((pubkey.to_string(), reason.to_string()));
                 }
             }
-            relay.persist_access().await;
+            if !relay.persist_access().await {
+                return rpc_err("error: cannot persist the access control state");
+            }
             audit!(&relay, &identity, "banpubkey", params);
             rpc_ok(json!(true))
         }
@@ -234,7 +236,9 @@ pub async fn rpc_handler(
                     .blocked_pubkeys
                     .retain(|(p, _)| !p.eq_ignore_ascii_case(pubkey));
             }
-            relay.persist_access().await;
+            if !relay.persist_access().await {
+                return rpc_err("error: cannot persist the access control state");
+            }
             audit!(&relay, &identity, "unbanpubkey", params);
             rpc_ok(json!(true))
         }
@@ -276,7 +280,9 @@ pub async fn rpc_handler(
                         .push((pubkey.to_string(), reason.to_string()));
                 }
             }
-            relay.persist_access().await;
+            if !relay.persist_access().await {
+                return rpc_err("error: cannot persist the access control state");
+            }
             audit!(&relay, &identity, "allowpubkey", params);
             rpc_ok(json!(true))
         }
@@ -294,7 +300,9 @@ pub async fn rpc_handler(
                     .allowed_pubkeys
                     .retain(|(p, _)| !p.eq_ignore_ascii_case(pubkey));
             }
-            relay.persist_access().await;
+            if !relay.persist_access().await {
+                return rpc_err("error: cannot persist the access control state");
+            }
             audit!(&relay, &identity, "unallowpubkey", params);
             rpc_ok(json!(true))
         }
@@ -320,7 +328,9 @@ pub async fn rpc_handler(
                     access.allowed_kinds.push(kind);
                 }
             }
-            relay.persist_access().await;
+            if !relay.persist_access().await {
+                return rpc_err("error: cannot persist the access control state");
+            }
             audit!(&relay, &identity, "allowkind", params);
             rpc_ok(json!(true))
         }
@@ -334,7 +344,9 @@ pub async fn rpc_handler(
                     access.blocked_kinds.push(kind);
                 }
             }
-            relay.persist_access().await;
+            if !relay.persist_access().await {
+                return rpc_err("error: cannot persist the access control state");
+            }
             audit!(&relay, &identity, "disallowkind", params);
             rpc_ok(json!(true))
         }
@@ -527,7 +539,9 @@ pub async fn rpc_handler(
                     access.blocked_ips.push(ip.to_string(), reason.to_string());
                 }
             }
-            relay.persist_access().await;
+            if !relay.persist_access().await {
+                return rpc_err("error: cannot persist the access control state");
+            }
             // Drop existing connections from this IP, not just new ones.
             relay.note_ip_blocks_changed();
             audit!(&relay, &identity, "blockip", params);
@@ -547,7 +561,9 @@ pub async fn rpc_handler(
                 // `0:0:0:0:0:0:0:1`, v4-mapped versus IPv4).
                 access.blocked_ips.remove(ip);
             }
-            relay.persist_access().await;
+            if !relay.persist_access().await {
+                return rpc_err("error: cannot persist the access control state");
+            }
             // Re-connect checks: unblocking also bumps the version so
             // connections that were blocked mid-flight re-verify (a version
             // bump with an empty list is harmless).

@@ -594,8 +594,15 @@ async fn get_blob(
     let Some(sha) = split_blob(&blob) else {
         return error(StatusCode::BAD_REQUEST, "invalid blob hash");
     };
-    let Some(desc) = state.store.find(&sha).await else {
-        return error(StatusCode::NOT_FOUND, "blob not found");
+    let desc = match state.store.find(&sha).await {
+        Ok(Some(desc)) => desc,
+        Ok(None) => return error(StatusCode::NOT_FOUND, "blob not found"),
+        Err(_) => {
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "blob lookup unavailable, please retry",
+            );
+        }
     };
     let size = desc.size;
     // `size` is a `u64` from a stored (possibly corrupt) descriptor: narrow
@@ -733,8 +740,15 @@ async fn head_blob(
     let Some(sha) = split_blob(&blob) else {
         return error(StatusCode::BAD_REQUEST, "invalid blob hash");
     };
-    let Some(desc) = state.store.find(&sha).await else {
-        return error(StatusCode::NOT_FOUND, "blob not found");
+    let desc = match state.store.find(&sha).await {
+        Ok(Some(desc)) => desc,
+        Ok(None) => return error(StatusCode::NOT_FOUND, "blob not found"),
+        Err(_) => {
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "blob lookup unavailable, please retry",
+            );
+        }
     };
     let size = desc.size;
     let Ok(size_usize) = usize::try_from(size) else {
@@ -1261,8 +1275,14 @@ async fn list(
     // a stale cursor cannot loop over duplicates forever.
     let (after_uploaded, after_sha) = match cursor {
         Some(sha) => match state.store.find(sha).await {
-            Some(desc) => (Some(desc.uploaded.max(0) as u64), Some(sha.to_string())),
-            None => {
+            Ok(Some(desc)) => (Some(desc.uploaded.max(0) as u64), Some(sha.to_string())),
+            Err(_) => {
+                return error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "blob lookup unavailable, please retry",
+                );
+            }
+            Ok(None) => {
                 let empty: Vec<Value> = Vec::new();
                 return (
                     [(axum::http::header::CONTENT_TYPE, "application/json")],
@@ -1324,8 +1344,15 @@ async fn delete_blob(
     let Some(pubkey) = verify_auth(&relay, &state, &headers, "delete", Some(&sha)).await else {
         return error(StatusCode::UNAUTHORIZED, "invalid or missing authorization");
     };
-    if state.store.find(&sha).await.is_none() {
-        return error(StatusCode::NOT_FOUND, "blob not found");
+    match state.store.find(&sha).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return error(StatusCode::NOT_FOUND, "blob not found"),
+        Err(_) => {
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "blob lookup unavailable, please retry",
+            );
+        }
     }
     // Only an uploader of these bytes may delete their own copy; other
     // uploaders of identical content keep theirs.
