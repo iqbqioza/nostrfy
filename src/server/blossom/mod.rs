@@ -51,6 +51,62 @@ pub(crate) struct BlossomState {
     /// temporary file, so this bounds disk-backed work and prevents a burst
     /// of maximum-sized requests from creating unbounded concurrent work.
     pub upload_budget: Arc<tokio::sync::Semaphore>,
+    /// In-flight upload count per uploader pubkey (see
+    /// [`MAX_UPLOADS_PER_PUBKEY`]), so one identity cannot hold the whole
+    /// global budget. A plain mutex: the critical section is two map
+    /// operations and never crosses an await.
+    pub uploads_inflight: std::sync::Mutex<std::collections::HashMap<String, usize>>,
+}
+
+/// The most upload permits one pubkey may hold at once. The global budget
+/// allows four maximum-sized uploads; without a per-identity cap a single
+/// host with several trickling connections could hold every permit for the
+/// whole rate window and 429 all other uploaders.
+const MAX_UPLOADS_PER_PUBKEY: usize = 2;
+
+/// In-flight upload count per uploader pubkey. The slot releases on drop,
+/// so every path (success, error, timeout, or a cancelled handler future)
+/// returns it.
+struct UploadSlot {
+    state: Arc<BlossomState>,
+    pubkey: String,
+}
+
+impl BlossomState {
+    /// Claims an in-flight upload slot for `pubkey`; `None` when this
+    /// identity already holds [`MAX_UPLOADS_PER_PUBKEY`] uploads. The
+    /// caller answers 429 before taking a global permit or spooling a body.
+    fn try_register_upload(self: &Arc<Self>, pubkey: &str) -> Option<UploadSlot> {
+        let mut inflight = self
+            .uploads_inflight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let count = inflight.entry(pubkey.to_string()).or_insert(0);
+        if *count >= MAX_UPLOADS_PER_PUBKEY {
+            return None;
+        }
+        *count += 1;
+        Some(UploadSlot {
+            state: Arc::clone(self),
+            pubkey: pubkey.to_string(),
+        })
+    }
+}
+
+impl Drop for UploadSlot {
+    fn drop(&mut self) {
+        let mut inflight = self
+            .state
+            .uploads_inflight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(count) = inflight.get_mut(&self.pubkey) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                inflight.remove(&self.pubkey);
+            }
+        }
+    }
 }
 
 /// The routes, mounted by `build_router` only when `blossom.host` is set.
@@ -899,6 +955,17 @@ async fn put_blob(relay: Arc<Relay>, headers: HeaderMap, body: Body, verb: &str)
     if state.store.check_space().is_err() {
         return error(StatusCode::INSUFFICIENT_STORAGE, "storage is full");
     }
+    // Per-identity cap: the global budget allows four maximum-sized
+    // uploads, so without this one host trickling several connections
+    // could hold every permit for the whole rate window and 429 everyone
+    // else. The slot covers the spool and the publish; it releases when
+    // this function returns (including on cancellation).
+    let Some(_upload_slot) = state.try_register_upload(&pubkey) else {
+        return error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many uploads in progress",
+        );
+    };
     let max_upload = state.max_upload_bytes;
     let permits = match state
         .upload_budget
@@ -1073,13 +1140,12 @@ async fn spool_upload(
     let mut path = spool_dir
         .map(std::path::Path::to_path_buf)
         .unwrap_or_else(std::env::temp_dir);
-    // The sweep at startup parses the PID out of this name to skip other
-    // processes' in-flight spools (storage::sweep_stale_spools).
-    path.push(format!(
-        "{}{}-{}",
-        storage::SPOOL_PREFIX,
-        std::process::id(),
-        TEMP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    // The name carries the process PID, a per-process-start token and a
+    // counter: the token keeps a restarted process (PID 1 again) from
+    // colliding with a previous process's stale spool, and the sweep
+    // (storage::sweep_stale_spools) uses it to tell live spools apart.
+    path.push(storage::spool_file_name(
+        TEMP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
     ));
     let mut cleanup = TempUploadCleanup::new(path.clone());
     let mut file = match tokio::fs::OpenOptions::new()
@@ -1481,6 +1547,7 @@ pub(crate) async fn build_state(cfg: &Config, _relay: &Relay) -> Option<Arc<Blos
                 upload_budget: Arc::new(tokio::sync::Semaphore::new(
                     cfg.blossom.max_upload_bytes.saturating_mul(4).max(1),
                 )),
+                uploads_inflight: std::sync::Mutex::new(std::collections::HashMap::new()),
             });
             // One-time automatic migration of legacy blobs (storage files
             // that predate the LMDB mapping), in the background so the
@@ -1589,7 +1656,21 @@ mod tests {
         x: Option<&str>,
         server: Option<&str>,
     ) -> Event {
-        let keypair = Keypair::from_seckey_slice(secp, &[9u8; 32]).unwrap();
+        auth_event_with_key(secp, &[9u8; 32], created, verb, expiration, x, server)
+    }
+
+    /// Like [`auth_event`], but signed with `seckey`: tests that need two
+    /// distinct uploader identities.
+    fn auth_event_with_key(
+        secp: &Secp256k1<secp256k1::All>,
+        seckey: &[u8; 32],
+        created: u64,
+        verb: &str,
+        expiration: Option<u64>,
+        x: Option<&str>,
+        server: Option<&str>,
+    ) -> Event {
+        let keypair = Keypair::from_seckey_slice(secp, seckey).unwrap();
         let pubkey = XOnlyPublicKey::from_keypair(&keypair).0.to_string();
         let mut tags: Vec<Vec<String>> = vec![vec!["t".into(), verb.into()]];
         if let Some(exp) = expiration {
@@ -1629,8 +1710,19 @@ mod tests {
         verb: &str,
         sha: Option<&str>,
     ) -> (HeaderMap, String) {
+        auth_headers_scoped_with_key(secp, &[9u8; 32], verb, sha)
+    }
+
+    /// Like [`auth_headers_scoped`], but signed with `seckey` (a second
+    /// uploader identity for the per-pubkey upload-cap tests).
+    fn auth_headers_scoped_with_key(
+        secp: &Secp256k1<secp256k1::All>,
+        seckey: &[u8; 32],
+        verb: &str,
+        sha: Option<&str>,
+    ) -> (HeaderMap, String) {
         let now = unix_now();
-        let ev = auth_event(secp, now, verb, Some(now + 600), sha, None);
+        let ev = auth_event_with_key(secp, seckey, now, verb, Some(now + 600), sha, None);
         let token = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(serde_json::to_vec(&ev).unwrap());
         let mut headers = HeaderMap::new();
@@ -2117,7 +2209,7 @@ mod tests {
     #[tokio::test]
     async fn stalled_upload_body_times_out_and_releases_the_permit() {
         use futures_util::StreamExt as _;
-        let relay = build_blossom_relay(0).await;
+        let relay = build_blossom_relay(1).await;
         // A 1-second read timeout keeps the test fast.
         relay.config.write().await.limits.http_read_timeout_secs = 1;
         let data = b"hello";
@@ -2155,6 +2247,169 @@ mod tests {
             state.upload_budget.available_permits(),
             state.max_upload_bytes.saturating_mul(4).max(1),
             "the aborted upload must release its permit"
+        );
+        assert!(
+            state.uploads_inflight.lock().unwrap().is_empty(),
+            "the aborted upload must release its identity slot"
+        );
+        assert_eq!(
+            state.store.reserved_bytes(),
+            0,
+            "the aborted upload must release its spool reservation"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn upload_reservation_returns_to_zero_on_every_path() {
+        use futures_util::StreamExt as _;
+        // Every exit path releases the spool reservation: a leaked guard
+        // would eventually refuse uploads with 507 while the disk is empty.
+        let relay = build_blossom_relay(1).await;
+        relay.config.write().await.limits.http_read_timeout_secs = 1;
+        let state = state_of(&relay).await.expect("blossom state");
+        let data = b"reserved blob";
+        let sha = sha256_hex(data);
+
+        // Success: a declared size that matches the body.
+        let (mut headers, _) = auth_headers_scoped(relay.secp(), "upload", Some(&sha));
+        headers.insert(
+            axum::http::header::CONTENT_LENGTH,
+            data.len().to_string().parse().unwrap(),
+        );
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain".parse().unwrap(),
+        );
+        let resp = upload(
+            State(relay.clone()),
+            headers,
+            Body::from(bytes::Bytes::from_static(data)),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        assert_eq!(
+            state.store.reserved_bytes(),
+            0,
+            "a successful upload must release its spool reservation"
+        );
+
+        // Size error: the body overruns its declared Content-Length (413).
+        let (mut headers, _) = auth_headers_scoped(relay.secp(), "upload", Some(&sha));
+        headers.insert(axum::http::header::CONTENT_LENGTH, "1".parse().unwrap());
+        let resp = upload(
+            State(relay.clone()),
+            headers,
+            Body::from(bytes::Bytes::from_static(data)),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            state.store.reserved_bytes(),
+            0,
+            "a rejected upload must release its spool reservation"
+        );
+
+        // Timeout: one chunk, then a stalled stream (408).
+        let (headers, _) = auth_headers_scoped(relay.secp(), "upload", Some(&sha));
+        let stream = futures_util::stream::once(async {
+            Ok::<_, std::io::Error>(bytes::Bytes::from_static(data))
+        })
+        .chain(futures_util::stream::pending());
+        let resp = upload(State(relay.clone()), headers, Body::from_stream(stream)).await;
+        assert_eq!(resp.status(), StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(
+            state.store.reserved_bytes(),
+            0,
+            "a timed-out upload must release its spool reservation"
+        );
+        assert!(
+            state.uploads_inflight.lock().unwrap().is_empty(),
+            "every path must release its identity slot"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn one_pubkey_cannot_hold_every_upload_permit() {
+        let relay = build_blossom_relay(0).await;
+        // Long enough that the stalled uploads stay pending while the
+        // second identity uploads.
+        relay.config.write().await.limits.http_read_timeout_secs = 30;
+        let state = state_of(&relay).await.expect("blossom state");
+        let data = b"another uploader's blob";
+        let sha = sha256_hex(data);
+        let (headers_a, pk_a) = auth_headers_scoped(relay.secp(), "upload", Some(&sha));
+        let pending = || {
+            Body::from_stream(futures_util::stream::pending::<
+                Result<bytes::Bytes, std::io::Error>,
+            >())
+        };
+        // Pubkey A fills its per-identity share with stalled uploads.
+        let mut stalled = Vec::new();
+        for _ in 0..MAX_UPLOADS_PER_PUBKEY {
+            stalled.push(tokio::spawn(upload(
+                State(relay.clone()),
+                headers_a.clone(),
+                pending(),
+            )));
+        }
+        let mut a_slots = 0;
+        for _ in 0..200 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            a_slots = state
+                .uploads_inflight
+                .lock()
+                .unwrap()
+                .get(&pk_a)
+                .copied()
+                .unwrap_or(0);
+            if a_slots >= MAX_UPLOADS_PER_PUBKEY {
+                break;
+            }
+        }
+        assert_eq!(
+            a_slots, MAX_UPLOADS_PER_PUBKEY,
+            "the stalled uploads must register their identity slots"
+        );
+        // A third upload by A is refused before it can take a permit.
+        let before = state.upload_budget.available_permits();
+        let resp = upload(State(relay.clone()), headers_a, pending()).await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            state.upload_budget.available_permits(),
+            before,
+            "a refused upload must not take a global permit"
+        );
+        // Another identity still uploads: A cannot hold the whole budget.
+        let (headers_b, _) =
+            auth_headers_scoped_with_key(relay.secp(), &[7u8; 32], "upload", Some(&sha));
+        let resp = upload(
+            State(relay.clone()),
+            headers_b,
+            Body::from(bytes::Bytes::from_static(data)),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "another uploader must succeed while one identity is saturated"
+        );
+        // Cancelling the stalled uploads returns every slot and permit.
+        for handle in &stalled {
+            handle.abort();
+        }
+        for handle in stalled {
+            let _ = handle.await;
+        }
+        assert!(
+            state.uploads_inflight.lock().unwrap().is_empty(),
+            "cancelled uploads must release their identity slots"
+        );
+        assert_eq!(
+            state.upload_budget.available_permits(),
+            state.max_upload_bytes.saturating_mul(4).max(1),
+            "cancelled uploads must release their permits"
         );
         relay.db.shutdown();
     }

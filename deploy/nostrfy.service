@@ -12,6 +12,11 @@ Type=simple
 ExecStart=/usr/local/bin/nostrfy --config /etc/nostrfy/nostrfy.toml start --foreground
 Restart=always
 RestartSec=5
+# Every connection (and every live WebSocket) holds a file descriptor, and
+# the systemd default of 1024 is far below the default
+# `limits.max_connections = 10000`: without this the relay hits EMFILE and
+# refuses connections under load. 2x the connection budget plus headroom.
+LimitNOFILE=65536
 # Harden the service.
 NoNewPrivileges=true
 PrivateTmp=true

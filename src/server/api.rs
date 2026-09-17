@@ -716,6 +716,9 @@ pub async fn api_monthly_handler(
         let Some((events, more)) = relay.db.api_count(vec![filter], count_limit, now).await else {
             return db_unavailable();
         };
+        // The per-iteration scan is done: release the permit before the
+        // group lock.
+        drop(_permit);
         approximate |= more;
         // The same visibility rules as the unauthenticated API: protected
         // events, gift wraps and private/hidden group content are withheld.
@@ -810,6 +813,9 @@ pub async fn api_count_handler(
     let Some((events, more)) = relay.db.api_count(vec![filter], count_limit, now).await else {
         return db_unavailable();
     };
+    // The scan is done: release the permit before the group lock below so a
+    // slow group-state read cannot occupy a database concurrency slot.
+    drop(_permit);
     let has_group_events = events.iter().any(nip29::is_group_event);
     let groups = if has_group_events {
         Some(relay.groups.read().await)
@@ -821,7 +827,6 @@ pub async fn api_count_handler(
         .filter(|e| api_visible(e, groups.as_deref(), &no_tags, nip78))
         .count();
     drop(groups);
-    drop(_permit);
     (
         StatusCode::OK,
         Json(json!({ "count": count, "approximate": more })),
@@ -857,6 +862,8 @@ pub async fn api_kinds_handler(
     let Some((events, more)) = relay.db.api_count(vec![filter], count_limit, now).await else {
         return db_unavailable();
     };
+    // Release the permit before the group lock (see `api_count_handler`).
+    drop(_permit);
     let has_group_events = events.iter().any(nip29::is_group_event);
     let groups = if has_group_events {
         Some(relay.groups.read().await)
@@ -883,7 +890,6 @@ pub async fn api_kinds_handler(
             .cmp(&a["count"].as_u64())
             .then_with(|| a["kind"].as_u64().cmp(&b["kind"].as_u64()))
     });
-    drop(_permit);
     (
         StatusCode::OK,
         Json(json!({ "kinds": kinds, "approximate": more })),
@@ -962,6 +968,8 @@ pub async fn api_daily_handler(
         let Some((events, more)) = relay.db.api_count(vec![filter], count_limit, now).await else {
             return db_unavailable();
         };
+        // Release the permit before the group lock (per-iteration permit).
+        drop(_permit);
         approximate |= more;
         let has_group_events = events.iter().any(nip29::is_group_event);
         let groups = if has_group_events {
@@ -1102,22 +1110,29 @@ pub async fn api_stats_handler(
     {
         let mut fetch = 64usize;
         for _ in 0..4 {
-            let _permit = permit!();
-            let Some((first, _)) = relay
-                .db
-                .api_query(vec![filter.clone()], fetch, now, true)
-                .await
-            else {
+            // One permit per scan, released before the group lock: a permit
+            // held across `groups.read()` would let a slow group-state read
+            // occupy a concurrency slot that is meant to bound database
+            // scans, and holding one permit across both scans doubles the
+            // slot a single `stats` request occupies.
+            let Some((first, _)) = ({
+                let _permit = permit!();
+                relay
+                    .db
+                    .api_query(vec![filter.clone()], fetch, now, true)
+                    .await
+            }) else {
                 return db_unavailable();
             };
-            let Some((last, _)) = relay
-                .db
-                .api_query(vec![filter.clone()], fetch, now, false)
-                .await
-            else {
+            let Some((last, _)) = ({
+                let _permit = permit!();
+                relay
+                    .db
+                    .api_query(vec![filter.clone()], fetch, now, false)
+                    .await
+            }) else {
                 return db_unavailable();
             };
-            drop(_permit);
             let stats_groups = relay.groups.read().await;
             if first_visible.is_none() {
                 first_visible = first
@@ -1258,6 +1273,8 @@ pub async fn api_hourly_handler(
         let Some((events, more)) = relay.db.api_count(vec![filter], count_limit, now).await else {
             return db_unavailable();
         };
+        // Release the permit before the group lock (per-iteration permit).
+        drop(_permit);
         approximate |= more;
         let has_group_events = events.iter().any(nip29::is_group_event);
         let groups = if has_group_events {
@@ -1453,6 +1470,8 @@ pub async fn api_relay_kinds_handler(
             Json(json!({ "error": "database timeout, please retry" })),
         );
     };
+    // The sample is fetched: release the permit before the group lock.
+    drop(_permit);
     let nip78 = enabled_nip78_auth_active(&relay).await;
     let mut counts: HashMap<u64, u64> = HashMap::new();
     {
@@ -1469,7 +1488,6 @@ pub async fn api_relay_kinds_handler(
             }
         }
     }
-    drop(_permit);
     let limit = params.limit.unwrap_or(20).min(100);
     // Sort on tuples: indexing into a `Value` for every comparison was the
     // hot part of the aggregation.
@@ -1510,6 +1528,8 @@ pub async fn api_top_authors_handler(
             Json(json!({ "error": "database timeout, please retry" })),
         );
     };
+    // The sample is fetched: release the permit before the group lock.
+    drop(_permit);
     let nip78 = enabled_nip78_auth_active(&relay).await;
     let mut counts: HashMap<&str, u64> = HashMap::new();
     {
@@ -1525,7 +1545,6 @@ pub async fn api_top_authors_handler(
             }
         }
     }
-    drop(_permit);
     let limit = params.limit.unwrap_or(20).min(100);
     // Tuple sort (see the kinds aggregation above).
     let mut authors: Vec<(&str, u64)> = counts.into_iter().collect();
@@ -1683,14 +1702,10 @@ async fn query_and_respond(
 ) -> (StatusCode, Json<Value>) {
     // Concurrency limiter: at most `api_max_concurrent` `/api/v1` queries
     // run at once. When saturated, the request fails fast with 503 so a
-    // flood of REST traffic cannot pile up behind the shared database. The
-    // permit releases the slot on every exit path of this handler.
-    let Some(_permit) = relay.api_limit.try_acquire() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "error": "server is busy, try again shortly" })),
-        );
-    };
+    // flood of REST traffic cannot pile up behind the shared database. One
+    // permit is taken per database scan (never held across a group lock or
+    // the whole handler): a slow `groups.read()` must not occupy a slot
+    // that exists to bound database work.
     let now = unix_now();
     // NIP-50: when the search capability is disabled, strip `search` from the
     // filters (like the WebSocket path) so the REST API cannot trigger a
@@ -1742,15 +1757,24 @@ async fn query_and_respond(
     let mut events: Vec<Event> = Vec::new();
     let mut db_more = true;
     for _ in 0..4 {
-        let Some((batch, more)) = relay
-            .db
-            .api_query(filters.clone(), fetch, now, ascending)
-            .await
-        else {
+        let Some((batch, more)) = ({
+            let Some(_permit) = relay.api_limit.try_acquire() else {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({ "error": "server is busy, try again shortly" })),
+                );
+            };
+            relay
+                .db
+                .api_query(filters.clone(), fetch, now, ascending)
+                .await
+        }) else {
             return db_unavailable();
         };
         events = batch;
         db_more = more;
+        // The permit is released here (the scan is done): the group lock
+        // below must not hold a database concurrency slot.
         let has_group_events = events.iter().any(nip29::is_group_event);
         let groups = if has_group_events {
             Some(relay.groups.read().await)
@@ -1770,7 +1794,6 @@ async fn query_and_respond(
             break;
         }
     }
-    drop(_permit);
 
     // The REST API is unauthenticated, so it must apply the same
     // visibility rules as an anonymous WebSocket connection: NIP-70

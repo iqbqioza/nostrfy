@@ -64,6 +64,12 @@ pub enum Command {
         #[command(subcommand)]
         action: RelayAction,
     },
+    /// Manage the persisted access-control state (blocked-IP recovery).
+    #[command(name = "access")]
+    Access {
+        #[command(subcommand)]
+        action: AccessAction,
+    },
     /// Update the relay binary to the latest release (or a given version).
     ///
     /// Downloads the GitHub release asset for this platform and atomically
@@ -102,6 +108,16 @@ pub enum RelayAction {
     List,
 }
 
+#[derive(Debug, Subcommand)]
+pub enum AccessAction {
+    /// Remove an IP from the persisted NIP-86 blocked-IP list. Recovery for
+    /// an operator whose own address was blocked (the management API is
+    /// then unreachable): edits the database directly. A running daemon
+    /// must be restarted for the change to apply.
+    #[command(name = "unblockip")]
+    Unblockip { ip: String },
+}
+
 impl Cli {
     /// Runs every synchronous step of the command. For `start`/`restart` in
     /// daemon mode the parent process terminates inside this call and only
@@ -134,25 +150,37 @@ impl Cli {
             }
             Command::Blossom { action } => return self.blossom_allowlist(action),
             Command::Relay { action } => return self.relay_access(action),
+            Command::Access { action } => {
+                return match action {
+                    AccessAction::Unblockip { ip } => self.access_unblockip(ip),
+                };
+            }
             Command::Upgrade { version, force } => return self.upgrade(version.as_deref(), *force),
             _ => {}
         }
 
-        if matches!(self.command, Command::Restart) {
-            let _ = self.stop();
-        }
-
         self.config = absolutize(&self.config);
         let cfg = self.load_config()?;
-        // Validate before daemonizing: an invalid config must fail loudly in
-        // the foreground (the parent), not silently in the daemon child
-        // whose stderr is already pointed at /dev/null.
+        // Validate before daemonizing AND before stopping a running daemon:
+        // a restart whose replacement config has a typo must leave the old
+        // instance serving (the command exits non-zero, the relay stays up).
         cfg.validate()?;
+        if matches!(self.command, Command::Restart) {
+            // The replacement is known-good: now stop the old daemon. `stop`
+            // keeps its lenient pid-file lookup, so a config that was broken
+            // by the edit is still stoppable through the normal `stop`.
+            self.stop()?;
+        }
         if let Some(pid) = running_pid(&cfg.daemon.pid_file) {
             return Err(config_err(format!(
                 "already running (pid {pid}); use 'nostrfy stop' or 'nostrfy restart'"
             )));
         }
+        // Fail before forking when another process already holds the port:
+        // the child's bind error only reaches the log (stderr is /dev/null)
+        // and the readiness probe below would connect to the foreign
+        // listener and report a false success.
+        ensure_port_available(&cfg)?;
         self.daemonize(&cfg)?;
         Ok(())
     }
@@ -168,10 +196,35 @@ impl Cli {
                 }
                 let cfg = self.load_config()?;
                 cfg.validate()?;
+                // Foreground mode (including the recommended systemd unit)
+                // writes the pid file too, so the CLI lifecycle commands
+                // (`stats`, `stop`, `restart`) can find the instance. The
+                // daemon child already owns the file written by `daemonize`;
+                // the guard removes the foreground file on exit and refuses
+                // to overwrite a live daemon's pid file.
+                let _pid_guard = if self.daemonized {
+                    None
+                } else {
+                    Some(PidFileGuard::create(&cfg.daemon.pid_file)?)
+                };
                 let db = open_db(&cfg)?;
                 run_server(self.config.clone(), cfg, db).await
             }
             _ => Ok(()),
+        }
+    }
+
+    /// Runs [`Cli::serve`] and logs a terminal error through the configured
+    /// logger before returning it. After daemonization the process stderr is
+    /// /dev/null, so a startup failure (an unopenable database, a bind
+    /// error) would otherwise leave no trace anywhere.
+    pub async fn serve_logged(&self) -> Result<()> {
+        match self.serve().await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                error!("error: {e}");
+                Err(e)
+            }
         }
     }
 
@@ -529,6 +582,61 @@ impl Cli {
         Ok(())
     }
 
+    /// `nostrfy access unblockip <ip>`: removes an address from the
+    /// persisted NIP-86 blocked-IP list by editing the relay database
+    /// directly. This is the recovery path for an operator whose own
+    /// address was blocked (`blockip` refuses the management connection
+    /// too, so the RPC cannot undo it). The running daemon keeps its
+    /// in-memory list: the command tells the operator to restart, which is
+    /// the only reload that applies blocked-IP changes.
+    fn access_unblockip(&self, ip: &str) -> Result<()> {
+        if !self.config.exists() {
+            return Err(config_err(format!(
+                "{} not found; run 'nostrfy init' first",
+                self.config.display()
+            )));
+        }
+        let cfg = self.load_config()?;
+        let parsed: std::net::IpAddr = ip
+            .trim()
+            .parse()
+            .map_err(|_| config_err(format!("{ip:?} is not an IP address")))?;
+        let parsed = crate::util::normalize_ip(parsed);
+        let env = open_db_env(&cfg)?;
+        let mut wtxn = env.write_txn()?;
+        let access = env
+            .create_database::<heed::types::Bytes, heed::types::Bytes>(&mut wtxn, Some("access"))?;
+        let Some(raw) = access.get(&wtxn, b"access")? else {
+            print_line(&format!(
+                "{parsed} is not blocked (no persisted access state)"
+            ));
+            return Ok(());
+        };
+        let mut control: crate::config::AccessControl = serde_json::from_slice(raw)?;
+        let before = control.blocked_ips.entries().len();
+        control.blocked_ips.remove(parsed);
+        if control.blocked_ips.entries().len() == before {
+            print_line(&format!("{parsed} is not blocked"));
+            return Ok(());
+        }
+        // Disk-full guard like the server write paths (an mmap commit on a
+        // full disk risks SIGBUS).
+        crate::db::store::check_env_space(&env)?;
+        access.put(&mut wtxn, b"access", &serde_json::to_vec(&control)?)?;
+        wtxn.commit()?;
+        print_line(&format!("unblocked {parsed} in the persisted access state"));
+        // The daemon holds the list in memory; blocked-IP changes are
+        // applied at startup, not by a config reload.
+        match running_pid(&cfg.daemon.pid_file) {
+            Some(pid) => print_line(&format!(
+                "the running daemon (pid {pid}) must be restarted for the change to apply: \
+                 run 'nostrfy restart' (or 'systemctl restart nostrfy')"
+            )),
+            None => print_line("no daemon is running; the change applies on the next start"),
+        }
+        Ok(())
+    }
+
     /// `nostrfy upgrade`: replaces the relay binary with a GitHub release
     /// asset (the version given on the command line, or the latest release).
     /// The download is written to a temp file next to the current
@@ -803,6 +911,101 @@ impl Cli {
     }
 }
 
+/// The foreground process's pid file: `start --foreground` (including the
+/// recommended systemd unit) writes it so `nostrfy stats`/`stop`/`restart`
+/// can observe the instance, and removes it when the process exits. A live
+/// daemon's pid file is never overwritten.
+#[derive(Debug)]
+struct PidFileGuard {
+    path: PathBuf,
+}
+
+impl PidFileGuard {
+    fn create(path: &Path) -> Result<Self> {
+        if let Some(pid) = running_pid(path) {
+            return Err(config_err(format!(
+                "already running (pid {pid}); use 'nostrfy stop' or 'nostrfy restart'"
+            )));
+        }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| config_err(format!("cannot create {}: {e}", parent.display())))?;
+        }
+        // A stale pid file (a dead pid) is overwritten; the live-pid check
+        // above and this write are not atomic, but the caller has already
+        // validated the config and no live instance exists.
+        std::fs::write(path, format!("{}\n", std::process::id())).map_err(|e| {
+            config_err(format!("cannot write the pid file {}: {e}", path.display()))
+        })?;
+        Ok(PidFileGuard {
+            path: path.to_path_buf(),
+        })
+    }
+}
+
+impl Drop for PidFileGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// The address used for a pre-flight bind check and the readiness probe: a
+/// wildcard bind ("" / "0.0.0.0" / "::") is probed over loopback, which the
+/// wildcard listener also accepts.
+fn probe_host(host: &str) -> String {
+    match host.trim() {
+        "" | "0.0.0.0" => "127.0.0.1".to_string(),
+        "::" | "[::]" => "::1".to_string(),
+        other => other.trim_matches(['[', ']']).to_string(),
+    }
+}
+
+/// Fails when `server.host:server.port` cannot be bound (another process
+/// already holds it). Run before daemonizing: the daemon child's bind
+/// failure is only visible in the log, and the readiness probe would
+/// connect to the foreign listener and report a false success.
+fn ensure_port_available(cfg: &Config) -> Result<()> {
+    let host = probe_host(&cfg.server.host);
+    let addrs = (host.as_str(), cfg.server.port)
+        .to_socket_addrs()
+        .map_err(|e| {
+            config_err(format!(
+                "cannot resolve {}:{}: {e}",
+                cfg.server.host, cfg.server.port
+            ))
+        })?;
+    let mut last_error = None;
+    let mut resolved = false;
+    for addr in addrs {
+        resolved = true;
+        match std::net::TcpListener::bind(addr) {
+            // The port is free: the listener is closed immediately so the
+            // daemon child can bind it.
+            Ok(listener) => {
+                drop(listener);
+                return Ok(());
+            }
+            Err(e) => last_error = Some(e),
+        }
+    }
+    if !resolved {
+        return Err(config_err(format!(
+            "cannot resolve {}: no address",
+            cfg.server.host
+        )));
+    }
+    Err(config_err(format!(
+        "cannot bind to {}:{}: {} (is another process already using the port?)",
+        cfg.server.host,
+        cfg.server.port,
+        last_error
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "bind failed".to_string())
+    )))
+}
+
 fn open_db(cfg: &Config) -> Result<crate::db::DbClient> {
     let db = crate::db::DbClient::open(
         &cfg.database,
@@ -859,16 +1062,17 @@ fn wait_for_ready(cfg: &Config, pid: Option<u32>) -> Result<()> {
 fn wait_for_ready_within(cfg: &Config, pid: Option<u32>, timeout: Duration) -> Result<()> {
     // A wildcard bind address is not connectable: probe loopback, which the
     // wildcard listener also accepts.
-    let host = match cfg.server.host.trim() {
-        "" | "0.0.0.0" => "127.0.0.1".to_string(),
-        "::" | "[::]" => "::1".to_string(),
-        other => other.trim_matches(['[', ']']).to_string(),
-    };
-    let deadline = Instant::now() + timeout;
+    let host = probe_host(&cfg.server.host);
+    let started = Instant::now();
+    let deadline = started + timeout;
     loop {
         // A child that already exited can never become ready (and an
         // unwritable pid file must not make us wait for the whole timeout).
-        if !child_alive(&cfg.daemon.pid_file, pid) {
+        // A pid file that never appears within the grace means the child
+        // died before writing it.
+        let pid = pid.or_else(|| running_pid(&cfg.daemon.pid_file));
+        let grace_elapsed = started.elapsed() >= PID_FILE_GRACE;
+        if !child_alive(&cfg.daemon.pid_file, pid, grace_elapsed) {
             return Err(config_err(format!(
                 "nostrfy exited before it became ready; see {} for the error",
                 cfg.daemon.log_file.display()
@@ -880,6 +1084,25 @@ fn wait_for_ready_within(cfg: &Config, pid: Option<u32>, timeout: Duration) -> R
             .unwrap_or_default();
         for addr in addrs {
             if std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok() {
+                // The connect may have reached a *foreign* listener while
+                // our child died on the bind (the probe cannot tell whose
+                // listener answered): settle briefly and re-check the child
+                // before reporting success.
+                std::thread::sleep(READY_STABILIZE);
+                let pid = pid.or_else(|| running_pid(&cfg.daemon.pid_file));
+                if !child_alive(
+                    &cfg.daemon.pid_file,
+                    pid,
+                    started.elapsed() >= PID_FILE_GRACE,
+                ) {
+                    return Err(config_err(format!(
+                        "nostrfy exited during startup (something is listening on {}:{}, but \
+                         the child died); see {} for the error",
+                        cfg.server.host,
+                        cfg.server.port,
+                        cfg.daemon.log_file.display()
+                    )));
+                }
                 return Ok(());
             }
         }
@@ -896,14 +1119,27 @@ fn wait_for_ready_within(cfg: &Config, pid: Option<u32>, timeout: Duration) -> R
     }
 }
 
-/// Whether the freshly forked child is still alive. Before the pid file
-/// appears the child is assumed to be starting; once the file exists, a
-/// dead pid means the child exited (the daemonize crate neither truncates
-/// the file on exit nor removes it).
-fn child_alive(pid_file: &Path, pid: Option<u32>) -> bool {
+/// Grace for the pid file to appear (and for a connected probe to settle)
+/// before a missing pid file or a dying child is reported: the daemonize
+/// crate writes the pid file before the child binds, so a file that never
+/// appears means the child died on the way.
+const PID_FILE_GRACE: Duration = Duration::from_secs(1);
+/// After the readiness probe connects, the child is re-checked after this
+/// settle window (see `wait_for_ready_within`).
+const READY_STABILIZE: Duration = Duration::from_millis(250);
+
+/// Whether the freshly forked child is still alive. `pid` is the pid read
+/// from the pid file, or `None` while the file has not appeared yet; a
+/// missing file after `pid_grace_elapsed` means the child died before
+/// writing it (the daemonize crate neither truncates the file on exit nor
+/// removes it).
+fn child_alive(pid_file: &Path, pid: Option<u32>, pid_grace_elapsed: bool) -> bool {
     match pid {
         Some(pid) => process_alive(pid),
-        None => !pid_file.exists() || running_pid(pid_file).is_some(),
+        None => match pid_file.exists() {
+            true => running_pid(pid_file).is_some(),
+            false => !pid_grace_elapsed,
+        },
     }
 }
 
@@ -1155,8 +1391,11 @@ fn open_db_env(cfg: &Config) -> Result<heed::Env> {
     // process exits.
     let env = unsafe {
         heed::EnvOpenOptions::new()
-            // 17 named tables, plus the word index when search is on.
-            .max_dbs(cfg.database.max_dbs.max(18))
+            // Mirror the store's floor: 18 named tables, plus the word
+            // index when search is on. A lower value made opening an
+            // existing database fail with MDB_DBS_FULL (the CLI commands
+            // must open the same tables the server created).
+            .max_dbs(cfg.database.max_dbs.max(19))
             .max_readers(cfg.database.max_readers.max(8))
             .map_size(map_size as usize)
             .open(&cfg.database.path)?
@@ -1683,5 +1922,311 @@ name = \"nostrfy\"\n",
             "{err}"
         );
         let _ = std::fs::remove_file(&cfg.daemon.pid_file);
+    }
+
+    #[test]
+    fn child_alive_treats_a_missing_pid_file_after_the_grace_as_death() {
+        let path =
+            std::env::temp_dir().join(format!("nostrfy-child-alive-{:x}.pid", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            child_alive(&path, None, false),
+            "while the pid file may still appear the child is starting"
+        );
+        assert!(
+            !child_alive(&path, None, true),
+            "a pid file that never appeared within the grace means the child died"
+        );
+        // A pid file with a dead pid is death even within the grace.
+        std::fs::write(&path, "999999999\n").unwrap();
+        assert!(!child_alive(&path, None, false));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn readiness_probe_rejects_a_dead_child_behind_a_live_listener() {
+        // The stabilization re-check: a live listener answered, but the
+        // child is dead, so the probe must fail (not report "started").
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut cfg = Config::default();
+        cfg.server.host = "127.0.0.1".into();
+        cfg.server.port = listener.local_addr().unwrap().port();
+        cfg.daemon.pid_file = std::env::temp_dir().join(format!(
+            "nostrfy-ready-dead-explicit-{:x}.pid",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&cfg.daemon.pid_file);
+        let err =
+            wait_for_ready_within(&cfg, Some(999_999_999), Duration::from_secs(1)).unwrap_err();
+        assert!(
+            err.to_string().contains("exited before it became ready"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn ensure_port_available_rejects_an_occupied_port() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut cfg = Config::default();
+        cfg.server.host = "127.0.0.1".into();
+        cfg.server.port = listener.local_addr().unwrap().port();
+        let err = ensure_port_available(&cfg).unwrap_err();
+        assert!(err.to_string().contains("cannot bind"), "{err}");
+        drop(listener);
+        // Once the listener is closed the port is free again.
+        assert!(
+            ensure_port_available(&cfg).is_ok(),
+            "a released port must pass the pre-flight check"
+        );
+    }
+
+    #[test]
+    fn prepare_rejects_an_occupied_port_without_daemonizing() {
+        // Regression: `nostrfy start` used to fork first and rely on the
+        // readiness probe, which connected to the foreign listener holding
+        // the port and reported a false success while our child died.
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir()
+            .join("nostrfy-occupied-port-test")
+            .join(format!("{:x}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let config_path = dir.join("nostrfy.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[server]\nhost = \"127.0.0.1\"\nport = {}\n",
+                listener.local_addr().unwrap().port()
+            ),
+        )
+        .unwrap();
+        let mut cli = Cli {
+            config: config_path,
+            command: Command::Start { foreground: false },
+            daemonized: false,
+        };
+        let err = cli.prepare().unwrap_err();
+        assert!(err.to_string().contains("cannot bind"), "{err}");
+        assert!(!cli.daemonized, "the parent must not have forked");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pid_file_guard_writes_removes_and_protects_a_live_daemon() {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir()
+            .join("nostrfy-pid-guard-test")
+            .join(format!("{:x}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pid_file = dir.join("nostrfy.pid");
+        {
+            let _guard = PidFileGuard::create(&pid_file).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(&pid_file).unwrap().trim(),
+                std::process::id().to_string(),
+                "foreground mode must write its own pid"
+            );
+        }
+        assert!(
+            !pid_file.exists(),
+            "the guard must remove the pid file when the process exits"
+        );
+
+        // A live daemon's pid file must never be overwritten. The fake
+        // process carries the expected `nostrfy` comm name.
+        let Some(mut daemon) = spawn_fake_nostrfy(&dir) else {
+            return;
+        };
+        std::fs::write(&pid_file, format!("{}\n", daemon.id())).unwrap();
+        let err = PidFileGuard::create(&pid_file).unwrap_err();
+        assert!(err.to_string().contains("already running"), "{err}");
+        let _ = daemon.kill();
+        let _ = daemon.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restart_validates_before_stopping_a_running_daemon() {
+        // Regression: `restart` used to stop the daemon first and then fail
+        // on a TOML typo, leaving the relay down. With a live daemon and an
+        // invalid replacement config, prepare must fail without signalling
+        // the daemon.
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir()
+            .join("nostrfy-restart-validate-test")
+            .join(format!("{:x}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let Some(mut daemon) = spawn_fake_nostrfy(&dir) else {
+            return;
+        };
+        let pid_file = dir.join("nostrfy.pid");
+        std::fs::write(&pid_file, format!("{}\n", daemon.id())).unwrap();
+        assert!(
+            running_pid(&pid_file).is_some(),
+            "the fake daemon must be detectable"
+        );
+        let config_path = dir.join("nostrfy.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[daemon]\npid_file = {:?}\n[limits]\nmax_connections = 0\n",
+                pid_file.display().to_string()
+            ),
+        )
+        .unwrap();
+        let mut cli = Cli {
+            config: config_path,
+            command: Command::Restart,
+            daemonized: false,
+        };
+        let err = cli.prepare().unwrap_err();
+        assert!(err.to_string().contains("max_connections"), "{err}");
+        assert!(
+            running_pid(&pid_file).is_some(),
+            "the old daemon must keep running when the new config is invalid"
+        );
+        let _ = daemon.kill();
+        let _ = daemon.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn access_unblockip_removes_the_persisted_entry() {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir()
+            .join("nostrfy-access-unblockip-test")
+            .join(format!("{:x}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("nostrfy.toml");
+        let db_path = dir.join("db");
+        std::fs::write(
+            &config_path,
+            format!("[database]\npath = {:?}\n", db_path.display().to_string()),
+        )
+        .unwrap();
+        let cli = Cli {
+            config: config_path,
+            command: Command::Check,
+            daemonized: false,
+        };
+        let cfg = cli.load_config().unwrap();
+        // Seed the persisted blob with a blocked IP (the state a NIP-86
+        // blockip leaves behind).
+        {
+            let env = open_db_env(&cfg).unwrap();
+            let mut wtxn = env.write_txn().unwrap();
+            let access = env
+                .create_database::<heed::types::Bytes, heed::types::Bytes>(
+                    &mut wtxn,
+                    Some("access"),
+                )
+                .unwrap();
+            let mut control = crate::config::AccessControl::default();
+            control
+                .blocked_ips
+                .push("203.0.113.9".into(), "self-lockout".into());
+            access
+                .put(&mut wtxn, b"access", &serde_json::to_vec(&control).unwrap())
+                .unwrap();
+            wtxn.commit().unwrap();
+        }
+        // The v4-mapped spelling must remove the same address.
+        cli.access_unblockip("::ffff:203.0.113.9").unwrap();
+        let env = open_db_env(&cfg).unwrap();
+        let rtxn = env.read_txn().unwrap();
+        let access = env
+            .open_database::<heed::types::Bytes, heed::types::Bytes>(&rtxn, Some("access"))
+            .unwrap()
+            .unwrap();
+        let raw = access.get(&rtxn, b"access").unwrap().unwrap();
+        let control: crate::config::AccessControl = serde_json::from_slice(raw).unwrap();
+        assert!(
+            control.blocked_ips.entries().is_empty(),
+            "the entry must be removed from the persisted state"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn serve_logged_records_an_unopenable_database_reason() {
+        // After daemonization the process stderr is /dev/null: a database
+        // that cannot be opened must leave its reason in the log file.
+        crate::logging::init();
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir()
+            .join("nostrfy-serve-logged-test")
+            .join(format!("{:x}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // `database.path` points at a regular file: opening the LMDB
+        // environment must fail.
+        let db_file = dir.join("not-a-directory");
+        std::fs::write(&db_file, b"x").unwrap();
+        let config_path = dir.join("nostrfy.toml");
+        std::fs::write(
+            &config_path,
+            format!("[database]\npath = {:?}\n", db_file.display().to_string()),
+        )
+        .unwrap();
+        let log_path = dir.join("nostrfy.log");
+        crate::logging::install_file_logger(log_path.clone(), 1 << 20, 4).unwrap();
+        let cli = Cli {
+            config: config_path,
+            command: Command::Start { foreground: true },
+            daemonized: false,
+        };
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let err = rt.block_on(cli.serve_logged()).unwrap_err();
+        let pid_file = cli.load_config().unwrap().daemon.pid_file;
+        assert!(
+            !pid_file.exists(),
+            "the foreground pid file must be removed on a startup failure"
+        );
+        let log = std::fs::read_to_string(&log_path).unwrap();
+        assert!(
+            log.contains(&err.to_string()),
+            "the startup error must reach the log file: {log:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A stand-in for a running daemon: a copy of `sleep` whose comm name is
+    /// `nostrfy`, so `process_alive`'s name check accepts it. `None` when no
+    /// usable `sleep` binary exists.
+    #[cfg(target_os = "linux")]
+    fn spawn_fake_nostrfy(dir: &Path) -> Option<std::process::Child> {
+        let source = ["/bin/sleep", "/usr/bin/sleep"]
+            .into_iter()
+            .find(|path| Path::new(path).exists())?;
+        let fake = dir.join("nostrfy");
+        std::fs::copy(source, &fake).ok()?;
+        let child = std::process::Command::new(&fake).arg("60").spawn().ok()?;
+        // The comm name is set at exec; wait until it is visible so
+        // `running_pid` does not race the spawn.
+        for _ in 0..100 {
+            if process_name(child.id()).as_deref() == Some("nostrfy") {
+                return Some(child);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let mut child = child;
+        let _ = child.kill();
+        let _ = child.wait();
+        None
+    }
+
+    /// Non-Linux: no cheap comm-name stand-in, the tests skip.
+    #[cfg(not(target_os = "linux"))]
+    fn spawn_fake_nostrfy(_dir: &Path) -> Option<std::process::Child> {
+        None
     }
 }

@@ -130,7 +130,7 @@ Every key is optional; a missing key uses the default shown below.
 
 **`max_events_per_min_per_pubkey`** — A pubkey may publish at most this many events per minute (sliding 60-second window); the excess is rejected with `rate-limited: too many events`. The window is bounded at 10,000 tracked pubkeys (a full map is never cleared — tracked windows are preserved and fresh pubkeys alone are fail-open until old windows expire). `0` = unlimited.
 
-**`max_groups`** — The cap on the in-memory NIP-29 group store. The store keeps the active groups plus a marker per deleted group (the marker is permanent so a deleted group cannot be resurrected), so without a cap an attacker could churn group ids and grow the memory without limit. The cap counts both, and group creation beyond it is rejected with `restricted: group limit reached` (both on the live write path and during the startup rebuild). `0` disables the cap. Read at startup — changing it requires a `restart`.
+**`max_groups`** — The cap on the in-memory NIP-29 group store. The store keeps the active groups plus a marker per deleted group (the marker is permanent so a deleted group cannot be resurrected), so without a cap an attacker could churn group ids and grow the memory without limit. The cap counts both, and group creation beyond it is rejected with `restricted: group limit reached` (both on the live write path and during the startup rebuild). Must be at least 1: `0` (formerly "unlimited") is rejected because unlimited group-id churn is a memory-exhaustion vector. Read at startup — changing it requires a `restart`.
 
 **`require_auth`** — When `true`, the relay refuses REQ/EVENT/COUNT/NEG messages with `auth-required:` unless the connection has completed NIP-42 AUTH. Useful for a private relay. Applied per connection.
 
@@ -180,6 +180,7 @@ The changes take effect immediately and are persisted (same lists as `nostrfy re
 | `ws_paths` | string | `"root"` | WebSocket endpoint paths: `root` (`/` only), `inbox-outbox`, or `all` |
 | `inbox_write_policy` | string | `"any"` | Write policy for `/inbox`: `any` or `relay` |
 | `outbox_write_policy` | string | `"any"` | Write policy for `/outbox`: `any` or `relay` |
+| `trusted_proxies` | string array | `[]` | Reverse-proxy addresses/CIDRs whose `X-Forwarded-For` is trusted (e.g. `["127.0.0.1/32", "::1/128"]`). Empty = trust no proxy. Fixed at startup — requires a `restart` |
 
 ### Key details
 
@@ -196,6 +197,12 @@ The changes take effect immediately and are persisted (same lists as `nostrfy re
 **`admin_pubkey`** — The administrator's public key for NIP-98 authentication: management calls must carry a valid NIP-98 auth event (kind 27235, with a `payload` tag, a `u` tag matching the relay URL exactly, signed by this key). Empty = NIP-98 authentication is disabled. Each auth event is single-use within its 60-second window.
 
 **`metrics_enabled`** — When `true`, serves Prometheus-formatted metrics at `/metrics` (no authentication). Fixed at startup — requires a `restart`.
+
+**`trusted_proxies`** — Reverse-proxy addresses (single IPs or CIDR ranges) whose `X-Forwarded-For` header is trusted. When the TCP peer matches an entry, the client address used for the per-IP connection caps (`max_connections_per_ip`, `max_connections_per_sec_per_ip`), NIP-86 `blockip` and the connection logs is the **last untrusted** entry of `X-Forwarded-For` (proxies append per hop, so the right-most entry that is not itself a trusted proxy is the address that reached the nearest hop); an absent or malformed header falls back to the peer. IPv6 clients are accounted under their `/64` prefix, so one host cannot rotate addresses inside its `/64` to dodge a cap. Empty (the default) trusts no proxy and ignores the header entirely.
+
+Set this whenever a reverse proxy (nginx, Caddy, a cloud load balancer, Cloudflare Tunnel) sits in front: without it every client is seen as `127.0.0.1`, so the default `max_connections_per_ip = 64` caps the whole relay at 64 clients and `blockip` blocks the proxy (everyone). The nginx template in [docs/deploy/vps.md](deploy/vps.md) appends the client IP (`proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`); Caddy does it by default.
+
+> **Warning**: list only addresses that clients cannot reach directly. Any peer bound to a `trusted_proxies` range can set `X-Forwarded-For` freely and bypass the per-IP limits and `blockip`. `0.0.0.0/0` and `::/0` are rejected by validation. Under a trusted proxy the per-IP checks run at the HTTP layer (a refused request gets `429`) instead of the accept layer. Fixed at startup — requires a `restart`.
 
 ### Behavior notes
 
@@ -221,7 +228,7 @@ The changes take effect immediately and are persisted (same lists as `nostrfy re
 | `http_read_timeout_secs` | integer | `30` | Seconds to deliver a complete HTTP request head (and the NIP-86 POST body) before the connection is closed (`0` = disabled; slow-loris defense — applies to WebSocket upgrades too) |
 | `max_connections_per_sec_per_ip` | integer | `0` | Max new connections per second per source IP (`0` = unlimited) |
 | `max_events_per_min_per_pubkey` | integer | `0` | Max events a pubkey may publish per minute (`0` = unlimited) |
-| `max_req_response_bytes` | integer | `33554432` | Byte budget for one REQ response (`0` = unlimited); beyond it the subscription is closed with `CLOSED` |
+| `max_req_response_bytes` | integer | `33554432` | Byte budget for one REQ response (`0` = unlimited); beyond it the subscription is closed with `CLOSED`. Above 512 MiB warned, above 2 GiB rejected |
 
 ### Subscriptions and queries
 
@@ -239,7 +246,7 @@ The changes take effect immediately and are persisted (same lists as `nostrfy re
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
 | `max_content_bytes` | integer | `65536` | Max event content length in **characters** |
-| `max_groups` | integer | `1000` | Cap on the in-memory NIP-29 group store (active groups + deleted-group markers). Creates beyond it are rejected with `restricted: group limit reached`. `0` = unlimited |
+| `max_groups` | integer | `1000` | Cap on the in-memory NIP-29 group store (active groups + deleted-group markers). Creates beyond it are rejected with `restricted: group limit reached`. Must be ≥ 1 (`0` is rejected) |
 | `max_tags` | integer | `2000` | Max tags per event |
 | `max_tag_value_bytes` | integer | `1024` | Max bytes per tag value |
 | `max_created_at_future_secs` | integer | `3600` | Tolerated future skew of `created_at` (seconds) |
@@ -252,7 +259,7 @@ The changes take effect immediately and are persisted (same lists as `nostrfy re
 | --- | --- | --- | --- |
 | `db_queue_msgs` | integer | `4096` | Max queued messages before failing fast (legacy location of `database.max_db_queue_msgs`) |
 | `db_queue_events` | integer | `262144` | Max queued events before failing fast (legacy location of `database.max_db_queue_events`) |
-| `max_neg_items` | integer | `100000` | Max records per NIP-77 negentropy sync |
+| `max_neg_items` | integer | `100000` | Max records per NIP-77 negentropy sync. Above 1,000,000 warned, above 10,000,000 rejected |
 | `live_buffer` | integer | `65536` | Live fan-out queue size |
 
 ### Anti-spam
@@ -290,13 +297,13 @@ The changes take effect immediately and are persisted (same lists as `nostrfy re
 
 **`max_out_queue_bytes`** — The per-connection cap on queued outgoing bytes, protecting memory against slow readers (`0` = unlimited). REQ responses are pumped through the queue in bounded chunks (see `max_req_response_bytes`), so they cannot pin more than the cap either; EOSE and CLOSED messages are tiny and take the uncapped path. Live traffic is dropped when full (recoverable by re-subscribing).
 
-**`max_req_response_bytes`** — Byte budget for a single REQ response (the stored events delivered for one subscription). The response is pumped into the capped outgoing queue in chunks as the socket drains; when the budget is exceeded the subscription is closed with `CLOSED ... blocked: response too large; narrow the filter or paginate` and the client can re-request with a narrower filter. `0` disables the budget. A connection may queue at most four pending responses; older ones are cut off with their EOSE.
+**`max_req_response_bytes`** — Byte budget for a single REQ response (the stored events delivered for one subscription). The response is pumped into the capped outgoing queue in chunks as the socket drains; when the budget is exceeded the subscription is closed with `CLOSED ... blocked: response too large; narrow the filter or paginate` and the client can re-request with a narrower filter. `0` disables the budget. A connection may queue at most four pending responses; older ones are cut off with their EOSE. Values above 512 MiB are warned about, and anything above 2 GiB is rejected as a clear mistake (one response could exhaust memory).
 
 **`ws_idle_timeout_secs`** — Connections with no inbound frames for this long are closed. While enabled, the relay also sends periodic WebSocket PINGs: healthy clients answer with a PONG (an inbound frame, which resets the timer) and stay connected; dead peers are reaped. `0` = disabled (no timeout, no pings).
 
 **`http_read_timeout_secs`** — Seconds a connection has to deliver a complete HTTP request head (the request line and headers) before it is closed. This closes slow-loris sockets that trickle bytes without ever completing a request — the attack would otherwise pin file descriptors and memory. Applies to every HTTP connection, WebSocket upgrades included (an upgrade request is a normal HTTP request head). The same deadline bounds the NIP-86 `POST` body read (a body that delivers no byte within the window is answered with `408 Request Timeout`), and Blossom uploads use it as their per-chunk idle timeout. `0` disables the timeout.
 
-**`max_connections_per_sec_per_ip`** — Maximum number of new connections a single source IP may open per second (sliding window). Sockets beyond the window are refused immediately. The limiter tracks at most 10,000 source IPs; when that map is full of still-active windows, a previously unseen IP is **refused** (fail closed) instead of passed through — a host with more than 10,000 active addresses cannot bypass the limit, and already-tracked IPs are always enforced. `0` = unlimited.
+**`max_connections_per_sec_per_ip`** — Maximum number of new connections a single source IP may open per second (sliding window). Sockets beyond the window are refused immediately. The limiter tracks at most 10,000 source IPs; when that map is full of still-active windows, a previously unseen IP is **refused** (fail closed) instead of passed through — a host with more than 10,000 active addresses cannot bypass the limit, and already-tracked IPs are always enforced. The full-map eviction walk is throttled to at most once per second, so the refusal is immediate and the accept loop stays O(1) per connection. `0` = unlimited.
 
 **`max_filters`** — The maximum number of filters a single REQ (or COUNT) may carry. Violations get a `CLOSED ... too many filters` reply. This also bounds scanning work per REQ.
 
@@ -318,7 +325,7 @@ The changes take effect immediately and are persisted (same lists as `nostrfy re
 
 **`max_created_at_future_secs`** — How far into the future an event's `created_at` may be. Beyond this the event is rejected as invalid (`OK false` with `invalid: event creation date is in the future`).
 
-**`max_neg_items`** — The maximum number of records a single NIP-77 negentropy sync may process. Larger syncs are refused with a `NEG-ERR`.
+**`max_neg_items`** — The maximum number of records a single NIP-77 negentropy sync may process. Larger syncs are refused with a `NEG-ERR`. The whole sync window is held in memory: values above 1,000,000 are warned about and anything above 10,000,000 is rejected as a clear mistake (a unit typo can turn one NEG-OPEN into an out-of-memory trigger).
 
 **`live_buffer`** — The size of the fan-out queue between the relay and the broadcaster. On overflow, events are dropped for live delivery (they stay available via subscriptions).
 
@@ -407,7 +414,7 @@ The changes take effect immediately and are persisted (same lists as `nostrfy re
 - **Data migrations** run automatically once, at startup:
   - access pubkey lists moved into their dedicated key (legacy `access` blob → `relay_pubkeys`),
   - the Blossom sha→owner mapping rebuilt from legacy files (marker key, skipped on later restarts).
-- The startup log reports `database ready at ... (14 tables, map ... MiB)` and the migration checks.
+- The startup log reports `database ready at ... (19 tables, map ... MiB)` — 18 named tables plus the NIP-50 word index (18 tables when `database.search_index = false`) — and the migration checks.
 
 ---
 
@@ -472,7 +479,14 @@ nostrfy relay list                # show both lists and restrict_relay
 
 **`allowed_kinds`** — The kind allowlist. When non-empty, only the listed kinds are accepted.
 
-**`blocked_ips`** — IP addresses whose connections are refused at the WebSocket layer (and the NIP-86 RPC). `blockip` also drops the IP's existing connections.
+**`blocked_ips`** — IP addresses whose connections are refused at the WebSocket layer (and the NIP-86 RPC). `blockip` also drops the IP's existing connections. **Self-lockout**: blocking the address you manage from (or the reverse proxy's address without `server.trusted_proxies`) makes the management API unreachable. Recover with the CLI (it edits the persisted list directly, no connection to the relay needed):
+
+```sh
+nostrfy access unblockip 203.0.113.9   # also accepts ::ffff:203.0.113.9 etc.
+nostrfy restart                        # the daemon holds the list in memory
+```
+
+Remove the address from `access.blocked_ips` in the config too when it is listed there.
 
 ### Behavior notes
 
@@ -528,7 +542,8 @@ Each `allow`/`deny` writes the database and reloads the running daemon (SIGHUP),
 - The feature is completely off when `host` is empty — no routes, no storage directories.
 - Blob bytes never enter the LMDB database: uploads, fetches and deletes operate on the configured local filesystem or S3 bucket. LMDB does persist the SHA-256-to-owner metadata and upload allowlist, so both the blob storage and relay database are required for a complete backup.
 - Storage I/O is asynchronous (`tokio::fs` / the `reqwest` client) — relay and WebSocket performance is unaffected.
-- The sha256 → owner mapping is persisted in the relay database (LMDB): no in-memory index and no startup scan, so lookups survive restarts and memory stays bounded. Uploads write the mapping first (a crash leaves a healable state); deleting a blob removes its mapping.
+- **Upload spooling and disk sizing**: an upload is streamed to a spool file first, then fsynced and renamed into place (local) or streamed to the bucket (S3), so the response body never sits in memory. Local spools live in `<local_path>/.spool` — the same filesystem as the blobs — and are removed on completion; a killed process can leave one behind, and the relay sweeps stale spools (only files whose owning process is gone) at startup and on later uploads. Each in-flight upload occupies up to `max_upload_bytes` of spool space, and the free-space reservation (`min_free_bytes`) covers it: size the filesystem for `min_free_bytes` plus one `max_upload_bytes` per expected concurrent upload (S3 uploads spool to the system temp directory, so size that too). A full disk refuses uploads with `507` before spooling.
+- The sha256 → owner mapping is persisted in the relay database (LMDB): no in-memory index and no startup scan, so lookups survive restarts and memory stays bounded. **The mapping is committed after the blob is durable**: a crash between the publish and the mapping write leaves an *invisible orphan* blob (a later upload of the same bytes overwrites it) rather than a listed blob whose GET 404s, and deleting a blob removes its mapping. Back up the blob storage and the database **together** — restoring the blobs without the database requires the mapping migration (see below), and the migration marker must then also be reset (delete the database directory) or the restored blobs stay unreachable.
 - **Automatic one-time migration**: at startup the relay checks whether the `blossom` mapping table exists (created instantly if missing) and whether the legacy migration already ran (marker key). If not, it scans the storage in the background (local directories / bucket objects, with or without the legacy `.meta.json` files) and rebuilds the mapping — the relay starts immediately and existing blobs become reachable as the migration completes. Later restarts skip it. Legacy multi-owner blobs keep every uploader's mapping, and the writes are chunked so a large migration never blocks the relay's event writes for long. If a migration batch fails (e.g. the LMDB map is full), the marker is left unset and the migration retries on the next start. **Backup restore**: if you restore an old storage directory/bucket without its database, delete the database directory first (or upload the blobs again) — the migration marker then triggers a fresh scan.
 - Only the uploader (the pubkey whose npub directory holds the file) can delete a blob.
 - Uploads and deletes are authorized with Blossom auth events (kind 24242, `t` + `server` tags, a mandatory `expiration` tag in the future, and an `x` tag with the blob hash for upload/delete/media per BUD-11). An optional `X-SHA-256` header is verified against the request body (mismatch = 409). `PUT /media` / `HEAD /media` (BUD-05) and `HEAD /upload` (BUD-06) are supported with the same policy; the CORS pre-flight allows the `X-SHA-256` / `X-Content-Type` / `X-Content-Length` headers. Local files are written atomically (temp file + rename), so a crash cannot leave a truncated blob.
@@ -547,11 +562,13 @@ Each `allow`/`deny` writes the database and reloads the running daemon (SIGHUP),
 | `port` must be 1–65535 | `server.port must be between 1 and 65535` |
 | `api_host` / `blossom.host` must be bare hostnames | `server.api_host must be a bare hostname (no scheme, port or path), got "https://..."` |
 | `api_host` must differ from `blossom.host` | `server.api_host and blossom.host must be different hostnames` |
+| `trusted_proxies` entries must be IPs/CIDRs (no `/0`) | `server.trusted_proxies entries must be an IP address or CIDR range ..., got "0.0.0.0/0"` |
 | blocked IPs must parse | `access.blocked_ips contains an invalid IP address: "..."` |
 | `map_size` ≤ `max_map_size` | `database.map_size must not exceed database.max_map_size` |
-| Core limits must be ≥ 1 | `limits.max_connections must be at least 1 (got 0)` |
+| Core limits must be ≥ 1 (incl. `relay.max_groups`) | `limits.max_connections must be at least 1 (got 0)` |
 | `daemon.stats_interval_secs` must be ≥ 1 | `daemon.stats_interval_secs must be at least 1 (got 0)` |
 | `daemon.max_log_files` must be 1-1000 | `daemon.max_log_files must be between 1 and 1000` |
+| `max_neg_items`/`max_req_response_bytes` hard ceilings | `config.limits.max_neg_items = 20000000 exceeds the hard ceiling of 10000000; ...` |
 | Paths must not be empty | `database.path must not be empty` |
 
 Unknown keys or sections produce **warnings** (not errors), so typos are visible:
@@ -571,7 +588,7 @@ Editing the file and sending `kill -HUP $(cat nostrfy.pid)` reloads it **without
 | --- | --- |
 | Relay identity and policies: `relay.name`, `description`, `pubkey`, `contact`, `icon`, `post_policy`, `public_url`, `reject_ephemeral`, `enabled_git`, `enabled_nip78_auth`, `require_auth`, `send_auth_challenge`, `require_pow`, `new_pubkey_min_age_secs`, `max_events_per_min_per_pubkey` | `relay.private_key` (warned about and ignored), `relay.livekit_url`/`livekit_api_key`/`livekit_api_secret`, `relay.enabled_nips`/`disabled_nips`, `relay.max_groups` |
 | `rpc.management_token`, `rpc.admin_pubkey`, `blossom.restrict_uploads`, `access.restrict_relay` | `rpc.max_admin_body_bytes` |
-| Most of `[limits]`: `max_ws_message_bytes`, `max_filters`, `max_subscriptions`, `max_limit`, `max_count`, `max_sub_id_len`, `max_content_bytes`, `max_tags`, `max_tag_value_bytes`, `max_created_at_future_secs`, `max_neg_items`, `max_sub_bytes`, `group_late_publish_secs`, the API bounds (`max_api_concurrent`, `max_api_queue_msgs`, `max_api_limit`, `max_api_offset`, `max_api_fetch`, `max_api_search_bytes`), `max_out_queue_bytes`, `max_req_response_bytes`, `ws_idle_timeout_secs` | `limits.live_buffer`, `limits.live_batch_size`, `limits.live_batch_interval_ms`, `limits.socket_recv_buffer_kb`, `limits.max_connections`, `limits.max_connections_per_ip`, `limits.http_read_timeout_secs`, `limits.max_connections_per_sec_per_ip` (they shape the accept loop built at startup) |
+| Most of `[limits]`: `max_ws_message_bytes`, `max_filters`, `max_subscriptions`, `max_limit`, `max_count`, `max_sub_id_len`, `max_content_bytes`, `max_tags`, `max_tag_value_bytes`, `max_created_at_future_secs`, `max_neg_items`, `max_sub_bytes`, `group_late_publish_secs`, the API bounds (`max_api_concurrent`, `max_api_queue_msgs`, `max_api_limit`, `max_api_offset`, `max_api_fetch`, `max_api_search_bytes`), `max_out_queue_bytes`, `max_req_response_bytes`, `ws_idle_timeout_secs` | `limits.live_buffer`, `limits.live_batch_size`, `limits.live_batch_interval_ms`, `limits.socket_recv_buffer_kb`, `limits.max_connections`, `limits.max_connections_per_ip`, `limits.http_read_timeout_secs`, `limits.max_connections_per_sec_per_ip` (they shape the accept loop built at startup), `server.trusted_proxies` (it shapes the per-connection accounting) |
 | — | `database.path`, `database.purge_interval_secs`, `database.map_size`, `database.max_map_size`, `database.max_dbs`, `database.max_readers`, `database.search_index`, `database.meta_index`, `database.reader_threads`, `database.disabled_fsync`, `database.db_request_timeout_secs`, `database.max_db_queue_msgs`, `database.max_db_queue_events`, `database.max_db_queue_bytes`, `database.max_indexed_words` |
 | — | `daemon.max_log_size_bytes`, `daemon.max_log_files`, `daemon.stats_interval_secs`, `daemon.log_file`, `daemon.pid_file` |
 | — | `blossom.host`, `blossom.storage`, `blossom.local_path`, `blossom.max_upload_bytes`, `blossom.min_free_bytes`, `blossom.s3_*` |
@@ -612,6 +629,8 @@ require_auth = false
 send_auth_challenge = true
 enabled_nip78_auth = true
 metrics_enabled = true
+# Proxies on this host (nginx/Caddy); remove for direct exposure.
+trusted_proxies = ["127.0.0.1/32", "::1/128"]
 
 [limits]
 max_connections = 10000

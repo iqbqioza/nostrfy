@@ -111,17 +111,25 @@ pub struct Verified {
 /// absolute request URL" only authorizes one request, so a captured
 /// `Authorization` header must not be reusable. Entries expire with the
 /// 60-second auth window; a hard cap bounds memory even under an
-/// authenticated event flood. At capacity, the earliest-expiring entry is
-/// evicted so a new authorization cannot deny every subsequent request.
-/// This is process-local replay protection; restarting clears the guard.
+/// authenticated event flood. Expired entries are pruned on every call,
+/// and at capacity a new authorization is rejected (fail closed) instead
+/// of evicting a live entry — evicting one would let a captured
+/// authorization be replayed once the entry was dropped. The guard drains
+/// by itself within a minute of the flood ending. This is process-local
+/// replay protection; restarting clears the guard.
 pub struct ReplayGuard {
     seen: std::sync::Mutex<std::collections::HashMap<String, u64>>,
+    /// Unix time of the last capacity warning: `accept` runs for every
+    /// authenticated request, so a flood that fills the guard must not log
+    /// one line per rejected authorization.
+    last_capacity_warning: std::sync::atomic::AtomicU64,
 }
 
 impl Default for ReplayGuard {
     fn default() -> Self {
         ReplayGuard {
             seen: std::sync::Mutex::new(std::collections::HashMap::new()),
+            last_capacity_warning: std::sync::atomic::AtomicU64::new(0),
         }
     }
 }
@@ -129,9 +137,13 @@ impl Default for ReplayGuard {
 impl ReplayGuard {
     /// Maximum authorizations tracked within one window.
     const MAX_ENTRIES: usize = 4096;
+    /// Minimum seconds between capacity warnings.
+    const WARNING_INTERVAL: u64 = 60;
 
     /// Records `id` (valid until `now + 60`); returns `false` when it was
-    /// already used (a replay). At capacity, the earliest expiry is evicted.
+    /// already used (a replay) or when the guard is full. Expired entries
+    /// are pruned first; a full guard of still-live authorizations rejects
+    /// the new one instead of evicting a live entry.
     pub fn accept(&self, id: &str, now: u64) -> bool {
         let mut seen = self.seen.lock().unwrap_or_else(|p| p.into_inner());
         seen.retain(|_, expiry| *expiry > now);
@@ -139,16 +151,35 @@ impl ReplayGuard {
             return false;
         }
         if seen.len() >= Self::MAX_ENTRIES {
-            let oldest = seen
-                .iter()
-                .min_by_key(|(_, expiry)| **expiry)
-                .map(|(id, _)| id.clone());
-            if let Some(oldest) = oldest {
-                seen.remove(&oldest);
-            }
+            // Drop the lock before logging: the warning must not stall the
+            // other requests waiting on the guard.
+            drop(seen);
+            self.warn_capacity(now);
+            return false;
         }
         seen.insert(id.to_string(), now.saturating_add(60));
         true
+    }
+
+    /// Rate-limited capacity warning (a bool would log once ever; time
+    /// based keeps the operator informed while a flood persists).
+    fn warn_capacity(&self, now: u64) {
+        use std::sync::atomic::Ordering;
+        let last = self.last_capacity_warning.load(Ordering::Relaxed);
+        if now.saturating_sub(last) < Self::WARNING_INTERVAL {
+            return;
+        }
+        if self
+            .last_capacity_warning
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            log::warn!(
+                "NIP-98 replay guard is full ({} live authorizations): refusing new \
+                 authorizations until entries expire",
+                Self::MAX_ENTRIES
+            );
+        }
     }
 }
 
@@ -463,19 +494,32 @@ mod tests {
     }
 
     #[test]
-    fn replay_guard_evicts_oldest_entry_at_capacity() {
+    fn replay_guard_rejects_new_entries_when_full_instead_of_evicting() {
         let guard = ReplayGuard::default();
         for n in 0..ReplayGuard::MAX_ENTRIES {
-            assert!(guard.accept(&format!("id-{n}"), 1_000 + n as u64));
+            assert!(guard.accept(&format!("id-{n}"), 1_000));
         }
-        assert!(guard.accept("new", 1_001));
+        // The guard is full of live entries: the new authorization is
+        // refused (fail closed) instead of evicting a live one...
         assert!(
-            guard.accept("id-0", 1_001),
-            "the oldest entry was evicted instead of denying new auth"
+            !guard.accept("new", 1_001),
+            "a full guard must reject the new authorization"
+        );
+        // ...and no live entry was dropped to make room: the oldest and the
+        // newest authorizations are both still tracked as replays.
+        assert!(
+            !guard.accept("id-0", 1_001),
+            "the oldest live entry must not be evicted"
         );
         assert!(
             !guard.accept("id-4095", 1_001),
             "the newest entry remains protected from replay"
+        );
+        // Once the 60-second window passes, all entries expire and the guard
+        // drains by itself.
+        assert!(
+            guard.accept("new", 1_061),
+            "acceptance resumes after the live entries expire"
         );
     }
 }

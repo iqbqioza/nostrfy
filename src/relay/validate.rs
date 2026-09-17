@@ -20,7 +20,10 @@ pub(crate) enum Precheck {
     /// The event is acknowledged as a duplicate (OK true, not stored):
     /// NIP-43's example for a member's repeated join claim.
     Duplicate(String),
-    /// NIP-62: the event is a valid request to vanish.
+    /// NIP-62: the event is a valid request to vanish. The relay records
+    /// the pubkey permanently: every later event from it is rejected, even
+    /// ones created after the request's `until_created` (see the vanish
+    /// semantics in the `relay` module docs).
     Vanish,
 }
 

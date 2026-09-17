@@ -83,6 +83,10 @@ impl Stats {
             "buffers_dropped": self.buffers_dropped.load(Ordering::Relaxed),
             "db_errors": self.db_errors.load(Ordering::Relaxed),
             "db_size_bytes": self.db_size_bytes.load(Ordering::Relaxed),
+            // Logger write/rotation failures: a nonzero value means log
+            // records are being lost (the log file is not the source of
+            // truth for these counters).
+            "log_errors": crate::logging::log_errors(),
         })
     }
 
@@ -199,6 +203,12 @@ impl Stats {
             "gauge",
             self.db_size_bytes.load(Ordering::Relaxed),
         );
+        metric(
+            "nostrfy_log_errors",
+            "Log file write/rotation failures since start (log records are being lost).",
+            "counter",
+            crate::logging::log_errors(),
+        );
         out
     }
 }
@@ -232,6 +242,10 @@ mod tests {
         assert!(text.contains("nostrfy_events_accepted 3\n"));
         assert!(text.contains("# TYPE nostrfy_events_accepted counter\n"));
         assert!(text.contains("# TYPE nostrfy_uptime_seconds gauge\n"));
+        assert!(
+            text.contains("# TYPE nostrfy_log_errors counter\n"),
+            "the logger failure counter must be exposed for alerting"
+        );
         // Every line is either a comment, a blank, or `name value`.
         for line in text.lines() {
             if line.is_empty() || line.starts_with('#') {
@@ -241,5 +255,15 @@ mod tests {
             assert!(value.parse::<f64>().is_ok(), "value parses: {line}");
             assert!(!name.contains(' '), "name has no spaces: {line}");
         }
+    }
+
+    #[test]
+    fn log_errors_is_reported_in_the_json_snapshot() {
+        let stats = Stats::new();
+        let json = stats.as_json();
+        assert!(
+            json.get("log_errors").and_then(Value::as_u64).is_some(),
+            "the JSON snapshot must carry the logger failure counter"
+        );
     }
 }

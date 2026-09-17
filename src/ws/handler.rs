@@ -476,25 +476,27 @@ impl super::Conn {
             live: Default::default(),
             live_bytes: 0,
             eose_sent: false,
+            budget: None,
+            reserved: 0,
         });
 
         let now = unix_now();
-        // The scan over-fetches each filter's limit (hidden-event slack) so
-        // that events withheld by the visibility rules below do not consume
-        // the limit slots; the visible results are then truncated back to
-        // the requested per-filter limits (their sum, since the scan unions
-        // the filters).
-        // `max_limit` itself is operator-configured without an upper bound,
-        // so the sum saturates instead of overflowing (a wrap would truncate
-        // the page and confuse pagination).
-        let original_total: usize = stored
+        // NIP-01: `limit` applies to each filter independently. The scan
+        // over-fetches each filter's limit (hidden-event slack) so that
+        // events withheld by the visibility rules below do not consume the
+        // limit slots; the visible results are then attributed back to the
+        // filters, so one filter's matches cannot consume another filter's
+        // quota. `max_limit` is operator-configured without an upper bound,
+        // so the quotas are per-filter (a sum would need saturation and
+        // still blur the attribution).
+        let limits: Vec<usize> = stored
             .iter()
             .map(|f| f.limit.unwrap_or(max_limit).min(max_limit))
-            .fold(0usize, |acc, n| acc.saturating_add(n));
+            .collect();
         let Some((events, more)) = self
             .relay
             .db
-            .query_req_reported(stored, max_limit, now)
+            .query_req_reported(stored.clone(), max_limit, now)
             .await
         else {
             // A timed-out query must not be presented as an empty
@@ -537,26 +539,50 @@ impl super::Conn {
                 to_send.push(event);
             }
         }
-        let truncated = to_send.len() > original_total;
-        // NIP-01/NIP-67 boundary rule: events sharing the boundary
-        // `created_at` belong to the same page. The scan already continues
-        // ties past its limit; extend the visible truncation the same way so
-        // a tie split by withheld events is not cut in half here.
+        // Attribute the visible events to the filter whose quota they
+        // consume: the first filter with remaining quota that matches gets
+        // the event (the same rule the scan's search path applies), so a
+        // filter that matched many events cannot starve a later filter.
+        // Events at the boundary timestamp of a filter whose quota is
+        // already exhausted still belong to that filter's page (NIP-01/
+        // NIP-67: a page never splits a created_at tie), exactly like the
+        // scan's per-filter boundary continuation.
         // Note: `truncated || more` below is computed pre-visibility-filter
         // (like the scan's `more`), so a fully-withheld page can still
         // report `more`. That is conservative on purpose: it prompts the
         // client to authenticate (see the `auth` hint) instead of wrongly
         // claiming completeness.
-        if truncated && original_total > 0 {
-            let boundary = to_send[original_total - 1].created_at;
-            let mut end = original_total;
-            while end < to_send.len() && to_send[end].created_at == boundary {
-                end += 1;
+        let mut remaining = limits;
+        let mut boundaries: Vec<Option<u64>> = vec![None; remaining.len()];
+        let mut kept = Vec::with_capacity(to_send.len());
+        let mut truncated = false;
+        for event in to_send {
+            let mut placed = false;
+            for (i, filter) in stored.iter().enumerate() {
+                if remaining[i] == 0 {
+                    continue;
+                }
+                if filter.matches(&event) {
+                    remaining[i] -= 1;
+                    if remaining[i] == 0 {
+                        boundaries[i] = Some(event.created_at);
+                    }
+                    placed = true;
+                    break;
+                }
             }
-            to_send.truncate(end);
-        } else {
-            to_send.truncate(original_total);
+            if !placed {
+                placed = stored.iter().enumerate().any(|(i, filter)| {
+                    boundaries[i] == Some(event.created_at) && filter.matches(&event)
+                });
+            }
+            if placed {
+                kept.push(event);
+            } else {
+                truncated = true;
+            }
         }
+        to_send = kept;
         // Bound the memory this response pins while it waits for the
         // socket. The pump enforces `max_req_response_bytes` on the wire,
         // but without this a slow reader would hold the whole
@@ -585,6 +611,24 @@ impl super::Conn {
             byte_truncated = kept < to_send.len();
             to_send.truncate(kept);
         }
+        // Relay-wide accounting: the materialized events stay pinned until
+        // the response finishes pumping, so reserve their (lower-bound)
+        // byte size against the relay-wide budget before queueing them.
+        // Over-budget responses fail fast with a retryable CLOSED instead
+        // of pinning memory; the reservation is released by
+        // `PendingReq`'s Drop on every completion, close/replacement,
+        // disconnect and panic path.
+        let response_bytes = to_send.iter().fold(0u64, |acc, event| {
+            acc.saturating_add(event_frame_lower_bound(event, sub_id.len()))
+        });
+        let Some(reserved) = self.pending_budget.try_reserve(
+            response_bytes,
+            super::pending_response_budget_bytes(self.req_response_bytes),
+        ) else {
+            self.remove_req_subscription(sub_id);
+            self.send_closed(sub_id, "error: overloaded, please retry");
+            return;
+        };
         // The response is queued for the pump instead of being pushed into
         // the outgoing queue all at once: the connection loop moves it into
         // the capped queue in bounded chunks as the socket drains, so a
@@ -595,11 +639,14 @@ impl super::Conn {
             .iter_mut()
             .find(|pending| pending.sub_id == sub_id)
         else {
+            self.pending_budget.release(reserved);
             self.remove_req_subscription(sub_id);
             self.send_closed(sub_id, "error: response barrier lost, please retry");
             return;
         };
         pending.events = to_send.into();
+        pending.budget = Some(std::sync::Arc::clone(&self.pending_budget));
+        pending.reserved = reserved;
         pending.truncated_or_more = truncated || more || byte_truncated;
         pending.auth_hint = auth_hidden;
     }
@@ -704,12 +751,16 @@ impl super::Conn {
     }
 
     pub(crate) async fn handle_auth(&mut self, rest: &[Value]) {
-        // Bound the AUTH attempts per connection: each well-formed frame
-        // costs a Schnorr verification, so an unlimited stream of AUTH
-        // frames would burn CPU on one connection. The limit is generous
-        // (a client retries a couple of times at most) and does not close
-        // the connection: the client can still read and reconnect.
-        const MAX_AUTH_ATTEMPTS: u32 = 16;
+        // Bound the AUTH frames per connection: each well-formed frame
+        // costs a Schnorr verification, so an unlimited stream would burn
+        // CPU on one connection. The cap must stay comfortably above
+        // `MAX_AUTH_KEYS`: every successful authentication counts as an
+        // attempt too, so a multi-key client spending its whole key budget
+        // would otherwise be refused before it could use it. Frames past
+        // the cap are answered with OK (not a NOTICE): the client can
+        // still read and reconnect, and NIP-42 requires a correlated
+        // response for every AUTH.
+        const MAX_AUTH_ATTEMPTS: u32 = 256;
         // Distinct keys recorded per connection. The AUTH attempt cap above
         // already bounds it in practice; the explicit cap remains a DoS
         // guard for the per-event visibility scan over the list.
@@ -728,21 +779,31 @@ impl super::Conn {
             self.send_control(json!(["OK", id, false, "error: too many AUTH attempts"]));
             return;
         }
+        // NIP-42: a parsed AUTH message is always answered with OK, even
+        // when no event (or no valid event) can be recovered. A missing
+        // event object is still a parsed AUTH frame, so it gets OK with
+        // the empty id and an `invalid:` reason instead of a NOTICE.
         let Some(value) = rest.first() else {
-            self.send_notice("error: AUTH requires an event object");
+            self.send_control(json!([
+                "OK",
+                "",
+                false,
+                "invalid: AUTH requires an event object"
+            ]));
             return;
         };
         let event: Event = match serde_json::from_value(value.clone()) {
             Ok(event) => event,
             Err(_) => {
-                // NIP-42: AUTH messages MUST be answered with OK, like any
-                // EVENT. Correlate with the id when the malformed event
-                // still carries one.
-                if let Some(id) = value.get("id").and_then(Value::as_str) {
-                    self.send_control(nip42::ok(id, false));
-                } else {
-                    self.send_notice("error: invalid auth event");
-                }
+                // Correlate with the id when the malformed event still
+                // carries one; otherwise the empty id is the only
+                // correlation the frame allows.
+                self.send_control(json!([
+                    "OK",
+                    value.get("id").and_then(Value::as_str).unwrap_or(""),
+                    false,
+                    "invalid: malformed AUTH event"
+                ]));
                 return;
             }
         };
@@ -1171,7 +1232,12 @@ impl super::Conn {
         // iteration.
         let mut direct: Vec<(Message, u64)> = Vec::new();
         for (sub_id, (filters, _, sub_json)) in self.subs.iter() {
-            if !filters.iter().any(|f| f.matches(event)) {
+            // The filter's tag plan is hoisted out of the per-event loop
+            // (`matches_with`): the live path matches every event against
+            // every subscription, and the plan keeps tag matching
+            // O(event tags + filter values) instead of the old
+            // values × tags product.
+            if !filters.iter().any(|f| f.matches_with(event, f.tag_plan())) {
                 continue;
             }
             let mut out = String::with_capacity(event_json.len() + sub_json.len() + 16);

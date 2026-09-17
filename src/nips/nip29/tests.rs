@@ -845,13 +845,13 @@ fn create_adopts_a_group_that_declared_it_as_a_child() {
         "the adopting parent's metadata is republished"
     );
 
-    // An uncapped store skips the scan (n creates would make it O(n²)): the
-    // placeholder link stays one-sided until an explicit edit.
+    // An uncapped store adopts too: the scan is bounded by the
+    // declared-children hint, so n creates do not turn into O(n²).
     let mut uncapped = GroupStore::default();
     uncapped.apply(&create1, "relay", 1, false, false);
     uncapped.apply(&declare, "relay", 1, false, false);
     uncapped.apply(&create2, "relay", 1, false, false);
-    assert_eq!(uncapped.group("g2").unwrap().parent, None);
+    assert_eq!(uncapped.group("g2").unwrap().parent.as_deref(), Some("g1"));
 }
 
 #[test]
@@ -1716,7 +1716,11 @@ fn ghost_missing_withholds_groups_lost_in_a_vanish_rebuild() {
         !rebuilt.visible_gid("g1", false, None),
         "a group lost in the rebuild must be ghosted (content withheld)"
     );
-    // An explicitly deleted group stays deleted (not ghosted).
+    // An explicitly deleted (confirmed-purged) group stays deleted rather
+    // than becoming a ghost: `hidden_group_ids` carries the tombstone, and
+    // the rebuild re-seeds it because the scan cannot reconstruct it once
+    // the 9008's purge removed the events (the marker would otherwise turn
+    // into a permanent ghost, blocking re-creation forever).
     let mut store = GroupStore::default();
     store.apply(
         &event(CREATE_GROUP, ADMIN, Some("g2"), vec![]),
@@ -1732,12 +1736,25 @@ fn ghost_missing_withholds_groups_lost_in_a_vanish_rebuild() {
         false,
         false,
     );
-    let previous: Vec<String> = store.groups.keys().cloned().collect();
+    let previous = store.hidden_group_ids();
+    assert!(
+        previous.contains(&"g2".to_string()),
+        "the hidden ids must carry the delete tombstone"
+    );
+    let previous_deleted = store.deleted_group_ids();
+    let previous_ghost = store.ghost_group_ids();
     let mut rebuilt = GroupStore::default();
-    rebuilt.ghost_missing(previous);
+    rebuilt.restore_hidden(previous, previous_deleted, previous_ghost);
     assert!(
         !rebuilt.ghost.contains("g2"),
         "a 9008-deleted id must not be added to the ghost set"
+    );
+    assert!(rebuilt.deleted.contains("g2"));
+    assert!(
+        rebuilt
+            .validate_write(&event(CREATE_GROUP, ADMIN, Some("g2"), vec![]))
+            .is_ok(),
+        "a confirmed-purged id must stay re-creatable after the rebuild"
     );
 }
 
@@ -1803,4 +1820,109 @@ fn apply_keeps_the_last_admin_on_9000_demotion() {
         group.is_admin(ADMIN2),
         "the remaining admin keeps the group manageable"
     );
+}
+
+#[test]
+fn global_member_budget_is_enforced_and_freed_on_leave() {
+    // The per-group cap does not bound the sum across groups; the global
+    // budget (maintained as a counter, not a per-event scan) rejects fresh
+    // members once the total is reached, on both JOIN and 9000.
+    let mut store = seeded();
+    // seeded() gives g1 two members (ADMIN and OTHER).
+    assert_eq!(store.total_members, 2);
+    store.max_total_members = 3;
+    let join = event(JOIN, USER, Some("g1"), vec![]);
+    assert!(store.validate_write(&join).is_ok());
+    store.apply(&join, "", 2, false, false);
+    assert_eq!(store.total_members, 3);
+    // A fresh member is rejected by the global budget...
+    let fresh = "ee".repeat(32);
+    let join2 = event(JOIN, &fresh, Some("g1"), vec![]);
+    assert_eq!(
+        store.validate_write(&join2).unwrap_err().to_string(),
+        "restricted: the relay member limit is reached"
+    );
+    // ...on the 9000 path too.
+    let grant = event(
+        9000,
+        ADMIN,
+        Some("g1"),
+        vec![vec![P.into(), "ff".repeat(32), "mod".into()]],
+    );
+    assert_eq!(
+        store.validate_write(&grant).unwrap_err().to_string(),
+        "restricted: the relay member limit is reached"
+    );
+    // Demoting an existing member does not consume budget.
+    let demote = event(9000, ADMIN, Some("g1"), vec![vec![P.into(), OTHER.into()]]);
+    assert!(store.validate_write(&demote).is_ok());
+    // A LEAVE frees a slot for the next fresh member.
+    let leave = event(LEAVE, USER, Some("g1"), vec![]);
+    assert!(store.validate_write(&leave).is_ok());
+    store.apply(&leave, "", 3, false, false);
+    assert_eq!(store.total_members, 2);
+    let join3 = event(JOIN, &fresh, Some("g1"), vec![]);
+    assert!(store.validate_write(&join3).is_ok());
+    store.apply(&join3, "", 4, false, false);
+    assert_eq!(store.total_members, 3);
+    // History replay (the rebuild) ignores the budget instead of dropping
+    // stored members, but still counts them.
+    let replay = event(
+        9000,
+        ADMIN,
+        Some("g1"),
+        vec![vec![P.into(), "ff".repeat(32), "mod".into()]],
+    );
+    store.apply(&replay, "", 5, true, true);
+    assert_eq!(store.total_members, 4);
+    assert!(store.group("g1").unwrap().is_member(&"ff".repeat(32)));
+}
+
+#[test]
+fn subgroup_adoption_is_deterministic_and_works_uncapped() {
+    // Two groups declare the same placeholder child id: the smallest
+    // declaring parent wins, deterministically (a HashMap walk used to pick
+    // an arbitrary one). The store is uncapped (max_groups == 0), where
+    // adoption used to be skipped entirely (turning n creates into O(n²)).
+    let mut store = GroupStore::default();
+    assert_eq!(store.max_groups, 0);
+    for gid in ["g3", "g1", "g2"] {
+        store.apply(
+            &event(CREATE_GROUP, ADMIN, Some(gid), vec![]),
+            "relay",
+            1,
+            false,
+            false,
+        );
+    }
+    for parent in ["g3", "g2", "g1"] {
+        let adopt = event(
+            9002,
+            ADMIN,
+            Some(parent),
+            vec![vec!["child".into(), "child".into()]],
+        );
+        store.apply(&adopt, "relay", 2, false, false);
+    }
+    store.apply(
+        &event(CREATE_GROUP, ADMIN, Some("child"), vec![]),
+        "relay",
+        3,
+        false,
+        false,
+    );
+    assert_eq!(
+        store.group("child").unwrap().parent.as_deref(),
+        Some("g1"),
+        "the smallest declaring parent must adopt"
+    );
+    // The adoption is idempotent: replaying the create does not reparent.
+    store.apply(
+        &event(CREATE_GROUP, ADMIN, Some("child"), vec![]),
+        "relay",
+        4,
+        false,
+        false,
+    );
+    assert_eq!(store.group("child").unwrap().parent.as_deref(), Some("g1"));
 }

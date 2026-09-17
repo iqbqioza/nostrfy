@@ -2,9 +2,10 @@
 //! disk or in an S3-compatible bucket (AWS S3 / Cloudflare R2).
 //!
 //! The sha256 → owner mapping is **persisted in the relay database**
-//! (LMDB, the `blossom` table): an upload writes the mapping first, and a
-//! lookup reads it straight from LMDB — no in-memory index and no startup
-//! scan, so lookups survive restarts, memory stays bounded and startup is
+//! (LMDB, the `blossom` table): an upload publishes the object first and
+//! writes the mapping only after the object is durable, and a lookup reads
+//! it straight from LMDB — no in-memory index and no startup scan, so
+//! lookups survive restarts, memory stays bounded and startup is
 //! independent of the storage size. The blobs themselves are files in
 //! `bucket/{npub1xxx}/{file}`; the multi-owner mapping lets every uploader
 //! of identical content manage their own copy independently.
@@ -97,6 +98,12 @@ pub(crate) struct BlobStore {
     storage: Storage,
     db: DbClient,
     upload_locks: Vec<tokio::sync::Mutex<()>>,
+    /// Test-only one-shot fault injection: the next owner-mapping commit is
+    /// treated as a database failure so the publish-first ordering (an
+    /// orphan object, never a phantom mapping) is testable without a real
+    /// database fault. Mirrors `Store::fail_next_commit`.
+    #[cfg(test)]
+    fail_next_mapping: std::sync::atomic::AtomicBool,
 }
 
 impl BlobStore {
@@ -126,6 +133,8 @@ impl BlobStore {
             upload_locks: (0..Self::UPLOAD_LOCK_COUNT)
                 .map(|_| tokio::sync::Mutex::new(()))
                 .collect(),
+            #[cfg(test)]
+            fail_next_mapping: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -156,16 +165,33 @@ impl BlobStore {
         }
     }
 
+    /// Test-only: bytes currently reserved by in-flight uploads (0 when the
+    /// guard is disabled). Every upload path must return this to zero; a
+    /// leaked reservation would eventually refuse uploads with 507 while
+    /// the disk is empty.
+    #[cfg(test)]
+    pub(crate) fn reserved_bytes(&self) -> u64 {
+        match &self.storage {
+            Storage::Local(s) => s.reserved.load(std::sync::atomic::Ordering::Relaxed),
+            Storage::S3(_) => 0,
+        }
+    }
+
     /// A directory on the blob filesystem where uploads may be spooled, so
     /// the final store is a rename instead of a second full write (None for
     /// S3, which keeps the system temp directory).
     /// Removes spool files left behind by a crash (the Drop cleanup cannot
     /// run on SIGKILL/power loss) so they do not accumulate until the disk
-    /// is full. Only spools whose owning process is gone are removed: the
-    /// temp directory is shared, and deleting a live process's in-flight
-    /// spool would corrupt its upload (or make it publish a missing body).
-    /// A removal failure is ignored (best effort).
+    /// is full. Only files whose owning process start is gone (a dead PID)
+    /// or whose token is foreign and that outlived the grace period are
+    /// removed: the temp directory is shared, and deleting a live process's
+    /// in-flight spool would corrupt its upload (or make it publish a
+    /// missing body). Files this process start owns (matching token) and
+    /// files of unknown shape are never touched. A removal failure is
+    /// ignored (best effort).
     pub(crate) fn sweep_stale_spools(&self) {
+        let current = spool_process_token();
+        let now = std::time::SystemTime::now();
         let mut dirs = vec![std::env::temp_dir()];
         if let Some(dir) = self.spool_dir() {
             dirs.push(dir);
@@ -177,7 +203,21 @@ impl BlobStore {
             for entry in entries.flatten() {
                 let name = entry.file_name();
                 let name = name.to_string_lossy();
-                if name.starts_with(SPOOL_PREFIX) && !spool_owner_alive(&name) {
+                let Some(pid) = spool_pid(&name) else {
+                    // Unknown shape: never delete a file that cannot be
+                    // attributed to a spool.
+                    continue;
+                };
+                if spool_token(&name) == Some(current) {
+                    // This process start's own (possibly in-flight) spool.
+                    continue;
+                }
+                // A foreign token: another process, or a previous process
+                // whose PID a restart reused (a container restart always
+                // yields PID 1 again). It is stale once its PID is gone, or
+                // once it outlived the grace period and can no longer be a
+                // live sibling's spool.
+                if !process_alive(pid) || spool_older_than(&entry, now) {
                     let _ = std::fs::remove_file(entry.path());
                 }
             }
@@ -200,8 +240,34 @@ impl BlobStore {
         Ok(SpaceReservation { store: self, size })
     }
 
-    /// Stores a blob: the LMDB mapping first (so a crash leaves a healable
-    /// state — a mapping without a file can be deleted), then the file.
+    /// Commits the LMDB owner mapping. Called only after the object has
+    /// been published durably, so a `false` result leaves an invisible,
+    /// overwritable orphan object rather than a phantom mapping.
+    async fn commit_owner(
+        &self,
+        sha256: &str,
+        mime: &str,
+        size: u64,
+        uploaded: i64,
+        pubkey: &str,
+    ) -> bool {
+        #[cfg(test)]
+        if self
+            .fail_next_mapping
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return false;
+        }
+        self.db
+            .blossom_add_owner(sha256, mime, size, uploaded, pubkey)
+            .await
+    }
+
+    /// Stores a blob: the object is published first (fsync + rename +
+    /// directory fsync) and the LMDB mapping is committed only after it is
+    /// durable. A crash in between leaves an invisible, overwritable orphan
+    /// object instead of a listed blob whose GET 404s; a failed mapping
+    /// commit leaves the same orphan and reports the error.
     #[cfg(test)]
     pub(crate) async fn put(
         &self,
@@ -211,52 +277,21 @@ impl BlobStore {
         mime: &str,
     ) -> Result<Descriptor> {
         // Disk-full guard first: a refused upload must not even leave an
-        // orphan mapping behind (the mapping-first design heals such
-        // leftovers, but only the bytes that will actually land should be
-        // committed). The reservation covers the whole upload.
+        // orphan object behind. The reservation covers the whole upload.
         let _space = self.reserve_space(bytes.len() as u64)?;
         let _blob_guard = self.blob_lock(sha256).await;
         let uploaded = crate::util::unix_now() as i64;
-        // Whether the uploader already owned the blob BEFORE this upload
-        // (read before the add: a failed re-upload of identical bytes must
-        // not roll back their pre-existing, valid mapping). The checked
-        // read keeps a database failure from being mistaken for "no owner
-        // yet": the rollback below would then delete a valid mapping.
-        let Some(existing) = self.db.blossom_load_checked(sha256).await else {
-            return Err(db_unavailable());
-        };
-        let was_owner = existing.is_some_and(|m| m.owners.iter().any(|o| o == pubkey));
-        // The mapping must land first: without it the file would be an
-        // unreachable orphan. Abort the upload when the commit fails.
-        if !self
-            .db
-            .blossom_add_owner(sha256, mime, bytes.len() as u64, uploaded, pubkey)
-            .await
-        {
-            return Err(anyhow!("blossom mapping write failed"));
-        }
-
         let npub = npub_of(pubkey);
         let stored = match &self.storage {
             Storage::Local(s) => s.put(&npub, sha256, bytes, mime, uploaded).await,
             Storage::S3(s) => s.put(&npub, sha256, bytes, mime, uploaded).await,
         };
-        if let Err(e) = stored {
-            // Roll the owner mapping back: a failed PUT must not leave a
-            // mapping pointing at an object that was never stored (an
-            // unreachable, billed orphan) — but only when this upload
-            // created the mapping (a failed re-upload keeps the
-            // pre-existing valid mapping).
-            //
-            if !was_owner {
-                let (removed, db_ok) = self.db.blossom_remove_owner_checked(sha256, pubkey).await;
-                if !db_ok || !removed {
-                    return Err(anyhow!(
-                        "blob storage failed ({e}); owner mapping rollback failed"
-                    ));
-                }
-            }
-            return Err(e);
+        stored?;
+        if !self
+            .commit_owner(sha256, mime, bytes.len() as u64, uploaded, pubkey)
+            .await
+        {
+            return Err(anyhow!("blossom mapping write failed"));
         }
         Ok(Descriptor {
             sha256: sha256.to_string(),
@@ -270,6 +305,14 @@ impl BlobStore {
     /// Stores a blob from a temporary file, keeping the upload path
     /// bounded to filesystem and transport buffers instead of retaining the
     /// complete request body in memory.
+    ///
+    /// The object is published first (the spool is fsynced, renamed into
+    /// place and its directory fsynced) and the owner mapping is committed
+    /// only after it is durable: a crash in between leaves an invisible,
+    /// overwritable orphan object instead of a listed blob that 404s. A
+    /// failed mapping commit leaves the orphan and reports the error; a
+    /// failed publish adds no mapping and never touches the uploader's
+    /// pre-existing one.
     pub(crate) async fn put_file(
         &self,
         pubkey: &str,
@@ -289,50 +332,43 @@ impl BlobStore {
         };
         let _blob_guard = self.blob_lock(sha256).await;
         let uploaded = crate::util::unix_now() as i64;
-        // A failed read must not be mistaken for "no mapping yet": the
-        // rollback below would then delete a valid pre-existing owner
-        // mapping (the blob becomes unreachable) when the storage write
-        // fails. Only a KNOWN previous state may roll back.
+        // Read the pre-upload state first: it decides the 409 cap response
+        // and the re-upload descriptor. A failed read must abort before the
+        // object is published (a database outage must not create orphans),
+        // and it must never be mistaken for "no mapping yet".
         let Some(existing) = self.db.blossom_load_checked(sha256).await else {
             return Err(db_unavailable());
         };
         let existed = existing.is_some();
-        let was_owner = existing
-            .as_ref()
-            .is_some_and(|m| m.owners.iter().any(|o| o == pubkey));
         // A new owner past the per-blob cap is refused by the database
         // anyway; pre-checking turns the resulting commit failure into a
         // client-visible conflict (409) instead of a 500. The load above is
         // not atomic with the add, so a concurrent upload can still win the
-        // last slot — the database cap remains the real guard.
+        // last slot — the database cap remains the real guard (the raced
+        // loser then leaves an orphan object, never a mapping).
         if let Some(meta) = &existing
             && !meta.owners.iter().any(|o| o == pubkey)
             && meta.owners.len() >= MAX_BLOB_OWNERS
         {
             return Err(anyhow::Error::new(BlobOwnerLimit));
         }
-        if !self
-            .db
-            .blossom_add_owner(sha256, mime, size, uploaded, pubkey)
-            .await
-        {
-            return Err(anyhow!("blossom mapping write failed"));
-        }
         let npub = npub_of(pubkey);
         let stored = match &self.storage {
             Storage::Local(s) => s.put_file(&npub, sha256, path).await,
             Storage::S3(s) => s.put_file(&npub, sha256, path, size, mime).await,
         };
-        if let Err(e) = stored {
-            if !was_owner {
-                let (removed, db_ok) = self.db.blossom_remove_owner_checked(sha256, pubkey).await;
-                if !db_ok || !removed {
-                    return Err(anyhow!(
-                        "blob storage failed ({e}); owner mapping rollback failed"
-                    ));
-                }
-            }
-            return Err(e);
+        // Publish before mapping: without a durable object the mapping
+        // would be a phantom that 404s and consumes an owner slot. A
+        // failed publish leaves the pre-existing mapping untouched.
+        stored?;
+        if !self
+            .commit_owner(sha256, mime, size, uploaded, pubkey)
+            .await
+        {
+            return Err(anyhow!(
+                "blossom mapping write failed; the published object is an invisible orphan \
+                 that a later upload of the same bytes overwrites"
+            ));
         }
         if existed && let Some(meta) = self.db.blossom_load(sha256).await {
             // A re-upload keeps the original mapping (add_owner only
@@ -591,8 +627,48 @@ impl BlobStore {
 }
 
 /// Prefix of the temporary files uploads are spooled into:
-/// `nostrfy-blossom-<pid>-<counter>` (see `mod.rs::spool_upload`).
+/// `nostrfy-blossom-<pid>-<token>-<counter>` (see [`spool_file_name`]).
 pub(crate) const SPOOL_PREFIX: &str = "nostrfy-blossom-";
+
+/// How long a spool whose owner cannot be proven dead is kept before the
+/// sweep removes it. A restarted container reuses PID 1, so the token
+/// identifies the current process and a foreign token means "not ours";
+/// a young foreign spool may still belong to a live sibling process, so
+/// only files older than the grace period are swept on liveness ambiguity.
+const SPOOL_GRACE_PERIOD: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// A per-process-start token embedded in every spool name. The PID alone
+/// cannot distinguish a previous process's stale spools from the current
+/// process's live ones when a container restart reuses PID 1; a random
+/// token (falling back to the start time) makes a name collision with the
+/// previous start practically impossible, so `create_new` never fails on
+/// a stale spool and the sweep can attribute each file to a process start.
+pub(crate) fn spool_process_token() -> &'static str {
+    static TOKEN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    TOKEN.get_or_init(|| {
+        let mut bytes = [0u8; 8];
+        if getrandom::getrandom(&mut bytes).is_ok() {
+            return format!("{:016x}", u64::from_ne_bytes(bytes));
+        }
+        // No RNG: the wall-clock start time still separates ordinary
+        // restarts (the PID alone does not under a container restart).
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        format!("{nanos:x}")
+    })
+}
+
+/// The spool file name for one upload: unique per process start (token) and
+/// per upload (counter), so a restarted process can never collide with a
+/// stale spool even before the sweep runs.
+pub(crate) fn spool_file_name(counter: u64) -> String {
+    format!(
+        "{SPOOL_PREFIX}{}-{}-{counter}",
+        std::process::id(),
+        spool_process_token()
+    )
+}
 
 /// The PID embedded in a spool file name, when it parses.
 fn spool_pid(name: &str) -> Option<u32> {
@@ -603,16 +679,26 @@ fn spool_pid(name: &str) -> Option<u32> {
         .ok()
 }
 
-/// Whether the process that created a spool file is still running. A file
-/// whose name does not carry a parseable PID is treated as alive: the sweep
-/// must never delete a file it cannot attribute (safe fallback). On
-/// non-unix platforms liveness cannot be checked cheaply, so every spool is
-/// kept (the leak is bounded by restarts; deleting a live spool is not).
-fn spool_owner_alive(name: &str) -> bool {
-    match spool_pid(name) {
-        Some(pid) => process_alive(pid),
-        None => true,
-    }
+/// The process token of a spool name, or `None` for the legacy
+/// `nostrfy-blossom-<pid>[-<counter>]` shapes that carry no token. The new
+/// shape always has a counter segment after the token.
+fn spool_token(name: &str) -> Option<&str> {
+    let mut parts = name.strip_prefix(SPOOL_PREFIX)?.split('-');
+    parts.next()?.parse::<u32>().ok()?;
+    let token = parts.next()?;
+    parts.next()?;
+    if token.is_empty() { None } else { Some(token) }
+}
+
+/// Whether a spool file is older than the sweep grace period. A file whose
+/// age cannot be read is not considered old (never delete on an unknown).
+fn spool_older_than(entry: &std::fs::DirEntry, now: std::time::SystemTime) -> bool {
+    entry
+        .metadata()
+        .ok()
+        .and_then(|meta| meta.modified().ok())
+        .and_then(|modified| now.duration_since(modified).ok())
+        .is_some_and(|age| age >= SPOOL_GRACE_PERIOD)
 }
 
 #[cfg(unix)]
@@ -1965,6 +2051,86 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    #[tokio::test]
+    async fn mapping_failure_leaves_orphan_object_not_a_visible_blob() {
+        let (s, _db_path) = store("publish-before-map").await;
+        let a = pk(1);
+        let b = pk(2);
+        let sha = "5a".repeat(32);
+        let bytes = b"publish before map";
+        let src = std::env::temp_dir().join(format!(
+            "nostrfy-blossom-publish-src-{}",
+            std::process::id()
+        ));
+        std::fs::write(&src, bytes).unwrap();
+        // The object is published before the mapping commits: a commit
+        // failure must leave no mapping at all (no list entry, no owner
+        // slot), only the invisible orphan object.
+        s.fail_next_mapping
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let err = s
+            .put_file(&a, &sha, &src, bytes.len() as u64, "text/plain", true)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("mapping"),
+            "the commit failure must be reported: {err}"
+        );
+        assert!(
+            s.find(&sha).await.unwrap().is_none(),
+            "a failed mapping commit must not leave a mapping"
+        );
+        assert!(!s.has(&a, &sha).await.unwrap());
+        assert!(s.list(&a, 10).await.is_empty());
+        // The publish did happen first (the orphan is invisible through the
+        // mapping but a later upload overwrites it in place).
+        assert!(
+            s.open_stream(&a, &sha, 0, u64::MAX)
+                .await
+                .unwrap()
+                .is_some(),
+            "the object is published before the mapping commits"
+        );
+
+        // A later successful flow overwrites the orphan and lists the blob.
+        std::fs::write(&src, bytes).unwrap();
+        let (desc, existed) = s
+            .put_file(&a, &sha, &src, bytes.len() as u64, "text/plain", true)
+            .await
+            .unwrap();
+        assert_eq!(desc.sha256, sha);
+        assert!(!existed);
+        assert!(s.find(&sha).await.unwrap().is_some());
+        assert!(s.has(&a, &sha).await.unwrap());
+        assert_eq!(s.list(&a, 10).await.len(), 1);
+        // A second owner appends to the mapping normally.
+        std::fs::write(&src, bytes).unwrap();
+        let (_, existed) = s
+            .put_file(&b, &sha, &src, bytes.len() as u64, "text/plain", true)
+            .await
+            .unwrap();
+        assert!(existed, "the second uploader sees the existing blob");
+        assert!(s.has(&b, &sha).await.unwrap());
+        assert_eq!(s.list(&b, 10).await.len(), 1);
+
+        // A failed re-upload by an existing owner keeps their mapping.
+        s.fail_next_mapping
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        std::fs::write(&src, bytes).unwrap();
+        assert!(
+            s.put_file(&a, &sha, &src, bytes.len() as u64, "text/plain", true)
+                .await
+                .is_err()
+        );
+        assert!(
+            s.has(&a, &sha).await.unwrap(),
+            "a failed re-upload must not delete the pre-existing owner mapping"
+        );
+        assert_eq!(s.list(&a, 10).await.len(), 1);
+        let _ = std::fs::remove_file(&src);
+        s.db.shutdown();
+    }
+
     #[test]
     fn spool_pid_parsing() {
         assert_eq!(spool_pid("nostrfy-blossom-123-0"), Some(123));
@@ -1973,6 +2139,44 @@ mod tests {
         assert_eq!(spool_pid("nostrfy-blossom-abc-1"), None);
         assert_eq!(spool_pid("nostrfy-blossom-"), None);
         assert_eq!(spool_pid("unrelated-1-2"), None);
+    }
+
+    #[test]
+    fn spool_token_parsing() {
+        // The new shape is `<pid>-<token>-<counter>`.
+        assert_eq!(spool_token("nostrfy-blossom-123-abc-7"), Some("abc"));
+        assert_eq!(
+            spool_token("nostrfy-blossom-123-deadbeef-0"),
+            Some("deadbeef")
+        );
+        // The legacy shapes carry no token.
+        assert_eq!(spool_token("nostrfy-blossom-123-7"), None);
+        assert_eq!(spool_token("nostrfy-blossom-123"), None);
+        // An unparseable PID is not a spool at all (never swept).
+        assert_eq!(spool_token("nostrfy-blossom-abc-1-2"), None);
+        assert_eq!(spool_token("unrelated-1-2-3"), None);
+        // A generated name parses back to this process start.
+        let name = spool_file_name(42);
+        assert_eq!(spool_pid(&name), Some(std::process::id()));
+        assert_eq!(spool_token(&name), Some(spool_process_token()));
+        assert!(
+            name.ends_with("-42"),
+            "the counter stays in the name: {name}"
+        );
+        assert_ne!(
+            spool_file_name(0),
+            spool_file_name(1),
+            "concurrent spools need distinct names"
+        );
+    }
+
+    /// Backdates `path`'s mtime by `age` so the sweep's grace period can be
+    /// crossed without waiting an hour.
+    fn backdate(path: &std::path::Path, age: std::time::Duration) {
+        let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        let modified = std::time::SystemTime::now() - age;
+        file.set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
     }
 
     #[cfg(unix)]
@@ -2002,17 +2206,48 @@ mod tests {
         assert!(!dead.exists(), "a dead process's spool must be swept");
     }
 
+    /// The container case: a restart reuses PID 1, so a stale spool's PID
+    /// is alive (the current process). The token, not the PID, decides.
     #[cfg(unix)]
-    #[test]
-    fn spool_owner_liveness() {
+    #[tokio::test]
+    async fn stale_spool_sweep_handles_reused_pid_and_tokens() {
+        let (s, _db_path) = store("sweep-token").await;
+        let dir = s.spool_dir().expect("local store");
+        std::fs::create_dir_all(&dir).unwrap();
+        let our_pid = std::process::id();
+        // A previous process start reused our PID: foreign token, old.
+        let reused = dir.join(format!("{SPOOL_PREFIX}{our_pid}-deadbeef-0"));
+        // A live sibling process (unknown token) that just wrote its spool.
+        let sibling = dir.join(format!("{SPOOL_PREFIX}{our_pid}-cafef00d-1"));
+        // This process's own spool, old but owned by the current token.
+        let ours = dir.join(spool_file_name(7));
+        for path in [&reused, &sibling, &ours] {
+            std::fs::write(path, b"spool").unwrap();
+        }
+        let stale_age = SPOOL_GRACE_PERIOD + std::time::Duration::from_secs(60);
+        backdate(&reused, stale_age);
+        backdate(&ours, stale_age);
+        s.sweep_stale_spools();
         assert!(
-            spool_owner_alive(&format!("{}{}-0", SPOOL_PREFIX, std::process::id())),
-            "our own PID is alive"
+            !reused.exists(),
+            "a same-PID spool from a previous start (foreign token, old) must be swept"
         );
         assert!(
-            spool_owner_alive(&format!("{SPOOL_PREFIX}abc-0")),
-            "an unparseable PID must be treated as alive (safe fallback)"
+            sibling.exists(),
+            "a young foreign-token spool (live sibling) must not be swept"
         );
+        assert!(
+            ours.exists(),
+            "this process start's own spool must never be swept, even when old"
+        );
+        // A dead PID is swept regardless of the token and age.
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let dead_pid = child.id();
+        child.wait().unwrap();
+        let dead = dir.join(format!("{SPOOL_PREFIX}{dead_pid}-deadbeef-2"));
+        std::fs::write(&dead, b"dead").unwrap();
+        s.sweep_stale_spools();
+        assert!(!dead.exists(), "a dead process's spool must be swept");
     }
 }
 

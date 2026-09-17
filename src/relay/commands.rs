@@ -132,6 +132,29 @@ fn access_reply(cmd: &Command, already: bool, persisted: bool) -> String {
     }
 }
 
+/// The kind:1111 reply text for a `/blossom allow|deny` command. Same
+/// contract as [`access_reply`]: only an applied change that failed to
+/// persist is reported as an error (a no-op change has nothing to lose).
+fn blossom_reply(cmd: &Command, changed: bool, persisted: bool) -> String {
+    if !changed {
+        return match cmd {
+            Command::BlossomAllow(_) => format!("ok: {} is already allowed", cmd.verb()),
+            Command::BlossomDeny(_) => format!("ok: {} is not on the allowlist", cmd.verb()),
+            _ => unreachable!("blossom_reply is only used for /blossom allow|deny"),
+        };
+    }
+    if persisted {
+        format!("ok: {} {}", cmd.verb(), cmd.pubkey())
+    } else {
+        format!(
+            "error: {} {} was applied in memory but could not be persisted; it will \
+             be lost on restart",
+            cmd.verb(),
+            cmd.pubkey()
+        )
+    }
+}
+
 impl Relay {
     /// Runs the command-event side effect for a stored kind:1 event:
     /// recognizes the admin pubkey (`relay.pubkey`) and
@@ -213,6 +236,11 @@ impl Relay {
                 access_reply(cmd, already, persisted)
             }
             Command::BlossomAllow(pk) => {
+                // Capture and write are serialized (like `persist_roles`):
+                // two concurrent commands could otherwise snapshot the list
+                // in one order and queue their writes in the other, losing
+                // the newer entry on the next restart.
+                let _guard = self.persist_blossom_allow_lock.lock().await;
                 let mut allow = self.blossom_allow.write().await;
                 let already = allow.iter().any(|p| p == pk);
                 if !already {
@@ -220,25 +248,18 @@ impl Relay {
                 }
                 let entries = allow.clone();
                 drop(allow);
-                self.db.save_blossom_allow(&entries).await;
-                if already {
-                    format!("ok: {} is already allowed", cmd.verb())
-                } else {
-                    format!("ok: {} {}", cmd.verb(), cmd.pubkey())
-                }
+                let persisted = self.db.save_blossom_allow(&entries).await;
+                blossom_reply(cmd, !already, persisted)
             }
             Command::BlossomDeny(pk) => {
+                let _guard = self.persist_blossom_allow_lock.lock().await;
                 let mut allow = self.blossom_allow.write().await;
                 let present = allow.iter().any(|p| p == pk);
                 allow.retain(|p| p != pk);
                 let entries = allow.clone();
                 drop(allow);
-                self.db.save_blossom_allow(&entries).await;
-                if present {
-                    format!("ok: {} {}", cmd.verb(), cmd.pubkey())
-                } else {
-                    format!("ok: {} is not on the allowlist", cmd.verb())
-                }
+                let persisted = self.db.save_blossom_allow(&entries).await;
+                blossom_reply(cmd, present, persisted)
             }
         }
     }

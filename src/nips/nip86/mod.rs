@@ -3,6 +3,27 @@
 //! The current NIP-86 revision defines a JSON-RPC style protocol served on
 //! the same URI as the relay's websocket, with `Content-Type:
 //! application/nostr+json+rpc` and NIP-98 authentication.
+//!
+//! Kind access (`allowkind` / `disallowkind` / `listallowedkinds`) operates
+//! on the access-control state, which has two kind lists:
+//!
+//! - `blocked_kinds` is a denylist and is checked first: a kind on it is
+//!   never accepted;
+//! - `allowed_kinds` is the config allowlist. While it is empty it
+//!   restricts nothing; while it is non-empty it is exhaustive, so a kind
+//!   missing from it is rejected.
+//!
+//! `disallowkind(k)` adds `k` to the denylist and removes it from the
+//! allowlist. `allowkind(k)` always un-blocks `k`; it extends
+//! `allowed_kinds` only when that allowlist is already active. Populating
+//! an empty allowlist would turn one `allowkind` into a global allowlist
+//! and make the relay reject every other kind (bricking publishing), so on
+//! a relay with no config allowlist the call leaves the list empty and
+//! `listallowedkinds` keeps reporting `[]` — "no allowlist restriction":
+//! every kind is accepted except the blocked ones, and the re-allowed kind
+//! is not individually listed. With an active allowlist the list reports
+//! exactly the config allowlist plus the kinds added by `allowkind`, which
+//! is what a management client needs to verify the call's effect.
 
 use std::sync::Arc;
 
@@ -382,7 +403,26 @@ pub async fn rpc_handler(
         }
         "listallowedkinds" => {
             let access = relay.access.read().await;
-            rpc_ok(json!(access.allowed_kinds))
+            // Report the kinds the relay actually accepts from the config
+            // allowlist. `allows_kind` checks `blocked_kinds` first, so a
+            // kind present in both lists is filtered out here (the config
+            // may list it in both; `disallowkind` keeps the lists disjoint).
+            //
+            // A kind explicitly re-allowed by `allowkind` on a relay whose
+            // config allowlist is empty (the default) cannot be reported
+            // individually: there is no field for it in `AccessControl`, and
+            // an empty `allowed_kinds` already means "no allowlist
+            // restriction" — every non-blocked kind is accepted — so `[]`
+            // stays the faithful answer. Only when the config allowlist is
+            // active does `allowkind` extend it (see the module docs), which
+            // makes the call's effect visible in this list.
+            let list: Vec<u64> = access
+                .allowed_kinds
+                .iter()
+                .copied()
+                .filter(|kind| !access.blocked_kinds.contains(kind))
+                .collect();
+            rpc_ok(json!(list))
         }
         "changerelayname" | "changerelaydescription" | "changerelayicon" => {
             let Some(value) = params.first().and_then(Value::as_str) else {
@@ -1170,6 +1210,11 @@ mod tests {
         serde_json::from_slice::<Value>(&body).unwrap()["result"] == json!(true)
     }
 
+    async fn rpc_result_of(resp: Response) -> Value {
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        serde_json::from_slice::<Value>(&body).unwrap()["result"].clone()
+    }
+
     #[tokio::test]
     async fn mutations_are_audited() {
         let relay = build_admin_relay().await;
@@ -1223,6 +1268,11 @@ mod tests {
             );
             assert!(access.allows_kind(1), "other kinds must stay allowed");
         }
+        // The empty allowlist means "no allowlist restriction", so
+        // `listallowedkinds` reports [] both before and after: on such a
+        // relay every non-blocked kind is accepted.
+        let list = rpc_result_of(rpc_call(&relay, "listallowedkinds", vec![]).await).await;
+        assert_eq!(list, json!([]), "an empty allowlist means unrestricted");
         // Disallow again, and the kind disappears from `listallowedkinds`:
         // a blocked kind must never be reported as allowed.
         let resp = rpc_call(&relay, "allowkind", vec![json!(7)]).await;
@@ -1248,6 +1298,11 @@ mod tests {
         // success while `allows_kind` still rejects the kind.
         relay.access.write().await.allowed_kinds = vec![1];
         assert!(!relay.access.read().await.allows_kind(7));
+        assert_eq!(
+            rpc_result_of(rpc_call(&relay, "listallowedkinds", vec![]).await).await,
+            json!([1]),
+            "the active allowlist must be reported before the change"
+        );
         let resp = rpc_call(&relay, "allowkind", vec![json!(7)]).await;
         assert!(rpc_ok_of(resp).await);
         {
@@ -1258,6 +1313,13 @@ mod tests {
             );
             assert!(access.allows_kind(1), "the existing allowlist survives");
         }
+        // The management client can now verify the call's effect: the
+        // re-allowed kind shows up in `listallowedkinds`.
+        assert_eq!(
+            rpc_result_of(rpc_call(&relay, "listallowedkinds", vec![]).await).await,
+            json!([1, 7]),
+            "listallowedkinds must report the extended allowlist"
+        );
         let resp = rpc_call(&relay, "disallowkind", vec![json!(7)]).await;
         assert!(rpc_ok_of(resp).await);
         {
@@ -1269,6 +1331,25 @@ mod tests {
             );
             assert!(access.allows_kind(1));
         }
+        assert_eq!(
+            rpc_result_of(rpc_call(&relay, "listallowedkinds", vec![]).await).await,
+            json!([1]),
+            "listallowedkinds must drop the disallowed kind"
+        );
+        // A kind that the config lists as both allowed and blocked is not
+        // accepted (`allows_kind` checks the denylist first) and must not be
+        // reported as allowed either.
+        {
+            let mut access = relay.access.write().await;
+            access.allowed_kinds = vec![1, 3];
+            access.blocked_kinds = vec![3];
+        }
+        assert!(!relay.access.read().await.allows_kind(3));
+        assert_eq!(
+            rpc_result_of(rpc_call(&relay, "listallowedkinds", vec![]).await).await,
+            json!([1]),
+            "a blocked kind must never be reported as allowed"
+        );
         relay.db.shutdown();
     }
 

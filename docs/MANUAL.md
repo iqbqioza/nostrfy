@@ -98,7 +98,7 @@ Platform notes:
   process name via the `kern.proc.pid.<pid>.comm` sysctl on FreeBSD (it
   uses `/proc/<pid>/comm` on Linux), so a stale pid file whose pid was
   reused by another program is detected on both platforms.
-- `daemon.mode` forks like on Linux; the standard double-fork daemon
+- Daemon mode forks like on Linux; the standard double-fork daemon
   works with the default `rc` integration (`service nostrfy start`).
 - Blossom's `min_free_bytes` check uses `statvfs`, which both systems
   provide; no other platform-specific code is used (the relay itself is
@@ -164,7 +164,7 @@ If anything is wrong, it tells you exactly what. It is strongly recommended to r
 | `require_pow` | Required proof-of-work difficulty in bits (0 = none) | `0` |
 | `new_pubkey_min_age_secs` | Reject posts from accounts younger than this (spam defense, 0 = off) | `0` |
 | `max_events_per_min_per_pubkey` | Max events a pubkey may publish per minute (0 = unlimited) | `0` |
-| `max_groups` | NIP-29 in-memory group store cap (active + deleted markers; `0` = unlimited) | `1000` |
+| `max_groups` | NIP-29 in-memory group store cap (active + deleted markers; must be ≥ 1, `0` is rejected) | `1000` |
 | `require_auth` | Require NIP-42 auth for everything (subscriptions and publishing) | `false` |
 | `send_auth_challenge` | Send an AUTH challenge on connect | `true` |
 | `enabled_nip78_auth` | Require NIP-42 AUTH before accepting kind 78/30078 events and serve them only to the authenticated owner | `true` |
@@ -182,6 +182,7 @@ To generate a secret key, use the `nostrfy genkey` command (see [5. Command Refe
 | `ws_paths` | Which paths serve the WebSocket endpoint (and the NIP-11 document): `root` (`/` only), `inbox-outbox` (only `/inbox` and `/outbox`), or `all` | `root` |
 | `inbox_write_policy` | Write policy for `/inbox`: `any` (the event must carry a `p` tag) or `relay` (the event must `p`-tag the relay's own pubkey) | `any` |
 | `outbox_write_policy` | Write policy for `/outbox`: `any` (the event must be authored by the connection's NIP-42-authenticated pubkey) or `relay` (only the relay's own events) | `any` |
+| `trusted_proxies` | Reverse-proxy addresses/CIDRs whose `X-Forwarded-For` is trusted, e.g. `["127.0.0.1/32", "::1/128"]`. When the peer matches, the per-IP caps, connect rate limit, `blockip` and logs use the right-most untrusted forwarded address (IPv6 aggregated by `/64`). List only addresses clients cannot reach directly. Fixed at startup | `[]` |
 | `metrics_enabled` | Serve `/metrics` (Prometheus format) | `true` |
 
 > **Note**: `require_auth = true` combined with `send_auth_challenge = false` locks everyone out — nobody can authenticate. Avoid this combination.
@@ -214,12 +215,12 @@ To generate a secret key, use the `nostrfy genkey` command (see [5. Command Refe
 | `max_tags` | Max tags per event | `2000` |
 | `max_tag_value_bytes` | Max bytes per tag value | `1024` |
 | `max_created_at_future_secs` | How many seconds of future timestamps are tolerated | `3600` |
-| `max_neg_items` | Max records per NIP-77 negentropy sync | `100000` |
+| `max_neg_items` | Max records per NIP-77 negentropy sync (above 1,000,000 warned, above 10,000,000 rejected) | `100000` |
 | `max_out_queue_bytes` | Per-connection outgoing queue cap (bytes; `0` = unlimited) | `262144` |
 | `ws_idle_timeout_secs` | Close idle connections after this many seconds (0 = off) | `300` |
 | `http_read_timeout_secs` | Seconds to complete an HTTP request head or NIP-86 POST body (0 = disabled; slow-loris defense, applies to WS upgrades too) | `30` |
 | `max_connections_per_sec_per_ip` | Max new connections per second per source IP (0 = unlimited) | `0` |
-| `max_req_response_bytes` | Byte budget for one REQ response (0 = unlimited; over it the subscription is closed with `CLOSED`) | `33554432` (32 MiB) |
+| `max_req_response_bytes` | Byte budget for one REQ response (0 = unlimited; over it the subscription is closed with `CLOSED`; above 2 GiB rejected) | `33554432` (32 MiB) |
 | `max_sub_bytes` | Total subscription filter bytes per connection | `1048576` |
 | `group_late_publish_secs` | Reject NIP-29 group events older than this (0 = off) | `3600` (1 hour) |
 | `max_api_concurrent` | Max concurrent REST API requests | `8` |
@@ -250,8 +251,8 @@ To generate a secret key, use the `nostrfy genkey` command (see [5. Command Refe
 
 | Option | Description | Default |
 | --- | --- | --- |
-| `pid_file` | PID file path | `./nostrfy.pid` |
-| `log_file` | Log file path | `./nostrfy.log` |
+| `pid_file` | PID file path (written in daemon **and** foreground mode, so `stats`/`stop`/`restart` find the instance; removed on exit) | `./nostrfy.pid` |
+| `log_file` | Log file path (used in daemon mode; foreground mode logs to stderr, i.e. journald under systemd) | `./nostrfy.log` |
 | `stats_file` | Statistics file path | `./nostrfy.stats.json` |
 | `stats_interval_secs` | Statistics write interval (must be ≥ 1) | `5` |
 | `max_log_size_bytes` | Log rotation size (0 = no rotation) | 50 MB |
@@ -284,6 +285,8 @@ To generate a secret key, use the `nostrfy genkey` command (see [5. Command Refe
 ```bash
 ./target/release/nostrfy --config nostrfy.toml start --foreground
 ```
+
+> **Foreground lifecycle**: foreground mode (including the recommended systemd unit) writes the same `daemon.pid_file`, so `nostrfy stats` and `nostrfy stop` find the instance and the pid file is removed on exit. Under systemd prefer `systemctl stop nostrfy` / `systemctl restart nostrfy`: the unit's `Restart=always` would immediately restart a process that `nostrfy stop`/`restart` terminated, and foreground logs go to stderr (journald: `journalctl -u nostrfy -f`), not to `daemon.log_file`.
 
 ### Stop
 
@@ -342,6 +345,7 @@ All commands accept `--config <path>` (default: `nostrfy.toml`).
 | `nostrfy stats` | Show live statistics |
 | `nostrfy blossom allow <pubkey>` / `deny <pubkey>` / `list` | Manage the Blossom upload allowlist (persisted in LMDB; the running relay applies it on SIGHUP) |
 | `nostrfy relay allow <pubkey>` / `deny <pubkey>` / `list` | Manage the relay pubkey allow/deny lists (persisted in LMDB; a denied pubkey is always rejected when publishing and never served when reading; the running relay applies changes on SIGHUP) |
+| `nostrfy access unblockip <ip>` | Remove an IP from the persisted NIP-86 blocked-IP list by editing the database directly — the self-lockout recovery when `blockip` also blocked the management connection. Restart the daemon to apply |
 | `nostrfy upgrade [version]` | Update the relay binary to the latest GitHub release, or to the given version. Downloads the asset for this platform (`nostrfy-linux-x86_64`, `-aarch64` or `-freebsd-x86_64`), verifies it runs (`--version` probe) and atomically replaces the binary — a crash mid-upgrade keeps the old binary. Never downgrades a newer local build unless a version is given explicitly; `--force` reinstalls the current version. A running daemon keeps the old binary until `nostrfy restart` |
 
 ### Inbox/outbox subscription filters
@@ -501,7 +505,7 @@ curl -X POST http://127.0.0.1:8080/ \
 | 50 | Search capability (full-text, relevance-ordered) |
 | 57 | Lightning zaps (kinds 9734/9735, `#z` indexed) |
 | 59 | Gift wrap (recipient-only serving) |
-| 62 | Request to vanish |
+| 62 | Request to vanish — this relay keeps a **stricter, fail-closed bar** than the spec's `until_created` window: once a vanish request is honored the pubkey is recorded in a permanent set and **every** later event from it is rejected (including events created after the request), so a vanished key cannot resume publishing here; it is purged history plus a permanent publishing ban |
 | 65 | Relay list metadata (kind 10002, `#r` indexed) |
 | 66 | Relay discovery & liveness (self-publishes kind 30166 when `relay.private_key` is set, refreshed every 12 h) |
 | 67 | EOSE completeness hint (incl. the `"auth"` hint with a challenge when AUTH-gated events were withheld) |
@@ -568,7 +572,7 @@ From these moderation events, the relay generates the following **relay-signed s
 
 | Tag | Meaning |
 | --- | --- |
-| `private` | Only members can read messages |
+| `private` | Only members can read group **messages**. It does **not** hide the relay-generated metadata (39000 name/description, 39001/39002): those stay readable to everyone, as they are not the private content (the messages are). Use `hidden` to also hide the metadata from non-members |
 | `restricted` | Only members can write |
 | `hidden` | Metadata is hidden from non-members |
 | `closed` | Join requests are not auto-approved (invite codes required) |
@@ -790,7 +794,7 @@ kill -HUP $(cat nostrfy.pid)
 
 The reload is **not all-or-nothing**: every live setting is applied even when the same edit also changes a startup-only one. Settings that take effect on reload: the relay name/description/pubkey/contact/icon/post-policy, `public_url`, the auth and policy knobs (`reject_ephemeral`, `enabled_git`, `enabled_nip78_auth`, `require_auth`, `send_auth_challenge`, `require_pow`, `new_pubkey_min_age_secs`, `max_events_per_min_per_pubkey`), most `[limits]` entries (the restart-only ones are listed below), the NIP-40 on/off state and the REST API concurrency ceiling, `rpc.management_token`/`admin_pubkey`, `blossom.restrict_uploads` and `access.restrict_relay`.
 
-Settings that require a **restart**: each changed one is warned about (`... a restart is required to apply it`) and keeps its running value. They are `private_key` (warned about and ignored), `api_host`, `metrics_enabled`, LiveKit settings, `enabled_nips`/`disabled_nips`, `server.host`/`port`/`ws_paths`, `rpc.max_admin_body_bytes`, `database.path`/`purge_interval_secs`/`map_size`/`max_map_size`/`max_dbs`/`max_readers`/`search_index`/`meta_index`/`reader_threads`/`disabled_fsync`/`db_request_timeout_secs`/`max_db_queue_msgs`/`max_db_queue_events`/`max_db_queue_bytes`/`max_indexed_words`, `daemon.max_log_size_bytes`/`max_log_files`/`stats_interval_secs`/`log_file`/`pid_file`, `limits.live_buffer`/`live_batch_size`/`live_batch_interval_ms`/`socket_recv_buffer_kb`/`max_connections`/`max_connections_per_ip`/`http_read_timeout_secs`/`max_connections_per_sec_per_ip`, all `blossom.*`, and `relay.max_groups`. See the CONFIGURATION.md SIGHUP table for the full matrix.
+Settings that require a **restart**: each changed one is warned about (`... a restart is required to apply it`) and keeps its running value. They are `private_key` (warned about and ignored), `api_host`, `metrics_enabled`, LiveKit settings, `enabled_nips`/`disabled_nips`, `server.host`/`port`/`ws_paths`/`trusted_proxies`, `rpc.max_admin_body_bytes`, `database.path`/`purge_interval_secs`/`map_size`/`max_map_size`/`max_dbs`/`max_readers`/`search_index`/`meta_index`/`reader_threads`/`disabled_fsync`/`db_request_timeout_secs`/`max_db_queue_msgs`/`max_db_queue_events`/`max_db_queue_bytes`/`max_indexed_words`, `daemon.max_log_size_bytes`/`max_log_files`/`stats_interval_secs`/`log_file`/`pid_file`, `limits.live_buffer`/`live_batch_size`/`live_batch_interval_ms`/`socket_recv_buffer_kb`/`max_connections`/`max_connections_per_ip`/`http_read_timeout_secs`/`max_connections_per_sec_per_ip`, all `blossom.*`, and `relay.max_groups`. See the CONFIGURATION.md SIGHUP table for the full matrix.
 
 The `[access]` kind/IP lists are runtime-managed via NIP-86 (a config edit is ignored and warned about); `restrict_relay` applies on reload. A file that fails validation is rejected as a whole: the error is logged and the old configuration stays in force.
 

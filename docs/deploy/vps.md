@@ -97,9 +97,24 @@ server {
         proxy_set_header Connection "upgrade";
         proxy_set_header Host $host;
         proxy_set_header X-Forwarded-Proto $scheme;
+        # The relay's per-IP caps / blockip need the real client address.
+        # nginx appends the direct peer to any client-supplied header.
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        # Default 60 s would cut idle WebSockets before the relay's ~100 s
+        # keep-alive PING.
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
     }
 }
 ```
+
+The proxy headers only take effect when the relay trusts the proxy: set
+`server.trusted_proxies = ["127.0.0.1/32", "::1/128"]` in `nostrfy.toml`
+(already in the deploy template) and restart. Without it every client shares
+the proxy's address for the per-IP caps (`max_connections_per_ip`, default
+64) and a `blockip` of one client would block everyone. Trust only addresses
+clients cannot reach directly — otherwise they can spoof
+`X-Forwarded-For` and bypass the per-IP limits.
 
 Get a free certificate with [certbot](https://certbot.eff.org/) (`sudo certbot --nginx -d relay.example.com`).
 
@@ -110,6 +125,10 @@ relay.example.com {
     reverse_proxy 127.0.0.1:8080
 }
 ```
+
+Caddy sets `X-Forwarded-For` and `X-Forwarded-Proto` itself (and does not
+need the long read timeout), so the same `server.trusted_proxies = ["127.0.0.1/32", "::1/128"]`
+configuration applies.
 
 **Serving the Blossom media host too**: when `blossom.host = "media.example.com"` is set, that hostname must also reach the same port — the relay splits the hosts internally (like `server.api_host`). Add a second server block / site for it:
 

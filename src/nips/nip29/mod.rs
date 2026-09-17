@@ -65,6 +65,13 @@ pub(crate) const MAX_INVITES: usize = 100;
 /// `39001`/`39002`) without limit.
 pub(crate) const MAX_MEMBERS: usize = 10_000;
 
+/// Maximum members across every group (the global member budget). The
+/// per-group cap alone still lets an attacker churn groups (or spread
+/// grants) until the total member map exhausts memory; the global budget
+/// bounds the sum. Enforced on JOIN/9000 through a maintained counter, so
+/// the check costs O(1) instead of scanning every group per event.
+pub(crate) const MAX_TOTAL_MEMBERS: usize = 1_000_000;
+
 fn tag_value<'a>(event: &'a Event, name: &str) -> Option<&'a str> {
     event
         .tags
@@ -221,6 +228,20 @@ pub struct GroupStore {
     /// in-memory state even when an attacker churns group ids. 0 =
     /// unlimited.
     max_groups: usize,
+    /// Total members across every group: the global budget (see
+    /// [`MAX_TOTAL_MEMBERS`]) is enforced against this counter instead of
+    /// rescanning every group per JOIN/9000. Every member-map mutation in
+    /// this module (and [`Self::remove_member_everywhere`]) keeps it in
+    /// sync; [`Self::restore`] recomputes it.
+    total_members: usize,
+    /// The global member budget; 0 = unlimited (tests).
+    max_total_members: usize,
+    /// Child ids that some group's `children` list declared (a hint, never
+    /// the authority): a CREATE_GROUP scans the groups for an adopting
+    /// parent only when the id was ever declared, so an uncapped store does
+    /// not pay an O(groups) scan per create. Stale entries (a link that was
+    /// later removed) only cost one scan.
+    declared_children: HashSet<String>,
 }
 
 /// The persistable NIP-29 group state: everything [`GroupStore`] holds
@@ -270,6 +291,7 @@ impl GroupStore {
     pub fn with_cap(max_groups: usize) -> GroupStore {
         GroupStore {
             max_groups,
+            max_total_members: MAX_TOTAL_MEMBERS,
             ..Default::default()
         }
     }
@@ -286,11 +308,30 @@ impl GroupStore {
     }
 
     /// Restores state persisted by [`Self::snapshot`], keeping the current
-    /// capacity cap.
+    /// capacity cap. The derived counters (`total_members`,
+    /// `declared_children`) start from the restored groups.
     pub(crate) fn restore(&mut self, snap: GroupsSnapshot) {
         self.groups = snap.groups;
         self.deleted = snap.deleted;
         self.ghost = snap.ghost;
+        self.recompute_derived();
+    }
+
+    /// Recomputes the counters derived from `groups` (after a restore or a
+    /// bulk mutation).
+    fn recompute_derived(&mut self) {
+        self.total_members = self.groups.values().map(|group| group.members.len()).sum();
+        self.declared_children = self
+            .groups
+            .values()
+            .flat_map(|group| group.children.iter().cloned())
+            .collect();
+    }
+
+    /// Whether `fresh` more members would exceed the global member budget.
+    fn at_member_capacity(&self, fresh: usize) -> bool {
+        self.max_total_members > 0
+            && self.total_members.saturating_add(fresh) > self.max_total_members
     }
 
     /// Whether another group may be created. The deleted and ghost markers
@@ -401,6 +442,10 @@ impl GroupStore {
             if group.members.len() >= MAX_MEMBERS {
                 bail!("restricted: the group is full");
             }
+            // The global budget caps the total member map across groups.
+            if self.at_member_capacity(1) {
+                bail!("restricted: the relay member limit is reached");
+            }
             if group.settings.closed {
                 // NIP-29: `closed` means join requests are ignored — the
                 // request is rejected (final) and not stored. Admission to
@@ -480,6 +525,11 @@ impl GroupStore {
                     .len();
                 if group.members.len().saturating_add(fresh) > MAX_MEMBERS {
                     bail!("restricted: too many group members");
+                }
+                // The per-group cap does not bound the total across groups:
+                // the global budget does.
+                if self.at_member_capacity(fresh) {
+                    bail!("restricted: the relay member limit is reached");
                 }
             }
             // NIP-29: the group must retain at least one admin — a 9000
@@ -587,14 +637,29 @@ impl GroupStore {
                 });
                 if admitted {
                     let member = event.pubkey.clone();
+                    let mut added = false;
                     if let Some(group) = self.groups.get_mut(gid) {
                         // Membership is the entry in the member map; roles
                         // (granted only via `kind:9000`) decide privileges.
                         // Bounded like validation (history replay bypasses
-                        // the check above, so re-check here).
-                        if group.members.len() < MAX_MEMBERS || group.is_member(&member) {
-                            group.members.entry(member.clone()).or_default();
+                        // the check above, so re-check here). The global
+                        // member budget is bypassed on history replay
+                        // (`ignore_capacity`): dropping a stored membership
+                        // would change what the restart rebuilds.
+                        let over_global = !ignore_capacity
+                            && self.max_total_members > 0
+                            && self.total_members >= self.max_total_members
+                            && !group.is_member(&member);
+                        if !over_global
+                            && (group.members.len() < MAX_MEMBERS || group.is_member(&member))
+                            && !group.is_member(&member)
+                        {
+                            group.members.insert(member.clone(), Default::default());
+                            added = true;
                         }
+                    }
+                    if added {
+                        self.total_members = self.total_members.saturating_add(1);
                     }
                     if emit {
                         out.push(build_put_user(gid, &member, &[], relay_pubkey, now));
@@ -604,8 +669,13 @@ impl GroupStore {
             }
             LEAVE => {
                 let member = event.pubkey.clone();
-                if let Some(group) = self.groups.get_mut(gid) {
-                    group.members.remove(&member);
+                let removed = if let Some(group) = self.groups.get_mut(gid) {
+                    group.members.remove(&member).is_some()
+                } else {
+                    false
+                };
+                if removed {
+                    self.total_members = self.total_members.saturating_sub(1);
                 }
                 if emit {
                     out.push(build_remove_user(gid, &member, relay_pubkey, now));
@@ -613,6 +683,7 @@ impl GroupStore {
                 }
             }
             9000 => {
+                let mut added = 0usize;
                 if let Some(group) = self.groups.get_mut(gid) {
                     // Re-check the last-admin invariant under the write
                     // lock, like the 9001 arm below: two concurrent 9000
@@ -648,8 +719,17 @@ impl GroupStore {
                     // ("the user roles must just be updated"), and a `p` tag
                     // without roles leaves the user a plain member.
                     for tag in event.tags.iter().filter(|t| t.len() >= 2 && t[0] == P) {
-                        // Bounded like validation (see above).
+                        // Bounded like validation (see above). The global
+                        // budget re-check is runtime-only (history replay
+                        // must not drop stored members).
                         if group.members.len() >= MAX_MEMBERS && !group.is_member(&tag[1]) {
+                            continue;
+                        }
+                        let over_global = !ignore_capacity
+                            && self.max_total_members > 0
+                            && self.total_members >= self.max_total_members
+                            && !group.is_member(&tag[1]);
+                        if over_global {
                             continue;
                         }
                         let pk = tag[1].clone();
@@ -660,14 +740,21 @@ impl GroupStore {
                             tag[2..].iter().filter(|r| !r.is_empty()).cloned().collect();
                         // An empty role list leaves the user a plain member
                         // (replacing any previous roles).
+                        if !group.members.contains_key(&pk) {
+                            added += 1;
+                        }
                         group.members.insert(pk, roles);
                     }
+                }
+                if added > 0 {
+                    self.total_members = self.total_members.saturating_add(added);
                 }
                 if emit {
                     out.extend(self.membership_events(gid, relay_pubkey, now));
                 }
             }
             9001 => {
+                let mut removed = 0usize;
                 if let Some(group) = self.groups.get_mut(gid) {
                     // The last-admin invariant is validated under a read
                     // lock before the store; re-check it here under the
@@ -688,15 +775,20 @@ impl GroupStore {
                         return Vec::new();
                     }
                     for pk in removing {
-                        group.members.remove(pk);
+                        if group.members.remove(pk).is_some() {
+                            removed += 1;
+                        }
                     }
+                }
+                if removed > 0 {
+                    self.total_members = self.total_members.saturating_sub(removed);
                 }
                 if emit {
                     out.extend(self.membership_events(gid, relay_pubkey, now));
                 }
             }
             9002 => {
-                let (parent_before, parent_after, children_before) = {
+                let (parent_before, parent_after, children_before, children_after) = {
                     match self.groups.get_mut(gid) {
                         Some(group) => {
                             apply_settings(group, event);
@@ -710,11 +802,17 @@ impl GroupStore {
                                 .collect();
                             let before = group.parent.clone();
                             let after = tag_value(event, "parent").map(str::to_string);
-                            (before, after, children_before)
+                            (before, after, children_before, group.children.clone())
                         }
-                        None => (None, None, Vec::new()),
+                        None => (None, None, Vec::new(), Vec::new()),
                     }
                 };
+                // Keep the adoption hint current: a declared child id makes
+                // a later CREATE_GROUP scan for the (deterministically
+                // smallest) adopting parent.
+                for child in children_after {
+                    self.declared_children.insert(child);
+                }
                 if parent_before != parent_after {
                     if let Some(old) = parent_before.clone()
                         && let Some(parent_group) = self.groups.get_mut(&old)
@@ -726,6 +824,7 @@ impl GroupStore {
                         && !parent_group.children.iter().any(|c| c == gid)
                     {
                         parent_group.children.push(gid.to_string());
+                        self.declared_children.insert(gid.to_string());
                     }
                     if let Some(group) = self.groups.get_mut(gid) {
                         group.parent = parent_after.clone();
@@ -870,19 +969,24 @@ impl GroupStore {
                     // A group that already declared this id as a child
                     // (a placeholder: the child did not exist yet) adopts
                     // it now, keeping both sides of the parent link
-                    // consistent. The scan is bounded by the group cap;
-                    // with an uncapped store n creates would make it
-                    // O(n²), so adoption is skipped there (the declarer
-                    // keeps the id in its children list).
-                    if self.max_groups > 0 {
-                        adopted_parent = self.groups.iter().find_map(|(id, g)| {
-                            g.children.iter().any(|c| c == gid).then(|| id.clone())
-                        });
+                    // consistent. Only a declared id pays the scan (the
+                    // hint is kept by the 9002 arm), so an uncapped store
+                    // does not turn n creates into O(n²); the smallest
+                    // declaring parent wins deterministically when several
+                    // groups declared the same placeholder id.
+                    if self.declared_children.contains(gid) {
+                        adopted_parent = self
+                            .groups
+                            .iter()
+                            .filter(|(_, g)| g.children.iter().any(|c| c == gid))
+                            .map(|(id, _)| id.clone())
+                            .min();
                         if let Some(parent) = &adopted_parent {
                             group.parent = Some(parent.clone());
                         }
                     }
                     self.groups.insert(gid.to_string(), group);
+                    self.total_members = self.total_members.saturating_add(1);
                     if emit && let Some(parent) = &adopted_parent {
                         // The adopting parent's stored metadata must name
                         // the now-existing child: its stored 39000 may have
@@ -907,6 +1011,7 @@ impl GroupStore {
             }
             DELETE_GROUP => {
                 if let Some(group) = self.groups.remove(gid) {
+                    self.total_members = self.total_members.saturating_sub(group.members.len());
                     // Children become roots.
                     for child in group.children {
                         if let Some(child_group) = self.groups.get_mut(&child) {
@@ -1024,6 +1129,62 @@ impl GroupStore {
             .collect()
     }
 
+    /// The delete tombstones (confirmed-purged ids). A rebuild must carry
+    /// them so a confirmed purge stays re-creatable: the `9008` (and its
+    /// purge marker) removed the group's events from the database, so the
+    /// scan cannot reconstruct the tombstone on its own.
+    pub(crate) fn deleted_group_ids(&self) -> Vec<String> {
+        self.deleted.iter().cloned().collect()
+    }
+
+    /// The ghost markers (fail-closed ids whose history may survive). A
+    /// rebuild must carry them so an unconfirmed purge keeps withholding
+    /// the id's content even when the scan reconstructs part of it.
+    pub(crate) fn ghost_group_ids(&self) -> Vec<String> {
+        self.ghost.iter().cloned().collect()
+    }
+
+    /// Removes `pubkey` from every group's member map (a vanish) and keeps
+    /// the global member counter in sync. Returns whether any membership
+    /// was removed.
+    pub fn remove_member_everywhere(&mut self, pubkey: &str) -> bool {
+        let mut removed = 0usize;
+        for group in self.groups.values_mut() {
+            if group.members.remove(pubkey).is_some() {
+                removed += 1;
+            }
+        }
+        if removed > 0 {
+            self.total_members = self.total_members.saturating_sub(removed);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Re-seeds the hidden markers captured before a rebuild and ghosts
+    /// every previous id the rebuilt store no longer knows (see
+    /// [`Self::ghost_missing`]). The delete tombstones must be restored
+    /// (the scan cannot see an id whose events were purged), while a live
+    /// group is never pre-marked deleted: a create accepted while the scan
+    /// ran replays afterwards and legitimately resurrects the id.
+    pub fn restore_hidden(
+        &mut self,
+        previous: impl IntoIterator<Item = String>,
+        previous_deleted: impl IntoIterator<Item = String>,
+        previous_ghost: impl IntoIterator<Item = String>,
+    ) {
+        for gid in previous_ghost {
+            self.ghost.insert(gid);
+        }
+        for gid in previous_deleted {
+            if !self.groups.contains_key(&gid) {
+                self.deleted.insert(gid);
+            }
+        }
+        self.ghost_missing(previous);
+    }
+
     /// Marks every `previous` group id that the (rebuilt) store no longer
     /// knows — and that was not explicitly deleted — as a ghost: its
     /// create/state is gone, so on a keyless relay its surviving posts
@@ -1100,7 +1261,7 @@ impl GroupStore {
     /// Rebuilds the in-memory group state from the stored events.
     ///
     /// Returns `false` when the rebuild could not be completed (the database
-    /// did not answer, or the scan budget was exhausted mid-page): the
+    /// did not answer, or a page boundary could not be verified): the
     /// caller must not persist or serve the partially-rebuilt store (missing
     /// groups turn private content world-readable) and aborts startup.
     ///
@@ -1121,20 +1282,36 @@ impl GroupStore {
     /// materialized and sorted every stored group event before applying
     /// anything).
     pub async fn rebuild(&mut self, db: &DbClient) -> bool {
-        self.rebuild_inner(db, None).await
+        self.rebuild_inner(db, None, Vec::new(), Vec::new()).await
     }
 
-    /// Rebuilds after a vanish, seeding the ghost detection from `previous`
-    /// (the pre-rebuild [`Self::hidden_group_ids`]): every group id that
-    /// existed before the vanish is known, so any id missing from the
-    /// rebuilt store is ghosted from the seed. The full-history ordinary
-    /// pass of [`Self::rebuild`] is unnecessary here and is skipped: the
-    /// vanish accept path must not pay for a full table scan.
-    pub async fn rebuild_after_vanish(&mut self, db: &DbClient, previous: Vec<String>) -> bool {
-        self.rebuild_inner(db, Some(previous)).await
+    /// Rebuilds after a vanish, seeding the hidden markers from the
+    /// pre-rebuild [`Self::hidden_group_ids`], [`Self::deleted_group_ids`]
+    /// and [`Self::ghost_group_ids`]: every group id that existed before
+    /// the vanish is known, so any id missing from the rebuilt store is
+    /// ghosted from the seed, and the delete tombstones (whose events the
+    /// purge removed, so the scan cannot reconstruct them) are restored so
+    /// a confirmed purge stays re-creatable. The full-history ordinary pass
+    /// of [`Self::rebuild`] is unnecessary here and is skipped: the vanish
+    /// accept path must not pay for a full table scan.
+    pub async fn rebuild_after_vanish(
+        &mut self,
+        db: &DbClient,
+        previous: Vec<String>,
+        previous_deleted: Vec<String>,
+        previous_ghost: Vec<String>,
+    ) -> bool {
+        self.rebuild_inner(db, Some(previous), previous_deleted, previous_ghost)
+            .await
     }
 
-    async fn rebuild_inner(&mut self, db: &DbClient, previous: Option<Vec<String>>) -> bool {
+    async fn rebuild_inner(
+        &mut self,
+        db: &DbClient,
+        previous: Option<Vec<String>>,
+        previous_deleted: Vec<String>,
+        previous_ghost: Vec<String>,
+    ) -> bool {
         // 9021 JOIN is included so that honored joins survive a restart even
         // on relays without a private key (which never emit the relay-signed
         // 9000 put-user that would otherwise carry the membership).
@@ -1209,18 +1386,15 @@ impl GroupStore {
             if page.is_empty() {
                 break;
             }
-            let full = page.len() >= PAGE;
-            if !full && more {
-                log::error!(
-                    "group state rebuild aborted: the scan budget was exhausted with {} events \
-                     in the page, so the history is incomplete",
-                    page.len()
-                );
-                return false;
-            }
-            if full && more {
-                // The collector's hard caps can cut the boundary second
-                // while the page still looks complete (it reports `more`).
+            if more {
+                // The collector stopped early. It can stop on the count cap
+                // with a full page, but also on the byte cap (64 MiB) or the
+                // work budget with a short page; either way the boundary
+                // second (the newest here) may be cut. Verifying it lets the
+                // scan continue past it instead of failing the whole
+                // rebuild; only a boundary that cannot be verified (a real
+                // store error, or a second larger than the verify budget)
+                // stays fatal.
                 let boundary = page.last().map(|e| e.created_at).unwrap_or(0);
                 let delivered = page.iter().filter(|e| e.created_at == boundary).count();
                 if !boundary_second_complete(db, filter.clone(), boundary, delivered).await {
@@ -1254,8 +1428,9 @@ impl GroupStore {
                 }
                 self.apply(&event, "", unix_now(), false, true);
             }
-            if !full {
-                // Fewer than a page: every remaining event was collected.
+            if !more {
+                // The collector reported no truncation: every remaining
+                // event was collected.
                 break;
             }
             // The scan collects every event at the boundary timestamp, so
@@ -1267,9 +1442,12 @@ impl GroupStore {
         }
         // A prior id set (the post-vanish rebuild) makes the ghost detection
         // exact without touching ordinary events: every id the rebuilt store
-        // no longer knows is ghosted from the seed.
+        // no longer knows is ghosted from the seed. The delete tombstones
+        // are re-seeded from the pre-rebuild state because the scan cannot
+        // reconstruct an id whose events the purge removed (a confirmed
+        // purge must stay re-creatable, not become a permanent ghost).
         if let Some(previous) = previous {
-            self.ghost_missing(previous);
+            self.restore_hidden(previous, previous_deleted, previous_ghost);
             return true;
         }
         // No prior id set: every group id referenced by a stored event must
@@ -1278,10 +1456,11 @@ impl GroupStore {
         // metadata, which uses `d` tags) are not covered by any kind filter,
         // and there is no index for "has an h tag", so this walks the whole
         // history in bounded pages (newest-first: only the ids are
-        // collected, no events are retained). A relay hosting many groups
-        // can hold far more than one page of posts, and a truncated walk
-        // would fail the ghost detection open (private content
-        // world-readable), so any incompleteness aborts the rebuild.
+        // collected, no events are retained). A page cut by the byte cap or
+        // the work budget is resumed past its verified boundary second; a
+        // boundary that cannot be verified aborts the rebuild (fail-closed),
+        // because a silently dropped second would fail the ghost detection
+        // open (private content world-readable).
         //
         // The h-tagged survivors are tracked separately: a delete tombstone
         // is normally safe (the relay purged the group's events, which
@@ -1310,20 +1489,15 @@ impl GroupStore {
                 break;
             }
             let min_created = page.iter().map(|e| e.created_at).min().unwrap_or(0);
-            let full = page.len() >= PAGE;
-            if !full && more {
-                // The scan budget was exhausted mid-timestamp: the page is
-                // partial and stepping the cursor would silently skip the
-                // unexamined events of the same timestamp, leaving their
-                // groups out of the ghost detection (fail-open).
-                log::error!(
-                    "group state rebuild aborted: the ghost-detection scan budget was exhausted \
-                     with {} events in the page, so the ghost detection is incomplete",
-                    page.len()
-                );
-                return false;
-            }
-            if full && more {
+            if more {
+                // The collector stopped early. A byte-cap (64 MiB) or
+                // work-budget stop can cut the page below PAGE events, but
+                // the boundary second (the oldest here) is verified the same
+                // way: when it is fully collected the cursor may advance
+                // past it and the walk continues, instead of failing the
+                // whole rebuild (which would refuse to start). A boundary
+                // that cannot be verified — a store error, or a second
+                // larger than the verify budget — stays fatal (fail-closed).
                 let delivered = page.iter().filter(|e| e.created_at == min_created).count();
                 if !boundary_second_complete(db, filter.clone(), min_created, delivered).await {
                     log::error!(
@@ -1342,7 +1516,9 @@ impl GroupStore {
                     seen_gids.insert(gid.to_string());
                 }
             }
-            if !full || min_created == 0 {
+            if !more || min_created == 0 {
+                // No truncation (or the oldest second): the walk covered
+                // every stored event.
                 break;
             }
             until = Some(min_created - 1);

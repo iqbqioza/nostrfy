@@ -37,7 +37,7 @@ curl http://localhost:8080/health
 
 **Blossom media host**: if `blossom.host` is set, point that hostname at the same port in the TLS proxy too (see the [vps guide](vps.md) for nginx/Caddy blocks).
 
-For VMs, the relay itself serves plain WebSocket on port 8080; a reverse proxy (nginx/Caddy) or the provider's TLS termination in front of it provides `wss://` — nostrfy honors `X-Forwarded-Proto`, so it works behind any TLS-terminating proxy.
+For VMs, the relay itself serves plain WebSocket on port 8080; a reverse proxy (nginx/Caddy) or the provider's TLS termination in front of it provides `wss://` — nostrfy honors `X-Forwarded-Proto`, so it works behind any TLS-terminating proxy. Also set `server.trusted_proxies` to the proxy's address(es) (e.g. `["127.0.0.1/32", "::1/128"]`, already in the deploy template) so the per-IP caps, the connect rate limit, `blockip` and the logs use the real client address instead of the proxy's — without it all clients share one per-IP budget and `blockip` blocks everyone. Never list an address clients can reach directly.
 
 ## Configuring the relay
 

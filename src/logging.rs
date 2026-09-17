@@ -9,7 +9,28 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Logger failures (write, rotate, reopen) since the process start. The
+/// logger cannot report through itself; this counter is exported by the
+/// stats file and `/metrics` (`nostrfy_log_errors`) so monitoring can alert
+/// when the log is no longer being written (e.g. a full disk).
+static LOG_ERRORS: AtomicU64 = AtomicU64::new(0);
+
+/// The number of logger failures recorded so far.
+pub fn log_errors() -> u64 {
+    LOG_ERRORS.load(Ordering::Relaxed)
+}
+
+fn bump_log_error() {
+    // Saturate instead of wrapping, like the stats counters: a wrapped
+    // value would hide that the logger is failing.
+    let current = LOG_ERRORS.load(Ordering::Relaxed);
+    if current != u64::MAX {
+        LOG_ERRORS.store(current.saturating_add(1), Ordering::Relaxed);
+    }
+}
 
 /// The global logger that delegates to the installed backend (file or stderr).
 static LOGGER: Logger = Logger {
@@ -146,8 +167,10 @@ struct FileState {
     file: std::fs::File,
     size: u64,
     /// Whether the last write failed (reported once per failure streak, so
-    /// a full disk cannot flood stderr with one line per log record).
+    /// a full disk cannot flood the log with one line per record).
     write_failed: bool,
+    /// Whether the last rotation failed (same one-report-per-streak rule).
+    rotate_failed: bool,
 }
 
 impl FileLogger {
@@ -162,8 +185,32 @@ impl FileLogger {
                 file,
                 size,
                 write_failed: false,
+                rotate_failed: false,
             }),
         })
+    }
+
+    /// Records a logger failure without recursing through the logging
+    /// macros: the counter is bumped, the message goes to stderr and a
+    /// single marker line is appended directly to the log file (best
+    /// effort, so the reason survives when stderr is /dev/null in daemon
+    /// mode even though normal records cannot be written).
+    fn emergency(&self, message: &str) {
+        bump_log_error();
+        eprintln!("nostrfy: {message}");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let line = format!("[{} ERROR nostrfy::logging] {message}\n", utc_format(now));
+        if let Ok(mut file) = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+        {
+            let _ = file.write_all(line.as_bytes());
+            let _ = file.flush();
+        }
     }
 
     fn rotate(&self, state: &mut FileState) {
@@ -189,6 +236,7 @@ impl FileLogger {
         // Descending so `.N` is moved before `.N-1` overwrites it. A
         // generation above the current ceiling is left in place (the same
         // as before) until a later shift overwrites it.
+        let mut failure: Option<String> = None;
         for i in existing.into_iter().rev() {
             if i >= self.max_files {
                 continue;
@@ -196,21 +244,27 @@ impl FileLogger {
             let from = backup_path(&self.path, i);
             let to = backup_path(&self.path, i + 1);
             if let Err(e) = std::fs::rename(&from, &to) {
-                eprintln!("cannot rotate log backup {}: {e}", from.display());
+                let message = format!("cannot rotate log backup {}: {e}", from.display());
+                failure.get_or_insert(message);
             }
         }
         // The current file becomes `.1` and a fresh one is opened. A failed
-        // rename is logged (the old log content between the rotation size
+        // rename is recorded (the old log content between the rotation size
         // and the failure would otherwise be silently lost).
         let first = backup_path(&self.path, 1);
-        let rotated = std::fs::rename(&self.path, &first).is_ok();
-        if !rotated {
-            eprintln!(
-                "cannot rotate log {} -> {}",
-                self.path.display(),
-                first.display()
-            );
-        }
+        let rotated = match std::fs::rename(&self.path, &first) {
+            Ok(()) => true,
+            Err(e) => {
+                failure.get_or_insert_with(|| {
+                    format!(
+                        "cannot rotate log {} -> {}: {e}",
+                        self.path.display(),
+                        first.display()
+                    )
+                });
+                false
+            }
+        };
         match OpenOptions::new()
             .create(true)
             .append(true)
@@ -226,7 +280,21 @@ impl FileLogger {
                     state.size = 0;
                 }
             }
-            Err(e) => eprintln!("cannot reopen log file: {e}"),
+            Err(e) => {
+                failure.get_or_insert_with(|| format!("cannot reopen log file: {e}"));
+            }
+        }
+        match failure {
+            // One marker line per failure streak: while the file stays
+            // oversized, every record retries the rotation and reporting
+            // each attempt would flood the log.
+            Some(message) => {
+                if !state.rotate_failed {
+                    state.rotate_failed = true;
+                    self.emergency(&message);
+                }
+            }
+            None => state.rotate_failed = false,
         }
     }
 }
@@ -265,10 +333,11 @@ impl log::Log for FileLogger {
             }
             Err(e) => {
                 // The logger cannot report through itself (that would
-                // recurse): write to stderr, once per failure streak.
+                // recurse): a marker goes directly to the log file (best
+                // effort) plus stderr, once per failure streak.
                 if !state.write_failed {
                     state.write_failed = true;
-                    eprintln!("nostrfy: cannot write the log file: {e}");
+                    self.emergency(&format!("cannot write the log file: {e}"));
                 }
             }
         }
@@ -374,6 +443,34 @@ mod tests {
                 .unwrap()
                 .contains("after poison"),
             "the record must still be written after the poison"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn emergency_fallback_appends_a_marker_and_counts() {
+        // The logger cannot log its own failure. When the normal write path
+        // fails the reason must still reach the log file (daemon stderr is
+        // /dev/null) and the counter must move so monitoring can alert.
+        let dir = std::env::temp_dir().join("nostrfy-log-emergency-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("relay.log");
+        let logger = FileLogger::open(path.clone(), 1 << 20, 4).unwrap();
+        let before = log_errors();
+        logger.emergency("cannot write the log file: test failure");
+        assert!(
+            log_errors() > before,
+            "a logger failure must move the log_errors counter"
+        );
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("cannot write the log file: test failure"),
+            "the marker must be appended directly to the log file: {text:?}"
+        );
+        assert!(
+            text.contains("ERROR nostrfy::logging"),
+            "the marker must carry level and target: {text:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

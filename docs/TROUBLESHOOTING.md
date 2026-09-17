@@ -5,8 +5,10 @@ This page collects the errors you are most likely to meet while running nostrfy,
 **Three things to check first**:
 
 1. `nostrfy check` validates your config (9 out of 10 errors are config mistakes)
-2. `tail -f nostrfy.log` shows the log (the cause of the error is almost always there)
-3. `nostrfy restart` restarts the daemon cleanly
+2. Check the log — the cause of the error is almost always there:
+   - daemon mode: `tail -f nostrfy.log`
+   - foreground mode / systemd: the terminal, or `journalctl -u nostrfy -f` (the file logger is installed in daemon mode; foreground logs go to stderr)
+3. `nostrfy restart` restarts the relay cleanly; under systemd use `systemctl restart nostrfy` (the unit's `Restart=always` would immediately restart a process stopped by `nostrfy stop`/`restart`)
 
 ---
 
@@ -169,6 +171,8 @@ When using Cloudflare Tunnel:
 
 **Cause**: `max_connections` (default 10000) was reached, the per-IP cap (`max_connections_per_ip`, default 64) kicked in, or the per-second connection rate limit (`max_connections_per_sec_per_ip`) refused the burst. The caps apply to every connection — WebSocket and plain HTTP alike.
 
+**Reverse proxies**: without `server.trusted_proxies` every client is seen as the proxy's address, so they all share one per-IP budget — 64 clients behind nginx with the default config. Configure `server.trusted_proxies` (e.g. `["127.0.0.1/32", "::1/128"]`) and restart.
+
 **Fix**: Review and adjust the settings. `max_connections_per_ip = 0` disables the per-IP cap (be careful about floods); `max_connections_per_sec_per_ip = 0` disables the rate limit. These three settings require a restart.
 
 ### 2-7. Connections drop after a while
@@ -192,6 +196,27 @@ When using Cloudflare Tunnel:
 **Cause**: The advertised list is dynamic — a NIP is hidden when all the kinds it defines are rejected: they are all in `blocked_kinds`, none of them is in `allowed_kinds`, or they are ephemeral kinds rejected by `reject_ephemeral` (only the exempt kinds `22242`, `27235`, `28934`/`28935`/`28936`, `24133`, `23194`/`23195`, `24242`, `21059` are forwarded). NIP-29/43/66 additionally require `relay.private_key` (their relay-signed events cannot be produced without it) and NIP-86 requires `rpc.management_token` or `rpc.admin_pubkey`. Runtime access changes via NIP-86 (`allowkind`/`disallowkind`) apply immediately; NIPs without dedicated kinds (11, 13, 26, 33, 40, 45, 50, 67, 70, 77) are always advertised when enabled.
 
 **Fix**: Check the active access lists — NIP-86 `listallowedkinds` shows the kind allowlist (use `disallowkind` to add a kind to the blocklist, `allowkind` to remove it), and `GET /` shows the effective `supported_nips` immediately. Remove the blocking kind or the `reject_ephemeral` setting, then `SIGHUP` or re-issue the NIP-86 call.
+
+---
+
+### 2-9. Locked out after `blockip` (own address or the reverse proxy)
+
+**Cause**: `blockip` refuses **every** connection from the address, including the management API — blocking your own address (or the reverse proxy's address when `server.trusted_proxies` is not configured) locks you out completely. Existing connections are dropped too.
+
+**Fix**: the CLI edits the persisted blocked-IP list directly, so no connection to the relay is needed:
+
+```bash
+# Remove the address (any spelling: 203.0.113.9, ::ffff:203.0.113.9, ...)
+nostrfy --config /etc/nostrfy/nostrfy.toml access unblockip 203.0.113.9
+
+# The running relay keeps the list in memory: restart it to apply.
+# Daemon mode:
+nostrfy --config /etc/nostrfy/nostrfy.toml restart
+# systemd:
+sudo systemctl restart nostrfy
+```
+
+Then check `GET /` or the NIP-86 `listblockedips` call. Also remove the address from `access.blocked_ips` in the config file if it is listed there, so the next fresh start does not seed it again. **Prevention**: configure `server.trusted_proxies` before using `blockip` behind a proxy (otherwise a client block blocks the proxy), and manage the relay from a different address than the one you are blocking.
 
 ---
 
@@ -386,6 +411,12 @@ curl http://127.0.0.1:8080/relay/stats
 # => "db_size_bytes" in bytes
 ```
 
+### 5-4a. Blossom uploads fill the disk (the `.spool` directory)
+
+**Cause**: an in-flight upload is streamed to `<blossom.local_path>/.spool` (the blob filesystem) before it is published, so concurrent uploads need disk headroom beyond the stored blobs. Disk-full refusals (`507`) trigger when free space drops below `blossom.min_free_bytes`.
+
+**Fix**: size the filesystem for `min_free_bytes` plus roughly one `max_upload_bytes` per expected concurrent upload. A killed process can leave spool files behind; the relay sweeps stale spools (only files whose owning process is gone) at startup and on later uploads. To clean up manually while the relay is stopped: `rm -rf <local_path>/.spool` (files of live uploads must not be removed). For `storage = "s3"` the spool lives in the system temp directory instead.
+
 ### 5-5. Backing up / moving the database
 
 All data lives in the `database.path` directory. **Stop the relay before copying** (copying a live database can corrupt it).
@@ -403,9 +434,11 @@ cp -a ./data ./data-backup
 
 ### 6-1. `nostrfy stats` says the daemon is not running or the statistics are stale
 
-**Cause**: The stats file does not exist (the daemon never ran), the pid file's process is gone, or the snapshot is older than three `stats_interval_secs` intervals. `nostrfy stats` refuses to print counters that no running daemon is refreshing.
+**Cause**: The stats file does not exist (the relay never ran), the pid file's process is gone, or the snapshot is older than three `stats_interval_secs` intervals. `nostrfy stats` refuses to print counters that no running relay is refreshing.
 
-**Fix**: Run `nostrfy start` (or `restart`), wait at least one `stats_interval_secs`, and try again. If the daemon is running but the snapshot stays stale, check the log for stats-writer errors (e.g. an unwritable `daemon.stats_file`).
+**Fix**: Run `nostrfy start` (or `restart`), wait at least one `stats_interval_secs`, and try again. If the relay is running but the snapshot stays stale, check the log for stats-writer errors (e.g. an unwritable `daemon.stats_file`).
+
+> **Foreground/systemd**: foreground mode writes the same `daemon.pid_file` as the daemon (removed on exit), so `stats`/`stop` find it. Prefer `systemctl stop/restart nostrfy` under systemd, and read the log from journald (the file logger is installed in daemon mode only).
 
 ### 6-2. The log grows without bound
 
@@ -425,12 +458,12 @@ cp -a ./data ./data-backup
 
 **Fix**:
 
-1. Check the end of the log: `tail -50 nostrfy.log`
+1. Check the end of the log: `tail -50 nostrfy.log` (daemon mode) or `journalctl -u nostrfy -n 50` (systemd)
 2. Check if the machine rebooted: `uptime` (a very short uptime means a reboot)
 3. Check memory: `free -h`
-4. Start the relay again: `nostrfy start`
+4. Start the relay again: `nostrfy start` (or `systemctl start nostrfy`)
 
-> **Tip**: To start nostrfy automatically on boot, register it as a systemd service with the relay's start command as `ExecStart`.
+> **Tip**: To start nostrfy automatically on boot, register it as a systemd service with the relay's start command as `ExecStart` (see [deploy/nostrfy.service](../deploy/nostrfy.service)).
 
 ### 6-5. systemd cannot start the relay on port 80
 
@@ -440,7 +473,7 @@ A systemd service running as root can bind port 80. If you set `User=` to a regu
 
 ## 7. Still Not Solved?
 
-1. **Check the log**: `tail -100 nostrfy.log` — it usually names the direct cause
+1. **Check the log**: `tail -100 nostrfy.log`, or `journalctl -u nostrfy -n 100` under systemd — it usually names the direct cause
 2. **Re-validate the config**: `nostrfy check` — shows warnings and errors
 3. **Gather reproduction details**: what were you doing, which client, what exact error
 4. **Ask in the project repository**: https://github.com/iqbqioza/nostrfy (when filing an issue, include the reproduction steps and the log)
