@@ -1293,7 +1293,13 @@ pub(crate) fn tag_range(name: u8, value: &[u8], since: u64, until: u64) -> (Vec<
         end.extend_from_slice(&[0xffu8; ID_LEN]);
         end.push(0);
     } else {
-        end[..prefix_len + CREATED_LEN].copy_from_slice(&until.saturating_add(1).to_be_bytes());
+        // Replace the `until` field just appended at `prefix_len`: the
+        // exclusive bound is `until + 1`. Copying into `[..prefix_len +
+        // CREATED_LEN]` would target the whole buffer and panic (the slice
+        // length never equals the 8-byte timestamp), aborting every indexed
+        // tag scan that carries an explicit `until`.
+        end[prefix_len..prefix_len + CREATED_LEN]
+            .copy_from_slice(&until.saturating_add(1).to_be_bytes());
         end.extend_from_slice(&[0u8; ID_LEN]);
     }
     (start, end)

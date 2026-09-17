@@ -83,6 +83,56 @@ fn insert_and_query() {
 }
 
 #[test]
+fn tag_filter_with_until_bounds_the_range() {
+    // Regression: the indexed `#tag` walk built its exclusive upper bound
+    // with `end[..prefix_len + CREATED_LEN].copy_from_slice(..)`, whose
+    // destination is the whole (prefix-sized) buffer: any tag filter with
+    // an explicit `until` panicked the reader thread instead of scanning.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        for (content, created_at) in [("old", now - 100), ("mid", now - 50), ("new", now)] {
+            let e = event(
+                1,
+                content,
+                created_at,
+                vec![vec!["t".into(), "rust".into()]],
+            );
+            assert_eq!(db.put(e, now).await, PutOutcome::Stored);
+        }
+        let f: Filter =
+            serde_json::from_value(serde_json::json!({"#t": ["rust"], "until": now - 60})).unwrap();
+        let (res, _) = db.query(vec![f], 500, now).await;
+        assert_eq!(res.len(), 1, "only the pre-`until` event matches");
+        assert_eq!(res[0].content, "old");
+
+        let f: Filter = serde_json::from_value(
+            serde_json::json!({"#t": ["rust"], "since": now - 60, "until": now - 1}),
+        )
+        .unwrap();
+        let (res, _) = db.query(vec![f], 500, now).await;
+        assert_eq!(res.len(), 1, "the bounded window selects the middle event");
+        assert_eq!(res[0].content, "mid");
+
+        let f: Filter =
+            serde_json::from_value(serde_json::json!({"#t": ["rust"], "since": now - 50})).unwrap();
+        let (res, _) = db.query(vec![f], 500, now).await;
+        assert_eq!(res.len(), 2, "the open upper bound keeps both newer events");
+    });
+    db.shutdown();
+}
+
+#[test]
 fn maximal_timestamp_is_included_by_indexed_queries() {
     let db = DbClient::open(
         &config(),
