@@ -303,6 +303,14 @@ impl GroupsRebuild {
     /// state written out. Holding the lock across capture and write keeps a
     /// stale snapshot from landing after a newer one.
     ///
+    /// The snapshot carries the database's group-state generation
+    /// (`DbClient::state_stamp`) so a later restore can reject a snapshot
+    /// that predates a removal. The stamp is read *before* the capture and
+    /// re-checked after it: a removal committed in between advances the
+    /// generation past the one the captured state can claim, so the
+    /// snapshot is dropped. An unavailable stamp read drops the snapshot
+    /// too (fail-closed): its currency cannot be established.
+    ///
     /// Returns whether the intended write committed. On `false` the caller
     /// must keep the state pending (fail-closed): a failed clear leaves the
     /// stale snapshot on disk, and a failed save is not durable state.
@@ -311,28 +319,70 @@ impl GroupsRebuild {
         if self.pending.load(Ordering::SeqCst) {
             return db.clear_groups_snapshot().await;
         }
-        let snapshot = groups.read().await.snapshot();
+        let Some(stamp) = db.state_stamp().await else {
+            // The generation is unknown: a snapshot whose currency cannot
+            // be established must not be saved. Keep the state pending so
+            // every retry stays fail-closed.
+            self.pending.store(true, Ordering::SeqCst);
+            log::error!(
+                "cannot read the group state generation; dropping the persisted snapshot \
+                 so the next restart rebuilds from the surviving events"
+            );
+            return db.clear_groups_snapshot().await;
+        };
+        let mut snapshot = groups.read().await.snapshot();
         if self.pending.load(Ordering::SeqCst) {
             return db.clear_groups_snapshot().await;
         }
+        match db.state_stamp().await {
+            // A group-state removal committed between the stamp read and
+            // the capture: the in-memory snapshot predates it and must not
+            // claim the newer generation.
+            Some(current) if current > stamp => {
+                self.pending.store(true, Ordering::SeqCst);
+                log::error!(
+                    "the group state generation advanced while the snapshot was captured; \
+                     dropping it so the next restart rebuilds from the surviving events"
+                );
+                return db.clear_groups_snapshot().await;
+            }
+            // Same fail-closed rule as the first read.
+            None => {
+                self.pending.store(true, Ordering::SeqCst);
+                log::error!(
+                    "cannot re-read the group state generation; dropping the persisted \
+                     snapshot so the next restart rebuilds from the surviving events"
+                );
+                return db.clear_groups_snapshot().await;
+            }
+            Some(_) => {}
+        }
+        snapshot.stamp = stamp;
         db.save_groups(snapshot).await
     }
 }
 
 /// Marks the group state stale and schedules the coalesced background
 /// rebuild (single-flight via the state's lock and the `running` flag).
+/// A signaled drain never starts a worker: the state stays pending (the
+/// removal that scheduled the rebuild set it), so the snapshot stays
+/// dropped and the next startup rebuilds from the surviving events.
 fn schedule_groups_rebuild(
     db: DbClient,
     groups: std::sync::Arc<RwLock<GroupStore>>,
     config: std::sync::Arc<RwLock<Config>>,
     state: std::sync::Arc<GroupsRebuild>,
+    drain: tokio::sync::watch::Receiver<bool>,
 ) {
+    if *drain.borrow() {
+        return;
+    }
     if state.running.swap(true, Ordering::SeqCst) {
         // A worker is already draining; it re-checks the dirty flag before
         // it exits, so this request is covered.
         return;
     }
-    tokio::spawn(groups_rebuild_worker(db, groups, config, state));
+    tokio::spawn(groups_rebuild_worker(db, groups, config, state, drain));
 }
 
 /// The coalesced group-state rebuild worker. Holds the single-flight lock,
@@ -348,30 +398,52 @@ fn schedule_groups_rebuild(
 /// scan; a mutation the database cannot replay (a `9008`'s purge outcome, a
 /// vanish's member removal) or a buffer overflow discards the fresh store
 /// and rebuilds again instead of swapping a state that predates it.
+///
+/// The worker observes the relay's drain signal: it refuses to start a
+/// scan after shutdown, aborts the interval wait, and drops an in-flight
+/// scan future at its next await. An aborted rebuild keeps the state
+/// pending, so the snapshot stays dropped and the next startup rebuilds
+/// from the surviving events (fail-closed) instead of running a
+/// full-history pass after shutdown.
 async fn groups_rebuild_worker(
     db: DbClient,
     groups: std::sync::Arc<RwLock<GroupStore>>,
     config: std::sync::Arc<RwLock<Config>>,
     state: std::sync::Arc<GroupsRebuild>,
+    mut drain: tokio::sync::watch::Receiver<bool>,
 ) {
     {
         // Scope the single-flight guard so it is released before the
         // trailing re-schedule below (which may move `state`).
         let _single_flight = state.lock.lock().await;
         loop {
+            // Shutdown: stop before starting another scan. The removal that
+            // dirtied the state already set the pending flag, so the
+            // snapshot stays dropped and the next startup rebuilds from the
+            // surviving events.
+            if *drain.borrow() {
+                state.pending.store(true, Ordering::SeqCst);
+                break;
+            }
             if !state.dirty.swap(false, Ordering::SeqCst) {
                 break;
             }
             // The first scan runs immediately (`last == 0`); later requests
             // wait out the remainder of the interval. Requests that arrive
             // while waiting coalesce into this rebuild (the flag is drained
-            // above, and any later trigger sets it again).
+            // above, and any later trigger sets it again); a shutdown
+            // aborts the wait without starting the scan.
             let elapsed = unix_now().saturating_sub(state.last.load(Ordering::Relaxed));
             if elapsed < GROUPS_REBUILD_MIN_INTERVAL_SECS {
-                tokio::time::sleep(std::time::Duration::from_secs(
-                    GROUPS_REBUILD_MIN_INTERVAL_SECS - elapsed,
-                ))
-                .await;
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(
+                        GROUPS_REBUILD_MIN_INTERVAL_SECS - elapsed,
+                    )) => {}
+                    _ = drain.changed() => {
+                        state.pending.store(true, Ordering::SeqCst);
+                        break;
+                    }
+                }
             }
             // Read the cap before taking the group lock: the accept paths take
             // `config.read` and then `groups.read`, so the worker must not hold
@@ -403,9 +475,33 @@ async fn groups_rebuild_worker(
                 )
             };
             let mut fresh = GroupStore::with_cap(cap);
-            let rebuilt = fresh
-                .rebuild_after_vanish(&db, previous, previous_deleted, previous_ghost)
-                .await;
+            // The scan must not outlive a shutdown: abort it at its next
+            // await (a page query) and keep the state pending. The fresh
+            // store is local and was never swapped in, so the live store
+            // stays authoritative and the snapshot stays dropped
+            // (fail-closed) until a later startup rebuild completes.
+            let rebuilt = tokio::select! {
+                rebuilt = fresh.rebuild_after_vanish(
+                    &db,
+                    previous,
+                    previous_deleted,
+                    previous_ghost,
+                ) => rebuilt,
+                _ = drain.changed() => {
+                    let mut buffer = state.buffer.lock().await;
+                    buffer.scanning = false;
+                    buffer.events.clear();
+                    buffer.retry = false;
+                    buffer.overflow = false;
+                    drop(buffer);
+                    log::warn!(
+                        "group state rebuild aborted by shutdown; keeping the persisted \
+                         snapshot dropped so the next startup rebuilds from the surviving events"
+                    );
+                    state.pending.store(true, Ordering::SeqCst);
+                    break;
+                }
+            };
             state
                 .last
                 .store(unix_now(), std::sync::atomic::Ordering::Relaxed);
@@ -494,10 +590,12 @@ async fn groups_rebuild_worker(
     }
     // Release the single-flight claim, then re-check: a trigger that set the
     // dirty flag between the last swap and this release saw `running ==
-    // true` and did not spawn, so it must not be lost.
+    // true` and did not spawn, so it must not be lost. After a drain the
+    // re-schedule is suppressed: the pending flag stays set (fail-closed)
+    // and the next startup rebuilds instead.
     state.running.store(false, Ordering::SeqCst);
-    if state.dirty.load(Ordering::SeqCst) {
-        schedule_groups_rebuild(db, groups, config, state);
+    if state.dirty.load(Ordering::SeqCst) && !*drain.borrow() {
+        schedule_groups_rebuild(db, groups, config, state, drain);
     }
 }
 
@@ -789,7 +887,11 @@ impl Relay {
     /// `stats.connections_active` to reach zero before stopping the
     /// database, so the flushed batches are still committed.
     pub fn signal_drain(&self) {
-        let _ = self.drain_tx.send(true);
+        // `send_replace` (not `send`): tokio's `send` is a no-op when no
+        // receiver is subscribed right now, which would leave the signal
+        // unrecorded and let a later `subscribe_drain` see `false` (a
+        // removal arriving after shutdown could then schedule a rebuild).
+        self.drain_tx.send_replace(true);
     }
 
     /// A receiver for a connection loop to observe [`Self::signal_drain`].
@@ -1801,6 +1903,7 @@ impl Relay {
             Arc::clone(&self.groups),
             Arc::clone(&self.config),
             Arc::clone(&self.groups_rebuild),
+            self.subscribe_drain(),
         );
     }
 
@@ -1819,6 +1922,65 @@ impl Relay {
         {
             Some((events, more)) => !more && events.is_empty(),
             None => false,
+        }
+    }
+
+    /// Crash recovery for `kind:9008` group purges: re-runs every purge the
+    /// database recorded as pending (a purge that was accepted but whose
+    /// walk did not complete, e.g. the process crashed mid-walk). The
+    /// server calls this at startup, before serving. An unreadable pending
+    /// list is fail-closed: the restored/rebuilt ghosts and the database's
+    /// pending records stay in place. Idempotent when nothing is pending.
+    pub(crate) async fn resume_pending_purges(&self) {
+        let pending: Vec<(String, u64)> = match self.db.pending_purges().await {
+            Some(pending) => pending,
+            None => {
+                // The recorded purges are unknown: some pending purge may
+                // still need resuming, so the fail-closed state (ghosted
+                // ids, dropped snapshot) stays as restored.
+                log::error!(
+                    "cannot read the pending group purges; leaving the fail-closed state \
+                     in place"
+                );
+                return;
+            }
+        };
+        for (gid, purge_now) in pending {
+            self.resume_pending_purge(&gid, purge_now).await;
+        }
+    }
+
+    /// Resumes one recorded purge (see [`Self::resume_pending_purges`]):
+    /// re-runs the purge, confirms it, then downgrades the ghost to the
+    /// ordinary delete tombstone and persists. Kept separate from the
+    /// database read so the resume path is testable without a real
+    /// mid-walk failure.
+    async fn resume_pending_purge(&self, gid: &str, purge_now: u64) {
+        // The id must stay ghosted until the purge is confirmed: mark it
+        // (and persist) before touching the database, so a crash mid-resume
+        // cannot restore a snapshot that would let a create expose the
+        // (possibly un-purged) history.
+        self.ghost_deleted_group(gid).await;
+        if !self.persist_groups().await {
+            log::error!(
+                "could not persist the pending-purge ghost for {gid}; the persisted state \
+                 stays fail-closed"
+            );
+        }
+        let removed = self.db.group_purge(gid.to_string(), purge_now).await;
+        self.stats.bump(&self.stats.events_deleted, removed as u64);
+        if self.group_purge_confirmed(gid).await {
+            // The history is gone: downgrade to the ordinary tombstone,
+            // like the 9008 path.
+            self.unghost_confirmed(gid).await;
+            if !self.persist_groups().await {
+                log::error!("could not persist the confirmed group purge for {gid}");
+            }
+        } else {
+            log::error!(
+                "could not confirm the resumed group purge for {gid}; keeping the id \
+                 ghosted so a re-create cannot expose the un-purged history"
+            );
         }
     }
 
@@ -3573,19 +3735,47 @@ mod tests {
                     .vanish_pubkey(ev.pubkey_bytes().unwrap(), ev.created_at)
                     .await;
             }
-            let mut converged = false;
+            // While the state is pending the on-disk snapshot must stay
+            // dropped (fail-closed): a crash now must rebuild from the
+            // surviving events, not restore pre-vanish state. The flag is
+            // sampled around the load so a rebuild that completed in
+            // between (and legitimately persisted the fresh snapshot)
+            // cannot trip the invariant.
+            let pending_before = relay
+                .groups_rebuild
+                .pending
+                .load(std::sync::atomic::Ordering::SeqCst);
+            let snapshot = relay.db.load_groups().await;
+            let pending_after = relay
+                .groups_rebuild
+                .pending
+                .load(std::sync::atomic::Ordering::SeqCst);
+            if pending_before && pending_after {
+                assert!(
+                    snapshot.is_none(),
+                    "a pending rebuild must leave the persisted snapshot dropped"
+                );
+            }
+            // Wait for the worker to finish and persist the fresh snapshot:
+            // the pending flag clears just before the save, so the snapshot
+            // is the completion signal.
+            let mut persisted = None;
             for _ in 0..600 {
                 if !relay
                     .groups_rebuild
                     .pending
                     .load(std::sync::atomic::Ordering::SeqCst)
+                    && let Some(snap) = relay.db.load_groups().await
                 {
-                    converged = true;
+                    persisted = Some(snap);
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
-            assert!(converged, "the coalesced rebuild must converge");
+            assert!(
+                persisted.is_some(),
+                "the coalesced rebuild must converge and persist"
+            );
             let state = relay.groups.read().await;
             assert!(state.groups.is_empty(), "every group lost its create");
             let hidden = state.hidden_group_ids();
@@ -3596,13 +3786,27 @@ mod tests {
                 );
             }
             drop(state);
+            // A real bound: at least one scan must run (zero means the
+            // rebuild never happened) and the five vanishes must coalesce
+            // into fewer scans than triggers (the minimum-interval floor
+            // batches the tail). An absolute cap would be flaky on slow
+            // runners, where each vanish can take longer than the floor.
             let scans = relay
                 .groups_rebuild
                 .rebuilds
                 .load(std::sync::atomic::Ordering::Relaxed);
             assert!(
-                scans < gids.len() as u64,
-                "a burst of vanishes must coalesce into fewer scans, got {scans}"
+                scans >= 1 && scans < gids.len() as u64,
+                "a burst of {} vanishes must coalesce into fewer than {} scans, got {scans}",
+                gids.len(),
+                gids.len()
+            );
+            // The fresh snapshot carries the rebuilt (fail-closed) state: a
+            // restart must not resurrect the vanished groups.
+            let snapshot = persisted.expect("checked above");
+            assert!(
+                snapshot.groups.is_empty() && snapshot.ghost.len() >= gids.len(),
+                "the rebuilt snapshot must carry the ghosts, not the groups"
             );
             relay.db.shutdown();
         });
@@ -3933,6 +4137,172 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pending_group_purge_is_resumed_to_completion() {
+        // A crash mid-walk leaves the purge recorded in the database's
+        // pending table. The startup resume must finish the purge, confirm
+        // it, downgrade the fail-closed ghost to the ordinary delete
+        // tombstone and persist — so a create can re-use the id while the
+        // un-purged history cannot surface. The pending record is seeded
+        // directly (an in-process crash cannot be reproduced).
+        use crate::db::PutOutcome;
+        use crate::db::store::{Store, encode_pending_purge, purged_group_key};
+
+        let now = crate::util::unix_now();
+        let mut cfg = crate::config::Config::default();
+        cfg.database.map_size = 16 * 1024 * 1024;
+        cfg.database.max_map_size = 64 * 1024 * 1024;
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        cfg.database.path = std::env::temp_dir()
+            .join("nostrfy-resume-purge")
+            .join(format!("{:x}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&cfg.database.path);
+        let expiry = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let store = Store::open(&cfg.database, std::sync::Arc::clone(&expiry), 128)
+            .expect("the scratch store opens");
+        {
+            // What a crash after `purge_group`'s first commit leaves behind:
+            // the purge marker plus the in-progress record, no completed walk.
+            let mut wtxn = store.env.write_txn().unwrap();
+            store
+                .purge_pending
+                .put(
+                    &mut wtxn,
+                    &purged_group_key("g1"),
+                    &encode_pending_purge("g1", now, now),
+                )
+                .unwrap();
+            wtxn.commit().unwrap();
+        }
+        let db = crate::db::DbClient::open_with_store(
+            &cfg.database,
+            store,
+            expiry,
+            std::sync::Arc::new(Default::default()),
+            0,
+            128,
+            4096,
+        )
+        .unwrap();
+        let config = std::sync::Arc::new(tokio::sync::RwLock::new(cfg));
+        let mut relay = Relay::new(
+            config,
+            db,
+            crate::stats::Stats::new(),
+            "",
+            crate::relay::LiveBusConfig {
+                buffer: 1024,
+                batch_interval_ms: 10,
+                batch_size: 64,
+            },
+        )
+        .await;
+        relay.start_live_bus();
+        let relay = std::sync::Arc::new(relay);
+
+        assert_eq!(
+            relay.db.pending_purges().await,
+            Some(vec![("g1".to_string(), now)]),
+            "the seeded pending purge must be visible at startup"
+        );
+
+        let secp = secp256k1::Secp256k1::new();
+        let admin = secp256k1::Keypair::from_seckey_slice(&secp, &[4u8; 32]).unwrap();
+        let create = signed_group_event(
+            &secp,
+            &admin,
+            crate::nips::nip29::CREATE_GROUP,
+            "g1",
+            vec![],
+            now.saturating_sub(10),
+        );
+        let message = signed_group_event(&secp, &admin, 1, "g1", vec![], now.saturating_sub(10));
+        let delete = signed_group_event(
+            &secp,
+            &admin,
+            crate::nips::nip29::DELETE_GROUP,
+            "g1",
+            vec![],
+            now,
+        );
+        for event in [&create, &message, &delete] {
+            assert_eq!(relay.db.put(event.clone(), now).await, PutOutcome::Stored);
+        }
+        // The pre-crash in-memory state: the 9008 applied (the group is
+        // gone) and its id is ghosted because the purge was never confirmed.
+        {
+            let mut groups = relay.groups.write().await;
+            groups.apply(&create, "", now.saturating_sub(10), false, false);
+            groups.apply(&delete, "", now, false, false);
+        }
+        relay.ghost_deleted_group("g1").await;
+        let filter: crate::filter::Filter =
+            serde_json::from_value(serde_json::json!({"#h": ["g1"]})).unwrap();
+        assert_eq!(
+            relay.db.query(vec![filter.clone()], 10, now).await.0.len(),
+            3,
+            "the crashed purge must leave the group's history stored"
+        );
+
+        // The startup call the server makes after the snapshot restore.
+        relay.resume_pending_purges().await;
+
+        assert_eq!(
+            relay.db.pending_purges().await,
+            Some(Vec::new()),
+            "the resumed purge must clear the pending record"
+        );
+        assert!(
+            relay.db.query(vec![filter], 10, now).await.0.is_empty(),
+            "the resumed purge must remove the group's stored events"
+        );
+        {
+            let groups = relay.groups.read().await;
+            assert!(
+                !groups.ghost_group_ids().contains(&"g1".to_string()),
+                "a confirmed resume must clear the fail-closed ghost"
+            );
+            assert!(
+                groups.deleted_group_ids().contains(&"g1".to_string()),
+                "the confirmed purge must downgrade the ghost to the delete tombstone"
+            );
+        }
+        // The persisted snapshot must reflect the confirmed purge (with the
+        // generation stamp of the purge's state-stamp bump), so a restart
+        // does not re-ghost the id.
+        let snap = relay
+            .db
+            .load_groups()
+            .await
+            .expect("the confirmed resume must persist a snapshot");
+        assert!(
+            snap.stamp > 0,
+            "the snapshot must carry the purge's generation stamp"
+        );
+        assert!(
+            !snap.ghost.contains("g1") && snap.deleted.contains("g1"),
+            "the snapshot must hold the downgraded tombstone, not the ghost"
+        );
+
+        let recreate = signed_group_event(
+            &secp,
+            &admin,
+            crate::nips::nip29::CREATE_GROUP,
+            "g1",
+            vec![],
+            now.saturating_add(1),
+        );
+        assert!(
+            matches!(
+                relay.accept_event(recreate, &[], None).await,
+                PutOutcome::Stored
+            ),
+            "a resumed, confirmed purge must leave the id re-creatable"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
     async fn deleting_a_9000_grant_with_9005_revokes_the_membership() {
         // A `9005` delete-event removing a state event must invalidate the
         // derived state (the deleted 9000's grant) like a NIP-09 deletion:
@@ -4050,6 +4420,37 @@ mod tests {
                 .load(std::sync::atomic::Ordering::SeqCst),
             "a failed rebuild must keep the state pending"
         );
+    }
+
+    #[tokio::test]
+    async fn drain_prevents_new_group_rebuilds() {
+        // Shutdown must not start a full-history rebuild whose result
+        // cannot be persisted: the state stays pending (fail-closed) and
+        // the next startup rebuilds from the surviving events.
+        let relay = build_relay().await;
+        relay.signal_drain();
+        relay.mark_group_state_stale().await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            relay
+                .groups_rebuild
+                .rebuilds
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "a drained relay must not run a rebuild scan"
+        );
+        assert!(
+            relay
+                .groups_rebuild
+                .pending
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "the state must stay pending so the snapshot stays dropped"
+        );
+        assert!(
+            relay.db.load_groups().await.is_none(),
+            "the stale snapshot must be dropped, not saved"
+        );
+        relay.db.shutdown();
     }
 
     #[test]

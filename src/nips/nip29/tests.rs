@@ -1567,6 +1567,43 @@ fn groups_snapshot_without_ghost_deserializes() {
     assert!(snap.groups.is_empty());
     assert!(snap.deleted.contains("g1"));
     assert!(snap.ghost.is_empty());
+    assert_eq!(snap.stamp, 0, "legacy snapshots have no generation stamp");
+}
+
+#[test]
+fn stale_snapshot_generation_is_rejected_at_restore() {
+    // A snapshot taken before a group-state removal (its stamp is older
+    // than the database generation) must not be restored: it would
+    // resurrect state the removal invalidated. Equal generations are
+    // current; a snapshot stamped ahead can only mean the counter was
+    // reset, and it is the freshest state available.
+    assert!(GroupStore::snapshot_is_current(7, 7));
+    assert!(GroupStore::snapshot_is_current(8, 7));
+    assert!(!GroupStore::snapshot_is_current(6, 7));
+
+    let mut store = GroupStore::default();
+    store.apply(
+        &event(CREATE_GROUP, ADMIN, Some("g1"), vec![]),
+        "relay",
+        1,
+        false,
+        false,
+    );
+    let mut stale = store.snapshot();
+    stale.stamp = 6;
+    assert!(
+        !store.restore_checked(stale, 7),
+        "a snapshot from before the current generation must be rejected"
+    );
+    assert!(
+        store.group("g1").is_some(),
+        "a rejected snapshot must leave the store untouched"
+    );
+
+    let mut current = store.snapshot();
+    current.stamp = 7;
+    assert!(store.restore_checked(current, 7));
+    assert!(store.group("g1").is_some());
 }
 
 #[test]

@@ -256,6 +256,13 @@ pub(crate) struct GroupsSnapshot {
     /// force a full rebuild and silently discard the rest of the state).
     #[serde(default)]
     pub ghost: HashSet<String>,
+    /// The database's group-state generation the snapshot was taken at
+    /// (see `DbClient::state_stamp`): a restore must reject a snapshot
+    /// stamped before the current generation, because it predates a
+    /// group-state removal. Present in snapshots written after the stamp
+    /// was introduced; older snapshots deserialize as 0.
+    #[serde(default)]
+    pub stamp: u64,
 }
 
 /// Verifies that a rebuild page delivered every event of its boundary
@@ -304,6 +311,9 @@ impl GroupStore {
             groups: self.groups.clone(),
             deleted: self.deleted.clone(),
             ghost: self.ghost.clone(),
+            // Filled by the persist path, which reads the database's
+            // group-state generation (`DbClient::state_stamp`).
+            stamp: 0,
         }
     }
 
@@ -315,6 +325,30 @@ impl GroupStore {
         self.deleted = snap.deleted;
         self.ghost = snap.ghost;
         self.recompute_derived();
+    }
+
+    /// Whether a snapshot stamped `snapshot_stamp` still reflects the
+    /// database generation `current_stamp`: a snapshot from before a
+    /// group-state removal (its stamp is older) must not be restored. A
+    /// snapshot stamped at the current generation is current; one stamped
+    /// ahead can only mean the counter was reset and is the freshest state
+    /// available. A caller that cannot read `current_stamp` must fail
+    /// closed (see the startup restore path).
+    pub(crate) fn snapshot_is_current(snapshot_stamp: u64, current_stamp: u64) -> bool {
+        snapshot_stamp >= current_stamp
+    }
+
+    /// Restores `snap` only when it does not predate the database's
+    /// `current_stamp`. Returns false without touching the store when the
+    /// snapshot is stale, so the caller runs the existing rebuild path
+    /// (fail-closed): restoring it would resurrect state a removal
+    /// invalidated.
+    pub(crate) fn restore_checked(&mut self, snap: GroupsSnapshot, current_stamp: u64) -> bool {
+        if !Self::snapshot_is_current(snap.stamp, current_stamp) {
+            return false;
+        }
+        self.restore(snap);
+        true
     }
 
     /// Recomputes the counters derived from `groups` (after a restore or a
@@ -1547,10 +1581,13 @@ impl GroupStore {
     }
 
     /// Removes a group id from the ghost set once its history is confirmed
-    /// purged: the id returns to the ordinary delete tombstone, which a
-    /// fresh create may clear.
+    /// purged and downgrades it to the ordinary delete tombstone, which a
+    /// fresh create may clear. The tombstone is (re-)asserted because the
+    /// pending-purge resume may be the first path to confirm the purge and
+    /// its in-memory state need not have applied the `9008` before.
     pub(crate) fn unghost(&mut self, gid: &str) {
         self.ghost.remove(gid);
+        self.deleted.insert(gid.to_string());
     }
 }
 

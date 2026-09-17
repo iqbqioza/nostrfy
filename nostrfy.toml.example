@@ -393,7 +393,9 @@ db_buffer_size = 2048
 db_request_timeout_secs = 30
 
 # When true, fsync is skipped after each write batch (faster, but a power
-# loss can lose recent writes or corrupt the database — not recommended).
+# loss or OS crash can lose acknowledged writes or corrupt the database —
+# the writer only force-syncs about once per second). Use only with a
+# backup/replica you can restore from; not recommended.
 disabled_fsync = false
 
 # Overload protection: when the database thread's queue holds more than

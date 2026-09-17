@@ -118,19 +118,50 @@ pub(crate) fn pending_response_budget_bytes(per_response: u64) -> u64 {
     per_response.saturating_mul(PENDING_RESPONSE_BUDGET_FACTOR)
 }
 
-/// The pending-response budget of one relay. `Arc::as_ptr` identifies the
-/// relay allocation (every `Conn` holds a clone of the same allocation),
+/// Relay-wide NEG budget as a multiple of the per-query item cap, mirroring
+/// [`PENDING_RESPONSE_BUDGET_FACTOR`]. The per-connection NEG caps alone
+/// allow `max_connections × 2 × max_neg_items` held items (tens of GB with
+/// the documented defaults); the default (100k items × 16 ≈ 122 MiB) bounds
+/// the relay-wide held set while leaving room for many concurrent
+/// full-size syncs.
+pub(crate) const NEG_BUDGET_FACTOR: u64 = 16;
+
+/// The estimated in-memory size of one held negentropy item: twice the
+/// `(created_at, id)` tuple (40 bytes) because the collecting `Vec` may
+/// hold up to twice its length in capacity. The deliberate overestimate is
+/// what [`neg_budget_bytes`] charges per held item.
+pub(crate) const NEG_ITEM_BYTES: u64 = std::mem::size_of::<crate::nips::nip77::Item>() as u64 * 2;
+
+/// Sizes the relay-wide NEG budget from `limits.max_neg_items`; when the
+/// per-query cap is `0` (no processable records) the documented default is
+/// used, so the relay-wide bound still exists instead of `0` disabling the
+/// budget entirely (`try_reserve` treats a `0` limit as unlimited).
+pub(crate) fn neg_budget_bytes(per_query: usize) -> u64 {
+    /// The documented default of `limits.max_neg_items`.
+    const DEFAULT_MAX_NEG_ITEMS: u64 = 100_000;
+    let per_query = if per_query == 0 {
+        DEFAULT_MAX_NEG_ITEMS
+    } else {
+        per_query as u64
+    };
+    per_query
+        .saturating_mul(NEG_ITEM_BYTES)
+        .saturating_mul(NEG_BUDGET_FACTOR)
+}
+
+/// A per-relay budget registry, keyed by the relay allocation. `Arc::as_ptr`
+/// identifies the relay (every `Conn` holds a clone of the same allocation),
 /// so several relays in one process (tests) do not share a budget. The
-/// registry holds a `Weak` reference: once every connection (and pending
-/// response) of a relay is gone the counter is freed, so a later relay
+/// registry holds a `Weak` reference: once every connection (and
+/// reservation) of a relay is gone the counter is freed, so a later relay
 /// allocated at the same address gets a fresh budget instead of a stale
 /// counter, and the registry cannot keep budgets alive.
-fn pending_response_budget(relay: &Arc<Relay>) -> Arc<PendingResponseBudget> {
-    static BUDGETS: std::sync::OnceLock<
-        std::sync::Mutex<HashMap<usize, std::sync::Weak<PendingResponseBudget>>>,
-    > = std::sync::OnceLock::new();
+type BudgetRegistry =
+    std::sync::OnceLock<std::sync::Mutex<HashMap<usize, std::sync::Weak<PendingResponseBudget>>>>;
+
+fn relay_budget(registry: &BudgetRegistry, relay: &Arc<Relay>) -> Arc<PendingResponseBudget> {
     let key = Arc::as_ptr(relay) as usize;
-    let mut budgets = BUDGETS
+    let mut budgets = registry
         .get_or_init(Default::default)
         .lock()
         .unwrap_or_else(|p| p.into_inner());
@@ -140,6 +171,20 @@ fn pending_response_budget(relay: &Arc<Relay>) -> Arc<PendingResponseBudget> {
     let budget = Arc::new(PendingResponseBudget::new());
     budgets.insert(key, Arc::downgrade(&budget));
     budget
+}
+
+/// The pending-response budget of one relay (see [`relay_budget`] for the
+/// registry rationale).
+fn pending_response_budget(relay: &Arc<Relay>) -> Arc<PendingResponseBudget> {
+    static BUDGETS: BudgetRegistry = std::sync::OnceLock::new();
+    relay_budget(&BUDGETS, relay)
+}
+
+/// The relay-wide NEG budget of one relay (see [`relay_budget`] for the
+/// registry rationale).
+fn neg_budget(relay: &Arc<Relay>) -> Arc<PendingResponseBudget> {
+    static BUDGETS: BudgetRegistry = std::sync::OnceLock::new();
+    relay_budget(&BUDGETS, relay)
 }
 
 /// A REQ response waiting to be pumped to the socket in bounded chunks:
@@ -231,6 +276,13 @@ pub struct Conn {
     /// connection; each materialized response reserves its size against it
     /// and over-budget responses fail with a retryable CLOSED.
     pub(crate) pending_budget: Arc<PendingResponseBudget>,
+    /// The relay-wide NEG item budget shared by every connection; each
+    /// open NEG subscription reserves its held items against it, so the
+    /// per-connection caps cannot pin GBs across many connections.
+    /// Over-budget opens fail with a retryable NEG-ERR instead of pinning
+    /// the items, and the reservation is released on NEG-CLOSE,
+    /// replacement, connection drop or panic (RAII, like `PendingReq`).
+    pub(crate) neg_budget: Arc<PendingResponseBudget>,
     /// REQ responses awaiting the pump: the scan results are moved into
     /// the capped outgoing queue in chunks as the socket drains.
     pub(crate) pending_reqs: std::collections::VecDeque<PendingReq>,
@@ -244,7 +296,9 @@ pub struct Conn {
     neg: HashMap<String, negentropy::NegState>,
     /// Total number of negentropy items held across all open NEG-OPEN
     /// subscriptions, so that a connection cannot pin more than twice the
-    /// configured per-query maximum in memory.
+    /// configured per-query maximum in memory. This per-connection count is
+    /// a second bound: the held items are also reserved against the
+    /// relay-wide `neg_budget`.
     pub(crate) neg_total: usize,
     /// Total NEG-OPENs this connection has issued (including re-opens of
     /// closed subscriptions): caps how often the 128-round CPU budget can
@@ -1127,6 +1181,7 @@ pub async fn handle_connection(
         );
     let mut conn = Conn {
         pending_budget: pending_response_budget(&relay),
+        neg_budget: neg_budget(&relay),
         relay,
         conn_id,
         subscriptions_held,
@@ -1727,6 +1782,7 @@ mod tests {
             );
         Conn {
             pending_budget: pending_response_budget(&relay),
+            neg_budget: neg_budget(&relay),
             relay,
             conn_id,
             subscriptions_held: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -3134,10 +3190,14 @@ mod tests {
                 now - 10,
                 vec![vec!["expiration".into(), (now - 1).to_string()]],
             );
-            conn.deliver_live(
+            // `deliver_live_at` takes the batch timestamp: pin it to the
+            // test's `now` so the expiry boundary is deterministic rather
+            // than sampled from the wall clock mid-test.
+            conn.deliver_live_at(
                 &expired,
                 &serde_json::to_string(&expired).unwrap_or_default(),
                 None,
+                now,
             );
             assert!(
                 !outgoing_json(&conn)
@@ -3154,10 +3214,11 @@ mod tests {
                 now,
                 vec![vec!["expiration".into(), (now + 3_600).to_string()]],
             );
-            conn.deliver_live(
+            conn.deliver_live_at(
                 &alive,
                 &serde_json::to_string(&alive).unwrap_or_default(),
                 None,
+                now,
             );
             assert!(
                 outgoing_json(&conn)
@@ -3789,20 +3850,31 @@ mod tests {
                 std::time::Duration::from_secs(2),
                 conn_a.live.as_mut().unwrap().recv(),
             )
-            .await;
+            .await
+            .expect("the matching connection receives the batch")
+            .expect("the live channel stays open");
             assert!(
-                received_a.is_ok(),
-                "the matching connection receives the batch"
+                received_a.iter().any(|(e, _)| e.id == ev.id),
+                "the delivered batch must contain the broadcast event"
             );
-            // conn_b's queue stays silent (nothing is sent to it).
-            let received_b = tokio::time::timeout(
-                std::time::Duration::from_millis(300),
-                conn_b.live.as_mut().unwrap().recv(),
-            )
-            .await;
+            // conn_b is not a delivery candidate for this event at all
+            // (its subscription indexes kind 1), so the bus cannot wake it.
+            // Asserting the candidate set is deterministic; the old 300 ms
+            // receive timeout could pass vacuously when a delivery was
+            // merely slow.
+            let candidates = conn_a
+                .relay
+                .sub_index
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .candidates(&ev);
             assert!(
-                received_b.is_err(),
-                "a non-matching connection must not be woken"
+                candidates.contains(&conn_a.conn_id),
+                "the matching connection must be a delivery candidate"
+            );
+            assert!(
+                !candidates.contains(&conn_b.conn_id),
+                "a non-matching connection must not be a delivery candidate"
             );
             conn_a.relay.db.shutdown();
         });
@@ -3810,24 +3882,43 @@ mod tests {
 
     #[test]
     fn live_flags_refresh_only_on_config_version_change() {
+        // The caches are refreshed only when the config version changed:
+        // without a bump the stale value must survive (the hot paths never
+        // re-read the config), while a bumped version must pick the new
+        // config up. This mirrors the connection loop's gate.
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let conn = build_conn().await;
+            let mut conn = build_conn().await;
             let v0 = conn.config_version;
-            // Same version: no refresh happens (nothing to assert besides
-            // the field staying put — the flag refresh is data-driven).
-            assert_eq!(conn.config_version, v0);
-            // A bumped version on the relay is picked up by the next live
-            // loop iteration (exercised by `handle_frame`'s sibling
-            // refresh; here we only assert the plumbing).
+            assert!(
+                conn.expiry_enabled,
+                "NIP-40 is enabled by the default config"
+            );
+            // The config changes without a version bump: the cached flag
+            // stays put (a refresh here would silently re-read on every
+            // frame).
+            conn.relay.config.write().await.relay.disabled_nips.push(40);
+            assert!(
+                conn.expiry_enabled,
+                "the cache must not change without a config version bump"
+            );
+            // A bumped version refreshes every cached value.
             conn.relay
                 .config_version
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            assert_eq!(
-                conn.relay
-                    .config_version
-                    .load(std::sync::atomic::Ordering::Relaxed),
-                v0 + 1
+            let version = conn
+                .relay
+                .config_version
+                .load(std::sync::atomic::Ordering::Relaxed);
+            assert_ne!(version, v0, "the version must have been bumped");
+            if version != conn.config_version {
+                conn.config_version = version;
+                conn.refresh_config_cache().await;
+            }
+            assert_eq!(conn.config_version, v0 + 1);
+            assert!(
+                !conn.expiry_enabled,
+                "a bumped version must refresh the cached NIP-40 flag"
             );
             conn.relay.db.shutdown();
         });
@@ -4992,10 +5083,10 @@ mod tests {
             let (_ip_tx, mut ip_rx) = tokio::sync::watch::channel(0u64);
             let (_overflow_tx, mut overflow_rx) = tokio::sync::watch::channel(());
             let (drain_tx, mut drain_rx) = tokio::sync::watch::channel(false);
-            tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                let _ = drain_tx.send(true);
-            });
+            // Signal before the drain parks: a `watch` receiver treats the
+            // value as changed from the one seen at subscribe time, so the
+            // drain observes it deterministically (no timer needed).
+            let _ = drain_tx.send(true);
             let outcome = tokio::time::timeout(
                 Duration::from_secs(2),
                 drain_outgoing(
@@ -6334,13 +6425,19 @@ mod tests {
                 "live receiver survives a CLOSE + REQ cycle"
             );
             let ev = signed_note(conn.relay.secp(), "resubscribed", now, vec![]);
+            let ev_id = ev.id.clone();
             assert!(conn.relay.broadcast(ev).await.is_ok());
             let received = tokio::time::timeout(
                 std::time::Duration::from_secs(2),
                 conn.live.as_mut().unwrap().recv(),
             )
-            .await;
-            assert!(received.is_ok(), "live delivery resumes after CLOSE + REQ");
+            .await
+            .expect("live delivery resumes after CLOSE + REQ")
+            .expect("the live channel stays open");
+            assert!(
+                received.iter().any(|(e, _)| e.id == ev_id),
+                "the resubscribed connection must receive the event"
+            );
             conn.relay.db.shutdown();
         });
     }
@@ -6362,6 +6459,14 @@ mod tests {
             conn.send_control(serde_json::json!(["EOSE", "s"]));
             assert_eq!(conn.outgoing.len(), OUT_QUEUE_LIMIT * 2);
             assert_eq!(conn.dropped, dropped_before + 1);
+            // The connection loop closes exactly on this mark, so the peer
+            // waiting on the dropped frame can resynchronize instead of
+            // hanging forever.
+            assert!(
+                conn.control_overflowed,
+                "a dropped completion-critical frame must mark the connection \
+                 for close so the peer can resynchronize"
+            );
             conn.relay.db.shutdown();
         });
     }
@@ -6489,6 +6594,132 @@ mod tests {
             32 * 1024 * 1024 * PENDING_RESPONSE_BUDGET_FACTOR,
             "a disabled per-response budget still gets the relay-wide default"
         );
+    }
+
+    #[test]
+    fn neg_budget_sizes_from_config() {
+        assert_eq!(
+            neg_budget_bytes(1_000),
+            1_000 * NEG_ITEM_BYTES * NEG_BUDGET_FACTOR,
+            "the budget is the per-query item cap times the item estimate and factor"
+        );
+        assert_eq!(
+            neg_budget_bytes(0),
+            100_000 * NEG_ITEM_BYTES * NEG_BUDGET_FACTOR,
+            "a zero item cap still gets the relay-wide default (0 would disable the budget)"
+        );
+    }
+
+    #[test]
+    fn neg_global_budget_rejects_and_releases() {
+        // The relay-wide NEG budget bounds the items held across all
+        // connections: an open that does not fit fails retryably with
+        // NEG-ERR (which per NIP-77 closes the id) instead of pinning the
+        // items, and the reservation is returned exactly once on NEG-CLOSE,
+        // replacement, connection drop and panic (the latter through
+        // `NegState`'s Drop, like `PendingReq`).
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let now = unix_now();
+            let mut ids = Vec::new();
+            for i in 0..2 {
+                let ev = signed_note(conn.relay.secp(), &format!("e{i}"), now - i as u64, vec![]);
+                conn.relay.db.put(ev.clone(), now).await;
+                ids.push(ev.id);
+            }
+            let budget = Arc::clone(&conn.neg_budget);
+            let limit = neg_budget_bytes(conn.relay.config.read().await.limits.max_neg_items);
+            assert!(limit > 0, "held NEG state must always be budgeted");
+            // Fill the budget as if other connections held syncs.
+            assert!(budget.try_reserve(limit, limit).is_some());
+
+            conn.handle_neg_open(&[json!("sub"), json!({"kinds": [1]}), json!("61000000")])
+                .await;
+            let msgs = outgoing_json(&conn);
+            assert!(
+                msgs.iter().any(|m| m[0] == "NEG-ERR"
+                    && m[1] == "sub"
+                    && m[2].as_str().unwrap_or("").contains("overloaded")),
+                "an over-budget open must fail retryably with NEG-ERR: {msgs:?}"
+            );
+            assert!(conn.neg.is_empty(), "no over-budget state may be pinned");
+            assert_eq!(
+                budget.used(),
+                limit,
+                "the refused open must not reserve anything"
+            );
+
+            // Freeing a slot admits the open; the held set is reserved
+            // exactly (one reservation per held item).
+            budget.release(limit);
+            conn.outgoing.clear();
+            conn.handle_neg_open(&[json!("sub"), json!({"kinds": [1]}), json!("61000000")])
+                .await;
+            assert!(conn.neg.contains_key("sub"));
+            let held = budget.used();
+            assert_eq!(
+                held,
+                2 * NEG_ITEM_BYTES,
+                "the held item count must be reserved exactly"
+            );
+
+            // A successful replacement releases the old reservation before
+            // taking the new one: net zero for the same set.
+            conn.handle_neg_open(&[json!("sub"), json!({"kinds": [1]}), json!("61000000")])
+                .await;
+            assert_eq!(budget.used(), held, "replacement must be net zero");
+
+            // A second subscription reserves its own set; NEG-CLOSE returns
+            // exactly that one.
+            conn.outgoing.clear();
+            conn.handle_neg_open(&[json!("one"), json!({"ids": [ids[0]]}), json!("61000000")])
+                .await;
+            assert!(conn.neg.contains_key("one"));
+            assert_eq!(
+                budget.used(),
+                held + NEG_ITEM_BYTES,
+                "the second set must be reserved on top"
+            );
+            conn.handle_neg_close(&[json!("sub")]);
+            assert_eq!(
+                budget.used(),
+                NEG_ITEM_BYTES,
+                "NEG-CLOSE must release exactly the closed set"
+            );
+            assert!(!conn.neg.contains_key("sub"));
+
+            // Connection drop releases whatever is still held.
+            conn.relay.db.shutdown();
+            drop(conn);
+            assert_eq!(
+                budget.used(),
+                0,
+                "connection drop must release the remaining reservation"
+            );
+
+            // Panic path: a `NegState` dropped while unwinding releases its
+            // reservation (the connection guard relies on this when the
+            // connection task panics).
+            let panic_budget = Arc::new(PendingResponseBudget::new());
+            assert_eq!(panic_budget.try_reserve(128, 128), Some(128));
+            let state_budget = Arc::clone(&panic_budget);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _state = super::negentropy::NegState {
+                    items: Vec::new(),
+                    rounds_left: 1,
+                    budget: Some(state_budget),
+                    reserved: 128,
+                };
+                panic!("simulated panic while the NEG state is held");
+            }));
+            assert!(result.is_err(), "the simulated panic must unwind");
+            assert_eq!(
+                panic_budget.used(),
+                0,
+                "a panic must release the NEG reservation exactly once"
+            );
+        });
     }
 
     #[test]

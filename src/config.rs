@@ -366,9 +366,13 @@ pub struct DatabaseConfig {
     pub db_request_timeout_secs: u64,
     /// Skip the synchronous disk flush after every write batch (LMDB
     /// `MDB_NOSYNC`). Writes land in the OS page cache and are flushed by
-    /// the kernel later, which multiplies ingest throughput at the cost of
-    /// durability: on a power loss the most recent writes since the last
-    /// kernel flush may be lost. The default (false) flushes every batch.
+    /// the kernel later: commits cost microseconds instead of an fsync, at
+    /// the cost of durability and integrity. A power loss or OS crash can
+    /// lose acknowledged writes; if the OS persists the meta page before
+    /// the data pages it references, the database can be left corrupt
+    /// (restore from a backup). The writer force-syncs about once per
+    /// second, which bounds the loss window but not the ordering risk. The
+    /// default (false) flushes every batch.
     pub disabled_fsync: bool,
     /// Overload protection: when the database thread's queue holds more than
     /// this many pending messages (or `max_db_queue_events` events), new
@@ -1146,6 +1150,20 @@ impl Config {
             return Err(config_err(
                 "database.map_size must not exceed database.max_map_size",
             ));
+        }
+        // `disabled_fsync` (LMDB MDB_NOSYNC) skips the fsync after each
+        // commit: acknowledged writes can be lost, and a crash that leaves
+        // the meta page persisted before the data pages it references can
+        // corrupt the database. The writer force-syncs about once per
+        // second, which bounds the loss window but not the ordering risk.
+        // Warn loudly so the operator weighs it against the throughput.
+        if self.database.disabled_fsync {
+            log::warn!(
+                "database.disabled_fsync is enabled: commits skip the fsync, so a power \
+                 loss or OS crash can lose acknowledged writes and can corrupt the \
+                 database; the writer only force-syncs about once per second. Keep the \
+                 default (false) unless you have a backup and accept the risk"
+            );
         }
 
         // NIP toggles: `enabled_nips` wins silently; surface the ambiguity.

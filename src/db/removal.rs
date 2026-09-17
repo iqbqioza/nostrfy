@@ -1,10 +1,14 @@
 //! Event removal operations: NIP-09 deletions, NIP-86 bans, NIP-62
 //! vanish and the NIP-40 expiration purge.
 
+use std::sync::Arc;
+
+use super::db_error;
 use super::store::{
-    CREATED_LEN, GIFT_WRAP_INDEX, ID_LEN, Store, created_key, decode_purged_group_marker,
-    delegated_by, deleted_address_key, dtag_key_safe, encode_purged_group_marker, pubkey_key,
-    purged_group_key, replaceable_key, tag_key,
+    CREATED_LEN, GIFT_WRAP_INDEX, ID_LEN, Store, created_key, decode_pending_purge,
+    decode_purged_group_marker, delegated_by, deleted_address_key, dtag_key_safe,
+    encode_pending_purge, encode_purged_group_marker, pubkey_key, purged_group_key,
+    replaceable_key, tag_key,
 };
 use crate::error::Result;
 use crate::event::Event;
@@ -413,9 +417,16 @@ impl Store {
     /// which grew the database by the group's whole history). The marker is
     /// written and committed *first*: a put queued behind the purge sees it,
     /// and a crash mid-purge leaves the (fail-closed) cut rather than a
-    /// window where re-published events are accepted. A second commit
-    /// after the walk folds the newest removed timestamp into the cut, so
-    /// same-second or future-dated purged events are rejected too.
+    /// window where re-published events are accepted.
+    ///
+    /// The same commit records the purge in [`PURGE_PENDING`]: a crash or
+    /// `MapFull` after the marker but before the walk completes would
+    /// otherwise leave a ghosted group whose marker rejects every event —
+    /// including a re-issued `kind:9008` — while the old history stays
+    /// stored. [`Self::pending_purges`] reports the record so the caller
+    /// re-issues the purge, which is idempotent and keeps the furthest cut.
+    /// The completion commit folds the newest removed timestamp into the
+    /// cut, clears the in-progress record and bumps the derived-state stamp.
     pub(crate) fn purge_group(&self, gid: &str, now: u64) -> Result<usize> {
         self.disk_full_error()?;
         let key = purged_group_key(gid);
@@ -435,6 +446,8 @@ impl Store {
             let cut = old_cut.max(now);
             self.purged_groups
                 .put(&mut wtxn, &key, &encode_purged_group_marker(purge_now, cut))?;
+            self.purge_pending
+                .put(&mut wtxn, &key, &encode_pending_purge(gid, purge_now, cut))?;
             wtxn.commit()?;
             (purge_now, cut)
         };
@@ -444,6 +457,15 @@ impl Store {
         let mut removed = 0usize;
         let mut max_created = 0u64;
         loop {
+            // Test-only: fail after the marker and in-progress record
+            // committed, so the resume path runs with real crash state.
+            #[cfg(test)]
+            if self
+                .fail_next_purge_chunk
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(anyhow::anyhow!("test-only purge chunk failure"));
+            }
             // A fresh write transaction per chunk: a group's history is
             // unbounded, and one transaction across the whole purge pinned
             // the writer while a MapFull aborted everything.
@@ -476,24 +498,45 @@ impl Store {
             }
             wtxn.commit()?;
         }
-        if max_created > cut {
-            // Re-merge rather than overwrite: another purge cannot run
-            // concurrently (single writer), but a legacy 8-byte marker may
-            // have been upgraded by the initial commit above, and the
-            // furthest-cut rule must hold either way.
-            let mut wtxn = self.env.write_txn()?;
-            let (old_now, old_cut) = self
-                .purged_groups
-                .get(&wtxn, &key)?
-                .map(decode_purged_group_marker)
-                .unwrap_or((0, 0));
-            purge_now = purge_now.max(old_now);
-            cut = old_cut.max(max_created);
-            self.purged_groups
-                .put(&mut wtxn, &key, &encode_purged_group_marker(purge_now, cut))?;
-            wtxn.commit()?;
-        }
+        // Completion commit: re-merge the marker (a legacy 8-byte marker was
+        // upgraded by the initial commit above), clear the in-progress
+        // record and bump the derived-state stamp in one transaction. The
+        // stamp bump always happens here: every purge removes (or confirms
+        // the absence of) group history, and the derived state must be
+        // rebuilt from the surviving events.
+        let mut wtxn = self.env.write_txn()?;
+        let (old_now, old_cut) = self
+            .purged_groups
+            .get(&wtxn, &key)?
+            .map(decode_purged_group_marker)
+            .unwrap_or((0, 0));
+        purge_now = purge_now.max(old_now);
+        cut = cut.max(old_cut).max(max_created);
+        self.purged_groups
+            .put(&mut wtxn, &key, &encode_purged_group_marker(purge_now, cut))?;
+        self.purge_pending.delete(&mut wtxn, &key)?;
+        self.bump_state_stamp(&mut wtxn)?;
+        wtxn.commit()?;
         Ok(removed)
+    }
+
+    /// Started-but-unfinished group purges as `(gid, purge_now)`: each was
+    /// recorded before its first removal chunk and not cleared, so the
+    /// caller re-runs `purge_group(gid, purge_now)` to finish it (the walk
+    /// is idempotent and the marker keeps the furthest cut). A malformed
+    /// record is an error, so a caller that fails closed never treats a
+    /// corrupt pending table as "nothing to resume".
+    pub(crate) fn pending_purges(&self) -> Result<Vec<(String, u64)>> {
+        let rtxn = self.env.read_txn()?;
+        let mut out = Vec::new();
+        for item in self.purge_pending.iter(&rtxn)? {
+            let (_, raw) = item?;
+            let (gid, purge_now, _) = decode_pending_purge(raw).ok_or_else(|| {
+                anyhow::anyhow!("corrupt pending purge record ({} bytes)", raw.len())
+            })?;
+            out.push((gid, purge_now));
+        }
+        Ok(out)
     }
 
     /// NIP-62: deletes every event authored by `pubkey` (including NIP-09
@@ -504,28 +547,126 @@ impl Store {
     /// already honored, and a request covered by it removes nothing (NIP-62
     /// requests are signed, re-broadcastable events, so an unchecked replay
     /// would re-walk the author's whole history and rewrite the NIP-29/43
-    /// snapshots on every delivery).
+    /// snapshots on every delivery). Only the *completed* marker
+    /// short-circuits: an in-progress record means the walk was interrupted
+    /// and must be retried.
     pub(crate) fn apply_vanish(&self, pubkey: &[u8], until_created: u64) -> Result<(usize, bool)> {
         self.disk_full_error()?;
-        // Replay check: a marker covering this request means every event up
-        // to its cut was already removed (the marker is written last, see
-        // below), so there is nothing to do.
+        // Replay check: a completed marker covering this request means every
+        // event up to its cut was already removed, so there is nothing to do.
         {
             let rtxn = self.env.read_txn()?;
             // Legacy entries (written before the marker carried the timestamp)
             // have an empty value and count as `until_created = 0`, so they are
             // upgraded by the next request.
-            if let Some(raw) = self.vanish.get(&rtxn, pubkey)? {
-                let covered = raw
-                    .get(..8)
-                    .map(|bytes| u64::from_be_bytes(bytes.try_into().expect("checked length")))
-                    .unwrap_or(0);
-                if covered >= until_created {
-                    return Ok((0, false));
-                }
+            if self
+                .vanished_until(&rtxn, pubkey)?
+                .is_some_and(|covered| covered >= until_created)
+            {
+                return Ok((0, false));
             }
         }
+        // Persist the in-progress record *before* the first removal chunk:
+        // a crash or a store error mid-walk is then resumed at startup (or
+        // by a re-delivered request) instead of leaving removed events with
+        // no marker and no cursor. The merged cut is returned so a
+        // re-delivered older request never walks a shorter bound than the
+        // interrupted one.
+        let until_created = self.record_pending_vanish(pubkey, until_created)?;
+        self.finish_vanish(pubkey, until_created)
+    }
 
+    /// Completes every interrupted vanish before the writer serves its first
+    /// message (called from the writer thread at startup, so no put can
+    /// interleave and no `DbClient` round trip is needed — which would
+    /// deadlock the writer against itself). Idempotent: already-removed
+    /// events are simply not found, and a crash between the marker and the
+    /// pending clear re-writes the same (furthest) marker. A failed record
+    /// is logged and left in place for the next restart or re-delivery.
+    pub(crate) fn resume_pending_vanishes(
+        &self,
+        errors: &Arc<std::sync::atomic::AtomicU64>,
+    ) -> usize {
+        let pending = match self.pending_vanishes() {
+            Ok(pending) => pending,
+            Err(e) => {
+                db_error(errors, &e);
+                return 0;
+            }
+        };
+        let mut completed = 0usize;
+        for (pubkey, until_created) in pending {
+            match self.finish_vanish(&pubkey, until_created) {
+                Ok(_) => completed += 1,
+                Err(e) => db_error(errors, &e),
+            }
+        }
+        completed
+    }
+
+    /// Every started-but-unfinished vanish as `(pubkey, until_created)`,
+    /// used by the startup resume. A malformed record (bitrot) is skipped
+    /// with a warning: the completed-marker path still fails closed for the
+    /// pubkey once its marker exists, and a skipped record must not abort
+    /// the resume of the healthy ones.
+    pub(crate) fn pending_vanishes(&self) -> Result<Vec<(Vec<u8>, u64)>> {
+        let rtxn = self.env.read_txn()?;
+        let mut out = Vec::new();
+        for item in self.vanish_pending.iter(&rtxn)? {
+            let (key, raw) = item?;
+            match raw.get(..8) {
+                Some(bytes) => out.push((
+                    key.to_vec(),
+                    u64::from_be_bytes(bytes.try_into().expect("checked length")),
+                )),
+                None => log::warn!(
+                    "skipping corrupt pending vanish record ({} bytes)",
+                    raw.len()
+                ),
+            }
+        }
+        Ok(out)
+    }
+
+    /// The completed vanish bound for `pubkey`, if any (see [`VANISH`]).
+    fn vanished_until(&self, rtxn: &heed::RoTxn, pubkey: &[u8]) -> Result<Option<u64>> {
+        Ok(self
+            .vanish
+            .get(rtxn, pubkey)?
+            .and_then(|raw| raw.get(..8))
+            .map(|bytes| u64::from_be_bytes(bytes.try_into().expect("checked length"))))
+    }
+
+    /// Persists the in-progress vanish record (pubkey -> furthest
+    /// `until_created`) and returns the merged bound, so a re-delivered
+    /// older request resumes the interrupted one's full cut.
+    fn record_pending_vanish(&self, pubkey: &[u8], until_created: u64) -> Result<u64> {
+        self.disk_full_error()?;
+        let mut wtxn = self.env.write_txn()?;
+        let until = self
+            .vanish_pending
+            .get(&wtxn, pubkey)?
+            .and_then(|raw| raw.get(..8))
+            .map(|bytes| u64::from_be_bytes(bytes.try_into().expect("checked length")))
+            .unwrap_or(0)
+            .max(until_created);
+        self.vanish_pending
+            .put(&mut wtxn, pubkey, &until.to_be_bytes())?;
+        wtxn.commit()?;
+        Ok(until)
+    }
+
+    /// Walks and removes `pubkey`'s history up to `until_created`, drops the
+    /// addressed gift wraps, then writes the completed marker and clears the
+    /// pending record in the same commit. The walk is idempotent, so both a
+    /// re-delivered request and the startup resume can call it. The
+    /// derived-state stamp is bumped inside each chunk's transaction that
+    /// removed a NIP-29/NIP-43 state event, so a crash later in the walk
+    /// cannot lose the fact that the derived state changed.
+    fn finish_vanish(&self, pubkey: &[u8], until_created: u64) -> Result<(usize, bool)> {
+        // The resume path enters here directly: refuse to write to a full
+        // disk like every other write path (SIGBUS protection).
+        self.disk_full_error()?;
         let mut removed = 0usize;
         // Whether a NIP-29/NIP-43 state event (moderation/join/leave/role
         // mutation) was removed: only then does the derived state need a
@@ -544,11 +685,20 @@ impl Store {
         );
         let mut last_key: Option<Vec<u8>> = None;
         loop {
+            // Test-only: fail after the in-progress record committed (the
+            // caller wrote it), so the resume path runs with real crash
+            // state instead of hand-written table entries.
+            #[cfg(test)]
+            if self
+                .fail_next_vanish_chunk
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(anyhow::anyhow!("test-only vanish chunk failure"));
+            }
             // A fresh write transaction per chunk: the author's history is
             // unbounded, and one transaction across it pinned the writer
-            // while a MapFull aborted the whole vanish. The marker is
-            // written after the walk, so a partial pass is retried by a
-            // re-delivered request.
+            // while a MapFull aborted the whole vanish. The pending record
+            // (written by the caller) makes a partial pass resumable.
             let mut wtxn = self.env.write_txn()?;
             let lower = match &last_key {
                 Some(k) => std::ops::Bound::Excluded(k.as_slice()),
@@ -564,6 +714,7 @@ impl Store {
             }
             last_key = Some(entries.last().unwrap().0.clone());
             let pubkey_hex = hex::encode(pubkey);
+            let mut chunk_state_removed = false;
             for (key, id) in entries {
                 let Some(raw) = self.events.get(&wtxn, &id)? else {
                     continue;
@@ -585,29 +736,39 @@ impl Store {
                     }
                     continue;
                 }
-                group_state_removed |= is_group_state_kind(event.kind);
+                chunk_state_removed |= is_group_state_kind(event.kind);
                 self.remove_event(&mut wtxn, &id)?;
                 removed += 1;
             }
+            if chunk_state_removed {
+                // The stamp and the state-event removals commit atomically.
+                self.bump_state_stamp(&mut wtxn)?;
+            }
+            group_state_removed |= chunk_state_removed;
             wtxn.commit()?;
         }
 
         // NIP-59 gift wraps addressed to the vanished pubkey: the reserved
         // recipient index (keyed by the decoded pubkey) finds every hex case
         // variant with one narrow range. A failure here must not write the
-        // marker below: the re-delivered request has to finish the wraps.
+        // marker below: the re-delivered request (or the startup resume)
+        // has to finish the wraps.
         self.remove_gift_wraps_for(pubkey, &mut removed)?;
 
-        // The marker is written last, in its own transaction: a crash or a
-        // failure mid-walk leaves no marker, so a re-delivered request
-        // finishes the removal (already-removed chunks are gone) — the walk
-        // is idempotent and eventual consistency holds. The writer thread
-        // handles one message at a time, so no put can interleave between
-        // the walk and the marker: every put queued behind this vanish
-        // still sees the marker.
+        // The completed marker and the pending clear commit together: a
+        // crash between them would otherwise leave a pending record whose
+        // request is already covered, and the startup resume would never
+        // finish. The marker is written last, and the furthest honored
+        // bound is preserved so a replay or resume never regresses it. The
+        // writer thread handles one message at a time, so no put can
+        // interleave between the walk and the marker: every put queued
+        // behind this vanish still sees the marker (or the pending record
+        // in between).
         let mut wtxn = self.env.write_txn()?;
+        let covered = self.vanished_until(&wtxn, pubkey)?.unwrap_or(0);
         self.vanish
-            .put(&mut wtxn, pubkey, &until_created.to_be_bytes())?;
+            .put(&mut wtxn, pubkey, &covered.max(until_created).to_be_bytes())?;
+        self.vanish_pending.delete(&mut wtxn, pubkey)?;
         wtxn.commit()?;
 
         Ok((removed, group_state_removed))
@@ -667,10 +828,11 @@ impl Store {
                 break;
             }
             last_key = Some(entries.last().unwrap().0.clone());
+            let mut chunk_state_removed = false;
             for (key, id) in entries {
                 if let Some(raw) = self.events.get(&wtxn, &id)? {
                     if let Ok(event) = serde_json::from_slice::<Event>(raw) {
-                        group_state_removed |= is_group_state_kind(event.kind);
+                        chunk_state_removed |= is_group_state_kind(event.kind);
                     }
                     self.remove_event(&mut wtxn, &id)?;
                     removed += 1;
@@ -681,6 +843,13 @@ impl Store {
                     self.expiry.delete(&mut wtxn, &key)?;
                 }
             }
+            if chunk_state_removed {
+                // The stamp and the state-event removals commit atomically
+                // (a separate bump transaction would let a crash lose the
+                // fact that the derived state changed).
+                self.bump_state_stamp(&mut wtxn)?;
+            }
+            group_state_removed |= chunk_state_removed;
             wtxn.commit()?;
         }
         Ok((removed, group_state_removed))

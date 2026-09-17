@@ -93,11 +93,28 @@ impl std::error::Error for BlobOwnerLimit {}
 /// correctness.
 const MAX_BLOB_OWNERS: usize = 64;
 
+/// Result of one [`BlobStore::auto_migrate_legacy`] pass.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum MigrationOutcome {
+    /// The pass finished and the database marker is set.
+    Completed(usize),
+    /// The relay drained before the pass finished. The marker is **not**
+    /// set, so the next start reruns the migration; the chunks committed
+    /// before the stop are re-added idempotently there.
+    Interrupted(usize),
+}
+
 /// Blob storage: the LMDB-persisted mapping plus the file backend.
 pub(crate) struct BlobStore {
     storage: Storage,
     db: DbClient,
     upload_locks: Vec<tokio::sync::Mutex<()>>,
+    /// Stale spool files removed by the startup sweep (see
+    /// [`Self::sweep_stale_spools`]): each one is a temporary upload that
+    /// died before it could publish, so it doubles as the cheap
+    /// orphan/interrupted-upload signal. Exposed via
+    /// [`Self::orphan_spools_swept`] for the stats owner.
+    orphan_spools_swept: std::sync::atomic::AtomicU64,
     /// Test-only one-shot fault injection: the next owner-mapping commit is
     /// treated as a database failure so the publish-first ordering (an
     /// orphan object, never a phantom mapping) is testable without a real
@@ -133,6 +150,7 @@ impl BlobStore {
             upload_locks: (0..Self::UPLOAD_LOCK_COUNT)
                 .map(|_| tokio::sync::Mutex::new(()))
                 .collect(),
+            orphan_spools_swept: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             fail_next_mapping: std::sync::atomic::AtomicBool::new(false),
         })
@@ -189,9 +207,20 @@ impl BlobStore {
     /// missing body). Files this process start owns (matching token) and
     /// files of unknown shape are never touched. A removal failure is
     /// ignored (best effort).
+    ///
+    /// This is the whole file/mapping reconciliation story: the publish
+    /// path writes the object first and the LMDB mapping second, so a crash
+    /// leaves at most an invisible, overwritable orphan object — never a
+    /// mapping that 404s — and the only cheap orphan evidence is the
+    /// interrupted upload's spool file. No startup object-vs-mapping diff
+    /// is attempted: it would need an unbounded scan of the mapping index
+    /// (or the whole blob tree), and a legacy database whose mappings
+    /// `auto_migrate_legacy` is still rebuilding would report every
+    /// not-yet-mapped object as an orphan.
     pub(crate) fn sweep_stale_spools(&self) {
         let current = spool_process_token();
         let now = std::time::SystemTime::now();
+        let mut swept = 0u64;
         let mut dirs = vec![std::env::temp_dir()];
         if let Some(dir) = self.spool_dir() {
             dirs.push(dir);
@@ -217,11 +246,28 @@ impl BlobStore {
                 // yields PID 1 again). It is stale once its PID is gone, or
                 // once it outlived the grace period and can no longer be a
                 // live sibling's spool.
-                if !process_alive(pid) || spool_older_than(&entry, now) {
-                    let _ = std::fs::remove_file(entry.path());
+                if (!process_alive(pid) || spool_older_than(&entry, now))
+                    && std::fs::remove_file(entry.path()).is_ok()
+                {
+                    swept += 1;
                 }
             }
         }
+        if swept > 0 {
+            self.orphan_spools_swept
+                .fetch_add(swept, std::sync::atomic::Ordering::Relaxed);
+            log::info!("Blossom spool sweep: removed {swept} orphaned upload spool file(s)");
+        }
+    }
+
+    /// Stale spool files removed by [`Self::sweep_stale_spools`] since this
+    /// store was created. A plain counter the stats owner can wire as
+    /// `nostrfy_blossom_orphan_spools_swept` (counter): read
+    /// `relay.blossom.read().await` and call this getter.
+    #[allow(dead_code)] // Wired into `Stats` by the server/stats owner.
+    pub(crate) fn orphan_spools_swept(&self) -> u64 {
+        self.orphan_spools_swept
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub(crate) fn spool_dir(&self) -> Option<PathBuf> {
@@ -526,9 +572,23 @@ impl BlobStore {
     /// chunks and are committed as they arrive, so a legacy store with
     /// hundreds of thousands of blobs never materializes the full listing
     /// (nor a task per object) in memory.
-    pub(crate) async fn auto_migrate_legacy(&self) -> Result<usize> {
+    ///
+    /// The relay's `drain` signal is observed before the scan starts and in
+    /// the pass loop: shutdown returns [`MigrationOutcome::Interrupted`]
+    /// without writing the marker, so the next start reruns the pass (the
+    /// chunks already committed are re-added idempotently). The marker is
+    /// written only after the scan finished and every chunk committed.
+    pub(crate) async fn auto_migrate_legacy(
+        &self,
+        mut drain: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<MigrationOutcome> {
         if self.db.blossom_migration_done().await {
-            return Ok(0);
+            return Ok(MigrationOutcome::Completed(0));
+        }
+        // Shutdown before the pass even started: do not scan a store whose
+        // database is about to stop, and leave the marker unset.
+        if *drain.borrow() {
+            return Ok(MigrationOutcome::Interrupted(0));
         }
         // Backpressure of one chunk: the scanner waits while a slow disk
         // commits, bounding transient memory to ~2 chunks + one page.
@@ -546,6 +606,13 @@ impl BlobStore {
         loop {
             tokio::select! {
                 biased;
+                // Shutdown: abandon the scan at the next await. The marker
+                // stays unset (below is never reached), so the pass is
+                // resumable; a sender that is already gone counts as a
+                // drain too (the relay is being dropped).
+                _ = drain.changed() => {
+                    return Ok(MigrationOutcome::Interrupted(count));
+                }
                 r = &mut scan, if scanning => {
                     // The scanner finished (its sender is dropped): keep
                     // draining already-queued chunks below.
@@ -573,7 +640,7 @@ impl BlobStore {
             }
         }
         self.db.mark_blossom_migration().await;
-        Ok(count)
+        Ok(MigrationOutcome::Completed(count))
     }
 
     /// Blobs uploaded by `pubkey` (hex), via the persisted reverse index,
@@ -907,6 +974,11 @@ impl LocalStore {
     }
 
     fn release(&self, size: u64) {
+        // Mirror `reserve`: with the floor disabled nothing was counted, so
+        // subtracting here would wrap the counter.
+        if self.min_free_bytes == 0 {
+            return;
+        }
         self.reserved
             .fetch_sub(size, std::sync::atomic::Ordering::Relaxed);
     }
@@ -1855,9 +1927,11 @@ mod tests {
             .unwrap();
             let npub = "npub1external";
             std::os::unix::fs::symlink(&external, local(&s).root.join(npub)).unwrap();
-            let mapped = s.auto_migrate_legacy().await.unwrap();
+            let (_tx, drain) = tokio::sync::watch::channel(false);
+            let mapped = s.auto_migrate_legacy(drain).await.unwrap();
             assert_eq!(
-                mapped, 0,
+                mapped,
+                MigrationOutcome::Completed(0),
                 "the migration must not map files through a symlinked directory"
             );
             assert!(
@@ -1896,8 +1970,13 @@ mod tests {
             std::fs::write(&meta, r#"{"mime":"text/plain","size":999,"uploaded":1}"#).unwrap();
             std::os::unix::fs::symlink(&meta, dir.join(format!("{}.meta.json", "cd".repeat(32))))
                 .unwrap();
-            let mapped = s.auto_migrate_legacy().await.unwrap();
-            assert_eq!(mapped, 0, "the migration must not map symlinked blob files");
+            let (_tx, drain) = tokio::sync::watch::channel(false);
+            let mapped = s.auto_migrate_legacy(drain).await.unwrap();
+            assert_eq!(
+                mapped,
+                MigrationOutcome::Completed(0),
+                "the migration must not map symlinked blob files"
+            );
             assert!(s.find(&"ab".repeat(32)).await.unwrap().is_none());
             assert!(s.find(&"cd".repeat(32)).await.unwrap().is_none());
             let _ = std::fs::remove_file(&external);
@@ -1971,8 +2050,13 @@ mod tests {
             .unwrap();
         }
         let s = BlobStore::new("local", &dir, 0, None, db).await.unwrap();
-        let migrated = s.auto_migrate_legacy().await.unwrap();
-        assert_eq!(migrated, 2, "both owners are mapped");
+        let (_tx, drain) = tokio::sync::watch::channel(false);
+        let migrated = s.auto_migrate_legacy(drain).await.unwrap();
+        assert_eq!(
+            migrated,
+            MigrationOutcome::Completed(2),
+            "both owners are mapped"
+        );
         assert!(s.has(&pk(1), &sha).await.unwrap());
         assert!(
             s.has(&pk(2), &sha).await.unwrap(),
@@ -1983,6 +2067,55 @@ mod tests {
         // 一人削除してももう一人は残る
         assert!(s.delete(&pk(1), &sha).await.unwrap());
         assert!(s.find(&sha).await.unwrap().is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = db_path;
+    }
+
+    /// A drain that fires before the pass completes must leave the marker
+    /// unset: the marker is written only after a full scan, so the next
+    /// start resumes instead of skipping an unmapped store.
+    #[tokio::test]
+    async fn drained_migration_leaves_the_marker_unset_for_the_next_start() {
+        let (db, db_path) = db("mig-drain").await;
+        let dir = std::env::temp_dir().join(format!(
+            "nostrfy-blossom-test-mig-drain-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let a = pk(1);
+        let sha = "ee".repeat(32);
+        let npub_dir = dir.join(npub_of(&a));
+        std::fs::create_dir_all(&npub_dir).unwrap();
+        std::fs::write(npub_dir.join(&sha), b"x").unwrap();
+        std::fs::write(
+            npub_dir.join(format!("{sha}.meta.json")),
+            br#"{"size":1,"mime":"text/plain","uploaded":1787000000}"#,
+        )
+        .unwrap();
+        let s = BlobStore::new("local", &dir, 0, None, db).await.unwrap();
+
+        // Already draining: nothing is scanned, nothing is mapped and the
+        // marker stays unset.
+        let (tx, drain) = tokio::sync::watch::channel(false);
+        tx.send_replace(true);
+        assert_eq!(
+            s.auto_migrate_legacy(drain).await.unwrap(),
+            MigrationOutcome::Interrupted(0)
+        );
+        assert!(
+            !s.db.blossom_migration_done().await,
+            "an interrupted pass must not write the marker"
+        );
+        assert!(s.find(&sha).await.unwrap().is_none());
+
+        // The next start (a live drain signal) completes and marks.
+        let (_tx, drain) = tokio::sync::watch::channel(false);
+        assert_eq!(
+            s.auto_migrate_legacy(drain).await.unwrap(),
+            MigrationOutcome::Completed(1)
+        );
+        assert!(s.db.blossom_migration_done().await);
+        assert!(s.has(&a, &sha).await.unwrap());
         let _ = std::fs::remove_dir_all(&dir);
         let _ = db_path;
     }
@@ -2248,6 +2381,44 @@ mod tests {
         std::fs::write(&dead, b"dead").unwrap();
         s.sweep_stale_spools();
         assert!(!dead.exists(), "a dead process's spool must be swept");
+    }
+
+    /// The sweep counts every stale spool it removes: that counter is the
+    /// cheap interrupted-upload signal exposed for the stats owner.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stale_spool_sweep_counts_only_the_removed_orphans() {
+        let (s, _db_path) = store("sweep-count").await;
+        let dir = s.spool_dir().expect("local store");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Clear any leftover from an earlier test process first: the
+        // shared temp directory is swept too, and the count below must
+        // only see the orphan this test creates.
+        s.sweep_stale_spools();
+        let before = s.orphan_spools_swept();
+        // This process start's own spool: kept and not counted.
+        let ours = dir.join(spool_file_name(3));
+        std::fs::write(&ours, b"ours").unwrap();
+        // An orphan from a dead process start: removed and counted.
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let dead_pid = child.id();
+        child.wait().unwrap();
+        let dead = dir.join(format!("{SPOOL_PREFIX}{dead_pid}-deadbeef-0"));
+        std::fs::write(&dead, b"orphan").unwrap();
+        s.sweep_stale_spools();
+        assert!(ours.exists(), "this process start's own spool must be kept");
+        assert!(!dead.exists(), "the foreign-token orphan must be swept");
+        assert_eq!(
+            s.orphan_spools_swept() - before,
+            1,
+            "exactly the removed orphan must be counted"
+        );
+        s.sweep_stale_spools();
+        assert_eq!(
+            s.orphan_spools_swept() - before,
+            1,
+            "a second sweep must not count the kept spool"
+        );
     }
 }
 

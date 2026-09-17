@@ -26,6 +26,22 @@ pub struct Stats {
     pub buffers_dropped: AtomicU64,
     pub db_errors: AtomicU64,
     pub db_size_bytes: AtomicU64,
+    /// Recorded NIP-29 group purges still pending after the startup resume:
+    /// a non-zero value means a purge could not be completed, so the group
+    /// stays fail-closed (ghosted) until it is retried. A startup snapshot,
+    /// not a live count.
+    pub pending_purges: AtomicU64,
+    /// Completed NIP-62 vanish markers. The table grows permanently by
+    /// design (a vanished identity stays barred), so this gauge exists to
+    /// observe growth rather than to bound it.
+    pub vanish_markers: AtomicU64,
+    /// NIP-62 vanishes recorded but not yet completed: non-zero right after
+    /// a crash means the writer thread is resuming them at startup.
+    pub pending_vanishes: AtomicU64,
+    /// Blossom upload spool files removed by the startup sweep (orphans
+    /// from a previous process). A growing value on every restart means
+    /// uploads are being interrupted before publication.
+    pub blossom_orphan_spools_swept: AtomicU64,
 }
 
 impl Stats {
@@ -83,6 +99,15 @@ impl Stats {
             "buffers_dropped": self.buffers_dropped.load(Ordering::Relaxed),
             "db_errors": self.db_errors.load(Ordering::Relaxed),
             "db_size_bytes": self.db_size_bytes.load(Ordering::Relaxed),
+            // NIP-29 group purges still pending after the startup resume
+            // (see the Prometheus metric of the same name).
+            "pending_purges": self.pending_purges.load(Ordering::Relaxed),
+            // NIP-62 bookkeeping gauges (see the Prometheus metrics below).
+            "vanish_markers": self.vanish_markers.load(Ordering::Relaxed),
+            "pending_vanishes": self.pending_vanishes.load(Ordering::Relaxed),
+            "blossom_orphan_spools_swept": self
+                .blossom_orphan_spools_swept
+                .load(Ordering::Relaxed),
             // Logger write/rotation failures: a nonzero value means log
             // records are being lost (the log file is not the source of
             // truth for these counters).
@@ -204,6 +229,30 @@ impl Stats {
             self.db_size_bytes.load(Ordering::Relaxed),
         );
         metric(
+            "nostrfy_pending_purges",
+            "Recorded NIP-29 group purges still pending after the startup resume.",
+            "gauge",
+            self.pending_purges.load(Ordering::Relaxed),
+        );
+        metric(
+            "nostrfy_vanish_markers",
+            "Completed NIP-62 vanish markers (grows permanently by design).",
+            "gauge",
+            self.vanish_markers.load(Ordering::Relaxed),
+        );
+        metric(
+            "nostrfy_pending_vanishes",
+            "NIP-62 vanish requests recorded but not yet completed (resumed at startup).",
+            "gauge",
+            self.pending_vanishes.load(Ordering::Relaxed),
+        );
+        metric(
+            "nostrfy_blossom_orphan_spools_swept",
+            "Blossom upload spool files removed by the startup sweep.",
+            "counter",
+            self.blossom_orphan_spools_swept.load(Ordering::Relaxed),
+        );
+        metric(
             "nostrfy_log_errors",
             "Log file write/rotation failures since start (log records are being lost).",
             "counter",
@@ -245,6 +294,10 @@ mod tests {
         assert!(
             text.contains("# TYPE nostrfy_log_errors counter\n"),
             "the logger failure counter must be exposed for alerting"
+        );
+        assert!(
+            text.contains("# TYPE nostrfy_pending_purges gauge\n"),
+            "the pending-purge gauge must be exposed for alerting"
         );
         // Every line is either a comment, a blank, or `name value`.
         for line in text.lines() {

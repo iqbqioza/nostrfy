@@ -336,8 +336,25 @@ enum Msg {
         now: u64,
         reply: oneshot::Sender<(usize, bool)>,
     },
+    /// Started-but-unfinished NIP-29 group purges as `(gid, purge_now)`
+    /// (see `Store::pending_purges`). `None` when the table could not be
+    /// read: the caller fails closed instead of treating it as "none".
+    PendingPurges {
+        reply: oneshot::Sender<Option<Vec<(String, u64)>>>,
+    },
+    /// The persistent derived-group-state stamp (see `Store::state_stamp`).
+    /// `None` when the read failed: the caller fails closed instead of
+    /// treating a missing stamp as free to overwrite.
+    StateStamp {
+        reply: oneshot::Sender<Option<u64>>,
+    },
     DatabaseSize {
         reply: oneshot::Sender<u64>,
+    },
+    /// NIP-62 bookkeeping gauges: `(vanish markers, pending vanishes)`.
+    /// `None` when the read failed (the stats writer keeps the last value).
+    VanishCounts {
+        reply: oneshot::Sender<Option<(u64, u64)>>,
     },
     /// Last used LMDB page number. The map is opened at its fixed ceiling
     /// and never resized, so tests assert real page growth instead of the
@@ -596,6 +613,52 @@ impl DbClient {
     ) -> Result<DbClient> {
         let expiry = Arc::new(std::sync::atomic::AtomicBool::new(expiry_enabled));
         let store = Store::open(cfg, Arc::clone(&expiry), max_indexed_words)?;
+        Self::build(
+            cfg,
+            store,
+            expiry,
+            errors,
+            request_timeout_secs,
+            max_pending_msgs,
+            max_pending_events,
+        )
+    }
+
+    /// Test-only: builds a client over an already opened store, so a test
+    /// can arm the store's one-shot fault hooks before the threads start
+    /// (the hooks are consumed by the handler that runs them).
+    #[cfg(test)]
+    pub(crate) fn open_with_store(
+        cfg: &DatabaseConfig,
+        store: Store,
+        expiry: Arc<std::sync::atomic::AtomicBool>,
+        errors: Arc<std::sync::atomic::AtomicU64>,
+        request_timeout_secs: u64,
+        max_pending_msgs: usize,
+        max_pending_events: usize,
+    ) -> Result<DbClient> {
+        Self::build(
+            cfg,
+            store,
+            expiry,
+            errors,
+            request_timeout_secs,
+            max_pending_msgs,
+            max_pending_events,
+        )
+    }
+
+    /// Assembles a client over an opened store: the one-time access
+    /// migration, the thread spawn and the handle.
+    fn build(
+        cfg: &DatabaseConfig,
+        store: Store,
+        expiry: Arc<std::sync::atomic::AtomicBool>,
+        errors: Arc<std::sync::atomic::AtomicU64>,
+        request_timeout_secs: u64,
+        max_pending_msgs: usize,
+        max_pending_events: usize,
+    ) -> Result<DbClient> {
         // One-time migration: databases written before the pubkey lists
         // moved into their own key still carry them inside the `access`
         // blob — copy them over so existing bans/allowlists survive.
@@ -1815,8 +1878,39 @@ impl DbClient {
             .await
     }
 
+    /// Started-but-unfinished NIP-29 group purges as `(gid, purge_now)`:
+    /// each record was written before its first removal chunk and not
+    /// cleared, so the caller re-runs `group_purge(gid, purge_now)` to
+    /// finish the walk (idempotent, keeps the furthest cut). `None` when
+    /// the database could not answer: the caller fails closed instead of
+    /// treating unpurged (ghosted) groups as done.
+    pub async fn pending_purges(&self) -> Option<Vec<(String, u64)>> {
+        self.request_read_startup(|reply| Msg::PendingPurges { reply })
+            .await
+            .flatten()
+    }
+
+    /// The persistent "derived group state changed" stamp: monotonic, bumped
+    /// inside the write transaction of every group-state-relevant removal,
+    /// so a caller can persist it with a group snapshot and compare it at
+    /// startup to detect that the stored snapshot predates removals. `None`
+    /// when the database could not answer: the caller fails closed.
+    pub async fn state_stamp(&self) -> Option<u64> {
+        self.request_read_startup(|reply| Msg::StateStamp { reply })
+            .await
+            .flatten()
+    }
+
     pub async fn size_on_disk(&self) -> u64 {
         self.request_read(|reply| Msg::DatabaseSize { reply }).await
+    }
+
+    /// NIP-62 bookkeeping gauges (`vanish markers`, `pending vanishes`);
+    /// `None` when the reader could not answer.
+    pub async fn vanish_counts(&self) -> Option<(u64, u64)> {
+        self.request_read_result(|reply| Msg::VanishCounts { reply })
+            .await
+            .flatten()
     }
 
     /// Last used LMDB page number (used by tests to verify real database

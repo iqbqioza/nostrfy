@@ -132,6 +132,24 @@ pub(crate) const ROLES: &str = "roles";
 /// value carried two fields hold the cut alone and are read as
 /// `(cut, cut)`.
 pub(crate) const PURGED_GROUPS: &str = "purged_groups";
+/// In-progress NIP-29 group purges: `sha256(gid) -> gid length (BE u32) ||
+/// gid bytes || purge time (BE u64) || cut (BE u64)`. Written in the same
+/// commit as the [`PURGED_GROUPS`] marker, before the first removal chunk,
+/// and deleted only when the walk completed cleanly. A crash or `MapFull`
+/// mid-walk therefore leaves a resumable record instead of a ghosted group
+/// whose marker rejects the re-issued `kind:9008` (and every re-published
+/// history event) while the old history stays stored. The group id itself
+/// is stored because the marker table only keeps its digest.
+pub(crate) const PURGE_PENDING: &str = "purge_pending";
+/// In-progress NIP-62 vanishes: pubkey (32 bytes) -> until_created (BE
+/// u64). Written before the removal walk and cleared in the same commit as
+/// the completed [`VANISH`] marker, so an interrupted vanish is resumed at
+/// startup instead of leaving removed events with no marker and no cursor.
+pub(crate) const VANISH_PENDING: &str = "vanish_pending";
+/// [`INDEX_META`] key of the persistent derived-group-state stamp: bumped
+/// inside the write transaction of every group-state-relevant removal, so
+/// the stamp and the removals commit atomically.
+pub(crate) const STATE_STAMP_KEY: &[u8] = b"state_stamp";
 pub(crate) const CREATED_LEN: usize = 8;
 pub(crate) const ID_LEN: usize = 32;
 pub(crate) const TAG_VALUE_MAX: usize = 1024;
@@ -436,7 +454,12 @@ pub(crate) struct Store {
     /// NIP-29 purge markers (see [`PURGED_GROUPS`]): a purged group's
     /// history must not be re-publishable after the id is re-created.
     pub(crate) purged_groups: Database<Bytes, Bytes>,
-    /// One-time index migration markers (see [`INDEX_META`]).
+    /// Started-but-unfinished NIP-29 group purges (see [`PURGE_PENDING`]).
+    pub(crate) purge_pending: Database<Bytes, Bytes>,
+    /// Started-but-unfinished NIP-62 vanishes (see [`VANISH_PENDING`]).
+    pub(crate) vanish_pending: Database<Bytes, Bytes>,
+    /// One-time index migration markers (see [`INDEX_META`]) plus the
+    /// derived-state stamp (`state_stamp`).
     pub(crate) index_meta: Database<Bytes, Bytes>,
     /// NIP-40 expiration handling is only active when the NIP is enabled.
     /// Shared with the relay so that a config reload can toggle it at runtime.
@@ -461,6 +484,30 @@ pub(crate) struct Store {
     /// real 16 MiB (map floor) environment.
     #[cfg(test)]
     pub(crate) fail_next_commit: std::sync::atomic::AtomicBool,
+    /// Whether commits skip the fsync (`database.disabled_fsync`): the
+    /// writer thread then syncs periodically instead of only at shutdown.
+    /// Set once at open (the flag is not reloadable).
+    pub(crate) disabled_fsync: bool,
+    /// Test-only one-shot fault injection: the next writer message handler
+    /// panics, so the writer's `catch_unwind` recovery, its reply
+    /// revocation and the queued-work counter release are testable.
+    #[cfg(test)]
+    pub(crate) panic_next_write: Arc<std::sync::atomic::AtomicBool>,
+    /// Test-only one-shot fault injection for the reader threads (shared
+    /// with `clone_for_reader`, so arming the store before the threads
+    /// start reaches every reader).
+    #[cfg(test)]
+    pub(crate) panic_next_read: Arc<std::sync::atomic::AtomicBool>,
+    /// Test-only one-shot fault injection: the next `purge_group` removal
+    /// chunk fails after the marker and the in-progress record committed,
+    /// so the crash-recovery resume is exercised with real in-progress
+    /// state instead of hand-written table entries.
+    #[cfg(test)]
+    pub(crate) fail_next_purge_chunk: std::sync::atomic::AtomicBool,
+    /// Test-only one-shot fault injection: the next `apply_vanish` removal
+    /// chunk fails after the in-progress record committed.
+    #[cfg(test)]
+    pub(crate) fail_next_vanish_chunk: std::sync::atomic::AtomicBool,
 }
 
 /// `(created_at, id, protected, group_id, is_meta)` records returned by the
@@ -495,8 +542,8 @@ impl Store {
         let map_size = map_max_size as usize;
         let env = unsafe {
             EnvOpenOptions::new()
-                // 18 named tables, plus the word index when search is on.
-                .max_dbs(cfg.max_dbs.max(19))
+                // 20 named tables, plus the word index when search is on.
+                .max_dbs(cfg.max_dbs.max(21))
                 // Every reader thread can hold a concurrent read transaction,
                 // the writer/API/startup paths take slots too, and some read
                 // paths nest a second transaction inside the first
@@ -554,6 +601,9 @@ impl Store {
         let groups = env.create_database::<Bytes, Bytes>(&mut wtxn, Some(GROUPS))?;
         let roles = env.create_database::<Bytes, Bytes>(&mut wtxn, Some(ROLES))?;
         let purged_groups = env.create_database::<Bytes, Bytes>(&mut wtxn, Some(PURGED_GROUPS))?;
+        let purge_pending = env.create_database::<Bytes, Bytes>(&mut wtxn, Some(PURGE_PENDING))?;
+        let vanish_pending =
+            env.create_database::<Bytes, Bytes>(&mut wtxn, Some(VANISH_PENDING))?;
         let index_meta = env.create_database::<Bytes, Bytes>(&mut wtxn, Some(INDEX_META))?;
         wtxn.commit()?;
         // The word-index limit is persisted with the index it describes: a
@@ -589,7 +639,7 @@ impl Store {
         } else {
             configured_words
         };
-        let tables = if by_word.is_some() { 19 } else { 18 };
+        let tables = if by_word.is_some() { 21 } else { 20 };
         log::info!(
             "database ready at {} ({} tables, map {} MiB)",
             cfg.path.display(),
@@ -617,6 +667,8 @@ impl Store {
             groups,
             roles,
             purged_groups,
+            purge_pending,
+            vanish_pending,
             index_meta,
             expiry_enabled,
             max_indexed_words: max_indexed_words.max(1),
@@ -625,6 +677,15 @@ impl Store {
             df_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             #[cfg(test)]
             fail_next_commit: std::sync::atomic::AtomicBool::new(false),
+            disabled_fsync: cfg.disabled_fsync,
+            #[cfg(test)]
+            panic_next_write: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(test)]
+            panic_next_read: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(test)]
+            fail_next_purge_chunk: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_vanish_chunk: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -689,6 +750,8 @@ impl Store {
             groups: self.groups,
             roles: self.roles,
             purged_groups: self.purged_groups,
+            purge_pending: self.purge_pending,
+            vanish_pending: self.vanish_pending,
             index_meta: self.index_meta,
             expiry_enabled: Arc::clone(&self.expiry_enabled),
             max_indexed_words: self.max_indexed_words,
@@ -697,6 +760,18 @@ impl Store {
             df_cache: Arc::clone(&self.df_cache),
             #[cfg(test)]
             fail_next_commit: std::sync::atomic::AtomicBool::new(false),
+            disabled_fsync: self.disabled_fsync,
+            // The panic hooks are shared: a test arms the store before the
+            // threads start, and exactly one handler (writer or reader)
+            // consumes the one-shot flag.
+            #[cfg(test)]
+            panic_next_write: Arc::clone(&self.panic_next_write),
+            #[cfg(test)]
+            panic_next_read: Arc::clone(&self.panic_next_read),
+            #[cfg(test)]
+            fail_next_purge_chunk: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_vanish_chunk: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -1461,6 +1536,30 @@ pub(crate) fn decode_purged_group_marker(raw: &[u8]) -> (u64, u64) {
     }
 }
 
+/// Encodes a [`PURGE_PENDING`] record: `gid length (BE u32) || gid bytes ||
+/// purge time (BE u64) || cut (BE u64)`.
+pub(crate) fn encode_pending_purge(gid: &str, purge_now: u64, cut: u64) -> Vec<u8> {
+    let mut value = Vec::with_capacity(4 + gid.len() + 16);
+    value.extend_from_slice(&(gid.len() as u32).to_be_bytes());
+    value.extend_from_slice(gid.as_bytes());
+    value.extend_from_slice(&purge_now.to_be_bytes());
+    value.extend_from_slice(&cut.to_be_bytes());
+    value
+}
+
+/// Decodes a [`PURGE_PENDING`] record into `(gid, purge time, cut)`.
+pub(crate) fn decode_pending_purge(raw: &[u8]) -> Option<(String, u64, u64)> {
+    let gid_len = u32::from_be_bytes(raw.get(..4)?.try_into().ok()?) as usize;
+    let gid = raw.get(4..4 + gid_len)?;
+    let purge_now = u64::from_be_bytes(raw.get(4 + gid_len..4 + gid_len + 8)?.try_into().ok()?);
+    let cut = u64::from_be_bytes(
+        raw.get(4 + gid_len + 8..4 + gid_len + 16)?
+            .try_into()
+            .ok()?,
+    );
+    Some((String::from_utf8(gid.to_vec()).ok()?, purge_now, cut))
+}
+
 /// Tombstone key for an `a`-tag (address) deletion, stored in the
 /// [`DELETED`] table. Event ids are exactly 32 bytes, so the one-byte prefix
 /// keeps the two key spaces disjoint. The `d` tag is normalized like the
@@ -1481,6 +1580,60 @@ pub(crate) fn deleted_address_key(kind: u64, pubkey: &[u8], dtag: &str) -> Vec<u
 }
 impl Store {
     // ----- event persistence -----
+
+    /// Whether `pubkey` has requested a NIP-62 vanish: the completed
+    /// [`VANISH`] marker or an in-progress [`VANISH_PENDING`] record both
+    /// block new events, so a crash between the walk and the marker cannot
+    /// reopen a vanished identity before the startup resume completes.
+    /// The pending table is usually empty, so the second lookup is skipped.
+    fn vanished_or_pending(&self, wtxn: &heed::RwTxn, pubkey: &[u8]) -> Result<bool> {
+        if self.vanish.get(wtxn, pubkey)?.is_some() {
+            return Ok(true);
+        }
+        if self.vanish_pending.is_empty(wtxn)? {
+            return Ok(false);
+        }
+        Ok(self.vanish_pending.get(wtxn, pubkey)?.is_some())
+    }
+
+    /// Row counts of the NIP-62 bookkeeping: `(completed vanish markers,
+    /// pending vanish records)`. Exposed as gauges so operators can see the
+    /// (permanently growing) marker table and confirm that interrupted
+    /// vanishes were resumed.
+    pub(crate) fn vanish_counts(&self) -> Result<(u64, u64)> {
+        let rtxn = self.env.read_txn()?;
+        Ok((self.vanish.len(&rtxn)?, self.vanish_pending.len(&rtxn)?))
+    }
+
+    /// The persistent derived-group-state stamp: 0 when it was never
+    /// bumped (fresh/pre-stamp database). See [`STATE_STAMP_KEY`].
+    pub(crate) fn state_stamp(&self) -> Result<u64> {
+        let rtxn = self.env.read_txn()?;
+        Ok(self
+            .index_meta
+            .get(&rtxn, STATE_STAMP_KEY)?
+            .and_then(|raw| raw.get(..8))
+            .map(|bytes| u64::from_be_bytes(bytes.try_into().expect("checked length")))
+            .unwrap_or(0))
+    }
+
+    /// Bumps the derived-group-state stamp inside an open write
+    /// transaction, so the stamp and the group-state-relevant removal it
+    /// describes commit atomically (a startup stamp comparison can never
+    /// observe one without the other). Callers invoke this only when the
+    /// transaction actually removed a group-state event.
+    pub(crate) fn bump_state_stamp(&self, wtxn: &mut heed::RwTxn) -> Result<()> {
+        let next = self
+            .index_meta
+            .get(wtxn, STATE_STAMP_KEY)?
+            .and_then(|raw| raw.get(..8))
+            .map(|bytes| u64::from_be_bytes(bytes.try_into().expect("checked length")))
+            .unwrap_or(0)
+            .saturating_add(1);
+        self.index_meta
+            .put(wtxn, STATE_STAMP_KEY, &next.to_be_bytes())?;
+        Ok(())
+    }
 
     /// Whether a NIP-29 purge marker blocks `event`: any `h`-tagged event
     /// with `created_at <= cut` is a re-publication of purged history (see
@@ -1535,7 +1688,7 @@ impl Store {
             None => return Ok(PutOutcome::Invalid("invalid pubkey".into())),
         };
 
-        if self.vanish.get(wtxn, &pubkey)?.is_some() {
+        if self.vanished_or_pending(wtxn, &pubkey)? {
             return Ok(PutOutcome::Invalid(
                 "blocked: this pubkey has requested to vanish".into(),
             ));
@@ -1547,7 +1700,7 @@ impl Store {
         if let Some(delegator) = crate::nips::nip26::delegation(event)
             && let Ok(delegator_bytes) = hex::decode(delegator[0])
             && delegator_bytes.len() == ID_LEN
-            && self.vanish.get(wtxn, &delegator_bytes)?.is_some()
+            && self.vanished_or_pending(wtxn, &delegator_bytes)?
         {
             return Ok(PutOutcome::Invalid(
                 "blocked: the delegator has requested to vanish".into(),
@@ -1564,7 +1717,7 @@ impl Store {
                     && tag[0] == "p"
                     && let Ok(recipient) = hex::decode(&tag[1])
                     && recipient.len() == ID_LEN
-                    && self.vanish.get(wtxn, &recipient)?.is_some()
+                    && self.vanished_or_pending(wtxn, &recipient)?
                 {
                     return Ok(PutOutcome::Invalid(
                         "blocked: the recipient has requested to vanish".into(),

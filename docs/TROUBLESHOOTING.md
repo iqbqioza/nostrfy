@@ -291,6 +291,12 @@ The request did not reach the relay with the Blossom Host header. Point `media.e
 
 The file is content-addressed by its SHA-256: fetch it via the exact hash returned in the upload response (`/<sha256>` or `/<sha256>.<ext>`). A mismatch means the client requested a different hash than the bytes it sent.
 
+### 3b-5. A blob is listed (`HEAD`/metadata) but `GET` 404s after a crash
+
+**Cause**: the blob object (file or S3 object) and its LMDB owner mapping are separate writes. Current builds publish the object first and commit the mapping only after the object is durable, so a crash in between leaves an invisible orphan object (never a listed blob whose bytes are missing). Builds before this file-first ordering could commit the mapping first, so a crash — or a `disabled_fsync` loss — could leave a **phantom mapping**: `HEAD` answers with metadata while `GET` 404s, and the per-blob owner cap can make a fresh upload of the same bytes fail with `409`.
+
+**Fix**: re-upload the exact bytes: the upload publishes the object and the existing mapping then resolves. If the owner cap refuses the re-upload, have one of the mapping's listed owners delete the blob through the Blossom API (BUD-02 `DELETE`) and upload again; a mapping with no reachable owner or a lost object needs an operator-side cleanup of the blob directory/mapping.
+
 ## 4. Search, Groups, Auth
 
 ### 4-1. Search returns 0 results / unexpected results
@@ -427,6 +433,18 @@ cp -a ./data ./data-backup
 # Also back up [blossom].local_path when using local Blossom storage.
 ./target/release/nostrfy --config nostrfy.toml start
 ```
+
+### 5-6. Acknowledged writes are missing, or the database will not open (`disabled_fsync`)
+
+**Cause**: `database.disabled_fsync = true` (LMDB `MDB_NOSYNC`) makes commits skip the fsync; the writer only force-syncs about once per second. A power loss or OS crash can therefore lose acknowledged writes, and if the OS persists the LMDB meta page before the data pages it references the database can be left corrupt (it may fail to open, or read stale/garbage pages). The startup log warns when the flag is enabled.
+
+**Fix**: Stop the relay and restore the newest backup into `database.path` (see 5-5), then run with `disabled_fsync = false` — or keep a continuously synced backup/replica if you need the throughput. Without a backup, `mdb_dump`/`mdb_load` (`lmdb-utils`) may salvage a readable prefix, but expect errors and missing recent data: restoring a backup is the only reliable recovery.
+
+### 5-7. The database directory keeps growing after vanishes or group purges
+
+**Cause/posture**: NIP-62 vanish requests keep one permanent marker per vanished pubkey (so the identity cannot re-publish and the startup rebuilds exclude its pre-vanish events), and NIP-29 group purges keep one permanent tombstone per purged group (so purged history cannot be re-published). These markers are deliberately never expired, so the tables grow by roughly one small entry (tens of bytes) per vanished identity / purged group — a per-action, not per-event, cost. The removed content itself is freed for reuse; with LMDB the file's high-water mark can stay at its peak even when pages are reused, and `database.map_size` is only a virtual-address reservation, so check actual usage with `nostrfy stats` (`db_size_bytes`) rather than the map size.
+
+**Monitoring**: the Prometheus/JSON gauge `nostrfy_pending_purges` counts recorded group purges that could not be completed at startup (the relay re-runs them before serving; it should be `0`, and a non-zero value means a group stays fail-closed/ghosted until the next restart retries). There is no vanish-marker count gauge yet.
 
 ---
 

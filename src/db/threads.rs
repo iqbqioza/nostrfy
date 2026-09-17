@@ -41,6 +41,52 @@ impl Drop for PendingGuard {
     }
 }
 
+/// Why a timed receive returned (see [`recv_timeout`]).
+pub(crate) enum RecvOutcome<T> {
+    Message(T),
+    /// The timeout elapsed with no message.
+    TimedOut,
+    /// Every sender was dropped.
+    Closed,
+}
+
+/// Blocks for at most `timeout` for the next message, waking immediately
+/// when one arrives. The writer thread only needs this when commits skip
+/// the fsync: an unbounded `blocking_recv` would sleep through an idle
+/// period and leave the committed tail in the page cache until shutdown.
+/// Built on `poll_recv` with a waker that unparks this thread, so no
+/// runtime is required and new messages keep their normal latency.
+pub(crate) fn recv_timeout(
+    rx: &mut mpsc::UnboundedReceiver<Msg>,
+    timeout: std::time::Duration,
+) -> RecvOutcome<Msg> {
+    use std::task::{Context, Poll, Wake, Waker};
+
+    struct Unpark(std::thread::Thread);
+    impl Wake for Unpark {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+
+    let waker = Waker::from(Arc::new(Unpark(std::thread::current())));
+    let mut cx = Context::from_waker(&waker);
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match rx.poll_recv(&mut cx) {
+            Poll::Ready(Some(msg)) => return RecvOutcome::Message(msg),
+            Poll::Ready(None) => return RecvOutcome::Closed,
+            Poll::Pending => {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    return RecvOutcome::TimedOut;
+                }
+                std::thread::park_timeout(deadline - now);
+            }
+        }
+    }
+}
+
 /// The channels, counters and flags handed to the [`super::DbClient`] by
 /// [`spawn`].
 pub(crate) struct DbThreads {
@@ -75,6 +121,17 @@ pub(crate) struct DbThreads {
 /// Serves one read-only message on a dedicated reader thread. Returns
 /// `true` when the thread must shut down.
 fn handle_read_msg(store: &Store, errors: &Arc<std::sync::atomic::AtomicU64>, msg: Msg) -> bool {
+    // Test-only fault injection: the reader's `catch_unwind` recovery and
+    // its queued-work counter release are exercised by panicking once here
+    // (the caller's reply sender is dropped, so a reporting caller sees a
+    // failure instead of a default value).
+    #[cfg(test)]
+    if store
+        .panic_next_read
+        .swap(false, std::sync::atomic::Ordering::SeqCst)
+    {
+        panic!("test-only reader handler fault");
+    }
     match msg {
         Msg::VanishPubkeysPage {
             after,
@@ -336,6 +393,41 @@ fn handle_read_msg(store: &Store, errors: &Arc<std::sync::atomic::AtomicU64>, ms
             let _ = reply.send(store.size_on_disk());
             false
         }
+        Msg::VanishCounts { reply } => {
+            let counts = match store.vanish_counts() {
+                Ok(counts) => Some(counts),
+                Err(e) => {
+                    db_error(errors, &e);
+                    None
+                }
+            };
+            let _ = reply.send(counts);
+            false
+        }
+        Msg::PendingPurges { reply } => {
+            // A failed read sends `None`: the caller fails closed instead
+            // of treating an unreadable table as "no pending purges".
+            let pending = match store.pending_purges() {
+                Ok(pending) => Some(pending),
+                Err(e) => {
+                    db_error(errors, &e);
+                    None
+                }
+            };
+            let _ = reply.send(pending);
+            false
+        }
+        Msg::StateStamp { reply } => {
+            let stamp = match store.state_stamp() {
+                Ok(stamp) => Some(stamp),
+                Err(e) => {
+                    db_error(errors, &e);
+                    None
+                }
+            };
+            let _ = reply.send(stamp);
+            false
+        }
         #[cfg(test)]
         Msg::LastPage { reply } => {
             let _ = reply.send(store.env.info().last_page_number as u64);
@@ -529,16 +621,56 @@ pub(crate) fn spawn(
             Ok(false) => {}
             Err(e) => db_error(&thread_errors, &e),
         }
+        // Resume interrupted NIP-62 vanishes before serving any message: a
+        // crash or store error mid-walk left the pending record, and the
+        // remaining events must not stay visible once the relay opens. This
+        // runs on the writer thread (the single writer) before the drain
+        // loop, so no put can interleave and no `DbClient` round trip is
+        // needed (which would deadlock the writer against itself).
+        let resumed = store.resume_pending_vanishes(&thread_errors);
+        if resumed > 0 {
+            log::info!("resumed {resumed} interrupted vanish request(s)");
+        }
         // Puts are applied in batches sharing one write transaction so
         // that the LMDB commit cost (a full fsync by default) is paid
         // once per batch instead of once per event. Replies are only
         // sent after the commit, so an OK implies durability.
         const BATCH: usize = 64;
+        // With fsync disabled, commits land in the OS page cache: sync at
+        // most once per interval so a crash loses only a small tail. The
+        // default (fsync enabled) keeps the plain blocking receive.
+        const SYNC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+        let mut next_sync = std::time::Instant::now() + SYNC_INTERVAL;
         // Put batches received within the current message drain are merged
         // into a single commit at flush time.
         let mut batch = WriteBatch::default();
         'outer: loop {
-            let Some(msg) = rx.blocking_recv() else {
+            // The periodic sync must fire even under a sustained message
+            // stream, where the timed receive below always finds work.
+            if store.disabled_fsync && std::time::Instant::now() >= next_sync {
+                // Best effort: a failed sync is reported but does not stop
+                // the writer (the next tick retries).
+                if let Err(e) = store.env.force_sync() {
+                    db_error(&thread_errors, &e.into());
+                }
+                next_sync = std::time::Instant::now() + SYNC_INTERVAL;
+            }
+            let msg = if store.disabled_fsync {
+                match recv_timeout(
+                    &mut rx,
+                    next_sync.saturating_duration_since(std::time::Instant::now()),
+                ) {
+                    RecvOutcome::Message(msg) => Some(msg),
+                    // The deadline passed while waiting: sync at the top of
+                    // the next iteration (a message that arrived at the same
+                    // moment was returned instead and is not delayed).
+                    RecvOutcome::TimedOut => continue 'outer,
+                    RecvOutcome::Closed => None,
+                }
+            } else {
+                rx.blocking_recv()
+            };
+            let Some(msg) = msg else {
                 // The channel is closed (every DbClient was dropped
                 // without a shutdown): flush any pending batch so that
                 // awaiting requests are not left hanging.
@@ -629,6 +761,18 @@ pub(crate) fn spawn(
                             batch.puts.push((event, now));
                             batch.first_seen.push(first_seen);
                             batch.senders.push(reply);
+                            // Test-only fault injection: panic once *after*
+                            // the put joined the batch, so the recovery's
+                            // reply revocation (the batch is rolled back
+                            // with the transaction) and the `PendingGuard`
+                            // counter release are both exercised.
+                            #[cfg(test)]
+                            if store
+                                .panic_next_write
+                                .swap(false, std::sync::atomic::Ordering::SeqCst)
+                            {
+                                panic!("test-only writer handler fault");
+                            }
                         }
                         Msg::PutBatch { events, reply } => {
                             batch.pending_batches.push((events, reply));
@@ -1098,8 +1242,38 @@ pub(crate) fn spawn(
                                     };
                                     let _ = reply.send(n);
                                 }
+                                Msg::PendingPurges { reply } => {
+                                    let pending = match store.pending_purges() {
+                                        Ok(pending) => Some(pending),
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            None
+                                        }
+                                    };
+                                    let _ = reply.send(pending);
+                                }
+                                Msg::StateStamp { reply } => {
+                                    let stamp = match store.state_stamp() {
+                                        Ok(stamp) => Some(stamp),
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            None
+                                        }
+                                    };
+                                    let _ = reply.send(stamp);
+                                }
                                 Msg::DatabaseSize { reply } => {
                                     let _ = reply.send(store.size_on_disk());
+                                }
+                                Msg::VanishCounts { reply } => {
+                                    let counts = match store.vanish_counts() {
+                                        Ok(counts) => Some(counts),
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            None
+                                        }
+                                    };
+                                    let _ = reply.send(counts);
                                 }
                                 #[cfg(test)]
                                 Msg::LastPage { reply } => {

@@ -4883,3 +4883,663 @@ fn search_limit_applies_to_the_union_of_indexed_and_overflow_matches() {
     });
     db.shutdown();
 }
+
+// ----- crash recovery, durability and thread failure injection -----
+
+#[test]
+fn writer_thread_recovers_from_a_handler_panic() {
+    // A panic inside a writer handler must not kill the database thread:
+    // the queued batch is revoked (an OK after a rollback would be a lie),
+    // the queued-work counters return to zero and the next request is
+    // served. The one-shot test hook panics after the put joined the batch,
+    // so both the reply revocation and the `PendingGuard` release are
+    // exercised.
+    let cfg = config();
+    let expiry = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let store = crate::db::store::Store::open(&cfg, Arc::clone(&expiry), 128).unwrap();
+    store
+        .panic_next_write
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let db = DbClient::open_with_store(
+        &cfg,
+        store,
+        expiry,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+    )
+    .unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let now = unix_now();
+        let e = event(1, "panic candidate", now, vec![]);
+        let out = db.put(e.clone(), now).await;
+        assert!(
+            matches!(out, PutOutcome::Invalid(_)),
+            "the panicking handler's put must be revoked, got {out:?}"
+        );
+        assert_eq!(
+            db.pending_msgs.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "the panic must release the queued-message counter"
+        );
+        assert_eq!(
+            db.pending_events.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "the panic must release the queued-event counter"
+        );
+        assert_eq!(
+            db.pending_bytes.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "the panic must release the queued-byte counter"
+        );
+        // The rolled-back put was not stored, and the thread recovered.
+        assert_eq!(db.put(e.clone(), now).await, PutOutcome::Stored);
+        let f: Filter = serde_json::from_value(serde_json::json!({"ids": [e.id]})).unwrap();
+        let (res, _) = db.query(vec![f], 10, now).await;
+        assert_eq!(res.len(), 1, "the database thread must keep serving");
+    });
+    db.shutdown();
+}
+
+#[test]
+fn reader_thread_recovers_from_a_handler_panic() {
+    // A panic inside a reader handler drops that request's reply (a
+    // reporting caller sees a failure instead of a default), releases the
+    // reader-queue counters and leaves the thread serving the next query.
+    let cfg = config();
+    let expiry = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let store = crate::db::store::Store::open(&cfg, Arc::clone(&expiry), 128).unwrap();
+    store
+        .panic_next_read
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let db = DbClient::open_with_store(
+        &cfg,
+        store,
+        expiry,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+    )
+    .unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let now = unix_now();
+        let e = event(1, "reader panic", now, vec![]);
+        assert_eq!(db.put(e.clone(), now).await, PutOutcome::Stored);
+        let f: Filter = serde_json::from_value(serde_json::json!({"ids": [e.id]})).unwrap();
+        assert!(
+            db.query_req_reported(vec![f.clone()], 10, now)
+                .await
+                .is_none(),
+            "the panicked reader's reply must be a reported failure"
+        );
+        // The reply is dropped during unwinding, so the caller observes the
+        // failure before the reader thread has finished its panic recovery:
+        // wait briefly for the counters instead of racing the unwind.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline
+            && db.pending_reads.load(std::sync::atomic::Ordering::Relaxed) != 0
+        {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(
+            db.pending_reads.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "the panic must release the reader-queue counter"
+        );
+        assert_eq!(
+            db.pending_read_bytes
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "the panic must release the reader byte counter"
+        );
+        let (res, _) = db.query(vec![f], 10, now).await;
+        assert_eq!(res.len(), 1, "the reader must keep serving after a panic");
+    });
+    db.shutdown();
+}
+
+#[test]
+fn pending_group_purge_is_reported_and_resumable() {
+    // Crash recovery for `kind:9008`: the initial commit writes the marker
+    // and the in-progress record, then the walk fails (armed fault) before
+    // removing a chunk. `pending_purges` reports the record and the
+    // re-issued purge completes the walk idempotently, keeping the furthest
+    // cut, before clearing the record.
+    use crate::db::store::Store;
+    let cfg = config();
+    let now = 1_700_000_000u64;
+    let gid = "pending-purge";
+    let tagged = |content: &str, created: u64| {
+        event(1, content, created, vec![vec!["h".into(), gid.into()]])
+    };
+    let e1 = tagged("one", now - 10);
+    let e2 = tagged("two", now);
+    // Future-dated history pushes the completed cut past the purge time.
+    let e3 = tagged("future", now + 100);
+    let expiry = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let store = Store::open(&cfg, Arc::clone(&expiry), 128).unwrap();
+    {
+        let mut wtxn = store.env.write_txn().unwrap();
+        for e in [&e1, &e2, &e3] {
+            assert_eq!(
+                store.put_event_in(&mut wtxn, e, now).unwrap(),
+                PutOutcome::Stored
+            );
+        }
+        wtxn.commit().unwrap();
+    }
+    // Arm the one-shot fault: the purge records its marker and in-progress
+    // record, then fails before the first removal chunk.
+    store
+        .fail_next_purge_chunk
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let db = DbClient::open_with_store(
+        &cfg,
+        store,
+        expiry,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+    )
+    .unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        // The failed walk reports zero removed, but the marker is already
+        // committed: the group's history stays stored while a replay is
+        // fail-closed.
+        let history: Filter = serde_json::from_value(serde_json::json!({"#h": [gid]})).unwrap();
+        assert_eq!(db.group_purge(gid.into(), now).await, 0);
+        assert_eq!(
+            db.query(vec![history.clone()], 10, now).await.0.len(),
+            3,
+            "a failed purge must leave the group's history stored"
+        );
+        assert_eq!(db.put(e1.clone(), now).await, PutOutcome::PreviouslyDeleted);
+        assert_eq!(
+            db.pending_purges()
+                .await
+                .expect("a healthy pending read must answer"),
+            vec![(gid.to_string(), now)],
+            "the interrupted purge must be recorded"
+        );
+        // The re-issued purge finishes the walk and clears the record.
+        assert_eq!(db.group_purge(gid.into(), now).await, 3);
+        assert!(
+            db.pending_purges()
+                .await
+                .expect("a healthy pending read must answer")
+                .is_empty(),
+            "the completed purge must clear its in-progress record"
+        );
+        assert!(db.query(vec![history], 10, now).await.0.is_empty());
+        // An idempotent re-run keeps the furthest cut: the future-dated
+        // event's timestamp was folded in, so a replay between the purge
+        // time and that event is still rejected.
+        assert_eq!(db.group_purge(gid.into(), now).await, 0);
+        assert_eq!(
+            db.put(tagged("between", now + 50), now).await,
+            PutOutcome::PreviouslyDeleted
+        );
+        // Beyond the furthest removed timestamp a new event is accepted.
+        assert_eq!(
+            db.put(tagged("fresh", now + 200), now).await,
+            PutOutcome::Stored
+        );
+    });
+    db.shutdown();
+}
+
+#[test]
+fn interrupted_vanish_is_resumed_at_startup() {
+    // Arm the one-shot vanish fault so a real `Msg::Vanish` fails after the
+    // in-progress record committed: the record exists, no marker is written
+    // and the history stays stored. A restart (`Store::open` + the real
+    // writer/reader threads) runs the startup resume, which removes the
+    // remaining history, writes the completed marker and bars the pubkey.
+    use crate::db::store::Store;
+    let cfg = config();
+    let now = 1_700_000_000u64;
+    let pk = "ef".repeat(32);
+    let pk_bytes: [u8; 32] = hex::decode(&pk).unwrap().try_into().unwrap();
+    let authored = |content: &str, created: u64| {
+        let mut e = event(1, content, created, vec![]);
+        e.pubkey = pk.to_string();
+        e.id = nip01::compute_id(&e);
+        e
+    };
+    let old = authored("old", now - 20);
+    let newer = authored("newer", now - 10);
+    let expiry = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let store = Store::open(&cfg, Arc::clone(&expiry), 128).unwrap();
+    {
+        let mut wtxn = store.env.write_txn().unwrap();
+        for e in [&old, &newer] {
+            assert_eq!(
+                store.put_event_in(&mut wtxn, e, now).unwrap(),
+                PutOutcome::Stored
+            );
+        }
+        wtxn.commit().unwrap();
+    }
+    // Arm the one-shot fault: the vanish records its in-progress record,
+    // then fails before the first removal chunk.
+    store
+        .fail_next_vanish_chunk
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let db = DbClient::open_with_store(
+        &cfg,
+        store,
+        expiry,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+    )
+    .unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let author_filter =
+        || -> Filter { serde_json::from_value(serde_json::json!({"authors": [pk]})).unwrap() };
+    rt.block_on(async {
+        assert_eq!(
+            db.apply_vanish_checked(pk_bytes, now).await,
+            None,
+            "the interrupted walk must report failure"
+        );
+        assert_eq!(
+            db.query(vec![author_filter()], 10, now).await.0.len(),
+            2,
+            "a failed vanish must leave its history stored"
+        );
+    });
+    db.shutdown();
+    // No completed marker, but the in-progress record is durable.
+    {
+        let store = Store::open(
+            &cfg,
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            128,
+        )
+        .unwrap();
+        let rtxn = store.env.read_txn().unwrap();
+        assert!(
+            store.vanish.get(&rtxn, &pk_bytes).unwrap().is_none(),
+            "an interrupted vanish must not write the completed marker"
+        );
+        let pending = store
+            .vanish_pending
+            .get(&rtxn, &pk_bytes)
+            .unwrap()
+            .expect("the interrupted vanish must be recorded");
+        assert_eq!(u64::from_be_bytes(pending.try_into().unwrap()), now);
+    }
+    // A restart: the writer completes the pending vanish before serving.
+    let db = DbClient::open(
+        &cfg,
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    rt.block_on(async {
+        // The write round trip is ordered after the startup resume (the
+        // resume runs on the writer thread before it drains any message),
+        // so it is the barrier that makes the reads below deterministic.
+        assert_eq!(
+            db.put(event(1, "barrier", now, vec![]), now).await,
+            PutOutcome::Stored
+        );
+        assert!(
+            db.query(vec![author_filter()], 10, now).await.0.is_empty(),
+            "the resumed vanish must remove the remaining history"
+        );
+        // The pubkey is barred...
+        assert!(
+            matches!(
+                db.put(authored("after", now + 100), now).await,
+                PutOutcome::Invalid(reason) if reason.contains("vanish")
+            ),
+            "a resumed vanish must bar the pubkey"
+        );
+        // ...and a re-delivered request is a no-op covered by the marker.
+        assert_eq!(
+            db.apply_vanish_checked(pk_bytes, now).await,
+            Some((0, false))
+        );
+    });
+    db.shutdown();
+    // The completed marker replaced the pending record.
+    let store = Store::open(
+        &cfg,
+        Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        128,
+    )
+    .unwrap();
+    let rtxn = store.env.read_txn().unwrap();
+    assert_eq!(store.vanish_pending.len(&rtxn).unwrap(), 0);
+    let marker = store
+        .vanish
+        .get(&rtxn, &pk_bytes)
+        .unwrap()
+        .expect("the resumed vanish must write the completed marker");
+    assert_eq!(u64::from_be_bytes(marker.try_into().unwrap()), now);
+}
+
+#[test]
+fn pending_vanish_is_resumed_at_startup() {
+    // Crash recovery for NIP-62: an interrupted walk leaves an
+    // in-progress record (and possibly no marker). The writer resumes it
+    // before serving, so the remaining history is gone and the completed
+    // marker makes a re-delivered request a no-op. A crash between the
+    // marker and the pending clear must also be cleaned up.
+    use crate::db::store::Store;
+    let cfg = config();
+    let now = 1_700_000_000u64;
+    let pk_a = "ab".repeat(32);
+    let pk_b = "cd".repeat(32);
+    let authored = |pk: &str, content: &str, created: u64| {
+        let mut e = event(1, content, created, vec![]);
+        e.pubkey = pk.to_string();
+        e.id = nip01::compute_id(&e);
+        e
+    };
+    let a_old = authored(&pk_a, "a-old", now - 10);
+    let a_new = authored(&pk_a, "a-new", now - 5);
+    let b_old = authored(&pk_b, "b-old", now - 10);
+    let a_bytes: [u8; 32] = hex::decode(&pk_a).unwrap().try_into().unwrap();
+    let b_bytes: [u8; 32] = hex::decode(&pk_b).unwrap().try_into().unwrap();
+    {
+        let store = Store::open(
+            &cfg,
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            128,
+        )
+        .unwrap();
+        let mut wtxn = store.env.write_txn().unwrap();
+        for e in [&a_old, &a_new, &b_old] {
+            assert_eq!(
+                store.put_event_in(&mut wtxn, e, now).unwrap(),
+                PutOutcome::Stored
+            );
+        }
+        wtxn.commit().unwrap();
+        let mut wtxn = store.env.write_txn().unwrap();
+        // A: the walk removed one event and persisted the in-progress
+        // record, but the process died before the marker.
+        store
+            .remove_event(&mut wtxn, &a_old.id_bytes().unwrap())
+            .unwrap();
+        store
+            .vanish_pending
+            .put(&mut wtxn, &a_bytes, &u64::MAX.to_be_bytes())
+            .unwrap();
+        // B: the marker was committed but the process died before the
+        // pending record was cleared.
+        store
+            .remove_event(&mut wtxn, &b_old.id_bytes().unwrap())
+            .unwrap();
+        store
+            .vanish
+            .put(&mut wtxn, &b_bytes, &u64::MAX.to_be_bytes())
+            .unwrap();
+        store
+            .vanish_pending
+            .put(&mut wtxn, &b_bytes, &u64::MAX.to_be_bytes())
+            .unwrap();
+        wtxn.commit().unwrap();
+    }
+    let db = DbClient::open(
+        &cfg,
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        // A write round trip is ordered after the startup resume (the
+        // resume runs on the writer thread before it drains any message),
+        // so it is the barrier that makes the reads below deterministic.
+        // Querying first could race the resume on the reader threads.
+        assert_eq!(
+            db.put(event(1, "barrier", now, vec![]), now).await,
+            PutOutcome::Stored
+        );
+        // No event of either pubkey survives (the interrupted walks were
+        // completed before the writer served the barrier).
+        for pk in [&pk_a, &pk_b] {
+            let f: Filter = serde_json::from_value(serde_json::json!({"authors": [pk]})).unwrap();
+            let (res, _) = db.query(vec![f], 10, now).await;
+            assert!(
+                res.is_empty(),
+                "the interrupted vanish for {pk} must be completed at startup"
+            );
+        }
+        // The replay short-circuit works after the resume.
+        assert_eq!(
+            db.apply_vanish_checked(a_bytes, u64::MAX).await,
+            Some((0, false))
+        );
+        assert_eq!(
+            db.apply_vanish_checked(b_bytes, u64::MAX).await,
+            Some((0, false))
+        );
+    });
+    db.shutdown();
+    // Every pending record was cleared.
+    let store = Store::open(
+        &cfg,
+        Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        128,
+    )
+    .unwrap();
+    let rtxn = store.env.read_txn().unwrap();
+    assert_eq!(
+        store.vanish_pending.len(&rtxn).unwrap(),
+        0,
+        "the resume must clear every pending vanish record"
+    );
+}
+
+#[test]
+fn state_stamp_advances_with_group_state_removals() {
+    // The persistent derived-group-state generation (consumed by the group
+    // snapshot currency check): bumped by a removal of a NIP-29/NIP-43
+    // state event via vanish, expiry or group purge, and *not* bumped by an
+    // ordinary removal.
+    let cfg = config();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let now = unix_now();
+    rt.block_on(async {
+        let db = DbClient::open(
+            &cfg,
+            true,
+            Arc::new(Default::default()),
+            0,
+            128,
+            4096,
+            262144,
+        )
+        .unwrap();
+        assert_eq!(
+            db.state_stamp().await,
+            Some(0),
+            "a fresh database starts at generation 0"
+        );
+        let authored = |kind: u64, pk: &str, created: u64| {
+            let mut e = event(kind, "x", created, vec![]);
+            e.pubkey = pk.to_string();
+            e.id = nip01::compute_id(&e);
+            e
+        };
+
+        // An ordinary post's vanish is not a derived-state change.
+        assert_eq!(
+            db.put(authored(1, &"aa".repeat(32), now), now).await,
+            PutOutcome::Stored
+        );
+        assert_eq!(
+            db.apply_vanish_checked([0xaa; 32], now).await,
+            Some((1, false))
+        );
+        assert_eq!(
+            db.state_stamp().await,
+            Some(0),
+            "an ordinary removal must not bump the stamp"
+        );
+
+        // A moderation event's vanish is.
+        assert_eq!(
+            db.put(authored(9000, &"bb".repeat(32), now), now).await,
+            PutOutcome::Stored
+        );
+        assert_eq!(
+            db.apply_vanish_checked([0xbb; 32], now).await,
+            Some((1, true))
+        );
+        assert_eq!(db.state_stamp().await, Some(1));
+
+        // An expired state event removed by NIP-40 is.
+        db.set_expiry_enabled(false);
+        let mut expiring = authored(9001, &"cc".repeat(32), now - 100);
+        expiring.tags = vec![vec!["expiration".into(), (now - 50).to_string()]];
+        assert_eq!(db.put(expiring, now).await, PutOutcome::Stored);
+        db.set_expiry_enabled(true);
+        assert_eq!(db.purge_expired(now).await, (1, true));
+        assert_eq!(db.state_stamp().await, Some(2));
+
+        // A group purge bumps the stamp at completion.
+        let gid = "stamp-group";
+        let tagged = event(1, "group post", now, vec![vec!["h".into(), gid.into()]]);
+        assert_eq!(db.put(tagged, now).await, PutOutcome::Stored);
+        assert_eq!(db.group_purge(gid.into(), now).await, 1);
+        assert_eq!(db.state_stamp().await, Some(3));
+        db.shutdown();
+    });
+    // The stamp is persistent: a restart reports the same generation.
+    let db = DbClient::open(
+        &cfg,
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    rt.block_on(async {
+        assert_eq!(db.state_stamp().await, Some(3));
+    });
+    db.shutdown();
+}
+
+#[test]
+fn startup_removal_reads_report_failure_when_the_reader_is_gone() {
+    // The contracts are startup-checked: `None` means "the database could
+    // not answer", so a caller fails closed instead of treating an
+    // unreadable pending list/stamp as empty.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        assert!(db.pending_purges().await.is_some());
+        assert!(db.state_stamp().await.is_some());
+        db.shutdown();
+        assert!(
+            db.pending_purges().await.is_none(),
+            "a lost reader must report failure"
+        );
+        assert!(
+            db.state_stamp().await.is_none(),
+            "a lost reader must report failure"
+        );
+    });
+}
+
+#[test]
+fn disabled_fsync_writer_serves_requests() {
+    // With fsync disabled the writer switches to a timed receive so it can
+    // sync periodically; requests must keep their normal behavior and the
+    // shutdown sync must still run.
+    let mut cfg = config();
+    cfg.disabled_fsync = true;
+    let errors = Arc::new(Default::default());
+    let db = DbClient::open(&cfg, true, Arc::clone(&errors), 0, 128, 4096, 262144).unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let now = unix_now();
+        let e = event(1, "no fsync", now, vec![]);
+        assert_eq!(db.put(e.clone(), now).await, PutOutcome::Stored);
+        let f: Filter = serde_json::from_value(serde_json::json!({"ids": [e.id]})).unwrap();
+        let (res, _) = db.query(vec![f], 10, now).await;
+        assert_eq!(res.len(), 1);
+        assert_eq!(
+            errors.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "a healthy no-fsync writer must not report database errors"
+        );
+    });
+    db.shutdown();
+}
+
+#[test]
+fn timed_receive_wakes_on_a_message_and_times_out() {
+    // The writer's periodic-sync receive must wake immediately for a queued
+    // message (normal write latency), return TimedOut when idle and Closed
+    // once every sender is gone.
+    use crate::db::threads::{RecvOutcome, recv_timeout};
+    let (tx, mut rx) = mpsc::unbounded_channel::<Msg>();
+    tx.send(Msg::Shutdown).unwrap();
+    let start = std::time::Instant::now();
+    assert!(matches!(
+        recv_timeout(&mut rx, std::time::Duration::from_secs(5)),
+        RecvOutcome::Message(Msg::Shutdown)
+    ));
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(1),
+        "a queued message must not wait for the timeout"
+    );
+    assert!(matches!(
+        recv_timeout(&mut rx, std::time::Duration::from_millis(20)),
+        RecvOutcome::TimedOut
+    ));
+    // A message sent while the receive is parked wakes it immediately.
+    let (tx2, mut rx2) = mpsc::unbounded_channel::<Msg>();
+    let sender = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let _ = tx2.send(Msg::Shutdown);
+    });
+    let start = std::time::Instant::now();
+    assert!(matches!(
+        recv_timeout(&mut rx2, std::time::Duration::from_secs(5)),
+        RecvOutcome::Message(Msg::Shutdown)
+    ));
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(1),
+        "a message must unpark the blocked receiver"
+    );
+    sender.join().unwrap();
+    drop(tx);
+    assert!(matches!(
+        recv_timeout(&mut rx, std::time::Duration::from_millis(20)),
+        RecvOutcome::Closed
+    ));
+}

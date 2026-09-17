@@ -837,7 +837,7 @@ writer performs after every commit batch. Both are tunable in
 
 | Setting | Value | Why |
 | --- | --- | --- |
-| `database.disabled_fsync = true` | `false` | The dominant ingest cost is the fsync after each commit batch. With `disabled_fsync` the writer commits into the OS page cache (microseconds) and the kernel flushes shortly after; a power loss loses only the writes since the last flush. Start here. |
+| `database.disabled_fsync = true` | `false` | The dominant ingest cost is the fsync after each commit batch. With `disabled_fsync` the writer commits into the OS page cache (microseconds) and force-syncs about once per second; a power loss or OS crash can lose acknowledged writes and can corrupt the database, so use it only with a backup (or replica) you can restore from. For a single always-live instance, start with `max_db_queue_*` / batch tuning instead. |
 | CPU cores | ≥ 8 vCPU | The batch `EVENT` path verifies every signature in parallel across the cores (see below) before the cheap checks run |
 
 Starting the relay with `RUST_LOG=nostrfy=debug` shows the config the
