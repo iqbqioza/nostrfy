@@ -826,6 +826,16 @@ async fn ws_handler(State(relay): State<Arc<Relay>>, request: Request) -> Respon
         .map(|info| info.0.ip());
     match WebSocketUpgrade::from_request_parts(&mut parts, &()).await {
         Ok(upgrade) => {
+            // Claim the accept-layer slot for the upgraded connection
+            // before the HTTP task ends: the WebSocket then holds it for
+            // its whole lifetime, so the global and per-IP caps count the
+            // connection exactly once. The handover is synchronous (the
+            // request is still being served), so the accept guard cannot
+            // have released it yet.
+            let slot = parts
+                .extensions
+                .remove::<Arc<crate::conn::ConnSlot>>()
+                .and_then(|slot| slot.handover());
             // Start with small read/write buffers (they grow on demand) so
             // that hundreds of thousands of idle connections do not pin
             // megabytes each.
@@ -861,6 +871,7 @@ async fn ws_handler(State(relay): State<Arc<Relay>>, request: Request) -> Respon
                             .map(crate::util::normalize_ip)
                             .unwrap_or_else(|| "0.0.0.0".parse().unwrap()),
                         path,
+                        slot,
                     )
                 })
                 .into_response()
@@ -1062,60 +1073,6 @@ impl IpConnLimiter {
     }
 }
 
-/// Per-IP concurrent connection accounting at the accept layer. The
-/// WebSocket handler only sees upgrades, so without this a single host could
-/// open every one of `limits.max_connections` as plain HTTP and hold them
-/// (pinning file descriptors and the connection budget). `max == 0`
-/// disables the cap, mirroring [`crate::relay::Relay::try_register_connection`].
-#[derive(Default)]
-struct IpConnCounter {
-    counts: std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, usize>>,
-}
-
-impl IpConnCounter {
-    /// Reserves a connection slot for `ip`; `false` means the per-IP cap is
-    /// reached and the connection must be dropped at the socket level.
-    fn try_acquire(&self, ip: std::net::IpAddr, max: usize) -> bool {
-        if max == 0 {
-            return true;
-        }
-        // Recover from a poisoned lock instead of panicking: a panic while
-        // holding the map would otherwise kill every later connection.
-        let mut counts = self.counts.lock().unwrap_or_else(|p| p.into_inner());
-        let count = counts.entry(ip).or_insert(0);
-        if *count >= max {
-            return false;
-        }
-        *count += 1;
-        true
-    }
-
-    /// Releases one slot; the entry is removed when the last connection of
-    /// that IP closes, so the map never grows beyond the live connections.
-    fn release(&self, ip: std::net::IpAddr) {
-        let mut counts = self.counts.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(count) = counts.get_mut(&ip) {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                counts.remove(&ip);
-            }
-        }
-    }
-}
-
-/// Releases the accept-layer per-IP slot on every exit path of the
-/// connection task (including a panic).
-struct IpConnGuard {
-    counter: Arc<IpConnCounter>,
-    ip: std::net::IpAddr,
-}
-
-impl Drop for IpConnGuard {
-    fn drop(&mut self) {
-        self.counter.release(self.ip);
-    }
-}
-
 /// Serves the main listener with the HTTP-layer hardening: a cap on
 /// concurrent connections (`limits.max_connections`) and a per-IP
 /// concurrent cap (`limits.max_connections_per_ip`), both also enforced on
@@ -1138,7 +1095,7 @@ async fn serve_limited(
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     let active = Arc::new(AtomicUsize::new(0));
-    let ip_counter = Arc::new(IpConnCounter::default());
+    let ip_counter = Arc::new(crate::conn::IpConnCounter::default());
     let (drain_tx, drain_rx) = watch::channel(());
     // Connection task handles, used to abort stragglers at shutdown. The
     // vector is pruned of finished handles above 1024 entries, so a
@@ -1180,11 +1137,21 @@ async fn serve_limited(
                 }
                 // Per-IP concurrent cap: plain HTTP connections count too,
                 // not only WebSocket upgrades. The slot is released by the
-                // task guard on every exit path (including a panic).
+                // task guard on every exit path (including a panic), or by
+                // the WebSocket layer after a handover.
                 if !ip_counter.try_acquire(peer_ip, max_per_ip) {
                     continue;
                 }
                 active.fetch_add(1, Ordering::Relaxed);
+                // The accept-layer slot for this connection: the global and
+                // per-IP counts stay reserved until the HTTP task ends, or
+                // until a WebSocket upgrade hands the slot over to the
+                // detached WebSocket task (`crate::conn::ConnSlot`).
+                let slot = crate::conn::ConnSlot::new(
+                    Arc::clone(&active),
+                    Arc::clone(&ip_counter),
+                    peer_ip,
+                );
 
                 // Keep per-connection kernel buffers small so that hundreds
                 // of thousands of idle connections do not pin gigabytes of
@@ -1207,22 +1174,24 @@ async fn serve_limited(
                 }
 
                 let app = app.clone();
-                let active = Arc::clone(&active);
-                let ip_guard = IpConnGuard {
-                    counter: Arc::clone(&ip_counter),
-                    ip: peer_ip,
-                };
                 let mut drain_rx = drain_rx.clone();
                 let io = hyper_util::rt::TokioIo::new(stream);
                 // Inject the peer address as ConnectInfo (the axum
-                // `ConnectInfo` extractor reads this extension).
+                // `ConnectInfo` extractor reads this extension) and the
+                // accept-layer slot. The WebSocket handler removes and takes
+                // over the slot when the request upgrades, so the WS
+                // connection keeps exactly one reserved slot (no second
+                // counter, no double release).
+                let slot_handle = Arc::clone(&slot);
                 let svc = app.layer(axum::middleware::from_fn(
                     move |mut req: axum::extract::Request,
                           next: axum::middleware::Next| {
                         let peer = peer;
+                        let slot = Arc::clone(&slot_handle);
                         async move {
                             req.extensions_mut()
                                 .insert(axum::extract::ConnectInfo(peer));
+                            req.extensions_mut().insert(slot);
                             next.run(req).await
                         }
                     },
@@ -1233,25 +1202,12 @@ async fn serve_limited(
                     }),
                 );
                 conn_tasks.push(tokio::spawn(async move {
-                    // Guard the accept-layer connection count: a panic in the
-                    // serve path must still release the slot, otherwise the
-                    // `>= max_connections` check above would refuse every new
-                    // connection forever (the WS layer already uses
-                    // `ConnectionGuard` for the same reason).
-                    struct ActiveGuard {
-                        active: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-                    }
-                    impl Drop for ActiveGuard {
-                        fn drop(&mut self) {
-                            self.active.fetch_sub(1, Ordering::Relaxed);
-                        }
-                    }
-                    let _guard = ActiveGuard {
-                        active: Arc::clone(&active),
-                    };
-                    // Releases the accept-layer per-IP slot on every exit
-                    // path of this task (including a panic).
-                    let _ip_guard = ip_guard;
+                    // Releases the accept-layer slot (global and per-IP) on
+                    // every exit path of this task, including a panic. A
+                    // WebSocket upgrade moves the release responsibility to
+                    // the detached WS task instead, so the counts are never
+                    // released here while the socket is still served.
+                    let _slot = crate::conn::AcceptSlotGuard::new(slot);
                     let mut builder = hyper_util::server::conn::auto::Builder::new(
                         hyper_util::rt::TokioExecutor::new(),
                     );
@@ -1298,8 +1254,13 @@ async fn serve_limited(
     // grace stays well under the CLI stop timeout (10 s), so a relay with
     // long-lived WebSocket connections still stops in time.
     let _ = drain_tx.send(());
+    // Wait for the HTTP connection tasks to finish. The `active` count is
+    // not usable here: upgraded WebSocket connections keep their slot
+    // reserved until the relay's own drain signal runs (after this
+    // function returns), so waiting on `active` would always burn the full
+    // grace period while any WebSocket connection is open.
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        while active.load(Ordering::Relaxed) > 0 {
+        while conn_tasks.iter().any(|task| !task.is_finished()) {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
     })
@@ -2199,6 +2160,66 @@ mod tests {
         drop(conn3);
         tx.send(true).unwrap();
         handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ws_connection_holds_the_per_ip_slot_after_upgrade() {
+        // Regression: the accept layer and the WebSocket layer used to
+        // count per-IP connections independently, so one host could hold
+        // `2 * max_connections_per_ip` sockets and a WS connection released
+        // its accept slot at the upgrade. The upgraded WebSocket now keeps
+        // the single shared slot for its whole lifetime.
+        let relay = blossom_relay().await;
+        let app = axum::Router::new()
+            .route("/", axum::routing::get(ws_handler))
+            .with_state(Arc::clone(&relay));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = watch::channel(false);
+        let handle = tokio::spawn(serve_limited(
+            listener,
+            app,
+            10,
+            1,
+            Some(Duration::from_secs(30)),
+            None,
+            16,
+            rx,
+        ));
+        // The handshake upgrades and the WebSocket holds the only per-IP
+        // slot.
+        let mut ws = TcpStream::connect(addr).await.unwrap();
+        ws.write_all(
+            b"GET / HTTP/1.1\r\nHost: t\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+              Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        let mut buf = [0u8; 1024];
+        let n = ws.read(&mut buf).await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&buf[..n]).contains("101"),
+            "the handshake must upgrade"
+        );
+        // A plain HTTP connection from the same IP is refused while the
+        // WebSocket is open (the old double counter let it through).
+        let refused = http_keepalive(addr).await;
+        assert!(
+            refused.1.is_empty(),
+            "the live WebSocket must occupy the per-IP slot"
+        );
+        // Closing the WebSocket releases the slot for the next connection.
+        drop(ws);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let (conn, body) = http_keepalive(addr).await;
+        assert!(
+            String::from_utf8_lossy(&body).contains("200 OK"),
+            "the slot must be released when the WebSocket closes"
+        );
+        drop(conn);
+        tx.send(true).unwrap();
+        handle.await.unwrap();
+        relay.db.shutdown();
     }
 
     #[tokio::test]

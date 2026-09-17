@@ -599,7 +599,11 @@ pub(crate) fn message_size(msg: &Message) -> usize {
 struct ConnectionGuard {
     relay: Arc<Relay>,
     stats: Arc<Stats>,
-    peer_ip: std::net::IpAddr,
+    /// The accept-layer slot handed over at the upgrade: the connection is
+    /// already accounted for the global and per-IP caps, and the slot is
+    /// released exactly once here (the shared counter replaces the old
+    /// WS-layer per-IP map, so no connection is counted twice).
+    conn_slot: Option<crate::conn::ConnSlotGuard>,
     /// The connection's live-index id, unregistered on drop so a panic in
     /// the connection handling cannot leave a dead entry (the bus would
     /// keep trying to deliver to a gone connection forever).
@@ -615,7 +619,9 @@ impl Drop for ConnectionGuard {
         self.stats
             .connections_active
             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-        self.relay.release_connection(&self.peer_ip);
+        // Releases the accept-layer slot inherited at the upgrade exactly
+        // once, even when a panic unwinds through the connection loop.
+        drop(self.conn_slot.take());
         self.relay
             .sub_index
             .write()
@@ -796,39 +802,17 @@ pub async fn handle_connection(
     relay: Arc<Relay>,
     peer_ip: std::net::IpAddr,
     path: String,
+    conn_slot: Option<crate::conn::ConnSlotGuard>,
 ) {
-    // Read the caps before accounting: everything between `fetch_add`
-    // and the guard below is synchronous (`try_register_connection` takes
-    // no lock across an await), so a panic cannot strand the slot across
-    // an await point before the guard owns it.
-    let (max_connections, max_per_ip) = {
-        let cfg = relay.config.read().await;
-        (
-            cfg.limits.max_connections,
-            cfg.limits.max_connections_per_ip,
-        )
-    };
-    // Account the connection with add-then-check so the cap stays exact
-    // under concurrency.
-    let active = relay
+    // The global/per-IP caps were already enforced at the accept layer, and
+    // the accept slot was handed over synchronously at the upgrade (the
+    // HTTP task can no longer release it), so the connection cannot be
+    // refused here: only the stats are accounted.
+    relay
         .stats
         .connections_active
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        + 1;
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     relay.stats.bump(&relay.stats.connections_total, 1);
-
-    // `active` is the post-increment count (this connection included), so
-    // `>` accepts exactly `max_connections` connections. Short-circuit
-    // order matters: when the global cap already refuses, the per-IP slot
-    // is never taken, so only the global counter is rolled back.
-    if active > max_connections as u64 || !relay.try_register_connection(&peer_ip, max_per_ip) {
-        relay
-            .stats
-            .connections_active
-            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-        let _ = socket.close().await;
-        return;
-    }
     let conn_id = relay
         .next_conn_id
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -836,7 +820,7 @@ pub async fn handle_connection(
     let _guard = ConnectionGuard {
         relay: relay.clone(),
         stats: relay.stats.clone(),
-        peer_ip,
+        conn_slot,
         conn_id,
         subscriptions_held: Arc::clone(&subscriptions_held),
     };

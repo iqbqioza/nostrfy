@@ -69,9 +69,6 @@ pub struct Relay {
     /// fails fast (503) instead of piling up behind WebSocket work. The
     /// limit is adjustable at runtime (SIGHUP config reload).
     pub api_limit: Arc<ApiLimiter>,
-    /// Active WebSocket connections per source IP, so a socket flood from
-    /// a single host cannot consume the whole connection budget.
-    per_ip_connections: std::sync::Mutex<HashMap<String, usize>>,
     /// Per-pubkey sliding window of accepted event timestamps
     /// (`relay.max_events_per_min_per_pubkey`). Bounded: at most 10k
     /// pubkeys are tracked — a full map never clears (tracked windows are
@@ -413,7 +410,6 @@ impl Relay {
             groups_rebuild_pending: std::sync::atomic::AtomicBool::new(false),
             roles: Arc::new(RwLock::new(RoleStore::default())),
             api_limit: ApiLimiter::new(api_max_concurrent),
-            per_ip_connections: std::sync::Mutex::new(HashMap::new()),
             publish_rate: std::sync::Mutex::new(HashMap::new()),
             publish_rate_pruned_at: std::sync::atomic::AtomicU64::new(0),
             persist_access_lock: tokio::sync::Mutex::new(()),
@@ -681,44 +677,6 @@ impl Relay {
         // in their own LMDB key so the CLI and NIP-86 share one source.
         let lists_saved = self.db.save_relay_pubkeys(&deny, &allow).await;
         saved && lists_saved
-    }
-
-    /// Registers a new WebSocket connection from `ip` if it does not exceed
-    /// the per-IP cap. Returns `false` (and registers nothing) when the cap
-    /// would be exceeded, so the caller rejects the connection.
-    pub fn try_register_connection(&self, ip: &std::net::IpAddr, max_per_ip: usize) -> bool {
-        if max_per_ip == 0 {
-            return true;
-        }
-        // Recover from a poisoned lock instead of panicking: a panic while
-        // holding the map would otherwise kill every later connection.
-        let mut map = self
-            .per_ip_connections
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        let count = map.entry(ip.to_string()).or_insert(0);
-        if *count >= max_per_ip {
-            return false;
-        }
-        *count += 1;
-        true
-    }
-
-    /// Releases one connection slot for `ip` (called when the connection
-    /// closes).
-    pub fn release_connection(&self, ip: &std::net::IpAddr) {
-        // Recover from a poisoned lock instead of panicking: a panic while
-        // holding the map would otherwise kill every later connection.
-        let mut map = self
-            .per_ip_connections
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        if let Some(count) = map.get_mut(&ip.to_string()) {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                map.remove(&ip.to_string());
-            }
-        }
     }
 
     /// Reloads the database-owned access state (Blossom upload allowlist,
@@ -2038,9 +1996,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn api_limiter_and_connection_slots() {
+    async fn api_limiter_caps_concurrent_acquisitions() {
         // The limiter caps concurrent acquisitions and honors set_max.
-        let limiter = build_relay().await.api_limit.clone();
+        // (Per-IP connection accounting moved to the accept layer; its unit
+        // tests live in `crate::conn`.)
+        let relay = build_relay().await;
+        let limiter = relay.api_limit.clone();
         limiter.set_max(2);
         let a = limiter.try_acquire().unwrap();
         let b = limiter.try_acquire().unwrap();
@@ -2061,28 +2022,6 @@ mod tests {
         assert_eq!(
             limiter.in_flight.load(std::sync::atomic::Ordering::Relaxed),
             0
-        );
-
-        // Per-IP connection registration and release.
-        let relay = build_relay().await;
-        let ip: std::net::IpAddr = "198.51.100.9".parse().unwrap();
-        assert!(relay.try_register_connection(&ip, 0), "max 0 = unlimited");
-        assert!(relay.try_register_connection(&ip, 2));
-        assert!(relay.try_register_connection(&ip, 2));
-        assert!(
-            !relay.try_register_connection(&ip, 2),
-            "the per-IP cap holds"
-        );
-        relay.release_connection(&ip);
-        assert!(relay.try_register_connection(&ip, 2));
-        // Releasing a slot for an unknown IP is a no-op.
-        relay.release_connection(&"203.0.113.5".parse().unwrap());
-        relay.release_connection(&ip);
-        relay.release_connection(&ip);
-        assert_eq!(
-            relay.per_ip_connections.lock().unwrap().len(),
-            0,
-            "the map entry is removed at zero"
         );
         relay.db.shutdown();
     }
