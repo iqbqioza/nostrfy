@@ -469,6 +469,8 @@ pub enum Nip19Hex {
 mod tests {
     use super::*;
 
+    use crate::fuzz_tests::Rng;
+
     #[test]
     fn overlong_bech32_strings_are_rejected() {
         // NIP-19: "Bech32-formatted strings SHOULD be limited in size to
@@ -760,6 +762,147 @@ mod tests {
                 assert_eq!(d_tag, "");
             }
             _ => panic!("expected addr"),
+        }
+    }
+
+    // ----- deterministic fuzzing (see crate::fuzz_tests) -----
+
+    /// A TLV item: one type byte, one length byte, the value.
+    fn push_tlv(data: &mut Vec<u8>, tlv_type: u8, value: &[u8]) {
+        assert!(value.len() <= u8::MAX as usize);
+        data.push(tlv_type);
+        data.push(value.len() as u8);
+        data.extend_from_slice(value);
+    }
+
+    #[test]
+    fn fuzz_parse_nip19_never_panics_on_random_strings() {
+        // A charset mixing valid bech32 characters with the shapes that
+        // make the decoder branch: separators, mixed case, non-ASCII,
+        // whitespace.
+        const ALPHABET: &[char] = &[
+            'q', 'p', 'z', '1', 'n', 's', 'e', 'c', '0', '2', 'b', 'u', 't', 'N', 'P', 'U', 'B',
+            ':', '/', '.', '-', '_', 'é', '日', '𝄞', '\n', '\t', '"', '\\',
+        ];
+        let mut rng = Rng::new(0x5eed_19a0);
+        for _ in 0..20_000 {
+            let len = rng.below(64);
+            let text: String = (0..len)
+                .map(|_| ALPHABET[rng.below(ALPHABET.len())])
+                .collect();
+            let _ = parse_nip19(&text);
+        }
+        // Random bytes decoded as UTF-8 (lossy, so invalid sequences become
+        // replacement characters) hit the same entry point.
+        let mut bytes = [0u8; 48];
+        for _ in 0..5_000 {
+            let len = rng.below(bytes.len() + 1);
+            rng.fill(&mut bytes[..len]);
+            let _ = parse_nip19(&String::from_utf8_lossy(&bytes[..len]));
+        }
+    }
+
+    #[test]
+    fn fuzz_nip19_roundtrips_random_entities() {
+        let mut rng = Rng::new(0x5eed_19b0);
+        for _ in 0..400 {
+            let mut raw = [0u8; 32];
+            rng.fill(&mut raw);
+
+            // npub and note: 32 random bytes each.
+            let npub = bech32_encode("npub", &raw).unwrap();
+            assert_eq!(parse_nip19(&npub).unwrap(), Nip19Entity::Pubkey(raw));
+            let note = bech32_encode("note", &raw).unwrap();
+            assert_eq!(parse_nip19(&note).unwrap(), Nip19Entity::Note(raw));
+
+            // nprofile: special pubkey plus random relays (which decode to
+            // the pubkey, like npub).
+            let mut tlv = Vec::new();
+            push_tlv(&mut tlv, TLV_SPECIAL, &raw);
+            for _ in 0..rng.below(3) {
+                let relay = format!("wss://{}.example", rng.hex(8));
+                push_tlv(&mut tlv, TLV_RELAY, relay.as_bytes());
+            }
+            let nprofile = bech32_encode("nprofile", &tlv).unwrap();
+            assert_eq!(parse_nip19(&nprofile).unwrap(), Nip19Entity::Pubkey(raw));
+
+            // nevent: id plus optional relays, author hint and kind.
+            let mut id = [0u8; 32];
+            rng.fill(&mut id);
+            let mut tlv = Vec::new();
+            push_tlv(&mut tlv, TLV_SPECIAL, &id);
+            let mut relays = Vec::new();
+            for _ in 0..rng.below(3) {
+                let relay = format!("wss://{}.example", rng.hex(8));
+                push_tlv(&mut tlv, TLV_RELAY, relay.as_bytes());
+                relays.push(relay);
+            }
+            let mut author = None;
+            if rng.bool() {
+                let mut pk = [0u8; 32];
+                rng.fill(&mut pk);
+                push_tlv(&mut tlv, TLV_AUTHOR, &pk);
+                author = Some(pk);
+            }
+            let mut kind = None;
+            if rng.bool() {
+                let k = rng.next_u64() as u32;
+                push_tlv(&mut tlv, TLV_KIND, &k.to_be_bytes());
+                kind = Some(k as u64);
+            }
+            let nevent = bech32_encode("nevent", &tlv).unwrap();
+            assert_eq!(
+                parse_nip19(&nevent).unwrap(),
+                Nip19Entity::Event {
+                    id,
+                    relays,
+                    author,
+                    kind,
+                }
+            );
+
+            // naddr: required kind and pubkey, a random d tag and optional
+            // relays.
+            let mut pubkey = [0u8; 32];
+            rng.fill(&mut pubkey);
+            let d_tag = format!("post-{}", rng.hex(6));
+            let k = rng.next_u64() as u32;
+            let mut tlv = Vec::new();
+            push_tlv(&mut tlv, TLV_SPECIAL, d_tag.as_bytes());
+            push_tlv(&mut tlv, TLV_AUTHOR, &pubkey);
+            push_tlv(&mut tlv, TLV_KIND, &k.to_be_bytes());
+            let mut relays = Vec::new();
+            for _ in 0..rng.below(3) {
+                let relay = format!("wss://{}.example", rng.hex(8));
+                push_tlv(&mut tlv, TLV_RELAY, relay.as_bytes());
+                relays.push(relay);
+            }
+            let naddr = bech32_encode("naddr", &tlv).unwrap();
+            assert_eq!(
+                parse_nip19(&naddr).unwrap(),
+                Nip19Entity::Addr {
+                    kind: k as u64,
+                    pubkey,
+                    d_tag,
+                    relays,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn fuzz_nip19_tlv_payloads_never_panic() {
+        // Random TLV bytes (arbitrary types, lengths, truncations) wrapped
+        // in a valid bech32 envelope for every structured prefix.
+        let mut rng = Rng::new(0x5eed_19c0);
+        let mut payload = [0u8; 64];
+        for _ in 0..5_000 {
+            let len = rng.below(payload.len() + 1);
+            rng.fill(&mut payload[..len]);
+            for hrp in ["nevent", "naddr", "nprofile"] {
+                let encoded = bech32_encode(hrp, &payload[..len]).unwrap();
+                let _ = parse_nip19(&encoded);
+            }
         }
     }
 }

@@ -50,6 +50,25 @@ jobs:
       - name: Tests
         run: cargo test --all-targets
 
+  perf-smoke:
+    name: Performance smoke
+    runs-on: ubuntu-latest
+    # Conservative floors (300 ev/s ingest, 100% fan-out): shared runners
+    # are noisy, so the throughput floor only catches order-of-magnitude
+    # regressions, while a delivery miss is a real fan-out bug. The timeout
+    # guards a hung relay/bench; the expected runtime is a few minutes,
+    # dominated by the release build.
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Performance smoke
+        run: bash scripts/perf_smoke.sh
+
   freebsd:
     name: Build and test on FreeBSD
     runs-on: ubuntu-latest

@@ -470,6 +470,8 @@ pub(crate) fn rewrite_inbox_outbox(value: &mut Value) -> Result<()> {
 mod tests {
     use super::*;
 
+    use crate::fuzz_tests::{Rng, random_event, random_json};
+
     #[test]
     fn tag_values_borrows_without_allocating() {
         let single = serde_json::json!("abc");
@@ -956,5 +958,133 @@ mod tests {
             serde_json::from_value(serde_json::json!({"#b": ["x"], "#a": ["y"]})).unwrap();
         let keys: Vec<&str> = f.tags.keys().map(String::as_str).collect();
         assert_eq!(keys, vec!["#b", "#a"]);
+    }
+
+    // ----- deterministic fuzzing (see crate::fuzz_tests) -----
+
+    #[test]
+    fn fuzz_random_json_never_panics_filter_parsing() {
+        // Random JSON documents (nested, mixed types, non-string ids and
+        // tag values) through the wire parser and the pre-DB helpers the
+        // REQ path runs on the result. Filter has a flattened tag map, so
+        // every object parses; the point is that neither parsing nor
+        // validating may panic.
+        let mut rng = Rng::new(0x5eed_f001);
+        let mut parsed = 0usize;
+        for _ in 0..4_000 {
+            let value = random_json(&mut rng, 4);
+            let text = serde_json::to_string(&value).unwrap();
+            let Ok(filter) = serde_json::from_str::<Filter>(&text) else {
+                continue;
+            };
+            parsed += 1;
+            let _ = filter.too_many_members();
+            let _ = filter.invalid_tag_values();
+            let _ = filter.has_search();
+            let event = random_event(&mut rng);
+            let _ = filter.matches(&event);
+            let _ = filter.matches_with(&event, filter.tag_plan());
+        }
+        assert!(parsed > 0, "the generator must produce parseable filters");
+    }
+
+    #[test]
+    fn fuzz_rewrite_inbox_outbox_never_panics() {
+        let mut rng = Rng::new(0x5eed_f002);
+        for _ in 0..4_000 {
+            let mut value = random_json(&mut rng, 3);
+            if rewrite_inbox_outbox(&mut value).is_ok() {
+                // A successfully rewritten value must still parse into a
+                // filter whenever it is an object.
+                let text = serde_json::to_string(&value).unwrap();
+                let _ = serde_json::from_str::<Filter>(&text);
+            }
+        }
+    }
+
+    #[test]
+    fn fuzz_over_cap_filters_are_rejected() {
+        // Random over-cap sizes for every bounded member list: the parsed
+        // filter must be flagged by the same helper the REQ path uses to
+        // refuse the subscription. Exactly at the cap stays allowed.
+        let mut rng = Rng::new(0x5eed_f003);
+        for _ in 0..32 {
+            let over = MAX_FILTER_MEMBERS + 1 + rng.below(64);
+            let ids: Vec<String> = (0..over).map(|_| rng.hex(64)).collect();
+            let f: Filter = serde_json::from_value(serde_json::json!({"ids": ids})).unwrap();
+            assert!(f.too_many_members(), "oversized ids must be flagged");
+            let authors: Vec<String> = (0..over).map(|_| rng.hex(64)).collect();
+            let f: Filter =
+                serde_json::from_value(serde_json::json!({"authors": authors})).unwrap();
+            assert!(f.too_many_members(), "oversized authors must be flagged");
+            let kinds: Vec<u64> = (0..over as u64).collect();
+            let f: Filter = serde_json::from_value(serde_json::json!({"kinds": kinds})).unwrap();
+            assert!(f.too_many_members(), "oversized kinds must be flagged");
+            // Tag values are bounded across every tag attribute combined.
+            let half = MAX_FILTER_TAG_VALUES / 2 + 1;
+            let values: Vec<String> = (0..half).map(|_| rng.hex(8)).collect();
+            let f: Filter =
+                serde_json::from_value(serde_json::json!({"#e": values.clone(), "#p": values}))
+                    .unwrap();
+            assert!(
+                f.too_many_members(),
+                "combined oversized tag values must be flagged"
+            );
+        }
+        let at_cap: Vec<String> = (0..MAX_FILTER_MEMBERS).map(|_| "a".repeat(64)).collect();
+        let f: Filter = serde_json::from_value(serde_json::json!({"ids": at_cap})).unwrap();
+        assert!(
+            !f.too_many_members(),
+            "exactly at the cap must stay allowed"
+        );
+    }
+
+    #[test]
+    fn fuzz_malformed_member_and_tag_shapes_are_handled() {
+        // Non-string members and mixed-type tag values: parse errors are
+        // fine, parser panics are not; whatever parses is then classified
+        // without panicking.
+        let mut rng = Rng::new(0x5eed_f004);
+        let shapes = [
+            r#"{"ids": [1, 2, 3]}"#,
+            r#"{"authors": [null]}"#,
+            r#"{"kinds": ["1"]}"#,
+            r#"{"ids": [{}]}"#,
+            r#"{"ids": "aa"}"#,
+            r##"{"#e": [1]}"##,
+            r##"{"#e": [["x"]]}"##,
+            r##"{"#e": {"nested": [1]}}"##,
+            r##"{"#e": "ok", "#p": []}"##,
+            r#"{"since": "yesterday"}"#,
+            r#"{"limit": -1}"#,
+            r#"{"search": 7}"#,
+            r#"[]"#,
+            r#""just a string""#,
+            r#"null"#,
+        ];
+        for text in shapes {
+            let event = ev(1, vec![vec!["e".into(), rng.hex(8)]]);
+            if let Ok(filter) = serde_json::from_str::<Filter>(text) {
+                let _ = filter.too_many_members();
+                let _ = filter.invalid_tag_values();
+                let _ = filter.has_search();
+                let _ = filter.matches(&event);
+            }
+        }
+        // NIP-01 defines tag attribute values as a string or an array of
+        // strings: everything else is flagged as invalid.
+        let f: Filter = serde_json::from_str(r##"{"#e": [1]}"##).unwrap();
+        assert!(f.invalid_tag_values());
+        let f: Filter = serde_json::from_str(r##"{"#e": [["x"]]}"##).unwrap();
+        assert!(f.invalid_tag_values());
+        let f: Filter = serde_json::from_str(r##"{"#e": {"a": 1}}"##).unwrap();
+        assert!(f.invalid_tag_values());
+        let f: Filter = serde_json::from_str(r##"{"#e": "ok"}"##).unwrap();
+        assert!(!f.invalid_tag_values());
+        let f: Filter = serde_json::from_str(r##"{"#e": ["ok", 1]}"##).unwrap();
+        assert!(f.invalid_tag_values());
+        // Unknown non-tag keys are ignored regardless of their value type.
+        let f: Filter = serde_json::from_str(r#"{"unknown": {"a": [1]}}"#).unwrap();
+        assert!(!f.invalid_tag_values());
     }
 }
