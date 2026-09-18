@@ -45,6 +45,53 @@ use api::{
 };
 use livekit::{livekit_supported, livekit_token};
 
+/// Minimum interval between rate-limited WARNs for connection refusals: the
+/// refusal paths run per connection, so an unthrottled warning would flood
+/// the log during exactly the incident it reports.
+const REFUSAL_WARN_INTERVAL_SECS: u64 = 10;
+
+/// Emits at most one refusal WARN per [`REFUSAL_WARN_INTERVAL_SECS`],
+/// process-wide. The counters still move on every refusal.
+fn warn_refusal(message: &str) {
+    static LAST_WARN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now = unix_now();
+    let last = LAST_WARN.load(std::sync::atomic::Ordering::Relaxed);
+    if now.saturating_sub(last) >= REFUSAL_WARN_INTERVAL_SECS
+        && LAST_WARN
+            .compare_exchange(
+                last,
+                now,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .is_ok()
+    {
+        warn!("{message}");
+    }
+}
+
+/// Worst-case graceful-shutdown budget, per phase. `nostrfy stop` must wait
+/// at least this long (see `cli::wait_for_stop`), because exceeding it means
+/// the process is force-killed after writes may already be committed.
+///
+/// Phases, run in order by [`run_server`]:
+/// 1. HTTP connections drain in `serve_limited` (`HTTP_DRAIN_GRACE`);
+/// 2. background tasks are joined with `TASK_JOIN_GRACE`;
+/// 3. upgraded WebSocket connections flush their final batches
+///    (`WS_DRAIN_GRACE`);
+/// 4. the database flushes and joins its threads (`DB_SHUTDOWN_MARGIN`; the
+///    join itself has no timeout, this is the margin).
+pub(crate) const HTTP_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+pub(crate) const TASK_JOIN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+pub(crate) const WS_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(7);
+pub(crate) const DB_SHUTDOWN_MARGIN: std::time::Duration = std::time::Duration::from_secs(10);
+pub(crate) const SHUTDOWN_BUDGET: std::time::Duration = std::time::Duration::from_secs(
+    HTTP_DRAIN_GRACE.as_secs()
+        + TASK_JOIN_GRACE.as_secs()
+        + WS_DRAIN_GRACE.as_secs()
+        + DB_SHUTDOWN_MARGIN.as_secs(),
+);
+
 /// Sets an integer socket option on a TCP stream.
 ///
 /// # Safety
@@ -331,6 +378,11 @@ async fn build_router(
                     .map(|info| info.0.ip())
                     && relay.access.read().await.is_ip_blocked(ip)
                 {
+                    // Debug, not WARN: a blocked peer can reconnect as fast
+                    // as it likes, so a warning here would flood the log. The
+                    // counter moves on every refusal.
+                    log::debug!("refused {ip}: blocked by NIP-86 blockip");
+                    relay.stats.bump(&relay.stats.conn_refused_blocked, 1);
                     return StatusCode::FORBIDDEN.into_response();
                 }
                 next.run(req).await
@@ -419,21 +471,23 @@ fn host_route_allowed(api_host: &str, blossom_host: &str, host: &str, path: &str
 
 /// Restores the persisted NIP-29 group state at startup, comparing the
 /// snapshot's stamp and sequence against the database's current group-state
-/// generation (`DbClient::state_stamp`, `DbClient::state_seq`). A snapshot
-/// from before a group-state removal (stamp) or state event (seq) must not
-/// be restored (it would resurrect state a purge/vanish invalidated, or
-/// predate an accepted event), and a generation the database cannot answer
-/// is treated the same way: fail closed and rebuild from the surviving
-/// events. A legacy snapshot (stamp and seq 0) is accepted while both
-/// counters are still 0. The rebuild path only runs when the NIP is
-/// enabled; with NIP-29 disabled the store stays empty exactly as when no
-/// snapshot exists (the next start with the NIP re-enabled rebuilds).
+/// generation (`DbClient::state_stamp`, `DbClient::state_seq_group`). A
+/// snapshot from before a group-state removal (stamp) or group-state event
+/// (group seq) must not be restored (it would resurrect state a purge/vanish
+/// invalidated, or predate an accepted event), and a generation the database
+/// cannot answer is treated the same way: fail closed and rebuild from the
+/// surviving events. A NIP-43 role event no longer invalidates the group
+/// snapshot (the per-family sequence). A legacy snapshot (stamp and seq 0)
+/// is accepted while both counters are still 0. The rebuild path only runs
+/// when the NIP is enabled; with NIP-29 disabled the store stays empty
+/// exactly as when no snapshot exists (the next start with the NIP
+/// re-enabled rebuilds).
 async fn restore_group_state(relay: &Relay, groups_enabled: bool) -> Result<()> {
     let Some(snapshot) = relay.db.load_groups().await else {
         return rebuild_group_state(relay, groups_enabled).await;
     };
     let stamp = relay.db.state_stamp().await;
-    let seq = relay.db.state_seq().await;
+    let seq = relay.db.state_seq_group().await;
     match (stamp, seq) {
         (Some(stamp), Some(seq)) => {
             if relay
@@ -513,7 +567,97 @@ async fn startup_group_state(relay: &Relay, groups_enabled: bool) -> Result<()> 
     Ok(())
 }
 
-pub async fn run_server(config_path: PathBuf, config: Config, db: DbClient) -> Result<()> {
+/// The startup NIP-43 sequence: restore the persisted role snapshot or
+/// rebuild from the surviving events.
+///
+/// The snapshot's stamp and sequence are compared against the database's
+/// state generation (`DbClient::state_stamp`, `DbClient::state_seq_role`):
+/// a NIP-09 deletion of a role-state event (stamp) or a role-state event
+/// itself (role seq) advances them, so a snapshot from before such a change
+/// must not be restored (it would resurrect a deleted grant or predate a
+/// state event). A NIP-29 group event no longer invalidates the role
+/// snapshot (the per-family sequence), and an unreadable generation fails
+/// closed the same way. Both cases fall through to the replay migration,
+/// which rebuilds from the surviving events. A failed rebuild is fatal.
+async fn restore_role_state(relay: &Relay) -> Result<()> {
+    if !relay.config.read().await.nip_enabled(43) {
+        return Ok(());
+    }
+    let needs_rebuild = match relay.db.load_roles().await {
+        Some(snap) => match (
+            relay.db.state_stamp().await,
+            relay.db.state_seq_role().await,
+        ) {
+            (Some(stamp), Some(seq)) => {
+                if relay.roles.write().await.restore_checked(snap, stamp, seq) {
+                    info!("NIP-43 role state restored from the database snapshot");
+                    false
+                } else {
+                    error!(
+                        "the persisted NIP-43 role snapshot predates the database's state \
+                         generation (stamp {stamp}, seq {seq}); refusing to restore it and \
+                         rebuilding from the surviving events instead"
+                    );
+                    true
+                }
+            }
+            _ => {
+                // The generation is unknown, so the snapshot's currency
+                // cannot be established: restoring it could resurrect a
+                // deleted grant.
+                error!(
+                    "cannot read the database's state generation; refusing to restore \
+                     the persisted NIP-43 role snapshot and rebuilding from the \
+                     surviving events"
+                );
+                true
+            }
+        },
+        None => true,
+    };
+    if needs_rebuild {
+        if !relay
+            .roles
+            .write()
+            .await
+            .rebuild(&relay.db, &relay.relay_pubkey().unwrap_or_default())
+            .await
+        {
+            return Err(anyhow::anyhow!(
+                "NIP-43 role state rebuild failed: refusing to start with an \
+                 incomplete role store"
+            ));
+        }
+        relay.persist_roles().await;
+    }
+    Ok(())
+}
+
+pub async fn run_server(
+    config_path: PathBuf,
+    config: Config,
+    db: DbClient,
+    signals: StartupSignals,
+) -> Result<()> {
+    // The signals were registered by the CLI before the database was opened
+    // (see `StartupSignals`): the handler tasks below consume the streams,
+    // and anything received in between is buffered by the tokio driver.
+    let StartupSignals {
+        terminate,
+        interrupt,
+        hangup,
+    } = signals;
+    let pid_file = config.daemon.pid_file.clone();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    // Detached on purpose: the supervisor's bounded join would abort it
+    // mid-shutdown, and the second-signal escalation must stay armed until
+    // the process actually exits (see `signal_handler`).
+    let _signal_task = tokio::spawn(signal_handler(
+        terminate,
+        interrupt,
+        shutdown_tx.clone(),
+        Some(pid_file),
+    ));
     let private_key = config.relay.private_key.clone();
     let live = crate::relay::LiveBusConfig {
         buffer: config.limits.live_buffer,
@@ -532,6 +676,24 @@ pub async fn run_server(config_path: PathBuf, config: Config, db: DbClient) -> R
     // Make the config file path known to the relay so NIP-86 runtime
     // changes (relay name/description/icon) can be persisted to disk.
     *relay.config_path.write().await = Some(config_path.clone());
+    // The SIGHUP handler is registered early too (see above); the task can
+    // run as soon as the relay exists, before the long state restore.
+    let reload_task = tokio::spawn(reload_handler(
+        config_path,
+        relay.clone(),
+        relay.db.clone(),
+        relay.api_limit.clone(),
+        shutdown_rx.clone(),
+        hangup,
+    ));
+    // Startup barrier: the database's synchronous recovery may have removed
+    // a NIP-29/NIP-43 state event while resuming interrupted deletions. The
+    // relay marks its derived stores stale here, before any snapshot is
+    // restored or rebuilt, so a recovered removal cannot be resurrected by
+    // the startup state load (the persistent generation was bumped too, but
+    // the fail-closed marking is what keeps the pending background rebuild
+    // from certifying stale state).
+    relay.recovery_done().await;
 
     // Restore the NIP-29 group state from the persisted snapshot. Only
     // when no snapshot was ever written (pre-persistence database) fall
@@ -552,63 +714,9 @@ pub async fn run_server(config_path: PathBuf, config: Config, db: DbClient) -> R
     }
 
     // Same lifecycle for the NIP-43 role store: snapshot first, replay
-    // migration only when nothing usable was ever persisted. The snapshot's
-    // stamp and sequence are compared against the database's state
-    // generation (`DbClient::state_stamp`, `DbClient::state_seq`), which a
-    // NIP-09 deletion of a role-state event or a role-state event itself
-    // advances: a snapshot from before such a change must not be restored
-    // (it would resurrect a deleted grant or predate a state event), and an
-    // unreadable generation fails closed the same way. Both cases fall
-    // through to the replay migration below, which rebuilds from the
-    // surviving events.
-    if relay.config.read().await.nip_enabled(43) {
-        let needs_rebuild = match relay.db.load_roles().await {
-            Some(snap) => match (relay.db.state_stamp().await, relay.db.state_seq().await) {
-                (Some(stamp), Some(seq)) => {
-                    if relay.roles.write().await.restore_checked(snap, stamp, seq) {
-                        info!("NIP-43 role state restored from the database snapshot");
-                        false
-                    } else {
-                        error!(
-                            "the persisted NIP-43 role snapshot predates the database's state \
-                             generation (stamp {stamp}, seq {seq}); refusing to restore it and \
-                             rebuilding from the surviving events instead"
-                        );
-                        true
-                    }
-                }
-                _ => {
-                    // The generation is unknown, so the snapshot's currency
-                    // cannot be established: restoring it could resurrect a
-                    // deleted grant.
-                    error!(
-                        "cannot read the database's state generation; refusing to restore \
-                         the persisted NIP-43 role snapshot and rebuilding from the \
-                         surviving events"
-                    );
-                    true
-                }
-            },
-            None => true,
-        };
-        if needs_rebuild {
-            if !relay
-                .roles
-                .write()
-                .await
-                .rebuild(&relay.db, &relay.relay_pubkey().unwrap_or_default())
-                .await
-            {
-                return Err(anyhow::anyhow!(
-                    "NIP-43 role state rebuild failed: refusing to start with an \
-                     incomplete role store"
-                ));
-            }
-            relay.persist_roles().await;
-        }
-    }
-
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    // migration only when nothing usable was ever persisted (see
+    // [`restore_role_state`]).
+    restore_role_state(&relay).await?;
 
     let blossom_state = blossom::build_state(&relay.config.read().await.clone(), &relay).await;
     *relay.blossom.write().await = blossom_state.clone();
@@ -639,20 +747,10 @@ pub async fn run_server(config_path: PathBuf, config: Config, db: DbClient) -> R
             "nip66_publisher",
             tokio::spawn(nip66_publisher(relay.clone(), shutdown_rx.clone())),
         ),
-        (
-            "signal_handler",
-            tokio::spawn(signal_handler(shutdown_tx.clone())),
-        ),
-        (
-            "reload_handler",
-            tokio::spawn(reload_handler(
-                config_path,
-                relay.clone(),
-                relay.db.clone(),
-                relay.api_limit.clone(),
-                shutdown_rx.clone(),
-            )),
-        ),
+        // Spawned before the startup work (see the top of `run_server`) and
+        // kept out of the abortable set so its second-signal escalation
+        // stays armed.
+        ("reload_handler", reload_task),
     ] {
         let shutdown = shutdown_rx.clone();
         tasks.push(tokio::spawn(async move {
@@ -713,6 +811,7 @@ pub async fn run_server(config_path: PathBuf, config: Config, db: DbClient) -> R
         per_sec_per_ip,
         trusted_proxies,
         recv_buf_kb,
+        relay.stats.clone(),
         shutdown_rx,
     )
     .await;
@@ -727,7 +826,7 @@ pub async fn run_server(config_path: PathBuf, config: Config, db: DbClient) -> R
     // (e.g. a mid-flight `purge_expired`) must not delay the process exit
     // without limit. Aborting drops the loop at its next await point; the
     // database is stopped afterwards.
-    let join_grace = std::time::Duration::from_secs(5);
+    let join_grace = TASK_JOIN_GRACE;
     if !join_tasks_bounded(&mut tasks, join_grace).await {
         warn!(
             "background tasks did not stop within {}s; aborted them",
@@ -741,7 +840,8 @@ pub async fn run_server(config_path: PathBuf, config: Config, db: DbClient) -> R
     // process would exit with accepted-but-uncommitted events (and no OKs).
     // The window covers the WebSocket teardown grace (5 s, see
     // `ws::handler`) plus a margin for the final flush and close.
-    let ws_deadline = std::time::Instant::now() + std::time::Duration::from_secs(7);
+    // `SHUTDOWN_BUDGET` covers this phase for the `nostrfy stop` timeout.
+    let ws_deadline = std::time::Instant::now() + WS_DRAIN_GRACE;
     while relay
         .stats
         .connections_active
@@ -1066,8 +1166,38 @@ async fn ws_handler(State(relay): State<Arc<Relay>>, request: Request) -> Respon
     }
 }
 
-async fn health_handler() -> impl IntoResponse {
-    (StatusCode::OK, Json(json!({ "status": "ok" })))
+/// `GET /health`: liveness plus a write-path check.
+///
+/// Liveness (is the process serving?) is always observable: the handler
+/// answers while the listener accepts. The body/status additionally reports
+/// whether the database is accepting writes, because a full disk or an
+/// exhausted LMDB map makes the relay read-only while the process is
+/// otherwise healthy — a liveness-only `200` would hide that. `503` means
+/// "up but refusing writes" (disk full / map full / writer gone); it is not
+/// a restart signal, reads and live delivery keep working and the relay
+/// recovers on its own once space is available.
+async fn health_handler(State(relay): State<Arc<Relay>>) -> Response {
+    if relay.db.disk_full() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "status": "unavailable",
+                "reason": "database is refusing writes: storage is full (disk or map)",
+            })),
+        )
+            .into_response();
+    }
+    if relay.db.cancelled() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "status": "unavailable",
+                "reason": "database writer is not accepting work",
+            })),
+        )
+            .into_response();
+    }
+    (StatusCode::OK, Json(json!({ "status": "ok" }))).into_response()
 }
 
 /// Prometheus metrics endpoint: the counters in text exposition format.
@@ -1094,26 +1224,107 @@ async fn stats_writer(relay: Arc<Relay>, mut shutdown: watch::Receiver<bool>) {
                     .db_size_bytes
                     .store(relay.db.size_on_disk().await, std::sync::atomic::Ordering::Relaxed);
                 relay.stats.bump(&relay.stats.db_errors, relay.db.take_errors());
-                // NIP-62 bookkeeping gauges: a failed read keeps the last
-                // value (the counters must not flip to zero on a timeout).
-                if let Some((markers, pending)) = relay.db.vanish_counts().await {
+                // Overload is distinct from faults: the fail-fast paths bump
+                // their own database counter, and the database itself stays
+                // healthy. Polled here so a stalled writer is visible even
+                // though no request completed.
+                relay
+                    .stats
+                    .bump(&relay.stats.db_overloaded, relay.db.take_overloads());
+                relay.stats.db_pending_msgs.store(
+                    relay.db.pending_msgs() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                relay.stats.db_pending_events.store(
+                    relay.db.pending_events() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                relay.stats.db_pending_bytes.store(
+                    relay.db.pending_bytes() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                relay.stats.db_pending_reads.store(
+                    relay.db.pending_reads() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                relay.stats.db_pending_read_bytes.store(
+                    relay.db.pending_read_bytes() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                relay.stats.db_api_pending.store(
+                    relay.db.api_pending() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                relay.stats.db_api_pending_bytes.store(
+                    relay.db.api_pending_bytes() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                // Storage-full gauge: unlike the counters, a failed read
+                // must not flip a true refusal to false, so the free-space
+                // gauge keeps its last value when the store cannot answer.
+                relay.stats.db_disk_full.store(
+                    u64::from(relay.db.disk_full()),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                if let Some(free) = relay.db.free_disk_bytes() {
+                    relay
+                        .stats
+                        .db_free_bytes
+                        .store(free, std::sync::atomic::Ordering::Relaxed);
+                }
+                // Runtime derived-state rebuild failures (the startup rebuild
+                // is fatal and never reaches this counter).
+                relay
+                    .stats
+                    .rebuild_failures
+                    .store(relay.rebuild_failures(), std::sync::atomic::Ordering::Relaxed);
+                // Bookkeeping-table gauges in one read: the permanent
+                // removal markers and the pending recovery queues. A failed
+                // read keeps the last values (the gauges must not flip to
+                // zero on a timeout), and the compatibility fields
+                // (vanish_markers / pending_vanishes / pending_purges) are
+                // refreshed from the same snapshot.
+                if let Some(counts) = relay.db.table_counts().await {
                     relay
                         .stats
                         .vanish_markers
-                        .store(markers, std::sync::atomic::Ordering::Relaxed);
+                        .store(counts.vanish, std::sync::atomic::Ordering::Relaxed);
                     relay
                         .stats
                         .pending_vanishes
-                        .store(pending, std::sync::atomic::Ordering::Relaxed);
-                }
-                // Purges can become pending at runtime (a failed removal
-                // during operation), so refresh the gauge here as well as at
-                // startup.
-                if let Some(pending) = relay.db.pending_purges().await {
+                        .store(counts.vanish_pending, std::sync::atomic::Ordering::Relaxed);
                     relay
                         .stats
                         .pending_purges
-                        .store(pending.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                        .store(counts.purge_pending, std::sync::atomic::Ordering::Relaxed);
+                    relay
+                        .stats
+                        .db_table_deleted
+                        .store(counts.deleted, std::sync::atomic::Ordering::Relaxed);
+                    relay
+                        .stats
+                        .db_table_first_seen
+                        .store(counts.first_seen, std::sync::atomic::Ordering::Relaxed);
+                    relay
+                        .stats
+                        .db_table_purged_groups
+                        .store(counts.purged_groups, std::sync::atomic::Ordering::Relaxed);
+                    relay
+                        .stats
+                        .db_table_vanish
+                        .store(counts.vanish, std::sync::atomic::Ordering::Relaxed);
+                    relay
+                        .stats
+                        .db_table_vanish_pending
+                        .store(counts.vanish_pending, std::sync::atomic::Ordering::Relaxed);
+                    relay
+                        .stats
+                        .db_table_purge_pending
+                        .store(counts.purge_pending, std::sync::atomic::Ordering::Relaxed);
+                    relay
+                        .stats
+                        .db_table_delete_pending
+                        .store(counts.delete_pending, std::sync::atomic::Ordering::Relaxed);
                 }
                 if let Some(blossom) = relay.blossom.read().await.as_ref() {
                     relay
@@ -1230,7 +1441,17 @@ async fn purge_loop(relay: Arc<Relay>, mut shutdown: watch::Receiver<bool>) {
                 // mid-flight purge (the join timeout in `run_server` bounds
                 // the worst case, but this lets a clean shutdown complete
                 // promptly instead of aborting the task).
-                let purge = relay.db.purge_expired(unix_now());
+                //
+                // `first_seen` rows are reaped once a pubkey is older than
+                // the new-pubkey gate: it can never reject that pubkey again,
+                // so the row only grows the table (0 = gate disabled = no
+                // reap, the database's documented convention). Read per tick
+                // so a config reload applies.
+                let (now, first_seen_min_age) = {
+                    let cfg = relay.config.read().await;
+                    (unix_now(), cfg.relay.new_pubkey_min_age_secs)
+                };
+                let purge = relay.db.purge_expired(now, first_seen_min_age);
                 tokio::select! {
                     (removed, state_changed) = purge => {
                         if removed > 0 {
@@ -1381,6 +1602,7 @@ async fn serve_limited(
     per_sec_per_ip: Option<Arc<IpConnLimiter>>,
     trusted_proxies: Arc<[TrustedProxy]>,
     recv_buf_kb: u32,
+    stats: Arc<Stats>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1408,6 +1630,8 @@ async fn serve_limited(
                     // descriptors) would otherwise spin the loop hot; back
                     // off briefly so the relay keeps serving existing
                     // connections while the OS recovers.
+                    stats.bump(&stats.accept_errors, 1);
+                    warn_refusal("accept() failed; backing off — the relay keeps serving existing connections (check the file-descriptor limit)");
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     continue;
                 };
@@ -1428,12 +1652,21 @@ async fn serve_limited(
                     if let Some(limiter) = &per_sec_per_ip
                         && !limiter.allow_now(accounting)
                     {
+                        stats.bump(&stats.conn_refused_rate, 1);
+                        warn_refusal(
+                            "connections refused by limits.max_connections_per_sec_per_ip \
+                             (per-IP connection rate limit)",
+                        );
                         continue;
                     }
                 }
                 // Connection cap: refuse the socket outright at the cap so
                 // established-but-idle sockets cannot pin file descriptors.
                 if active.load(Ordering::Relaxed) >= max_connections {
+                    stats.bump(&stats.conn_refused_global, 1);
+                    warn_refusal(
+                        "connections refused at limits.max_connections (global connection cap)",
+                    );
                     continue;
                 }
                 // Per-IP concurrent cap: plain HTTP connections count too,
@@ -1441,6 +1674,11 @@ async fn serve_limited(
                 // task guard on every exit path (including a panic), or by
                 // the WebSocket layer after a handover.
                 if !trusted && !ip_counter.try_acquire(accounting, max_per_ip) {
+                    stats.bump(&stats.conn_refused_per_ip, 1);
+                    warn_refusal(
+                        "connections refused at limits.max_connections_per_ip \
+                         (per-IP concurrent connection cap)",
+                    );
                     continue;
                 }
                 active.fetch_add(1, Ordering::Relaxed);
@@ -1495,6 +1733,7 @@ async fn serve_limited(
                 let proxies = Arc::clone(&trusted_proxies);
                 let per_sec = per_sec_per_ip.clone();
                 let ip_counter_handle = Arc::clone(&ip_counter);
+                let stats_handle = Arc::clone(&stats);
                 let svc = app.layer(axum::middleware::from_fn(
                     move |mut req: axum::extract::Request,
                           next: axum::middleware::Next| {
@@ -1503,6 +1742,7 @@ async fn serve_limited(
                         let proxies = Arc::clone(&proxies);
                         let per_sec = per_sec.clone();
                         let ip_counter = Arc::clone(&ip_counter_handle);
+                        let stats = Arc::clone(&stats_handle);
                         async move {
                             let raw_ip = normalize_ip(peer.ip());
                             let client = if trusted {
@@ -1532,9 +1772,19 @@ async fn serve_limited(
                                 if let Some(limiter) = &per_sec
                                     && !limiter.allow_now(accounting)
                                 {
+                                    stats.bump(&stats.conn_refused_proxy, 1);
+                                    warn_refusal(
+                                        "trusted-proxy requests refused with 429: per-IP \
+                                         connection rate limit",
+                                    );
                                     return StatusCode::TOO_MANY_REQUESTS.into_response();
                                 }
                                 if !ip_counter.try_acquire(accounting, max_per_ip) {
+                                    stats.bump(&stats.conn_refused_proxy, 1);
+                                    warn_refusal(
+                                        "trusted-proxy requests refused with 429: per-IP \
+                                         concurrent connection cap",
+                                    );
                                     return StatusCode::TOO_MANY_REQUESTS.into_response();
                                 }
                                 // Two handles to the guard: one in the
@@ -1620,15 +1870,15 @@ async fn serve_limited(
     }
     // Graceful drain: signal every connection, wait a bounded grace, then
     // abort the stragglers so shutdown never hangs on a stuck peer. The
-    // grace stays well under the CLI stop timeout (10 s), so a relay with
-    // long-lived WebSocket connections still stops in time.
+    // grace is one phase of `SHUTDOWN_BUDGET`, which the CLI stop timeout
+    // covers.
     let _ = drain_tx.send(());
     // Wait for the HTTP connection tasks to finish. The `active` count is
     // not usable here: upgraded WebSocket connections keep their slot
     // reserved until the relay's own drain signal runs (after this
     // function returns), so waiting on `active` would always burn the full
     // grace period while any WebSocket connection is open.
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    tokio::time::timeout(HTTP_DRAIN_GRACE, async {
         while conn_tasks.iter().any(|task| !task.is_finished()) {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
@@ -1640,27 +1890,92 @@ async fn serve_limited(
     }
 }
 
-async fn signal_handler(shutdown: watch::Sender<bool>) {
-    let mut terminate = match signal(SignalKind::terminate()) {
-        Ok(s) => s,
-        Err(e) => {
-            error!("cannot register SIGTERM handler: {e}");
-            return;
+/// The termination/reload signal streams, registered by the CLI *before*
+/// the long startup work (database open and recovery, relay construction,
+/// state restore, bind). `Signal` creation installs the handler; until then
+/// the default action applies and a SIGHUP received during startup
+/// terminates the process. Signals that arrive before the handler tasks
+/// run are buffered by the tokio driver and handled as soon as it is
+/// polled, so behavior after startup is unchanged.
+pub(crate) struct StartupSignals {
+    pub(crate) terminate: Option<tokio::signal::unix::Signal>,
+    pub(crate) interrupt: Option<tokio::signal::unix::Signal>,
+    pub(crate) hangup: Option<tokio::signal::unix::Signal>,
+}
+
+impl StartupSignals {
+    /// Registers SIGTERM, SIGINT and SIGHUP. A registration failure is
+    /// logged and leaves that signal unhandled (the others still work).
+    pub(crate) fn register() -> Self {
+        StartupSignals {
+            terminate: register_signal(SignalKind::terminate()),
+            interrupt: register_signal(SignalKind::interrupt()),
+            hangup: register_signal(SignalKind::hangup()),
         }
-    };
-    let mut interrupt = match signal(SignalKind::interrupt()) {
-        Ok(s) => s,
-        Err(e) => {
-            error!("cannot register SIGINT handler: {e}");
-            return;
-        }
-    };
-    tokio::select! {
-        _ = terminate.recv() => {}
-        _ = interrupt.recv() => {}
     }
+}
+
+/// Registers one Unix signal with the tokio driver. Registration installs
+/// the process-wide handler, so it must run before the long startup work:
+/// until then the default action applies (a SIGHUP during startup
+/// terminates the process). A registration failure is logged and leaves the
+/// signal unhandled (the other signals still work).
+fn register_signal(kind: SignalKind) -> Option<tokio::signal::unix::Signal> {
+    match signal(kind) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            error!("cannot register {kind:?} handler: {e}");
+            None
+        }
+    }
+}
+
+/// Awaits the next termination signal from either stream; pending forever
+/// when neither could be registered.
+async fn await_termination_signal(
+    terminate: &mut Option<tokio::signal::unix::Signal>,
+    interrupt: &mut Option<tokio::signal::unix::Signal>,
+) {
+    match (terminate, interrupt) {
+        (Some(terminate), Some(interrupt)) => {
+            tokio::select! {
+                _ = terminate.recv() => {}
+                _ = interrupt.recv() => {}
+            }
+        }
+        (Some(terminate), None) => {
+            let _ = terminate.recv().await;
+        }
+        (None, Some(interrupt)) => {
+            let _ = interrupt.recv().await;
+        }
+        (None, None) => std::future::pending().await,
+    }
+}
+
+/// Handles SIGTERM/SIGINT. The first signal starts the graceful shutdown;
+/// a second one forces an immediate exit: once shutdown is under way the
+/// grace windows can add up to `SHUTDOWN_BUDGET`, and an operator asking
+/// twice wants out now. The pid file is removed first (the normal `Drop`
+/// guards do not run on `process::exit`), so the next `start` is not
+/// blocked by a stale file.
+async fn signal_handler(
+    mut terminate: Option<tokio::signal::unix::Signal>,
+    mut interrupt: Option<tokio::signal::unix::Signal>,
+    shutdown: watch::Sender<bool>,
+    pid_file: Option<PathBuf>,
+) {
+    await_termination_signal(&mut terminate, &mut interrupt).await;
     info!("shutdown signal received");
     let _ = shutdown.send(true);
+    await_termination_signal(&mut terminate, &mut interrupt).await;
+    warn!("second shutdown signal received; forcing an immediate exit");
+    if let Some(path) = &pid_file {
+        let _ = std::fs::remove_file(path);
+    }
+    // SIGINT's conventional status (128 + 2); the test harness and shells
+    // only need "stopped by signal", the exact value is informational.
+    std::process::exit(130);
 }
 
 async fn reload_handler(
@@ -1669,13 +1984,14 @@ async fn reload_handler(
     db: DbClient,
     api_limit: Arc<crate::relay::ApiLimiter>,
     mut shutdown: watch::Receiver<bool>,
+    hangup: Option<tokio::signal::unix::Signal>,
 ) {
-    let mut hangup = match signal(SignalKind::hangup()) {
-        Ok(s) => s,
-        Err(e) => {
-            error!("cannot register SIGHUP handler: {e}");
-            return;
-        }
+    // `None` (registration failed, see `register_signal`) leaves the task
+    // running only for the shutdown watch: the relay serves without SIGHUP
+    // reload instead of the task returning and the supervisor reporting it.
+    let Some(mut hangup) = hangup else {
+        let _ = shutdown.changed().await;
+        return;
     };
     loop {
         tokio::select! {
@@ -2198,6 +2514,85 @@ mod tests {
         relay.db.shutdown();
     }
 
+    #[tokio::test]
+    async fn per_family_sequences_reject_a_stale_group_snapshot_and_restore_current_roles() {
+        // The startup restore blocks compare each snapshot against its own
+        // family sequence: a role event advances only the role sequence, so
+        // a group snapshot that predates a group event is rejected (and
+        // rebuilt from the surviving events) while the role snapshot saved
+        // after the role event still restores.
+        let relay = blossom_relay().await;
+        let now = unix_now();
+        let authored = |kind: u64, content: &str| {
+            let mut event = crate::event::Event {
+                id: String::new(),
+                pubkey: "aa".repeat(32),
+                created_at: now,
+                kind,
+                tags: vec![],
+                content: content.to_string(),
+                sig: "00".repeat(64),
+            };
+            event.id = crate::nips::nip01::compute_id(&event);
+            event
+        };
+
+        // One group event advances the group sequence to 1; one role event
+        // advances the role sequence to 1. Neither crosses over.
+        assert_eq!(
+            relay.db.put(authored(9002, "group"), now).await,
+            crate::db::PutOutcome::Stored
+        );
+        assert_eq!(
+            relay
+                .db
+                .put(authored(crate::nips::nip43::ROLE_DEFINITION, "role"), now)
+                .await,
+            crate::db::PutOutcome::Stored
+        );
+        assert_eq!(relay.db.state_seq_group().await, Some(1));
+        assert_eq!(relay.db.state_seq_role().await, Some(1));
+        let stamp = relay.db.state_stamp().await.expect("stamp");
+
+        // A stale group snapshot (sequence 0 < current 1).
+        let mut stale_group = crate::nips::nip29::GroupsSnapshot::default();
+        stale_group
+            .groups
+            .insert("stale".to_string(), Default::default());
+        stale_group.stamp = stamp;
+        stale_group.seq = 0;
+        assert!(relay.db.save_groups(stale_group).await);
+
+        // A current role snapshot (sequence 1 == current 1).
+        let mut current_roles = crate::nips::nip43::RolesSnapshot::default();
+        current_roles
+            .roles
+            .insert("king".to_string(), Default::default());
+        current_roles.stamp = stamp;
+        current_roles.seq = 1;
+        assert!(relay.db.save_roles(current_roles).await);
+
+        // The group restore rejects the stale snapshot and rebuilds.
+        startup_group_state(&relay, true)
+            .await
+            .expect("the group rebuild must succeed");
+        assert!(
+            relay.groups.read().await.group("stale").is_none(),
+            "the stale group snapshot must not be restored"
+        );
+
+        // The role snapshot is still current: the group event did not
+        // advance the role sequence, so it restores instead of rebuilding.
+        restore_role_state(&relay)
+            .await
+            .expect("the role restore must succeed");
+        assert!(
+            relay.roles.read().await.roles.contains_key("king"),
+            "a role snapshot at the current role sequence must restore"
+        );
+        relay.db.shutdown();
+    }
+
     /// Writes `cfg` to a fresh temp config file and returns `(dir, path)`,
     /// so a SIGHUP test can exercise the real load/validate path.
     fn write_temp_config(name: &str, cfg: &Config) -> (PathBuf, PathBuf) {
@@ -2594,6 +2989,15 @@ mod tests {
             >("198.51.100.8:1234".parse().unwrap()));
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        // Every blocked-IP refusal bumped the counter (three above).
+        assert_eq!(
+            relay
+                .stats
+                .conn_refused_blocked
+                .load(std::sync::atomic::Ordering::Relaxed),
+            3,
+            "blocked-IP 403s must be counted"
+        );
         relay.db.shutdown();
     }
 
@@ -2768,6 +3172,33 @@ mod tests {
             per_sec.map(Arc::new),
             Arc::from(trusted),
             16,
+            crate::stats::Stats::new(),
+            rx,
+        ));
+        (addr, tx, handle)
+    }
+
+    /// Like [`serve_limited_for_test`], but returns the shared stats so a
+    /// test can assert the refusal counters.
+    async fn serve_limited_with_stats(
+        max_connections: usize,
+        max_per_ip: usize,
+        per_sec: Option<IpConnLimiter>,
+        stats: Arc<crate::stats::Stats>,
+    ) -> (SocketAddr, watch::Sender<bool>, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = watch::channel(false);
+        let handle = tokio::spawn(serve_limited(
+            listener,
+            test_app(),
+            max_connections,
+            max_per_ip,
+            Some(Duration::from_secs(30)),
+            per_sec.map(Arc::new),
+            Arc::from(Vec::new()),
+            16,
+            stats,
             rx,
         ));
         (addr, tx, handle)
@@ -2866,6 +3297,90 @@ mod tests {
         drop(conn3);
         tx.send(true).unwrap();
         handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn serve_limited_counts_each_refusal_reason() {
+        use std::sync::atomic::Ordering;
+        // Global cap.
+        let stats = crate::stats::Stats::new();
+        let (addr, tx, handle) = serve_limited_with_stats(1, 0, None, stats.clone()).await;
+        let (conn1, body) = http_keepalive(addr).await;
+        assert!(String::from_utf8_lossy(&body).contains("200 OK"));
+        assert!(http_get_with_xff(addr, None).await.is_empty());
+        assert_eq!(
+            stats.conn_refused_global.load(Ordering::Relaxed),
+            1,
+            "a global-cap drop must be counted"
+        );
+        drop(conn1);
+        tx.send(true).unwrap();
+        handle.await.unwrap();
+
+        // Per-IP concurrent cap.
+        let stats = crate::stats::Stats::new();
+        let (addr, tx, handle) = serve_limited_with_stats(10, 1, None, stats.clone()).await;
+        let (conn1, body) = http_keepalive(addr).await;
+        assert!(String::from_utf8_lossy(&body).contains("200 OK"));
+        assert!(http_get_with_xff(addr, None).await.is_empty());
+        assert_eq!(
+            stats.conn_refused_per_ip.load(Ordering::Relaxed),
+            1,
+            "a per-IP-cap drop must be counted"
+        );
+        drop(conn1);
+        tx.send(true).unwrap();
+        handle.await.unwrap();
+
+        // Per-IP rate limit: the injected clock pins the one-second window,
+        // so the second connection is deterministically over the limit.
+        let stats = crate::stats::Stats::new();
+        let (addr, tx, handle) = serve_limited_with_stats(
+            10,
+            0,
+            IpConnLimiter::with_clock(1, Arc::new(|| 0)),
+            stats.clone(),
+        )
+        .await;
+        let (conn1, body) = http_keepalive(addr).await;
+        assert!(String::from_utf8_lossy(&body).contains("200 OK"));
+        assert!(http_get_with_xff(addr, None).await.is_empty());
+        assert_eq!(
+            stats.conn_refused_rate.load(Ordering::Relaxed),
+            1,
+            "a rate-limit drop must be counted"
+        );
+        drop(conn1);
+        tx.send(true).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn health_reports_ok_for_a_healthy_database() {
+        // A healthy database (and, until the database accessors land, the
+        // fallback) keeps the liveness answer 200.
+        let relay = blossom_relay().await;
+        let response = health_handler(State(relay.clone())).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn termination_wait_pends_without_registered_signals() {
+        // A failed signal registration must leave the handler waiting for
+        // the shutdown watch instead of returning (which the supervisor
+        // would report as a lost background task).
+        let mut terminate = None;
+        let mut interrupt = None;
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                await_termination_signal(&mut terminate, &mut interrupt),
+            )
+            .await
+            .is_err(),
+            "no signal stream means pending forever"
+        );
     }
 
     #[tokio::test]
@@ -2982,6 +3497,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (tx, rx) = watch::channel(false);
+        let stats = crate::stats::Stats::new();
         let handle = tokio::spawn(serve_limited(
             listener,
             app,
@@ -2991,6 +3507,7 @@ mod tests {
             None,
             Arc::from(vec![TrustedProxy::parse("127.0.0.1/32").unwrap()]),
             16,
+            stats.clone(),
             rx,
         ));
         // The first client's request stays in flight, holding its slot.
@@ -3010,6 +3527,13 @@ mod tests {
             String::from_utf8_lossy(&refused).contains("429"),
             "the forwarded client must be capped: {:?}",
             String::from_utf8_lossy(&refused)
+        );
+        assert_eq!(
+            stats
+                .conn_refused_proxy
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "a trusted-proxy 429 must be counted"
         );
         // A different forwarded client is admitted and parks in the handler.
         let mut other = TcpStream::connect(addr).await.unwrap();
@@ -3058,6 +3582,7 @@ mod tests {
             None,
             Arc::from(Vec::new()),
             16,
+            crate::stats::Stats::new(),
             rx,
         ));
         let mut first = TcpStream::connect(addr).await.unwrap();
@@ -3150,6 +3675,7 @@ mod tests {
             None,
             Arc::from(Vec::new()),
             16,
+            crate::stats::Stats::new(),
             rx,
         ));
         // The handshake upgrades and the WebSocket holds the only per-IP

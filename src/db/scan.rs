@@ -669,6 +669,15 @@ impl Store {
         budget: usize,
         hidden_slack: usize,
     ) -> Result<(Vec<Event>, bool)> {
+        // Test-only one-shot fault injection: the reported read variants
+        // must answer `None` on a failed scan, never an empty success.
+        #[cfg(test)]
+        if self
+            .fail_next_scan
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(anyhow!("test-only scan failure"));
+        }
         let has_search = filters.iter().any(Filter::has_search);
         let kind = if count_mode {
             ScanKind::Count
@@ -738,6 +747,15 @@ impl Store {
         max_items: usize,
         budget: usize,
     ) -> Result<(NegItems, bool)> {
+        // See `scan`: test-only scan failure for the reported NEG/aggregate
+        // paths.
+        #[cfg(test)]
+        if self
+            .fail_next_scan
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(anyhow!("test-only scan failure"));
+        }
         let collect_cap = if filter.has_search() {
             max_items
                 .saturating_mul(SEARCH_BUDGET_MULTIPLIER)

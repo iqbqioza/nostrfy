@@ -1277,6 +1277,17 @@ impl TempUploadCleanup {
     }
 }
 
+/// Bounds the detached spool-removal tasks: a burst of aborted uploads must
+/// not spawn an unbounded number of tasks (each pins a runtime slot and a
+/// potentially large unlink). When no permit is free the removal falls back
+/// to the synchronous best-effort unlink, which is cheap and cannot pile up.
+static SPOOL_REMOVAL_LIMITS: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> =
+    std::sync::OnceLock::new();
+
+fn spool_removal_limit() -> Arc<tokio::sync::Semaphore> {
+    Arc::clone(SPOOL_REMOVAL_LIMITS.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(16))))
+}
+
 impl Drop for TempUploadCleanup {
     fn drop(&mut self) {
         let Some(path) = self.path.take() else {
@@ -1295,9 +1306,16 @@ impl Drop for TempUploadCleanup {
         }
         // Removing a large spool can block the worker for a while: hand it
         // to the runtime when one is available (Drop runs on the handler
-        // task), and fall back to a sync removal otherwise.
-        if tokio::runtime::Handle::try_current().is_ok() {
-            tokio::spawn(remove_spool(path, drain));
+        // task) and a removal task permit is free, and fall back to a sync
+        // removal otherwise. The permit bound keeps a storm of aborted
+        // uploads from spawning one task per spool.
+        if tokio::runtime::Handle::try_current().is_ok()
+            && let Ok(permit) = spool_removal_limit().try_acquire_owned()
+        {
+            tokio::spawn(async move {
+                let _permit = permit;
+                remove_spool(path, drain).await;
+            });
         } else if let Err(e) = std::fs::remove_file(&path)
             && e.kind() != std::io::ErrorKind::NotFound
         {

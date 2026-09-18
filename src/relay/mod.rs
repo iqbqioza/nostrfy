@@ -236,6 +236,13 @@ const GROUPS_REBUILD_MIN_INTERVAL_SECS: u64 = 2;
 /// the persisted snapshot stays dropped until a scan completes cleanly).
 const GROUPS_REBUILD_BUFFER_MAX: usize = 4096;
 
+/// Minimum seconds between two completed role rebuilds, mirroring
+/// [`GROUPS_REBUILD_MIN_INTERVAL_SECS`]: a NIP-09 deletion burst (or a
+/// client deleting many role-state events) must not run a full role scan
+/// per event. Requests arriving inside the window coalesce into the next
+/// scan through the dirty flag.
+const ROLES_REBUILD_MIN_INTERVAL_SECS: u64 = 2;
+
 /// A group event accepted while a rebuild scan was in flight, replayed onto
 /// the fresh store once the scan completes.
 struct BufferedGroupEvent {
@@ -266,6 +273,65 @@ struct RebuildBuffer {
     retry: bool,
 }
 
+/// Tracks derived-state mutations between the point their database write is
+/// issued and the point their in-memory effect is applied. A snapshot
+/// captured in that window would be stamped with the post-commit
+/// generation while holding pre-mutation state, and a later startup would
+/// accept it; `persist` refuses to save while a mutation is in flight (it
+/// simply defers: the mutation path schedules the next debounced save and a
+/// removal marks the state stale itself).
+#[derive(Default)]
+struct DerivedMutationEpoch {
+    started: std::sync::atomic::AtomicU64,
+    finished: std::sync::atomic::AtomicU64,
+}
+
+impl DerivedMutationEpoch {
+    fn in_flight(&self) -> bool {
+        self.started.load(Ordering::SeqCst) != self.finished.load(Ordering::SeqCst)
+    }
+
+    fn begin(&self) -> DerivedMutationGuard<'_> {
+        self.started.fetch_add(1, Ordering::SeqCst);
+        DerivedMutationGuard { epoch: self }
+    }
+}
+
+/// Releases one in-flight claim when the in-memory apply completes (or the
+/// mutation is abandoned).
+struct DerivedMutationGuard<'a> {
+    epoch: &'a DerivedMutationEpoch,
+}
+
+impl Drop for DerivedMutationGuard<'_> {
+    fn drop(&mut self) {
+        self.epoch.finished.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// Result of the post-commit side effects (see [`Relay::after_put`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemovalAck {
+    /// The side effects applied; the bool is whether live delivery succeeded.
+    Applied(bool),
+    /// A required removal (NIP-09 deletion or NIP-29 9005) was not applied
+    /// (writer overload): the client must be told to retry, not `OK true`.
+    NotApplied,
+}
+
+/// Result of a snapshot persist attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PersistOutcome {
+    /// The snapshot was written (or a stale one cleared).
+    Committed,
+    /// A derived mutation was in flight: nothing was written and the state
+    /// must not be treated as stale. The next debounced pass retries.
+    Deferred,
+    /// The intended write failed: the caller must keep the state
+    /// fail-closed (pending) so the next startup rebuilds.
+    Failed,
+}
+
 /// Coordination state for the coalesced NIP-29 group rebuild that follows a
 /// vanish (or another removal of group-state-relevant events). Kept in an
 /// `Arc` so the background worker can run without borrowing the relay.
@@ -282,6 +348,10 @@ struct GroupsRebuild {
     last: std::sync::atomic::AtomicU64,
     /// Completed scans, for tests asserting that a burst coalesces.
     rebuilds: std::sync::atomic::AtomicU64,
+    /// Failed rebuild attempts (scan failure, discarded buffer, failed
+    /// persist): exposed as the `nostrfy_rebuild_failures` counter, which
+    /// the startup rebuild (fatal, never counted here) cannot hide.
+    failed_rebuilds: std::sync::atomic::AtomicU64,
     /// Single-flight token: only the task that takes it drains the loop.
     lock: tokio::sync::Mutex<()>,
     /// Serializes snapshot capture and write (like `persist_access_lock`):
@@ -291,6 +361,9 @@ struct GroupsRebuild {
     persist_lock: tokio::sync::Mutex<()>,
     /// Mutations accepted while the scan runs (see [`RebuildBuffer`]).
     buffer: tokio::sync::Mutex<RebuildBuffer>,
+    /// Derived-state mutations committed but not yet applied in memory
+    /// (see [`DerivedMutationEpoch`]).
+    derived: DerivedMutationEpoch,
 }
 
 impl Default for GroupsRebuild {
@@ -301,9 +374,11 @@ impl Default for GroupsRebuild {
             pending: std::sync::atomic::AtomicBool::new(false),
             last: std::sync::atomic::AtomicU64::new(0),
             rebuilds: std::sync::atomic::AtomicU64::new(0),
+            failed_rebuilds: std::sync::atomic::AtomicU64::new(0),
             lock: tokio::sync::Mutex::new(()),
             persist_lock: tokio::sync::Mutex::new(()),
             buffer: tokio::sync::Mutex::new(RebuildBuffer::default()),
+            derived: DerivedMutationEpoch::default(),
         }
     }
 }
@@ -316,8 +391,8 @@ impl GroupsRebuild {
     /// stale snapshot from landing after a newer one.
     ///
     /// The snapshot carries the database's group-state generation
-    /// (`DbClient::state_stamp`) and derived-state sequence
-    /// (`DbClient::state_seq`) so a later restore can reject a snapshot
+    /// (`DbClient::state_stamp`) and group-state sequence
+    /// (`DbClient::state_seq_group`) so a later restore can reject a snapshot
     /// that predates a state removal or a state event. The generation is
     /// read *before* the capture and re-checked after it: a state change
     /// committed in between advances past the one the captured state can
@@ -325,15 +400,28 @@ impl GroupsRebuild {
     /// drops the snapshot too (fail-closed): its currency cannot be
     /// established.
     ///
-    /// Returns whether the intended write committed. On `false` the caller
-    /// must keep the state pending (fail-closed): a failed clear leaves the
-    /// stale snapshot on disk, and a failed save is not durable state.
-    async fn persist(&self, db: &DbClient, groups: &RwLock<GroupStore>) -> bool {
+    /// A `Deferred` outcome (a derived mutation was in flight) must not be
+    /// treated as a failure: the capture simply could not certify a
+    /// generation yet, and a later debounced pass retries. Only `Failed`
+    /// requires the caller to keep the state pending (fail-closed).
+    async fn persist(&self, db: &DbClient, groups: &RwLock<GroupStore>) -> PersistOutcome {
         let _guard = self.persist_lock.lock().await;
         if self.pending.load(Ordering::SeqCst) {
-            return db.clear_groups_snapshot().await;
+            return if db.clear_groups_snapshot().await {
+                PersistOutcome::Committed
+            } else {
+                PersistOutcome::Failed
+            };
         }
-        let Some((stamp, seq)) = read_state_generation(db).await else {
+        // A mutation committed to the database but not yet applied in
+        // memory: the capture would hold pre-mutation state while claiming
+        // the post-commit generation. Defer (do not clear: the mutation
+        // path schedules the next save, and a removal marks the state
+        // stale itself).
+        if self.derived.in_flight() {
+            return PersistOutcome::Deferred;
+        }
+        let Some((stamp, seq)) = read_group_generation(db).await else {
             // The generation is unknown: a snapshot whose currency cannot
             // be established must not be saved. Keep the state pending so
             // every retry stays fail-closed.
@@ -342,13 +430,24 @@ impl GroupsRebuild {
                 "cannot read the group state generation; dropping the persisted snapshot \
                  so the next restart rebuilds from the surviving events"
             );
-            return db.clear_groups_snapshot().await;
+            return if db.clear_groups_snapshot().await {
+                PersistOutcome::Committed
+            } else {
+                PersistOutcome::Failed
+            };
         };
         let mut snapshot = groups.read().await.snapshot();
         if self.pending.load(Ordering::SeqCst) {
-            return db.clear_groups_snapshot().await;
+            return if db.clear_groups_snapshot().await {
+                PersistOutcome::Committed
+            } else {
+                PersistOutcome::Failed
+            };
         }
-        match read_state_generation(db).await {
+        if self.derived.in_flight() {
+            return PersistOutcome::Deferred;
+        }
+        match read_group_generation(db).await {
             // A group-state removal committed between the stamp read and
             // the capture (or a state event was stored after it): the
             // in-memory snapshot predates it and must not claim the newer
@@ -359,7 +458,7 @@ impl GroupsRebuild {
                     "the group state generation advanced while the snapshot was captured; \
                      dropping this save so the next startup rebuilds from the surviving events"
                 );
-                return false;
+                PersistOutcome::Failed
             }
             // Same fail-closed rule as the first read.
             None => {
@@ -368,22 +467,40 @@ impl GroupsRebuild {
                     "cannot re-read the group state generation; dropping the persisted \
                      snapshot so the next restart rebuilds from the surviving events"
                 );
-                return db.clear_groups_snapshot().await;
+                if db.clear_groups_snapshot().await {
+                    PersistOutcome::Committed
+                } else {
+                    PersistOutcome::Failed
+                }
             }
-            Some(_) => {}
+            Some(_) => {
+                snapshot.stamp = stamp;
+                snapshot.seq = seq;
+                if db.save_groups(snapshot).await {
+                    PersistOutcome::Committed
+                } else {
+                    PersistOutcome::Failed
+                }
+            }
         }
-        snapshot.stamp = stamp;
-        snapshot.seq = seq;
-        db.save_groups(snapshot).await
     }
 }
 
-/// Reads the database's derived-state generation: `(stamp, seq)`. `None`
-/// when either read failed: a snapshot whose currency cannot be established
-/// must not be saved.
-async fn read_state_generation(db: &DbClient) -> Option<(u64, u64)> {
+/// Reads the database's derived-state generation for the NIP-29 group
+/// family: `(stamp, group_seq)`. `None` when either read failed: a snapshot
+/// whose currency cannot be established must not be saved. The per-family
+/// sequence means a NIP-43 role event cannot invalidate a group snapshot.
+async fn read_group_generation(db: &DbClient) -> Option<(u64, u64)> {
     let stamp = db.state_stamp().await?;
-    let seq = db.state_seq().await?;
+    let seq = db.state_seq_group().await?;
+    Some((stamp, seq))
+}
+
+/// Reads the database's derived-state generation for the NIP-43 role family
+/// (the counterpart of [`read_group_generation`]).
+async fn read_role_generation(db: &DbClient) -> Option<(u64, u64)> {
+    let stamp = db.state_stamp().await?;
+    let seq = db.state_seq_role().await?;
     Some((stamp, seq))
 }
 
@@ -425,6 +542,16 @@ enum BufferedRoleMutation {
     RemovePubkey {
         pubkey: String,
     },
+}
+
+/// Which derived stores a removal of stored events invalidates: a NIP-29
+/// moderation/join/leave event rebuilds the group store, a NIP-43 role-state
+/// event rebuilds the role store. Kept separate so a NIP-29-only removal
+/// does not revoke the live NIP-43 grants (and schedule a full role scan).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct StateTouch {
+    groups: bool,
+    roles: bool,
 }
 
 /// Role mutations accepted while a rebuild scan is in flight (see
@@ -491,8 +618,21 @@ struct RolesRebuild {
     /// A worker task owns (or is about to own) the rebuild loop: triggers
     /// only set the flags.
     running: std::sync::atomic::AtomicBool,
+    /// Unix seconds of the last completed attempt, the minimum-interval
+    /// floor (see [`ROLES_REBUILD_MIN_INTERVAL_SECS`]).
+    last: std::sync::atomic::AtomicU64,
+    /// Completed scans: tests assert that a NIP-29-only removal schedules
+    /// no role scan at all.
+    rebuilds: std::sync::atomic::AtomicU64,
+    /// Failed rebuild attempts (scan failure, discarded buffer, failed
+    /// persist): summed with the group worker's counter by
+    /// [`Relay::rebuild_failures`].
+    failed_rebuilds: std::sync::atomic::AtomicU64,
     /// Mutations accepted while the scan runs (see [`RolesRebuildBuffer`]).
     buffer: tokio::sync::Mutex<RolesRebuildBuffer>,
+    /// Derived-state mutations committed but not yet applied in memory
+    /// (see [`DerivedMutationEpoch`]).
+    derived: DerivedMutationEpoch,
 }
 
 impl RolesRebuild {
@@ -507,20 +647,28 @@ impl RolesRebuild {
     }
 
     /// Applies the buffered mutations to `fresh` and swaps it into the live
-    /// store, atomically against the mutation capture (both hold the buffer
-    /// lock). Returns false when the buffer overflowed or a removal landed
-    /// while the scan ran: the fresh store is discarded and the dirty flag
-    /// stays set so the worker rebuilds again instead of swapping a state
-    /// that predates the lost mutations.
+    /// store, atomically against the mutation capture. The buffer lock is
+    /// held across the replay **and** the swap: a mutation accepted in the
+    /// gap between taking the buffer and taking `roles.write` would see
+    /// `scanning == false` and apply to the live store, and the swap would
+    /// then overwrite it with a fresh store that predates it (silently
+    /// losing the mutation). Holding the lock makes every mutation either
+    /// land in `buffered` or wait and apply to the swapped-in store.
+    ///
+    /// Returns false when the buffer overflowed or a removal landed while
+    /// the scan ran: the fresh store is discarded and the dirty flag stays
+    /// set so the worker rebuilds again instead of swapping a state that
+    /// predates the lost mutations.
     async fn finish_rebuild(&self, roles: &RwLock<RoleStore>, mut fresh: RoleStore) -> bool {
         let mut buffer = self.buffer.lock().await;
         let buffered = std::mem::take(&mut buffer.mutations);
         let overflow = buffer.overflow;
         buffer.overflow = false;
         buffer.scanning = false;
-        drop(buffer);
         if overflow {
             self.dirty.store(true, Ordering::SeqCst);
+            self.failed_rebuilds
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             log::warn!(
                 "role state rebuild discarded: the mutation buffer overflowed during the \
                  scan; rebuilding again"
@@ -538,6 +686,8 @@ impl RolesRebuild {
             // removed grant. Restore the fail-closed empty store and let
             // the worker rebuild again.
             *store = RoleStore::default();
+            self.failed_rebuilds
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return false;
         }
         true
@@ -600,6 +750,23 @@ async fn roles_rebuild_worker(
         if !state.dirty.swap(false, Ordering::SeqCst) {
             break;
         }
+        // The first scan runs immediately (`last == 0`); later requests wait
+        // out the remainder of the interval. Requests that arrive while
+        // waiting coalesce into this rebuild (the flag is drained above, and
+        // any later trigger sets it again); a shutdown aborts the wait
+        // without starting the scan.
+        let elapsed = unix_now().saturating_sub(state.last.load(Ordering::Relaxed));
+        if elapsed < ROLES_REBUILD_MIN_INTERVAL_SECS {
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(
+                    ROLES_REBUILD_MIN_INTERVAL_SECS - elapsed,
+                )) => {}
+                _ = drain.changed() => {
+                    state.dirty.store(true, Ordering::SeqCst);
+                    break;
+                }
+            }
+        }
         // Enter the buffering window *before* the scan starts: a mutation
         // accepted meanwhile is captured and replayed onto the fresh store,
         // so it cannot be lost when the rebuilt store replaces the live one.
@@ -625,12 +792,17 @@ async fn roles_rebuild_worker(
                 break;
             }
         };
+        state.last.store(unix_now(), Ordering::Relaxed);
+        state.rebuilds.fetch_add(1, Ordering::Relaxed);
         if !rebuilt {
             // Keep the fail-closed empty store and leave the state dirty:
             // the next role-state removal schedules another attempt, and a
             // restart rebuilds from the surviving events. The buffered
             // mutations were applied to the live store, which stays.
             state.dirty.store(true, Ordering::SeqCst);
+            state
+                .failed_rebuilds
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             state.leave_buffering().await;
             log::error!(
                 "role state rebuild failed; keeping the live role store empty (fail-closed) \
@@ -658,7 +830,10 @@ async fn roles_rebuild_worker(
         // state is not established yet) and a removal clears the store
         // again; the loop then rebuilds with the surviving state.
         let _persist = persist_lock.lock().await;
-        if !persist_fresh_roles(&db, &roles, &state).await {
+        if persist_fresh_roles(&db, &roles, &state).await == PersistOutcome::Failed {
+            state
+                .failed_rebuilds
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             log::error!(
                 "could not persist the rebuilt role state; the stored snapshot keeps its \
                  older stamp so the next startup rebuilds from the surviving events"
@@ -683,24 +858,37 @@ async fn persist_fresh_roles(
     db: &DbClient,
     roles: &RwLock<RoleStore>,
     state: &RolesRebuild,
-) -> bool {
-    let Some((stamp, seq)) = read_state_generation(db).await else {
+) -> PersistOutcome {
+    // A role mutation committed but not yet applied in memory: the capture
+    // would hold pre-mutation state while claiming the post-commit
+    // generation. Defer; the mutation path schedules the next save.
+    if state.derived.in_flight() {
+        return PersistOutcome::Deferred;
+    }
+    let Some((stamp, seq)) = read_role_generation(db).await else {
         log::error!(
             "cannot read the state generation; keeping the persisted NIP-43 role \
              snapshot so the next startup rebuilds from the surviving events"
         );
-        return false;
+        return PersistOutcome::Failed;
     };
     let mut snapshot = roles.read().await.snapshot();
     // A removal that landed after the swap check replaced the live store
     // with the fail-closed empty one: saving it with the current generation
     // would make the next startup accept state that predates the removal.
     if state.dirty.load(Ordering::SeqCst) {
-        return false;
+        return PersistOutcome::Failed;
+    }
+    if state.derived.in_flight() {
+        return PersistOutcome::Deferred;
     }
     snapshot.stamp = stamp;
     snapshot.seq = seq;
-    db.save_roles(snapshot).await
+    if db.save_roles(snapshot).await {
+        PersistOutcome::Committed
+    } else {
+        PersistOutcome::Failed
+    }
 }
 
 /// Captures and saves the live role store under the mutation-serializing
@@ -708,24 +896,26 @@ async fn persist_fresh_roles(
 /// worker).
 ///
 /// The snapshot carries the database's state generation
-/// (`DbClient::state_stamp`) and derived-state sequence
-/// (`DbClient::state_seq`) so a later restore can reject a snapshot that
-/// predates a NIP-09 deletion of a role-state event or a role-state event
-/// itself. The generation is read *before* the capture: a change committed
-/// in between leaves the snapshot with the older generation, so the startup
-/// comparison rejects it. An unavailable generation read leaves the
-/// pre-existing snapshot untouched (its currency cannot be established).
+/// (`DbClient::state_stamp`) and role-state sequence
+/// (`DbClient::state_seq_role`) so a later restore can reject a snapshot
+/// that predates a NIP-09 deletion of a role-state event or a role-state
+/// event itself. The generation is read *before* the capture: a change
+/// committed in between leaves the snapshot with the older generation, so
+/// the startup comparison rejects it. An unavailable generation read leaves
+/// the pre-existing snapshot untouched (its currency cannot be
+/// established).
 ///
 /// While a role rebuild is dirty/running the store is known stale (or owned
-/// by the worker): the write is refused so the stale store cannot be
-/// stamped with the already-advanced generation (which would make the next
-/// startup accept it). Returns whether the write committed.
+/// by the worker): the write is refused (`Failed`) so the stale store cannot
+/// be stamped with the already-advanced generation (which would make the next
+/// startup accept it). A derived mutation in flight (`Deferred`) only skips
+/// this pass; the mutation path schedules the next one.
 async fn persist_roles_now(
     db: &DbClient,
     roles: &RwLock<RoleStore>,
     state: &RolesRebuild,
     lock: &tokio::sync::Mutex<()>,
-) -> bool {
+) -> PersistOutcome {
     let _guard = lock.lock().await;
     // A stale store must never overwrite the stored snapshot: while a
     // removal is pending a rebuild (`dirty`) or a worker owns the state
@@ -736,25 +926,35 @@ async fn persist_roles_now(
     // and rebuilds from the surviving events.
     let stale = || state.dirty.load(Ordering::SeqCst) || state.running.load(Ordering::SeqCst);
     if stale() {
-        return false;
+        return PersistOutcome::Failed;
     }
-    let Some((stamp, seq)) = read_state_generation(db).await else {
+    if state.derived.in_flight() {
+        return PersistOutcome::Deferred;
+    }
+    let Some((stamp, seq)) = read_role_generation(db).await else {
         log::error!(
             "cannot read the state generation; keeping the persisted NIP-43 role \
              snapshot so the next startup rebuilds from the surviving events"
         );
-        return false;
+        return PersistOutcome::Failed;
     };
     let mut snapshot = roles.read().await.snapshot();
     // Re-check after the capture: a removal that landed while the store
     // was being captured must not have its pre-removal grants stamped
     // with the removal's generation.
     if stale() {
-        return false;
+        return PersistOutcome::Failed;
+    }
+    if state.derived.in_flight() {
+        return PersistOutcome::Deferred;
     }
     snapshot.stamp = stamp;
     snapshot.seq = seq;
-    db.save_roles(snapshot).await
+    if db.save_roles(snapshot).await {
+        PersistOutcome::Committed
+    } else {
+        PersistOutcome::Failed
+    }
 }
 
 /// Marks the group state stale and schedules the coalesced background
@@ -915,6 +1115,9 @@ async fn groups_rebuild_worker(
                 buffer.retry = false;
                 buffer.overflow = false;
                 drop(buffer);
+                state
+                    .failed_rebuilds
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 log::error!(
                     "group state rebuild after a vanish failed; dropping the persisted \
                      snapshot so the next restart rebuilds from the surviving events"
@@ -940,6 +1143,9 @@ async fn groups_rebuild_worker(
                     // still authoritative), so nothing is lost.
                     state.dirty.store(true, Ordering::SeqCst);
                     state.pending.store(true, Ordering::SeqCst);
+                    state
+                        .failed_rebuilds
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     log::warn!(
                         "group state rebuild discarded: an unreplayable mutation or a buffer \
                          overflow happened during the scan; rebuilding again"
@@ -970,11 +1176,15 @@ async fn groups_rebuild_worker(
                     state.pending.store(true, Ordering::SeqCst);
                 }
             }
-            if !state.persist(&db, &groups).await {
+            if state.persist(&db, &groups).await == PersistOutcome::Failed {
                 // A failed save is not durable state, and a failed clear
                 // left the stale snapshot on disk: keep pending so the next
                 // persist retries the clear instead of treating the state
-                // as clean.
+                // as clean. A `Deferred` pass (a mutation was in flight) is
+                // retried by the debounced worker instead.
+                state
+                    .failed_rebuilds
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 log::error!(
                     "could not persist the rebuilt group state; keeping the stored snapshot \
                      dropped so a restart rebuilds from the surviving events"
@@ -997,8 +1207,9 @@ async fn groups_rebuild_worker(
 /// Minimum time between two debounced snapshot passes. A burst of group or
 /// role mutations coalesces into one clone+serialize per store instead of
 /// one per event; correctness never depends on the debounce, because every
-/// state event advances the database sequence (`DbClient::state_seq`) and a
-/// snapshot that was skipped (or a crash before the worker ran) is rejected
+/// state event advances its family's database sequence (`state_seq_group` /
+/// `state_seq_role`) and a snapshot that was skipped (or a crash before the
+/// worker ran) is rejected
 /// at startup and rebuilt from the surviving events.
 const SNAPSHOT_PERSIST_INTERVAL_MS: u64 = 1_000;
 
@@ -1627,16 +1838,30 @@ impl Relay {
     /// ones committed and the newer entry is lost after a restart.
     /// Returns whether both writes committed: the NIP-86 methods surface
     /// a failure instead of reporting a change that is only in memory.
+    ///
+    /// The snapshot and write also hold the cross-process `access.lock`
+    /// shared with the CLI's read-modify-write (`src/cli.rs`): a CLI
+    /// mutation can no longer land between this snapshot and its write.
+    /// The blocking `flock` is acquired on the blocking pool and the guard
+    /// is held across the database await; the CLI never waits on the
+    /// daemon, so the ordering cannot deadlock.
     pub async fn persist_access(&self) -> bool {
+        let db_path = self.config.read().await.database.path.clone();
         let _guard = self.persist_access_lock.lock().await;
+        // The cross-process lock is taken *before* the snapshot so the CLI
+        // cannot slip a read-modify-write between the capture and the write.
+        let _state_lock = crate::db::lock_access_state_async(db_path).await;
         let access = self.access.read().await.clone();
+        // The pubkey lists are excluded from the `access` blob and kept in
+        // their own LMDB key so the CLI and NIP-86 share one source. The
+        // blob and both lists commit in one transaction: a crash (or a
+        // failed second write) must not leave the NIP-86 ban list ahead of
+        // the persisted access blob.
         let deny = access.blocked_pubkeys.clone();
         let allow = access.allowed_pubkeys.clone();
-        let saved = self.db.save_access(access).await;
-        // The pubkey lists are excluded from the `access` blob: keep them
-        // in their own LMDB key so the CLI and NIP-86 share one source.
-        let lists_saved = self.db.save_relay_pubkeys(&deny, &allow).await;
-        saved && lists_saved
+        self.db
+            .save_access_and_pubkeys(&access, &deny, &allow)
+            .await
     }
 
     /// Reloads the database-owned access state (Blossom upload allowlist,
@@ -1690,6 +1915,17 @@ impl Relay {
 
     pub fn has_relay_key(&self) -> bool {
         self.key.is_some()
+    }
+
+    /// Failed runtime derived-state rebuilds (group + role) since startup.
+    /// The startup rebuild is fatal and never reaches this counter; this is
+    /// the background rebuild worker's failure total, exposed as the
+    /// `nostrfy_rebuild_failures` metric.
+    pub(crate) fn rebuild_failures(&self) -> u64 {
+        self.groups_rebuild
+            .failed_rebuilds
+            .load(Ordering::Relaxed)
+            .saturating_add(self.roles_rebuild.failed_rebuilds.load(Ordering::Relaxed))
     }
 
     /// Notifies every connection that the blocked-IP list changed, so each
@@ -1803,7 +2039,16 @@ impl Relay {
                 // NIP-86 command), freezing every later config read.
                 drop(cfg);
                 drop(access);
-                self.vanish_pubkey(pubkey, event.created_at).await;
+                if !self.vanish_pubkey(pubkey, event.created_at).await {
+                    // The removal side effect (and its recoverable pending
+                    // record) was not applied: a `true` ack would tell the
+                    // client the vanish took effect while the pubkey can
+                    // keep publishing. Report a retryable failure instead.
+                    self.stats.bump(&self.stats.events_rejected, 1);
+                    return PutOutcome::Invalid(
+                        "error: database overloaded: vanish was not applied; retry".into(),
+                    );
+                }
                 // A vanish request is accepted like any other event (the
                 // OK:true is sent): count it so the accepted/rejected
                 // accounting stays consistent with the OKs.
@@ -1812,6 +2057,14 @@ impl Relay {
             }
             crate::relay::validate::Precheck::Accept => {}
         }
+
+        // A stored NIP-29 group action mutates the derived group state in
+        // `after_put`, after its database write committed. The in-flight
+        // claim keeps a concurrent snapshot persist from certifying the
+        // post-commit state generation while the in-memory apply is still
+        // pending (see [`DerivedMutationEpoch`]).
+        let _group_mutation = (cfg.nip_enabled(29) && nip29::is_group_action(&event))
+            .then(|| self.groups_rebuild.derived.begin());
 
         // First-seen trust check: a pubkey's first accepted event records
         // its arrival; events from pubkeys first seen within the configured
@@ -1869,11 +2122,26 @@ impl Relay {
         drop(cfg);
         match outcome {
             PutOutcome::Stored | PutOutcome::Replaced | PutOutcome::Ephemeral => {
-                if !self.after_put(event, now, nip9, nip43, nip29_enabled).await {
-                    log::error!("event persisted but live delivery failed");
+                match self.after_put(event, now, nip9, nip43, nip29_enabled).await {
+                    RemovalAck::Applied(delivered) => {
+                        if !delivered {
+                            log::error!("event persisted but live delivery failed");
+                        }
+                        self.stats.bump(&self.stats.events_accepted, 1);
+                        outcome
+                    }
+                    // The event stored but a required removal side effect
+                    // (NIP-09/9005) was dropped: the client must retry
+                    // instead of receiving a `true` ack for a deletion that
+                    // did not happen. `after_put` already counted the
+                    // database error.
+                    RemovalAck::NotApplied => {
+                        self.stats.bump(&self.stats.events_rejected, 1);
+                        PutOutcome::Invalid(
+                            "error: database overloaded: removal was not applied; retry".into(),
+                        )
+                    }
                 }
-                self.stats.bump(&self.stats.events_accepted, 1);
-                outcome
             }
             PutOutcome::Duplicate(_) => {
                 self.stats.bump(&self.stats.events_duplicate, 1);
@@ -1932,12 +2200,13 @@ impl Relay {
             .await
     }
 
-    /// The batch's pre-resolved `previous` tag references plus every
-    /// sibling event id prefix, collected in one database round trip, and
-    /// whether the reference collection hit its cap. The precheck must not
-    /// issue one lookup per reference (a single event can carry thousands)
-    /// and must accept references to sibling events that are not committed
-    /// yet.
+    /// The batch's pre-resolved `previous` tag references, collected in one
+    /// database round trip, and whether the reference collection hit its
+    /// cap. The precheck must not issue one lookup per reference (a single
+    /// event can carry thousands). Sibling references are *not* included
+    /// here: an event's id becomes known only once that event was actually
+    /// accepted (or already stored), so a rejected sibling cannot satisfy a
+    /// later event's `previous` tag (see `accept_batch_non_group`).
     async fn batch_known_prefixes(
         &self,
         events: &[Event],
@@ -1977,7 +2246,7 @@ impl Relay {
                 events.len()
             );
         }
-        let mut known: std::collections::HashSet<Vec<u8>> = if prefixes.is_empty() {
+        let known: std::collections::HashSet<Vec<u8>> = if prefixes.is_empty() {
             std::collections::HashSet::new()
         } else {
             let existing = self.db.prefixes_exist(prefixes.clone()).await;
@@ -1987,17 +2256,19 @@ impl Relay {
                 .filter_map(|(p, exists)| exists.then_some(p))
                 .collect()
         };
-        // References to sibling events of the same batch are valid: an
-        // earlier event of the batch is a legitimate `previous` target even
-        // though it is not committed to the database yet.
-        for event in events {
-            if let Ok(id_bytes) = hex::decode(&event.id) {
-                for len in 1..=id_bytes.len() {
-                    known.insert(id_bytes[..len].to_vec());
-                }
+        (known, previous_capped)
+    }
+
+    /// Inserts every prefix of `id` into the batch's known-reference set:
+    /// once an event is accepted (or already stored), later events of the
+    /// same batch may reference it via `previous` even though it is not
+    /// committed yet. A rejected sibling is never inserted.
+    fn insert_event_prefixes(known: &mut std::collections::HashSet<Vec<u8>>, id: &str) {
+        if let Ok(id_bytes) = hex::decode(id) {
+            for len in 1..=id_bytes.len() {
+                known.insert(id_bytes[..len].to_vec());
             }
         }
-        (known, previous_capped)
     }
 
     /// Whether accepting `event` has post-commit effects that later events
@@ -2020,11 +2291,10 @@ impl Relay {
     /// verification of the whole batch runs once, in parallel, and both
     /// paths reuse the verdicts.
     async fn accept_batch_mixed(&self, events: Vec<Event>, authed: &[String]) -> PendingBatch {
-        let (known_set, previous_capped) = self.batch_known_prefixes(&events).await;
-        let known = crate::relay::validate::KnownPrevious {
-            known: &known_set,
-            capped: previous_capped,
-        };
+        // The known-reference set grows with each event that is actually
+        // accepted (or already stored): a later event may reference an
+        // earlier sibling, but never a rejected one.
+        let (mut known_set, previous_capped) = self.batch_known_prefixes(&events).await;
         // One parallel pass for the whole batch: the sequential singletons
         // below must not re-verify each signature inline.
         let verified = crate::relay::validate::verify_signatures_parallel(&events, self.secp());
@@ -2034,6 +2304,10 @@ impl Relay {
         for (index, event) in events.into_iter().enumerate() {
             if self.has_state_effects(&event) {
                 if !run.is_empty() {
+                    let known = crate::relay::validate::KnownPrevious {
+                        known: &known_set,
+                        capped: previous_capped,
+                    };
                     let resolved = self
                         .accept_batch_non_group(
                             std::mem::take(&mut run),
@@ -2044,13 +2318,38 @@ impl Relay {
                         .await
                         .finish(self)
                         .await;
+                    for (id, outcome) in &resolved {
+                        if matches!(
+                            outcome,
+                            PutOutcome::Stored
+                                | PutOutcome::Replaced
+                                | PutOutcome::Ephemeral
+                                | PutOutcome::Duplicate(_)
+                        ) {
+                            Self::insert_event_prefixes(&mut known_set, id);
+                        }
+                    }
                     out.extend(resolved);
                     run_verdicts.clear();
                 }
                 let id = event.id.clone();
-                let outcome = self
-                    .accept_event_verified(event, authed, Some(&known), Some(verified[index]))
-                    .await;
+                let outcome = {
+                    let known = crate::relay::validate::KnownPrevious {
+                        known: &known_set,
+                        capped: previous_capped,
+                    };
+                    self.accept_event_verified(event, authed, Some(&known), Some(verified[index]))
+                        .await
+                };
+                if matches!(
+                    outcome,
+                    PutOutcome::Stored
+                        | PutOutcome::Replaced
+                        | PutOutcome::Ephemeral
+                        | PutOutcome::Duplicate(_)
+                ) {
+                    Self::insert_event_prefixes(&mut known_set, &id);
+                }
                 out.push((id, outcome));
             } else {
                 run_verdicts.push(verified[index]);
@@ -2058,6 +2357,10 @@ impl Relay {
             }
         }
         if !run.is_empty() {
+            let known = crate::relay::validate::KnownPrevious {
+                known: &known_set,
+                capped: previous_capped,
+            };
             let resolved = self
                 .accept_batch_non_group(run, authed, Some(&known), Some(&run_verdicts))
                 .await
@@ -2101,6 +2404,17 @@ impl Relay {
         // (slot, id, event) of the vanish requests, resolved at the end so
         // the OK replies keep the order of the received batch.
         let mut vanishes: Vec<(usize, String, Event)> = Vec::new();
+        // The set of `previous` targets known so far. It starts from the
+        // database prefetch and grows with each event that is actually
+        // accepted (or already stored); a rejected sibling's id is never
+        // inserted, so it cannot satisfy a later event's `previous` tag.
+        // `None` means no prefetch: each reference is looked up in the
+        // database.
+        let per_reference_lookup = known_prefixes.is_none();
+        let previous_capped = known_prefixes.is_some_and(|known| known.capped);
+        let mut known_set: std::collections::HashSet<Vec<u8>> = known_prefixes
+            .map(|known| known.known.clone())
+            .unwrap_or_default();
 
         // The Schnorr signature check dominates the per-event accept cost
         // (tens of microseconds), so a large batch verifies every signature
@@ -2119,8 +2433,12 @@ impl Relay {
         for event in events {
             let id = event.id.clone();
             let verified = verified.get(results.len()).copied();
+            let known = (!per_reference_lookup).then_some(crate::relay::validate::KnownPrevious {
+                known: &known_set,
+                capped: previous_capped,
+            });
             match self
-                .precheck(&cfg, &access, &event, now, authed, known_prefixes, verified)
+                .precheck(&cfg, &access, &event, now, authed, known.as_ref(), verified)
                 .await
             {
                 crate::relay::validate::Precheck::Reject(reason) => {
@@ -2134,11 +2452,18 @@ impl Relay {
                     continue;
                 }
                 crate::relay::validate::Precheck::Duplicate(msg) => {
+                    // Already stored: its id is a valid reference even
+                    // though this reply is a duplicate.
+                    Self::insert_event_prefixes(&mut known_set, &id);
                     self.stats.bump(&self.stats.events_duplicate, 1);
                     results.push((id, PutOutcome::Duplicate(msg)));
                     continue;
                 }
-                crate::relay::validate::Precheck::Accept => {}
+                crate::relay::validate::Precheck::Accept => {
+                    // Accepted and queued for the same commit as the later
+                    // events: later events of the batch may reference it.
+                    Self::insert_event_prefixes(&mut known_set, &id);
+                }
             }
             put_slots.push(results.len());
             results.push((String::new(), PutOutcome::Invalid(String::new())));
@@ -2257,7 +2582,8 @@ impl Relay {
         nip9: bool,
         nip43: bool,
         nip29_enabled: bool,
-    ) -> bool {
+    ) -> RemovalAck {
+        let mut removal_failed = false;
         if nip9 && event.kind == nip09::DELETION_KIND {
             // NIP-29/NIP-43: a deletion that removes state events
             // (moderation, join/leave, role state) invalidates the derived
@@ -2266,9 +2592,20 @@ impl Relay {
             // failed lookup fails closed (the rebuild runs even if the
             // targets turn out unrelated). Deleting ordinary posts does not
             // touch the derived state and takes no rebuild.
-            let touches_group_state =
-                (nip29_enabled || nip43) && self.deletion_touches_group_state(&event).await;
-            match self
+            //
+            // The removal commits in the database before the in-memory
+            // state is updated (or marked stale): the in-flight claims keep
+            // a concurrent snapshot persist from certifying the
+            // post-removal generation while the in-memory effect is
+            // pending.
+            let _groups_in_flight = nip29_enabled.then(|| self.groups_rebuild.derived.begin());
+            let _roles_in_flight = nip43.then(|| self.roles_rebuild.derived.begin());
+            let touch = if nip29_enabled || nip43 {
+                self.deletion_touches_group_state(&event).await
+            } else {
+                StateTouch::default()
+            };
+            let (removed, state_removed) = self
                 .db
                 .apply_deletion_checked(
                     nip09::deletion_targets(&event),
@@ -2276,28 +2613,41 @@ impl Relay {
                     Some(event.pubkey.clone()),
                     event.created_at,
                 )
-                .await
-            {
-                Some(removed) => {
-                    self.stats.bump(&self.stats.events_deleted, removed as u64);
-                    if touches_group_state && removed > 0 {
-                        // The live state still holds state derived from the
-                        // deleted events: mark it stale and let the
-                        // coalesced background worker rebuild.
-                        self.mark_group_state_stale().await;
-                    }
-                }
+                .await;
+            match removed {
+                Some(removed) => self.stats.bump(&self.stats.events_deleted, removed as u64),
                 None => {
                     // The deletion event stored but its side effect was
-                    // dropped (writer overload): make it visible instead of
-                    // reporting a silent success.
+                    // dropped (writer overload): the client must retry
+                    // instead of receiving a `true` ack for a deletion that
+                    // did not happen.
                     log::error!("NIP-09 deletion side effect was not applied");
                     self.stats.bump(&self.stats.db_errors, 1);
+                    removal_failed = true;
+                }
+            }
+            if state_removed {
+                // The live state still holds state derived from a removed
+                // event: mark the touched store(s) stale and let the
+                // coalesced background workers rebuild. A NIP-29-only
+                // removal must not revoke the role grants (or pay for a
+                // role scan). When the relevance pre-check could not
+                // classify the targets, both stores are marked (fail
+                // closed).
+                let unknown = !touch.groups && !touch.roles;
+                if touch.groups || unknown {
+                    self.mark_group_state_stale().await;
+                }
+                if touch.roles || unknown {
+                    self.mark_roles_stale().await;
                 }
             }
             // NIP-59: gift wraps are signed by random keys, so their
             // recipient cannot delete them via NIP-09; the relay
-            // deletes wraps addressed to the deleter instead.
+            // deletes wraps addressed to the deleter instead. A failure
+            // only logs: the purge has no pending record, so a client
+            // retry is a duplicate and cannot resume it (the next restart's
+            // expiry/name maintenance does not re-run it either).
             if let Some(pubkey) = event.pubkey_bytes() {
                 match self.db.delete_gift_wraps_to_checked(pubkey).await {
                     Some(purged) => self.stats.bump(&self.stats.events_deleted, purged as u64),
@@ -2313,12 +2663,11 @@ impl Relay {
             // list without being stored.
             self.apply_leave_request(&event).await;
         }
-        let is_group_event = nip29_enabled
-            && ((nip29::MOD_MIN..=nip29::MOD_MAX).contains(&event.kind)
-                || event.kind == nip29::JOIN
-                || event.kind == nip29::LEAVE);
-        if is_group_event {
-            self.apply_group_event(&event, now).await;
+        if nip29_enabled
+            && nip29::is_group_action(&event)
+            && !self.apply_group_event(&event, now).await
+        {
+            removal_failed = true;
         }
         // Command events: with `relay.enabled_command_events` a kind:1
         // event authored by the relay's own pubkey carries an operator
@@ -2327,7 +2676,12 @@ impl Relay {
         if event.kind == 1 {
             self.handle_command_event(&event).await;
         }
-        self.broadcast(event).await.is_ok()
+        let delivered = self.broadcast(event).await.is_ok();
+        if removal_failed {
+            RemovalAck::NotApplied
+        } else {
+            RemovalAck::Applied(delivered)
+        }
     }
 
     /// Persists the live NIP-29 group state immediately. The hot mutation
@@ -2347,6 +2701,13 @@ impl Relay {
     /// stale snapshot may still be on disk, and the fresh one is not
     /// durable.
     pub(crate) async fn persist_groups(&self) -> bool {
+        self.persist_groups_outcome().await == PersistOutcome::Committed
+    }
+
+    /// Like [`Self::persist_groups`], reporting a deferred save (a derived
+    /// mutation was in flight) separately from a failed one: callers must
+    /// only treat `Failed` as fail-closed (the state may still be current).
+    async fn persist_groups_outcome(&self) -> PersistOutcome {
         self.groups_rebuild.persist(&self.db, &self.groups).await
     }
 
@@ -2356,8 +2717,8 @@ impl Relay {
     /// capture snapshots in one order and queue their writes in the other.
     ///
     /// The snapshot carries the database's state generation
-    /// (`DbClient::state_stamp`) and derived-state sequence
-    /// (`DbClient::state_seq`) so a later restore can reject a snapshot
+    /// (`DbClient::state_stamp`) and role-state sequence
+    /// (`DbClient::state_seq_role`) so a later restore can reject a snapshot
     /// that predates a NIP-09 deletion of a role-state event or a
     /// role-state event itself. The generation is read *before* the
     /// capture: a change committed in between leaves the snapshot with the
@@ -2381,6 +2742,7 @@ impl Relay {
             &self.persist_roles_lock,
         )
         .await
+            == PersistOutcome::Committed
     }
 
     /// Marks the group snapshot dirty and wakes the debounced worker (see
@@ -2420,16 +2782,19 @@ impl Relay {
     }
 
     /// Whether `event` may remove events the NIP-29/NIP-43 derived state is
-    /// built from (moderation, join/leave and role state kinds). `a`-tag
-    /// addresses carry their kind directly; `e`-tag targets are looked up in
-    /// the database because the deletion removes them. A failed lookup fails
-    /// closed: the state is rebuilt even if the targets turn out unrelated.
-    async fn deletion_touches_group_state(&self, event: &Event) -> bool {
-        fn is_state_kind(kind: u64) -> bool {
-            (nip29::MOD_MIN..=nip29::MOD_MAX).contains(&kind)
-                || kind == nip29::JOIN
-                || kind == nip29::LEAVE
-                || matches!(
+    /// built from (moderation, join/leave and role state kinds), split per
+    /// store: a NIP-29-only removal must not revoke and rescan the NIP-43
+    /// role state (and vice versa). `a`-tag addresses carry their kind
+    /// directly; `e`-tag targets are looked up in the database because the
+    /// deletion removes them. A failed lookup fails closed: both stores are
+    /// rebuilt even if the targets turn out unrelated.
+    async fn deletion_touches_group_state(&self, event: &Event) -> StateTouch {
+        fn classify(kind: u64) -> StateTouch {
+            StateTouch {
+                groups: (nip29::MOD_MIN..=nip29::MOD_MAX).contains(&kind)
+                    || kind == nip29::JOIN
+                    || kind == nip29::LEAVE,
+                roles: matches!(
                     kind,
                     nip43::ROLE_DEFINITION
                         | nip43::MEMBERSHIP_LIST
@@ -2437,17 +2802,18 @@ impl Relay {
                         | nip43::REMOVE_USER
                         | nip43::JOIN
                         | nip43::LEAVE
-                )
+                ),
+            }
         }
-        if nip09::deletion_addresses(event)
-            .iter()
-            .any(|address| is_state_kind(address.kind))
-        {
-            return true;
+        let mut touch = StateTouch::default();
+        for address in nip09::deletion_addresses(event) {
+            let classified = classify(address.kind);
+            touch.groups |= classified.groups;
+            touch.roles |= classified.roles;
         }
         let targets = nip09::deletion_targets(event);
         if targets.is_empty() {
-            return false;
+            return touch;
         }
         let mut kinds: Vec<u64> = (nip29::MOD_MIN..=nip29::MOD_MAX)
             .chain([nip29::JOIN, nip29::LEAVE])
@@ -2465,14 +2831,27 @@ impl Relay {
             kinds: Some(kinds),
             ..Default::default()
         };
+        // The lookup is only a relevance check, so a bounded page is enough:
+        // either store is marked stale if any of the targets is one of its
+        // state kinds.
         match self
             .db
-            .query_full_startup(vec![filter], 1, unix_now(), false)
+            .query_full_startup(vec![filter], 64, unix_now(), false)
             .await
         {
-            Some((events, _)) => !events.is_empty(),
+            Some((events, _)) => {
+                for found in &events {
+                    let classified = classify(found.kind);
+                    touch.groups |= classified.groups;
+                    touch.roles |= classified.roles;
+                }
+                touch
+            }
             // The database did not answer: assume the deletion matters.
-            None => true,
+            None => StateTouch {
+                groups: true,
+                roles: true,
+            },
         }
     }
 
@@ -2483,16 +2862,13 @@ impl Relay {
     /// crash before the rebuild completes must not restore it. The accept
     /// path never blocks on the rebuild scan (see `groups_rebuild_worker`).
     ///
-    /// The NIP-43 role state is derived from the same event kinds (the role
-    /// kinds are part of `is_group_state_kind`), so the live role grants are
-    /// revoked and rebuilt too (see [`Self::mark_roles_stale`]).
+    /// This only touches the group store: callers that know a NIP-43
+    /// role-state event was removed ([`StateTouch::roles`]) call
+    /// [`Self::mark_roles_stale`] separately, so a NIP-29-only removal does
+    /// not revoke the live role grants and schedule a full role scan.
     pub(crate) async fn mark_group_state_stale(&self) {
         self.groups_rebuild.dirty.store(true, Ordering::SeqCst);
         self.groups_rebuild.pending.store(true, Ordering::SeqCst);
-        // Revoke the role grants before the (possibly slow) group snapshot
-        // clear: a role definition or membership list may be what was
-        // removed, and the live store must stop authorizing its grants now.
-        self.mark_roles_stale().await;
         self.persist_groups().await;
         schedule_groups_rebuild(
             self.db.clone(),
@@ -2543,6 +2919,27 @@ impl Relay {
         }
     }
 
+    /// Startup barrier for the database writer's recovery: the server
+    /// awaits this before it serves. The writer resumes interrupted NIP-62
+    /// vanishes and NIP-09 deletions synchronously before `DbClient::open`
+    /// returns, so the await joins an already-completed recovery; if a
+    /// resumed deletion removed a NIP-29/NIP-43 state event (the db exposes
+    /// the fact via `resumed_deletion_state_removed`), the derived state is
+    /// marked stale here so the group/role stores rebuild from the
+    /// surviving events before they are trusted. Kept as an async relay
+    /// API so a future asynchronous recovery can be awaited without the
+    /// server changing its startup order.
+    pub async fn recovery_done(&self) {
+        if self.db.resumed_deletion_state_removed() {
+            log::warn!(
+                "startup recovery removed a derived-state event; rebuilding the NIP-29/NIP-43 \
+                 state from the surviving events"
+            );
+            self.mark_group_state_stale().await;
+            self.mark_roles_stale().await;
+        }
+    }
+
     /// Crash recovery for `kind:9008` group purges: re-runs every purge the
     /// database recorded as pending (a purge that was accepted but whose
     /// walk did not complete, e.g. the process crashed mid-walk). The
@@ -2579,7 +2976,7 @@ impl Relay {
         // cannot restore a snapshot that would let a create expose the
         // (possibly un-purged) history.
         self.ghost_deleted_group(gid).await;
-        if !self.persist_groups().await {
+        if self.persist_groups_outcome().await == PersistOutcome::Failed {
             log::error!(
                 "could not persist the pending-purge ghost for {gid}; the persisted state \
                  stays fail-closed"
@@ -2591,7 +2988,7 @@ impl Relay {
             // The history is gone: downgrade to the ordinary tombstone,
             // like the 9008 path.
             self.unghost_confirmed(gid).await;
-            if !self.persist_groups().await {
+            if self.persist_groups_outcome().await == PersistOutcome::Failed {
                 log::error!("could not persist the confirmed group purge for {gid}");
             }
         } else {
@@ -2618,60 +3015,58 @@ impl Relay {
     /// the persisted snapshot is dropped (fail-closed) until it completes,
     /// so a crash in between rebuilds on the next startup instead of
     /// restoring the stale state.
-    async fn vanish_pubkey(&self, pubkey: [u8; 32], until_created: u64) {
+    /// Returns whether the vanish removal was applied: `false` means the
+    /// database did not commit the removal (and its recoverable pending
+    /// record), so the caller must not acknowledge the request.
+    async fn vanish_pubkey(&self, pubkey: [u8; 32], until_created: u64) -> bool {
         let pubkey_hex = hex::encode(pubkey);
+        let nip29_enabled = self.config.read().await.nip_enabled(29);
+        let nip43_enabled = self.config.read().await.nip_enabled(43);
+        let mut changed_member = false;
+        let mut role_changed = false;
+        // The removal commits in the database before the in-memory derived
+        // state is updated: hold the in-flight claims until the per-store
+        // effects (member/role removal or the stale marking) are applied, so
+        // a concurrent snapshot persist cannot certify the post-removal
+        // generation against pre-removal state.
+        let groups_in_flight = nip29_enabled.then(|| self.groups_rebuild.derived.begin());
+        let roles_in_flight = nip43_enabled.then(|| self.roles_rebuild.derived.begin());
         let (removed, group_state_removed) =
             match self.db.apply_vanish_checked(pubkey, until_created).await {
                 Some(outcome) => outcome,
                 None => {
-                    // The vanish was accepted (OK) but its side effect was
-                    // dropped: the marker is not stored, so the pubkey would
-                    // come back. Surface the failure in the logs and metrics.
+                    // The vanish side effect was dropped: the marker is not
+                    // stored (and no pending record exists), so the pubkey
+                    // would come back. Surface the failure in the logs and
+                    // metrics; the accept path turns the request into a
+                    // retryable failure.
                     log::error!("NIP-62 vanish side effect was not applied");
                     self.stats.bump(&self.stats.db_errors, 1);
-                    return;
+                    return false;
                 }
             };
         self.stats.bump(&self.stats.events_deleted, removed as u64);
-        if self.config.read().await.nip_enabled(29) {
-            if group_state_removed {
-                // A moderation/join/leave event was removed: the derived
-                // state (settings, pins, members, invites) must be rebuilt
-                // from the surviving history. The rebuild is a full-history
-                // scan and vanishes are exempt from the publish rate limit,
-                // so any fresh keypair could otherwise stall every group
-                // write on the group lock; mark the state stale and let the
-                // coalesced background worker rebuild instead (the snapshot
-                // is dropped fail-closed until it completes).
-                self.mark_group_state_stale().await;
-            } else {
-                // A replayed vanish, one that removed nothing, or one that
-                // only deleted ordinary posts: the live state only needs the
-                // vanished pubkey dropped from its memberships, and only a
-                // real change is worth a snapshot write. The removal is not
-                // reconstructible from the database (an admin's surviving
-                // 9000 may re-add the pubkey after the scan's vanished-set
-                // snapshot), so an in-flight rebuild discards its scan.
-                let changed = {
-                    let mut buffer = self.groups_rebuild.buffer.lock().await;
-                    if buffer.scanning {
-                        buffer.retry = true;
-                    }
-                    let mut groups = self.groups.write().await;
-                    groups.remove_member_everywhere(&pubkey_hex)
-                };
-                if changed && !self.persist_groups().await {
-                    log::error!(
-                        "could not persist the group state after a vanish; it will be \
-                         rebuilt on the next restart"
-                    );
+        if nip29_enabled && !group_state_removed {
+            // A replayed vanish, one that removed nothing, or one that only
+            // deleted ordinary posts: the live state only needs the vanished
+            // pubkey dropped from its memberships, and only a real change is
+            // worth a snapshot write. The removal is not reconstructible
+            // from the database (an admin's surviving 9000 may re-add the
+            // pubkey after the scan's vanished-set snapshot), so an
+            // in-flight rebuild discards its scan.
+            changed_member = {
+                let mut buffer = self.groups_rebuild.buffer.lock().await;
+                if buffer.scanning {
+                    buffer.retry = true;
                 }
-            }
+                let mut groups = self.groups.write().await;
+                groups.remove_member_everywhere(&pubkey_hex)
+            };
         }
-        // NIP-43 role assignments hold pubkeys too: a vanished author
-        // must not keep its roles.
-        if self.config.read().await.nip_enabled(43) {
-            let changed = self
+        // NIP-43 role assignments hold pubkeys too: a vanished author must
+        // not keep its roles.
+        if nip43_enabled {
+            role_changed = self
                 .mutate_roles(
                     BufferedRoleMutation::RemovePubkey {
                         pubkey: pubkey_hex.clone(),
@@ -2682,10 +3077,36 @@ impl Relay {
                     },
                 )
                 .await;
-            if changed {
-                self.schedule_roles_persist();
-            }
         }
+        if nip29_enabled && group_state_removed {
+            // A moderation/join/leave (or role-state) event was removed: the
+            // derived state must be rebuilt from the surviving history. The
+            // db reports one combined flag, so both stores are marked stale
+            // (a relay-signed role event can only be removed when the
+            // operator's own key vanished, but the fail-closed revocation is
+            // cheap compared to resurrecting a grant). The marks run while
+            // the in-flight claims are held: `mark_group_state_stale` sets
+            // `pending` and its persist clears the snapshot through that
+            // branch, so no concurrent save can certify pre-removal state in
+            // the window. The rebuilds are full-history scans and vanishes
+            // are exempt from the publish rate limit, so any fresh keypair
+            // could otherwise stall every group write; the coalesced
+            // background workers keep it amortized.
+            self.mark_group_state_stale().await;
+            self.mark_roles_stale().await;
+        }
+        drop(groups_in_flight);
+        if nip29_enabled && !group_state_removed && changed_member && !self.persist_groups().await {
+            log::error!(
+                "could not persist the group state after a vanish; it will be \
+                 rebuilt on the next restart"
+            );
+        }
+        drop(roles_in_flight);
+        if nip43_enabled && role_changed {
+            self.schedule_roles_persist();
+        }
+        true
     }
 
     /// Captures a group event for replay while a rebuild scan runs, then
@@ -2751,7 +3172,14 @@ impl Relay {
 
     /// Applies a stored NIP-29 event to the group state and publishes the
     /// relay-generated metadata events.
-    async fn apply_group_event(&self, event: &Event, now: u64) {
+    ///
+    /// Returns `false` when a required `9005` removal side effect was not
+    /// applied: the caller must report the retryable outcome instead of
+    /// `OK true`. Every other path returns `true` (a failed `9008` purge
+    /// keeps the id fail-closed as a ghost, which is a safe, non-removal
+    /// outcome).
+    async fn apply_group_event(&self, event: &Event, now: u64) -> bool {
+        let mut removal_failed = false;
         // A `kind:9008` purge may fail (or the process may crash before it
         // commits). The delete tombstone alone would let a later create
         // clear it and expose the un-purged history, so the id is ghosted
@@ -2763,7 +3191,7 @@ impl Relay {
             && let Some(gid) = nip29::group_id(event)
         {
             self.ghost_deleted_group(gid).await;
-            if !self.persist_groups().await {
+            if self.persist_groups_outcome().await == PersistOutcome::Failed {
                 log::error!(
                     "could not persist the pre-delete group ghost for {gid}; the in-memory \
                      state stays fail-closed"
@@ -2773,7 +3201,7 @@ impl Relay {
         let generated = self.apply_group_state(event, now).await;
         // Debounced persistence: restarts restore from the snapshot instead
         // of replaying history, and a skipped save is detected at startup
-        // through the state sequence (`DbClient::state_seq`).
+        // through the group-state sequence (`DbClient::state_seq_group`).
         self.schedule_groups_persist();
 
         if event.kind == 9005 {
@@ -2787,30 +3215,35 @@ impl Relay {
                 // failed lookup assumes the deletion matters), and the
                 // derived state is only rebuilt when a state-kind event was
                 // actually removed.
-                let touches_group_state = self.deletion_touches_group_state(event).await;
-                match self
+                let touch = self.deletion_touches_group_state(event).await;
+                let (removed, state_removed) = self
                     .db
                     .apply_group_deletion_checked(nip29::delete_targets(event), gid.to_string())
-                    .await
-                {
-                    Some(removed) => {
-                        self.stats.bump(&self.stats.events_deleted, removed as u64);
-                        if touches_group_state && removed > 0 {
-                            // Removing a moderation/join/leave event
-                            // invalidates the in-memory state derived from
-                            // it (a deleted 9000 grant must revoke the
-                            // membership): mark it stale and let the
-                            // coalesced worker rebuild.
-                            self.mark_group_state_stale().await;
-                        }
-                    }
+                    .await;
+                match removed {
+                    Some(removed) => self.stats.bump(&self.stats.events_deleted, removed as u64),
                     None => {
                         // The 9005 stored but its side effect was dropped
-                        // (writer overload): make it visible instead of
-                        // reporting a silent success (same OK semantics as
+                        // (writer overload): report the retryable failure
+                        // instead of a silent success (same OK semantics as
                         // the NIP-09 deletion path).
                         log::error!("NIP-29 9005 deletion side effect was not applied");
                         self.stats.bump(&self.stats.db_errors, 1);
+                        removal_failed = true;
+                    }
+                }
+                if state_removed {
+                    // Removing a moderation/join/leave event invalidates
+                    // the in-memory state derived from it (a deleted 9000
+                    // grant must revoke the membership): mark the touched
+                    // store(s) stale and let the coalesced workers rebuild.
+                    // An unclassifiable pre-check marks both (fail closed).
+                    let unknown = !touch.groups && !touch.roles;
+                    if touch.groups || unknown {
+                        self.mark_group_state_stale().await;
+                    }
+                    if touch.roles || unknown {
+                        self.mark_roles_stale().await;
                     }
                 }
             }
@@ -2832,7 +3265,7 @@ impl Relay {
             if self.group_purge_confirmed(gid).await {
                 // The history is gone: the id may be re-created normally.
                 self.unghost_confirmed(gid).await;
-                if !self.persist_groups().await {
+                if self.persist_groups_outcome().await == PersistOutcome::Failed {
                     log::error!("could not persist the confirmed group purge for {gid}");
                 }
             } else {
@@ -2895,6 +3328,7 @@ impl Relay {
                 );
             }
         }
+        !removal_failed
     }
 }
 
@@ -2945,11 +3379,22 @@ impl PendingBatch {
             // resolved here all the same, or the placeholder replies
             // (empty id, `invalid:`) would leak to the client.
             for (slot, id, event) in vanishes {
-                if let Some(pubkey) = event.pubkey_bytes() {
-                    relay.vanish_pubkey(pubkey, event.created_at).await;
+                let applied = match event.pubkey_bytes() {
+                    Some(pubkey) => relay.vanish_pubkey(pubkey, event.created_at).await,
+                    None => false,
+                };
+                if applied {
+                    relay.stats.bump(&relay.stats.events_accepted, 1);
+                    results[slot] = (id, PutOutcome::Stored);
+                } else {
+                    relay.stats.bump(&relay.stats.events_rejected, 1);
+                    results[slot] = (
+                        id,
+                        PutOutcome::Invalid(
+                            "error: database overloaded: vanish was not applied; retry".into(),
+                        ),
+                    );
                 }
-                relay.stats.bump(&relay.stats.events_accepted, 1);
-                results[slot] = (id, PutOutcome::Stored);
             }
             return results;
         };
@@ -2979,15 +3424,32 @@ impl PendingBatch {
         {
             let id = event.id.clone();
             let first_seen_pubkey = if is_new { event.pubkey_bytes() } else { None };
+            let mut ack_override = None;
             match outcome {
                 PutOutcome::Stored | PutOutcome::Replaced | PutOutcome::Ephemeral => {
-                    if !relay.after_put(event, now, nip9, nip43, nip29).await {
-                        log::error!("event persisted but live delivery failed");
-                    }
+                    let ack = relay.after_put(event, now, nip9, nip43, nip29).await;
+                    // The first-seen timestamp belongs to the stored event
+                    // regardless of a removal side effect.
                     if let Some(pk) = first_seen_pubkey {
                         persist_first_seen.push(pk);
                     }
-                    relay.stats.bump(&relay.stats.events_accepted, 1);
+                    match ack {
+                        RemovalAck::Applied(delivered) => {
+                            if !delivered {
+                                log::error!("event persisted but live delivery failed");
+                            }
+                            relay.stats.bump(&relay.stats.events_accepted, 1);
+                        }
+                        RemovalAck::NotApplied => {
+                            // The event stored but a required removal was
+                            // not: report the retryable failure (see the
+                            // single-event path).
+                            relay.stats.bump(&relay.stats.events_rejected, 1);
+                            ack_override = Some(PutOutcome::Invalid(
+                                "error: database overloaded: removal was not applied; retry".into(),
+                            ));
+                        }
+                    }
                 }
                 PutOutcome::Duplicate(_) => {
                     relay.publish_rate_rollback(&event.pubkey, now);
@@ -2998,7 +3460,7 @@ impl PendingBatch {
                     relay.stats.bump(&relay.stats.events_rejected, 1);
                 }
             }
-            results[slot] = (id, outcome);
+            results[slot] = (id, ack_override.unwrap_or(outcome));
         }
         if !persist_first_seen.is_empty() {
             relay
@@ -3010,13 +3472,26 @@ impl PendingBatch {
         }
 
         for (slot, id, event) in vanishes {
-            if let Some(pubkey) = event.pubkey_bytes() {
-                relay.vanish_pubkey(pubkey, event.created_at).await;
+            let applied = match event.pubkey_bytes() {
+                Some(pubkey) => relay.vanish_pubkey(pubkey, event.created_at).await,
+                None => false,
+            };
+            if applied {
+                // Same accounting as the single-event path: a vanish is
+                // accepted (its OK:true is sent) and counts as accepted.
+                relay.stats.bump(&relay.stats.events_accepted, 1);
+                results[slot] = (id, PutOutcome::Stored);
+            } else {
+                // The removal side effect was not applied: a retryable
+                // failure instead of `OK true` (see the single-event path).
+                relay.stats.bump(&relay.stats.events_rejected, 1);
+                results[slot] = (
+                    id,
+                    PutOutcome::Invalid(
+                        "error: database overloaded: vanish was not applied; retry".into(),
+                    ),
+                );
             }
-            // Same accounting as the single-event path: a vanish is
-            // accepted (its OK:true is sent) and counts as accepted.
-            relay.stats.bump(&relay.stats.events_accepted, 1);
-            results[slot] = (id, PutOutcome::Stored);
         }
 
         results
@@ -3404,6 +3879,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn persist_access_waits_for_the_cli_lock() {
+        // The daemon's access persistence shares the CLI's cross-process
+        // `access.lock`: while the CLI holds it, the snapshot+write must
+        // not proceed (otherwise the CLI's read-modify-write could be
+        // interleaved with the daemon's stale snapshot).
+        let relay = build_relay().await;
+        let db_path = relay.config.read().await.database.path.clone();
+        let held = crate::db::lock_access_state(&db_path).expect("the lock file opens");
+        let persist = {
+            let relay = relay.clone();
+            tokio::spawn(async move { relay.persist_access().await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(
+            !persist.is_finished(),
+            "persist_access must wait for the CLI's access lock"
+        );
+        drop(held);
+        let committed = tokio::time::timeout(std::time::Duration::from_secs(5), persist)
+            .await
+            .expect("the persist must proceed once the lock is released")
+            .expect("the persist task must not panic");
+        assert!(committed, "the access snapshot must commit after the wait");
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
     async fn nip09_deletion_of_a_role_definition_revokes_and_rebuilds_survivors() {
         // NIP-09: deleting a relay-signed role-state event must revoke the
         // grants derived from it immediately (the marking path clears the
@@ -3576,7 +4078,7 @@ mod tests {
             assert!(relay.db.save_groups(snapshot).await);
 
             // The stored event advanced the sequence to 1.
-            let seq = relay.db.state_seq().await.expect("seq");
+            let seq = relay.db.state_seq_group().await.expect("seq");
             assert_eq!(seq, 1, "the group event must advance the sequence");
             let stamp = relay.db.state_stamp().await.expect("stamp");
             let saved = relay.db.load_groups().await.expect("snapshot");
@@ -3602,6 +4104,64 @@ mod tests {
             );
             relay.db.shutdown();
         });
+    }
+
+    #[tokio::test]
+    async fn snapshot_captured_between_put_and_apply_is_not_certified() {
+        // A state event's put commits (advancing the sequence) before its
+        // in-memory apply runs. A persist in that window would capture the
+        // pre-apply store but stamp it with the post-commit sequence, and
+        // the next startup would accept the snapshot and silently lose the
+        // event. The in-flight epoch makes the persist defer instead.
+        let relay = build_relay().await;
+        // The baseline snapshot at sequence 0.
+        assert!(relay.persist_groups().await, "the baseline snapshot saves");
+        let baseline = relay.db.load_groups().await.expect("baseline snapshot");
+
+        // The event's put commits, but its in-memory apply has not run yet:
+        // claim the epoch the way `accept_event_verified` does.
+        let now = crate::util::unix_now();
+        let secp = secp256k1::Secp256k1::new();
+        let admin = secp256k1::Keypair::from_seckey_slice(&secp, &[4u8; 32]).unwrap();
+        let create = signed_group_event(
+            &secp,
+            &admin,
+            crate::nips::nip29::CREATE_GROUP,
+            "g1",
+            vec![],
+            now,
+        );
+        assert!(matches!(
+            relay.db.put(create, now).await,
+            crate::db::PutOutcome::Stored
+        ));
+        let in_flight = relay.groups_rebuild.derived.begin();
+
+        assert!(
+            !relay.persist_groups().await,
+            "a persist with an unapplied state event must defer"
+        );
+        let saved = relay.db.load_groups().await.expect("snapshot");
+        assert_eq!(
+            saved.seq, baseline.seq,
+            "no snapshot may claim the unapplied generation"
+        );
+        let stamp = relay.db.state_stamp().await.expect("stamp");
+        let seq = relay.db.state_seq_group().await.expect("seq");
+        assert!(seq > saved.seq, "the put advanced the sequence");
+        let mut restored = crate::nips::nip29::GroupStore::with_cap(0);
+        assert!(
+            !restored.restore_checked(saved, stamp, seq),
+            "the pre-apply snapshot must not be accepted as current"
+        );
+
+        // Once the apply completes, the next save is certified at the
+        // current generation.
+        drop(in_flight);
+        assert!(relay.persist_groups().await, "the post-apply save lands");
+        let saved = relay.db.load_groups().await.expect("snapshot");
+        assert_eq!(saved.seq, seq, "the fresh snapshot carries the sequence");
+        relay.db.shutdown();
     }
 
     #[tokio::test]
@@ -3639,7 +4199,7 @@ mod tests {
         let mut persisted = None;
         for _ in 0..600 {
             if let Some(snap) = relay.db.load_groups().await
-                && snap.seq == relay.db.state_seq().await.unwrap_or(u64::MAX)
+                && snap.seq == relay.db.state_seq_group().await.unwrap_or(u64::MAX)
             {
                 persisted = Some(snap);
                 break;
@@ -3662,7 +4222,7 @@ mod tests {
         )
         .unwrap();
         let saved = db.load_groups().await.expect("snapshot after reopen");
-        let seq = db.state_seq().await.expect("seq");
+        let seq = db.state_seq_group().await.expect("seq");
         assert_eq!(
             saved.seq, seq,
             "the reopened snapshot must carry the latest sequence"
@@ -3710,6 +4270,216 @@ mod tests {
         assert!(
             relay.roles.read().await.is_member_of(&member),
             "the buffered mutation must survive the swap"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn finish_rebuild_holds_the_buffer_lock_across_the_swap() {
+        // A mutation accepted after the buffer take but before the swap
+        // would apply to the live store and then be overwritten by the
+        // freshly rebuilt store (its capture would see `scanning == false`).
+        // Holding the buffer lock across the swap makes it either land in
+        // the buffered set or wait and apply to the swapped-in store.
+        let key = "01".repeat(32);
+        let relay = build_role_relay(Some(&key)).await;
+        let member = "aa".repeat(32);
+        // Hold the roles write lock so `finish_rebuild` blocks while
+        // already holding the buffer lock: the interleaving is then
+        // deterministic.
+        let gate = relay.roles.write().await;
+        let mut fresh = RoleStore::default();
+        fresh.create("king", "King", "", "", None);
+        let task_relay = relay.clone();
+        let handle = tokio::spawn(async move {
+            task_relay
+                .roles_rebuild
+                .finish_rebuild(&task_relay.roles, fresh)
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            relay.roles_rebuild.buffer.try_lock().is_err(),
+            "the buffer lock must be held from the take through the swap"
+        );
+        drop(gate);
+        assert!(handle.await.unwrap(), "the fresh store must be swapped in");
+        assert!(relay.assign_role(&member, "king").await);
+        assert!(
+            relay.roles.read().await.is_member_of(&member),
+            "the post-swap mutation must apply to the swapped-in store"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn nip29_only_deletion_does_not_scan_roles() {
+        // A NIP-09 deletion of a NIP-29 state event must mark only the
+        // group store stale: revoking and rescanning the NIP-43 roles on
+        // every group deletion is both a correctness hazard (a NIP-29-only
+        // removal clears live grants) and a full-history scan per event.
+        let key = "01".repeat(32);
+        let relay = build_role_relay(Some(&key)).await;
+        relay.config.write().await.relay.enabled_nips = vec![9, 29, 43];
+        let member = "aa".repeat(32);
+        assert!(relay.create_role("mod", "Mod", "", "", None).await);
+        assert!(relay.assign_role(&member, "mod").await);
+
+        let now = crate::util::unix_now();
+        let secp = secp256k1::Secp256k1::new();
+        let author = secp256k1::Keypair::from_seckey_slice(&secp, &[21u8; 32]).unwrap();
+        let edit = signed_group_event(&secp, &author, 9002, "g-state", vec![], now);
+        assert_eq!(
+            relay.db.put(edit.clone(), now).await,
+            crate::db::PutOutcome::Stored
+        );
+
+        let mut deletion = crate::event::Event {
+            id: String::new(),
+            pubkey: secp256k1::XOnlyPublicKey::from_keypair(&author)
+                .0
+                .to_string(),
+            created_at: now,
+            kind: crate::nips::nip09::DELETION_KIND,
+            tags: vec![vec!["e".into(), edit.id.clone()]],
+            content: String::new(),
+            sig: String::new(),
+        };
+        deletion.id = crate::nips::nip01::compute_id(&deletion);
+        let raw = deletion.id_bytes().unwrap();
+        deletion.sig = secp.sign_schnorr_no_aux_rand(&raw, &author).to_string();
+        assert!(matches!(
+            relay.accept_event(deletion, &[], None).await,
+            crate::db::PutOutcome::Stored
+        ));
+
+        assert!(
+            wait_for_rebuild_worker(&relay).await,
+            "the group rebuild must run"
+        );
+        assert_eq!(
+            relay
+                .roles_rebuild
+                .rebuilds
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "a NIP-29-only removal must not trigger a role scan"
+        );
+        assert!(
+            relay.roles.read().await.is_member_of(&member),
+            "the live role grants must survive a NIP-29-only deletion"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn recovery_done_marks_the_state_stale_after_a_resumed_deletion() {
+        // The db writer resumes an interrupted NIP-09 deletion during
+        // `open`; when it removed a derived-state event, the startup
+        // barrier must mark the group/role stores stale so the startup
+        // restore/rebuild cannot certify pre-removal state.
+        use crate::db::store::{Store, encode_pending_deletion, pending_deletion_key};
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir()
+            .join("nostrfy-relay-resumed-deletion")
+            .join(format!("{:x}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        let mut cfg = crate::config::Config::default();
+        cfg.database.path = path;
+        cfg.database.map_size = 16 * 1024 * 1024;
+        cfg.database.max_map_size = 64 * 1024 * 1024;
+        let expiry = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let store = Store::open(&cfg.database, std::sync::Arc::clone(&expiry), 128)
+            .expect("the scratch store opens");
+        let now = crate::util::unix_now();
+        // A stored NIP-29 state event and the pending deletion that targets
+        // it (what a crash mid-walk leaves behind).
+        let author = "aa".repeat(32);
+        let mut edit = crate::event::Event {
+            id: String::new(),
+            pubkey: author.clone(),
+            created_at: now.saturating_sub(10),
+            kind: 9002,
+            tags: vec![vec!["h".into(), "g1".into()]],
+            content: String::new(),
+            sig: String::new(),
+        };
+        edit.id = crate::nips::nip01::compute_id(&edit);
+        {
+            let mut wtxn = store.env.write_txn().unwrap();
+            store
+                .put_event_in(&mut wtxn, &edit, now)
+                .expect("the state event stores");
+            wtxn.commit().unwrap();
+        }
+        let encoded = encode_pending_deletion(
+            &[edit.id.clone()],
+            &[],
+            Some(author.as_str()),
+            u64::MAX,
+            None,
+        );
+        {
+            let mut wtxn = store.env.write_txn().unwrap();
+            store
+                .delete_pending
+                .put(&mut wtxn, &pending_deletion_key(&encoded), &encoded)
+                .unwrap();
+            wtxn.commit().unwrap();
+        }
+        let db = crate::db::DbClient::open_with_store(
+            &cfg.database,
+            store,
+            expiry,
+            std::sync::Arc::new(Default::default()),
+            0,
+            128,
+            4096,
+        )
+        .expect("the db client opens");
+        let config = std::sync::Arc::new(tokio::sync::RwLock::new(cfg));
+        let relay = Relay::new(
+            config,
+            db,
+            crate::stats::Stats::new(),
+            "",
+            crate::relay::LiveBusConfig {
+                buffer: 1024,
+                batch_interval_ms: 10,
+                batch_size: 64,
+            },
+        )
+        .await;
+        assert!(
+            relay.db.resumed_deletion_state_removed(),
+            "the startup resume must expose the removed state event"
+        );
+        assert!(
+            !relay
+                .groups_rebuild
+                .pending
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "the state is not marked before the barrier runs"
+        );
+        // Drain first so the scheduled rebuild workers cannot clear the
+        // flags before the assertions (fail-closed is what matters for a
+        // real shutdown, and this keeps the interleaving deterministic).
+        relay.signal_drain();
+        relay.recovery_done().await;
+        assert!(
+            relay
+                .groups_rebuild
+                .pending
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "a resumed state removal must keep the group snapshot dropped"
+        );
+        assert!(
+            relay
+                .roles_rebuild
+                .dirty
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "a resumed state removal must revoke the live role grants"
         );
         relay.db.shutdown();
     }
@@ -3796,6 +4566,11 @@ mod tests {
         assert!(
             relay.roles.read().await.roles.is_empty(),
             "a failed rebuild must leave the fail-closed empty store"
+        );
+        assert_eq!(
+            relay.rebuild_failures(),
+            1,
+            "the failed role scan must be counted exactly once"
         );
     }
 
@@ -4137,6 +4912,230 @@ mod tests {
                 matches!(&results[0], (rid, crate::db::PutOutcome::Stored) if rid == &results[0].0 && !rid.is_empty()),
                 "the vanish reply must carry the event's real id: {:?}",
                 results
+            );
+            relay.db.shutdown();
+        });
+    }
+
+    /// Builds a relay whose database store has a one-shot removal fault
+    /// armed, so the retryable acknowledgment paths are testable without a
+    /// real partial walk.
+    async fn build_faulty_relay(arm_vanish: bool, arm_delete: bool) -> std::sync::Arc<Relay> {
+        use crate::db::store::Store;
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir()
+            .join("nostrfy-relay-removal-fault")
+            .join(format!("{:x}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        let mut cfg = crate::config::Config::default();
+        cfg.database.path = path;
+        cfg.database.map_size = 16 * 1024 * 1024;
+        cfg.database.max_map_size = 64 * 1024 * 1024;
+        let expiry = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let store = Store::open(&cfg.database, std::sync::Arc::clone(&expiry), 128)
+            .expect("the scratch store opens");
+        if arm_vanish {
+            store
+                .fail_next_vanish_chunk
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        if arm_delete {
+            store
+                .fail_next_delete_chunk
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        let db = crate::db::DbClient::open_with_store(
+            &cfg.database,
+            store,
+            expiry,
+            std::sync::Arc::new(Default::default()),
+            0,
+            128,
+            4096,
+        )
+        .expect("the db client opens");
+        let config = std::sync::Arc::new(tokio::sync::RwLock::new(cfg));
+        let relay = Relay::new(
+            config,
+            db,
+            crate::stats::Stats::new(),
+            "",
+            crate::relay::LiveBusConfig {
+                buffer: 1024,
+                batch_interval_ms: 10,
+                batch_size: 64,
+            },
+        )
+        .await;
+        std::sync::Arc::new(relay)
+    }
+
+    #[test]
+    fn vanish_failure_is_reported_as_retryable() {
+        // A vanish whose removal walk fails must not be acknowledged with
+        // `OK true`: the client retries, and the pending record lets the
+        // next startup finish the removal.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            use crate::db::PutOutcome;
+            let relay = build_faulty_relay(true, false).await;
+            let now = crate::util::unix_now();
+            let secp = secp256k1::Secp256k1::new();
+            let keypair = secp256k1::Keypair::from_seckey_slice(&secp, &[3u8; 32]).unwrap();
+            let pubkey = secp256k1::XOnlyPublicKey::from_keypair(&keypair)
+                .0
+                .to_string();
+            // A stored event by the vanishing pubkey: the walk has work and
+            // fails after its first chunk committed.
+            let mut old = crate::event::Event {
+                id: String::new(),
+                pubkey: pubkey.clone(),
+                created_at: now.saturating_sub(10),
+                kind: 1,
+                tags: vec![],
+                content: "old".into(),
+                sig: String::new(),
+            };
+            old.id = crate::nips::nip01::compute_id(&old);
+            let raw = old.id_bytes().unwrap();
+            old.sig = secp.sign_schnorr_no_aux_rand(&raw, &keypair).to_string();
+            assert_eq!(relay.db.put(old.clone(), now).await, PutOutcome::Stored);
+
+            let mut vanish = crate::event::Event {
+                id: String::new(),
+                pubkey: pubkey.clone(),
+                created_at: now,
+                kind: 62,
+                tags: vec![vec!["relay".into(), "ws://127.0.0.1:8080".into()]],
+                content: "vanish".into(),
+                sig: String::new(),
+            };
+            vanish.id = crate::nips::nip01::compute_id(&vanish);
+            let raw = vanish.id_bytes().unwrap();
+            vanish.sig = secp.sign_schnorr_no_aux_rand(&raw, &keypair).to_string();
+
+            let outcome = relay.accept_event(vanish, &[], None).await;
+            assert!(
+                matches!(&outcome, PutOutcome::Invalid(r) if r.contains("vanish") && r.contains("retry")),
+                "a failed vanish must report a retryable failure: {outcome:?}"
+            );
+            // The walk failed before completion, so no completed marker was
+            // written and the in-progress record remains for the startup
+            // resume (the pubkey must still be accepted until then).
+            let counts = relay
+                .db
+                .table_counts()
+                .await
+                .expect("the table counts must be readable");
+            assert_eq!(
+                counts.vanish, 0,
+                "a failed vanish must not write the completed marker"
+            );
+            assert!(
+                counts.vanish_pending >= 1,
+                "the in-progress vanish record must exist for the startup resume"
+            );
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn batch_vanish_failure_is_reported_as_retryable() {
+        // The batch path (a vanish-only batch resolves without a writer
+        // receiver) must apply the same retryable-failure ack.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_faulty_relay(true, false).await;
+            let now = crate::util::unix_now();
+            let secp = secp256k1::Secp256k1::new();
+            let keypair = secp256k1::Keypair::from_seckey_slice(&secp, &[5u8; 32]).unwrap();
+            let pubkey = secp256k1::XOnlyPublicKey::from_keypair(&keypair)
+                .0
+                .to_string();
+            let mut vanish = crate::event::Event {
+                id: String::new(),
+                pubkey,
+                created_at: now,
+                kind: 62,
+                tags: vec![vec!["relay".into(), "ws://127.0.0.1:8080".into()]],
+                content: "vanish".into(),
+                sig: String::new(),
+            };
+            vanish.id = crate::nips::nip01::compute_id(&vanish);
+            let raw = vanish.id_bytes().unwrap();
+            vanish.sig = secp.sign_schnorr_no_aux_rand(&raw, &keypair).to_string();
+            let results = relay.accept_events_batch(vec![vanish], &[]).await;
+            assert_eq!(results.len(), 1);
+            assert!(
+                matches!(&results[0].1, crate::db::PutOutcome::Invalid(r) if r.contains("vanish") && r.contains("retry")),
+                "the batch vanish ack must be retryable on failure: {results:?}"
+            );
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn nip09_deletion_failure_is_reported_as_retryable() {
+        // A NIP-09 deletion whose removal walk fails mid-way must report a
+        // retryable failure (the client retries; the durable pending record
+        // lets the startup resume finish it) and still mark the derived
+        // state stale for the events the partial walk removed.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            use crate::db::PutOutcome;
+            let relay = build_faulty_relay(false, true).await;
+            let now = crate::util::unix_now();
+            let secp = secp256k1::Secp256k1::new();
+            let author = secp256k1::Keypair::from_seckey_slice(&secp, &[6u8; 32]).unwrap();
+            let author_pk = secp256k1::XOnlyPublicKey::from_keypair(&author)
+                .0
+                .to_string();
+            // A stored NIP-29 state event the deletion targets.
+            let mut edit = crate::event::Event {
+                id: String::new(),
+                pubkey: author_pk.clone(),
+                created_at: now.saturating_sub(10),
+                kind: 9002,
+                tags: vec![
+                    vec!["h".into(), "g1".into()],
+                    vec!["private".into()],
+                ],
+                content: String::new(),
+                sig: String::new(),
+            };
+            edit.id = crate::nips::nip01::compute_id(&edit);
+            let raw = edit.id_bytes().unwrap();
+            edit.sig = secp.sign_schnorr_no_aux_rand(&raw, &author).to_string();
+            assert_eq!(relay.db.put(edit.clone(), now).await, PutOutcome::Stored);
+
+            let mut deletion = crate::event::Event {
+                id: String::new(),
+                pubkey: author_pk,
+                created_at: now,
+                kind: crate::nips::nip09::DELETION_KIND,
+                tags: vec![vec!["e".into(), edit.id.clone()]],
+                content: String::new(),
+                sig: String::new(),
+            };
+            deletion.id = crate::nips::nip01::compute_id(&deletion);
+            let raw = deletion.id_bytes().unwrap();
+            deletion.sig = secp.sign_schnorr_no_aux_rand(&raw, &author).to_string();
+
+            let outcome = relay.accept_event(deletion, &[], None).await;
+            assert!(
+                matches!(&outcome, PutOutcome::Invalid(r) if r.contains("removal") && r.contains("retry")),
+                "a failed deletion side effect must report a retryable failure: {outcome:?}"
+            );
+            let pending = relay
+                .db
+                .pending_deletions()
+                .await
+                .expect("the pending deletions must be readable");
+            assert_eq!(
+                pending.len(),
+                1,
+                "the durable pending record must exist for the startup resume"
             );
             relay.db.shutdown();
         });
@@ -4727,6 +5726,71 @@ mod tests {
             assert!(
                 matches!(results[0].1, PutOutcome::Invalid(_)),
                 "an unknown previous reference must be rejected: {results:?}"
+            );
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn rejected_sibling_does_not_satisfy_a_previous_reference() {
+        // The batch's known-reference set may only contain events that were
+        // actually accepted (or already stored): a rejected sibling must not
+        // satisfy a later event's `previous` tag.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            use crate::db::PutOutcome;
+
+            let relay = build_relay().await;
+            let now = crate::util::unix_now();
+            let secp = secp256k1::Secp256k1::new();
+            let keypair = secp256k1::Keypair::from_seckey_slice(&secp, &[7u8; 32]).unwrap();
+            let signed = |kind: u64, content: &str, tags: Vec<Vec<String>>| {
+                let mut e = crate::event::Event {
+                    id: String::new(),
+                    pubkey: secp256k1::XOnlyPublicKey::from_keypair(&keypair)
+                        .0
+                        .to_string(),
+                    created_at: now,
+                    kind,
+                    tags,
+                    content: content.into(),
+                    sig: String::new(),
+                };
+                e.id = crate::nips::nip01::compute_id(&e);
+                let id = e.id_bytes().unwrap();
+                e.sig = secp.sign_schnorr_no_aux_rand(&id, &keypair).to_string();
+                e
+            };
+            let h = |tags: Vec<Vec<String>>| {
+                let mut tags = tags;
+                tags.insert(0, vec!["h".into(), "g-rejected".into()]);
+                tags
+            };
+            let mut results = relay
+                .accept_events_batch(vec![signed(9007, "", h(vec![]))], &[])
+                .await;
+            assert!(matches!(results.remove(0).1, PutOutcome::Stored));
+
+            // The first sibling is rejected (corrupted signature); the
+            // second references its id prefix via `previous`.
+            let mut first = signed(1, "first", h(vec![]));
+            first.sig = "00".repeat(64);
+            let prefix = first.id[..8].to_string();
+            let second = signed(
+                1,
+                "second",
+                h(vec![vec!["previous".into(), prefix.clone()]]),
+            );
+            let first_id = first.id.clone();
+            let results = relay.accept_events_batch(vec![first, second], &[]).await;
+            assert_eq!(results[0].0, first_id);
+            assert!(
+                matches!(&results[0].1, PutOutcome::Invalid(r) if r.contains("signature")),
+                "the first sibling must be rejected: {results:?}"
+            );
+            assert!(
+                matches!(&results[1].1, PutOutcome::Invalid(r) if r.contains("previous")),
+                "a rejected sibling must not satisfy a previous reference: {results:?}"
             );
             relay.db.shutdown();
         });
@@ -5672,6 +6736,11 @@ mod tests {
                 .load(std::sync::atomic::Ordering::SeqCst),
             "a failed rebuild must keep the state pending"
         );
+        assert_eq!(
+            relay.rebuild_failures(),
+            1,
+            "the failed group scan must be counted exactly once"
+        );
     }
 
     #[tokio::test]
@@ -5952,6 +7021,73 @@ mod tests {
             ))
             .await;
         assert!(text.starts_with("error:"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn blossom_command_merges_a_concurrently_persisted_entry() {
+        // A CLI `blossom allow` can commit between the daemon's last load
+        // and the command. The command re-reads the persisted list under the
+        // cross-process lock and unions it with the in-memory list, so the
+        // CLI entry must survive instead of being overwritten by the
+        // daemon's older snapshot.
+        let relay = build_relay().await;
+        let cli = "cc".repeat(32);
+        assert!(
+            relay
+                .db
+                .save_blossom_allow(std::slice::from_ref(&cli))
+                .await,
+            "the concurrent CLI write must persist"
+        );
+        // The daemon's in-memory list never observed the CLI write.
+        assert!(relay.blossom_allow.read().await.is_empty());
+        let pk = "aa".repeat(32);
+        let text = relay
+            .execute_command(&crate::relay::commands::Command::BlossomAllow(pk.clone()))
+            .await;
+        assert_eq!(text, format!("ok: /blossom allow {pk}"));
+        let stored = relay.db.try_load_blossom_allow().await.expect("loads");
+        assert!(
+            stored.contains(&cli),
+            "the CLI entry must not be dropped: {stored:?}"
+        );
+        assert!(
+            stored.contains(&pk),
+            "the new entry must be persisted: {stored:?}"
+        );
+        assert_eq!(
+            *relay.blossom_allow.read().await,
+            stored,
+            "the in-memory list must mirror the written list"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn blossom_deny_removes_a_persisted_cli_entry() {
+        // The daemon's in-memory list does not contain the CLI-added entry:
+        // the command must remove it from the re-read persisted list instead
+        // of reporting a no-op while the entry survives on disk.
+        let relay = build_relay().await;
+        let cli = "cc".repeat(32);
+        assert!(
+            relay
+                .db
+                .save_blossom_allow(std::slice::from_ref(&cli))
+                .await
+        );
+        assert!(relay.blossom_allow.read().await.is_empty());
+        let text = relay
+            .execute_command(&crate::relay::commands::Command::BlossomDeny(cli.clone()))
+            .await;
+        assert_eq!(text, format!("ok: /blossom deny {cli}"));
+        let stored = relay.db.try_load_blossom_allow().await.expect("loads");
+        assert!(
+            !stored.contains(&cli),
+            "the CLI entry must be removed: {stored:?}"
+        );
+        assert!(relay.blossom_allow.read().await.is_empty());
+        relay.db.shutdown();
     }
 
     #[tokio::test]

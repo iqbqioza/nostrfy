@@ -208,6 +208,19 @@ impl super::Conn {
             );
             return;
         }
+        // Relay-wide CPU budget: spend the scan's worst case (this open's
+        // item cap) before the query runs, so a coordinated flood of
+        // NEG-OPENs across connections is refused before it reaches the
+        // reader threads. Charged even when the open fails later, like the
+        // per-connection open budget below: the scan work was already
+        // driven.
+        if !self.neg_cpu_budget.try_charge(
+            max_items as u64,
+            super::neg_cpu_budget_units(configured_max_items),
+        ) {
+            self.neg_err(&sub_id, "error: overloaded, please retry");
+            return;
+        }
         // Spend the budget before the scan: an open that fails later (a
         // codec error, a response over the byte budget, a full item cap)
         // has already driven the database query, so it must count too —
@@ -217,17 +230,15 @@ impl super::Conn {
         let now = unix_now();
         // The negentropy query only needs (created_at, id) records, so it
         // never materializes every matching full event in memory.
-        let Some((items, more)) = self
-            .relay
-            .db
-            .neg_items_reported(filter, max_items, now)
-            .await
+        let Some((items, more)) = self.relay.db.neg_query_result(filter, max_items, now).await
         else {
-            // A timed-out sync must never be answered with an empty item
-            // set: the peer would conclude everything is gone locally and
-            // delete its events. NEG-ERR closes the subscription per
-            // NIP-77, which is the safe failure mode.
-            self.neg_err(&sub_id, "error: database timeout, please retry");
+            // A failed sync must never be answered with an empty item set:
+            // the peer would conclude everything is gone locally and delete
+            // its events. The reported query variant returns `None` for
+            // every failure (timeout, fail-fast, the reader dropping the
+            // request on a store error); NEG-ERR closes the subscription
+            // per NIP-77, which is the safe retryable failure mode.
+            self.neg_err(&sub_id, "error: database unavailable; retry");
             return;
         };
         // The scan's collect cap is `max_items`, so the collected count can
@@ -432,8 +443,13 @@ impl super::Conn {
         }
         // NIP-77 disabled mid-session (SIGHUP reload or a command event):
         // stop the in-flight sync like any other refusal instead of letting
-        // a disabled feature keep running.
-        if !self.relay.config.read().await.nip_enabled(77) {
+        // a disabled feature keep running. The configured item cap sizes
+        // the relay-wide CPU budget charged below.
+        let (nip77_enabled, configured_max_items) = {
+            let cfg = self.relay.config.read().await;
+            (cfg.nip_enabled(77), cfg.limits.max_neg_items)
+        };
+        if !nip77_enabled {
             self.neg_err(&sub_id, "error: negentropy is not enabled on this relay");
             return;
         }
@@ -473,6 +489,17 @@ impl super::Conn {
             return;
         };
         state.rounds_left -= 1;
+        // Relay-wide CPU budget: a round's bisection costs about its held
+        // item count. A coordinated flood of rounds across connections is
+        // refused retryably instead of monopolizing the CPU; per NIP-77
+        // the NEG-ERR closes this subscription.
+        if !self.neg_cpu_budget.try_charge(
+            state.items.len().max(1) as u64,
+            super::neg_cpu_budget_units(configured_max_items),
+        ) {
+            self.neg_err(&sub_id, "error: overloaded, please retry");
+            return;
+        }
         match nip77::respond(&state.items, &message) {
             Ok(response) => {
                 // Bound the response like the REQ path's

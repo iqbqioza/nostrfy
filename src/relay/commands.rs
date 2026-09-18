@@ -155,6 +155,51 @@ fn blossom_reply(cmd: &Command, changed: bool, persisted: bool) -> String {
     }
 }
 
+/// Applies a `/blossom allow` on top of the persisted allowlist: the
+/// persisted list (re-read under the cross-process lock, `None` when that
+/// read failed) is unioned with the daemon's in-memory list — a daemon-side
+/// entry whose earlier persist failed must not be dropped by this write —
+/// and the pubkey is appended when absent. Returns the list to write and
+/// whether the command changed it.
+fn merge_blossom_allow(
+    persisted: Option<&[String]>,
+    in_memory: &[String],
+    pk: &str,
+) -> (Vec<String>, bool) {
+    let mut entries: Vec<String> = Vec::new();
+    for entry in persisted.into_iter().flatten().chain(in_memory) {
+        if !entries.contains(entry) {
+            entries.push(entry.clone());
+        }
+    }
+    let changed = !entries.iter().any(|e| e == pk);
+    if changed {
+        entries.push(pk.to_string());
+    }
+    (entries, changed)
+}
+
+/// Applies a `/blossom deny` on top of the persisted allowlist: the
+/// persisted list (re-read under the cross-process lock; the in-memory list
+/// is the fallback when that read failed) minus the pubkey. Unlike allow
+/// there is no union with the in-memory list: an entry a CLI `blossom deny`
+/// removed must stay removed. Returns the list to write and whether the
+/// command changed it.
+fn merge_blossom_deny(
+    persisted: Option<&[String]>,
+    in_memory: &[String],
+    pk: &str,
+) -> (Vec<String>, bool) {
+    let changed = persisted.is_some_and(|list| list.iter().any(|e| e == pk))
+        || in_memory.iter().any(|e| e == pk);
+    let mut entries = match persisted {
+        Some(list) => list.to_vec(),
+        None => in_memory.to_vec(),
+    };
+    entries.retain(|e| e != pk);
+    (entries, changed)
+}
+
 impl Relay {
     /// Runs the command-event side effect for a stored kind:1 event:
     /// recognizes the admin pubkey (`relay.pubkey`) and
@@ -239,27 +284,36 @@ impl Relay {
                 // Capture and write are serialized (like `persist_roles`):
                 // two concurrent commands could otherwise snapshot the list
                 // in one order and queue their writes in the other, losing
-                // the newer entry on the next restart.
+                // the newer entry on the next restart. The in-process lock
+                // only serializes daemon commands: the cross-process lock is
+                // taken *before* the persisted list is re-read, so a
+                // concurrent CLI read-modify-write cannot land between the
+                // read and the write and be overwritten by the daemon's
+                // older snapshot.
                 let _guard = self.persist_blossom_allow_lock.lock().await;
+                let _state_lock = self.db.lock_access_state().await;
+                let persisted = self.db.try_load_blossom_allow().await;
                 let mut allow = self.blossom_allow.write().await;
-                let already = allow.iter().any(|p| p == pk);
-                if !already {
-                    allow.push(pk.clone());
-                }
-                let entries = allow.clone();
+                let (entries, changed) = merge_blossom_allow(persisted.as_deref(), &allow, pk);
+                // The written list is the new in-memory truth: it carries
+                // the CLI entries the daemon had not observed yet.
+                *allow = entries.clone();
                 drop(allow);
-                let persisted = self.db.save_blossom_allow(&entries).await;
-                blossom_reply(cmd, !already, persisted)
+                // The cross-process lock is already held: taking it again
+                // from this process would block on itself.
+                let saved = self.db.save_blossom_allow_locked(&entries).await;
+                blossom_reply(cmd, changed, saved)
             }
             Command::BlossomDeny(pk) => {
                 let _guard = self.persist_blossom_allow_lock.lock().await;
+                let _state_lock = self.db.lock_access_state().await;
+                let persisted = self.db.try_load_blossom_allow().await;
                 let mut allow = self.blossom_allow.write().await;
-                let present = allow.iter().any(|p| p == pk);
-                allow.retain(|p| p != pk);
-                let entries = allow.clone();
+                let (entries, changed) = merge_blossom_deny(persisted.as_deref(), &allow, pk);
+                *allow = entries.clone();
                 drop(allow);
-                let persisted = self.db.save_blossom_allow(&entries).await;
-                blossom_reply(cmd, present, persisted)
+                let saved = self.db.save_blossom_allow_locked(&entries).await;
+                blossom_reply(cmd, changed, saved)
             }
         }
     }
@@ -407,5 +461,44 @@ mod tests {
         let text = access_reply(&Command::RelayDeny(hex.clone()), false, false);
         assert!(text.starts_with("error:"), "{text}");
         assert!(text.contains(&hex), "{text}");
+    }
+
+    #[test]
+    fn blossom_allow_merge_keeps_persisted_and_daemon_entries() {
+        let persisted = vec!["cli".to_string()];
+        let in_memory = vec!["daemon".to_string()];
+        // The CLI entry (persisted, not in memory) and the daemon-only
+        // entry both survive; order is persisted first, then in-memory.
+        let (entries, changed) = merge_blossom_allow(Some(&persisted), &in_memory, "new");
+        assert!(changed);
+        assert_eq!(entries, vec!["cli", "daemon", "new"]);
+        // An entry present in either list is not duplicated and reports
+        // no change when it is the one being allowed.
+        let (entries, changed) = merge_blossom_allow(Some(&persisted), &in_memory, "cli");
+        assert!(!changed);
+        assert_eq!(entries, vec!["cli", "daemon"]);
+        // A failed re-read falls back to the in-memory list.
+        let (entries, changed) = merge_blossom_allow(None, &in_memory, "new");
+        assert!(changed);
+        assert_eq!(entries, vec!["daemon", "new"]);
+    }
+
+    #[test]
+    fn blossom_deny_merge_removes_persisted_entries() {
+        let persisted = vec!["cli".to_string(), "keep".to_string()];
+        let in_memory = vec!["cli".to_string(), "stale".to_string()];
+        // The CLI-added entry is only in the persisted list: removing it is
+        // a real change, and the written list is the persisted one minus
+        // the pubkey (a CLI deny must not be resurrected).
+        let (entries, changed) = merge_blossom_deny(Some(&persisted), &in_memory, "cli");
+        assert!(changed);
+        assert_eq!(entries, vec!["keep"]);
+        let (entries, changed) = merge_blossom_deny(Some(&persisted), &in_memory, "absent");
+        assert!(!changed);
+        assert_eq!(entries, vec!["cli", "keep"]);
+        // A failed re-read falls back to the in-memory list.
+        let (entries, changed) = merge_blossom_deny(None, &in_memory, "stale");
+        assert!(changed);
+        assert_eq!(entries, vec!["cli"]);
     }
 }

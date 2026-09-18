@@ -7,8 +7,8 @@ use super::db_error;
 use super::store::{
     CREATED_LEN, GIFT_WRAP_INDEX, ID_LEN, Store, created_key, decode_pending_purge,
     decode_purged_group_marker, delegated_by, deleted_address_key, dtag_key_safe,
-    encode_pending_purge, encode_purged_group_marker, is_group_state_kind, pubkey_key,
-    purged_group_key, replaceable_key, tag_key,
+    encode_pending_deletion, encode_pending_purge, encode_purged_group_marker, is_group_state_kind,
+    pending_deletion_key, pubkey_key, purged_group_key, replaceable_key, tag_key,
 };
 use crate::error::Result;
 use crate::event::Event;
@@ -20,6 +20,31 @@ use crate::nips::nip09;
 /// in one `Vec`. The walks below resume just past the last collected key,
 /// so entries the caller leaves in place cannot loop forever.
 const REMOVAL_CHUNK: usize = 4096;
+
+/// The partial outcome of a chunked removal walk: what was removed before
+/// the walk ended, whether the removed events feed the derived NIP-29 /
+/// NIP-43 state, and the failure that stopped it (if any). The counters
+/// stay meaningful when `error` is `Some`: a later chunk that failed must
+/// not hide the state events an earlier chunk already removed (the derived
+/// state still needs the rebuild), nor the events it already removed.
+pub(crate) struct RemovalReport {
+    pub removed: usize,
+    pub group_state_removed: bool,
+    pub error: Option<anyhow::Error>,
+}
+
+impl RemovalReport {
+    /// Whether the walk completed cleanly.
+    pub(crate) fn is_clean(&self) -> bool {
+        self.error.is_none()
+    }
+
+    /// The removed count for a successful walk, `None` on failure: the
+    /// checked callers must not report a partial removal as a clean one.
+    pub(crate) fn checked_removed(&self) -> Option<usize> {
+        self.is_clean().then_some(self.removed)
+    }
+}
 
 /// Compares two hex pubkeys/ids on decoded bytes (case-insensitive like
 /// the scan's hex decode), falling back to exact match when either side
@@ -128,7 +153,43 @@ impl Store {
         request_pubkey: Option<&str>,
         request_created: u64,
         group: Option<&str>,
-    ) -> Result<usize> {
+    ) -> RemovalReport {
+        let mut removed = 0usize;
+        let mut group_state_removed = false;
+        let error = self
+            .apply_deletion_walk(
+                targets,
+                addresses,
+                request_pubkey,
+                request_created,
+                group,
+                &mut removed,
+                &mut group_state_removed,
+            )
+            .err();
+        RemovalReport {
+            removed,
+            group_state_removed,
+            error,
+        }
+    }
+
+    /// The chunked walk behind [`Self::apply_deletion_group`]. Records the
+    /// request in [`DELETE_PENDING`] before the first removal chunk and
+    /// clears it only after every chunk committed: an error mid-walk (or a
+    /// shutdown cancellation) leaves the record for the startup resume. The
+    /// out-parameters carry the partial counters to the caller's report.
+    #[allow(clippy::too_many_arguments)]
+    fn apply_deletion_walk(
+        &self,
+        targets: &[String],
+        addresses: &[nip09::Address],
+        request_pubkey: Option<&str>,
+        request_created: u64,
+        group: Option<&str>,
+        removed: &mut usize,
+        group_state_removed: &mut bool,
+    ) -> Result<()> {
         // Disk-full guard: a removal still writes (the deleted marker),
         // so the same SIGBUS protection as the put path applies.
         self.disk_full_error()?;
@@ -137,14 +198,32 @@ impl Store {
         // `None`, which skipped every authorization check and would delete
         // arbitrary events if a future caller passed neither.
         if request_pubkey.is_none() && group.is_none() {
-            return Ok(0);
+            return Ok(());
         }
-        let mut removed = 0usize;
+        // Record the request before the first removal chunk. A request with
+        // nothing to walk (no tags) cannot be interrupted, so it writes no
+        // record that would need clearing.
+        let pending_encoded =
+            encode_pending_deletion(targets, addresses, request_pubkey, request_created, group);
+        let pending_key = pending_deletion_key(&pending_encoded);
+        let has_work = !targets.is_empty() || !addresses.is_empty();
+        if has_work {
+            self.put_pending_deletion(&pending_key, &pending_encoded)?;
+        }
 
         // The `e`-tag targets are bounded by the deletion request's own tag
         // list, but the batch is still split into REMOVAL_CHUNK-sized write
         // transactions so a huge request never pins one commit.
         for chunk in targets.chunks(REMOVAL_CHUNK) {
+            if self.cancelled() {
+                // A SIGTERM mid-walk stops at the chunk boundary: the
+                // pending record stays and the next startup resumes the
+                // walk (fail-closed). Reporting the partial removal here
+                // is not needed — the record is the durable statement.
+                return Err(anyhow::anyhow!(
+                    "NIP-09 deletion cancelled during shutdown; resuming at next startup"
+                ));
+            }
             let mut wtxn = self.env.write_txn()?;
             let mut chunk_state_removed = false;
             for target in chunk {
@@ -208,12 +287,22 @@ impl Store {
                 // deleted grant.
                 chunk_state_removed |= is_group_state_kind(event.kind);
                 self.remove_event(&mut wtxn, &id)?;
-                removed += 1;
+                *removed += 1;
             }
             if chunk_state_removed {
                 self.bump_state_stamp(&mut wtxn)?;
             }
             wtxn.commit()?;
+            *group_state_removed |= chunk_state_removed;
+            // Test-only: fail after the chunk committed, so the resume
+            // path runs over a genuinely partial walk.
+            #[cfg(test)]
+            if self
+                .fail_next_delete_chunk
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(anyhow::anyhow!("test-only delete chunk failure"));
+            }
         }
 
         // NIP-09 `a` tags: remove every version of the referenced
@@ -252,6 +341,11 @@ impl Store {
             let end = replaceable_key(address.kind.saturating_add(1), &pubkey, "");
             let mut last_key: Option<Vec<u8>> = None;
             loop {
+                if self.cancelled() {
+                    return Err(anyhow::anyhow!(
+                        "NIP-09 deletion cancelled during shutdown; resuming at next startup"
+                    ));
+                }
                 // A fresh write transaction per chunk: one address's version
                 // history is unbounded, and a single transaction across it
                 // pinned the writer while a MapFull aborted the whole
@@ -332,12 +426,22 @@ impl Store {
                     // `e`-tag path).
                     chunk_state_removed |= is_group_state_kind(address.kind);
                     self.remove_event(&mut wtxn, id)?;
-                    removed += 1;
+                    *removed += 1;
                 }
                 if chunk_state_removed {
                     self.bump_state_stamp(&mut wtxn)?;
                 }
                 wtxn.commit()?;
+                *group_state_removed |= chunk_state_removed;
+                // See the `e`-tag walk: fail after a committed chunk so the
+                // resume runs over a partial removal.
+                #[cfg(test)]
+                if self
+                    .fail_next_delete_chunk
+                    .swap(false, std::sync::atomic::Ordering::SeqCst)
+                {
+                    return Err(anyhow::anyhow!("test-only delete chunk failure"));
+                }
             }
             // A delegated requester may only tombstone when a version
             // actually matched (the walk above authorizes each version): an
@@ -349,7 +453,13 @@ impl Store {
             }
         }
 
-        Ok(removed)
+        // The whole walk committed cleanly: the request no longer needs a
+        // resume record. A failed clear leaves the record, and the next
+        // startup replays the (idempotent) walk.
+        if has_work {
+            self.clear_pending_deletion(&pending_key)?;
+        }
+        Ok(())
     }
 
     /// Merges the NIP-09 `a`-tag tombstone at `akey` with the request's
@@ -459,6 +569,13 @@ impl Store {
         let mut removed = 0usize;
         let mut max_created = 0u64;
         loop {
+            if self.cancelled() {
+                // SIGTERM mid-walk: stop at the chunk boundary and leave the
+                // pending record (written above) for the next startup.
+                return Err(anyhow::anyhow!(
+                    "NIP-29 group purge cancelled during shutdown; resuming at next startup"
+                ));
+            }
             // Test-only: fail after the marker and in-progress record
             // committed, so the resume path runs with real crash state.
             #[cfg(test)]
@@ -606,6 +723,65 @@ impl Store {
         completed
     }
 
+    /// Completes every interrupted NIP-09 deletion before the writer serves
+    /// its first message (same startup/atomicity reasoning as
+    /// [`Self::resume_pending_vanishes`]). Each record is replayed through
+    /// the ordinary (idempotent) walk, which re-records and, on a clean
+    /// completion, clears it. The returned flag is true when any resumed
+    /// deletion removed a NIP-29/NIP-43 state event: the relay must mark
+    /// the derived state stale (the persistent state stamp is bumped in the
+    /// same removal transactions, and this flag surfaces the fact directly
+    /// to the startup path).
+    pub(crate) fn resume_pending_deletions(
+        &self,
+        errors: &Arc<std::sync::atomic::AtomicU64>,
+    ) -> (usize, bool) {
+        let pending = match self.pending_deletions() {
+            Ok(pending) => pending,
+            Err(e) => {
+                db_error(errors, &e);
+                return (0, false);
+            }
+        };
+        let mut completed = 0usize;
+        let mut group_state_removed = false;
+        for request in pending {
+            if self.cancelled() {
+                break;
+            }
+            // A record with neither a requester nor a group scope can never
+            // authorize a removal (the walk refuses it): drop it so it does
+            // not block every startup forever. Legitimate records always
+            // carry one of the two.
+            if request.request_pubkey.is_none() && request.group.is_none() {
+                let encoded = encode_pending_deletion(
+                    &request.targets,
+                    &request.addresses,
+                    None,
+                    request.request_created,
+                    None,
+                );
+                if let Err(e) = self.clear_pending_deletion(&pending_deletion_key(&encoded)) {
+                    db_error(errors, &e);
+                }
+                continue;
+            }
+            let report = self.apply_deletion_group(
+                &request.targets,
+                &request.addresses,
+                request.request_pubkey.as_deref(),
+                request.request_created,
+                request.group.as_deref(),
+            );
+            group_state_removed |= report.group_state_removed;
+            match report.error {
+                Some(e) => db_error(errors, &e),
+                None => completed += 1,
+            }
+        }
+        (completed, group_state_removed)
+    }
+
     /// Every started-but-unfinished vanish as `(pubkey, until_created)`,
     /// used by the startup resume. A malformed record (bitrot) is skipped
     /// with a warning: the completed-marker path still fails closed for the
@@ -687,6 +863,13 @@ impl Store {
         );
         let mut last_key: Option<Vec<u8>> = None;
         loop {
+            if self.cancelled() {
+                // SIGTERM mid-walk: stop at the chunk boundary; the pending
+                // record stays and the next startup finishes the vanish.
+                return Err(anyhow::anyhow!(
+                    "NIP-62 vanish cancelled during shutdown; resuming at next startup"
+                ));
+            }
             // Test-only: fail after the in-progress record committed (the
             // caller wrote it), so the resume path runs with real crash
             // state instead of hand-written table entries.
@@ -787,11 +970,41 @@ impl Store {
         Ok(removed)
     }
 
-    /// Removes every stored event whose NIP-40 expiration has arrived.
-    /// The returned bool reports whether a NIP-29/NIP-43 state event was
-    /// among them, so the caller rebuilds the derived state (mirrors
-    /// [`Self::apply_vanish`]'s second field).
-    pub(crate) fn purge_expired(&self, now: u64) -> Result<(usize, bool)> {
+    /// Removes every stored event whose NIP-40 expiration has arrived, then
+    /// reaps `first_seen` entries older than `first_seen_min_age` seconds
+    /// (0 disables the reap): once a pubkey is older than the new-pubkey
+    /// gate, the entry can never reject it again, so keeping it only grows
+    /// the table forever.
+    ///
+    /// The returned report carries the partial counters on a failed chunk
+    /// (the backlog is unbounded, so a MapFull mid-pass must not hide the
+    /// state events an earlier chunk already removed), and its
+    /// `group_state_removed` flag reports whether a NIP-29/NIP-43 state
+    /// event was among the removals so the caller rebuilds the derived
+    /// state.
+    pub(crate) fn purge_expired(&self, now: u64, first_seen_min_age: u64) -> RemovalReport {
+        let mut removed = 0usize;
+        let mut group_state_removed = false;
+        let error = self
+            .purge_expired_walk(now, &mut removed, &mut group_state_removed)
+            .and_then(|()| self.reap_first_seen(now, first_seen_min_age))
+            .err();
+        RemovalReport {
+            removed,
+            group_state_removed,
+            error,
+        }
+    }
+
+    /// The expiry walk behind [`Self::purge_expired`]. A shutdown
+    /// cancellation stops the walk cleanly at the chunk boundary (the next
+    /// periodic purge resumes; NIP-40 has no pending record to keep).
+    fn purge_expired_walk(
+        &self,
+        now: u64,
+        removed: &mut usize,
+        group_state_removed: &mut bool,
+    ) -> Result<()> {
         self.disk_full_error()?;
         // NIP-40 disabled: nothing is expired. Stale entries written while
         // it was enabled are removed by `remove_event` (which deletes the
@@ -801,7 +1014,7 @@ impl Store {
             .expiry_enabled
             .load(std::sync::atomic::Ordering::Relaxed)
         {
-            return Ok((0, false));
+            return Ok(());
         }
         let since_key = created_key(0, &[0u8; ID_LEN]);
         // NIP-40 semantics are `expiration <= now`: include every key at the
@@ -809,9 +1022,10 @@ impl Store {
         // inclusive upper bound.
         let until_key = created_key(now, &[0xff; ID_LEN]);
         let mut last_key: Option<Vec<u8>> = None;
-        let mut removed = 0usize;
-        let mut group_state_removed = false;
         loop {
+            if self.cancelled() {
+                break;
+            }
             // A fresh write transaction per chunk: the expired backlog is
             // unbounded, and one transaction across it pinned the writer
             // while a MapFull aborted the whole purge. Purges run
@@ -837,7 +1051,7 @@ impl Store {
                         chunk_state_removed |= is_group_state_kind(event.kind);
                     }
                     self.remove_event(&mut wtxn, &id)?;
-                    removed += 1;
+                    *removed += 1;
                 } else {
                     // The event is already gone (removed outside the normal
                     // path or corrupt data): drop the orphaned expiry key
@@ -851,9 +1065,64 @@ impl Store {
                 // fact that the derived state changed).
                 self.bump_state_stamp(&mut wtxn)?;
             }
-            group_state_removed |= chunk_state_removed;
             wtxn.commit()?;
+            *group_state_removed |= chunk_state_removed;
         }
-        Ok((removed, group_state_removed))
+        Ok(())
+    }
+
+    /// Reaps `first_seen` entries whose timestamp is older than `min_age`
+    /// seconds (see [`Self::purge_expired`]). `0` disables the reap. The
+    /// walk is chunked so a table with millions of accounts never pins one
+    /// write transaction, and a shutdown cancellation stops at the chunk
+    /// boundary (the next periodic purge finishes the reap).
+    fn reap_first_seen(&self, now: u64, min_age: u64) -> Result<()> {
+        if min_age == 0 {
+            return Ok(());
+        }
+        let cutoff = now.saturating_sub(min_age);
+        let mut last: Option<Vec<u8>> = None;
+        loop {
+            if self.cancelled() {
+                break;
+            }
+            let mut wtxn = self.env.write_txn()?;
+            let lower = match &last {
+                Some(key) => std::ops::Bound::Excluded(key.as_slice()),
+                None => std::ops::Bound::Unbounded,
+            };
+            let mut doomed: Vec<Vec<u8>> = Vec::new();
+            let mut scanned = 0usize;
+            let mut last_scanned: Option<Vec<u8>> = None;
+            for item in self
+                .first_seen
+                .range(&wtxn, &(lower, std::ops::Bound::Unbounded))?
+            {
+                let (key, raw) = item?;
+                scanned += 1;
+                last_scanned = Some(key.to_vec());
+                // A corrupt short entry has no usable timestamp: treat it as
+                // ancient (it can never satisfy the gate) and reap it.
+                let ts = raw
+                    .get(..8)
+                    .map(|bytes| u64::from_be_bytes(bytes.try_into().expect("checked length")))
+                    .unwrap_or(0);
+                if ts < cutoff {
+                    doomed.push(key.to_vec());
+                }
+                if scanned == REMOVAL_CHUNK {
+                    break;
+                }
+            }
+            for key in &doomed {
+                self.first_seen.delete(&mut wtxn, key)?;
+            }
+            wtxn.commit()?;
+            if scanned < REMOVAL_CHUNK {
+                break;
+            }
+            last = last_scanned;
+        }
+        Ok(())
     }
 }

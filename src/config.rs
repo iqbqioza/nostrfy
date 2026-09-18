@@ -2232,6 +2232,43 @@ mod tests {
     }
 
     #[test]
+    fn configuration_md_full_example_uses_known_keys() {
+        // The documented full example must be authoritative: every key it
+        // shows must be a real config key. A key under the wrong section
+        // (e.g. `enabled_nip78_auth` under `[server]`) is silently ignored
+        // at runtime, so the example would teach a configuration that does
+        // not apply.
+        let docs = std::fs::read_to_string("docs/CONFIGURATION.md")
+            .expect("docs/CONFIGURATION.md is readable from the crate root");
+        let example = docs
+            .split_once("## 11. Full example")
+            .and_then(|(_, rest)| rest.split_once("```toml\n"))
+            .and_then(|(_, rest)| rest.split_once("\n```"))
+            .map(|(block, _)| block)
+            .expect("the full example TOML block must be present");
+        let value: toml::Value = toml::from_str(example).expect("the full example is valid TOML");
+        let known = known_config_keys();
+        for (section, table) in value.as_table().unwrap() {
+            let Some(keys) = known
+                .iter()
+                .find(|(s, _)| s == section)
+                .map(|(_, keys)| *keys)
+            else {
+                panic!("unknown section [{section}] in the full example");
+            };
+            for key in table.as_table().unwrap().keys() {
+                assert!(
+                    keys.contains(&key.as_str()),
+                    "[{section}].{key} from the full example is not a real config key \
+                     (it would be silently ignored)"
+                );
+            }
+        }
+        // The typed loader must accept the example too (serde shape).
+        toml::from_str::<Config>(example).expect("the full example must deserialize");
+    }
+
+    #[test]
     fn set_relay_field_does_not_clobber_prefix_matches() {
         // Unknown keys are warned about but never rejected, so a line that
         // merely starts with the field name (e.g. `name_note`) must not be

@@ -207,8 +207,13 @@ impl Cli {
                 } else {
                     Some(PidFileGuard::create(&cfg.daemon.pid_file)?)
                 };
+                // Register the signal handlers before the database open and
+                // its recovery: a SIGHUP/SIGTERM received during the long
+                // startup work must be handled (buffered by the tokio
+                // driver), not applied as the default action.
+                let signals = crate::server::StartupSignals::register();
                 let db = open_db(&cfg)?;
-                run_server(self.config.clone(), cfg, db).await
+                run_server(self.config.clone(), cfg, db, signals).await
             }
             _ => Ok(()),
         }
@@ -329,8 +334,18 @@ impl Cli {
                 std::io::Error::last_os_error()
             )));
         }
-        if !wait_for_stop(&pid_file) {
-            return Err(anyhow!(format!("daemon (pid {pid}) did not stop in time")));
+        // The wait must cover the daemon's whole graceful-shutdown budget
+        // (HTTP drain + task joins + WebSocket drain + database joins); a
+        // shorter wait would report "did not stop in time" while a healthy
+        // daemon is still flushing. A second SIGTERM from the operator
+        // forces an immediate exit instead.
+        let stop_timeout = crate::server::SHUTDOWN_BUDGET.saturating_add(STOP_TIMEOUT_MARGIN);
+        if !wait_for_stop(&pid_file, stop_timeout) {
+            return Err(anyhow!(format!(
+                "daemon (pid {pid}) did not stop in time ({}s budget); send another \
+                 SIGTERM to force an immediate exit",
+                stop_timeout.as_secs()
+            )));
         }
         print_line("nostrfy stopped");
         Ok(())
@@ -420,34 +435,38 @@ impl Cli {
                 "{pubkey:?} is not an npub1... or 64-hex pubkey"
             )));
         }
-        let mut entries = load_blossom_allow(&cfg)?;
         match action {
             BlossomAction::Allow { pubkey } => {
+                let _lock = lock_access_state(&cfg)?;
+                let mut state = load_access_state(&cfg)?;
                 let hex = normalize_pubkey(pubkey);
-                if !entries.iter().any(|e| e == &hex) {
-                    entries.push(hex.clone());
-                    save_blossom_allow(&cfg, &entries)?;
+                if !state.blossom_allow.iter().any(|e| e == &hex) {
+                    state.blossom_allow.push(hex.clone());
+                    save_access_state(&cfg, &state)?;
                     print_line(&format!("allowed {hex} to upload (added to the allowlist)"));
                 } else {
                     print_line(&format!("{hex} is already allowed"));
                 }
             }
             BlossomAction::Deny { pubkey } => {
+                let _lock = lock_access_state(&cfg)?;
+                let mut state = load_access_state(&cfg)?;
                 let hex = normalize_pubkey(pubkey);
-                let before = entries.len();
-                entries.retain(|e| e != &hex);
-                if entries.len() != before {
-                    save_blossom_allow(&cfg, &entries)?;
+                let before = state.blossom_allow.len();
+                state.blossom_allow.retain(|e| e != &hex);
+                if state.blossom_allow.len() != before {
+                    save_access_state(&cfg, &state)?;
                     print_line(&format!("denied {hex} (removed from the allowlist)"));
                 } else {
                     print_line(&format!("{hex} was not in the allowlist"));
                 }
             }
             BlossomAction::List => {
-                if entries.is_empty() {
+                let state = load_access_state(&cfg)?;
+                if state.blossom_allow.is_empty() {
                     print_line("the Blossom upload allowlist is empty");
                 } else {
-                    for entry in &entries {
+                    for entry in &state.blossom_allow {
                         print_line(entry);
                     }
                 }
@@ -496,7 +515,8 @@ impl Cli {
                 "{pubkey:?} is not an npub1... or 64-hex pubkey"
             )));
         }
-        let (mut deny, mut allow) = load_relay_pubkeys(&cfg)?;
+        let _lock = lock_access_state(&cfg)?;
+        let mut state = load_access_state(&cfg)?;
         let mut changed = false;
         match action {
             RelayAction::Allow { pubkey } => {
@@ -504,12 +524,12 @@ impl Cli {
                 // Removing the pubkey from the deny list is itself a change
                 // that must be persisted even when it is already allowed
                 // (e.g. after a NIP-86 `banpubkey` put it on both lists).
-                let deny_before = deny.len();
-                deny.retain(|(p, _)| p != &hex);
-                let was_denied = deny.len() != deny_before;
+                let deny_before = state.relay_deny.len();
+                state.relay_deny.retain(|(p, _)| p != &hex);
+                let was_denied = state.relay_deny.len() != deny_before;
                 changed |= was_denied;
-                if !allow.iter().any(|(p, _)| p == &hex) {
-                    allow.push((hex.clone(), String::new()));
+                if !state.relay_allow.iter().any(|(p, _)| p == &hex) {
+                    state.relay_allow.push((hex.clone(), String::new()));
                     changed = true;
                     print_line(&format!("allowed {hex} to publish"));
                 } else if was_denied {
@@ -523,12 +543,12 @@ impl Cli {
             RelayAction::Deny { pubkey } => {
                 let hex = normalize_pubkey(pubkey);
                 // Symmetric: removing an existing allow entry is a change.
-                let allow_before = allow.len();
-                allow.retain(|(p, _)| p != &hex);
-                let was_allowed = allow.len() != allow_before;
+                let allow_before = state.relay_allow.len();
+                state.relay_allow.retain(|(p, _)| p != &hex);
+                let was_allowed = state.relay_allow.len() != allow_before;
                 changed |= was_allowed;
-                if !deny.iter().any(|(p, _)| p == &hex) {
-                    deny.push((hex.clone(), String::new()));
+                if !state.relay_deny.iter().any(|(p, _)| p == &hex) {
+                    state.relay_deny.push((hex.clone(), String::new()));
                     changed = true;
                     print_line(&format!("denied {hex}: its events are now rejected"));
                 } else if was_allowed {
@@ -541,18 +561,18 @@ impl Cli {
             }
             RelayAction::List => {
                 print_line("allow list:");
-                if allow.is_empty() {
+                if state.relay_allow.is_empty() {
                     print_line("  (empty)");
                 } else {
-                    for (p, _) in &allow {
+                    for (p, _) in &state.relay_allow {
                         print_line(&format!("  {p}"));
                     }
                 }
                 print_line("deny list:");
-                if deny.is_empty() {
+                if state.relay_deny.is_empty() {
                     print_line("  (empty)");
                 } else {
-                    for (p, _) in &deny {
+                    for (p, _) in &state.relay_deny {
                         print_line(&format!("  {p}"));
                     }
                 }
@@ -561,7 +581,7 @@ impl Cli {
             }
         }
         if changed {
-            save_relay_pubkeys(&cfg, &deny, &allow)?;
+            save_access_state(&cfg, &state)?;
         }
         // Reload the running daemon so the new lists apply immediately.
         match running_pid(&cfg.daemon.pid_file) {
@@ -602,28 +622,24 @@ impl Cli {
             .parse()
             .map_err(|_| config_err(format!("{ip:?} is not an IP address")))?;
         let parsed = crate::util::normalize_ip(parsed);
-        let env = open_db_env(&cfg)?;
-        let mut wtxn = env.write_txn()?;
-        let access = env
-            .create_database::<heed::types::Bytes, heed::types::Bytes>(&mut wtxn, Some("access"))?;
-        let Some(raw) = access.get(&wtxn, b"access")? else {
+        // The advisory lock serializes this read-modify-write with the
+        // daemon's NIP-86 access persists (and other CLI mutations), so a
+        // concurrent ban cannot be lost.
+        let _lock = lock_access_state(&cfg)?;
+        let mut state = load_access_state(&cfg)?;
+        let Some(control) = state.access.as_mut() else {
             print_line(&format!(
                 "{parsed} is not blocked (no persisted access state)"
             ));
             return Ok(());
         };
-        let mut control: crate::config::AccessControl = serde_json::from_slice(raw)?;
         let before = control.blocked_ips.entries().len();
         control.blocked_ips.remove(parsed);
         if control.blocked_ips.entries().len() == before {
             print_line(&format!("{parsed} is not blocked"));
             return Ok(());
         }
-        // Disk-full guard like the server write paths (an mmap commit on a
-        // full disk risks SIGBUS).
-        crate::db::store::check_env_space(&env)?;
-        access.put(&mut wtxn, b"access", &serde_json::to_vec(&control)?)?;
-        wtxn.commit()?;
+        save_access_state(&cfg, &state)?;
         print_line(&format!("unblocked {parsed} in the persisted access state"));
         // The daemon holds the list in memory; blocked-IP changes are
         // applied at startup, not by a config reload.
@@ -1127,6 +1143,12 @@ const PID_FILE_GRACE: Duration = Duration::from_secs(1);
 /// After the readiness probe connects, the child is re-checked after this
 /// settle window (see `wait_for_ready_within`).
 const READY_STABILIZE: Duration = Duration::from_millis(250);
+/// Extra wait on top of the server's `SHUTDOWN_BUDGET` before `nostrfy stop`
+/// reports a timeout: covers the pid-file removal and process teardown that
+/// follow the in-process phases, which are not part of the budget. The
+/// documented budget is `SHUTDOWN_BUDGET + STOP_TIMEOUT_MARGIN` (currently
+/// 32 s); a second SIGTERM forces the exit immediately.
+const STOP_TIMEOUT_MARGIN: Duration = Duration::from_secs(5);
 
 /// Whether the freshly forked child is still alive. `pid` is the pid read
 /// from the pid file, or `None` while the file has not appeared yet; a
@@ -1403,40 +1425,95 @@ fn open_db_env(cfg: &Config) -> Result<heed::Env> {
     Ok(env)
 }
 
-/// Loads the persisted Blossom upload allowlist (hex pubkeys).
-fn load_blossom_allow(cfg: &Config) -> Result<Vec<String>> {
-    let env = open_db_env(cfg)?;
-    // `create_database` opens an existing table or creates a missing one,
-    // exactly like the relay server does at startup — old databases that
-    // predate the table must keep working.
-    let mut wtxn = env.write_txn()?;
-    let access =
-        env.create_database::<heed::types::Bytes, heed::types::Bytes>(&mut wtxn, Some("access"))?;
-    let list = match access.get(&wtxn, b"blossom_allow")? {
-        Some(raw) => serde_json::from_slice(raw)?,
-        None => Vec::new(),
-    };
-    wtxn.commit()?;
-    Ok(list)
+/// The persisted access state the CLI reads and writes: the NIP-86 `access`
+/// blob (when one exists), the relay pubkey deny/allow lists and the Blossom
+/// upload allowlist. Holding all of them in one struct lets a read-modify-
+/// write commit every present key in a single transaction, mirroring the
+/// daemon's `Store::save_access_and_pubkeys`.
+struct PersistedAccess {
+    /// `None` when no `access` blob was ever persisted. The server treats
+    /// that as the first run and seeds the config's `[access]` section, so
+    /// the CLI must not create an empty blob just by touching another list.
+    access: Option<crate::config::AccessControl>,
+    relay_deny: Vec<(String, String)>,
+    relay_allow: Vec<(String, String)>,
+    blossom_allow: Vec<String>,
 }
 
-/// Persists the Blossom upload allowlist (hex pubkeys).
-fn save_blossom_allow(cfg: &Config, entries: &[String]) -> Result<()> {
-    let env = open_db_env(cfg)?;
-    // Disk-full guard like the server write paths: an mmap commit on a
-    // full disk raises SIGBUS instead of failing cleanly.
-    crate::db::store::check_env_space(&env)?;
-    let mut wtxn = env.write_txn()?;
-    let access =
-        env.create_database::<heed::types::Bytes, heed::types::Bytes>(&mut wtxn, Some("access"))?;
-    access.put(&mut wtxn, b"blossom_allow", &serde_json::to_vec(entries)?)?;
-    wtxn.commit()?;
-    Ok(())
+/// The advisory lock file next to the database that serializes the CLI's
+/// read-modify-write of the access state with the daemon's NIP-86 writes
+/// (documented in `docs/CONFIGURATION.md`). It is a lock file only: the name
+/// is never read, `flock` gives mutual exclusion across processes, and the
+/// lock is released when the handle drops (or the process dies). A stale
+/// file is harmless — the kernel lock is what matters — and the file is
+/// deliberately not removed: unlinking a locked file would let a third
+/// process lock a fresh inode while the holder still holds the old one.
+fn access_lock_path(cfg: &Config) -> PathBuf {
+    cfg.database.path.join("access.lock")
 }
 
-/// Loads the persisted relay pubkey access lists ((deny, allow), each a
-/// (pubkey, reason) pair) from the relay database.
-fn load_relay_pubkeys(cfg: &Config) -> Result<crate::db::store::RelayPubkeyLists> {
+/// Held for the duration of a CLI access mutation; the lock releases on
+/// drop. Unix-only (`flock`); on other platforms the operation is not
+/// serialized across processes (the same atomic transaction still applies).
+struct AccessStateLock {
+    #[cfg(unix)]
+    file: std::fs::File,
+}
+
+impl Drop for AccessStateLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            // Closing the file would release the lock too; the explicit
+            // unlock keeps the intent visible.
+            unsafe {
+                libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+            }
+        }
+    }
+}
+
+/// Takes the cross-process advisory lock guarding the persisted access
+/// state. The database directory is created first (the server creates it at
+/// startup; the CLI must work on a fresh install too).
+fn lock_access_state(cfg: &Config) -> Result<AccessStateLock> {
+    std::fs::create_dir_all(&cfg.database.path)?;
+    let path = access_lock_path(cfg);
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            // The lock file's contents are never read or written: the inode
+            // is what `flock` locks, so never truncate an existing file.
+            .truncate(false)
+            .open(&path)
+            .map_err(|e| anyhow!("cannot open the access lock {}: {e}", path.display()))?;
+        // SAFETY: `file` holds a valid descriptor for the call.
+        let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        if ret != 0 {
+            return Err(anyhow!(
+                "cannot lock {}: {}",
+                path.display(),
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(AccessStateLock { file })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(AccessStateLock {})
+    }
+}
+
+/// Loads the whole persisted access state in one read transaction. The
+/// one-time legacy migration runs first, exactly like the server startup and
+/// the old per-key helpers did.
+fn load_access_state(cfg: &Config) -> Result<PersistedAccess> {
     let env = open_db_env(cfg)?;
     // The table is created in its own transaction, committed before the
     // migration runs (LMDB allows a single writer at a time).
@@ -1445,16 +1522,18 @@ fn load_relay_pubkeys(cfg: &Config) -> Result<crate::db::store::RelayPubkeyLists
         env.create_database::<heed::types::Bytes, heed::types::Bytes>(&mut wtxn, Some("access"))?;
         wtxn.commit()?;
     }
-    // Same one-time migration the server runs: a CLI write before the
-    // first post-upgrade server start must not lose legacy entries.
     let rtxn = env.read_txn()?;
-    let access = env
+    let access_table = env
         .open_database::<heed::types::Bytes, heed::types::Bytes>(&rtxn, Some("access"))?
         .ok_or_else(|| anyhow::anyhow!("access table was not created"))?;
     drop(rtxn);
-    crate::db::store::migrate_access_pubkeys(&env, &access)?;
+    crate::db::store::migrate_access_pubkeys(&env, &access_table)?;
     let rtxn = env.read_txn()?;
-    let lists = match access.get(&rtxn, b"relay_pubkeys")? {
+    let access = match access_table.get(&rtxn, b"access")? {
+        Some(raw) => Some(serde_json::from_slice(raw)?),
+        None => None,
+    };
+    let (relay_deny, relay_allow) = match access_table.get(&rtxn, b"relay_pubkeys")? {
         Some(raw) => {
             let value: serde_json::Value = serde_json::from_slice(raw)?;
             let deny = serde_json::from_value(value.get("deny").cloned().unwrap_or_default())?;
@@ -1463,24 +1542,44 @@ fn load_relay_pubkeys(cfg: &Config) -> Result<crate::db::store::RelayPubkeyLists
         }
         None => (Vec::new(), Vec::new()),
     };
-    Ok(lists)
+    let blossom_allow = match access_table.get(&rtxn, b"blossom_allow")? {
+        Some(raw) => serde_json::from_slice(raw)?,
+        None => Vec::new(),
+    };
+    Ok(PersistedAccess {
+        access,
+        relay_deny,
+        relay_allow,
+        blossom_allow,
+    })
 }
 
-/// Persists the relay pubkey access lists ((deny, allow), (pubkey, reason)
-/// pairs) in the relay database.
-fn save_relay_pubkeys(
-    cfg: &Config,
-    deny: &[(String, String)],
-    allow: &[(String, String)],
-) -> Result<()> {
+/// Persists the whole access state in a single transaction (the CLI's
+/// equivalent of `DbClient::save_access_and_pubkeys`): the daemon and the
+/// CLI cannot observe a half-applied mutation, and the advisory lock keeps
+/// two read-modify-writes from losing each other. The `access` key is
+/// written only when a blob already existed (see [`PersistedAccess::access`]).
+fn save_access_state(cfg: &Config, state: &PersistedAccess) -> Result<()> {
     let env = open_db_env(cfg)?;
-    // Same disk-full guard as `save_blossom_allow` above.
+    // Disk-full guard like the server write paths: an mmap commit on a
+    // full disk raises SIGBUS instead of failing cleanly.
     crate::db::store::check_env_space(&env)?;
     let mut wtxn = env.write_txn()?;
     let access =
         env.create_database::<heed::types::Bytes, heed::types::Bytes>(&mut wtxn, Some("access"))?;
-    let data = serde_json::to_vec(&serde_json::json!({ "deny": deny, "allow": allow }))?;
-    access.put(&mut wtxn, b"relay_pubkeys", &data)?;
+    if let Some(control) = &state.access {
+        access.put(&mut wtxn, b"access", &serde_json::to_vec(control)?)?;
+    }
+    let lists = serde_json::to_vec(&serde_json::json!({
+        "deny": state.relay_deny,
+        "allow": state.relay_allow,
+    }))?;
+    access.put(&mut wtxn, b"relay_pubkeys", &lists)?;
+    access.put(
+        &mut wtxn,
+        b"blossom_allow",
+        &serde_json::to_vec(&state.blossom_allow)?,
+    )?;
     wtxn.commit()?;
     Ok(())
 }
@@ -1568,10 +1667,14 @@ fn process_name(_pid: u32) -> Option<String> {
     None
 }
 
-/// Waits up to 10 seconds for the daemon to exit (the pid file to disappear).
-/// Returns `true` when the daemon stopped, `false` when it is still running.
-fn wait_for_stop(pid_file: &Path) -> bool {
-    for _ in 0..100 {
+/// Waits up to `timeout` for the daemon to exit (the pid file's process to
+/// disappear). Returns `true` when the daemon stopped, `false` when it is
+/// still running. The timeout is the daemon's shutdown budget plus
+/// [`STOP_TIMEOUT_MARGIN`], computed by the caller so it stays in sync with
+/// the phases in `server::run_server`.
+fn wait_for_stop(pid_file: &Path, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
         let gone = std::fs::read_to_string(pid_file)
             .ok()
             .and_then(|p| p.trim().parse::<u32>().ok())
@@ -1581,10 +1684,14 @@ fn wait_for_stop(pid_file: &Path) -> bool {
             let _ = std::fs::remove_file(pid_file);
             return true;
         }
+        if Instant::now() >= deadline {
+            break;
+        }
         std::thread::sleep(Duration::from_millis(100));
     }
     error!(
-        "daemon did not stop in time; pid file {} still exists",
+        "daemon did not stop within {}s; pid file {} still exists",
+        timeout.as_secs(),
         pid_file.display()
     );
     false
@@ -1765,35 +1872,53 @@ name = \"nostrfy\"\n",
 
         // The NIP-86 state: the pubkey is on both lists. `relay allow` must
         // remove the deny entry and persist that removal.
-        save_relay_pubkeys(
+        save_access_state(
             &cfg,
-            &[(hex.clone(), String::new())],
-            &[(hex.clone(), String::new())],
+            &PersistedAccess {
+                access: None,
+                relay_deny: vec![(hex.clone(), String::new())],
+                relay_allow: vec![(hex.clone(), String::new())],
+                blossom_allow: vec!["first:key".into()],
+            },
         )
         .unwrap();
         cli.relay_access(&RelayAction::Allow {
             pubkey: hex.clone(),
         })
         .unwrap();
-        let (deny, allow) = load_relay_pubkeys(&cfg).unwrap();
+        let state = load_access_state(&cfg).unwrap();
         assert!(
-            !deny.iter().any(|(p, _)| p == &hex),
+            !state.relay_deny.iter().any(|(p, _)| p == &hex),
             "allow must remove the deny entry"
         );
-        assert!(allow.iter().any(|(p, _)| p == &hex));
+        assert!(state.relay_allow.iter().any(|(p, _)| p == &hex));
+        assert_eq!(
+            state.blossom_allow,
+            vec!["first:key".to_string()],
+            "an unrelated key must survive the read-modify-write"
+        );
+        assert!(
+            state.access.is_none(),
+            "a missing access blob must not be created by an unrelated mutation"
+        );
 
         // Symmetric: `relay deny` must remove and persist an allow entry.
-        save_relay_pubkeys(
+        save_access_state(
             &cfg,
-            &[(hex.clone(), String::new())],
-            &[(hex.clone(), String::new())],
+            &PersistedAccess {
+                access: None,
+                relay_deny: vec![(hex.clone(), String::new())],
+                relay_allow: vec![(hex.clone(), String::new())],
+                blossom_allow: Vec::new(),
+            },
         )
         .unwrap();
         cli.relay_access(&RelayAction::Deny {
             pubkey: hex.clone(),
         })
         .unwrap();
-        let (deny, allow) = load_relay_pubkeys(&cfg).unwrap();
+        let state = load_access_state(&cfg).unwrap();
+        let (deny, allow) = (state.relay_deny, state.relay_allow);
         assert!(
             !allow.iter().any(|(p, _)| p == &hex),
             "deny must remove the allow entry"
@@ -2165,6 +2290,81 @@ name = \"nostrfy\"\n",
             control.blocked_ips.entries().is_empty(),
             "the entry must be removed from the persisted state"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wait_for_stop_honors_the_budget() {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir()
+            .join("nostrfy-wait-stop-test")
+            .join(format!("{:x}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pid_file = dir.join("nostrfy.pid");
+
+        // A dead pid is reported stopped and the file is removed.
+        std::fs::write(&pid_file, "999999999\n").unwrap();
+        assert!(wait_for_stop(&pid_file, Duration::from_secs(1)));
+        assert!(!pid_file.exists());
+
+        // A live daemon: the wait uses the whole budget instead of the old
+        // fixed ten seconds (skipped without the fake-process helper).
+        if let Some(mut daemon) = spawn_fake_nostrfy(&dir) {
+            std::fs::write(&pid_file, format!("{}\n", daemon.id())).unwrap();
+            let started = Instant::now();
+            assert!(
+                !wait_for_stop(&pid_file, Duration::from_millis(200)),
+                "a live daemon must not be reported stopped"
+            );
+            assert!(
+                started.elapsed() >= Duration::from_millis(150),
+                "the wait must run for the given budget"
+            );
+            let _ = daemon.kill();
+            let _ = daemon.wait();
+            assert!(
+                wait_for_stop(&pid_file, Duration::from_secs(1)),
+                "a dead daemon must be reported stopped"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn access_lock_creates_and_releases_the_lock_file() {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir()
+            .join("nostrfy-access-lock-test")
+            .join(format!("{:x}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("nostrfy.toml");
+        let db_path = dir.join("db");
+        std::fs::write(
+            &config_path,
+            format!("[database]\npath = {:?}\n", db_path.display().to_string()),
+        )
+        .unwrap();
+        let cli = Cli {
+            config: config_path,
+            command: Command::Check,
+            daemonized: false,
+        };
+        let cfg = cli.load_config().unwrap();
+        let lock_path = access_lock_path(&cfg);
+        {
+            let _lock = lock_access_state(&cfg).unwrap();
+            assert!(
+                lock_path.exists(),
+                "the documented lock file must be created next to the database"
+            );
+        }
+        // The lock is released on drop: a second acquisition succeeds.
+        let _lock = lock_access_state(&cfg).unwrap();
+        assert!(lock_path.exists(), "the lock file is left in place");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

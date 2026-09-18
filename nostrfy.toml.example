@@ -340,8 +340,10 @@ live_buffer = 65536
 # socket in bounded chunks as it drains, so a slow reader cannot pin more
 # than max_out_queue_bytes in the queue — or more than this budget per
 # response. Beyond the budget the subscription is closed with
-# `CLOSED ... response too large`. 0 disables the budget. Above 512 MiB
-# warns; above 2 GiB is rejected (one response could exhaust memory).
+# `CLOSED ... response too large`. 0 disables the per-response budget only:
+# the relay-wide pending-response budget (16 x the 32 MiB default = 512 MiB)
+# still bounds all in-flight responses together. Above 512 MiB warns; above
+# 2 GiB is rejected (one response could exhaust memory).
 max_req_response_bytes = 33554432
 
 # -----------------------------------------------------------------------------

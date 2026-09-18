@@ -95,7 +95,22 @@ pub(crate) struct DbThreads {
     pub(crate) read_txs: Vec<mpsc::UnboundedSender<Msg>>,
     pub(crate) api_read_tx: mpsc::UnboundedSender<Msg>,
     pub(crate) errors: Arc<std::sync::atomic::AtomicU64>,
+    /// Cap (overload) fail-fasts since the last drain (see
+    /// `DbClient::take_overloads`), shared with the send paths that refuse
+    /// a request before it is queued.
+    pub(crate) overloads: Arc<std::sync::atomic::AtomicU64>,
     pub(crate) expiry: Arc<std::sync::atomic::AtomicBool>,
+    /// Set once at startup when the resumed NIP-09 deletions removed a
+    /// NIP-29/NIP-43 state event: the relay must mark its derived state
+    /// stale (the persistent state stamp was bumped too, but the direct
+    /// fact lets the startup path act without comparing snapshots).
+    pub(crate) resumed_deletion_state_removed: Arc<std::sync::atomic::AtomicBool>,
+    /// Receives one message when the writer finished its startup recovery
+    /// (interrupted vanish/deletion resumes and the outcome flag). The
+    /// [`super::DbClient`] constructor waits on it, so the recovery is
+    /// complete and observable before the client is handed out. A receive
+    /// error means the writer exited during startup.
+    pub(crate) recovery_rx: std::sync::mpsc::Receiver<()>,
     pub(crate) timeout_secs: u64,
     pub(crate) pending_msgs: Arc<std::sync::atomic::AtomicUsize>,
     pub(crate) pending_events: Arc<std::sync::atomic::AtomicUsize>,
@@ -148,6 +163,21 @@ fn handle_read_msg(store: &Store, errors: &Arc<std::sync::atomic::AtomicU64>, ms
             let _ = reply.send(page);
             false
         }
+        Msg::VanishPubkeysRawPage {
+            after,
+            limit,
+            reply,
+        } => {
+            // Drop the reply on a store error: the checked caller must
+            // distinguish a failed page from a genuinely empty one.
+            match store.vanish_pubkeys_raw_page(after.as_deref(), limit) {
+                Ok(page) => {
+                    let _ = reply.send(page);
+                }
+                Err(e) => db_error(errors, &e),
+            }
+            false
+        }
         Msg::Query {
             filters,
             limit,
@@ -157,15 +187,16 @@ fn handle_read_msg(store: &Store, errors: &Arc<std::sync::atomic::AtomicU64>, ms
             hidden_slack,
             reply,
         } => {
-            let out = match store.scan(&filters, now, limit, false, ascending, budget, hidden_slack)
-            {
-                Ok(out) => out,
-                Err(e) => {
-                    db_error(errors, &e);
-                    (Vec::new(), false)
+            // Drop the reply sender on a scan error (like `BlossomLoad`):
+            // the reporting callers must see `None` instead of an empty
+            // successful result, while the unchecked paths keep their
+            // default-empty semantics.
+            match store.scan(&filters, now, limit, false, ascending, budget, hidden_slack) {
+                Ok(out) => {
+                    let _ = reply.send(out);
                 }
-            };
-            let _ = reply.send(out);
+                Err(e) => db_error(errors, &e),
+            }
             false
         }
         Msg::NegQuery {
@@ -174,14 +205,12 @@ fn handle_read_msg(store: &Store, errors: &Arc<std::sync::atomic::AtomicU64>, ms
             now,
             reply,
         } => {
-            let out = match store.scan_neg(&filter, now, limit, SCAN_BUDGET) {
-                Ok(out) => out,
-                Err(e) => {
-                    db_error(errors, &e);
-                    (Vec::new(), false)
+            match store.scan_neg(&filter, now, limit, SCAN_BUDGET) {
+                Ok(out) => {
+                    let _ = reply.send(out);
                 }
-            };
-            let _ = reply.send(out);
+                Err(e) => db_error(errors, &e),
+            }
             false
         }
         Msg::Count {
@@ -190,14 +219,12 @@ fn handle_read_msg(store: &Store, errors: &Arc<std::sync::atomic::AtomicU64>, ms
             now,
             reply,
         } => {
-            let out = match store.scan(&filters, now, limit, true, false, SCAN_BUDGET, 0) {
-                Ok(out) => out,
-                Err(e) => {
-                    db_error(errors, &e);
-                    (Vec::new(), false)
+            match store.scan(&filters, now, limit, true, false, SCAN_BUDGET, 0) {
+                Ok(out) => {
+                    let _ = reply.send(out);
                 }
-            };
-            let _ = reply.send(out);
+                Err(e) => db_error(errors, &e),
+            }
             false
         }
         Msg::PrefixExists { prefix, reply } => {
@@ -234,15 +261,12 @@ fn handle_read_msg(store: &Store, errors: &Arc<std::sync::atomic::AtomicU64>, ms
             false
         }
         Msg::AggregateSample { limit, now, reply } => {
-            let out =
-                match store.scan_neg(&crate::filter::Filter::default(), now, limit, SCAN_BUDGET) {
-                    Ok(out) => Some(out),
-                    Err(e) => {
-                        db_error(errors, &e);
-                        None
-                    }
-                };
-            let _ = reply.send(out);
+            match store.scan_neg(&crate::filter::Filter::default(), now, limit, SCAN_BUDGET) {
+                Ok(out) => {
+                    let _ = reply.send(Some(out));
+                }
+                Err(e) => db_error(errors, &e),
+            }
             false
         }
         Msg::LoadAccess { reply } => {
@@ -417,6 +441,30 @@ fn handle_read_msg(store: &Store, errors: &Arc<std::sync::atomic::AtomicU64>, ms
             let _ = reply.send(pending);
             false
         }
+        Msg::PendingDeletions { reply } => {
+            // See `PendingPurges`: an unreadable table must not read as
+            // "no deletions to resume".
+            let pending = match store.pending_deletions() {
+                Ok(pending) => Some(pending),
+                Err(e) => {
+                    db_error(errors, &e);
+                    None
+                }
+            };
+            let _ = reply.send(pending);
+            false
+        }
+        Msg::TableCounts { reply } => {
+            let counts = match store.table_counts() {
+                Ok(counts) => Some(counts),
+                Err(e) => {
+                    db_error(errors, &e);
+                    None
+                }
+            };
+            let _ = reply.send(counts);
+            false
+        }
         Msg::StateStamp { reply } => {
             let stamp = match store.state_stamp() {
                 Ok(stamp) => Some(stamp),
@@ -430,6 +478,28 @@ fn handle_read_msg(store: &Store, errors: &Arc<std::sync::atomic::AtomicU64>, ms
         }
         Msg::StateSeq { reply } => {
             let seq = match store.state_seq() {
+                Ok(seq) => Some(seq),
+                Err(e) => {
+                    db_error(errors, &e);
+                    None
+                }
+            };
+            let _ = reply.send(seq);
+            false
+        }
+        Msg::StateSeqGroup { reply } => {
+            let seq = match store.state_seq_group() {
+                Ok(seq) => Some(seq),
+                Err(e) => {
+                    db_error(errors, &e);
+                    None
+                }
+            };
+            let _ = reply.send(seq);
+            false
+        }
+        Msg::StateSeqRole { reply } => {
+            let seq = match store.state_seq_role() {
                 Ok(seq) => Some(seq),
                 Err(e) => {
                     db_error(errors, &e);
@@ -462,6 +532,9 @@ pub(crate) fn spawn(
     let mut read_txs: Vec<mpsc::UnboundedSender<Msg>> = Vec::with_capacity(reader_threads);
     let (api_read_tx, mut api_read_rx) = mpsc::unbounded_channel();
     let thread_errors = Arc::clone(&errors);
+    // Cap fail-fasts, counted by the send paths and drained by the stats
+    // writer (see `DbClient::take_overloads`).
+    let overloads = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let pending_msgs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let pending_events = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let pending_reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -477,6 +550,13 @@ pub(crate) fn spawn(
     let read_pending_bytes = Arc::clone(&pending_read_bytes);
     let api_pending_bytes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let api_pending_bytes_thread = Arc::clone(&api_pending_bytes);
+    // Set by the writer's startup resume of interrupted NIP-09 deletions
+    // (see `DbThreads::resumed_deletion_state_removed`).
+    let resumed_deletion_state_removed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let thread_resumed_deletion_state_removed = Arc::clone(&resumed_deletion_state_removed);
+    // The writer signals once its startup recovery finished; the client
+    // constructor waits here (see `DbThreads::recovery_rx`).
+    let (recovery_tx, recovery_rx) = std::sync::mpsc::channel::<()>();
     // Dedicated reader threads: serve Query/Count/NEG and the small
     // lookups without ever taking the LMDB write lock. Two threads share
     // the channel (the receiver behind a mutex; each thread holds the
@@ -587,6 +667,49 @@ pub(crate) fn spawn(
         }));
     }
     handles.push(std::thread::spawn(move || {
+        // The recovery prelude runs first, before the long index rebuilds:
+        // `DbClient::open` waits for `recovery_tx` (see `recovery_rx`), so
+        // the server's startup state restore observes the completed
+        // recovery and its stale-state flag without racing this thread.
+        //
+        // One-time backfill of the NIP-59 gift-wrap recipient index: an
+        // older database has the wraps but no recipient entries, and the
+        // vanish resume below drops the wraps addressed to a vanished
+        // pubkey through that index.
+        match store.gift_wrap_index_needs_rebuild() {
+            Ok(true) => match store.rebuild_gift_wrap_index() {
+                Ok(n) => log::info!("gift-wrap recipient index rebuilt ({n} recipients)"),
+                Err(e) => log::warn!("gift-wrap recipient index rebuild failed: {e}"),
+            },
+            Ok(false) => {}
+            Err(e) => log::warn!("gift-wrap recipient index check failed: {e}"),
+        }
+        // Resume interrupted NIP-62 vanishes before serving any message: a
+        // crash or store error mid-walk left the pending record, and the
+        // remaining events must not stay visible once the relay opens. This
+        // runs on the writer thread (the single writer) before the drain
+        // loop, so no put can interleave and no `DbClient` round trip is
+        // needed (which would deadlock the writer against itself).
+        let resumed = store.resume_pending_vanishes(&thread_errors);
+        if resumed > 0 {
+            log::info!("resumed {resumed} interrupted vanish request(s)");
+        }
+        // Resume interrupted NIP-09 deletions before serving any message
+        // (same reasoning as the vanish resume): a crash mid-walk left the
+        // request record, and the half-applied deletion must be completed
+        // before the relay opens. A resumed deletion that removed
+        // NIP-29/NIP-43 state publishes the fact for the startup path.
+        let (resumed_deletions, deletion_state_removed) =
+            store.resume_pending_deletions(&thread_errors);
+        if resumed_deletions > 0 {
+            log::info!("resumed {resumed_deletions} interrupted deletion request(s)");
+        }
+        thread_resumed_deletion_state_removed
+            .store(deletion_state_removed, std::sync::atomic::Ordering::SeqCst);
+        // Recovery is complete and its outcome is visible: release the
+        // `DbClient::open` barrier. A send failure only means the client
+        // was never built (the receiver is dropped), which is harmless.
+        let _ = recovery_tx.send(());
         // One-time rebuild of the lightweight metadata index: an older
         // database has events but no meta entries. The rebuild runs on
         // the writer thread before any puts (the single-writer lock is
@@ -609,17 +732,6 @@ pub(crate) fn spawn(
                 }
             }
         }
-        // One-time backfill of the NIP-59 gift-wrap recipient index: an
-        // older database has the wraps but no recipient entries, so a
-        // NIP-09 deletion would not find them until the index is built.
-        match store.gift_wrap_index_needs_rebuild() {
-            Ok(true) => match store.rebuild_gift_wrap_index() {
-                Ok(n) => log::info!("gift-wrap recipient index rebuilt ({n} recipients)"),
-                Err(e) => log::warn!("gift-wrap recipient index rebuild failed: {e}"),
-            },
-            Ok(false) => {}
-            Err(e) => log::warn!("gift-wrap recipient index check failed: {e}"),
-        }
         // One-time backfill of the Blossom uploaded-order index (BUD-12
         // paging): databases written before the index existed page from
         // their sha-ordered reverse index, which hid every blob past the
@@ -631,16 +743,6 @@ pub(crate) fn spawn(
             },
             Ok(false) => {}
             Err(e) => db_error(&thread_errors, &e),
-        }
-        // Resume interrupted NIP-62 vanishes before serving any message: a
-        // crash or store error mid-walk left the pending record, and the
-        // remaining events must not stay visible once the relay opens. This
-        // runs on the writer thread (the single writer) before the drain
-        // loop, so no put can interleave and no `DbClient` round trip is
-        // needed (which would deadlock the writer against itself).
-        let resumed = store.resume_pending_vanishes(&thread_errors);
-        if resumed > 0 {
-            log::info!("resumed {resumed} interrupted vanish request(s)");
         }
         // Puts are applied in batches sharing one write transaction so
         // that the LMDB commit cost (a full fsync by default) is paid
@@ -821,6 +923,16 @@ pub(crate) fn spawn(
                                         };
                                     let _ = reply.send(page);
                                 }
+                                Msg::VanishPubkeysRawPage {
+                                    after,
+                                    limit,
+                                    reply,
+                                } => match store.vanish_pubkeys_raw_page(after.as_deref(), limit) {
+                                    Ok(page) => {
+                                        let _ = reply.send(page);
+                                    }
+                                    Err(e) => db_error(&thread_errors, &e),
+                                },
                                 Msg::BlossomMigrationDone { reply } => {
                                     let done = match store.blossom_migration_done() {
                                         Ok(done) => done,
@@ -929,7 +1041,10 @@ pub(crate) fn spawn(
                                     hidden_slack,
                                     reply,
                                 } => {
-                                    let out = match store.scan(
+                                    // See the reader arm: drop the reply on a
+                                    // scan error so the reporting callers
+                                    // see `None`, not an empty success.
+                                    match store.scan(
                                         &filters,
                                         now,
                                         limit,
@@ -938,37 +1053,30 @@ pub(crate) fn spawn(
                                         budget,
                                         hidden_slack,
                                     ) {
-                                        Ok(out) => out,
-                                        Err(e) => {
-                                            db_error(&thread_errors, &e);
-                                            (Vec::new(), false)
+                                        Ok(out) => {
+                                            let _ = reply.send(out);
                                         }
-                                    };
-                                    let _ = reply.send(out);
+                                        Err(e) => db_error(&thread_errors, &e),
+                                    }
                                 }
                                 Msg::NegQuery {
                                     filter,
                                     limit,
                                     now,
                                     reply,
-                                } => {
-                                    let out = match store.scan_neg(&filter, now, limit, SCAN_BUDGET)
-                                    {
-                                        Ok(out) => out,
-                                        Err(e) => {
-                                            db_error(&thread_errors, &e);
-                                            (Vec::new(), false)
-                                        }
-                                    };
-                                    let _ = reply.send(out);
-                                }
+                                } => match store.scan_neg(&filter, now, limit, SCAN_BUDGET) {
+                                    Ok(out) => {
+                                        let _ = reply.send(out);
+                                    }
+                                    Err(e) => db_error(&thread_errors, &e),
+                                },
                                 Msg::Count {
                                     filters,
                                     limit,
                                     now,
                                     reply,
                                 } => {
-                                    let out = match store.scan(
+                                    match store.scan(
                                         &filters,
                                         now,
                                         limit,
@@ -977,28 +1085,24 @@ pub(crate) fn spawn(
                                         SCAN_BUDGET,
                                         0,
                                     ) {
-                                        Ok(out) => out,
-                                        Err(e) => {
-                                            db_error(&thread_errors, &e);
-                                            (Vec::new(), false)
+                                        Ok(out) => {
+                                            let _ = reply.send(out);
                                         }
-                                    };
-                                    let _ = reply.send(out);
+                                        Err(e) => db_error(&thread_errors, &e),
+                                    }
                                 }
                                 Msg::AggregateSample { limit, now, reply } => {
-                                    let out = match store.scan_neg(
+                                    match store.scan_neg(
                                         &crate::filter::Filter::default(),
                                         now,
                                         limit,
                                         SCAN_BUDGET,
                                     ) {
-                                        Ok(out) => Some(out),
-                                        Err(e) => {
-                                            db_error(&thread_errors, &e);
-                                            None
+                                        Ok(out) => {
+                                            let _ = reply.send(Some(out));
                                         }
-                                    };
-                                    let _ = reply.send(out);
+                                        Err(e) => db_error(&thread_errors, &e),
+                                    }
                                 }
                                 Msg::Delete {
                                     targets,
@@ -1011,20 +1115,25 @@ pub(crate) fn spawn(
                                     // A failed walk replies `None` so the
                                     // checked callers see the failure
                                     // instead of an indistinguishable zero.
-                                    let n = match store.apply_deletion_group(
+                                    // The second element always reports
+                                    // whether a group/role-state event was
+                                    // removed: a later failed chunk must
+                                    // still let the caller mark the derived
+                                    // state stale.
+                                    let report = store.apply_deletion_group(
                                         &targets,
                                         &addresses,
                                         request_pubkey.as_deref(),
                                         request_created,
                                         group.as_deref(),
-                                    ) {
-                                        Ok(n) => Some(n),
-                                        Err(e) => {
-                                            db_error(&thread_errors, &e);
-                                            None
-                                        }
-                                    };
-                                    let _ = reply.send(n);
+                                    );
+                                    if let Some(e) = &report.error {
+                                        db_error(&thread_errors, e);
+                                    }
+                                    let _ = reply.send((
+                                        report.checked_removed(),
+                                        report.group_state_removed,
+                                    ));
                                 }
                                 Msg::GroupPurge { group, now, reply } => {
                                     let n = match store.purge_group(&group, now) {
@@ -1125,6 +1234,23 @@ pub(crate) fn spawn(
                                 }
                                 Msg::SaveRelayPubkeys { deny, allow, reply } => {
                                     let ok = match store.save_relay_pubkeys(&deny, &allow) {
+                                        Ok(()) => true,
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            false
+                                        }
+                                    };
+                                    let _ = reply.send(ok);
+                                }
+                                Msg::SaveAccessAndPubkeys {
+                                    access,
+                                    deny,
+                                    allow,
+                                    reply,
+                                } => {
+                                    let ok = match store
+                                        .save_access_and_pubkeys(&access, &deny, &allow)
+                                    {
                                         Ok(()) => true,
                                         Err(e) => {
                                             db_error(&thread_errors, &e);
@@ -1239,19 +1365,21 @@ pub(crate) fn spawn(
                                     }
                                     let _ = reply.send(());
                                 }
-                                Msg::PurgeExpired { now, reply } => {
-                                    // The public API returns a plain tuple (a
-                                    // purge self-heals on the next run), so a
-                                    // failed pass reports zero removals and no
-                                    // state rebuild.
-                                    let n = match store.purge_expired(now) {
-                                        Ok(n) => n,
-                                        Err(e) => {
-                                            db_error(&thread_errors, &e);
-                                            (0, false)
-                                        }
-                                    };
-                                    let _ = reply.send(n);
+                                Msg::PurgeExpired {
+                                    now,
+                                    first_seen_min_age,
+                                    reply,
+                                } => {
+                                    // A purge self-heals on the next run, but
+                                    // a failed later chunk must still report
+                                    // the partial removals and the derived-
+                                    // state change an earlier chunk applied.
+                                    let report = store.purge_expired(now, first_seen_min_age);
+                                    if let Some(e) = &report.error {
+                                        db_error(&thread_errors, e);
+                                    }
+                                    let _ =
+                                        reply.send((report.removed, report.group_state_removed));
                                 }
                                 Msg::PendingPurges { reply } => {
                                     let pending = match store.pending_purges() {
@@ -1262,6 +1390,26 @@ pub(crate) fn spawn(
                                         }
                                     };
                                     let _ = reply.send(pending);
+                                }
+                                Msg::PendingDeletions { reply } => {
+                                    let pending = match store.pending_deletions() {
+                                        Ok(pending) => Some(pending),
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            None
+                                        }
+                                    };
+                                    let _ = reply.send(pending);
+                                }
+                                Msg::TableCounts { reply } => {
+                                    let counts = match store.table_counts() {
+                                        Ok(counts) => Some(counts),
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            None
+                                        }
+                                    };
+                                    let _ = reply.send(counts);
                                 }
                                 Msg::StateStamp { reply } => {
                                     let stamp = match store.state_stamp() {
@@ -1275,6 +1423,26 @@ pub(crate) fn spawn(
                                 }
                                 Msg::StateSeq { reply } => {
                                     let seq = match store.state_seq() {
+                                        Ok(seq) => Some(seq),
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            None
+                                        }
+                                    };
+                                    let _ = reply.send(seq);
+                                }
+                                Msg::StateSeqGroup { reply } => {
+                                    let seq = match store.state_seq_group() {
+                                        Ok(seq) => Some(seq),
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            None
+                                        }
+                                    };
+                                    let _ = reply.send(seq);
+                                }
+                                Msg::StateSeqRole { reply } => {
+                                    let seq = match store.state_seq_role() {
                                         Ok(seq) => Some(seq),
                                         Err(e) => {
                                             db_error(&thread_errors, &e);
@@ -1383,7 +1551,10 @@ pub(crate) fn spawn(
         read_txs,
         api_read_tx,
         errors,
+        overloads,
         expiry,
+        resumed_deletion_state_removed,
+        recovery_rx,
         timeout_secs: request_timeout_secs,
         pending_msgs,
         pending_events,
