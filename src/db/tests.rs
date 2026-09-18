@@ -3539,6 +3539,62 @@ fn request_fails_fast_when_the_queue_is_full() {
 }
 
 #[test]
+fn inline_writes_release_queue_accounting_before_their_reply() {
+    // Regression: the writer drain released the queued-work accounting of
+    // every drained message only at the end (right before the put flush).
+    // Inline-completed messages (`SaveAccess` and friends) send their reply
+    // inside the drain, so a caller woken by such a reply could immediately
+    // issue another write and be spuriously fail-fast ("database
+    // overloaded") while the rest of the batch was still counted. This
+    // bursts cheap inline writes that coalesce into one drain; a probe put
+    // issued right after one save's reply must be admitted even though the
+    // rest of the burst is still in flight.
+    let mut cfg = config();
+    cfg.max_db_queue_bytes = 1_024;
+    let errors = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let cap = 16;
+    let db = DbClient::open(&cfg, true, Arc::clone(&errors), 0, 128, cap, cap).unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        for round in 0..16u64 {
+            let mut saves = Vec::with_capacity(cap);
+            for _ in 0..cap {
+                let db = db.clone();
+                saves.push(tokio::spawn(async move {
+                    db.save_access(crate::config::AccessControl::default())
+                        .await
+                }));
+            }
+            // Wait for one save of the burst, then write immediately: the
+            // other saves are still being processed, so a drain-end release
+            // would count the queue as full while it has already replied.
+            assert!(saves.remove(0).await.unwrap(), "the burst save must commit");
+            let probe = event(1, &format!("probe-{round}"), now, vec![]);
+            let out = db.put(probe, now).await;
+            assert!(
+                matches!(out, PutOutcome::Stored),
+                "round {round}: a write after an inline reply must not be refused: {out:?}"
+            );
+            for save in saves {
+                assert!(save.await.unwrap(), "the burst save must commit");
+            }
+        }
+        assert_eq!(
+            db.take_overloads(),
+            0,
+            "no write may fail fast while the burst drains its inline replies"
+        );
+        assert_eq!(
+            errors.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "the burst must not report database faults"
+        );
+        db.shutdown();
+    });
+}
+
+#[test]
 fn search_works_without_word_index() {
     // NIP-50 must work even when database.search_index is disabled: the
     // relay falls back to a full scan with content term checks.
