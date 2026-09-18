@@ -45,6 +45,53 @@ use api::{
 };
 use livekit::{livekit_supported, livekit_token};
 
+/// Minimum interval between rate-limited WARNs for connection refusals: the
+/// refusal paths run per connection, so an unthrottled warning would flood
+/// the log during exactly the incident it reports.
+const REFUSAL_WARN_INTERVAL_SECS: u64 = 10;
+
+/// Emits at most one refusal WARN per [`REFUSAL_WARN_INTERVAL_SECS`],
+/// process-wide. The counters still move on every refusal.
+fn warn_refusal(message: &str) {
+    static LAST_WARN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now = unix_now();
+    let last = LAST_WARN.load(std::sync::atomic::Ordering::Relaxed);
+    if now.saturating_sub(last) >= REFUSAL_WARN_INTERVAL_SECS
+        && LAST_WARN
+            .compare_exchange(
+                last,
+                now,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .is_ok()
+    {
+        warn!("{message}");
+    }
+}
+
+/// Worst-case graceful-shutdown budget, per phase. `nostrfy stop` must wait
+/// at least this long (see `cli::wait_for_stop`), because exceeding it means
+/// the process is force-killed after writes may already be committed.
+///
+/// Phases, run in order by [`run_server`]:
+/// 1. HTTP connections drain in `serve_limited` (`HTTP_DRAIN_GRACE`);
+/// 2. background tasks are joined with `TASK_JOIN_GRACE`;
+/// 3. upgraded WebSocket connections flush their final batches
+///    (`WS_DRAIN_GRACE`);
+/// 4. the database flushes and joins its threads (`DB_SHUTDOWN_MARGIN`; the
+///    join itself has no timeout, this is the margin).
+pub(crate) const HTTP_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+pub(crate) const TASK_JOIN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+pub(crate) const WS_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(7);
+pub(crate) const DB_SHUTDOWN_MARGIN: std::time::Duration = std::time::Duration::from_secs(10);
+pub(crate) const SHUTDOWN_BUDGET: std::time::Duration = std::time::Duration::from_secs(
+    HTTP_DRAIN_GRACE.as_secs()
+        + TASK_JOIN_GRACE.as_secs()
+        + WS_DRAIN_GRACE.as_secs()
+        + DB_SHUTDOWN_MARGIN.as_secs(),
+);
+
 /// Sets an integer socket option on a TCP stream.
 ///
 /// # Safety
@@ -331,6 +378,11 @@ async fn build_router(
                     .map(|info| info.0.ip())
                     && relay.access.read().await.is_ip_blocked(ip)
                 {
+                    // Debug, not WARN: a blocked peer can reconnect as fast
+                    // as it likes, so a warning here would flood the log. The
+                    // counter moves on every refusal.
+                    log::debug!("refused {ip}: blocked by NIP-86 blockip");
+                    relay.stats.bump(&relay.stats.conn_refused_blocked, 1);
                     return StatusCode::FORBIDDEN.into_response();
                 }
                 next.run(req).await
@@ -417,7 +469,195 @@ fn host_route_allowed(api_host: &str, blossom_host: &str, host: &str, path: &str
     (is_api && api_path) || (is_blossom && blossom_path) || (is_relay && !api_path && !blossom_path)
 }
 
-pub async fn run_server(config_path: PathBuf, config: Config, db: DbClient) -> Result<()> {
+/// Restores the persisted NIP-29 group state at startup, comparing the
+/// snapshot's stamp and sequence against the database's current group-state
+/// generation (`DbClient::state_stamp`, `DbClient::state_seq_group`). A
+/// snapshot from before a group-state removal (stamp) or group-state event
+/// (group seq) must not be restored (it would resurrect state a purge/vanish
+/// invalidated, or predate an accepted event), and a generation the database
+/// cannot answer is treated the same way: fail closed and rebuild from the
+/// surviving events. A NIP-43 role event no longer invalidates the group
+/// snapshot (the per-family sequence). A legacy snapshot (stamp and seq 0)
+/// is accepted while both counters are still 0. The rebuild path only runs
+/// when the NIP is enabled; with NIP-29 disabled the store stays empty
+/// exactly as when no snapshot exists (the next start with the NIP
+/// re-enabled rebuilds).
+async fn restore_group_state(relay: &Relay, groups_enabled: bool) -> Result<()> {
+    let Some(snapshot) = relay.db.load_groups().await else {
+        return rebuild_group_state(relay, groups_enabled).await;
+    };
+    let stamp = relay.db.state_stamp().await;
+    let seq = relay.db.state_seq_group().await;
+    match (stamp, seq) {
+        (Some(stamp), Some(seq)) => {
+            if relay
+                .groups
+                .write()
+                .await
+                .restore_checked(snapshot, stamp, seq)
+            {
+                info!("NIP-29 group state restored from the database snapshot");
+                return Ok(());
+            }
+            error!(
+                "the persisted NIP-29 group snapshot predates the database's group-state \
+                 generation (stamp {stamp}, seq {seq}); refusing to restore it and rebuilding \
+                 from the surviving events instead"
+            );
+        }
+        _ => {
+            // The generation is unknown, so the snapshot's currency cannot
+            // be established: restoring it could resurrect state a removal
+            // invalidated.
+            error!(
+                "cannot read the database's group-state generation; refusing to restore the \
+                 persisted NIP-29 group snapshot and rebuilding from the surviving events"
+            );
+        }
+    }
+    rebuild_group_state(relay, groups_enabled).await
+}
+
+/// The replay/rebuild migration of [`restore_group_state`]: replays the
+/// stored moderation events and persists the result so later restarts skip
+/// the replay. A failed rebuild is fatal: starting with an incomplete
+/// group store would expose private/hidden content.
+async fn rebuild_group_state(relay: &Relay, groups_enabled: bool) -> Result<()> {
+    if !groups_enabled {
+        // The replay migration only runs when the NIP is enabled (see the
+        // caller). The store stays empty, the fail-closed state when no
+        // snapshot is available; a start with NIP-29 re-enabled rebuilds.
+        warn!(
+            "NIP-29 group state was not restored and NIP-29 is disabled; the group store \
+             starts empty until the NIP is re-enabled and the relay restarts"
+        );
+        return Ok(());
+    }
+    if !relay.groups.write().await.rebuild(&relay.db).await {
+        return Err(anyhow::anyhow!(
+            "NIP-29 group state rebuild failed: refusing to start with an \
+             incomplete group store (missing groups would expose private content)"
+        ));
+    }
+    relay.persist_groups().await;
+    Ok(())
+}
+
+/// The startup NIP-29 sequence, run before the relay accepts traffic:
+/// restore or rebuild the group state, then complete (or confirm) every
+/// interrupted `kind:9008` purge so a ghosted group is either fully purged
+/// or stays fail-closed, and publish the remaining pending count on the
+/// metrics. A failed rebuild is fatal (see [`rebuild_group_state`]).
+async fn startup_group_state(relay: &Relay, groups_enabled: bool) -> Result<()> {
+    restore_group_state(relay, groups_enabled).await?;
+    // Crash recovery for kind:9008 group purges: a purge accepted but not
+    // finished (the process crashed mid-walk) is re-run here, before the
+    // relay serves. Idempotent and a no-op when nothing is pending.
+    relay.resume_pending_purges().await;
+    // Surface the resume outcome on the metrics: after the resume the
+    // pending table should be empty, and a non-zero gauge means a recorded
+    // purge could not be completed (the group stays fail-closed until the
+    // next restart retries).
+    if let Some(pending) = relay.db.pending_purges().await {
+        relay
+            .stats
+            .pending_purges
+            .store(pending.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+    Ok(())
+}
+
+/// The startup NIP-43 sequence: restore the persisted role snapshot or
+/// rebuild from the surviving events.
+///
+/// The snapshot's stamp and sequence are compared against the database's
+/// state generation (`DbClient::state_stamp`, `DbClient::state_seq_role`):
+/// a NIP-09 deletion of a role-state event (stamp) or a role-state event
+/// itself (role seq) advances them, so a snapshot from before such a change
+/// must not be restored (it would resurrect a deleted grant or predate a
+/// state event). A NIP-29 group event no longer invalidates the role
+/// snapshot (the per-family sequence), and an unreadable generation fails
+/// closed the same way. Both cases fall through to the replay migration,
+/// which rebuilds from the surviving events. A failed rebuild is fatal.
+async fn restore_role_state(relay: &Relay) -> Result<()> {
+    if !relay.config.read().await.nip_enabled(43) {
+        return Ok(());
+    }
+    let needs_rebuild = match relay.db.load_roles().await {
+        Some(snap) => match (
+            relay.db.state_stamp().await,
+            relay.db.state_seq_role().await,
+        ) {
+            (Some(stamp), Some(seq)) => {
+                if relay.roles.write().await.restore_checked(snap, stamp, seq) {
+                    info!("NIP-43 role state restored from the database snapshot");
+                    false
+                } else {
+                    error!(
+                        "the persisted NIP-43 role snapshot predates the database's state \
+                         generation (stamp {stamp}, seq {seq}); refusing to restore it and \
+                         rebuilding from the surviving events instead"
+                    );
+                    true
+                }
+            }
+            _ => {
+                // The generation is unknown, so the snapshot's currency
+                // cannot be established: restoring it could resurrect a
+                // deleted grant.
+                error!(
+                    "cannot read the database's state generation; refusing to restore \
+                     the persisted NIP-43 role snapshot and rebuilding from the \
+                     surviving events"
+                );
+                true
+            }
+        },
+        None => true,
+    };
+    if needs_rebuild {
+        if !relay
+            .roles
+            .write()
+            .await
+            .rebuild(&relay.db, &relay.relay_pubkey().unwrap_or_default())
+            .await
+        {
+            return Err(anyhow::anyhow!(
+                "NIP-43 role state rebuild failed: refusing to start with an \
+                 incomplete role store"
+            ));
+        }
+        relay.persist_roles().await;
+    }
+    Ok(())
+}
+
+pub async fn run_server(
+    config_path: PathBuf,
+    config: Config,
+    db: DbClient,
+    signals: StartupSignals,
+) -> Result<()> {
+    // The signals were registered by the CLI before the database was opened
+    // (see `StartupSignals`): the handler tasks below consume the streams,
+    // and anything received in between is buffered by the tokio driver.
+    let StartupSignals {
+        terminate,
+        interrupt,
+        hangup,
+    } = signals;
+    let pid_file = config.daemon.pid_file.clone();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    // Detached on purpose: the supervisor's bounded join would abort it
+    // mid-shutdown, and the second-signal escalation must stay armed until
+    // the process actually exits (see `signal_handler`).
+    let _signal_task = tokio::spawn(signal_handler(
+        terminate,
+        interrupt,
+        shutdown_tx.clone(),
+        Some(pid_file),
+    ));
     let private_key = config.relay.private_key.clone();
     let live = crate::relay::LiveBusConfig {
         buffer: config.limits.live_buffer,
@@ -436,6 +676,24 @@ pub async fn run_server(config_path: PathBuf, config: Config, db: DbClient) -> R
     // Make the config file path known to the relay so NIP-86 runtime
     // changes (relay name/description/icon) can be persisted to disk.
     *relay.config_path.write().await = Some(config_path.clone());
+    // The SIGHUP handler is registered early too (see above); the task can
+    // run as soon as the relay exists, before the long state restore.
+    let reload_task = tokio::spawn(reload_handler(
+        config_path,
+        relay.clone(),
+        relay.db.clone(),
+        relay.api_limit.clone(),
+        shutdown_rx.clone(),
+        hangup,
+    ));
+    // Startup barrier: the database's synchronous recovery may have removed
+    // a NIP-29/NIP-43 state event while resuming interrupted deletions. The
+    // relay marks its derived stores stale here, before any snapshot is
+    // restored or rebuilt, so a recovered removal cannot be resurrected by
+    // the startup state load (the persistent generation was bumped too, but
+    // the fail-closed marking is what keeps the pending background rebuild
+    // from certifying stale state).
+    relay.recovery_done().await;
 
     // Restore the NIP-29 group state from the persisted snapshot. Only
     // when no snapshot was ever written (pre-persistence database) fall
@@ -447,23 +705,7 @@ pub async fn run_server(config_path: PathBuf, config: Config, db: DbClient) -> R
     // content world-readable until it is re-enabled. The replay/rebuild
     // migration only runs when the NIP is enabled.
     let groups_enabled = relay.config.read().await.nip_enabled(29);
-    match relay.db.load_groups().await {
-        Some(snap) => {
-            relay.groups.write().await.restore(snap);
-            info!("NIP-29 group state restored from the database snapshot");
-        }
-        None => {
-            if groups_enabled {
-                if !relay.groups.write().await.rebuild(&relay.db).await {
-                    return Err(anyhow::anyhow!(
-                        "NIP-29 group state rebuild failed: refusing to start with an \
-                         incomplete group store (missing groups would expose private content)"
-                    ));
-                }
-                relay.persist_groups().await;
-            }
-        }
-    }
+    startup_group_state(&relay, groups_enabled).await?;
     if groups_enabled && relay.has_relay_key() {
         info!(
             "NIP-29 groups enabled (relay key {})",
@@ -472,32 +714,9 @@ pub async fn run_server(config_path: PathBuf, config: Config, db: DbClient) -> R
     }
 
     // Same lifecycle for the NIP-43 role store: snapshot first, replay
-    // migration only when nothing was ever persisted.
-    if relay.config.read().await.nip_enabled(43) {
-        match relay.db.load_roles().await {
-            Some(snap) => {
-                relay.roles.write().await.restore(snap);
-                info!("NIP-43 role state restored from the database snapshot");
-            }
-            None => {
-                if !relay
-                    .roles
-                    .write()
-                    .await
-                    .rebuild(&relay.db, &relay.relay_pubkey().unwrap_or_default())
-                    .await
-                {
-                    return Err(anyhow::anyhow!(
-                        "NIP-43 role state rebuild failed: refusing to start with an \
-                         incomplete role store"
-                    ));
-                }
-                relay.persist_roles().await;
-            }
-        }
-    }
-
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    // migration only when nothing usable was ever persisted (see
+    // [`restore_role_state`]).
+    restore_role_state(&relay).await?;
 
     let blossom_state = blossom::build_state(&relay.config.read().await.clone(), &relay).await;
     *relay.blossom.write().await = blossom_state.clone();
@@ -528,20 +747,10 @@ pub async fn run_server(config_path: PathBuf, config: Config, db: DbClient) -> R
             "nip66_publisher",
             tokio::spawn(nip66_publisher(relay.clone(), shutdown_rx.clone())),
         ),
-        (
-            "signal_handler",
-            tokio::spawn(signal_handler(shutdown_tx.clone())),
-        ),
-        (
-            "reload_handler",
-            tokio::spawn(reload_handler(
-                config_path,
-                relay.clone(),
-                relay.db.clone(),
-                relay.api_limit.clone(),
-                shutdown_rx.clone(),
-            )),
-        ),
+        // Spawned before the startup work (see the top of `run_server`) and
+        // kept out of the abortable set so its second-signal escalation
+        // stays armed.
+        ("reload_handler", reload_task),
     ] {
         let shutdown = shutdown_rx.clone();
         tasks.push(tokio::spawn(async move {
@@ -602,6 +811,7 @@ pub async fn run_server(config_path: PathBuf, config: Config, db: DbClient) -> R
         per_sec_per_ip,
         trusted_proxies,
         recv_buf_kb,
+        relay.stats.clone(),
         shutdown_rx,
     )
     .await;
@@ -616,7 +826,7 @@ pub async fn run_server(config_path: PathBuf, config: Config, db: DbClient) -> R
     // (e.g. a mid-flight `purge_expired`) must not delay the process exit
     // without limit. Aborting drops the loop at its next await point; the
     // database is stopped afterwards.
-    let join_grace = std::time::Duration::from_secs(5);
+    let join_grace = TASK_JOIN_GRACE;
     if !join_tasks_bounded(&mut tasks, join_grace).await {
         warn!(
             "background tasks did not stop within {}s; aborted them",
@@ -630,7 +840,8 @@ pub async fn run_server(config_path: PathBuf, config: Config, db: DbClient) -> R
     // process would exit with accepted-but-uncommitted events (and no OKs).
     // The window covers the WebSocket teardown grace (5 s, see
     // `ws::handler`) plus a margin for the final flush and close.
-    let ws_deadline = std::time::Instant::now() + std::time::Duration::from_secs(7);
+    // `SHUTDOWN_BUDGET` covers this phase for the `nostrfy stop` timeout.
+    let ws_deadline = std::time::Instant::now() + WS_DRAIN_GRACE;
     while relay
         .stats
         .connections_active
@@ -955,8 +1166,38 @@ async fn ws_handler(State(relay): State<Arc<Relay>>, request: Request) -> Respon
     }
 }
 
-async fn health_handler() -> impl IntoResponse {
-    (StatusCode::OK, Json(json!({ "status": "ok" })))
+/// `GET /health`: liveness plus a write-path check.
+///
+/// Liveness (is the process serving?) is always observable: the handler
+/// answers while the listener accepts. The body/status additionally reports
+/// whether the database is accepting writes, because a full disk or an
+/// exhausted LMDB map makes the relay read-only while the process is
+/// otherwise healthy — a liveness-only `200` would hide that. `503` means
+/// "up but refusing writes" (disk full / map full / writer gone); it is not
+/// a restart signal, reads and live delivery keep working and the relay
+/// recovers on its own once space is available.
+async fn health_handler(State(relay): State<Arc<Relay>>) -> Response {
+    if relay.db.disk_full() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "status": "unavailable",
+                "reason": "database is refusing writes: storage is full (disk or map)",
+            })),
+        )
+            .into_response();
+    }
+    if relay.db.cancelled() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "status": "unavailable",
+                "reason": "database writer is not accepting work",
+            })),
+        )
+            .into_response();
+    }
+    (StatusCode::OK, Json(json!({ "status": "ok" }))).into_response()
 }
 
 /// Prometheus metrics endpoint: the counters in text exposition format.
@@ -983,6 +1224,114 @@ async fn stats_writer(relay: Arc<Relay>, mut shutdown: watch::Receiver<bool>) {
                     .db_size_bytes
                     .store(relay.db.size_on_disk().await, std::sync::atomic::Ordering::Relaxed);
                 relay.stats.bump(&relay.stats.db_errors, relay.db.take_errors());
+                // Overload is distinct from faults: the fail-fast paths bump
+                // their own database counter, and the database itself stays
+                // healthy. Polled here so a stalled writer is visible even
+                // though no request completed.
+                relay
+                    .stats
+                    .bump(&relay.stats.db_overloaded, relay.db.take_overloads());
+                relay.stats.db_pending_msgs.store(
+                    relay.db.pending_msgs() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                relay.stats.db_pending_events.store(
+                    relay.db.pending_events() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                relay.stats.db_pending_bytes.store(
+                    relay.db.pending_bytes() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                relay.stats.db_pending_reads.store(
+                    relay.db.pending_reads() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                relay.stats.db_pending_read_bytes.store(
+                    relay.db.pending_read_bytes() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                relay.stats.db_api_pending.store(
+                    relay.db.api_pending() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                relay.stats.db_api_pending_bytes.store(
+                    relay.db.api_pending_bytes() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                // Storage-full gauge: unlike the counters, a failed read
+                // must not flip a true refusal to false, so the free-space
+                // gauge keeps its last value when the store cannot answer.
+                relay.stats.db_disk_full.store(
+                    u64::from(relay.db.disk_full()),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                if let Some(free) = relay.db.free_disk_bytes() {
+                    relay
+                        .stats
+                        .db_free_bytes
+                        .store(free, std::sync::atomic::Ordering::Relaxed);
+                }
+                // Runtime derived-state rebuild failures (the startup rebuild
+                // is fatal and never reaches this counter).
+                relay
+                    .stats
+                    .rebuild_failures
+                    .store(relay.rebuild_failures(), std::sync::atomic::Ordering::Relaxed);
+                // Bookkeeping-table gauges in one read: the permanent
+                // removal markers and the pending recovery queues. A failed
+                // read keeps the last values (the gauges must not flip to
+                // zero on a timeout), and the compatibility fields
+                // (vanish_markers / pending_vanishes / pending_purges) are
+                // refreshed from the same snapshot.
+                if let Some(counts) = relay.db.table_counts().await {
+                    relay
+                        .stats
+                        .vanish_markers
+                        .store(counts.vanish, std::sync::atomic::Ordering::Relaxed);
+                    relay
+                        .stats
+                        .pending_vanishes
+                        .store(counts.vanish_pending, std::sync::atomic::Ordering::Relaxed);
+                    relay
+                        .stats
+                        .pending_purges
+                        .store(counts.purge_pending, std::sync::atomic::Ordering::Relaxed);
+                    relay
+                        .stats
+                        .db_table_deleted
+                        .store(counts.deleted, std::sync::atomic::Ordering::Relaxed);
+                    relay
+                        .stats
+                        .db_table_first_seen
+                        .store(counts.first_seen, std::sync::atomic::Ordering::Relaxed);
+                    relay
+                        .stats
+                        .db_table_purged_groups
+                        .store(counts.purged_groups, std::sync::atomic::Ordering::Relaxed);
+                    relay
+                        .stats
+                        .db_table_vanish
+                        .store(counts.vanish, std::sync::atomic::Ordering::Relaxed);
+                    relay
+                        .stats
+                        .db_table_vanish_pending
+                        .store(counts.vanish_pending, std::sync::atomic::Ordering::Relaxed);
+                    relay
+                        .stats
+                        .db_table_purge_pending
+                        .store(counts.purge_pending, std::sync::atomic::Ordering::Relaxed);
+                    relay
+                        .stats
+                        .db_table_delete_pending
+                        .store(counts.delete_pending, std::sync::atomic::Ordering::Relaxed);
+                }
+                if let Some(blossom) = relay.blossom.read().await.as_ref() {
+                    relay
+                        .stats
+                        .blossom_orphan_spools_swept
+                        .store(blossom.store.orphan_spools_swept(), std::sync::atomic::Ordering::Relaxed);
+                }
                 if let Ok(json) = serde_json::to_string_pretty(&relay.stats.as_json()) {
                     // The atomic write (fsync + rename) is blocking I/O:
                     // run it on the blocking pool instead of stalling an
@@ -1092,7 +1441,17 @@ async fn purge_loop(relay: Arc<Relay>, mut shutdown: watch::Receiver<bool>) {
                 // mid-flight purge (the join timeout in `run_server` bounds
                 // the worst case, but this lets a clean shutdown complete
                 // promptly instead of aborting the task).
-                let purge = relay.db.purge_expired(unix_now());
+                //
+                // `first_seen` rows are reaped once a pubkey is older than
+                // the new-pubkey gate: it can never reject that pubkey again,
+                // so the row only grows the table (0 = gate disabled = no
+                // reap, the database's documented convention). Read per tick
+                // so a config reload applies.
+                let (now, first_seen_min_age) = {
+                    let cfg = relay.config.read().await;
+                    (unix_now(), cfg.relay.new_pubkey_min_age_secs)
+                };
+                let purge = relay.db.purge_expired(now, first_seen_min_age);
                 tokio::select! {
                     (removed, state_changed) = purge => {
                         if removed > 0 {
@@ -1121,6 +1480,11 @@ async fn purge_loop(relay: Arc<Relay>, mut shutdown: watch::Receiver<bool>) {
 /// evicted, not grown, when the bound is reached).
 struct IpConnLimiter {
     max_per_sec: u64,
+    /// The current second. Production reads the wall clock; tests inject a
+    /// controllable clock so the window behavior is deterministic (the
+    /// limiter would otherwise race a second boundary: a connection at
+    /// `t = 0.999` followed by one at `t = 1.001` slides the window open).
+    clock: Arc<dyn Fn() -> u64 + Send + Sync>,
     seen: std::sync::Mutex<SeenIps>,
 }
 
@@ -1136,10 +1500,25 @@ struct SeenIps {
 
 impl IpConnLimiter {
     fn new(max_per_sec: u64) -> Option<Self> {
+        Self::with_clock(max_per_sec, Arc::new(unix_now))
+    }
+
+    /// Like [`Self::new`], with an injected clock. Tests use this to make
+    /// the per-second window deterministic instead of sleeping across a
+    /// wall-clock boundary.
+    fn with_clock(max_per_sec: u64, clock: Arc<dyn Fn() -> u64 + Send + Sync>) -> Option<Self> {
         (max_per_sec > 0).then_some(IpConnLimiter {
             max_per_sec,
+            clock,
             seen: std::sync::Mutex::new(SeenIps::default()),
         })
+    }
+
+    /// Whether a connection from `ip` may be accepted now, according to the
+    /// limiter's clock (the production path; tests call [`Self::allow`]
+    /// with explicit timestamps).
+    fn allow_now(&self, ip: std::net::IpAddr) -> bool {
+        self.allow(ip, (self.clock)())
     }
 
     /// Whether a connection from `ip` may be accepted at `now`.
@@ -1223,6 +1602,7 @@ async fn serve_limited(
     per_sec_per_ip: Option<Arc<IpConnLimiter>>,
     trusted_proxies: Arc<[TrustedProxy]>,
     recv_buf_kb: u32,
+    stats: Arc<Stats>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1250,6 +1630,8 @@ async fn serve_limited(
                     // descriptors) would otherwise spin the loop hot; back
                     // off briefly so the relay keeps serving existing
                     // connections while the OS recovers.
+                    stats.bump(&stats.accept_errors, 1);
+                    warn_refusal("accept() failed; backing off — the relay keeps serving existing connections (check the file-descriptor limit)");
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     continue;
                 };
@@ -1268,14 +1650,23 @@ async fn serve_limited(
                 if !trusted {
                     // Per-IP connection rate limit (slow-loris / socket flood).
                     if let Some(limiter) = &per_sec_per_ip
-                        && !limiter.allow(accounting, unix_now())
+                        && !limiter.allow_now(accounting)
                     {
+                        stats.bump(&stats.conn_refused_rate, 1);
+                        warn_refusal(
+                            "connections refused by limits.max_connections_per_sec_per_ip \
+                             (per-IP connection rate limit)",
+                        );
                         continue;
                     }
                 }
                 // Connection cap: refuse the socket outright at the cap so
                 // established-but-idle sockets cannot pin file descriptors.
                 if active.load(Ordering::Relaxed) >= max_connections {
+                    stats.bump(&stats.conn_refused_global, 1);
+                    warn_refusal(
+                        "connections refused at limits.max_connections (global connection cap)",
+                    );
                     continue;
                 }
                 // Per-IP concurrent cap: plain HTTP connections count too,
@@ -1283,6 +1674,11 @@ async fn serve_limited(
                 // task guard on every exit path (including a panic), or by
                 // the WebSocket layer after a handover.
                 if !trusted && !ip_counter.try_acquire(accounting, max_per_ip) {
+                    stats.bump(&stats.conn_refused_per_ip, 1);
+                    warn_refusal(
+                        "connections refused at limits.max_connections_per_ip \
+                         (per-IP concurrent connection cap)",
+                    );
                     continue;
                 }
                 active.fetch_add(1, Ordering::Relaxed);
@@ -1337,6 +1733,7 @@ async fn serve_limited(
                 let proxies = Arc::clone(&trusted_proxies);
                 let per_sec = per_sec_per_ip.clone();
                 let ip_counter_handle = Arc::clone(&ip_counter);
+                let stats_handle = Arc::clone(&stats);
                 let svc = app.layer(axum::middleware::from_fn(
                     move |mut req: axum::extract::Request,
                           next: axum::middleware::Next| {
@@ -1345,6 +1742,7 @@ async fn serve_limited(
                         let proxies = Arc::clone(&proxies);
                         let per_sec = per_sec.clone();
                         let ip_counter = Arc::clone(&ip_counter_handle);
+                        let stats = Arc::clone(&stats_handle);
                         async move {
                             let raw_ip = normalize_ip(peer.ip());
                             let client = if trusted {
@@ -1372,11 +1770,21 @@ async fn serve_limited(
                                 // is already established.
                                 let accounting = accounting_ip(client);
                                 if let Some(limiter) = &per_sec
-                                    && !limiter.allow(accounting, unix_now())
+                                    && !limiter.allow_now(accounting)
                                 {
+                                    stats.bump(&stats.conn_refused_proxy, 1);
+                                    warn_refusal(
+                                        "trusted-proxy requests refused with 429: per-IP \
+                                         connection rate limit",
+                                    );
                                     return StatusCode::TOO_MANY_REQUESTS.into_response();
                                 }
                                 if !ip_counter.try_acquire(accounting, max_per_ip) {
+                                    stats.bump(&stats.conn_refused_proxy, 1);
+                                    warn_refusal(
+                                        "trusted-proxy requests refused with 429: per-IP \
+                                         concurrent connection cap",
+                                    );
                                     return StatusCode::TOO_MANY_REQUESTS.into_response();
                                 }
                                 // Two handles to the guard: one in the
@@ -1462,15 +1870,15 @@ async fn serve_limited(
     }
     // Graceful drain: signal every connection, wait a bounded grace, then
     // abort the stragglers so shutdown never hangs on a stuck peer. The
-    // grace stays well under the CLI stop timeout (10 s), so a relay with
-    // long-lived WebSocket connections still stops in time.
+    // grace is one phase of `SHUTDOWN_BUDGET`, which the CLI stop timeout
+    // covers.
     let _ = drain_tx.send(());
     // Wait for the HTTP connection tasks to finish. The `active` count is
     // not usable here: upgraded WebSocket connections keep their slot
     // reserved until the relay's own drain signal runs (after this
     // function returns), so waiting on `active` would always burn the full
     // grace period while any WebSocket connection is open.
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    tokio::time::timeout(HTTP_DRAIN_GRACE, async {
         while conn_tasks.iter().any(|task| !task.is_finished()) {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
@@ -1482,27 +1890,92 @@ async fn serve_limited(
     }
 }
 
-async fn signal_handler(shutdown: watch::Sender<bool>) {
-    let mut terminate = match signal(SignalKind::terminate()) {
-        Ok(s) => s,
-        Err(e) => {
-            error!("cannot register SIGTERM handler: {e}");
-            return;
+/// The termination/reload signal streams, registered by the CLI *before*
+/// the long startup work (database open and recovery, relay construction,
+/// state restore, bind). `Signal` creation installs the handler; until then
+/// the default action applies and a SIGHUP received during startup
+/// terminates the process. Signals that arrive before the handler tasks
+/// run are buffered by the tokio driver and handled as soon as it is
+/// polled, so behavior after startup is unchanged.
+pub(crate) struct StartupSignals {
+    pub(crate) terminate: Option<tokio::signal::unix::Signal>,
+    pub(crate) interrupt: Option<tokio::signal::unix::Signal>,
+    pub(crate) hangup: Option<tokio::signal::unix::Signal>,
+}
+
+impl StartupSignals {
+    /// Registers SIGTERM, SIGINT and SIGHUP. A registration failure is
+    /// logged and leaves that signal unhandled (the others still work).
+    pub(crate) fn register() -> Self {
+        StartupSignals {
+            terminate: register_signal(SignalKind::terminate()),
+            interrupt: register_signal(SignalKind::interrupt()),
+            hangup: register_signal(SignalKind::hangup()),
         }
-    };
-    let mut interrupt = match signal(SignalKind::interrupt()) {
-        Ok(s) => s,
-        Err(e) => {
-            error!("cannot register SIGINT handler: {e}");
-            return;
-        }
-    };
-    tokio::select! {
-        _ = terminate.recv() => {}
-        _ = interrupt.recv() => {}
     }
+}
+
+/// Registers one Unix signal with the tokio driver. Registration installs
+/// the process-wide handler, so it must run before the long startup work:
+/// until then the default action applies (a SIGHUP during startup
+/// terminates the process). A registration failure is logged and leaves the
+/// signal unhandled (the other signals still work).
+fn register_signal(kind: SignalKind) -> Option<tokio::signal::unix::Signal> {
+    match signal(kind) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            error!("cannot register {kind:?} handler: {e}");
+            None
+        }
+    }
+}
+
+/// Awaits the next termination signal from either stream; pending forever
+/// when neither could be registered.
+async fn await_termination_signal(
+    terminate: &mut Option<tokio::signal::unix::Signal>,
+    interrupt: &mut Option<tokio::signal::unix::Signal>,
+) {
+    match (terminate, interrupt) {
+        (Some(terminate), Some(interrupt)) => {
+            tokio::select! {
+                _ = terminate.recv() => {}
+                _ = interrupt.recv() => {}
+            }
+        }
+        (Some(terminate), None) => {
+            let _ = terminate.recv().await;
+        }
+        (None, Some(interrupt)) => {
+            let _ = interrupt.recv().await;
+        }
+        (None, None) => std::future::pending().await,
+    }
+}
+
+/// Handles SIGTERM/SIGINT. The first signal starts the graceful shutdown;
+/// a second one forces an immediate exit: once shutdown is under way the
+/// grace windows can add up to `SHUTDOWN_BUDGET`, and an operator asking
+/// twice wants out now. The pid file is removed first (the normal `Drop`
+/// guards do not run on `process::exit`), so the next `start` is not
+/// blocked by a stale file.
+async fn signal_handler(
+    mut terminate: Option<tokio::signal::unix::Signal>,
+    mut interrupt: Option<tokio::signal::unix::Signal>,
+    shutdown: watch::Sender<bool>,
+    pid_file: Option<PathBuf>,
+) {
+    await_termination_signal(&mut terminate, &mut interrupt).await;
     info!("shutdown signal received");
     let _ = shutdown.send(true);
+    await_termination_signal(&mut terminate, &mut interrupt).await;
+    warn!("second shutdown signal received; forcing an immediate exit");
+    if let Some(path) = &pid_file {
+        let _ = std::fs::remove_file(path);
+    }
+    // SIGINT's conventional status (128 + 2); the test harness and shells
+    // only need "stopped by signal", the exact value is informational.
+    std::process::exit(130);
 }
 
 async fn reload_handler(
@@ -1511,371 +1984,388 @@ async fn reload_handler(
     db: DbClient,
     api_limit: Arc<crate::relay::ApiLimiter>,
     mut shutdown: watch::Receiver<bool>,
+    hangup: Option<tokio::signal::unix::Signal>,
 ) {
-    let config = relay.config.clone();
-    let mut hangup = match signal(SignalKind::hangup()) {
-        Ok(s) => s,
-        Err(e) => {
-            error!("cannot register SIGHUP handler: {e}");
-            return;
-        }
+    // `None` (registration failed, see `register_signal`) leaves the task
+    // running only for the shutdown watch: the relay serves without SIGHUP
+    // reload instead of the task returning and the supervisor reporting it.
+    let Some(mut hangup) = hangup else {
+        let _ = shutdown.changed().await;
+        return;
     };
     loop {
         tokio::select! {
-            _ = hangup.recv() => {
-                match Config::load(&config_path) {
-                    Ok(mut new_config) => {
-                        new_config.absolutize_paths(&config_path);
-                        // Validate before applying: a parseable-but-invalid
-                        // file (zero limits, bad keys, map layout) must not
-                        // silently disable the relay at runtime. The old
-                        // configuration stays in force on failure.
-                        if let Err(e) = new_config.validate() {
-                            error!("config reload rejected: {e}");
-                            continue;
-                        }
-                        // The relay's signing key is fixed at startup: a
-                        // reloaded private_key is not applied (NIP-29/NIP-43
-                        // keep signing and NIP-11 `self` keeps advertising
-                        // the old key). Warn so the operator knows a restart
-                        // is required for it to take effect.
-                        let old = config.read().await;
-                        if old.relay.private_key != new_config.relay.private_key {
-                            warn!(
-                                "relay.private_key changed in the reloaded config but is fixed \
-                                 at startup; a restart is required to apply it"
-                            );
-                        }
-                        // Settings that shape the HTTP router are fixed at
-                        // startup: a reload cannot rebuild the routes. A
-                        // change is warned about and the running value is
-                        // kept below (restart required), so the in-memory
-                        // config never lies about the wire behavior.
-                        let static_routes = [
-                            ("server.api_host", old.server.api_host != new_config.server.api_host),
-                            ("server.host", old.server.host != new_config.server.host),
-                            ("server.port", old.server.port != new_config.server.port),
-                            ("server.ws_paths", old.server.ws_paths != new_config.server.ws_paths),
-                            (
-                                "server.trusted_proxies",
-                                old.server.trusted_proxies != new_config.server.trusted_proxies,
-                            ),
-                            (
-                                "server.metrics_enabled",
-                                old.server.metrics_enabled != new_config.server.metrics_enabled,
-                            ),
-                            (
-                                "relay.livekit_url",
-                                old.relay.livekit_url != new_config.relay.livekit_url,
-                            ),
-                            (
-                                "relay.livekit_api_key",
-                                old.relay.livekit_api_key != new_config.relay.livekit_api_key,
-                            ),
-                            (
-                                "relay.livekit_api_secret",
-                                old.relay.livekit_api_secret
-                                    != new_config.relay.livekit_api_secret,
-                            ),
-                            ("relay.enabled_nips", old.relay.enabled_nips != new_config.relay.enabled_nips),
-                            ("relay.disabled_nips", old.relay.disabled_nips != new_config.relay.disabled_nips),
-                            (
-                                "database.map_size",
-                                old.database.map_size != new_config.database.map_size,
-                            ),
-                            (
-                                "database.max_map_size",
-                                old.database.max_map_size != new_config.database.max_map_size,
-                            ),
-                            (
-                                "database.search_index",
-                                old.database.search_index != new_config.database.search_index,
-                            ),
-                            (
-                                "database.meta_index",
-                                old.database.meta_index != new_config.database.meta_index,
-                            ),
-                            (
-                                "database.reader_threads",
-                                old.database.reader_threads != new_config.database.reader_threads,
-                            ),
-                            (
-                                "database.disabled_fsync",
-                                old.database.disabled_fsync != new_config.database.disabled_fsync,
-                            ),
-                            (
-                                "database.max_dbs",
-                                old.database.max_dbs != new_config.database.max_dbs,
-                            ),
-                            (
-                                "database.max_readers",
-                                old.database.max_readers != new_config.database.max_readers,
-                            ),
-                            (
-                                "blossom.host",
-                                old.blossom.host != new_config.blossom.host,
-                            ),
-                            (
-                                "blossom.storage",
-                                old.blossom.storage != new_config.blossom.storage,
-                            ),
-                            (
-                                "blossom.min_free_bytes",
-                                old.blossom.min_free_bytes != new_config.blossom.min_free_bytes,
-                            ),
-                            (
-                                "blossom.local_path",
-                                old.blossom.local_path != new_config.blossom.local_path,
-                            ),
-                            (
-                                "blossom.max_upload_bytes",
-                                old.blossom.max_upload_bytes
-                                    != new_config.blossom.max_upload_bytes,
-                            ),
-                            (
-                                "blossom.s3_*",
-                                old.blossom.s3_endpoint != new_config.blossom.s3_endpoint
-                                    || old.blossom.s3_region != new_config.blossom.s3_region
-                                    || old.blossom.s3_bucket != new_config.blossom.s3_bucket
-                                    || old.blossom.s3_access_key
-                                        != new_config.blossom.s3_access_key
-                                    || old.blossom.s3_secret_key
-                                        != new_config.blossom.s3_secret_key,
-                            ),
-                            (
-                                "database.path",
-                                old.database.path != new_config.database.path,
-                            ),
-                            (
-                                "database.purge_interval_secs",
-                                old.database.purge_interval_secs
-                                    != new_config.database.purge_interval_secs,
-                            ),
-                            (
-                                "daemon.max_log_size_bytes",
-                                old.daemon.max_log_size_bytes
-                                    != new_config.daemon.max_log_size_bytes,
-                            ),
-                            (
-                                "daemon.max_log_files",
-                                old.daemon.max_log_files != new_config.daemon.max_log_files,
-                            ),
-                            (
-                                "daemon.stats_interval_secs",
-                                old.daemon.stats_interval_secs
-                                    != new_config.daemon.stats_interval_secs,
-                            ),
-                            (
-                                "database.db_request_timeout_secs",
-                                old.database.db_request_timeout_secs
-                                    != new_config.database.db_request_timeout_secs,
-                            ),
-                            (
-                                "database.max_db_queue_msgs",
-                                old.database.max_db_queue_msgs != new_config.database.max_db_queue_msgs,
-                            ),
-                            (
-                                "database.max_db_queue_events",
-                                old.database.max_db_queue_events != new_config.database.max_db_queue_events,
-                            ),
-                            (
-                                "database.max_db_queue_bytes",
-                                old.database.max_db_queue_bytes != new_config.database.max_db_queue_bytes,
-                            ),
-                            (
-                                "database.max_indexed_words",
-                                old.database.max_indexed_words
-                                    != new_config.database.max_indexed_words,
-                            ),
-                            (
-                                "limits.live_buffer",
-                                old.limits.live_buffer != new_config.limits.live_buffer,
-                            ),
-                            (
-                                "limits.live_batch_size",
-                                old.limits.live_batch_size != new_config.limits.live_batch_size,
-                            ),
-                            (
-                                "limits.live_batch_interval_ms",
-                                old.limits.live_batch_interval_ms
-                                    != new_config.limits.live_batch_interval_ms,
-                            ),
-                            (
-                                "limits.max_connections",
-                                old.limits.max_connections != new_config.limits.max_connections,
-                            ),
-                            (
-                                // The accept-layer per-IP cap is captured
-                                // when the listener starts and no handshake
-                                // reads it anymore, so the reloaded config
-                                // must not leave `config.read()` claiming a
-                                // cap that is not enforced.
-                                "limits.max_connections_per_ip",
-                                old.limits.max_connections_per_ip
-                                    != new_config.limits.max_connections_per_ip,
-                            ),
-                            (
-                                "limits.http_read_timeout_secs",
-                                old.limits.http_read_timeout_secs
-                                    != new_config.limits.http_read_timeout_secs,
-                            ),
-                            (
-                                "limits.max_connections_per_sec_per_ip",
-                                old.limits.max_connections_per_sec_per_ip
-                                    != new_config.limits.max_connections_per_sec_per_ip,
-                            ),
-                            (
-                                "limits.socket_recv_buffer_kb",
-                                old.limits.socket_recv_buffer_kb
-                                    != new_config.limits.socket_recv_buffer_kb,
-                            ),
-                            (
-                                "rpc.max_admin_body_bytes",
-                                old.rpc.max_admin_body_bytes
-                                    != new_config.rpc.max_admin_body_bytes,
-                            ),
-                            (
-                                "relay.max_groups",
-                                old.relay.max_groups != new_config.relay.max_groups,
-                            ),
-                            (
-                                "daemon.log_file",
-                                old.daemon.log_file != new_config.daemon.log_file,
-                            ),
-                            (
-                                "daemon.pid_file",
-                                old.daemon.pid_file != new_config.daemon.pid_file,
-                            ),
-                        ];
-                        for (name, changed) in static_routes {
-                            if changed {
-                                warn!(
-                                    "{name} changed in the reloaded config but the routes are \
-                                     fixed at startup; a restart is required to apply it"
-                                );
-                            }
-                        }
-                        // Every changed startup-only setting is rejected
-                        // individually above (warning + value kept below),
-                        // while the live settings are still applied: a
-                        // reload must never be all-or-nothing, or an
-                        // unrelated edit would silently disable a
-                        // CLI-visible change.
-                        db.set_expiry_enabled(new_config.nip_enabled(40));
-                        api_limit.set_max(new_config.limits.max_api_concurrent);
-                        db.set_max_api_pending(new_config.limits.max_api_queue_msgs);
-                        // The kind/IP access lists are runtime-managed via NIP-86
-                        // and persisted in the database: editing them in the
-                        // config file has no effect after the first run (the
-                        // persisted state wins). Warn so the operator uses the
-                        // management API instead of wondering why the file is
-                        // ignored. `restrict_relay` is config-owned and applies.
-                        if old.access.blocked_kinds != new_config.access.blocked_kinds
-                            || old.access.allowed_kinds != new_config.access.allowed_kinds
-                            || old.access.blocked_ips != new_config.access.blocked_ips
-                        {
-                            warn!(
-                                "access.blocked_kinds/allowed_kinds/blocked_ips changed in the \
-                                 reloaded config but access lists are runtime-managed (NIP-86) \
-                                 and persisted in the database; the file change is ignored"
-                            );
-                        }
-                        // Apply-live-keep-startup-only: `new_config`'s live
-                        // settings are applied at the end (config swap,
-                        // database/API limiters), while every startup-only
-                        // setting keeps its running value. Overwriting them
-                        // in memory while the router, database and threads
-                        // still run the old values would leave
-                        // `config.read()` lying about actual behavior.
-                        new_config.server.api_host = old.server.api_host.clone();
-                        new_config.server.host = old.server.host.clone();
-                        new_config.server.port = old.server.port;
-                        new_config.server.ws_paths = old.server.ws_paths.clone();
-                        new_config.server.trusted_proxies = old.server.trusted_proxies.clone();
-                        new_config.server.metrics_enabled = old.server.metrics_enabled;
-                        new_config.rpc.max_admin_body_bytes = old.rpc.max_admin_body_bytes;
-                        new_config.relay.private_key = old.relay.private_key.clone();
-                        new_config.relay.livekit_url = old.relay.livekit_url.clone();
-                        new_config.relay.livekit_api_key = old.relay.livekit_api_key.clone();
-                        new_config.relay.livekit_api_secret = old.relay.livekit_api_secret.clone();
-                        // NIP toggles shape routing and stored behavior: keep
-                        // them restart-required so a reload cannot half-apply
-                        // (dynamic gates would flip while routes stay old).
-                        new_config.relay.enabled_nips = old.relay.enabled_nips.clone();
-                        new_config.relay.disabled_nips = old.relay.disabled_nips.clone();
-                        new_config.relay.max_groups = old.relay.max_groups;
-                        new_config.database.map_size = old.database.map_size;
-                        new_config.database.max_map_size = old.database.max_map_size;
-                        new_config.database.search_index = old.database.search_index;
-                        new_config.database.meta_index = old.database.meta_index;
-                        new_config.database.reader_threads = old.database.reader_threads;
-                        new_config.database.disabled_fsync = old.database.disabled_fsync;
-                        new_config.database.max_dbs = old.database.max_dbs;
-                        new_config.database.max_readers = old.database.max_readers;
-                        new_config.database.path = old.database.path.clone();
-                        new_config.database.purge_interval_secs = old.database.purge_interval_secs;
-                        new_config.database.db_request_timeout_secs =
-                            old.database.db_request_timeout_secs;
-                        new_config.database.max_db_queue_msgs = old.database.max_db_queue_msgs;
-                        new_config.database.max_db_queue_events =
-                            old.database.max_db_queue_events;
-                        new_config.database.max_db_queue_bytes =
-                            old.database.max_db_queue_bytes;
-                        new_config.database.max_indexed_words = old.database.max_indexed_words;
-                        new_config.blossom.host = old.blossom.host.clone();
-                        new_config.blossom.storage = old.blossom.storage.clone();
-                        new_config.blossom.min_free_bytes = old.blossom.min_free_bytes;
-                        new_config.blossom.local_path = old.blossom.local_path.clone();
-                        new_config.blossom.max_upload_bytes = old.blossom.max_upload_bytes;
-                        new_config.blossom.s3_endpoint = old.blossom.s3_endpoint.clone();
-                        new_config.blossom.s3_region = old.blossom.s3_region.clone();
-                        new_config.blossom.s3_bucket = old.blossom.s3_bucket.clone();
-                        new_config.blossom.s3_access_key = old.blossom.s3_access_key.clone();
-                        new_config.blossom.s3_secret_key = old.blossom.s3_secret_key.clone();
-                        new_config.daemon.max_log_size_bytes = old.daemon.max_log_size_bytes;
-                        new_config.daemon.max_log_files = old.daemon.max_log_files;
-                        new_config.daemon.stats_interval_secs = old.daemon.stats_interval_secs;
-                        new_config.daemon.log_file = old.daemon.log_file.clone();
-                        new_config.daemon.pid_file = old.daemon.pid_file.clone();
-                        new_config.limits.live_buffer = old.limits.live_buffer;
-                        new_config.limits.live_batch_size = old.limits.live_batch_size;
-                        new_config.limits.live_batch_interval_ms =
-                            old.limits.live_batch_interval_ms;
-                        new_config.limits.max_connections = old.limits.max_connections;
-                        new_config.limits.max_connections_per_ip =
-                            old.limits.max_connections_per_ip;
-                        new_config.limits.http_read_timeout_secs =
-                            old.limits.http_read_timeout_secs;
-                        new_config.limits.max_connections_per_sec_per_ip =
-                            old.limits.max_connections_per_sec_per_ip;
-                        new_config.limits.socket_recv_buffer_kb = old.limits.socket_recv_buffer_kb;
-                        // The kind/IP access lists are runtime-managed
-                        // (persisted in the database); only `restrict_relay`
-                        // is config-owned.
-                        new_config.access.blocked_kinds = old.access.blocked_kinds.clone();
-                        new_config.access.allowed_kinds = old.access.allowed_kinds.clone();
-                        new_config.access.blocked_ips = old.access.blocked_ips.clone();
-                        drop(old);
-                        *config.write().await = new_config;
-                        // Bump the config version: connections refresh
-                        // their cached NIP-40/NIP-42 flags on the next
-                        // live batch (see `Conn::config_version`).
-                        relay
-                            .config_version
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        info!("configuration reloaded from {}", config_path.display());
-                    }
-                    Err(e) => error!("config reload failed: {e}"),
-                }
-                // The Blossom upload allowlist and the relay pubkey
-                // deny/allow lists live in the database: re-read them (a
-                // failed load keeps the previous lists — see
-                // `Relay::reload_db_state`).
-                relay.reload_db_state().await;
-            }
+            _ = hangup.recv() => handle_reload(&config_path, &relay, &db, &api_limit).await,
             _ = shutdown.changed() => break,
         }
     }
+}
+
+/// Handles one SIGHUP: loads and validates the configuration file, applies
+/// it when valid, and re-reads the database-backed lists on the applied and
+/// the rejected path alike (a NIP-86 change committed since the last reload
+/// must not be skipped just because the config edit was invalid). No config
+/// lock is held across `Relay::reload_db_state`, which reads the config
+/// itself: a held read guard plus a queued writer deadlocks.
+async fn handle_reload(
+    config_path: &Path,
+    relay: &Arc<Relay>,
+    db: &DbClient,
+    api_limit: &Arc<crate::relay::ApiLimiter>,
+) {
+    match Config::load(config_path) {
+        Ok(mut new_config) => {
+            new_config.absolutize_paths(config_path);
+            // Validate before applying: a parseable-but-invalid file (zero
+            // limits, bad keys, map layout) must not silently disable the
+            // relay at runtime. The old configuration stays in force on
+            // failure.
+            if let Err(e) = new_config.validate() {
+                error!("config reload rejected: {e}");
+            } else {
+                // Snapshot the running config and drop the read guard before
+                // applying: `apply_reloaded_config` must never hold a config
+                // lock across `reload_db_state` (see the function doc).
+                let old = relay.config.read().await.clone();
+                apply_reloaded_config(&old, new_config, relay, db, api_limit).await;
+                info!("configuration reloaded from {}", config_path.display());
+            }
+        }
+        Err(e) => error!("config reload failed: {e}"),
+    }
+    // The Blossom upload allowlist and the relay pubkey deny/allow lists
+    // live in the database: re-read them on every reload (a failed load
+    // keeps the previous lists — see `Relay::reload_db_state`).
+    relay.reload_db_state().await;
+}
+
+/// Applies a validated, reloaded config to the live relay: live settings
+/// take effect, startup-only settings keep their running value (the router,
+/// accept loop and database environment cannot be rebuilt), and the
+/// database-backed lists are re-read by the caller. `old` is the running
+/// config snapshot taken by value so no read guard can be alive while the
+/// new config is written or while `reload_db_state` reads the config.
+async fn apply_reloaded_config(
+    old: &Config,
+    mut new_config: Config,
+    relay: &Arc<Relay>,
+    db: &DbClient,
+    api_limit: &Arc<crate::relay::ApiLimiter>,
+) {
+    // The relay's signing key is fixed at startup: a reloaded private_key
+    // is not applied (NIP-29/NIP-43 keep signing and NIP-11 `self` keeps
+    // advertising the old key). Warn so the operator knows a restart is
+    // required for it to take effect.
+    if old.relay.private_key != new_config.relay.private_key {
+        warn!(
+            "relay.private_key changed in the reloaded config but is fixed \
+             at startup; a restart is required to apply it"
+        );
+    }
+    // Settings that shape the HTTP router are fixed at
+    // startup: a reload cannot rebuild the routes. A
+    // change is warned about and the running value is
+    // kept below (restart required), so the in-memory
+    // config never lies about the wire behavior.
+    let static_routes = [
+        (
+            "server.api_host",
+            old.server.api_host != new_config.server.api_host,
+        ),
+        ("server.host", old.server.host != new_config.server.host),
+        ("server.port", old.server.port != new_config.server.port),
+        (
+            "server.ws_paths",
+            old.server.ws_paths != new_config.server.ws_paths,
+        ),
+        (
+            "server.trusted_proxies",
+            old.server.trusted_proxies != new_config.server.trusted_proxies,
+        ),
+        (
+            "server.metrics_enabled",
+            old.server.metrics_enabled != new_config.server.metrics_enabled,
+        ),
+        (
+            "relay.livekit_url",
+            old.relay.livekit_url != new_config.relay.livekit_url,
+        ),
+        (
+            "relay.livekit_api_key",
+            old.relay.livekit_api_key != new_config.relay.livekit_api_key,
+        ),
+        (
+            "relay.livekit_api_secret",
+            old.relay.livekit_api_secret != new_config.relay.livekit_api_secret,
+        ),
+        (
+            "relay.enabled_nips",
+            old.relay.enabled_nips != new_config.relay.enabled_nips,
+        ),
+        (
+            "relay.disabled_nips",
+            old.relay.disabled_nips != new_config.relay.disabled_nips,
+        ),
+        (
+            "database.map_size",
+            old.database.map_size != new_config.database.map_size,
+        ),
+        (
+            "database.max_map_size",
+            old.database.max_map_size != new_config.database.max_map_size,
+        ),
+        (
+            "database.search_index",
+            old.database.search_index != new_config.database.search_index,
+        ),
+        (
+            "database.meta_index",
+            old.database.meta_index != new_config.database.meta_index,
+        ),
+        (
+            "database.reader_threads",
+            old.database.reader_threads != new_config.database.reader_threads,
+        ),
+        (
+            "database.disabled_fsync",
+            old.database.disabled_fsync != new_config.database.disabled_fsync,
+        ),
+        (
+            "database.max_dbs",
+            old.database.max_dbs != new_config.database.max_dbs,
+        ),
+        (
+            "database.max_readers",
+            old.database.max_readers != new_config.database.max_readers,
+        ),
+        ("blossom.host", old.blossom.host != new_config.blossom.host),
+        (
+            "blossom.storage",
+            old.blossom.storage != new_config.blossom.storage,
+        ),
+        (
+            "blossom.min_free_bytes",
+            old.blossom.min_free_bytes != new_config.blossom.min_free_bytes,
+        ),
+        (
+            "blossom.local_path",
+            old.blossom.local_path != new_config.blossom.local_path,
+        ),
+        (
+            "blossom.max_upload_bytes",
+            old.blossom.max_upload_bytes != new_config.blossom.max_upload_bytes,
+        ),
+        (
+            "blossom.s3_*",
+            old.blossom.s3_endpoint != new_config.blossom.s3_endpoint
+                || old.blossom.s3_region != new_config.blossom.s3_region
+                || old.blossom.s3_bucket != new_config.blossom.s3_bucket
+                || old.blossom.s3_access_key != new_config.blossom.s3_access_key
+                || old.blossom.s3_secret_key != new_config.blossom.s3_secret_key,
+        ),
+        (
+            "database.path",
+            old.database.path != new_config.database.path,
+        ),
+        (
+            "database.purge_interval_secs",
+            old.database.purge_interval_secs != new_config.database.purge_interval_secs,
+        ),
+        (
+            "daemon.max_log_size_bytes",
+            old.daemon.max_log_size_bytes != new_config.daemon.max_log_size_bytes,
+        ),
+        (
+            "daemon.max_log_files",
+            old.daemon.max_log_files != new_config.daemon.max_log_files,
+        ),
+        (
+            "daemon.stats_interval_secs",
+            old.daemon.stats_interval_secs != new_config.daemon.stats_interval_secs,
+        ),
+        (
+            "database.db_request_timeout_secs",
+            old.database.db_request_timeout_secs != new_config.database.db_request_timeout_secs,
+        ),
+        (
+            "database.max_db_queue_msgs",
+            old.database.max_db_queue_msgs != new_config.database.max_db_queue_msgs,
+        ),
+        (
+            "database.max_db_queue_events",
+            old.database.max_db_queue_events != new_config.database.max_db_queue_events,
+        ),
+        (
+            "database.max_db_queue_bytes",
+            old.database.max_db_queue_bytes != new_config.database.max_db_queue_bytes,
+        ),
+        (
+            "database.max_indexed_words",
+            old.database.max_indexed_words != new_config.database.max_indexed_words,
+        ),
+        (
+            "limits.live_buffer",
+            old.limits.live_buffer != new_config.limits.live_buffer,
+        ),
+        (
+            "limits.live_batch_size",
+            old.limits.live_batch_size != new_config.limits.live_batch_size,
+        ),
+        (
+            "limits.live_batch_interval_ms",
+            old.limits.live_batch_interval_ms != new_config.limits.live_batch_interval_ms,
+        ),
+        (
+            "limits.max_connections",
+            old.limits.max_connections != new_config.limits.max_connections,
+        ),
+        (
+            // The accept-layer per-IP cap is captured
+            // when the listener starts and no handshake
+            // reads it anymore, so the reloaded config
+            // must not leave `config.read()` claiming a
+            // cap that is not enforced.
+            "limits.max_connections_per_ip",
+            old.limits.max_connections_per_ip != new_config.limits.max_connections_per_ip,
+        ),
+        (
+            "limits.http_read_timeout_secs",
+            old.limits.http_read_timeout_secs != new_config.limits.http_read_timeout_secs,
+        ),
+        (
+            "limits.max_connections_per_sec_per_ip",
+            old.limits.max_connections_per_sec_per_ip
+                != new_config.limits.max_connections_per_sec_per_ip,
+        ),
+        (
+            "limits.socket_recv_buffer_kb",
+            old.limits.socket_recv_buffer_kb != new_config.limits.socket_recv_buffer_kb,
+        ),
+        (
+            "rpc.max_admin_body_bytes",
+            old.rpc.max_admin_body_bytes != new_config.rpc.max_admin_body_bytes,
+        ),
+        (
+            "relay.max_groups",
+            old.relay.max_groups != new_config.relay.max_groups,
+        ),
+        (
+            "daemon.log_file",
+            old.daemon.log_file != new_config.daemon.log_file,
+        ),
+        (
+            "daemon.pid_file",
+            old.daemon.pid_file != new_config.daemon.pid_file,
+        ),
+    ];
+    for (name, changed) in static_routes {
+        if changed {
+            warn!(
+                "{name} changed in the reloaded config but the routes are \
+                                     fixed at startup; a restart is required to apply it"
+            );
+        }
+    }
+    // Every changed startup-only setting is rejected
+    // individually above (warning + value kept below),
+    // while the live settings are still applied: a
+    // reload must never be all-or-nothing, or an
+    // unrelated edit would silently disable a
+    // CLI-visible change.
+    db.set_expiry_enabled(new_config.nip_enabled(40));
+    api_limit.set_max(new_config.limits.max_api_concurrent);
+    db.set_max_api_pending(new_config.limits.max_api_queue_msgs);
+    // The kind/IP access lists are runtime-managed via NIP-86
+    // and persisted in the database: editing them in the
+    // config file has no effect after the first run (the
+    // persisted state wins). Warn so the operator uses the
+    // management API instead of wondering why the file is
+    // ignored. `restrict_relay` is config-owned and applies.
+    if old.access.blocked_kinds != new_config.access.blocked_kinds
+        || old.access.allowed_kinds != new_config.access.allowed_kinds
+        || old.access.blocked_ips != new_config.access.blocked_ips
+    {
+        warn!(
+            "access.blocked_kinds/allowed_kinds/blocked_ips changed in the \
+                                 reloaded config but access lists are runtime-managed (NIP-86) \
+                                 and persisted in the database; the file change is ignored"
+        );
+    }
+    // Apply-live-keep-startup-only: `new_config`'s live
+    // settings are applied at the end (config swap,
+    // database/API limiters), while every startup-only
+    // setting keeps its running value. Overwriting them
+    // in memory while the router, database and threads
+    // still run the old values would leave
+    // `config.read()` lying about actual behavior.
+    new_config.server.api_host = old.server.api_host.clone();
+    new_config.server.host = old.server.host.clone();
+    new_config.server.port = old.server.port;
+    new_config.server.ws_paths = old.server.ws_paths.clone();
+    new_config.server.trusted_proxies = old.server.trusted_proxies.clone();
+    new_config.server.metrics_enabled = old.server.metrics_enabled;
+    new_config.rpc.max_admin_body_bytes = old.rpc.max_admin_body_bytes;
+    new_config.relay.private_key = old.relay.private_key.clone();
+    new_config.relay.livekit_url = old.relay.livekit_url.clone();
+    new_config.relay.livekit_api_key = old.relay.livekit_api_key.clone();
+    new_config.relay.livekit_api_secret = old.relay.livekit_api_secret.clone();
+    // NIP toggles shape routing and stored behavior: keep
+    // them restart-required so a reload cannot half-apply
+    // (dynamic gates would flip while routes stay old).
+    new_config.relay.enabled_nips = old.relay.enabled_nips.clone();
+    new_config.relay.disabled_nips = old.relay.disabled_nips.clone();
+    new_config.relay.max_groups = old.relay.max_groups;
+    new_config.database.map_size = old.database.map_size;
+    new_config.database.max_map_size = old.database.max_map_size;
+    new_config.database.search_index = old.database.search_index;
+    new_config.database.meta_index = old.database.meta_index;
+    new_config.database.reader_threads = old.database.reader_threads;
+    new_config.database.disabled_fsync = old.database.disabled_fsync;
+    new_config.database.max_dbs = old.database.max_dbs;
+    new_config.database.max_readers = old.database.max_readers;
+    new_config.database.path = old.database.path.clone();
+    new_config.database.purge_interval_secs = old.database.purge_interval_secs;
+    new_config.database.db_request_timeout_secs = old.database.db_request_timeout_secs;
+    new_config.database.max_db_queue_msgs = old.database.max_db_queue_msgs;
+    new_config.database.max_db_queue_events = old.database.max_db_queue_events;
+    new_config.database.max_db_queue_bytes = old.database.max_db_queue_bytes;
+    new_config.database.max_indexed_words = old.database.max_indexed_words;
+    new_config.blossom.host = old.blossom.host.clone();
+    new_config.blossom.storage = old.blossom.storage.clone();
+    new_config.blossom.min_free_bytes = old.blossom.min_free_bytes;
+    new_config.blossom.local_path = old.blossom.local_path.clone();
+    new_config.blossom.max_upload_bytes = old.blossom.max_upload_bytes;
+    new_config.blossom.s3_endpoint = old.blossom.s3_endpoint.clone();
+    new_config.blossom.s3_region = old.blossom.s3_region.clone();
+    new_config.blossom.s3_bucket = old.blossom.s3_bucket.clone();
+    new_config.blossom.s3_access_key = old.blossom.s3_access_key.clone();
+    new_config.blossom.s3_secret_key = old.blossom.s3_secret_key.clone();
+    new_config.daemon.max_log_size_bytes = old.daemon.max_log_size_bytes;
+    new_config.daemon.max_log_files = old.daemon.max_log_files;
+    new_config.daemon.stats_interval_secs = old.daemon.stats_interval_secs;
+    new_config.daemon.log_file = old.daemon.log_file.clone();
+    new_config.daemon.pid_file = old.daemon.pid_file.clone();
+    new_config.limits.live_buffer = old.limits.live_buffer;
+    new_config.limits.live_batch_size = old.limits.live_batch_size;
+    new_config.limits.live_batch_interval_ms = old.limits.live_batch_interval_ms;
+    new_config.limits.max_connections = old.limits.max_connections;
+    new_config.limits.max_connections_per_ip = old.limits.max_connections_per_ip;
+    new_config.limits.http_read_timeout_secs = old.limits.http_read_timeout_secs;
+    new_config.limits.max_connections_per_sec_per_ip = old.limits.max_connections_per_sec_per_ip;
+    new_config.limits.socket_recv_buffer_kb = old.limits.socket_recv_buffer_kb;
+    // The kind/IP access lists are runtime-managed
+    // (persisted in the database); only `restrict_relay`
+    // is config-owned.
+    new_config.access.blocked_kinds = old.access.blocked_kinds.clone();
+    new_config.access.allowed_kinds = old.access.allowed_kinds.clone();
+    new_config.access.blocked_ips = old.access.blocked_ips.clone();
+    *relay.config.write().await = new_config;
+    // Bump the config version: connections refresh
+    // their cached NIP-40/NIP-42 flags on the next
+    // live batch (see `Conn::config_version`).
+    relay
+        .config_version
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 #[cfg(test)]
@@ -1929,6 +2419,335 @@ mod tests {
         let state = blossom::build_state(&relay.config.read().await.clone(), &relay).await;
         *relay.blossom.write().await = state;
         Arc::new(relay)
+    }
+
+    #[tokio::test]
+    async fn startup_rejects_a_stale_group_snapshot_and_resumes_purges() {
+        // A snapshot stamped before a group-state removal must not be
+        // restored: startup rebuilds from the surviving events instead
+        // (fail-closed). The resume then runs safely as a no-op.
+        let relay = blossom_relay().await;
+        // A completed NIP-29 purge advances the database generation, exactly
+        // like the removal that invalidates the snapshot below.
+        relay.db.group_purge("gone".to_string(), unix_now()).await;
+        let current = relay
+            .db
+            .state_stamp()
+            .await
+            .expect("the generation must be readable");
+        assert!(current > 0, "a completed purge must advance the generation");
+        let mut stale = crate::nips::nip29::GroupsSnapshot::default();
+        stale.groups.insert("stale".to_string(), Default::default());
+        assert!(
+            relay.db.save_groups(stale).await,
+            "the stale snapshot must be persisted for the test"
+        );
+        // The full startup sequence: restore rejected, rebuild runs, and
+        // the resume completes with nothing pending.
+        startup_group_state(&relay, true)
+            .await
+            .expect("the rebuild must succeed over an empty database");
+        assert!(
+            relay.groups.read().await.group("stale").is_none(),
+            "a snapshot older than the database generation must not be restored"
+        );
+        // The rebuild persisted a current snapshot (not the stale one), so
+        // the next start restores instead of rebuilding again.
+        let persisted = relay
+            .db
+            .load_groups()
+            .await
+            .expect("the rebuild must persist");
+        assert!(
+            persisted.stamp >= current,
+            "the rebuilt snapshot must carry the current generation (got {})",
+            persisted.stamp
+        );
+        assert!(
+            persisted.groups.is_empty(),
+            "the stale group must not survive the rebuild"
+        );
+        // Nothing is pending: the resume (part of the startup sequence) is a
+        // safe no-op, and the gauge reports zero.
+        assert!(
+            relay
+                .db
+                .pending_purges()
+                .await
+                .is_some_and(|pending| pending.is_empty()),
+            "the resume must leave no pending purges behind"
+        );
+        assert_eq!(
+            relay
+                .stats
+                .pending_purges
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "the startup sequence must publish the pending-purge count"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn startup_restores_a_legacy_snapshot_at_generation_zero() {
+        // A snapshot written before the stamp existed deserializes with
+        // stamp 0; while the database generation is still 0 it is current
+        // and must restore (the fail-closed check must not reject it).
+        let relay = blossom_relay().await;
+        assert_eq!(
+            relay.db.state_stamp().await,
+            Some(0),
+            "a fresh database has no stamp"
+        );
+        let mut legacy = crate::nips::nip29::GroupsSnapshot::default();
+        legacy
+            .groups
+            .insert("legacy".to_string(), Default::default());
+        assert!(relay.db.save_groups(legacy).await);
+        startup_group_state(&relay, true)
+            .await
+            .expect("the legacy restore must succeed");
+        assert!(
+            relay.groups.read().await.group("legacy").is_some(),
+            "a legacy snapshot (stamp 0) at generation 0 must restore"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn per_family_sequences_reject_a_stale_group_snapshot_and_restore_current_roles() {
+        // The startup restore blocks compare each snapshot against its own
+        // family sequence: a role event advances only the role sequence, so
+        // a group snapshot that predates a group event is rejected (and
+        // rebuilt from the surviving events) while the role snapshot saved
+        // after the role event still restores.
+        let relay = blossom_relay().await;
+        let now = unix_now();
+        let authored = |kind: u64, content: &str| {
+            let mut event = crate::event::Event {
+                id: String::new(),
+                pubkey: "aa".repeat(32),
+                created_at: now,
+                kind,
+                tags: vec![],
+                content: content.to_string(),
+                sig: "00".repeat(64),
+            };
+            event.id = crate::nips::nip01::compute_id(&event);
+            event
+        };
+
+        // One group event advances the group sequence to 1; one role event
+        // advances the role sequence to 1. Neither crosses over.
+        assert_eq!(
+            relay.db.put(authored(9002, "group"), now).await,
+            crate::db::PutOutcome::Stored
+        );
+        assert_eq!(
+            relay
+                .db
+                .put(authored(crate::nips::nip43::ROLE_DEFINITION, "role"), now)
+                .await,
+            crate::db::PutOutcome::Stored
+        );
+        assert_eq!(relay.db.state_seq_group().await, Some(1));
+        assert_eq!(relay.db.state_seq_role().await, Some(1));
+        let stamp = relay.db.state_stamp().await.expect("stamp");
+
+        // A stale group snapshot (sequence 0 < current 1).
+        let mut stale_group = crate::nips::nip29::GroupsSnapshot::default();
+        stale_group
+            .groups
+            .insert("stale".to_string(), Default::default());
+        stale_group.stamp = stamp;
+        stale_group.seq = 0;
+        assert!(relay.db.save_groups(stale_group).await);
+
+        // A current role snapshot (sequence 1 == current 1).
+        let mut current_roles = crate::nips::nip43::RolesSnapshot::default();
+        current_roles
+            .roles
+            .insert("king".to_string(), Default::default());
+        current_roles.stamp = stamp;
+        current_roles.seq = 1;
+        assert!(relay.db.save_roles(current_roles).await);
+
+        // The group restore rejects the stale snapshot and rebuilds.
+        startup_group_state(&relay, true)
+            .await
+            .expect("the group rebuild must succeed");
+        assert!(
+            relay.groups.read().await.group("stale").is_none(),
+            "the stale group snapshot must not be restored"
+        );
+
+        // The role snapshot is still current: the group event did not
+        // advance the role sequence, so it restores instead of rebuilding.
+        restore_role_state(&relay)
+            .await
+            .expect("the role restore must succeed");
+        assert!(
+            relay.roles.read().await.roles.contains_key("king"),
+            "a role snapshot at the current role sequence must restore"
+        );
+        relay.db.shutdown();
+    }
+
+    /// Writes `cfg` to a fresh temp config file and returns `(dir, path)`,
+    /// so a SIGHUP test can exercise the real load/validate path.
+    fn write_temp_config(name: &str, cfg: &Config) -> (PathBuf, PathBuf) {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir()
+            .join(name)
+            .join(format!("{:x}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("nostrfy.toml");
+        std::fs::write(&path, toml::to_string_pretty(cfg).unwrap()).unwrap();
+        (dir, path)
+    }
+
+    #[tokio::test]
+    async fn reload_applies_live_settings_and_keeps_startup_only() {
+        let relay = blossom_relay().await;
+        let old = relay.config.read().await.clone();
+        let mut new_config = old.clone();
+        new_config.relay.name = "reloaded relay".into();
+        new_config.access.restrict_relay = !old.access.restrict_relay;
+        new_config.limits.max_api_concurrent = 1;
+        // Startup-only values: the router/accept loop and the database
+        // environment keep running with the old values (restart required).
+        new_config.server.port = old.server.port.wrapping_add(1);
+        new_config.database.map_size = old.database.map_size / 2;
+        new_config.limits.max_connections = old.limits.max_connections + 1;
+        apply_reloaded_config(&old, new_config, &relay, &relay.db, &relay.api_limit).await;
+
+        let applied = relay.config.read().await;
+        assert_eq!(
+            applied.relay.name, "reloaded relay",
+            "a live setting must apply"
+        );
+        assert_eq!(
+            applied.access.restrict_relay, !old.access.restrict_relay,
+            "access.restrict_relay is config-owned and live"
+        );
+        assert_eq!(
+            applied.server.port, old.server.port,
+            "a startup-only setting must keep its running value"
+        );
+        assert_eq!(
+            applied.database.map_size, old.database.map_size,
+            "the database layout is startup-only"
+        );
+        assert_eq!(
+            applied.limits.max_connections, old.limits.max_connections,
+            "the accept loop is built at startup"
+        );
+        drop(applied);
+        assert_eq!(
+            relay
+                .config_version
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the config version must bump so connections refresh cached flags"
+        );
+        // The API concurrency ceiling was applied live.
+        let first = relay.api_limit.try_acquire().expect("the first slot");
+        assert!(
+            relay.api_limit.try_acquire().is_none(),
+            "the reloaded ceiling of 1 must be enforced"
+        );
+        drop(first);
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn reload_re_reads_the_database_lists_on_success_and_failure() {
+        // `handle_reload` must refresh the database-owned lists on both the
+        // applied and the rejected path: a NIP-86 change committed since the
+        // last reload must not be skipped because the config edit was bad.
+        let relay = blossom_relay().await;
+        let base = relay.config.read().await.clone();
+        let (dir, config_path) = write_temp_config("nostrfy-reload-test", &base);
+        let mut updated = base.clone();
+        updated.relay.name = "from file".into();
+        std::fs::write(&config_path, toml::to_string_pretty(&updated).unwrap()).unwrap();
+        assert!(
+            relay
+                .db
+                .save_blossom_allow(&["sha256:aaa".to_string()])
+                .await
+        );
+        handle_reload(&config_path, &relay, &relay.db, &relay.api_limit).await;
+        assert_eq!(
+            relay.config.read().await.relay.name,
+            "from file",
+            "a valid file must be applied"
+        );
+        assert_eq!(
+            *relay.blossom_allow.read().await,
+            vec!["sha256:aaa".to_string()],
+            "the applied path must re-read the database lists"
+        );
+
+        // An invalid file (zero limit) rejects the config as a whole but the
+        // database lists still refresh.
+        std::fs::write(&config_path, "[limits]\nmax_connections = 0\n").unwrap();
+        assert!(
+            relay
+                .db
+                .save_blossom_allow(&["sha256:bbb".to_string()])
+                .await
+        );
+        handle_reload(&config_path, &relay, &relay.db, &relay.api_limit).await;
+        assert_eq!(
+            relay.config.read().await.relay.name,
+            "from file",
+            "a rejected reload must keep the running config"
+        );
+        assert_eq!(
+            *relay.blossom_allow.read().await,
+            vec!["sha256:bbb".to_string()],
+            "the rejected path must still re-read the database lists"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn reload_does_not_deadlock_with_a_contending_config_writer() {
+        // Regression guard: the SIGHUP path must never hold a config read
+        // guard across `reload_db_state` (which reads the config itself).
+        // The apply takes a snapshot and releases its guard, so it completes
+        // even while another task continuously queues for the write lock.
+        let relay = blossom_relay().await;
+        let base = relay.config.read().await.clone();
+        let (dir, config_path) = write_temp_config("nostrfy-reload-contend-test", &base);
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = tokio::spawn({
+            let relay = Arc::clone(&relay);
+            let stop = Arc::clone(&stop);
+            async move {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let _guard = relay.config.write().await;
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            }
+        });
+        let reload = tokio::time::timeout(
+            Duration::from_secs(10),
+            handle_reload(&config_path, &relay, &relay.db, &relay.api_limit),
+        )
+        .await;
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        writer.await.unwrap();
+        assert!(
+            reload.is_ok(),
+            "the reload must complete while a config writer contends for the lock"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        relay.db.shutdown();
     }
 
     #[tokio::test]
@@ -2170,6 +2989,15 @@ mod tests {
             >("198.51.100.8:1234".parse().unwrap()));
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        // Every blocked-IP refusal bumped the counter (three above).
+        assert_eq!(
+            relay
+                .stats
+                .conn_refused_blocked
+                .load(std::sync::atomic::Ordering::Relaxed),
+            3,
+            "blocked-IP 403s must be counted"
+        );
         relay.db.shutdown();
     }
 
@@ -2344,6 +3172,33 @@ mod tests {
             per_sec.map(Arc::new),
             Arc::from(trusted),
             16,
+            crate::stats::Stats::new(),
+            rx,
+        ));
+        (addr, tx, handle)
+    }
+
+    /// Like [`serve_limited_for_test`], but returns the shared stats so a
+    /// test can assert the refusal counters.
+    async fn serve_limited_with_stats(
+        max_connections: usize,
+        max_per_ip: usize,
+        per_sec: Option<IpConnLimiter>,
+        stats: Arc<crate::stats::Stats>,
+    ) -> (SocketAddr, watch::Sender<bool>, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = watch::channel(false);
+        let handle = tokio::spawn(serve_limited(
+            listener,
+            test_app(),
+            max_connections,
+            max_per_ip,
+            Some(Duration::from_secs(30)),
+            per_sec.map(Arc::new),
+            Arc::from(Vec::new()),
+            16,
+            stats,
             rx,
         ));
         (addr, tx, handle)
@@ -2375,9 +3230,31 @@ mod tests {
         (s, buf)
     }
 
-    /// Reads the connection to EOF (the server closed it), returning the
-    /// bytes received.
-    async fn read_to_eof(mut s: TcpStream, timeout: Duration) -> Vec<u8> {
+    /// Polls until the server serves `GET /` (a 200 response head) or the
+    /// deadline passes: used after closing a connection to wait for the
+    /// slot release without a fixed sleep that could be too short on a
+    /// loaded machine.
+    async fn wait_for_served(addr: SocketAddr) -> (TcpStream, Vec<u8>) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let (conn, body) = http_keepalive(addr).await;
+            if String::from_utf8_lossy(&body).contains("200 OK") {
+                return (conn, body);
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the server did not release the slot within the deadline (last body: {:?})",
+                String::from_utf8_lossy(&body)
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Reads the connection until it closes (or the timeout passes),
+    /// returning the bytes received and whether the close was observed: a
+    /// timed-out read is *not* a close, so callers can assert the server
+    /// actually closed the socket instead of the test merely giving up.
+    async fn read_to_eof(mut s: TcpStream, timeout: Duration) -> (Vec<u8>, bool) {
         let mut buf = Vec::new();
         let mut tmp = [0u8; 4096];
         let deadline = tokio::time::sleep(timeout);
@@ -2386,14 +3263,13 @@ mod tests {
             tokio::select! {
                 n = s.read(&mut tmp) => {
                     match n {
-                        Ok(0) | Err(_) => break,
+                        Ok(0) | Err(_) => return (buf, true),
                         Ok(n) => buf.extend_from_slice(&tmp[..n]),
                     }
                 }
-                _ = &mut deadline => break,
+                _ = &mut deadline => return (buf, false),
             }
         }
-        buf
     }
 
     #[tokio::test]
@@ -2407,23 +3283,104 @@ mod tests {
             "the first connection must be served"
         );
         // With max_connections = 1 the second connection is dropped at the
-        // socket level: the TCP connect succeeds but the server refuses.
-        let refused = http_keepalive(addr).await;
+        // socket level: the TCP connect succeeds but the server refuses
+        // (and the close must be observed, not a read timeout).
+        let refused = http_get_with_xff(addr, None).await;
         assert!(
-            refused.1.is_empty(),
+            refused.is_empty(),
             "the capped connection must be dropped without a response"
         );
-        // Closing the first connection releases the slot.
+        // Closing the first connection releases the slot; poll for the
+        // release instead of sleeping a fixed interval.
         drop(conn1);
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        let (conn3, body) = http_keepalive(addr).await;
-        assert!(
-            String::from_utf8_lossy(&body).contains("200 OK"),
-            "the slot must be released when the first connection closes"
-        );
+        let (conn3, _) = wait_for_served(addr).await;
         drop(conn3);
         tx.send(true).unwrap();
         handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn serve_limited_counts_each_refusal_reason() {
+        use std::sync::atomic::Ordering;
+        // Global cap.
+        let stats = crate::stats::Stats::new();
+        let (addr, tx, handle) = serve_limited_with_stats(1, 0, None, stats.clone()).await;
+        let (conn1, body) = http_keepalive(addr).await;
+        assert!(String::from_utf8_lossy(&body).contains("200 OK"));
+        assert!(http_get_with_xff(addr, None).await.is_empty());
+        assert_eq!(
+            stats.conn_refused_global.load(Ordering::Relaxed),
+            1,
+            "a global-cap drop must be counted"
+        );
+        drop(conn1);
+        tx.send(true).unwrap();
+        handle.await.unwrap();
+
+        // Per-IP concurrent cap.
+        let stats = crate::stats::Stats::new();
+        let (addr, tx, handle) = serve_limited_with_stats(10, 1, None, stats.clone()).await;
+        let (conn1, body) = http_keepalive(addr).await;
+        assert!(String::from_utf8_lossy(&body).contains("200 OK"));
+        assert!(http_get_with_xff(addr, None).await.is_empty());
+        assert_eq!(
+            stats.conn_refused_per_ip.load(Ordering::Relaxed),
+            1,
+            "a per-IP-cap drop must be counted"
+        );
+        drop(conn1);
+        tx.send(true).unwrap();
+        handle.await.unwrap();
+
+        // Per-IP rate limit: the injected clock pins the one-second window,
+        // so the second connection is deterministically over the limit.
+        let stats = crate::stats::Stats::new();
+        let (addr, tx, handle) = serve_limited_with_stats(
+            10,
+            0,
+            IpConnLimiter::with_clock(1, Arc::new(|| 0)),
+            stats.clone(),
+        )
+        .await;
+        let (conn1, body) = http_keepalive(addr).await;
+        assert!(String::from_utf8_lossy(&body).contains("200 OK"));
+        assert!(http_get_with_xff(addr, None).await.is_empty());
+        assert_eq!(
+            stats.conn_refused_rate.load(Ordering::Relaxed),
+            1,
+            "a rate-limit drop must be counted"
+        );
+        drop(conn1);
+        tx.send(true).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn health_reports_ok_for_a_healthy_database() {
+        // A healthy database (and, until the database accessors land, the
+        // fallback) keeps the liveness answer 200.
+        let relay = blossom_relay().await;
+        let response = health_handler(State(relay.clone())).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn termination_wait_pends_without_registered_signals() {
+        // A failed signal registration must leave the handler waiting for
+        // the shutdown watch instead of returning (which the supervisor
+        // would report as a lost background task).
+        let mut terminate = None;
+        let mut interrupt = None;
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                await_termination_signal(&mut terminate, &mut interrupt),
+            )
+            .await
+            .is_err(),
+            "no signal stream means pending forever"
+        );
     }
 
     #[tokio::test]
@@ -2438,27 +3395,24 @@ mod tests {
         let (conn2, body2) = http_keepalive(addr).await;
         assert!(String::from_utf8_lossy(&body2).contains("200 OK"));
         // The third connection from the same IP is refused at the socket.
-        let refused = http_keepalive(addr).await;
+        let refused = http_get_with_xff(addr, None).await;
         assert!(
-            refused.1.is_empty(),
+            refused.is_empty(),
             "the per-IP capped connection must be dropped"
         );
-        // Closing one connection releases its per-IP slot.
+        // Closing one connection releases its per-IP slot; poll for it.
         drop(conn1);
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        let (conn3, body3) = http_keepalive(addr).await;
-        assert!(
-            String::from_utf8_lossy(&body3).contains("200 OK"),
-            "the per-IP slot must be released when a connection closes"
-        );
+        let (conn3, _) = wait_for_served(addr).await;
         drop(conn2);
         drop(conn3);
         tx.send(true).unwrap();
         handle.await.unwrap();
     }
 
-    /// One `GET /` with an optional `X-Forwarded-For` header; the connection
-    /// closes after the response, so the whole head is read.
+    /// One `GET /` with an optional `X-Forwarded-For` header; the request
+    /// carries `Connection: close`, so the whole response is read and the
+    /// close must actually be observed (a mere read timeout would otherwise
+    /// make the `is_empty()` refusal assertions vacuously pass).
     async fn http_get_with_xff(addr: SocketAddr, xff: Option<&str>) -> Vec<u8> {
         let mut s = TcpStream::connect(addr).await.unwrap();
         let forwarded = xff.map_or(String::new(), |xff| format!("X-Forwarded-For: {xff}\r\n"));
@@ -2467,7 +3421,12 @@ mod tests {
         )
         .await
         .unwrap();
-        read_to_eof(s, Duration::from_secs(3)).await
+        let (buf, closed) = read_to_eof(s, Duration::from_secs(3)).await;
+        assert!(
+            closed,
+            "the server must close a `Connection: close` request (read timed out instead)"
+        );
+        buf
     }
 
     /// Reads whatever arrives within `within`, without waiting for EOF.
@@ -2489,16 +3448,27 @@ mod tests {
     }
 
     /// A router whose requests park until the returned semaphore is
-    /// released, so several connections can be kept in flight at once.
-    fn gated_app() -> (axum::Router, Arc<tokio::sync::Semaphore>) {
+    /// released, so several connections can be kept in flight at once. The
+    /// `Notify` fires when a request reaches the handler, letting a test
+    /// wait for the parking connection deterministically instead of
+    /// sleeping.
+    fn gated_app() -> (
+        axum::Router,
+        Arc<tokio::sync::Semaphore>,
+        Arc<tokio::sync::Notify>,
+    ) {
         let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let arrived = Arc::new(tokio::sync::Notify::new());
         let app = axum::Router::new().route(
             "/",
             axum::routing::get({
                 let gate = Arc::clone(&gate);
+                let arrived = Arc::clone(&arrived);
                 move || {
                     let gate = Arc::clone(&gate);
+                    let arrived = Arc::clone(&arrived);
                     async move {
+                        arrived.notify_one();
                         let permit = gate.acquire().await.expect("the gate is open");
                         permit.forget();
                         "ok"
@@ -2506,7 +3476,15 @@ mod tests {
                 }
             }),
         );
-        (app, gate)
+        (app, gate, arrived)
+    }
+
+    /// Waits (bounded) until the gated handler reports that its first
+    /// request arrived.
+    async fn wait_for_arrival(arrived: &tokio::sync::Notify) {
+        tokio::time::timeout(Duration::from_secs(5), arrived.notified())
+            .await
+            .expect("the first request must reach the handler");
     }
 
     #[tokio::test]
@@ -2515,10 +3493,11 @@ mod tests {
         // forwarded client, not the proxy: two connections from the same
         // client are capped even though they share the proxy's TCP
         // address, and a different client gets its own slot.
-        let (app, gate) = gated_app();
+        let (app, gate, arrived) = gated_app();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (tx, rx) = watch::channel(false);
+        let stats = crate::stats::Stats::new();
         let handle = tokio::spawn(serve_limited(
             listener,
             app,
@@ -2528,6 +3507,7 @@ mod tests {
             None,
             Arc::from(vec![TrustedProxy::parse("127.0.0.1/32").unwrap()]),
             16,
+            stats.clone(),
             rx,
         ));
         // The first client's request stays in flight, holding its slot.
@@ -2539,7 +3519,7 @@ mod tests {
             )
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        wait_for_arrival(&arrived).await;
         // A second connection for the same forwarded client is refused with
         // 429 (the HTTP layer must not drop the already-established socket).
         let refused = http_get_with_xff(addr, Some("203.0.113.9")).await;
@@ -2547,6 +3527,13 @@ mod tests {
             String::from_utf8_lossy(&refused).contains("429"),
             "the forwarded client must be capped: {:?}",
             String::from_utf8_lossy(&refused)
+        );
+        assert_eq!(
+            stats
+                .conn_refused_proxy
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "a trusted-proxy 429 must be counted"
         );
         // A different forwarded client is admitted and parks in the handler.
         let mut other = TcpStream::connect(addr).await.unwrap();
@@ -2565,10 +3552,14 @@ mod tests {
         // Opening the gate completes both requests; the slots are released
         // (the guard held by the in-flight request must not leak).
         gate.add_permits(8);
-        let first_body = read_to_eof(first, Duration::from_secs(3)).await;
+        let (first_body, _) = read_to_eof(first, Duration::from_secs(3)).await;
         assert!(String::from_utf8_lossy(&first_body).contains("200 OK"));
-        let other_body = read_to_eof(other, Duration::from_secs(3)).await;
+        let (other_body, other_closed) = read_to_eof(other, Duration::from_secs(3)).await;
         assert!(String::from_utf8_lossy(&other_body).contains("200 OK"));
+        assert!(
+            other_closed,
+            "the `Connection: close` request must be answered and closed"
+        );
         tx.send(true).unwrap();
         handle.await.unwrap();
     }
@@ -2578,7 +3569,7 @@ mod tests {
         // Without `server.trusted_proxies` the header is attacker-controlled:
         // two connections from the same peer stay capped however they vary
         // `X-Forwarded-For`.
-        let (app, gate) = gated_app();
+        let (app, gate, arrived) = gated_app();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (tx, rx) = watch::channel(false);
@@ -2591,6 +3582,7 @@ mod tests {
             None,
             Arc::from(Vec::new()),
             16,
+            crate::stats::Stats::new(),
             rx,
         ));
         let mut first = TcpStream::connect(addr).await.unwrap();
@@ -2601,7 +3593,7 @@ mod tests {
             )
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        wait_for_arrival(&arrived).await;
         // A spoofed, different address in the header must not lift the cap:
         // the peer is the accounting key and the second connection is
         // dropped at the accept layer (same as today).
@@ -2611,7 +3603,7 @@ mod tests {
             "an untrusted peer must not change its accounting with X-Forwarded-For"
         );
         gate.add_permits(4);
-        let first_body = read_to_eof(first, Duration::from_secs(3)).await;
+        let (first_body, _) = read_to_eof(first, Duration::from_secs(3)).await;
         assert!(String::from_utf8_lossy(&first_body).contains("200 OK"));
         tx.send(true).unwrap();
         handle.await.unwrap();
@@ -2621,12 +3613,21 @@ mod tests {
     async fn serve_limited_rate_limits_forwarded_clients_of_trusted_proxies() {
         // The per-IP connection rate limiter must key on the forwarded
         // client too, otherwise every client behind the proxy shares one
-        // window.
+        // window. The injected clock keeps the window deterministic.
+        let now = Arc::new(std::sync::atomic::AtomicU64::new(1_700_000_000));
+        let limiter = IpConnLimiter::with_clock(
+            1,
+            Arc::new({
+                let now = Arc::clone(&now);
+                move || now.load(std::sync::atomic::Ordering::Relaxed)
+            }),
+        )
+        .expect("a positive limit yields a limiter");
         let (addr, tx, handle) = serve_limited_with_proxies(
             10,
             0,
             Some(Duration::from_secs(30)),
-            IpConnLimiter::new(1),
+            Some(limiter),
             vec![TrustedProxy::parse("127.0.0.1/32").unwrap()],
         )
         .await;
@@ -2674,6 +3675,7 @@ mod tests {
             None,
             Arc::from(Vec::new()),
             16,
+            crate::stats::Stats::new(),
             rx,
         ));
         // The handshake upgrades and the WebSocket holds the only per-IP
@@ -2693,19 +3695,15 @@ mod tests {
         );
         // A plain HTTP connection from the same IP is refused while the
         // WebSocket is open (the old double counter let it through).
-        let refused = http_keepalive(addr).await;
+        let refused = http_get_with_xff(addr, None).await;
         assert!(
-            refused.1.is_empty(),
+            refused.is_empty(),
             "the live WebSocket must occupy the per-IP slot"
         );
-        // Closing the WebSocket releases the slot for the next connection.
+        // Closing the WebSocket releases the slot for the next connection;
+        // poll for the release instead of sleeping a fixed interval.
         drop(ws);
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        let (conn, body) = http_keepalive(addr).await;
-        assert!(
-            String::from_utf8_lossy(&body).contains("200 OK"),
-            "the slot must be released when the WebSocket closes"
-        );
+        let (conn, _) = wait_for_served(addr).await;
         drop(conn);
         tx.send(true).unwrap();
         handle.await.unwrap();
@@ -2714,21 +3712,33 @@ mod tests {
 
     #[tokio::test]
     async fn serve_limited_applies_the_per_ip_rate_limit() {
+        // The per-second window comes from an injected clock, so the test is
+        // deterministic: a wall-clock race across a second boundary can no
+        // longer turn the expected refusals into successes.
+        let now = Arc::new(std::sync::atomic::AtomicU64::new(1_700_000_000));
+        let limiter = IpConnLimiter::with_clock(
+            1,
+            Arc::new({
+                let now = Arc::clone(&now);
+                move || now.load(std::sync::atomic::Ordering::Relaxed)
+            }),
+        )
+        .expect("a positive limit yields a limiter");
         let (addr, tx, handle) =
-            serve_limited_for_test(10, 0, Some(Duration::from_secs(30)), IpConnLimiter::new(1))
-                .await;
+            serve_limited_for_test(10, 0, Some(Duration::from_secs(30)), Some(limiter)).await;
         // The first connection of the second is accepted.
         let (conn1, body) = http_keepalive(addr).await;
         assert!(String::from_utf8_lossy(&body).contains("200 OK"));
         // A second connection from the same IP within the same second is
         // refused by the rate limiter.
-        let refused = http_keepalive(addr).await;
+        let refused = http_get_with_xff(addr, None).await;
         assert!(
-            refused.1.is_empty(),
+            refused.is_empty(),
             "the rate-limited connection must be dropped"
         );
-        // After the window slides, a new connection is accepted again.
-        tokio::time::sleep(Duration::from_millis(1100)).await;
+        // Advancing the injected clock slides the window open, with no
+        // sleep and no wall-clock race.
+        now.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let (conn3, body) = http_keepalive(addr).await;
         assert!(
             String::from_utf8_lossy(&body).contains("200 OK"),
@@ -2749,9 +3759,9 @@ mod tests {
         let mut s = TcpStream::connect(addr).await.unwrap();
         s.write_all(b"G").await.unwrap();
         let started = std::time::Instant::now();
-        let got = read_to_eof(s, Duration::from_secs(10)).await;
+        let (got, closed) = read_to_eof(s, Duration::from_secs(10)).await;
         assert!(
-            got.is_empty(),
+            closed && got.is_empty(),
             "the slow-loris socket must be closed without a response"
         );
         let elapsed = started.elapsed();
@@ -2774,9 +3784,9 @@ mod tests {
             serve_limited_for_test(10, 0, Some(Duration::from_secs(2)), None).await;
         let s = TcpStream::connect(addr).await.unwrap();
         let started = std::time::Instant::now();
-        let got = read_to_eof(s, Duration::from_secs(10)).await;
+        let (got, closed) = read_to_eof(s, Duration::from_secs(10)).await;
         assert!(
-            got.is_empty(),
+            closed && got.is_empty(),
             "the silent socket must be closed without a response"
         );
         let elapsed = started.elapsed();
@@ -2796,9 +3806,9 @@ mod tests {
         let (addr, tx, handle) = serve_limited_for_test(10, 0, None, None).await;
         let mut s = TcpStream::connect(addr).await.unwrap();
         s.write_all(b"G").await.unwrap();
-        let got = read_to_eof(s, Duration::from_millis(1500)).await;
+        let (got, closed) = read_to_eof(s, Duration::from_millis(1500)).await;
         assert!(
-            got.is_empty(),
+            !closed && got.is_empty(),
             "with the timeout disabled the socket must stay open"
         );
         // The socket is still usable: completing the request head gets a
@@ -2807,9 +3817,9 @@ mod tests {
         s.write_all(b"GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
             .await
             .unwrap();
-        let got = read_to_eof(s, Duration::from_secs(5)).await;
+        let (got, closed) = read_to_eof(s, Duration::from_secs(5)).await;
         assert!(
-            String::from_utf8_lossy(&got).contains("200 OK"),
+            closed && String::from_utf8_lossy(&got).contains("200 OK"),
             "a complete request must still be served"
         );
         tx.send(true).unwrap();
@@ -2823,14 +3833,29 @@ mod tests {
         let (conn, body) = http_keepalive(addr).await;
         assert!(String::from_utf8_lossy(&body).contains("200 OK"));
         // Shutdown: the accept loop stops and active connections are
-        // gracefully closed.
+        // gracefully closed. The close must be observed as EOF within a
+        // short deadline; a read timeout is *not* a drain and must fail the
+        // test (the old `is_empty() || contains("200")` assertion passed
+        // vacuously in exactly that case).
         tx.send(true).unwrap();
-        let got = read_to_eof(conn, Duration::from_secs(10)).await;
+        let started = std::time::Instant::now();
+        let (got, closed) = read_to_eof(conn, Duration::from_secs(3)).await;
+        assert!(
+            closed,
+            "the drained connection must reach EOF, not merely time out"
+        );
         assert!(
             got.is_empty() || String::from_utf8_lossy(&got).contains("200"),
-            "the active connection must be closed on shutdown"
+            "the drained connection must not receive a truncated response"
         );
-        handle.await.unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "the server must close the drained connection promptly"
+        );
+        // The accept loop must return promptly after the shutdown signal.
+        let joined = tokio::time::timeout(Duration::from_secs(5), handle).await;
+        assert!(joined.is_ok(), "the accept loop must stop promptly");
+        joined.unwrap().unwrap();
     }
 
     #[tokio::test]

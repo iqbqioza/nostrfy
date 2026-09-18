@@ -66,6 +66,20 @@ pub struct RoleStore {
 pub(crate) struct RolesSnapshot {
     pub roles: HashMap<String, Role>,
     pub assignments: HashMap<String, Vec<String>>,
+    /// The database's state generation the snapshot was taken at (see
+    /// `DbClient::state_stamp`): a restore must reject a snapshot stamped
+    /// before the current generation, because it predates a removal of a
+    /// role-state event. Present in snapshots written after the stamp was
+    /// introduced; older snapshots deserialize as 0.
+    #[serde(default)]
+    pub stamp: u64,
+    /// The database's derived-state sequence the snapshot was taken at
+    /// (see `DbClient::state_seq`): a restore must reject a snapshot whose
+    /// sequence is below the current one, because it predates a
+    /// NIP-29/NIP-43 state event. Present in snapshots written after the
+    /// sequence was introduced; older snapshots deserialize as 0.
+    #[serde(default)]
+    pub seq: u64,
 }
 
 impl RoleStore {
@@ -81,6 +95,10 @@ impl RoleStore {
         RolesSnapshot {
             roles: self.roles.clone(),
             assignments: self.assignments.clone(),
+            // Filled by the persist path, which reads the database's
+            // generation (`DbClient::state_stamp` and `DbClient::state_seq`).
+            stamp: 0,
+            seq: 0,
         }
     }
 
@@ -88,6 +106,38 @@ impl RoleStore {
     pub(crate) fn restore(&mut self, snap: RolesSnapshot) {
         self.roles = snap.roles;
         self.assignments = snap.assignments;
+    }
+
+    /// Whether a snapshot stamped `snapshot_stamp` still reflects the
+    /// database generation `current_stamp`: a snapshot from before a
+    /// role-state removal (its stamp is older) must not be restored. A
+    /// snapshot stamped at the current generation is current; one stamped
+    /// ahead can only mean the counter was reset and is the freshest state
+    /// available. A caller that cannot read `current_stamp` must fail
+    /// closed (see the startup restore path).
+    pub(crate) fn snapshot_is_current(snapshot_stamp: u64, current_stamp: u64) -> bool {
+        snapshot_stamp >= current_stamp
+    }
+
+    /// Restores `snap` only when it does not predate either the database's
+    /// `current_stamp` (a role-state removal advanced it) or `current_seq`
+    /// (a role-state event was stored). Returns false without touching the
+    /// store when the snapshot is stale, so the caller runs the existing
+    /// rebuild path (fail-closed): restoring it would resurrect a deleted
+    /// grant or lose a role-state event the snapshot predates.
+    pub(crate) fn restore_checked(
+        &mut self,
+        snap: RolesSnapshot,
+        current_stamp: u64,
+        current_seq: u64,
+    ) -> bool {
+        if !Self::snapshot_is_current(snap.stamp, current_stamp)
+            || !Self::snapshot_is_current(snap.seq, current_seq)
+        {
+            return false;
+        }
+        self.restore(snap);
+        true
     }
 
     pub fn create(
@@ -377,6 +427,16 @@ impl RoleStore {
                 _ => break,
             }
         }
+        // Drop assignments whose role definition did not survive: a
+        // NIP-09-deleted role must not keep authorizing its holders through
+        // the membership list that still names them. The filter runs after
+        // the whole scan because event timestamps are client-controlled: a
+        // membership list may legitimately precede its role definition.
+        let roles = &self.roles;
+        for assigned in self.assignments.values_mut() {
+            assigned.retain(|role| roles.contains_key(role));
+        }
+        self.assignments.retain(|_, assigned| !assigned.is_empty());
         true
     }
 }
@@ -423,6 +483,95 @@ mod tests {
             "empty assignments are dropped"
         );
         assert!(store.delete("king"));
+    }
+
+    #[test]
+    fn legacy_role_snapshot_without_stamp_restores_at_generation_zero() {
+        // Snapshots written before the stamp existed lack the field: it
+        // must default to 0 instead of failing the load (a failed load
+        // would force a rebuild and silently discard the persisted state).
+        // At generation 0 (no removal ever happened) the legacy snapshot is
+        // current.
+        let json = r#"{"roles":{"mod":{"label":"Mod","description":"","color":"","order":null}},"assignments":{"abc":["mod"]}}"#;
+        let snap: RolesSnapshot = serde_json::from_str(json).unwrap();
+        assert_eq!(snap.stamp, 0, "legacy snapshots have no generation stamp");
+        assert_eq!(snap.seq, 0, "legacy snapshots have no state sequence");
+
+        // Once a removal advanced the generation the legacy snapshot is
+        // stale and the startup path must rebuild instead.
+        let mut store = RoleStore::default();
+        assert!(!store.restore_checked(snap, 1, 0));
+        assert!(store.roles.is_empty(), "a rejected snapshot is not applied");
+
+        // At generation 0 (no removal ever happened) it is current.
+        let snap: RolesSnapshot = serde_json::from_str(json).unwrap();
+        let mut store = RoleStore::default();
+        assert!(store.restore_checked(snap, 0, 0));
+        assert!(store.roles.contains_key("mod"));
+        assert!(store.is_member_of("abc"));
+    }
+
+    #[test]
+    fn stale_role_snapshot_generation_is_rejected_at_restore() {
+        // Mirrors the NIP-29 group check: a snapshot taken before a
+        // role-state removal (its stamp is older than the database
+        // generation) must not be restored, because it would resurrect
+        // state the removal invalidated. Equal generations are current; a
+        // snapshot stamped ahead can only mean the counter was reset, and
+        // it is the freshest state available.
+        assert!(RoleStore::snapshot_is_current(7, 7));
+        assert!(RoleStore::snapshot_is_current(8, 7));
+        assert!(!RoleStore::snapshot_is_current(6, 7));
+
+        let mut store = RoleStore::default();
+        store.create("king", "king", "", "", None);
+        store.assign("abc", "king");
+        let mut stale = store.snapshot();
+        stale.stamp = 6;
+        stale.roles.clear();
+        stale.assignments.clear();
+        assert!(
+            !store.restore_checked(stale, 7, 7),
+            "a snapshot from before the current generation must be rejected"
+        );
+        assert!(
+            store.roles.contains_key("king"),
+            "a rejected snapshot must leave the store untouched"
+        );
+
+        let mut current = store.snapshot();
+        current.stamp = 7;
+        current.seq = 7;
+        assert!(store.restore_checked(current, 7, 7));
+        assert!(store.roles.contains_key("king"));
+    }
+
+    #[test]
+    fn stale_role_snapshot_sequence_is_rejected_at_restore() {
+        // The sequence tracks accepted role-state events, not just removals:
+        // a snapshot taken before the event advanced the sequence must not
+        // be restored, because the debounced persistence may have skipped
+        // the save that would have carried the event's state.
+        let mut store = RoleStore::default();
+        store.create("king", "king", "", "", None);
+        let mut snapshot = store.snapshot();
+        snapshot.stamp = 0;
+        snapshot.seq = 4;
+        let mut restored = RoleStore::default();
+        assert!(
+            !restored.restore_checked(snapshot, 0, 5),
+            "a snapshot below the current sequence must be rejected"
+        );
+        assert!(
+            restored.roles.is_empty(),
+            "a rejected snapshot is not applied"
+        );
+
+        let mut snapshot = store.snapshot();
+        snapshot.stamp = 0;
+        snapshot.seq = 5;
+        assert!(restored.restore_checked(snapshot, 0, 5));
+        assert!(restored.roles.contains_key("king"));
     }
 
     #[test]
@@ -619,6 +768,91 @@ mod tests {
             assert!(
                 !store.roles.contains_key("king"),
                 "a deleted role must not resurrect on restart"
+            );
+        });
+    }
+
+    #[test]
+    fn rebuild_drops_assignments_to_missing_roles() {
+        // A NIP-09-deleted role definition must not keep its holders
+        // authorized through the membership list that still names them: the
+        // rebuild keeps only the assignments whose role survived.
+        use crate::nips::nip01;
+        use std::sync::Arc;
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir()
+            .join("nostrfy-nip43-missing-role-test")
+            .join(format!("{:x}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        let cfg = crate::config::DatabaseConfig {
+            path,
+            map_size: 16 * 1024 * 1024,
+            max_map_size: 32 * 1024 * 1024,
+            ..Default::default()
+        };
+        let db = crate::db::DbClient::open(
+            &cfg,
+            true,
+            Arc::new(Default::default()),
+            0,
+            128,
+            4096,
+            262144,
+        )
+        .unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay_pk = "aa".repeat(32);
+            let kept_member = "cc".repeat(32);
+            let gone_member = "dd".repeat(32);
+            let mut role = Event {
+                id: String::new(),
+                pubkey: relay_pk.clone(),
+                created_at: 100,
+                kind: ROLE_DEFINITION,
+                tags: vec![
+                    vec!["-".into()],
+                    vec!["d".into(), "kept".into()],
+                    vec!["label".into(), "Kept".into()],
+                ],
+                content: String::new(),
+                sig: String::new(),
+            };
+            // The membership list still names the deleted role.
+            let mut members = Event {
+                id: String::new(),
+                pubkey: relay_pk.clone(),
+                created_at: 200,
+                kind: MEMBERSHIP_LIST,
+                tags: vec![
+                    vec!["-".into()],
+                    vec!["member".into(), kept_member.clone(), "kept".into()],
+                    vec!["member".into(), gone_member.clone(), "gone".into()],
+                ],
+                content: String::new(),
+                sig: String::new(),
+            };
+            for ev in [&mut role, &mut members] {
+                ev.id = nip01::compute_id(ev);
+            }
+            let now = unix_now();
+            for ev in [&role, &members] {
+                assert_eq!(db.put(ev.clone(), now).await, crate::db::PutOutcome::Stored);
+            }
+            let mut store = RoleStore::default();
+            assert!(
+                store.rebuild(&db, &relay_pk).await,
+                "the rebuild must complete"
+            );
+            assert!(store.roles.contains_key("kept"));
+            assert!(
+                store.is_member_of(&kept_member),
+                "the surviving role's grant must be restored"
+            );
+            assert!(
+                !store.is_member_of(&gone_member),
+                "a deleted role's grant must not be restored"
             );
         });
     }

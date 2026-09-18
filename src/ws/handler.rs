@@ -1,6 +1,14 @@
 //! Protocol message handlers (NIP-01/42/45/67/70/77) and the live
 //! delivery path. Every method operates on the [`super::Conn`] state; the
 //! connection loop itself lives in `super`.
+//!
+//! NIP-45 divergence (`limit`): `COUNT` ignores each filter's `limit`,
+//! including `limit: 0`, and counts every match (up to `limits.max_count`).
+//! NIP-45 asks for the size of the match set and defines no ordering or
+//! pagination, so a `limit` cannot bound "the last n events". `REQ` keeps
+//! the NIP-01 interpretation where `limit: 0` yields an empty page for that
+//! filter (and keeps the subscription alive). Both behaviors are pinned by
+//! tests; clients must not use `limit: 0` to probe a COUNT.
 
 use axum::extract::ws::Message;
 use serde_json::{Value, json};
@@ -496,7 +504,7 @@ impl super::Conn {
         let Some((events, more)) = self
             .relay
             .db
-            .query_req_reported(stored.clone(), max_limit, now)
+            .query_req_result(stored.clone(), max_limit, now)
             .await
         else {
             // A timed-out query must not be presented as an empty
@@ -506,7 +514,7 @@ impl super::Conn {
             // not keep receiving live events. REQ namespace only.
             let sub_id = sub_id.to_string();
             self.remove_req_subscription(&sub_id);
-            self.send_closed(&sub_id, "error: database timeout, please retry");
+            self.send_closed(&sub_id, "error: database unavailable; retry");
             return;
         };
         let mut to_send = Vec::new();
@@ -539,48 +547,34 @@ impl super::Conn {
                 to_send.push(event);
             }
         }
-        // Attribute the visible events to the filter whose quota they
-        // consume: the first filter with remaining quota that matches gets
-        // the event (the same rule the scan's search path applies), so a
-        // filter that matched many events cannot starve a later filter.
-        // Events at the boundary timestamp of a filter whose quota is
-        // already exhausted still belong to that filter's page (NIP-01/
-        // NIP-67: a page never splits a created_at tie), exactly like the
-        // scan's per-filter boundary continuation.
         // Note: `truncated || more` below is computed pre-visibility-filter
         // (like the scan's `more`), so a fully-withheld page can still
         // report `more`. That is conservative on purpose: it prompts the
         // client to authenticate (see the `auth` hint) instead of wrongly
         // claiming completeness.
-        let mut remaining = limits;
-        let mut boundaries: Vec<Option<u64>> = vec![None; remaining.len()];
-        let mut kept = Vec::with_capacity(to_send.len());
-        let mut truncated = false;
-        for event in to_send {
-            let mut placed = false;
-            for (i, filter) in stored.iter().enumerate() {
-                if remaining[i] == 0 {
-                    continue;
-                }
-                if filter.matches(&event) {
-                    remaining[i] -= 1;
-                    if remaining[i] == 0 {
-                        boundaries[i] = Some(event.created_at);
-                    }
-                    placed = true;
-                    break;
-                }
+        let (mut kept, mut truncated) = attribute_visible_page(&mut to_send, &stored, &limits);
+        // Same-second pagination guard: when the page is incomplete and
+        // every kept event shares one `created_at`, the scan ended at (or
+        // inside) that tie block and a client advancing inclusively
+        // (`until = T`) would receive the same block forever. The whole
+        // boundary second is dropped — a page never delivers a partial tie
+        // — and the older events the scan over-fetched are attributed
+        // instead, so the client's cursor advances past `T`. The omission
+        // keeps the `more` hint; the extreme flood (the scan returned only
+        // tie events) yields an empty `more` page, and the client proceeds
+        // from `T - 1` on the next request.
+        let page_capacity = limits.iter().copied().max().unwrap_or(0);
+        let mut tie_truncated = false;
+        while (more || truncated) && kept.len() >= page_capacity && !kept.is_empty() {
+            let boundary = kept[0].created_at;
+            if kept.iter().any(|event| event.created_at != boundary) {
+                break;
             }
-            if !placed {
-                placed = stored.iter().enumerate().any(|(i, filter)| {
-                    boundaries[i] == Some(event.created_at) && filter.matches(&event)
-                });
-            }
-            if placed {
-                kept.push(event);
-            } else {
-                truncated = true;
-            }
+            to_send.retain(|event| event.created_at != boundary);
+            let (next, next_truncated) = attribute_visible_page(&mut to_send, &stored, &limits);
+            kept = next;
+            truncated = next_truncated;
+            tie_truncated = true;
         }
         to_send = kept;
         // Bound the memory this response pins while it waits for the
@@ -647,7 +641,7 @@ impl super::Conn {
         pending.events = to_send.into();
         pending.budget = Some(std::sync::Arc::clone(&self.pending_budget));
         pending.reserved = reserved;
-        pending.truncated_or_more = truncated || more || byte_truncated;
+        pending.truncated_or_more = truncated || more || byte_truncated || tie_truncated;
         pending.auth_hint = auth_hidden;
     }
 
@@ -970,14 +964,19 @@ impl super::Conn {
                 f.search = None;
             }
         }
+        // `count_reported` (not `count_result`): NIP-45 COUNT must apply the
+        // connection's visibility rules (NIP-70/59/78/29) and the HLL
+        // registers, which need the matching events, not just their count.
+        // Both variants share the same reported-`None` failure contract.
         let Some((events, more)) = self
             .relay
             .db
             .count_reported(count_filters, count_limit, unix_now())
             .await
         else {
-            // A timed-out count must not be reported as zero.
-            self.reject_count(sub_id, "error: database timeout, please retry");
+            // A failed scan must not be reported as zero: the client
+            // cannot distinguish an error from an empty match set.
+            self.reject_count(sub_id, "error: database unavailable; retry");
             return;
         };
         // NIP-70/59/29: COUNT applies the same visibility rules as REQ, so
@@ -1282,6 +1281,55 @@ impl super::Conn {
             }
         }
     }
+}
+
+/// Attributes the visible scan results to the filters whose quotas they
+/// consume: the first filter with remaining quota that matches gets the
+/// event (the same rule the scan's search path applies), so a filter that
+/// matched many events cannot starve a later filter. Events at the
+/// boundary timestamp of a filter whose quota is already exhausted still
+/// belong to that filter's page (NIP-01/NIP-67: a page never splits a
+/// created_at tie), exactly like the scan's per-filter boundary
+/// continuation. Returns the kept events and whether any event was
+/// dropped (the caller turns that into the `more` completeness hint).
+/// Drains `events`, so the caller can re-run the attribution after
+/// dropping a boundary second.
+fn attribute_visible_page(
+    events: &mut Vec<Event>,
+    filters: &[Filter],
+    limits: &[usize],
+) -> (Vec<Event>, bool) {
+    let mut remaining = limits.to_vec();
+    let mut boundaries: Vec<Option<u64>> = vec![None; remaining.len()];
+    let mut kept = Vec::with_capacity(events.len());
+    let mut truncated = false;
+    for event in events.drain(..) {
+        let mut placed = false;
+        for (i, filter) in filters.iter().enumerate() {
+            if remaining[i] == 0 {
+                continue;
+            }
+            if filter.matches(&event) {
+                remaining[i] -= 1;
+                if remaining[i] == 0 {
+                    boundaries[i] = Some(event.created_at);
+                }
+                placed = true;
+                break;
+            }
+        }
+        if !placed {
+            placed = filters.iter().enumerate().any(|(i, filter)| {
+                boundaries[i] == Some(event.created_at) && filter.matches(&event)
+            });
+        }
+        if placed {
+            kept.push(event);
+        } else {
+            truncated = true;
+        }
+    }
+    (kept, truncated)
 }
 
 /// The JSON serialization size of a value without allocating the string:

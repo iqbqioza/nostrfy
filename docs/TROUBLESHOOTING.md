@@ -62,13 +62,17 @@ ss -tlnp | grep :8080
 
 ### 1-4. `nostrfy stop` hangs / `did not stop in time`
 
-**Cause**: The daemon is stuck or not responding.
+**Cause**: The daemon is stuck or not responding. Shutdown is graceful and bounded by the documented budget (`HTTP drain 5 s + background-task joins 5 s + WebSocket drain 7 s + database joins margin 10 s = 27 s`, plus a 5 s CLI margin), so a healthy daemon can take up to ~32 s to stop. `nostrfy stop` reports a timeout only when the process is still alive after that budget.
 
 **Fix**:
 
 ```bash
 # Check the process
 ps aux | grep nostrfy
+
+# Ask again: a second SIGTERM (or Ctrl-C in the foreground) forces an
+# immediate exit and removes the pid file
+kill -TERM <PID>
 
 # If it really will not stop, force-kill it
 kill -9 <PID>
@@ -187,7 +191,7 @@ When using Cloudflare Tunnel:
 
 **Cause**: The stored events of one REQ exceeded `max_req_response_bytes` (default 32 MiB) — the response is delivered in bounded chunks as the socket drains, and beyond the budget the subscription is closed so a slow reader cannot pin unbounded memory. This only happens with very large events or very wide filters.
 
-**Fix**: Narrow the filter (tighter `since`/`until`, a lower `limit`) or raise `max_req_response_bytes` (0 disables the budget).
+**Fix**: Narrow the filter (tighter `since`/`until`, a lower `limit`) or raise `max_req_response_bytes`. Note that `max_req_response_bytes = 0` disables only the *per-response* budget: the relay-wide pending-response budget still caps at 512 MiB (16 × the 32 MiB default), so a very large response can still be cut off by the global budget.
 
 ---
 
@@ -291,6 +295,14 @@ The request did not reach the relay with the Blossom Host header. Point `media.e
 
 The file is content-addressed by its SHA-256: fetch it via the exact hash returned in the upload response (`/<sha256>` or `/<sha256>.<ext>`). A mismatch means the client requested a different hash than the bytes it sent.
 
+### 3b-5. A blob is listed (`HEAD`/metadata) but `GET` 404s after a crash
+
+**Cause**: the blob object (file or S3 object) and its LMDB owner mapping are separate writes. Current builds publish the object first and commit the mapping only after the object is durable, so a crash in between leaves an invisible orphan object (never a listed blob whose bytes are missing). Builds before this file-first ordering could commit the mapping first, so a crash — or a `disabled_fsync` loss — could leave a **phantom mapping**: `HEAD` answers with metadata while `GET` 404s, and the per-blob owner cap can make a fresh upload of the same bytes fail with `409`.
+
+**Fix**: re-upload the exact bytes: the upload publishes the object and the existing mapping then resolves. If the owner cap refuses the re-upload, have one of the mapping's listed owners delete the blob through the Blossom API (BUD-02 `DELETE`) and upload again; a mapping with no reachable owner or a lost object needs an operator-side cleanup of the blob directory/mapping.
+
+**Monitoring**: every lookup that proves the object missing while the mapping exists — a definitive local `NotFound` or an S3 `404` under **all** owners (an owner error leaves the state unknown and is not counted) — increments the `nostrfy_blossom_missing_objects` counter (JSON snapshot: `blossom_missing_objects`). A growing value means the file tree / bucket and the LMDB mapping are drifting apart: here is the alerting signal. Reconciliation is intentionally lazy: the relay never diffs objects against the mapping at startup or in the background — that scan is unbounded (it would have to walk the mapping index or the whole blob tree) and would flag every not-yet-mapped object of a legacy store still being migrated. A missing object is healed only by re-uploading the exact bytes (which republishes the object and keeps the existing owners) or by deleting the blob through the API; the mapping itself is never removed automatically.
+
 ## 4. Search, Groups, Auth
 
 ### 4-1. Search returns 0 results / unexpected results
@@ -390,9 +402,9 @@ The NIP-98 spec says the `u` tag must be *exactly* the same as the absolute requ
 
 ### 5-2. `disk is full: refusing to commit N events`
 
-**Cause**: Less than 32 MB of free disk space. Writes stop (to protect the data); reads continue.
+**Cause**: The database filesystem (or the LMDB map) is full. Writes stop to protect the data; reads and live delivery continue. `GET /health` answers `503` with a `database is refusing writes` reason while this lasts, and `nostrfy_db_disk_full` / `nostrfy_db_free_bytes` (JSON: `db_disk_full`, `db_free_bytes`) expose the state to monitoring.
 
-**Fix**: Free up disk space. Writes resume automatically once space is available.
+**Fix**: Free up disk space (or raise `database.max_map_size` for a map-full error). Writes resume and `/health` returns `200` automatically once space is available — no restart is needed.
 
 ```bash
 df -h /path/to/data
@@ -415,7 +427,7 @@ curl http://127.0.0.1:8080/relay/stats
 
 **Cause**: an in-flight upload is streamed to `<blossom.local_path>/.spool` (the blob filesystem) before it is published, so concurrent uploads need disk headroom beyond the stored blobs. Disk-full refusals (`507`) trigger when free space drops below `blossom.min_free_bytes`.
 
-**Fix**: size the filesystem for `min_free_bytes` plus roughly one `max_upload_bytes` per expected concurrent upload. A killed process can leave spool files behind; the relay sweeps stale spools (only files whose owning process is gone) at startup and on later uploads. To clean up manually while the relay is stopped: `rm -rf <local_path>/.spool` (files of live uploads must not be removed). For `storage = "s3"` the spool lives in the system temp directory instead.
+**Fix**: size the filesystem for `min_free_bytes` plus roughly one `max_upload_bytes` per expected concurrent upload. A killed process can leave spool files behind; the relay sweeps stale spools (only files whose owning process is gone) **at startup only** — later uploads replace their own spool on completion, so a spool from a crash stays until the next restart (it is invisible to clients and is counted by `nostrfy_blossom_orphan_spools_swept` when removed). To clean up manually while the relay is stopped: `rm -rf <local_path>/.spool` (files of live uploads must not be removed). For `storage = "s3"` the spool lives in the system temp directory instead.
 
 ### 5-5. Backing up / moving the database
 
@@ -427,6 +439,40 @@ cp -a ./data ./data-backup
 # Also back up [blossom].local_path when using local Blossom storage.
 ./target/release/nostrfy --config nostrfy.toml start
 ```
+
+### 5-6. Acknowledged writes are missing, or the database will not open (`disabled_fsync`)
+
+**Cause**: `database.disabled_fsync = true` (LMDB `MDB_NOSYNC`) makes commits skip the fsync; the writer only force-syncs about once per second. A power loss or OS crash can therefore lose acknowledged writes, and if the OS persists the LMDB meta page before the data pages it references the database can be left corrupt (it may fail to open, or read stale/garbage pages). The startup log warns when the flag is enabled.
+
+**Fix**: Stop the relay and restore the newest backup into `database.path` (see 5-5), then run with `disabled_fsync = false` — or keep a continuously synced backup/replica if you need the throughput. Without a backup, `mdb_dump`/`mdb_load` (`lmdb-utils`) may salvage a readable prefix, but expect errors and missing recent data: restoring a backup is the only reliable recovery.
+
+### 5-7. The database directory keeps growing after vanishes or group purges
+
+**Cause/posture**: NIP-62 vanish requests keep one permanent marker per vanished pubkey (so the identity cannot re-publish and the startup rebuilds exclude its pre-vanish events), and NIP-29 group purges keep one permanent tombstone per purged group (so purged history cannot be re-published). These markers are deliberately never expired, so the tables grow by roughly one small entry (tens of bytes) per vanished identity / purged group — a per-action, not per-event, cost. The removed content itself is freed for reuse; with LMDB the file's high-water mark can stay at its peak even when pages are reused, and `database.map_size` is only a virtual-address reservation, so check actual usage with `nostrfy stats` (`db_size_bytes`) rather than the map size.
+
+**Monitoring**: the Prometheus/JSON gauge `nostrfy_pending_purges` counts recorded group purges that could not be completed at startup (the relay re-runs them before serving; it should be `0`, and a non-zero value means a group stays fail-closed/ghosted until the next restart retries). The vanish tables are observable too: `nostrfy_vanish_markers` is the permanent marker count (it grows by design, so alert on unexpected jumps, not on a threshold) and `nostrfy_pending_vanishes` is non-zero while a crash recovery is completing vanished-identity cleanup.
+
+### 5-8. Recommended monitoring and alerts
+
+The `/metrics` endpoint (Prometheus text format; `metrics_enabled = true`) and the JSON snapshot (`nostrfy stats`) share the same counters. Suggested alerts:
+
+| Metric | Alert on | Why |
+| --- | --- | --- |
+| `up` / `/health` status | process down or `/health` = `503` | `503` means the database refuses writes (disk full, map full, writer gone); the relay keeps serving reads but is losing publishes |
+| `nostrfy_db_errors` | any increase over a scrape interval | database faults (I/O errors, map full, dropped commits) |
+| `nostrfy_db_overloaded` | sustained increase | fail-fast admissions from a full queue: the relay is shedding load on purpose; scale up or raise `database.max_db_queue_*` |
+| `nostrfy_db_pending_msgs` / `nostrfy_db_pending_bytes` | near the configured caps for minutes | the writer cannot keep up; the next step is overload shedding |
+| `nostrfy_db_disk_full` | `1` for more than a few minutes | writes are refused; reads still work but the relay is read-only |
+| `nostrfy_log_errors` | any increase | the log file is no longer being written (log records are lost) |
+| `nostrfy_pending_purges` | `> 0` after startup | a NIP-29 group purge is incomplete: the group stays fail-closed/ghosted |
+| `nostrfy_pending_vanishes` | `> 0` after startup | a NIP-62 vanish is still completing |
+| `nostrfy_rebuild_failures` | any increase | a runtime NIP-29/NIP-43 derived-state rebuild failed; the store stays fail-closed until a later retry succeeds |
+| `nostrfy_blossom_missing_objects` | steady increase | the mapping references blobs that are gone from every owner (re-upload the bytes to heal) |
+| `nostrfy_blossom_orphan_spools_swept` | non-zero on every restart | uploads are being interrupted before publication |
+| `nostrfy_buffers_dropped` | sustained increase | slow readers are losing live events (they recover by re-subscribing) |
+| `nostrfy_db_size_bytes` | grows without bound | data growth; check the purge/expiry settings and map size headroom |
+| `nostrfy_conn_refused_global` / `_per_ip` / `_rate` / `_proxy` / `_blocked` | sustained increase | the connection caps, the per-IP rate limit or `blockip` are refusing traffic; verify it is the intended policy or raise the limits |
+| `nostrfy_accept_errors` | any increase | `accept()` is failing (often the file-descriptor limit); existing connections keep working but new ones cannot connect |
 
 ---
 

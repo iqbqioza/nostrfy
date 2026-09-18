@@ -272,19 +272,38 @@ mod tests {
         for content in contents {
             let words = tokenize(content);
             assert!(
-                matches_terms(content, &words) || words.is_empty(),
-                "every tokenized word must match: {content:?} -> {words:?}"
-            );
-            if let Some(first) = words.first() {
-                assert!(
-                    matches_terms(content, std::slice::from_ref(first)),
-                    "the first tokenized word must match: {content:?} -> {first:?}"
-                );
-            }
-            assert!(
                 !matches_terms(content, &["definitelynotpresent".to_string()]),
                 "an absent term must not match: {content:?}"
             );
+            if words.is_empty() {
+                // No indexable words (empty content, punctuation only or
+                // numeric/short words): there is nothing for the tokenized
+                // form to match, so the negative check above is the
+                // assertion that applies.
+                continue;
+            }
+            // Every tokenized word must match individually. Passing the
+            // whole vector would only prove that *some* word matched (the
+            // matcher is any-of), so a position-dependent bug in the
+            // streaming matcher — say, one that only ever matches the first
+            // word — would slip through.
+            for word in &words {
+                assert!(
+                    matches_terms(content, std::slice::from_ref(word)),
+                    "tokenized word {word:?} must match: {content:?} -> {words:?}"
+                );
+            }
+            // Every word passed as a term must match on its own, and every
+            // term set that shares no word with the tokenized form must
+            // not: the streaming matcher must agree with `tokenize` word
+            // for word, not merely "some word somewhere".
+            for word in &words {
+                let absent = format!("{word}x");
+                assert!(
+                    !matches_terms(content, std::slice::from_ref(&absent)),
+                    "a word extension must not match: {content:?} -> {absent:?}"
+                );
+            }
         }
         // Numeric-only and one-byte words are not words (the index excludes
         // them), so they cannot be matched.

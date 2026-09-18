@@ -671,8 +671,14 @@ pub async fn rpc_handler(
             let Ok(id): Result<[u8; 32], _> = id.try_into() else {
                 return rpc_err("invalid event id");
             };
-            relay.db.ban_event(id, reason).await;
+            // Like the neighboring mutations, a failed store must not be
+            // reported as success: the ban would silently disappear on the
+            // next restart.
+            let banned = relay.db.ban_event(id, reason).await;
             audit!(&relay, &identity, "banevent", params);
+            if !banned {
+                return rpc_err("error: cannot persist the event ban");
+            }
             rpc_ok(json!(true))
         }
         "allowevent" => {
@@ -685,8 +691,11 @@ pub async fn rpc_handler(
             let Ok(id): Result<[u8; 32], _> = id.try_into() else {
                 return rpc_err("invalid event id");
             };
-            relay.db.unban_event(id).await;
+            let unbanned = relay.db.unban_event(id).await;
             audit!(&relay, &identity, "allowevent", params);
+            if !unbanned {
+                return rpc_err("error: cannot persist the event unban");
+            }
             rpc_ok(json!(true))
         }
         "listbannedevents" => {
@@ -1153,8 +1162,31 @@ mod tests {
         );
         let _ = rpc_call(&relay, "unblockip", vec![json!("::9")]).await;
 
-        // banevent / allowevent / listbannedevents.
-        let id = "ab".repeat(32);
+        // banevent / allowevent / listbannedevents. The ban must name a
+        // stored event: the db's reply reports whether the event was
+        // actually removed, and an ignored failure would report success for
+        // a ban that did not land.
+        let secp = secp256k1::Secp256k1::new();
+        let keypair = secp256k1::Keypair::from_seckey_slice(&secp, &[13u8; 32]).unwrap();
+        let mut banned_event = crate::event::Event {
+            id: String::new(),
+            pubkey: secp256k1::XOnlyPublicKey::from_keypair(&keypair)
+                .0
+                .to_string(),
+            created_at: crate::util::unix_now(),
+            kind: 1,
+            tags: vec![],
+            content: "ban me".into(),
+            sig: String::new(),
+        };
+        banned_event.id = crate::nips::nip01::compute_id(&banned_event);
+        let id = banned_event.id.clone();
+        let raw = banned_event.id_bytes().unwrap();
+        banned_event.sig = secp.sign_schnorr_no_aux_rand(&raw, &keypair).to_string();
+        assert_eq!(
+            relay.db.put(banned_event, crate::util::unix_now()).await,
+            crate::db::PutOutcome::Stored
+        );
         let resp = rpc_call(&relay, "banevent", vec![]).await;
         assert!(rpc_err_of(resp).await.contains("params"));
         let resp = rpc_call(&relay, "banevent", vec![json!("zz")]).await;
@@ -1169,6 +1201,17 @@ mod tests {
         assert!(rpc_err_of(resp).await.contains("event id"));
         let resp = rpc_call(&relay, "allowevent", vec![json!(id.clone())]).await;
         assert!(rpc_ok_of(resp).await);
+        // A reply that reports the store as failed must surface an error,
+        // not a `true` result (the next call runs against the dead writer).
+        relay.db.shutdown();
+        let resp = rpc_call(&relay, "banevent", vec![json!(id.clone())]).await;
+        assert!(rpc_err_of(resp).await.contains("persist"));
+        let resp = rpc_call(&relay, "allowevent", vec![json!(id.clone())]).await;
+        assert!(rpc_err_of(resp).await.contains("persist"));
+        // The audit trail still records the attempted mutations.
+        let recent = relay.audit.recent();
+        assert!(recent.iter().any(|entry| entry.starts_with("banevent")));
+        assert!(recent.iter().any(|entry| entry.starts_with("allowevent")));
         let resp = rpc_call(&relay, "listbannedevents", vec![]).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let resp = rpc_call(&relay, "listeventsneedingmoderation", vec![]).await;

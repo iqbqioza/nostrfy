@@ -313,7 +313,9 @@ max_api_fetch = 55001
 max_api_search_bytes = 2048
 
 # Maximum bytes of outgoing messages queued per connection before new ones
-# are dropped (protects memory against slow readers). 0 = unlimited.
+# are dropped (protects memory against slow readers). 0 disables this
+# configured cap, but a safety ceiling derived from max_req_response_bytes
+# (2x, or 64 MiB when max_req_response_bytes is also 0) still applies.
 max_out_queue_bytes = 262144
 
 # Seconds a connection may stay idle (no inbound frames) before it is closed.
@@ -338,8 +340,10 @@ live_buffer = 65536
 # socket in bounded chunks as it drains, so a slow reader cannot pin more
 # than max_out_queue_bytes in the queue — or more than this budget per
 # response. Beyond the budget the subscription is closed with
-# `CLOSED ... response too large`. 0 disables the budget. Above 512 MiB
-# warns; above 2 GiB is rejected (one response could exhaust memory).
+# `CLOSED ... response too large`. 0 disables the per-response budget only:
+# the relay-wide pending-response budget (16 x the 32 MiB default = 512 MiB)
+# still bounds all in-flight responses together. Above 512 MiB warns; above
+# 2 GiB is rejected (one response could exhaust memory).
 max_req_response_bytes = 33554432
 
 # -----------------------------------------------------------------------------
@@ -393,7 +397,9 @@ db_buffer_size = 2048
 db_request_timeout_secs = 30
 
 # When true, fsync is skipped after each write batch (faster, but a power
-# loss can lose recent writes or corrupt the database — not recommended).
+# loss or OS crash can lose acknowledged writes or corrupt the database —
+# the writer only force-syncs about once per second). Use only with a
+# backup/replica you can restore from; not recommended.
 disabled_fsync = false
 
 # Overload protection: when the database thread's queue holds more than

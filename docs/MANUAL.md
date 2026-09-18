@@ -216,11 +216,11 @@ To generate a secret key, use the `nostrfy genkey` command (see [5. Command Refe
 | `max_tag_value_bytes` | Max bytes per tag value | `1024` |
 | `max_created_at_future_secs` | How many seconds of future timestamps are tolerated | `3600` |
 | `max_neg_items` | Max records per NIP-77 negentropy sync (above 1,000,000 warned, above 10,000,000 rejected) | `100000` |
-| `max_out_queue_bytes` | Per-connection outgoing queue cap (bytes; `0` = unlimited) | `262144` |
+| `max_out_queue_bytes` | Per-connection outgoing queue cap (bytes; `0` disables the configured cap, but a safety ceiling of 2× `max_req_response_bytes` — 64 MiB when that is also `0` — still applies) | `262144` |
 | `ws_idle_timeout_secs` | Close idle connections after this many seconds (0 = off) | `300` |
 | `http_read_timeout_secs` | Seconds to complete an HTTP request head or NIP-86 POST body (0 = disabled; slow-loris defense, applies to WS upgrades too) | `30` |
 | `max_connections_per_sec_per_ip` | Max new connections per second per source IP (0 = unlimited) | `0` |
-| `max_req_response_bytes` | Byte budget for one REQ response (0 = unlimited; over it the subscription is closed with `CLOSED`; above 2 GiB rejected) | `33554432` (32 MiB) |
+| `max_req_response_bytes` | Byte budget for one REQ response (0 = no per-response budget; the relay-wide 512 MiB budget still applies; over it the subscription is closed with `CLOSED`; above 2 GiB rejected) | `33554432` (32 MiB) |
 | `max_sub_bytes` | Total subscription filter bytes per connection | `1048576` |
 | `group_late_publish_secs` | Reject NIP-29 group events older than this (0 = off) | `3600` (1 hour) |
 | `max_api_concurrent` | Max concurrent REST API requests | `8` |
@@ -308,6 +308,8 @@ To generate a secret key, use the `nostrfy genkey` command (see [5. Command Refe
 curl http://127.0.0.1:8080/health
 # => {"status":"ok"}
 ```
+
+`200` means the process is serving and the database is accepting writes. `503` means the relay is **up but refusing writes** — the database disk or LMDB map is full, or the database writer is gone — and the body names the reason; reads and live delivery keep working, and the status returns to `200` automatically once space is available. Use `503` for write-path alerting only, not as a liveness/restart probe.
 
 ### NIP-11 information document
 
@@ -837,7 +839,7 @@ writer performs after every commit batch. Both are tunable in
 
 | Setting | Value | Why |
 | --- | --- | --- |
-| `database.disabled_fsync = true` | `false` | The dominant ingest cost is the fsync after each commit batch. With `disabled_fsync` the writer commits into the OS page cache (microseconds) and the kernel flushes shortly after; a power loss loses only the writes since the last flush. Start here. |
+| `database.disabled_fsync = true` | `false` | The dominant ingest cost is the fsync after each commit batch. With `disabled_fsync` the writer commits into the OS page cache (microseconds) and force-syncs about once per second; a power loss or OS crash can lose acknowledged writes and can corrupt the database, so use it only with a backup (or replica) you can restore from. For a single always-live instance, start with `max_db_queue_*` / batch tuning instead. |
 | CPU cores | ≥ 8 vCPU | The batch `EVENT` path verifies every signature in parallel across the cores (see below) before the cheap checks run |
 
 Starting the relay with `RUST_LOG=nostrfy=debug` shows the config the

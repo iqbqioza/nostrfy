@@ -17,6 +17,21 @@ pub(crate) struct NegState {
     /// bogus fingerprints would otherwise force an unbounded, CPU-bounded
     /// bisection over the held items on every message.
     pub(crate) rounds_left: u32,
+    /// The relay-wide NEG budget this state's items were reserved against
+    /// (`None` for test fixtures).
+    pub(crate) budget: Option<std::sync::Arc<super::PendingResponseBudget>>,
+    /// The bytes reserved in `budget`; released on drop so NEG-CLOSE,
+    /// replacement, connection drop and panic all unaccount exactly once
+    /// (the same RAII contract as `PendingReq`).
+    pub(crate) reserved: u64,
+}
+
+impl Drop for NegState {
+    fn drop(&mut self) {
+        if let Some(budget) = &self.budget {
+            budget.release(self.reserved);
+        }
+    }
 }
 
 /// Cap on the number of NEG-MSG rounds a single subscription may consume
@@ -157,7 +172,10 @@ impl super::Conn {
             return;
         };
 
-        let mut max_items = self.relay.config.read().await.limits.max_neg_items;
+        // The configured value also sizes the relay-wide budget below (the
+        // per-query cap is narrowed further for anonymous peers).
+        let configured_max_items = self.relay.config.read().await.limits.max_neg_items;
+        let mut max_items = configured_max_items;
         // Unauthenticated peers get a smaller per-query cap: the
         // per-connection budget is `2 × max_items`, and with the default
         // 100k items (~8 MiB held) times up to `max_connections` anonymous
@@ -190,6 +208,19 @@ impl super::Conn {
             );
             return;
         }
+        // Relay-wide CPU budget: spend the scan's worst case (this open's
+        // item cap) before the query runs, so a coordinated flood of
+        // NEG-OPENs across connections is refused before it reaches the
+        // reader threads. Charged even when the open fails later, like the
+        // per-connection open budget below: the scan work was already
+        // driven.
+        if !self.neg_cpu_budget.try_charge(
+            max_items as u64,
+            super::neg_cpu_budget_units(configured_max_items),
+        ) {
+            self.neg_err(&sub_id, "error: overloaded, please retry");
+            return;
+        }
         // Spend the budget before the scan: an open that fails later (a
         // codec error, a response over the byte budget, a full item cap)
         // has already driven the database query, so it must count too —
@@ -199,17 +230,15 @@ impl super::Conn {
         let now = unix_now();
         // The negentropy query only needs (created_at, id) records, so it
         // never materializes every matching full event in memory.
-        let Some((items, more)) = self
-            .relay
-            .db
-            .neg_items_reported(filter, max_items, now)
-            .await
+        let Some((items, more)) = self.relay.db.neg_query_result(filter, max_items, now).await
         else {
-            // A timed-out sync must never be answered with an empty item
-            // set: the peer would conclude everything is gone locally and
-            // delete its events. NEG-ERR closes the subscription per
-            // NIP-77, which is the safe failure mode.
-            self.neg_err(&sub_id, "error: database timeout, please retry");
+            // A failed sync must never be answered with an empty item set:
+            // the peer would conclude everything is gone locally and delete
+            // its events. The reported query variant returns `None` for
+            // every failure (timeout, fail-fast, the reader dropping the
+            // request on a store error); NEG-ERR closes the subscription
+            // per NIP-77, which is the safe retryable failure mode.
+            self.neg_err(&sub_id, "error: database unavailable; retry");
             return;
         };
         // The scan's collect cap is `max_items`, so the collected count can
@@ -283,14 +312,11 @@ impl super::Conn {
         // total so that many concurrent NEG-OPENs cannot pin excessive
         // memory on a single connection. A NEG-OPEN for an already open id
         // first closes the existing subscription (NIP-77), so its items are
-        // accounted out before the new set is admitted.
-        // Scope note: this (like `MAX_NEG_MSG_ROUNDS`/`MAX_NEG_OPENS`
-        // above) is a per-connection cap. The relay-wide
-        // `PendingResponseBudget` accounts materialized stored REQ
-        // responses only — NEG replies are completion-critical control
-        // frames that bypass the outgoing byte caps — so no global NEG
-        // budget exists; the per-connection item/round/open caps plus the
-        // `neg_backpressured` outgoing check are what bound NEG memory.
+        // accounted out before the new set is admitted. This per-connection
+        // cap (like `MAX_NEG_MSG_ROUNDS`/`MAX_NEG_OPENS` above) is a second
+        // bound: the relay-wide `neg_budget` below bounds the aggregate
+        // held items across connections, and `neg_backpressured` bounds the
+        // queued NEG replies.
         let total_cap = max_items.saturating_mul(2);
         let old_len = self
             .neg
@@ -336,23 +362,38 @@ impl super::Conn {
             );
             return;
         }
+        // Relay-wide NEG budget: the per-connection caps alone still let
+        // `max_connections` connections pin tens of GB of held items, so
+        // the set is reserved against the shared counter before it is
+        // stored. A NEG-OPEN for an already open id first closes the
+        // existing subscription (NIP-77): removing it releases its
+        // reservation and its subscription slot first, so a same-size
+        // replacement stays net zero even when the budget is full.
+        // Over-budget opens fail retryably (`error:`) — which per NIP-77
+        // closes the id — instead of pinning the items.
         if let Some(old) = self.neg.remove(&sub_id) {
             self.neg_total = self.neg_total.saturating_sub(old.items.len());
             // Release the subscription slot of the replaced negentropy
-            // subscription (the new one re-acquires it below).
-            self.relay
-                .stats
-                .subscriptions_active
-                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-            self.subscriptions_held
-                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            // subscription (the new one re-acquires it below). Dropping
+            // `old` also releases its budget reservation.
+            self.release_neg_stats_subscription();
         }
+        let item_bytes = items.len() as u64 * super::NEG_ITEM_BYTES;
+        let Some(reserved) = self
+            .neg_budget
+            .try_reserve(item_bytes, super::neg_budget_bytes(configured_max_items))
+        else {
+            self.neg_err(&sub_id, "error: overloaded, please retry");
+            return;
+        };
         self.neg_total += items.len();
         self.neg.insert(
             sub_id.clone(),
             NegState {
                 items,
                 rounds_left: MAX_NEG_MSG_ROUNDS,
+                budget: Some(std::sync::Arc::clone(&self.neg_budget)),
+                reserved,
             },
         );
         // NEG-OPEN subscriptions are active subscriptions: they hold
@@ -402,8 +443,13 @@ impl super::Conn {
         }
         // NIP-77 disabled mid-session (SIGHUP reload or a command event):
         // stop the in-flight sync like any other refusal instead of letting
-        // a disabled feature keep running.
-        if !self.relay.config.read().await.nip_enabled(77) {
+        // a disabled feature keep running. The configured item cap sizes
+        // the relay-wide CPU budget charged below.
+        let (nip77_enabled, configured_max_items) = {
+            let cfg = self.relay.config.read().await;
+            (cfg.nip_enabled(77), cfg.limits.max_neg_items)
+        };
+        if !nip77_enabled {
             self.neg_err(&sub_id, "error: negentropy is not enabled on this relay");
             return;
         }
@@ -443,6 +489,17 @@ impl super::Conn {
             return;
         };
         state.rounds_left -= 1;
+        // Relay-wide CPU budget: a round's bisection costs about its held
+        // item count. A coordinated flood of rounds across connections is
+        // refused retryably instead of monopolizing the CPU; per NIP-77
+        // the NEG-ERR closes this subscription.
+        if !self.neg_cpu_budget.try_charge(
+            state.items.len().max(1) as u64,
+            super::neg_cpu_budget_units(configured_max_items),
+        ) {
+            self.neg_err(&sub_id, "error: overloaded, please retry");
+            return;
+        }
         match nip77::respond(&state.items, &message) {
             Ok(response) => {
                 // Bound the response like the REQ path's

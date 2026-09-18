@@ -71,12 +71,16 @@ fn apply_covers_parent_child_roles_pins_and_delete() {
             .any(|e| e.kind == 39000 && e.tags.iter().any(|t| t[1] == "g2")),
         "the child's metadata is republished"
     );
-    // g1 adopts g3 as a child.
+    // g1 adopts g3 as a child (a metadata edit must carry every existing
+    // child, so g2 stays listed).
     let adopt = event(
         9002,
         ADMIN,
         Some("g1"),
-        vec![vec!["child".into(), "g3".into()]],
+        vec![
+            vec!["child".into(), "g2".into()],
+            vec!["child".into(), "g3".into()],
+        ],
     );
     store.apply(&adopt, "relay", now, true, false);
     assert_eq!(store.group("g3").unwrap().parent.as_deref(), Some("g1"));
@@ -84,14 +88,20 @@ fn apply_covers_parent_child_roles_pins_and_delete() {
     // re-parented.
     store.apply(&adopt, "relay", now, true, false);
     assert_eq!(store.group("g3").unwrap().parent.as_deref(), Some("g1"));
-    // g1 drops g3 from its children: the back-pointer is cleared.
+    // g1 drops g3 from its children (g2 stays listed): the back-pointer is
+    // cleared, and the unknown g4 stays a placeholder declaration. A
+    // dropping edit is not valid at runtime (NIP-29 requires every existing
+    // child), so this exercises the replay path (`ignore_capacity`).
     let drop_child = event(
         9002,
         ADMIN,
         Some("g1"),
-        vec![vec!["child".into(), "g4".into()]],
+        vec![
+            vec!["child".into(), "g2".into()],
+            vec!["child".into(), "g4".into()],
+        ],
     );
-    store.apply(&drop_child, "relay", now, true, false);
+    store.apply(&drop_child, "relay", now, true, true);
     assert_eq!(store.group("g3").unwrap().parent, None);
     // The old parent's metadata is republished when the parent changes.
     let reparent = event(
@@ -223,7 +233,17 @@ fn apply_covers_parent_child_roles_pins_and_delete() {
         false,
     );
     store.apply(
-        &event(9002, ADMIN, Some("g1"), vec![vec!["private".into()]]),
+        &event(
+            9002,
+            ADMIN,
+            Some("g1"),
+            vec![
+                vec!["private".into()],
+                // Keep the placeholder child alive in the replacing list
+                // (a metadata edit must carry every existing child).
+                vec!["child".into(), "g4".into()],
+            ],
+        ),
         "relay",
         now,
         true,
@@ -1567,6 +1587,76 @@ fn groups_snapshot_without_ghost_deserializes() {
     assert!(snap.groups.is_empty());
     assert!(snap.deleted.contains("g1"));
     assert!(snap.ghost.is_empty());
+    assert_eq!(snap.stamp, 0, "legacy snapshots have no generation stamp");
+    assert_eq!(snap.seq, 0, "legacy snapshots have no state sequence");
+}
+
+#[test]
+fn stale_snapshot_generation_is_rejected_at_restore() {
+    // A snapshot taken before a group-state removal (its stamp is older
+    // than the database generation) must not be restored: it would
+    // resurrect state the removal invalidated. Equal generations are
+    // current; a snapshot stamped ahead can only mean the counter was
+    // reset, and it is the freshest state available.
+    assert!(GroupStore::snapshot_is_current(7, 7));
+    assert!(GroupStore::snapshot_is_current(8, 7));
+    assert!(!GroupStore::snapshot_is_current(6, 7));
+
+    let mut store = GroupStore::default();
+    store.apply(
+        &event(CREATE_GROUP, ADMIN, Some("g1"), vec![]),
+        "relay",
+        1,
+        false,
+        false,
+    );
+    let mut stale = store.snapshot();
+    stale.stamp = 6;
+    assert!(
+        !store.restore_checked(stale, 7, 7),
+        "a snapshot from before the current generation must be rejected"
+    );
+    assert!(
+        store.group("g1").is_some(),
+        "a rejected snapshot must leave the store untouched"
+    );
+
+    let mut current = store.snapshot();
+    current.stamp = 7;
+    current.seq = 7;
+    assert!(store.restore_checked(current, 7, 7));
+    assert!(store.group("g1").is_some());
+}
+
+#[test]
+fn stale_snapshot_sequence_is_rejected_at_restore() {
+    // The sequence tracks accepted state events, not just removals: a
+    // snapshot below the current sequence predates an event (a debounced
+    // save may have skipped it) and must be rebuilt instead of restored.
+    let mut store = GroupStore::default();
+    store.apply(
+        &event(CREATE_GROUP, ADMIN, Some("g1"), vec![]),
+        "relay",
+        1,
+        false,
+        false,
+    );
+    let mut snapshot = store.snapshot();
+    snapshot.seq = 3;
+    let mut restored = GroupStore::default();
+    assert!(
+        !restored.restore_checked(snapshot, 0, 4),
+        "a snapshot below the current sequence must be rejected"
+    );
+    assert!(
+        restored.group("g1").is_none(),
+        "a rejected snapshot is not applied"
+    );
+
+    let mut snapshot = store.snapshot();
+    snapshot.seq = 4;
+    assert!(restored.restore_checked(snapshot, 0, 4));
+    assert!(restored.group("g1").is_some());
 }
 
 #[test]
@@ -1876,6 +1966,252 @@ fn global_member_budget_is_enforced_and_freed_on_leave() {
     store.apply(&replay, "", 5, true, true);
     assert_eq!(store.total_members, 4);
     assert!(store.group("g1").unwrap().is_member(&"ff".repeat(32)));
+}
+
+#[test]
+fn declared_children_hint_is_bounded() {
+    // The adoption hint is a monotonic set; without a bound, repeated 9002
+    // edits with fresh placeholder child ids would grow it without limit
+    // (and `at_capacity` never counted it). The hint is capped and stale
+    // entries are pruned when a fresh declaration arrives at the bound.
+    let mut store = GroupStore::with_cap(2);
+    let cap = store.declared_children_cap();
+    assert_eq!(cap, 2 * 4, "the cap is a small multiple of max_groups");
+    store.apply(
+        &event(CREATE_GROUP, ADMIN, Some("g1"), vec![]),
+        "relay",
+        1,
+        false,
+        false,
+    );
+    for round in 0..50u32 {
+        let children: Vec<Vec<String>> = (0..32)
+            .map(|i| vec!["child".into(), format!("c{round}-{i}")])
+            .collect();
+        store.apply(
+            &event(9002, ADMIN, Some("g1"), children),
+            "relay",
+            2,
+            false,
+            false,
+        );
+        assert!(
+            store.declared_children.len() <= cap,
+            "round {round}: the hint grew past its bound ({})",
+            store.declared_children.len()
+        );
+    }
+    // A single 9002 with more fresh placeholders than the cap allows is
+    // refused with a clear error (the apply side keeps the store bounded).
+    let overflow: Vec<Vec<String>> = (0..=cap)
+        .map(|i| vec!["child".into(), format!("o{i}")])
+        .collect();
+    let oversized = event(9002, ADMIN, Some("g1"), overflow);
+    assert_eq!(
+        store.validate_write(&oversized).unwrap_err().to_string(),
+        "restricted: too many declared child groups"
+    );
+}
+
+#[test]
+fn interleaved_9002_edits_recheck_the_graph_under_the_lock() {
+    // Two 9002 edits can each pass the read-side validation against the
+    // same state and then interleave into a cycle or drop a child another
+    // edit just adopted. The apply path re-checks under the write lock.
+    let mut store = seeded();
+    for gid in ["g2", "g3"] {
+        store.apply(
+            &event(CREATE_GROUP, ADMIN, Some(gid), vec![]),
+            "relay",
+            1,
+            false,
+            false,
+        );
+    }
+    // Both edits pass validation before either is applied: g1 -> parent g2
+    // and g2 -> parent g1 would form a cycle once the first lands.
+    let a = event(
+        9002,
+        ADMIN,
+        Some("g1"),
+        vec![vec!["parent".into(), "g2".into()]],
+    );
+    let b = event(
+        9002,
+        ADMIN,
+        Some("g2"),
+        vec![vec!["parent".into(), "g1".into()]],
+    );
+    assert!(store.validate_write(&a).is_ok());
+    assert!(store.validate_write(&b).is_ok());
+    store.apply(&a, "relay", 2, false, false);
+    store.apply(&b, "relay", 2, false, false);
+    assert_eq!(store.group("g1").unwrap().parent.as_deref(), Some("g2"));
+    assert_eq!(
+        store.group("g2").unwrap().parent,
+        None,
+        "the cycle-forming edit must be dropped by the write-lock re-check"
+    );
+
+    // Adopt g3 on g2 (c) while dropping g2's children (d): each passes
+    // validation before the other applies, but d no longer carries g3.
+    // (g1 is already in g2's list from the parent edit above.)
+    let c = event(
+        9002,
+        ADMIN,
+        Some("g2"),
+        vec![
+            vec!["child".into(), "g1".into()],
+            vec!["child".into(), "g3".into()],
+        ],
+    );
+    let d = event(
+        9002,
+        ADMIN,
+        Some("g2"),
+        vec![vec!["child".into(), "g1".into()]],
+    );
+    assert!(store.validate_write(&c).is_ok());
+    assert!(store.validate_write(&d).is_ok());
+    store.apply(&c, "relay", 3, false, false);
+    store.apply(&d, "relay", 3, false, false);
+    assert!(
+        store
+            .group("g2")
+            .unwrap()
+            .children
+            .contains(&"g3".to_string()),
+        "the edit that would silently drop the adopted child must be dropped"
+    );
+}
+
+#[test]
+fn last_admin_grant_skipped_at_capacity_is_not_retained() {
+    // A 9000 whose only admin-preserving grant is a fresh member that the
+    // apply loop then skips at the member cap must not count as retaining
+    // an admin: otherwise the demotion of the real last admin applies and
+    // leaves the group admin-less.
+    let mut store = seeded();
+    store.max_total_members = 3;
+    // The read-side validation passes while the global budget still has a
+    // slot for the fresh grant...
+    let fresh = "ff".repeat(32);
+    let demote = event(
+        9000,
+        ADMIN,
+        Some("g1"),
+        vec![
+            vec![P.into(), ADMIN.into()],
+            vec![P.into(), fresh.clone(), "mod".into()],
+        ],
+    );
+    assert!(store.validate_write(&demote).is_ok());
+    // ...but a concurrent JOIN consumes it first.
+    let joiner = "ee".repeat(32);
+    let join = event(JOIN, &joiner, Some("g1"), vec![]);
+    assert!(store.validate_write(&join).is_ok());
+    store.apply(&join, "", 2, false, false);
+    assert_eq!(store.total_members, 3);
+    // The grant cannot be inserted under the write lock, so the demotion
+    // of the last admin must be dropped too.
+    store.apply(&demote, "", 3, false, false);
+    let group = store.group("g1").unwrap();
+    assert!(
+        group.is_admin(ADMIN),
+        "the last admin must survive a capacity-skipped grant"
+    );
+    assert!(
+        !group.is_member(&fresh),
+        "the fresh grant must not be inserted at the global cap"
+    );
+
+    // The same at the per-group cap (fill the group through apply).
+    let mut store = GroupStore::default();
+    store.apply(
+        &event(CREATE_GROUP, ADMIN, Some("g1"), vec![]),
+        "",
+        1,
+        false,
+        false,
+    );
+    // Plain members (no roles): ADMIN stays the only admin, so the
+    // capacity-skipped fresh grant is the only way to retain one.
+    let fill: Vec<Vec<String>> = (0..super::MAX_MEMBERS - 1)
+        .map(|i| vec![P.into(), format!("{:064x}", i + 1)])
+        .collect();
+    store.apply(&event(9000, ADMIN, Some("g1"), fill), "", 1, false, false);
+    assert_eq!(store.group("g1").unwrap().members.len(), super::MAX_MEMBERS);
+    store.apply(
+        &event(
+            9000,
+            ADMIN,
+            Some("g1"),
+            vec![
+                vec![P.into(), ADMIN.into()],
+                vec![P.into(), "aa".repeat(31) + "b", "mod".into()],
+            ],
+        ),
+        "",
+        2,
+        false,
+        false,
+    );
+    assert!(
+        store.group("g1").unwrap().is_admin(ADMIN),
+        "the last admin must survive a group-capacity-skipped grant"
+    );
+}
+
+#[test]
+fn rebuild_ignores_d_tags_on_non_group_kinds() {
+    // Every addressable event carries a `d` tag; only kinds 39000-39005
+    // identify a group by it. Treating an arbitrary `d` value as a group id
+    // would ghost non-existent groups (withholding content that never
+    // belonged to one) and consume the group budget.
+    use crate::db::DbClient;
+    use crate::nips::nip01;
+    use std::sync::Arc;
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = std::env::temp_dir()
+        .join("nostrfy-nip29-d-tag-kind")
+        .join(format!("{:x}-{id}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&path);
+    let cfg = crate::config::DatabaseConfig {
+        path,
+        map_size: 16 * 1024 * 1024,
+        max_map_size: 32 * 1024 * 1024,
+        ..Default::default()
+    };
+    let db = DbClient::open(
+        &cfg,
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let now = 1_700_000_000;
+        // A long-form event with a `d` tag but no `h` tag.
+        let mut article = event(30023, OTHER, None, vec![vec![D.into(), "article-1".into()]]);
+        article.created_at = now;
+        article.id = nip01::compute_id(&article);
+        assert_eq!(
+            db.put(article.clone(), now).await,
+            crate::db::PutOutcome::Stored
+        );
+        let mut store = GroupStore::default();
+        assert!(store.rebuild(&db).await, "the rebuild must complete");
+        assert!(
+            store.ghost.is_empty(),
+            "a non-group `d` tag must not ghost a group: {:?}",
+            store.ghost
+        );
+    });
 }
 
 #[test]

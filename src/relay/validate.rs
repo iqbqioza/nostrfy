@@ -27,6 +27,18 @@ pub(crate) enum Precheck {
     Vanish,
 }
 
+/// A batch's pre-fetched `previous` tag references. `capped` records that
+/// the prefetch hit its bound (see `Relay::batch_known_prefixes`):
+/// references past the cap are absent from `known` through no fault of the
+/// client, so a miss on a capped batch is reported as a retryable
+/// rate limit instead of an invalid reference. The reference check itself
+/// is not weakened — the event is still rejected, and no per-reference
+/// database lookup is attempted.
+pub(crate) struct KnownPrevious<'a> {
+    pub known: &'a std::collections::HashSet<Vec<u8>>,
+    pub capped: bool,
+}
+
 /// The smallest batch large enough for parallel signature verification to
 /// beat the per-thread spawn overhead (a flood from one connection yields
 /// batches far above this).
@@ -105,7 +117,8 @@ impl super::Relay {
     /// rejection and the NIP-29 write-access rules (h tag, relay-signed
     /// metadata, late publication, membership and `previous` references).
     /// `known_prefixes` supplies the batch's pre-fetched `previous` tag
-    /// references; `None` falls back to per-reference database lookups.
+    /// references (including whether the prefetch was capped); `None` falls
+    /// back to per-reference database lookups.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn precheck(
         &self,
@@ -114,7 +127,7 @@ impl super::Relay {
         event: &Event,
         now: u64,
         authed: &[String],
-        known_prefixes: Option<&std::collections::HashSet<Vec<u8>>>,
+        known_prefixes: Option<&KnownPrevious<'_>>,
         verified: Option<bool>,
     ) -> Precheck {
         // Structural and signature validation first: the vanish detection
@@ -256,11 +269,18 @@ impl super::Relay {
                     };
                     if !prefix.is_empty() {
                         let exists = match known_prefixes {
-                            Some(known) => known.contains(&prefix),
+                            Some(known) => known.known.contains(&prefix),
                             None => self.db.event_id_prefix_exists(&prefix).await,
                         };
                         if !exists {
-                            unknown = Some("invalid: unknown previous tag reference");
+                            // A capped prefetch could not have resolved this
+                            // reference: report a retryable rate limit
+                            // instead of claiming the reference is wrong.
+                            unknown = Some(if known_prefixes.is_some_and(|known| known.capped) {
+                                "rate-limited: previous tag reference was not prefetched; retry"
+                            } else {
+                                "invalid: unknown previous tag reference"
+                            });
                             break;
                         }
                     }
@@ -1937,10 +1957,39 @@ mod tests {
             // A known prefix (via the known-prefixes set) passes.
             let ev = gh(1, vec![vec!["previous".into(), "ab".repeat(32)]]);
             let known = std::collections::HashSet::from([hex::decode("ab".repeat(32)).unwrap()]);
+            let known = super::KnownPrevious {
+                known: &known,
+                capped: false,
+            };
             let out = relay
                 .precheck(&cfg, &access, &ev, now, &[], Some(&known), None)
                 .await;
             assert!(matches!(out, super::Precheck::Accept));
+
+            // A miss against a *capped* prefetch is reported as retryable:
+            // the reference may simply be past the cap, so blaming it as
+            // unknown would mislead the client.
+            let ev = gh(1, vec![vec!["previous".into(), "cd".repeat(32)]]);
+            let capped = super::KnownPrevious {
+                known: &std::collections::HashSet::new(),
+                capped: true,
+            };
+            let out = relay
+                .precheck(&cfg, &access, &ev, now, &[], Some(&capped), None)
+                .await;
+            match out {
+                super::Precheck::Reject(m) => {
+                    assert!(
+                        m.contains("rate-limited") && m.contains("retry"),
+                        "a capped-prefetch miss must be reported as retryable: {m}"
+                    );
+                    assert!(
+                        !m.contains("unknown previous"),
+                        "a capped-prefetch miss must not blame the reference: {m}"
+                    );
+                }
+                _ => panic!("a capped-prefetch miss must be rejected"),
+            }
 
             // The late-publish guard rejects old group events.
             let mut cfg2 = (*cfg).clone();

@@ -12,8 +12,10 @@
 
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::db::DbClient;
+use crate::stats::Stats;
 use anyhow::anyhow;
 
 use crate::error::Result;
@@ -93,11 +95,45 @@ impl std::error::Error for BlobOwnerLimit {}
 /// correctness.
 const MAX_BLOB_OWNERS: usize = 64;
 
+/// The outcome of a store-level object lookup. `Missing` is a definitive
+/// "the object is not there" (local `NotFound`, S3 `404`); `Refused` means
+/// the lookup was not performed because the path is unsafe (a symlinked
+/// blob directory or object), so the object's existence is unknown. Only
+/// `Missing` may feed the mapped-but-missing counter — a refused lookup
+/// counted as missing would inflate it with an operator error rather than
+/// a real object loss.
+pub(crate) enum OpenOutcome {
+    Found(BlobStream),
+    Missing,
+    Refused,
+}
+
+/// Result of one [`BlobStore::auto_migrate_legacy`] pass.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum MigrationOutcome {
+    /// The pass finished and the database marker is set.
+    Completed(usize),
+    /// The relay drained before the pass finished. The marker is **not**
+    /// set, so the next start reruns the migration; the chunks committed
+    /// before the stop are re-added idempotently there.
+    Interrupted(usize),
+}
+
 /// Blob storage: the LMDB-persisted mapping plus the file backend.
 pub(crate) struct BlobStore {
     storage: Storage,
     db: DbClient,
+    /// The relay's shared counters; the blossom code bumps
+    /// `blossom_missing_objects` through this handle (the stats writer
+    /// cannot poll it without reaching into the store).
+    stats: Arc<Stats>,
     upload_locks: Vec<tokio::sync::Mutex<()>>,
+    /// Stale spool files removed by the startup sweep (see
+    /// [`Self::sweep_stale_spools`]): each one is a temporary upload that
+    /// died before it could publish, so it doubles as the cheap
+    /// orphan/interrupted-upload signal. Exposed via
+    /// [`Self::orphan_spools_swept`] for the stats owner.
+    orphan_spools_swept: std::sync::atomic::AtomicU64,
     /// Test-only one-shot fault injection: the next owner-mapping commit is
     /// treated as a database failure so the publish-first ordering (an
     /// orphan object, never a phantom mapping) is testable without a real
@@ -115,6 +151,7 @@ impl BlobStore {
         min_free_bytes: u64,
         s3: Option<S3Config>,
         db: DbClient,
+        stats: Arc<Stats>,
     ) -> Result<BlobStore> {
         let storage = match storage {
             "local" => Storage::Local(LocalStore::new(local_path, min_free_bytes).await?),
@@ -130,9 +167,11 @@ impl BlobStore {
         Ok(BlobStore {
             storage,
             db,
+            stats,
             upload_locks: (0..Self::UPLOAD_LOCK_COUNT)
                 .map(|_| tokio::sync::Mutex::new(()))
                 .collect(),
+            orphan_spools_swept: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             fail_next_mapping: std::sync::atomic::AtomicBool::new(false),
         })
@@ -189,9 +228,20 @@ impl BlobStore {
     /// missing body). Files this process start owns (matching token) and
     /// files of unknown shape are never touched. A removal failure is
     /// ignored (best effort).
+    ///
+    /// This is the whole file/mapping reconciliation story: the publish
+    /// path writes the object first and the LMDB mapping second, so a crash
+    /// leaves at most an invisible, overwritable orphan object — never a
+    /// mapping that 404s — and the only cheap orphan evidence is the
+    /// interrupted upload's spool file. No startup object-vs-mapping diff
+    /// is attempted: it would need an unbounded scan of the mapping index
+    /// (or the whole blob tree), and a legacy database whose mappings
+    /// `auto_migrate_legacy` is still rebuilding would report every
+    /// not-yet-mapped object as an orphan.
     pub(crate) fn sweep_stale_spools(&self) {
         let current = spool_process_token();
         let now = std::time::SystemTime::now();
+        let mut swept = 0u64;
         let mut dirs = vec![std::env::temp_dir()];
         if let Some(dir) = self.spool_dir() {
             dirs.push(dir);
@@ -217,11 +267,28 @@ impl BlobStore {
                 // yields PID 1 again). It is stale once its PID is gone, or
                 // once it outlived the grace period and can no longer be a
                 // live sibling's spool.
-                if !process_alive(pid) || spool_older_than(&entry, now) {
-                    let _ = std::fs::remove_file(entry.path());
+                if (!process_alive(pid) || spool_older_than(&entry, now))
+                    && std::fs::remove_file(entry.path()).is_ok()
+                {
+                    swept += 1;
                 }
             }
         }
+        if swept > 0 {
+            self.orphan_spools_swept
+                .fetch_add(swept, std::sync::atomic::Ordering::Relaxed);
+            log::info!("Blossom spool sweep: removed {swept} orphaned upload spool file(s)");
+        }
+    }
+
+    /// Stale spool files removed by [`Self::sweep_stale_spools`] since this
+    /// store was created. A plain counter the stats owner can wire as
+    /// `nostrfy_blossom_orphan_spools_swept` (counter): read
+    /// `relay.blossom.read().await` and call this getter.
+    #[allow(dead_code)] // Wired into `Stats` by the server/stats owner.
+    pub(crate) fn orphan_spools_swept(&self) -> u64 {
+        self.orphan_spools_swept
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub(crate) fn spool_dir(&self) -> Option<PathBuf> {
@@ -341,11 +408,14 @@ impl BlobStore {
         };
         let existed = existing.is_some();
         // A new owner past the per-blob cap is refused by the database
-        // anyway; pre-checking turns the resulting commit failure into a
-        // client-visible conflict (409) instead of a 500. The load above is
-        // not atomic with the add, so a concurrent upload can still win the
-        // last slot — the database cap remains the real guard (the raced
-        // loser then leaves an orphan object, never a mapping).
+        // anyway; pre-checking turns the refusal into a client-visible
+        // conflict (409) instead of a 500. This is the only provable cap
+        // rejection: the database reports a failed add as a bare `false`,
+        // so a *failed* commit (the list may have filled concurrently, or
+        // the storage may have faulted) cannot be classified after the
+        // fact without risking a false 409. It therefore surfaces as a
+        // generic storage error (500); restoring the raced 409 needs the
+        // database to return a typed cap outcome (`blossom_add_owner`).
         if let Some(meta) = &existing
             && !meta.owners.iter().any(|o| o == pubkey)
             && meta.owners.len() >= MAX_BLOB_OWNERS
@@ -366,8 +436,8 @@ impl BlobStore {
             .await
         {
             return Err(anyhow!(
-                "blossom mapping write failed; the published object is an invisible orphan \
-                 that a later upload of the same bytes overwrites"
+                "blossom mapping write failed; the published object is an invisible \
+                 orphan that a later upload of the same bytes overwrites"
             ));
         }
         if existed && let Some(meta) = self.db.blossom_load(sha256).await {
@@ -438,11 +508,17 @@ impl BlobStore {
             return Ok(None);
         };
         let mut last_error: Option<anyhow::Error> = None;
+        let mut missing = false;
         for owner in &meta.owners {
             match self.open_stream(owner, sha256, start, len).await {
-                Ok(Some(stream)) => return Ok(Some((stream, owner.clone()))),
-                // Missing under this owner: try the next copy.
-                Ok(None) => {}
+                // Found: stream it.
+                Ok(OpenOutcome::Found(stream)) => return Ok(Some((stream, owner.clone()))),
+                // Missing under this owner (a definitive local NotFound, or
+                // an S3 404): try the next copy.
+                Ok(OpenOutcome::Missing) => missing = true,
+                // Refused (unsafe symlinked path): the object's existence
+                // is unknown, so this must not feed the missing counter.
+                Ok(OpenOutcome::Refused) => {}
                 Err(e) => {
                     log::warn!("blossom: opening {sha256} for owner {owner} failed: {e}");
                     last_error = Some(e);
@@ -451,7 +527,17 @@ impl BlobStore {
         }
         match last_error {
             Some(e) => Err(e),
-            None => Ok(None),
+            None => {
+                if missing {
+                    // The mapping exists but every owner's object is
+                    // definitively gone: count the mapped-but-missing blob
+                    // (best effort, no behavior change — the mapping is
+                    // kept and a re-upload heals it). An owner error above
+                    // means the state is unknown, so it is not counted.
+                    self.stats.bump(&self.stats.blossom_missing_objects, 1);
+                }
+                Ok(None)
+            }
         }
     }
 
@@ -468,28 +554,40 @@ impl BlobStore {
     /// Opens a streamable reader for the blob, positioned at `start`
     /// (the caller derived `start`/`len` from the descriptor's size and a
     /// parsed Range header). The body is streamed in chunks, so a large
-    /// blob is never materialized in memory in full.
+    /// blob is never materialized in memory in full. The returned
+    /// [`OpenOutcome`] distinguishes a definitive absence from a refused
+    /// unsafe lookup (see the enum).
     pub(crate) async fn open_stream(
         &self,
         pubkey: &str,
         sha256: &str,
         start: u64,
         len: u64,
-    ) -> Result<Option<BlobStream>> {
+    ) -> Result<OpenOutcome> {
         // The canonical npub first; a blob stored under the legacy
         // bech32m npub directory (before the encoder became canonical)
         // is found via the fallback so old uploads stay readable.
         let npub = npub_of(pubkey);
         let legacy = legacy_npub_of(pubkey);
+        let mut refused = false;
         for candidate in [npub.as_str(), legacy.as_str()] {
-            if let Some(stream) = match &self.storage {
+            let outcome = match &self.storage {
                 Storage::Local(s) => s.open(candidate, sha256, start, len).await?,
                 Storage::S3(s) => s.open(candidate, sha256, start, len).await?,
-            } {
-                return Ok(Some(stream));
+            };
+            match outcome {
+                OpenOutcome::Found(stream) => return Ok(OpenOutcome::Found(stream)),
+                OpenOutcome::Missing => {}
+                OpenOutcome::Refused => refused = true,
             }
         }
-        Ok(None)
+        // A refusal anywhere keeps the "unknown" classification: the object
+        // must not be counted as definitively missing.
+        Ok(if refused {
+            OpenOutcome::Refused
+        } else {
+            OpenOutcome::Missing
+        })
     }
 
     /// Deletes the requester's copy: the file under their npub directory
@@ -526,9 +624,23 @@ impl BlobStore {
     /// chunks and are committed as they arrive, so a legacy store with
     /// hundreds of thousands of blobs never materializes the full listing
     /// (nor a task per object) in memory.
-    pub(crate) async fn auto_migrate_legacy(&self) -> Result<usize> {
+    ///
+    /// The relay's `drain` signal is observed before the scan starts and in
+    /// the pass loop: shutdown returns [`MigrationOutcome::Interrupted`]
+    /// without writing the marker, so the next start reruns the pass (the
+    /// chunks already committed are re-added idempotently). The marker is
+    /// written only after the scan finished and every chunk committed.
+    pub(crate) async fn auto_migrate_legacy(
+        &self,
+        mut drain: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<MigrationOutcome> {
         if self.db.blossom_migration_done().await {
-            return Ok(0);
+            return Ok(MigrationOutcome::Completed(0));
+        }
+        // Shutdown before the pass even started: do not scan a store whose
+        // database is about to stop, and leave the marker unset.
+        if *drain.borrow() {
+            return Ok(MigrationOutcome::Interrupted(0));
         }
         // Backpressure of one chunk: the scanner waits while a slow disk
         // commits, bounding transient memory to ~2 chunks + one page.
@@ -546,6 +658,13 @@ impl BlobStore {
         loop {
             tokio::select! {
                 biased;
+                // Shutdown: abandon the scan at the next await. The marker
+                // stays unset (below is never reached), so the pass is
+                // resumable; a sender that is already gone counts as a
+                // drain too (the relay is being dropped).
+                _ = drain.changed() => {
+                    return Ok(MigrationOutcome::Interrupted(count));
+                }
                 r = &mut scan, if scanning => {
                     // The scanner finished (its sender is dropped): keep
                     // draining already-queued chunks below.
@@ -573,7 +692,7 @@ impl BlobStore {
             }
         }
         self.db.mark_blossom_migration().await;
-        Ok(count)
+        Ok(MigrationOutcome::Completed(count))
     }
 
     /// Blobs uploaded by `pubkey` (hex), via the persisted reverse index,
@@ -907,17 +1026,24 @@ impl LocalStore {
     }
 
     fn release(&self, size: u64) {
+        // Mirror `reserve`: with the floor disabled nothing was counted, so
+        // subtracting here would wrap the counter.
+        if self.min_free_bytes == 0 {
+            return;
+        }
         self.reserved
             .fetch_sub(size, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Fsyncs the directory a blob was just renamed into, so the new name
     /// is durable on disk. Without this, a crash after the (already
-    /// durable) LMDB mapping commit could leave the mapping pointing at a
-    /// file whose directory entry was never written — the blob reads as
-    /// missing until the mapping is manually deleted. Best effort: the
-    /// failure is logged, not fatal, because the state is healable.
-    async fn sync_dir(&self, npub: &str) {
+    /// durable) file contents could leave a final name whose directory
+    /// entry was never written. The failure is returned (not swallowed) so
+    /// the caller can refuse to commit the LMDB mapping: a mapping whose
+    /// object's directory entry is not durable can materialize as a blob
+    /// that 404s after a crash, while skipping the mapping leaves at most
+    /// an invisible orphan object that a re-upload overwrites.
+    async fn sync_dir(&self, npub: &str) -> Result<()> {
         #[cfg(unix)]
         {
             let dir = self.npub_dir_path(npub);
@@ -927,10 +1053,12 @@ impl LocalStore {
             };
             if let Err(e) = result {
                 log::warn!("blossom: cannot fsync directory {}: {e}", dir.display());
+                return Err(e.into());
             }
         }
         #[cfg(not(unix))]
         let _ = npub;
+        Ok(())
     }
 
     #[cfg(test)]
@@ -987,7 +1115,7 @@ impl LocalStore {
             let _ = tokio::fs::remove_file(&tmp_path).await;
             return Err(e.into());
         }
-        self.sync_dir(npub).await;
+        self.sync_dir(npub).await?;
         Ok(())
     }
 
@@ -1016,7 +1144,7 @@ impl LocalStore {
         {
             // Publish the directory entry durably before the caller
             // reports success (the mapping commit already landed).
-            self.sync_dir(npub).await;
+            self.sync_dir(npub).await?;
             return Ok(());
         }
         let tmp_path = self.rooted_path(npub, &format!(".{sha256}.tmp"));
@@ -1051,32 +1179,31 @@ impl LocalStore {
             let _ = tokio::fs::remove_file(&tmp_path).await;
             return Err(e.into());
         }
-        self.sync_dir(npub).await;
+        self.sync_dir(npub).await?;
         Ok(())
     }
 
     /// Opens the blob for streaming, seeked to `start`; the caller reads
     /// at most `len` bytes from the returned file (`len` is enforced by
     /// the streaming wrapper, not by the file handle).
-    async fn open(
-        &self,
-        npub: &str,
-        sha256: &str,
-        start: u64,
-        _len: u64,
-    ) -> Result<Option<BlobStream>> {
+    async fn open(&self, npub: &str, sha256: &str, start: u64, _len: u64) -> Result<OpenOutcome> {
         // Symlink-escape guard: a symlinked npub directory would resolve
         // outside the root; a symlinked blob file would be followed by a
-        // plain open. Both are refused (the blob reads as missing).
+        // plain open. Both are refused — and reported as `Refused`, so the
+        // mapped-but-missing counter only sees definitive NotFound lookups.
         if !self.parent_within_root(npub).await {
             let dir = self.root.join(npub);
-            if let Ok(meta) = tokio::fs::symlink_metadata(&dir).await
-                && !meta.file_type().is_symlink()
-                && !meta.is_dir()
-            {
-                return Err(anyhow!("blossom storage directory is not a directory"));
-            }
-            return Ok(None);
+            return match tokio::fs::symlink_metadata(&dir).await {
+                Ok(meta) if meta.file_type().is_symlink() => Ok(OpenOutcome::Refused),
+                Ok(meta) if !meta.is_dir() => {
+                    Err(anyhow!("blossom storage directory is not a directory"))
+                }
+                // A directory whose canonicalization failed: the state is
+                // unknown, not definitively missing.
+                Ok(_) => Ok(OpenOutcome::Refused),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(OpenOutcome::Missing),
+                Err(_) => Ok(OpenOutcome::Refused),
+            };
         }
         let mut file = match tokio::fs::OpenOptions::new()
             .read(true)
@@ -1085,20 +1212,23 @@ impl LocalStore {
             .await
         {
             Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(OpenOutcome::Missing);
+            }
+            // A refused O_NOFOLLOW open (FreeBSD reports EMLINK, Linux
+            // ELOOP) means the object path is a symlink: the lookup is
+            // refused, not a definitive absence.
             Err(e)
-                if e.kind() == std::io::ErrorKind::NotFound
-                    || e.raw_os_error() == Some(libc::ELOOP)
-                    // FreeBSD reports a refused O_NOFOLLOW open as EMLINK
-                    // ("Too many links"), Linux as ELOOP.
+                if e.raw_os_error() == Some(libc::ELOOP)
                     || e.raw_os_error() == Some(libc::EMLINK) =>
             {
-                return Ok(None);
+                return Ok(OpenOutcome::Refused);
             }
             Err(e) => return Err(e.into()),
         };
         use tokio::io::AsyncSeekExt;
         file.seek(std::io::SeekFrom::Start(start)).await?;
-        Ok(Some(BlobStream::Local(file)))
+        Ok(OpenOutcome::Found(BlobStream::Local(file)))
     }
 
     async fn delete(&self, npub: &str, sha256: &str) -> Result<bool> {
@@ -1297,21 +1427,17 @@ impl S3Store {
     }
 
     /// Opens the blob for streaming: fetches the `bytes=start-...` range
-    /// and returns the response body (streamed in chunks by the caller).
-    async fn open(
-        &self,
-        npub: &str,
-        sha256: &str,
-        start: u64,
-        len: u64,
-    ) -> Result<Option<BlobStream>> {
+    /// and returns the response body (streamed in chunks by the caller). A
+    /// `404` from the store is a definitive absence; a refused lookup
+    /// cannot occur here (S3 has no symlinks).
+    async fn open(&self, npub: &str, sha256: &str, start: u64, len: u64) -> Result<OpenOutcome> {
         match self
             .client
             .get_object_range(&format!("{npub}/{sha256}"), start, len)
             .await?
         {
-            Some(resp) => Ok(Some(BlobStream::S3(resp))),
-            None => Ok(None),
+            Some(resp) => Ok(OpenOutcome::Found(BlobStream::S3(resp))),
+            None => Ok(OpenOutcome::Missing),
         }
     }
 
@@ -1472,7 +1598,10 @@ mod tests {
     /// Reads a blob through the streaming path (open + collect).
     async fn read_all(store: &BlobStore, pubkey: &str, sha: &str) -> Option<Vec<u8>> {
         use futures_util::StreamExt as _;
-        let stream = store.open_stream(pubkey, sha, 0, u64::MAX).await.unwrap()?;
+        let stream = match store.open_stream(pubkey, sha, 0, u64::MAX).await.unwrap() {
+            OpenOutcome::Found(stream) => stream,
+            OpenOutcome::Missing | OpenOutcome::Refused => return None,
+        };
         let mut out = Vec::new();
         match stream {
             crate::server::blossom::storage::BlobStream::Local(mut file) => {
@@ -1501,7 +1630,9 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("nostrfy-blossom-test-{tmp}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let s = BlobStore::new("local", &dir, 0, None, db).await.unwrap();
+        let s = BlobStore::new("local", &dir, 0, None, db, Stats::new())
+            .await
+            .unwrap();
         (s, db_path)
     }
 
@@ -1577,6 +1708,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mapped_missing_object_is_counted() {
+        // A mapping can outlive its object (an out-of-band delete, or a
+        // pre-publish-first build's mapping): the lookup must count the
+        // mapped-but-missing blob (best effort) without changing behavior.
+        let (s, _db_path) = store("missing-object").await;
+        let a = pk(1);
+        let sha = "9a".repeat(32);
+        s.put(&a, &sha, b"gone soon", "text/plain").await.unwrap();
+        let before = s
+            .stats
+            .blossom_missing_objects
+            .load(std::sync::atomic::Ordering::Relaxed);
+        // Remove the object behind the mapping's back.
+        let dir = std::env::temp_dir().join(format!(
+            "nostrfy-blossom-test-missing-object-{}",
+            std::process::id()
+        ));
+        tokio::fs::remove_file(dir.join(npub_of(&a)).join(&sha))
+            .await
+            .unwrap();
+        assert!(s.open_stream_any(&sha, 0, 1).await.unwrap().is_none());
+        assert_eq!(
+            s.stats
+                .blossom_missing_objects
+                .load(std::sync::atomic::Ordering::Relaxed),
+            before + 1,
+            "a mapped-but-missing object must be counted"
+        );
+        // A missing mapping is not a missing object.
+        assert!(
+            s.open_stream_any(&"bb".repeat(32), 0, 1)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            s.stats
+                .blossom_missing_objects
+                .load(std::sync::atomic::Ordering::Relaxed),
+            before + 1,
+            "an unmapped hash must not be counted"
+        );
+        // A reachable object is not counted either.
+        s.put(&a, &sha, b"gone soon", "text/plain").await.unwrap();
+        assert!(s.open_stream_any(&sha, 0, 1).await.unwrap().is_some());
+        assert_eq!(
+            s.stats
+                .blossom_missing_objects
+                .load(std::sync::atomic::Ordering::Relaxed),
+            before + 1,
+            "a successful lookup must not be counted"
+        );
+        s.db.shutdown();
+    }
+
+    #[tokio::test]
     async fn local_put_is_atomic() {
         // The final file must be written via a temp file + rename: no
         // `.tmp` leftovers, and the blob is served from its final path.
@@ -1616,6 +1803,7 @@ mod tests {
                 u64::MAX,
                 None,
                 s.db.clone(),
+                Stats::new(),
             )
             .await
             .unwrap();
@@ -1624,7 +1812,10 @@ mod tests {
             // The guard runs before any write: neither a file nor an orphan
             // mapping may be left behind.
             assert!(
-                full.open_stream(&a, &sha, 0, 1).await.unwrap().is_none(),
+                matches!(
+                    full.open_stream(&a, &sha, 0, 1).await.unwrap(),
+                    OpenOutcome::Missing
+                ),
                 "no file may be written for the refused upload"
             );
             assert!(
@@ -1639,6 +1830,7 @@ mod tests {
                 0,
                 None,
                 s.db.clone(),
+                Stats::new(),
             )
             .await
             .unwrap();
@@ -1666,20 +1858,18 @@ mod tests {
             assert_eq!(full, data);
             // Range read: the caller reads at most `len` bytes after seek.
             let mut file = match s.open_stream(&a, &sha, 1_000, 1_000).await.unwrap() {
-                Some(crate::server::blossom::storage::BlobStream::Local(f)) => f,
-                other => panic!("expected a local stream, got {other:?}"),
+                OpenOutcome::Found(crate::server::blossom::storage::BlobStream::Local(f)) => f,
+                _ => panic!("expected a local stream"),
             };
             use tokio::io::AsyncReadExt;
             let mut buf = vec![0u8; 1_000];
             file.read_exact(&mut buf).await.unwrap();
             assert_eq!(buf, data[1_000..2_000], "the range must be exact");
             // Nonexistent blob: None.
-            assert!(
-                s.open_stream(&a, &"ab".repeat(32), 0, 10)
-                    .await
-                    .unwrap()
-                    .is_none()
-            );
+            assert!(matches!(
+                s.open_stream(&a, &"ab".repeat(32), 0, 10).await.unwrap(),
+                OpenOutcome::Missing
+            ));
             s.db.shutdown();
         });
     }
@@ -1701,11 +1891,26 @@ mod tests {
             std::fs::write(&external, b"secret").unwrap();
             std::fs::remove_file(local(&s).blob_path(&npub, &sha)).unwrap();
             std::os::unix::fs::symlink(&external, local(&s).blob_path(&npub, &sha)).unwrap();
-            // The symlink is refused: the blob reads as missing, and the
+            // The symlink is refused as an unsafe lookup (the object's
+            // existence is unknown, so it is not counted as missing) and the
             // external content is never served.
             assert!(
-                s.open_stream(&a, &sha, 0, 1).await.unwrap().is_none(),
+                matches!(
+                    s.open_stream(&a, &sha, 0, 1).await.unwrap(),
+                    OpenOutcome::Refused
+                ),
                 "a symlinked blob must not be followed"
+            );
+            assert!(
+                s.open_stream_any(&sha, 0, 1).await.unwrap().is_none(),
+                "the refused lookup must not serve content"
+            );
+            assert_eq!(
+                s.stats
+                    .blossom_missing_objects
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                0,
+                "a refused symlink lookup must not count as a missing object"
             );
             std::fs::remove_file(&external).unwrap();
             s.db.shutdown();
@@ -1773,7 +1978,10 @@ mod tests {
                 "nothing may be written into the symlink target"
             );
             assert!(
-                s.open_stream(&npub, &sha, 0, 1).await.unwrap().is_none(),
+                matches!(
+                    s.open_stream(&npub, &sha, 0, 1).await.unwrap(),
+                    OpenOutcome::Refused
+                ),
                 "the blob must not be readable through the symlink"
             );
             assert!(
@@ -1800,8 +2008,8 @@ mod tests {
             std::fs::write(&tmp, b"stale").unwrap();
             s.put(&a, &sha, b"second", "text/plain").await.unwrap();
             let mut file = match s.open_stream(&a, &sha, 0, 6).await.unwrap() {
-                Some(crate::server::blossom::storage::BlobStream::Local(f)) => f,
-                other => panic!("expected a local stream, got {other:?}"),
+                OpenOutcome::Found(crate::server::blossom::storage::BlobStream::Local(f)) => f,
+                _ => panic!("expected a local stream"),
             };
             use tokio::io::AsyncReadExt;
             let mut buf = Vec::new();
@@ -1855,9 +2063,11 @@ mod tests {
             .unwrap();
             let npub = "npub1external";
             std::os::unix::fs::symlink(&external, local(&s).root.join(npub)).unwrap();
-            let mapped = s.auto_migrate_legacy().await.unwrap();
+            let (_tx, drain) = tokio::sync::watch::channel(false);
+            let mapped = s.auto_migrate_legacy(drain).await.unwrap();
             assert_eq!(
-                mapped, 0,
+                mapped,
+                MigrationOutcome::Completed(0),
                 "the migration must not map files through a symlinked directory"
             );
             assert!(
@@ -1896,8 +2106,13 @@ mod tests {
             std::fs::write(&meta, r#"{"mime":"text/plain","size":999,"uploaded":1}"#).unwrap();
             std::os::unix::fs::symlink(&meta, dir.join(format!("{}.meta.json", "cd".repeat(32))))
                 .unwrap();
-            let mapped = s.auto_migrate_legacy().await.unwrap();
-            assert_eq!(mapped, 0, "the migration must not map symlinked blob files");
+            let (_tx, drain) = tokio::sync::watch::channel(false);
+            let mapped = s.auto_migrate_legacy(drain).await.unwrap();
+            assert_eq!(
+                mapped,
+                MigrationOutcome::Completed(0),
+                "the migration must not map symlinked blob files"
+            );
             assert!(s.find(&"ab".repeat(32)).await.unwrap().is_none());
             assert!(s.find(&"cd".repeat(32)).await.unwrap().is_none());
             let _ = std::fs::remove_file(&external);
@@ -1917,7 +2132,9 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         {
-            let s = BlobStore::new("local", &dir, 0, None, db).await.unwrap();
+            let s = BlobStore::new("local", &dir, 0, None, db, Stats::new())
+                .await
+                .unwrap();
             let sha = "cd".repeat(32);
             s.put(&pk(1), &sha, b"x", "image/png").await.unwrap();
             s.put(&pk(2), &sha, b"x", "image/png").await.unwrap();
@@ -1941,7 +2158,9 @@ mod tests {
             262144,
         )
         .unwrap();
-        let s = BlobStore::new("local", &dir, 0, None, db).await.unwrap();
+        let s = BlobStore::new("local", &dir, 0, None, db, Stats::new())
+            .await
+            .unwrap();
         let sha = "cd".repeat(32);
         assert_eq!(s.find(&sha).await.unwrap().unwrap().pubkey, pk(1));
         assert!(s.has(&pk(1), &sha).await.unwrap());
@@ -1970,9 +2189,16 @@ mod tests {
             )
             .unwrap();
         }
-        let s = BlobStore::new("local", &dir, 0, None, db).await.unwrap();
-        let migrated = s.auto_migrate_legacy().await.unwrap();
-        assert_eq!(migrated, 2, "both owners are mapped");
+        let s = BlobStore::new("local", &dir, 0, None, db, Stats::new())
+            .await
+            .unwrap();
+        let (_tx, drain) = tokio::sync::watch::channel(false);
+        let migrated = s.auto_migrate_legacy(drain).await.unwrap();
+        assert_eq!(
+            migrated,
+            MigrationOutcome::Completed(2),
+            "both owners are mapped"
+        );
         assert!(s.has(&pk(1), &sha).await.unwrap());
         assert!(
             s.has(&pk(2), &sha).await.unwrap(),
@@ -1983,6 +2209,57 @@ mod tests {
         // 一人削除してももう一人は残る
         assert!(s.delete(&pk(1), &sha).await.unwrap());
         assert!(s.find(&sha).await.unwrap().is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = db_path;
+    }
+
+    /// A drain that fires before the pass completes must leave the marker
+    /// unset: the marker is written only after a full scan, so the next
+    /// start resumes instead of skipping an unmapped store.
+    #[tokio::test]
+    async fn drained_migration_leaves_the_marker_unset_for_the_next_start() {
+        let (db, db_path) = db("mig-drain").await;
+        let dir = std::env::temp_dir().join(format!(
+            "nostrfy-blossom-test-mig-drain-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let a = pk(1);
+        let sha = "ee".repeat(32);
+        let npub_dir = dir.join(npub_of(&a));
+        std::fs::create_dir_all(&npub_dir).unwrap();
+        std::fs::write(npub_dir.join(&sha), b"x").unwrap();
+        std::fs::write(
+            npub_dir.join(format!("{sha}.meta.json")),
+            br#"{"size":1,"mime":"text/plain","uploaded":1787000000}"#,
+        )
+        .unwrap();
+        let s = BlobStore::new("local", &dir, 0, None, db, Stats::new())
+            .await
+            .unwrap();
+
+        // Already draining: nothing is scanned, nothing is mapped and the
+        // marker stays unset.
+        let (tx, drain) = tokio::sync::watch::channel(false);
+        tx.send_replace(true);
+        assert_eq!(
+            s.auto_migrate_legacy(drain).await.unwrap(),
+            MigrationOutcome::Interrupted(0)
+        );
+        assert!(
+            !s.db.blossom_migration_done().await,
+            "an interrupted pass must not write the marker"
+        );
+        assert!(s.find(&sha).await.unwrap().is_none());
+
+        // The next start (a live drain signal) completes and marks.
+        let (_tx, drain) = tokio::sync::watch::channel(false);
+        assert_eq!(
+            s.auto_migrate_legacy(drain).await.unwrap(),
+            MigrationOutcome::Completed(1)
+        );
+        assert!(s.db.blossom_migration_done().await);
+        assert!(s.has(&a, &sha).await.unwrap());
         let _ = std::fs::remove_dir_all(&dir);
         let _ = db_path;
     }
@@ -2052,6 +2329,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn raced_owner_cap_commit_is_not_reported_as_a_conflict() {
+        // The put_file pre-check is not atomic with the add: a concurrent
+        // upload can win the last owner slot between them. The database
+        // reports the failed add as a bare `false`, so it cannot be told
+        // apart from a genuine storage fault after the fact; classifying it
+        // as a cap conflict would be a false 409 on a full disk. Only the
+        // pre-check (a list already at the cap before the upload) proves a
+        // cap rejection, and that path is covered by
+        // `owner_cap_is_reported_as_a_conflict_error`. The raced loser
+        // therefore gets a generic error (the invisible orphan is
+        // overwritten by a later upload).
+        let (s, _db_path) = store("owner-cap-race").await;
+        let sha = "5b".repeat(32);
+        let bytes = b"raced";
+        for i in 0..MAX_BLOB_OWNERS {
+            assert!(
+                s.db.blossom_add_owner(
+                    &sha,
+                    "text/plain",
+                    bytes.len() as u64,
+                    1,
+                    &pk(i as u8 + 10),
+                )
+                .await
+            );
+        }
+        // The raced loser's add is refused by the database cap.
+        assert!(
+            !s.commit_owner(&sha, "text/plain", bytes.len() as u64, 1, &pk(99))
+                .await
+        );
+        // The mapping is untouched: the loser did not become an owner, and
+        // the full list is intact. No re-read classification happens, so a
+        // storage fault can never be misreported as 409.
+        let meta = s.db.blossom_load(&sha).await.expect("the mapping exists");
+        assert_eq!(meta.owners.len(), MAX_BLOB_OWNERS);
+        assert!(!meta.owners.iter().any(|o| o == &pk(99)));
+    }
+
+    #[tokio::test]
     async fn mapping_failure_leaves_orphan_object_not_a_visible_blob() {
         let (s, _db_path) = store("publish-before-map").await;
         let a = pk(1);
@@ -2085,10 +2402,10 @@ mod tests {
         // The publish did happen first (the orphan is invisible through the
         // mapping but a later upload overwrites it in place).
         assert!(
-            s.open_stream(&a, &sha, 0, u64::MAX)
-                .await
-                .unwrap()
-                .is_some(),
+            matches!(
+                s.open_stream(&a, &sha, 0, u64::MAX).await.unwrap(),
+                OpenOutcome::Found(_)
+            ),
             "the object is published before the mapping commits"
         );
 
@@ -2248,6 +2565,44 @@ mod tests {
         std::fs::write(&dead, b"dead").unwrap();
         s.sweep_stale_spools();
         assert!(!dead.exists(), "a dead process's spool must be swept");
+    }
+
+    /// The sweep counts every stale spool it removes: that counter is the
+    /// cheap interrupted-upload signal exposed for the stats owner.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stale_spool_sweep_counts_only_the_removed_orphans() {
+        let (s, _db_path) = store("sweep-count").await;
+        let dir = s.spool_dir().expect("local store");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Clear any leftover from an earlier test process first: the
+        // shared temp directory is swept too, and the count below must
+        // only see the orphan this test creates.
+        s.sweep_stale_spools();
+        let before = s.orphan_spools_swept();
+        // This process start's own spool: kept and not counted.
+        let ours = dir.join(spool_file_name(3));
+        std::fs::write(&ours, b"ours").unwrap();
+        // An orphan from a dead process start: removed and counted.
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let dead_pid = child.id();
+        child.wait().unwrap();
+        let dead = dir.join(format!("{SPOOL_PREFIX}{dead_pid}-deadbeef-0"));
+        std::fs::write(&dead, b"orphan").unwrap();
+        s.sweep_stale_spools();
+        assert!(ours.exists(), "this process start's own spool must be kept");
+        assert!(!dead.exists(), "the foreign-token orphan must be swept");
+        assert_eq!(
+            s.orphan_spools_swept() - before,
+            1,
+            "exactly the removed orphan must be counted"
+        );
+        s.sweep_stale_spools();
+        assert_eq!(
+            s.orphan_spools_swept() - before,
+            1,
+            "a second sweep must not count the kept spool"
+        );
     }
 }
 

@@ -11,6 +11,8 @@ mod db;
 mod error;
 mod event;
 mod filter;
+#[cfg(test)]
+mod fuzz_tests;
 mod logging;
 mod nips;
 mod relay;

@@ -223,12 +223,12 @@ Set this whenever a reverse proxy (nginx, Caddy, a cloud load balancer, Cloudfla
 | `max_ws_message_bytes` | integer | `1048576` | Max bytes per WebSocket message/frame |
 | `buffer_size` | integer | `2048` | Initial per-connection WebSocket buffer (bytes; legacy location of `database.db_buffer_size`) |
 | `socket_recv_buffer_kb` | integer | `64` | Per-connection kernel receive buffer (KiB, `0` = kernel default; the kernel may double it). Larger values let a fast publisher's burst absorb into one batch while the relay commits; the buffer uses real memory only while data is queued |
-| `max_out_queue_bytes` | integer | `262144` | Per-connection outgoing queue cap (bytes; `0` = unlimited) |
+| `max_out_queue_bytes` | integer | `262144` | Per-connection outgoing queue cap (bytes; `0` disables the configured cap, but a safety ceiling derived from `max_req_response_bytes` still applies) |
 | `ws_idle_timeout_secs` | integer | `300` | Close idle connections after this long (`0` = never) |
 | `http_read_timeout_secs` | integer | `30` | Seconds to deliver a complete HTTP request head (and the NIP-86 POST body) before the connection is closed (`0` = disabled; slow-loris defense — applies to WebSocket upgrades too) |
 | `max_connections_per_sec_per_ip` | integer | `0` | Max new connections per second per source IP (`0` = unlimited) |
 | `max_events_per_min_per_pubkey` | integer | `0` | Max events a pubkey may publish per minute (`0` = unlimited) |
-| `max_req_response_bytes` | integer | `33554432` | Byte budget for one REQ response (`0` = unlimited); beyond it the subscription is closed with `CLOSED`. Above 512 MiB warned, above 2 GiB rejected |
+| `max_req_response_bytes` | integer | `33554432` | Byte budget for one REQ response (`0` = no per-response budget; the relay-wide budget still applies); beyond it the subscription is closed with `CLOSED`. Above 512 MiB warned, above 2 GiB rejected |
 
 ### Subscriptions and queries
 
@@ -295,9 +295,9 @@ Set this whenever a reverse proxy (nginx, Caddy, a cloud load balancer, Cloudfla
 
 **`max_ws_message_bytes`** — The maximum size of a single WebSocket message/frame in bytes. Oversized frames are rejected at the protocol layer and the connection is closed with a `message too large` notice. Also the effective ceiling for any single event.
 
-**`max_out_queue_bytes`** — The per-connection cap on queued outgoing bytes, protecting memory against slow readers (`0` = unlimited). REQ responses are pumped through the queue in bounded chunks (see `max_req_response_bytes`), so they cannot pin more than the cap either; EOSE and CLOSED messages are tiny and take the uncapped path. Live traffic is dropped when full (recoverable by re-subscribing).
+**`max_out_queue_bytes`** — The per-connection cap on queued outgoing bytes, protecting memory against slow readers. `0` disables the *configured* cap, but a safety ceiling still applies: twice `max_req_response_bytes` (or 64 MiB when that is also `0`), so a queue of frames up to `max_ws_message_bytes` can never pin gigabytes per connection. REQ responses are pumped through the queue in bounded chunks (see `max_req_response_bytes`), so they cannot pin more than the cap either; EOSE and CLOSED messages are tiny and take the uncapped path. Live traffic is dropped when full (recoverable by re-subscribing).
 
-**`max_req_response_bytes`** — Byte budget for a single REQ response (the stored events delivered for one subscription). The response is pumped into the capped outgoing queue in chunks as the socket drains; when the budget is exceeded the subscription is closed with `CLOSED ... blocked: response too large; narrow the filter or paginate` and the client can re-request with a narrower filter. `0` disables the budget. A connection may queue at most four pending responses; older ones are cut off with their EOSE. Values above 512 MiB are warned about, and anything above 2 GiB is rejected as a clear mistake (one response could exhaust memory).
+**`max_req_response_bytes`** — Byte budget for a single REQ response (the stored events delivered for one subscription). The response is pumped into the capped outgoing queue in chunks as the socket drains; when the budget is exceeded the subscription is closed with `CLOSED ... blocked: response too large; narrow the filter or paginate` and the client can re-request with a narrower filter. `0` disables only the per-response budget: the relay-wide pending-response budget (16 × the default 32 MiB = 512 MiB) still bounds the memory all in-flight responses can pin, so a response large enough to exhaust it is still cut off. A connection may queue at most four pending responses; older ones are cut off with their EOSE. Values above 512 MiB are warned about, and anything above 2 GiB is rejected as a clear mistake (one response could exhaust memory).
 
 **`ws_idle_timeout_secs`** — Connections with no inbound frames for this long are closed. While enabled, the relay also sends periodic WebSocket PINGs: healthy clients answer with a PONG (an inbound frame, which resets the timer) and stay connected; dead peers are reaped. `0` = disabled (no timeout, no pings).
 
@@ -352,7 +352,7 @@ Set this whenever a reverse proxy (nginx, Caddy, a cloud load balancer, Cloudfla
 ### Behavior notes
 
 - **`max_created_at_future_secs`** uses the NIP-01 `invalid:` prefix — the event is rejected as invalid (the NIP-01 example for this case).
-- **`max_out_queue_bytes`** protects against slow readers; REQ responses are never dropped by it (see key details).
+- **`max_out_queue_bytes`** protects against slow readers; REQ responses are never dropped by it (see key details). When it is `0`, the safety ceiling (twice `max_req_response_bytes`, or 64 MiB when that is also `0`) still bounds the queue.
 - **`new_pubkey_min_age_secs`**: the first-seen timestamp is only recorded when an event actually stores, so failed first events cannot pre-warm the account-age clock.
 - **`max_api_limit`** clamps silently; **`max_api_offset`**, **`max_api_fetch`** and **`max_api_search_bytes`** reject with a clear `400` error message.
 - **Filter member caps are fixed** (not configurable): a single filter may carry at most **512 `ids`, `authors` or `kinds` entries**, and the `#...` tag constraint values share a separate **512-value combined budget** across all tag attributes of that filter. The in-memory match and scan are linear in these arrays, so a larger filter would allow quadratic work per event. Over-cap filters are refused with `CLOSED ... invalid: too many ids, authors, kinds or tag values in a filter` (COUNT and NIP-77 syncs refuse them the same way).
@@ -374,7 +374,7 @@ Set this whenever a reverse proxy (nginx, Caddy, a cloud load balancer, Cloudfla
 | `reader_threads` | integer | `2` | Dedicated scan threads (1-64) |
 | `max_indexed_words` | integer | `32` | Words of each event's content indexed for search |
 | `meta_index` | boolean | `true` | Write the per-event metadata header used by the scan prefilter. Disabling it drops one random index write per event (ingest stays flat as the database grows) at the cost of scans falling back to the full parse |
-| `disabled_fsync` | boolean | `false` | Skip the synchronous disk flush after every write batch (`MDB_NOSYNC`). Multiplies ingest throughput at the cost of durability: a power loss may lose the most recent writes |
+| `disabled_fsync` | boolean | `false` | Skip the synchronous disk flush after every write batch (`MDB_NOSYNC`). Multiplies ingest throughput at the cost of durability **and integrity**: a power loss or OS crash can lose acknowledged writes and can corrupt the database (restore from a backup). The writer force-syncs about once per second, which bounds the loss window but not the ordering risk. A warning is logged at startup and on `nostrfy check` when it is enabled |
 | `max_db_queue_bytes` | integer | `268435456` (256 MiB) | Byte cap for queued database payloads (event fields on the writer queue, filter fields on the reader/API queues). Complements the count caps: a queue of maximum-size messages is refused before it exhausts memory. `0` disables the byte cap |
 
 ### Key details
@@ -395,10 +395,12 @@ Set this whenever a reverse proxy (nginx, Caddy, a cloud load balancer, Cloudfla
 **`db_buffer_size`** — The initial per-connection WebSocket buffer in bytes (grows on demand); the kernel receive buffer is tuned separately with `limits.socket_recv_buffer_kb`.
 **`max_indexed_words`** — How many words of each event's content are added to the NIP-50 search index. Higher values improve index-based recall for long texts at a small storage cost; words past the cap are still matched — long events carry an overflow marker and the search scan checks their full content — so lowering this trades query speed for index size, not correctness.
 **`db_request_timeout_secs`** — How long a database request may wait before it fails (`0` = forever). Keeps the relay responsive when the storage is stuck. Write requests are not subject to the timeout (a false timeout would skip their side effects). The startup loads of the persisted access state (deny/allow lists, Blossom allowlist) wait without a timeout and never fail fast: an empty result would silently lift every ban (fail-open). Their SIGHUP reloads keep the previous lists when a load fails.
-**`disabled_fsync`** — Skip the synchronous disk flush after every write batch (LMDB `MDB_NOSYNC`). Writes are committed to the mapped pages and left in the OS page cache, so commits cost microseconds instead of an fsync; the kernel flushes them shortly after. A power loss or OS crash may lose the writes since the last kernel flush — a fine trade for a high-throughput relay with a replica/backup, a poor one for a single always-live instance. Takes effect at startup. The Manual's [Throughput tuning](MANUAL.md#throughput-events-per-second) section shows the settings that move ingest throughput.
+**`disabled_fsync`** — Skip the synchronous disk flush after every write batch (LMDB `MDB_NOSYNC`). Writes are committed to the mapped pages and left in the OS page cache, so commits cost microseconds instead of an fsync. The tradeoff is not only durability: a power loss or OS crash can lose acknowledged writes **and** can leave the database corrupt when the OS persists the meta page before the data pages it references. The writer force-syncs about once per second, which bounds how much can be lost but does not order those syncs against every commit, so the corruption window remains. Treat `disabled_fsync = true` as a benchmark/throwaway setting: run it only with a backup (or a replica you can restore from); for a single always-live instance keep the default `false`. Enabling it logs a warning at startup / `nostrfy check`, and `docs/TROUBLESHOOTING.md` has a recovery note. Takes effect at startup. The Manual's [Throughput tuning](MANUAL.md#throughput-events-per-second) section shows the settings that move ingest throughput.
 **`max_db_queue_msgs`** — When the database queue holds more than this many pending messages, new requests fail fast instead of piling up in memory.
 **`max_db_queue_events`** — Like `max_db_queue_msgs`, but counts the events inside queued batches (the memory-dominant part). Whichever limit is hit first applies.
 **`max_db_queue_bytes`** — The same overload protection in bytes, measured over the queued payloads: event fields (content, tags, hex fields) on the writer queue and filter fields on the reader/API queues. The count caps alone let a queue of maximum-size messages reach gigabytes before tripping, because one message can carry a whole batch of large events. `0` disables the byte cap (a warning is logged).
+
+**Monitoring the queue** — The current depths are exported as `nostrfy_db_pending_msgs`, `nostrfy_db_pending_events`, `nostrfy_db_pending_bytes`, `nostrfy_db_pending_reads`, `nostrfy_db_pending_read_bytes`, `nostrfy_db_api_pending` and `nostrfy_db_api_pending_bytes` gauges, and requests failed fast by these caps are counted separately from faults as `nostrfy_db_overloaded` (a fault increments `nostrfy_db_errors`). See the alert table in [TROUBLESHOOTING.md](TROUBLESHOOTING.md#5-8-recommended-monitoring-and-alerts).
 
 
 ### Behavior notes
@@ -488,6 +490,8 @@ nostrfy restart                        # the daemon holds the list in memory
 
 Remove the address from `access.blocked_ips` in the config too when it is listed there.
 
+All CLI access mutations (`nostrfy relay allow/deny`, `nostrfy blossom allow/deny`, `nostrfy access unblockip`) serialize their read-modify-write with an advisory `flock` on `<database.path>/access.lock` and commit their changes in one LMDB transaction. The lock file is a marker only (its contents are never read) and can be left in place. For the cross-process guarantee — a daemon ban and a CLI mutation cannot overwrite each other — the daemon's NIP-86 access persistence must take the same lock around its own write (the CLI holds it for the whole read-modify-write).
+
 ### Behavior notes
 
 - The kinds/IP lists are seeded at startup and then **managed at runtime** through NIP-86. Runtime changes are persisted in the database and survive restarts; once runtime state exists, it takes precedence over the config section.
@@ -542,7 +546,7 @@ Each `allow`/`deny` writes the database and reloads the running daemon (SIGHUP),
 - The feature is completely off when `host` is empty — no routes, no storage directories.
 - Blob bytes never enter the LMDB database: uploads, fetches and deletes operate on the configured local filesystem or S3 bucket. LMDB does persist the SHA-256-to-owner metadata and upload allowlist, so both the blob storage and relay database are required for a complete backup.
 - Storage I/O is asynchronous (`tokio::fs` / the `reqwest` client) — relay and WebSocket performance is unaffected.
-- **Upload spooling and disk sizing**: an upload is streamed to a spool file first, then fsynced and renamed into place (local) or streamed to the bucket (S3), so the response body never sits in memory. Local spools live in `<local_path>/.spool` — the same filesystem as the blobs — and are removed on completion; a killed process can leave one behind, and the relay sweeps stale spools (only files whose owning process is gone) at startup and on later uploads. Each in-flight upload occupies up to `max_upload_bytes` of spool space, and the free-space reservation (`min_free_bytes`) covers it: size the filesystem for `min_free_bytes` plus one `max_upload_bytes` per expected concurrent upload (S3 uploads spool to the system temp directory, so size that too). A full disk refuses uploads with `507` before spooling.
+- **Upload spooling and disk sizing**: an upload is streamed to a spool file first, then fsynced and renamed into place (local) or streamed to the bucket (S3), so the response body never sits in memory. Local spools live in `<local_path>/.spool` — the same filesystem as the blobs — and are removed on completion; a killed process can leave one behind, and the relay sweeps stale spools (only files whose owning process is gone) **at startup only** (later uploads remove their own spool; a crash orphan is swept on the next start and counted by `nostrfy_blossom_orphan_spools_swept`). Each in-flight upload occupies up to `max_upload_bytes` of spool space, and the free-space reservation (`min_free_bytes`) covers it: size the filesystem for `min_free_bytes` plus one `max_upload_bytes` per expected concurrent upload (S3 uploads spool to the system temp directory, so size that too). A full disk refuses uploads with `507` before spooling.
 - The sha256 → owner mapping is persisted in the relay database (LMDB): no in-memory index and no startup scan, so lookups survive restarts and memory stays bounded. **The mapping is committed after the blob is durable**: a crash between the publish and the mapping write leaves an *invisible orphan* blob (a later upload of the same bytes overwrites it) rather than a listed blob whose GET 404s, and deleting a blob removes its mapping. Back up the blob storage and the database **together** — restoring the blobs without the database requires the mapping migration (see below), and the migration marker must then also be reset (delete the database directory) or the restored blobs stay unreachable.
 - **Automatic one-time migration**: at startup the relay checks whether the `blossom` mapping table exists (created instantly if missing) and whether the legacy migration already ran (marker key). If not, it scans the storage in the background (local directories / bucket objects, with or without the legacy `.meta.json` files) and rebuilds the mapping — the relay starts immediately and existing blobs become reachable as the migration completes. Later restarts skip it. Legacy multi-owner blobs keep every uploader's mapping, and the writes are chunked so a large migration never blocks the relay's event writes for long. If a migration batch fails (e.g. the LMDB map is full), the marker is left unset and the migration retries on the next start. **Backup restore**: if you restore an old storage directory/bucket without its database, delete the database directory first (or upload the blobs again) — the migration marker then triggers a fresh scan.
 - Only the uploader (the pubkey whose npub directory holds the file) can delete a blob.
@@ -618,19 +622,24 @@ enabled_nips = []
 disabled_nips = []
 reject_ephemeral = false
 enabled_git = false
+require_auth = false
+send_auth_challenge = true
+enabled_nip78_auth = true
+require_pow = 0
+new_pubkey_min_age_secs = 0
+max_events_per_min_per_pubkey = 0
 
 [server]
 host = "0.0.0.0"
 port = 8080
 api_host = "api.example.com"
-management_token = ""
-admin_pubkey = ""
-require_auth = false
-send_auth_challenge = true
-enabled_nip78_auth = true
 metrics_enabled = true
 # Proxies on this host (nginx/Caddy); remove for direct exposure.
 trusted_proxies = ["127.0.0.1/32", "::1/128"]
+
+[rpc]
+management_token = ""
+admin_pubkey = ""
 
 [limits]
 max_connections = 10000
@@ -645,16 +654,9 @@ max_content_bytes = 65536
 max_tags = 2000
 max_tag_value_bytes = 1024
 max_created_at_future_secs = 3600
-require_pow = 0
-max_indexed_words = 32
-db_buffer_size = 2048
 max_neg_items = 100000
-db_request_timeout_secs = 30
-new_pubkey_min_age_secs = 0
 max_out_queue_bytes = 262144
 ws_idle_timeout_secs = 300
-max_db_queue_msgs = 4096
-max_db_queue_events = 262144
 max_sub_bytes = 524288
 group_late_publish_secs = 604800
 max_api_concurrent = 32
@@ -664,7 +666,6 @@ max_api_fetch = 55001
 max_api_search_bytes = 1024
 http_read_timeout_secs = 30
 max_connections_per_sec_per_ip = 0
-max_events_per_min_per_pubkey = 0
 max_req_response_bytes = 33554432
 live_batch_interval_ms = 10
 live_batch_size = 64
@@ -679,6 +680,11 @@ max_map_size = 1099511627776
 purge_interval_secs = 300
 search_index = true
 disabled_fsync = false
+max_indexed_words = 32
+db_buffer_size = 2048
+db_request_timeout_secs = 30
+max_db_queue_msgs = 4096
+max_db_queue_events = 262144
 max_db_queue_bytes = 268435456
 
 [daemon]

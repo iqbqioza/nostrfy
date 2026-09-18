@@ -118,19 +118,50 @@ pub(crate) fn pending_response_budget_bytes(per_response: u64) -> u64 {
     per_response.saturating_mul(PENDING_RESPONSE_BUDGET_FACTOR)
 }
 
-/// The pending-response budget of one relay. `Arc::as_ptr` identifies the
-/// relay allocation (every `Conn` holds a clone of the same allocation),
+/// Relay-wide NEG budget as a multiple of the per-query item cap, mirroring
+/// [`PENDING_RESPONSE_BUDGET_FACTOR`]. The per-connection NEG caps alone
+/// allow `max_connections × 2 × max_neg_items` held items (tens of GB with
+/// the documented defaults); the default (100k items × 16 ≈ 122 MiB) bounds
+/// the relay-wide held set while leaving room for many concurrent
+/// full-size syncs.
+pub(crate) const NEG_BUDGET_FACTOR: u64 = 16;
+
+/// The estimated in-memory size of one held negentropy item: twice the
+/// `(created_at, id)` tuple (40 bytes) because the collecting `Vec` may
+/// hold up to twice its length in capacity. The deliberate overestimate is
+/// what [`neg_budget_bytes`] charges per held item.
+pub(crate) const NEG_ITEM_BYTES: u64 = std::mem::size_of::<crate::nips::nip77::Item>() as u64 * 2;
+
+/// Sizes the relay-wide NEG budget from `limits.max_neg_items`; when the
+/// per-query cap is `0` (no processable records) the documented default is
+/// used, so the relay-wide bound still exists instead of `0` disabling the
+/// budget entirely (`try_reserve` treats a `0` limit as unlimited).
+pub(crate) fn neg_budget_bytes(per_query: usize) -> u64 {
+    /// The documented default of `limits.max_neg_items`.
+    const DEFAULT_MAX_NEG_ITEMS: u64 = 100_000;
+    let per_query = if per_query == 0 {
+        DEFAULT_MAX_NEG_ITEMS
+    } else {
+        per_query as u64
+    };
+    per_query
+        .saturating_mul(NEG_ITEM_BYTES)
+        .saturating_mul(NEG_BUDGET_FACTOR)
+}
+
+/// A per-relay budget registry, keyed by the relay allocation. `Arc::as_ptr`
+/// identifies the relay (every `Conn` holds a clone of the same allocation),
 /// so several relays in one process (tests) do not share a budget. The
-/// registry holds a `Weak` reference: once every connection (and pending
-/// response) of a relay is gone the counter is freed, so a later relay
+/// registry holds a `Weak` reference: once every connection (and
+/// reservation) of a relay is gone the counter is freed, so a later relay
 /// allocated at the same address gets a fresh budget instead of a stale
 /// counter, and the registry cannot keep budgets alive.
-fn pending_response_budget(relay: &Arc<Relay>) -> Arc<PendingResponseBudget> {
-    static BUDGETS: std::sync::OnceLock<
-        std::sync::Mutex<HashMap<usize, std::sync::Weak<PendingResponseBudget>>>,
-    > = std::sync::OnceLock::new();
+type BudgetRegistry =
+    std::sync::OnceLock<std::sync::Mutex<HashMap<usize, std::sync::Weak<PendingResponseBudget>>>>;
+
+fn relay_budget(registry: &BudgetRegistry, relay: &Arc<Relay>) -> Arc<PendingResponseBudget> {
     let key = Arc::as_ptr(relay) as usize;
-    let mut budgets = BUDGETS
+    let mut budgets = registry
         .get_or_init(Default::default)
         .lock()
         .unwrap_or_else(|p| p.into_inner());
@@ -140,6 +171,167 @@ fn pending_response_budget(relay: &Arc<Relay>) -> Arc<PendingResponseBudget> {
     let budget = Arc::new(PendingResponseBudget::new());
     budgets.insert(key, Arc::downgrade(&budget));
     budget
+}
+
+/// The pending-response budget of one relay (see [`relay_budget`] for the
+/// registry rationale).
+fn pending_response_budget(relay: &Arc<Relay>) -> Arc<PendingResponseBudget> {
+    static BUDGETS: BudgetRegistry = std::sync::OnceLock::new();
+    relay_budget(&BUDGETS, relay)
+}
+
+/// The relay-wide NEG budget of one relay (see [`relay_budget`] for the
+/// registry rationale).
+fn neg_budget(relay: &Arc<Relay>) -> Arc<PendingResponseBudget> {
+    static BUDGETS: BudgetRegistry = std::sync::OnceLock::new();
+    relay_budget(&BUDGETS, relay)
+}
+
+/// Relay-wide NEG CPU budget as a multiple of the per-query item cap,
+/// mirroring [`NEG_BUDGET_FACTOR`]: one NEG-OPEN spends its per-query item
+/// cap (the scan's worst case) and every NEG-MSG spends its held item
+/// count (the bisection's worst case), so the whole relay processes at
+/// most `max_neg_items × NEG_CPU_BUDGET_FACTOR` fingerprint units per
+/// second. Without it the per-connection caps (`MAX_NEG_OPENS` ×
+/// `MAX_NEG_MSG_ROUNDS` each) multiplied by `max_connections` let a
+/// coordinated flood monopolize the CPU with reconciliation rounds.
+pub(crate) const NEG_CPU_BUDGET_FACTOR: u64 = 16;
+
+/// Sizes the relay-wide NEG CPU budget from `limits.max_neg_items`; when
+/// the per-query cap is `0` the documented default is used, so the
+/// relay-wide bound still exists instead of `0` disabling the budget.
+pub(crate) fn neg_cpu_budget_units(per_query: usize) -> u64 {
+    /// The documented default of `limits.max_neg_items`.
+    const DEFAULT_MAX_NEG_ITEMS: u64 = 100_000;
+    let per_query = if per_query == 0 {
+        DEFAULT_MAX_NEG_ITEMS
+    } else {
+        per_query as u64
+    };
+    per_query.saturating_mul(NEG_CPU_BUDGET_FACTOR)
+}
+
+/// A relay-wide per-second work budget for NEG reconciliation. The
+/// per-connection round and open budgets alone still allow
+/// `max_connections × MAX_NEG_OPENS × MAX_NEG_MSG_ROUNDS` rounds over the
+/// item budget's held sets; this shared counter caps the aggregate.
+///
+/// The window is packed into one `AtomicU64` (`unix second << 32 | units
+/// used`) so the rollover is race-free without a lock: concurrent charges
+/// in the same second add up, and the first charge of a new second (or
+/// the first charge after the configured limit shrank below what was
+/// already spent) resets the window.
+pub(crate) struct NegCpuBudget {
+    used: std::sync::atomic::AtomicU64,
+    /// Test-only: pins the window so a test's charges cannot be reset by a
+    /// wall-clock second tick (production always follows the clock).
+    #[cfg(test)]
+    frozen: std::sync::atomic::AtomicBool,
+}
+
+impl NegCpuBudget {
+    fn new() -> Self {
+        NegCpuBudget {
+            used: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            frozen: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// The current window's second: the wall clock, or the last charged
+    /// second while frozen (test-only).
+    fn window_second(&self) -> u32 {
+        #[cfg(test)]
+        if self.frozen.load(std::sync::atomic::Ordering::Relaxed) {
+            return (self.used.load(std::sync::atomic::Ordering::Relaxed) >> 32) as u32;
+        }
+        (crate::util::unix_now() & 0xffff_ffff) as u32
+    }
+
+    /// Charges `units` against the per-second `limit` (`0` = unlimited).
+    /// Returns `false` when the window is exhausted, so the caller refuses
+    /// the work with a retryable NEG-ERR. A charge larger than the whole
+    /// budget is refused without poisoning the fresh window for everyone
+    /// else.
+    fn try_charge(&self, units: u64, limit: u64) -> bool {
+        if units == 0 {
+            return true;
+        }
+        let limit = if limit == 0 {
+            u64::from(u32::MAX)
+        } else {
+            limit.min(u64::from(u32::MAX))
+        };
+        let now = self.window_second();
+        let mut current = self.used.load(std::sync::atomic::Ordering::Relaxed);
+        loop {
+            let second = (current >> 32) as u32;
+            let used = current & 0xffff_ffff;
+            // A new second, or a configured limit that shrank below what
+            // this window already spent (a SIGHUP reload): opening a fresh
+            // window would otherwise refuse every charge for the rest of
+            // the second.
+            if second != now || used > limit {
+                if units > limit {
+                    return false;
+                }
+                let next = (u64::from(now) << 32) | units;
+                match self.used.compare_exchange_weak(
+                    current,
+                    next,
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                ) {
+                    Ok(_) => return true,
+                    Err(actual) => current = actual,
+                }
+                continue;
+            }
+            if used + units > limit {
+                return false;
+            }
+            let next = (u64::from(now) << 32) | (used + units);
+            match self.used.compare_exchange_weak(
+                current,
+                next,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    /// Test-only: disables the second rollover so the accounting is
+    /// independent of the wall clock.
+    #[cfg(test)]
+    fn freeze(&self) {
+        self.frozen
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The relay-wide NEG CPU budget of one relay (see [`relay_budget`] for
+/// the registry rationale).
+fn neg_cpu_budget(relay: &Arc<Relay>) -> Arc<NegCpuBudget> {
+    type CpuBudgetRegistry =
+        std::sync::OnceLock<std::sync::Mutex<HashMap<usize, std::sync::Weak<NegCpuBudget>>>>;
+    fn budget_for(registry: &CpuBudgetRegistry, relay: &Arc<Relay>) -> Arc<NegCpuBudget> {
+        let key = Arc::as_ptr(relay) as usize;
+        let mut budgets = registry
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if let Some(existing) = budgets.get(&key).and_then(std::sync::Weak::upgrade) {
+            return existing;
+        }
+        let budget = Arc::new(NegCpuBudget::new());
+        budgets.insert(key, Arc::downgrade(&budget));
+        budget
+    }
+    static BUDGETS: CpuBudgetRegistry = std::sync::OnceLock::new();
+    budget_for(&BUDGETS, relay)
 }
 
 /// A REQ response waiting to be pumped to the socket in bounded chunks:
@@ -222,7 +414,8 @@ pub struct Conn {
     /// new message is queued or dropped.
     pub(crate) out_bytes: usize,
     /// Per-connection byte cap for the outgoing queue (`limits.max_out_queue_bytes`,
-    /// cached once per connection).
+    /// cached once per connection; `0` = unset, in which case the safety
+    /// ceiling of [`Conn::out_queue_cap`] applies instead).
     pub(crate) out_queue_bytes: usize,
     /// Byte budget for a single REQ response (`limits.max_req_response_bytes`,
     /// cached once per connection; 0 = unlimited).
@@ -231,6 +424,19 @@ pub struct Conn {
     /// connection; each materialized response reserves its size against it
     /// and over-budget responses fail with a retryable CLOSED.
     pub(crate) pending_budget: Arc<PendingResponseBudget>,
+    /// The relay-wide NEG item budget shared by every connection; each
+    /// open NEG subscription reserves its held items against it, so the
+    /// per-connection caps cannot pin GBs across many connections.
+    /// Over-budget opens fail with a retryable NEG-ERR instead of pinning
+    /// the items, and the reservation is released on NEG-CLOSE,
+    /// replacement, connection drop or panic (RAII, like `PendingReq`).
+    pub(crate) neg_budget: Arc<PendingResponseBudget>,
+    /// The relay-wide NEG CPU budget shared by every connection: NEG-OPEN
+    /// spends the scan's worst case and NEG-MSG spends the held item count,
+    /// so a flood across many connections cannot monopolize the CPU with
+    /// reconciliation rounds. Over-budget work fails with a retryable
+    /// NEG-ERR (which per NIP-77 closes that subscription).
+    pub(crate) neg_cpu_budget: Arc<NegCpuBudget>,
     /// REQ responses awaiting the pump: the scan results are moved into
     /// the capped outgoing queue in chunks as the socket drains.
     pub(crate) pending_reqs: std::collections::VecDeque<PendingReq>,
@@ -244,7 +450,9 @@ pub struct Conn {
     neg: HashMap<String, negentropy::NegState>,
     /// Total number of negentropy items held across all open NEG-OPEN
     /// subscriptions, so that a connection cannot pin more than twice the
-    /// configured per-query maximum in memory.
+    /// configured per-query maximum in memory. This per-connection count is
+    /// a second bound: the held items are also reserved against the
+    /// relay-wide `neg_budget`.
     pub(crate) neg_total: usize,
     /// Total NEG-OPENs this connection has issued (including re-opens of
     /// closed subscriptions): caps how often the 128-round CPU budget can
@@ -343,10 +551,14 @@ impl Conn {
     /// (live delivery) must react instead of assuming it was queued.
     pub(crate) fn send_tagged(&mut self, msg: Message, event_sub: Option<u64>) -> bool {
         let size = message_size(&msg);
-        // 0 = unlimited (the REQ-response budget documents the same meaning).
-        let over_byte_cap = self.out_queue_bytes > 0
-            && !self.outgoing.is_empty()
-            && self.out_bytes.saturating_add(size) > self.out_queue_bytes;
+        // The configured cap, or the control ceiling when it is unset
+        // (`0` = "no configured cap", not "no bound": without the ceiling
+        // OUT_QUEUE_LIMIT frames of up to `max_ws_message_bytes` could pin
+        // ~4 GiB per connection). The first frame of an empty queue is
+        // never dropped, so a single frame above the cap is still
+        // delivered; the queue then cannot grow past the cap again.
+        let over_byte_cap =
+            !self.outgoing.is_empty() && self.out_bytes.saturating_add(size) > self.out_queue_cap();
         if self.outgoing.len() >= OUT_QUEUE_LIMIT || over_byte_cap {
             self.dropped += 1;
             self.relay.stats.bump(&self.relay.stats.buffers_dropped, 1);
@@ -429,6 +641,17 @@ impl Conn {
             (self.req_response_bytes as usize).saturating_mul(2)
         } else {
             64 * 1024 * 1024
+        }
+    }
+
+    /// The effective byte cap of the outgoing queue: the configured
+    /// `limits.max_out_queue_bytes`, or [`Self::control_ceiling`] when
+    /// that is unset (`0` = "no configured cap", not "no bound").
+    fn out_queue_cap(&self) -> usize {
+        if self.out_queue_bytes > 0 {
+            self.out_queue_bytes
+        } else {
+            self.control_ceiling()
         }
     }
 
@@ -566,6 +789,10 @@ impl Conn {
     /// `CLOSED ... response too large` so the client can re-request with
     /// a narrower filter.
     pub(crate) fn pump_pending_reqs(&mut self) {
+        // Cached for the whole pump: the fields only change on SIGHUP
+        // (which is not applied mid-pump), and `front_mut` below borrows
+        // `self` mutably.
+        let out_queue_cap = self.out_queue_cap();
         loop {
             // The access lists gate the pump too: results queued before a
             // deny are dropped, so the restriction applies immediately
@@ -625,11 +852,12 @@ impl Conn {
                 // oversized event must still be delivered (dropping it
                 // would lose data permanently), so the first push may
                 // exceed the cap by one message; afterwards the queue
-                // cannot grow past the cap.
-                if self.out_queue_bytes > 0
-                    && self.out_bytes > 0
-                    && self.out_bytes.saturating_add(size) > self.out_queue_bytes
-                {
+                // cannot grow past the cap. The effective cap applies
+                // even when `max_out_queue_bytes` is unset (0 = no
+                // configured cap): the pump used to skip this check
+                // entirely then, letting a backlog fill the queue up to
+                // the count limit.
+                if self.out_bytes > 0 && self.out_bytes.saturating_add(size) > out_queue_cap {
                     break;
                 }
                 if self.req_response_bytes > 0
@@ -699,12 +927,11 @@ impl Conn {
                 return;
             };
             let size = text.len();
-            // The same byte-cap rule as the stored events: the first message
-            // may exceed the cap so a single event is never lost.
-            if self.out_queue_bytes > 0
-                && self.out_bytes > 0
-                && self.out_bytes.saturating_add(size) > self.out_queue_bytes
-            {
+            // The same byte-cap rule as the stored events (including the
+            // safety ceiling when `max_out_queue_bytes` is unset): the
+            // first message may exceed the cap so a single event is never
+            // lost.
+            if self.out_bytes > 0 && self.out_bytes.saturating_add(size) > self.out_queue_cap() {
                 return;
             }
             let text = pending.live.pop_front().expect("front checked");
@@ -1127,6 +1354,8 @@ pub async fn handle_connection(
         );
     let mut conn = Conn {
         pending_budget: pending_response_budget(&relay),
+        neg_budget: neg_budget(&relay),
+        neg_cpu_budget: neg_cpu_budget(&relay),
         relay,
         conn_id,
         subscriptions_held,
@@ -1727,6 +1956,8 @@ mod tests {
             );
         Conn {
             pending_budget: pending_response_budget(&relay),
+            neg_budget: neg_budget(&relay),
+            neg_cpu_budget: neg_cpu_budget(&relay),
             relay,
             conn_id,
             subscriptions_held: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -1959,10 +2190,10 @@ mod tests {
             let e1 = signed_note(conn.relay.secp(), "hello", now, vec![]);
             conn.relay.db.put(e1.clone(), now).await;
             // Killing the DB reader makes the REQ query fail deterministically
-            // (`query_req_reported` returns None), exactly like a timed-out
-            // scan: the CLOSED path must release the subscription it had
-            // registered before the query, or the dead sub keeps receiving
-            // live events under a closed id.
+            // (`query_req_result` returns None), exactly like a timed-out or
+            // errored scan: the CLOSED path must release the subscription it
+            // had registered before the query, or the dead sub keeps
+            // receiving live events under a closed id.
             conn.relay.db.shutdown();
             conn.handle_req(&[json!("sub"), json!({"kinds": [1]})])
                 .await;
@@ -1971,12 +2202,16 @@ mod tests {
             assert!(
                 msgs.iter().any(|m| m[0] == "CLOSED"
                     && m[1] == "sub"
-                    && m[2] == "error: database timeout, please retry"),
-                "a timed-out REQ must be closed with a retryable reason"
+                    && m[2] == "error: database unavailable; retry"),
+                "a failed REQ must be closed with a retryable reason"
             );
             assert!(
                 !conn.subs.contains_key("sub"),
                 "the subscription must be released on a timed-out query"
+            );
+            assert!(
+                conn.pending_reqs.is_empty(),
+                "the failed REQ's pending request must be released"
             );
             assert!(
                 !msgs.iter().any(|m| m[0] == "EVENT" && m[1] == "sub"),
@@ -2223,6 +2458,70 @@ mod tests {
                 "protected events are not counted for anonymous"
             );
             conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn count_ignores_filter_limit_zero() {
+        // Documented NIP-45 divergence: COUNT counts the match set and has
+        // no pagination, so `limit` (including `limit: 0`) does not bound
+        // the count — unlike REQ, where `limit: 0` is an empty page.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let now = unix_now();
+            for i in 0..3 {
+                let ev = signed_note(conn.relay.secp(), &format!("e{i}"), now - i, vec![]);
+                conn.relay.db.put(ev, now).await;
+            }
+            conn.handle_count(&[json!("c"), json!({"kinds": [1], "limit": 0})])
+                .await;
+            let count = outgoing_json(&conn)
+                .into_iter()
+                .find(|m| m[0] == "COUNT")
+                .expect("a COUNT response is sent");
+            assert_eq!(
+                count[2]["count"].as_u64(),
+                Some(3),
+                "COUNT ignores limit:0 and reports every match"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn count_database_failure_is_closed_not_zero() {
+        // A failed scan must never be reported as `{"count": 0}`: the
+        // client cannot distinguish that from an empty match set. NIP-45
+        // refuses with a CLOSED, here retryable, and the same-id REQ
+        // subscription (if any) is released with it.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let now = unix_now();
+            let ev = signed_note(conn.relay.secp(), "present", now, vec![]);
+            conn.relay.db.put(ev, now).await;
+            conn.relay.db.shutdown();
+            conn.handle_count(&[json!("c"), json!({"kinds": [1]})])
+                .await;
+            let msgs = outgoing_json(&conn);
+            let closed = msgs
+                .iter()
+                .find(|m| m[0] == "CLOSED" && m[1] == "c")
+                .expect("a failed COUNT must be closed");
+            assert_eq!(
+                closed[2],
+                json!("error: database unavailable; retry"),
+                "the CLOSED must carry a retryable database reason"
+            );
+            assert!(
+                !msgs.iter().any(|m| m[0] == "COUNT"),
+                "a failed scan must not be answered as a zero count"
+            );
+            assert!(
+                !conn.subs.contains_key("c"),
+                "the CLOSED releases any same-id REQ subscription"
+            );
         });
     }
 
@@ -3134,10 +3433,14 @@ mod tests {
                 now - 10,
                 vec![vec!["expiration".into(), (now - 1).to_string()]],
             );
-            conn.deliver_live(
+            // `deliver_live_at` takes the batch timestamp: pin it to the
+            // test's `now` so the expiry boundary is deterministic rather
+            // than sampled from the wall clock mid-test.
+            conn.deliver_live_at(
                 &expired,
                 &serde_json::to_string(&expired).unwrap_or_default(),
                 None,
+                now,
             );
             assert!(
                 !outgoing_json(&conn)
@@ -3154,10 +3457,11 @@ mod tests {
                 now,
                 vec![vec!["expiration".into(), (now + 3_600).to_string()]],
             );
-            conn.deliver_live(
+            conn.deliver_live_at(
                 &alive,
                 &serde_json::to_string(&alive).unwrap_or_default(),
                 None,
+                now,
             );
             assert!(
                 outgoing_json(&conn)
@@ -3789,20 +4093,31 @@ mod tests {
                 std::time::Duration::from_secs(2),
                 conn_a.live.as_mut().unwrap().recv(),
             )
-            .await;
+            .await
+            .expect("the matching connection receives the batch")
+            .expect("the live channel stays open");
             assert!(
-                received_a.is_ok(),
-                "the matching connection receives the batch"
+                received_a.iter().any(|(e, _)| e.id == ev.id),
+                "the delivered batch must contain the broadcast event"
             );
-            // conn_b's queue stays silent (nothing is sent to it).
-            let received_b = tokio::time::timeout(
-                std::time::Duration::from_millis(300),
-                conn_b.live.as_mut().unwrap().recv(),
-            )
-            .await;
+            // conn_b is not a delivery candidate for this event at all
+            // (its subscription indexes kind 1), so the bus cannot wake it.
+            // Asserting the candidate set is deterministic; the old 300 ms
+            // receive timeout could pass vacuously when a delivery was
+            // merely slow.
+            let candidates = conn_a
+                .relay
+                .sub_index
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .candidates(&ev);
             assert!(
-                received_b.is_err(),
-                "a non-matching connection must not be woken"
+                candidates.contains(&conn_a.conn_id),
+                "the matching connection must be a delivery candidate"
+            );
+            assert!(
+                !candidates.contains(&conn_b.conn_id),
+                "a non-matching connection must not be a delivery candidate"
             );
             conn_a.relay.db.shutdown();
         });
@@ -3810,24 +4125,43 @@ mod tests {
 
     #[test]
     fn live_flags_refresh_only_on_config_version_change() {
+        // The caches are refreshed only when the config version changed:
+        // without a bump the stale value must survive (the hot paths never
+        // re-read the config), while a bumped version must pick the new
+        // config up. This mirrors the connection loop's gate.
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let conn = build_conn().await;
+            let mut conn = build_conn().await;
             let v0 = conn.config_version;
-            // Same version: no refresh happens (nothing to assert besides
-            // the field staying put — the flag refresh is data-driven).
-            assert_eq!(conn.config_version, v0);
-            // A bumped version on the relay is picked up by the next live
-            // loop iteration (exercised by `handle_frame`'s sibling
-            // refresh; here we only assert the plumbing).
+            assert!(
+                conn.expiry_enabled,
+                "NIP-40 is enabled by the default config"
+            );
+            // The config changes without a version bump: the cached flag
+            // stays put (a refresh here would silently re-read on every
+            // frame).
+            conn.relay.config.write().await.relay.disabled_nips.push(40);
+            assert!(
+                conn.expiry_enabled,
+                "the cache must not change without a config version bump"
+            );
+            // A bumped version refreshes every cached value.
             conn.relay
                 .config_version
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            assert_eq!(
-                conn.relay
-                    .config_version
-                    .load(std::sync::atomic::Ordering::Relaxed),
-                v0 + 1
+            let version = conn
+                .relay
+                .config_version
+                .load(std::sync::atomic::Ordering::Relaxed);
+            assert_ne!(version, v0, "the version must have been bumped");
+            if version != conn.config_version {
+                conn.config_version = version;
+                conn.refresh_config_cache().await;
+            }
+            assert_eq!(conn.config_version, v0 + 1);
+            assert!(
+                !conn.expiry_enabled,
+                "a bumped version must refresh the cached NIP-40 flag"
             );
             conn.relay.db.shutdown();
         });
@@ -4062,15 +4396,22 @@ mod tests {
                 w.limits.max_subscriptions = 100;
             }
 
-            // A timed-out query (the reader is gone) closes with NEG-ERR.
+            // A failed query (the reader is gone) closes with a retryable
+            // NEG-ERR that never pretends the item set is empty (a peer
+            // must not conclude its events are gone and delete them).
             conn.relay.db.shutdown();
             conn.handle_neg_open(&[json!("s"), json!({}), json!("61000000")])
                 .await;
+            let msgs = outgoing_json(&conn);
             assert!(
-                outgoing_json(&conn)
-                    .iter()
-                    .any(|m| m[0] == "NEG-ERR" && m[2].as_str().unwrap().contains("timeout")),
-                "a timed-out sync must close with NEG-ERR"
+                msgs.iter().any(|m| m[0] == "NEG-ERR"
+                    && m[1] == "s"
+                    && m[2] == "error: database unavailable; retry"),
+                "a failed sync must close with a retryable NEG-ERR: {msgs:?}"
+            );
+            assert!(
+                !conn.neg.contains_key("s"),
+                "the NEG-ERR must close the subscription"
             );
         });
     }
@@ -4698,10 +5039,13 @@ mod tests {
     }
 
     #[test]
-    fn req_visible_truncate_keeps_created_at_ties() {
+    fn req_boundary_tie_beyond_the_page_is_dropped_whole() {
         // NIP-01/NIP-67 boundary rule: events sharing the boundary
-        // `created_at` belong to the same page — the visible truncation
-        // must extend ties instead of cutting them in half.
+        // `created_at` travel together — never a partial tie. When the tie
+        // block fills the page and the response is incomplete, keeping it
+        // would make an inclusive client (`until = T`) re-read the same
+        // block forever; the handler drops the whole boundary second and
+        // reports `more`, so the client advances to `T - 1` and finishes.
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let mut conn = build_conn().await;
@@ -4715,14 +5059,100 @@ mod tests {
             conn.handle_req(&[json!("sub"), json!({"kinds": [1], "limit": 1})])
                 .await;
             conn.pump_pending_reqs();
-            let contents: Vec<String> = outgoing_json(&conn)
+            let msgs = outgoing_json(&conn);
+            let contents: Vec<&str> = msgs
                 .iter()
                 .filter(|m| m[0] == "EVENT")
-                .map(|m| m[2]["content"].as_str().unwrap().to_string())
+                .map(|m| m[2]["content"].as_str().unwrap())
                 .collect();
             assert!(
-                contents.contains(&"v1".to_string()) && contents.contains(&"v2".to_string()),
-                "same-timestamp ties must stay together: {contents:?}"
+                !contents.contains(&"v1") && !contents.contains(&"v2"),
+                "an oversized boundary tie must not be delivered partially: {contents:?}"
+            );
+            assert!(
+                msgs.iter()
+                    .any(|m| m[0] == "EOSE" && m[1] == "sub" && m[2] == json!(["more"])),
+                "the dropped second must keep the more hint: {msgs:?}"
+            );
+            // The client advances to `T - 1` and completes.
+            conn.outgoing.clear();
+            conn.out_bytes = 0;
+            conn.handle_req(&[
+                json!("sub"),
+                json!({"kinds": [1], "limit": 1, "until": now - 1}),
+            ])
+            .await;
+            conn.pump_pending_reqs();
+            let msgs = outgoing_json(&conn);
+            assert!(
+                msgs.iter()
+                    .any(|m| m[0] == "EVENT" && m[2]["content"] == "v3"),
+                "the next page must serve the older event: {msgs:?}"
+            );
+            assert!(
+                msgs.iter()
+                    .any(|m| m[0] == "EOSE" && m[1] == "sub" && m[2] == json!(["finish"])),
+                "the follow-up page must complete: {msgs:?}"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn same_second_tie_flood_paginates_to_finish() {
+        // A same-second flood larger than the scan's tie cap used to
+        // return the same tie block on every page, so an inclusive client
+        // (`until = oldest created_at`) never finished. The handler drops
+        // the boundary second and the client advances on the next step.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let now = unix_now();
+            // Far more matching events at `now` than the page can carry,
+            // plus a few older events that make progress observable.
+            for i in 0..60 {
+                let ev = signed_note(conn.relay.secp(), &format!("flood-{i}"), now, vec![]);
+                conn.relay.db.put(ev, now).await;
+            }
+            for i in 1..=5u64 {
+                let ev = signed_note(conn.relay.secp(), &format!("older-{i}"), now - i, vec![]);
+                conn.relay.db.put(ev, now).await;
+            }
+            let mut until = now;
+            let mut finished = false;
+            for round in 0..12 {
+                conn.handle_req(&[
+                    json!("sub"),
+                    json!({"kinds": [1], "limit": 5, "until": until}),
+                ])
+                .await;
+                conn.pump_pending_reqs();
+                let msgs = outgoing_json(&conn);
+                if msgs
+                    .iter()
+                    .any(|m| m[0] == "EOSE" && m[1] == "sub" && m[2] == json!(["finish"]))
+                {
+                    finished = true;
+                    break;
+                }
+                let oldest = msgs
+                    .iter()
+                    .filter(|m| m[0] == "EVENT")
+                    .filter_map(|m| m[2]["created_at"].as_u64())
+                    .min();
+                // The inclusive client: `until` becomes the oldest event
+                // seen (no `- 1`); an empty page steps back one second.
+                until = oldest.unwrap_or_else(|| until.saturating_sub(1));
+                assert!(
+                    until < now,
+                    "round {round} must make progress: {until} < {now}"
+                );
+                conn.outgoing.clear();
+                conn.out_bytes = 0;
+            }
+            assert!(
+                finished,
+                "the inclusive client must reach finish within 12 rounds"
             );
             conn.relay.db.shutdown();
         });
@@ -4992,10 +5422,10 @@ mod tests {
             let (_ip_tx, mut ip_rx) = tokio::sync::watch::channel(0u64);
             let (_overflow_tx, mut overflow_rx) = tokio::sync::watch::channel(());
             let (drain_tx, mut drain_rx) = tokio::sync::watch::channel(false);
-            tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                let _ = drain_tx.send(true);
-            });
+            // Signal before the drain parks: a `watch` receiver treats the
+            // value as changed from the one seen at subscribe time, so the
+            // drain observes it deterministically (no timer needed).
+            let _ = drain_tx.send(true);
             let outcome = tokio::time::timeout(
                 Duration::from_secs(2),
                 drain_outgoing(
@@ -6334,13 +6764,19 @@ mod tests {
                 "live receiver survives a CLOSE + REQ cycle"
             );
             let ev = signed_note(conn.relay.secp(), "resubscribed", now, vec![]);
+            let ev_id = ev.id.clone();
             assert!(conn.relay.broadcast(ev).await.is_ok());
             let received = tokio::time::timeout(
                 std::time::Duration::from_secs(2),
                 conn.live.as_mut().unwrap().recv(),
             )
-            .await;
-            assert!(received.is_ok(), "live delivery resumes after CLOSE + REQ");
+            .await
+            .expect("live delivery resumes after CLOSE + REQ")
+            .expect("the live channel stays open");
+            assert!(
+                received.iter().any(|(e, _)| e.id == ev_id),
+                "the resubscribed connection must receive the event"
+            );
             conn.relay.db.shutdown();
         });
     }
@@ -6362,6 +6798,186 @@ mod tests {
             conn.send_control(serde_json::json!(["EOSE", "s"]));
             assert_eq!(conn.outgoing.len(), OUT_QUEUE_LIMIT * 2);
             assert_eq!(conn.dropped, dropped_before + 1);
+            // The connection loop closes exactly on this mark, so the peer
+            // waiting on the dropped frame can resynchronize instead of
+            // hanging forever.
+            assert!(
+                conn.control_overflowed,
+                "a dropped completion-critical frame must mark the connection \
+                 for close so the peer can resynchronize"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn unset_out_queue_bytes_still_enforces_the_control_ceiling() {
+        // `max_out_queue_bytes = 0` is "no configured cap", not "no
+        // bound": without the safety ceiling (twice the REQ-response
+        // budget) OUT_QUEUE_LIMIT frames of up to `max_ws_message_bytes`
+        // could pin ~4 GiB per connection.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            conn.out_queue_bytes = 0;
+            conn.req_response_bytes = 100;
+            assert_eq!(conn.control_ceiling(), 200);
+            // The first frame of an empty queue is never dropped (a single
+            // event larger than the ceiling is not lost).
+            assert!(conn.send_tagged(Message::Text("a".repeat(150).into()), None));
+            let dropped_before = conn
+                .relay
+                .stats
+                .buffers_dropped
+                .load(std::sync::atomic::Ordering::Relaxed);
+            // The next frame crosses the ceiling: dropped and counted.
+            assert!(!conn.send_tagged(Message::Text("b".repeat(150).into()), None));
+            assert_eq!(conn.outgoing.len(), 1, "only the first frame is queued");
+            assert_eq!(
+                conn.relay
+                    .stats
+                    .buffers_dropped
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                dropped_before + 1,
+                "the ceiling drop must be counted"
+            );
+            // A frame that keeps the queue below the ceiling still fits.
+            assert!(conn.send_tagged(Message::Text("c".repeat(20).into()), None));
+            assert_eq!(conn.outgoing.len(), 2);
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn unset_out_queue_bytes_still_caps_pumped_responses() {
+        // `max_out_queue_bytes = 0` must not disable the byte check on the
+        // REQ pump: without the effective cap a queued backlog was moved
+        // into the outgoing queue up to the count limit, defeating the
+        // documented ceiling on exactly this path.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            conn.out_queue_bytes = 0;
+            conn.req_response_bytes = 3_000;
+            let cap = conn.out_queue_cap();
+            assert_eq!(cap, 6_000);
+            let now = unix_now();
+            // MAX_PENDING_REQS responses of two ~1.4 KiB events each: all
+            // four together exceed the cap, each stays below its own
+            // per-response budget (so no over-budget CLOSED fires).
+            for sub in ["s0", "s1", "s2", "s3"] {
+                conn.subs
+                    .insert(sub.into(), (Vec::new(), 0, format!("\"{sub}\"")));
+                let mut events = std::collections::VecDeque::new();
+                for i in 0..2 {
+                    events.push_back(signed_note(
+                        conn.relay.secp(),
+                        &format!("{sub}-{i}-{}", "z".repeat(1_000)),
+                        now - i,
+                        vec![],
+                    ));
+                }
+                conn.enqueue_pending_req(PendingReq {
+                    sub_id: sub.into(),
+                    events,
+                    eose_hint: false,
+                    truncated_or_more: false,
+                    auth_hint: false,
+                    sent_bytes: 0,
+                    live: Default::default(),
+                    live_bytes: 0,
+                    eose_sent: false,
+                    budget: None,
+                    reserved: 0,
+                });
+            }
+            conn.pump_pending_reqs();
+            assert!(
+                conn.out_bytes <= cap,
+                "the unset queue cap must still bound the pump: {} > {cap}",
+                conn.out_bytes
+            );
+            // Nothing is lost: draining and re-pumping delivers every
+            // event and every EOSE.
+            let mut delivered = 0usize;
+            let mut eoses = 0usize;
+            loop {
+                for msg in outgoing_json(&conn) {
+                    match msg[0].as_str() {
+                        Some("EVENT") => delivered += 1,
+                        Some("EOSE") => eoses += 1,
+                        _ => {}
+                    }
+                }
+                conn.outgoing.clear();
+                conn.out_bytes = 0;
+                if conn.pending_reqs.is_empty() {
+                    break;
+                }
+                conn.pump_pending_reqs();
+            }
+            assert_eq!(delivered, 8, "no response event may be dropped");
+            assert_eq!(eoses, 4, "every response must end in its EOSE");
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn unset_out_queue_bytes_still_caps_pumped_live_backlog() {
+        // The live backlog held for a pumping response takes the same
+        // effective cap: with the configured cap unset, the old check was
+        // skipped and the whole backlog moved into the queue.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            conn.out_queue_bytes = 0;
+            conn.req_response_bytes = 1_000;
+            let cap = conn.out_queue_cap();
+            assert_eq!(cap, 2_000);
+            conn.subs
+                .insert("s".into(), (Vec::new(), 0, "\"s\"".into()));
+            let now = unix_now();
+            let mut live = std::collections::VecDeque::new();
+            let mut live_bytes = 0usize;
+            for i in 0..10 {
+                let ev = signed_note(
+                    conn.relay.secp(),
+                    &format!("live-{i}-{}", "z".repeat(1_000)),
+                    now - i,
+                    vec![],
+                );
+                let frame = format!("[\"EVENT\",\"s\",{}]", serde_json::to_string(&ev).unwrap());
+                live_bytes += frame.len();
+                live.push_back(frame);
+            }
+            conn.enqueue_pending_req(PendingReq {
+                sub_id: "s".into(),
+                events: Default::default(),
+                eose_hint: false,
+                truncated_or_more: false,
+                auth_hint: false,
+                sent_bytes: 0,
+                live,
+                live_bytes,
+                eose_sent: false,
+                budget: None,
+                reserved: 0,
+            });
+            conn.pump_pending_reqs();
+            assert!(
+                conn.out_bytes <= cap,
+                "the unset queue cap must still bound the live backlog: {} > {cap}",
+                conn.out_bytes
+            );
+            let remaining = conn
+                .pending_reqs
+                .front()
+                .map(|pending| pending.live.len())
+                .unwrap_or(0);
+            assert!(
+                remaining > 0,
+                "the live backlog beyond the cap must stay queued, not be moved"
+            );
             conn.relay.db.shutdown();
         });
     }
@@ -6489,6 +7105,239 @@ mod tests {
             32 * 1024 * 1024 * PENDING_RESPONSE_BUDGET_FACTOR,
             "a disabled per-response budget still gets the relay-wide default"
         );
+    }
+
+    #[test]
+    fn neg_budget_sizes_from_config() {
+        assert_eq!(
+            neg_budget_bytes(1_000),
+            1_000 * NEG_ITEM_BYTES * NEG_BUDGET_FACTOR,
+            "the budget is the per-query item cap times the item estimate and factor"
+        );
+        assert_eq!(
+            neg_budget_bytes(0),
+            100_000 * NEG_ITEM_BYTES * NEG_BUDGET_FACTOR,
+            "a zero item cap still gets the relay-wide default (0 would disable the budget)"
+        );
+    }
+
+    #[test]
+    fn neg_cpu_budget_sizes_from_config() {
+        assert_eq!(
+            neg_cpu_budget_units(1_000),
+            1_000 * NEG_CPU_BUDGET_FACTOR,
+            "the budget is the per-query item cap times the CPU factor"
+        );
+        assert_eq!(
+            neg_cpu_budget_units(0),
+            100_000 * NEG_CPU_BUDGET_FACTOR,
+            "a zero item cap still gets the relay-wide default"
+        );
+    }
+
+    #[test]
+    fn neg_cpu_budget_accounts_and_rejects() {
+        let budget = NegCpuBudget::new();
+        // Frozen so the assertions are independent of the wall clock: the
+        // production window rolls over once per second.
+        budget.freeze();
+        assert!(
+            budget.try_charge(3, 10),
+            "the first charge opens the window"
+        );
+        assert!(budget.try_charge(7, 10), "charges add up to the limit");
+        assert!(
+            !budget.try_charge(1, 10),
+            "the exhausted window refuses further work"
+        );
+        assert!(
+            budget.try_charge(0, 0),
+            "an empty charge is always admitted"
+        );
+        // A shrunken configured limit starts a fresh window instead of
+        // refusing every charge for the rest of the second.
+        assert!(
+            budget.try_charge(2, 5),
+            "a limit below the spent amount resets the window"
+        );
+        assert!(budget.try_charge(3, 5));
+        assert!(!budget.try_charge(1, 5));
+        // A charge above the whole budget is refused without poisoning a
+        // fresh window for everyone else.
+        let fresh = NegCpuBudget::new();
+        fresh.freeze();
+        assert!(!fresh.try_charge(11, 10));
+        assert!(
+            fresh.try_charge(10, 10),
+            "the refused oversized charge must not have consumed the window"
+        );
+    }
+
+    #[test]
+    fn neg_global_cpu_budget_rejects_opens_and_rounds() {
+        // The relay-wide CPU budget closes the 64 connections × 256 opens
+        // × 128 rounds amplification: once the shared per-second window is
+        // spent, both the NEG-OPEN scan and the NEG-MSG round are refused
+        // retryably (and, per NIP-77, the NEG-ERR closes the id).
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            conn.neg_cpu_budget.freeze();
+            let max_items = conn.relay.config.read().await.limits.max_neg_items;
+            let limit = neg_cpu_budget_units(max_items);
+            // Exhaust the window as another connection would.
+            assert!(conn.neg_cpu_budget.try_charge(limit, limit));
+
+            conn.handle_neg_open(&[json!("s"), json!({"kinds": [1]}), json!("61000000")])
+                .await;
+            let msgs = outgoing_json(&conn);
+            assert!(
+                msgs.iter().any(|m| m[0] == "NEG-ERR"
+                    && m[1] == "s"
+                    && m[2].as_str().unwrap_or("").contains("overloaded")),
+                "an over-budget open must be refused retryably before the scan: {msgs:?}"
+            );
+            assert!(conn.neg.is_empty(), "no over-budget state may be pinned");
+            conn.outgoing.clear();
+
+            // A NEG-MSG is charged by its held item count and refused once
+            // the window is exhausted.
+            conn.neg.insert(
+                "held".into(),
+                super::negentropy::NegState {
+                    items: vec![(1, [7u8; 32])],
+                    rounds_left: super::negentropy::MAX_NEG_MSG_ROUNDS,
+                    budget: None,
+                    reserved: 0,
+                },
+            );
+            conn.handle_neg_msg(&[json!("held"), json!("61000000")])
+                .await;
+            let msgs = outgoing_json(&conn);
+            assert!(
+                msgs.iter().any(|m| m[0] == "NEG-ERR"
+                    && m[1] == "held"
+                    && m[2].as_str().unwrap_or("").contains("overloaded")),
+                "an over-budget round must be refused retryably: {msgs:?}"
+            );
+            assert!(
+                !conn.neg.contains_key("held"),
+                "the over-budget NEG-ERR closes the subscription"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn neg_global_budget_rejects_and_releases() {
+        // The relay-wide NEG budget bounds the items held across all
+        // connections: an open that does not fit fails retryably with
+        // NEG-ERR (which per NIP-77 closes the id) instead of pinning the
+        // items, and the reservation is returned exactly once on NEG-CLOSE,
+        // replacement, connection drop and panic (the latter through
+        // `NegState`'s Drop, like `PendingReq`).
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let now = unix_now();
+            let mut ids = Vec::new();
+            for i in 0..2 {
+                let ev = signed_note(conn.relay.secp(), &format!("e{i}"), now - i as u64, vec![]);
+                conn.relay.db.put(ev.clone(), now).await;
+                ids.push(ev.id);
+            }
+            let budget = Arc::clone(&conn.neg_budget);
+            let limit = neg_budget_bytes(conn.relay.config.read().await.limits.max_neg_items);
+            assert!(limit > 0, "held NEG state must always be budgeted");
+            // Fill the budget as if other connections held syncs.
+            assert!(budget.try_reserve(limit, limit).is_some());
+
+            conn.handle_neg_open(&[json!("sub"), json!({"kinds": [1]}), json!("61000000")])
+                .await;
+            let msgs = outgoing_json(&conn);
+            assert!(
+                msgs.iter().any(|m| m[0] == "NEG-ERR"
+                    && m[1] == "sub"
+                    && m[2].as_str().unwrap_or("").contains("overloaded")),
+                "an over-budget open must fail retryably with NEG-ERR: {msgs:?}"
+            );
+            assert!(conn.neg.is_empty(), "no over-budget state may be pinned");
+            assert_eq!(
+                budget.used(),
+                limit,
+                "the refused open must not reserve anything"
+            );
+
+            // Freeing a slot admits the open; the held set is reserved
+            // exactly (one reservation per held item).
+            budget.release(limit);
+            conn.outgoing.clear();
+            conn.handle_neg_open(&[json!("sub"), json!({"kinds": [1]}), json!("61000000")])
+                .await;
+            assert!(conn.neg.contains_key("sub"));
+            let held = budget.used();
+            assert_eq!(
+                held,
+                2 * NEG_ITEM_BYTES,
+                "the held item count must be reserved exactly"
+            );
+
+            // A successful replacement releases the old reservation before
+            // taking the new one: net zero for the same set.
+            conn.handle_neg_open(&[json!("sub"), json!({"kinds": [1]}), json!("61000000")])
+                .await;
+            assert_eq!(budget.used(), held, "replacement must be net zero");
+
+            // A second subscription reserves its own set; NEG-CLOSE returns
+            // exactly that one.
+            conn.outgoing.clear();
+            conn.handle_neg_open(&[json!("one"), json!({"ids": [ids[0]]}), json!("61000000")])
+                .await;
+            assert!(conn.neg.contains_key("one"));
+            assert_eq!(
+                budget.used(),
+                held + NEG_ITEM_BYTES,
+                "the second set must be reserved on top"
+            );
+            conn.handle_neg_close(&[json!("sub")]);
+            assert_eq!(
+                budget.used(),
+                NEG_ITEM_BYTES,
+                "NEG-CLOSE must release exactly the closed set"
+            );
+            assert!(!conn.neg.contains_key("sub"));
+
+            // Connection drop releases whatever is still held.
+            conn.relay.db.shutdown();
+            drop(conn);
+            assert_eq!(
+                budget.used(),
+                0,
+                "connection drop must release the remaining reservation"
+            );
+
+            // Panic path: a `NegState` dropped while unwinding releases its
+            // reservation (the connection guard relies on this when the
+            // connection task panics).
+            let panic_budget = Arc::new(PendingResponseBudget::new());
+            assert_eq!(panic_budget.try_reserve(128, 128), Some(128));
+            let state_budget = Arc::clone(&panic_budget);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _state = super::negentropy::NegState {
+                    items: Vec::new(),
+                    rounds_left: 1,
+                    budget: Some(state_budget),
+                    reserved: 128,
+                };
+                panic!("simulated panic while the NEG state is held");
+            }));
+            assert!(result.is_err(), "the simulated panic must unwind");
+            assert_eq!(
+                panic_budget.used(),
+                0,
+                "a panic must release the NEG reservation exactly once"
+            );
+        });
     }
 
     #[test]

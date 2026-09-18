@@ -31,6 +31,8 @@ impl Event {
 mod tests {
     use super::*;
 
+    use crate::fuzz_tests::{Rng, random_event, random_json};
+
     fn event() -> Event {
         Event {
             id: "a".repeat(64),
@@ -52,5 +54,68 @@ mod tests {
             ..event()
         };
         assert!(bad.id_bytes().is_none());
+    }
+
+    // ----- deterministic fuzzing (see crate::fuzz_tests) -----
+
+    #[test]
+    fn fuzz_random_events_roundtrip_and_never_panic_the_helpers() {
+        // Structurally valid events with random contents survive a JSON
+        // round-trip, and the helpers reachable without a database
+        // (id_bytes, pubkey_bytes, the canonical id) never panic on them.
+        let mut rng = Rng::new(0x5eed_e001);
+        for _ in 0..4_000 {
+            let original = random_event(&mut rng);
+            let text = serde_json::to_string(&original).unwrap();
+            let decoded: Event = serde_json::from_str(&text).unwrap();
+            assert_eq!(decoded, original, "a serialized event must round-trip");
+            // The helpers decode hex: exactly 64 hex characters yield
+            // bytes, anything else (wrong length or non-hex) yields None.
+            let is_hex64 = |s: &str| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit());
+            assert_eq!(decoded.id_bytes().is_some(), is_hex64(&decoded.id));
+            assert_eq!(decoded.pubkey_bytes().is_some(), is_hex64(&decoded.pubkey));
+            assert_eq!(crate::nips::nip01::compute_id(&decoded).len(), 64);
+        }
+
+        // Random JSON text through the wire parser must never panic; only
+        // the rare structurally complete object parses.
+        for _ in 0..4_000 {
+            let value = random_json(&mut rng, 4);
+            let text = serde_json::to_string(&value).unwrap();
+            if let Ok(decoded) = serde_json::from_str::<Event>(&text) {
+                let _ = decoded.id_bytes();
+                let _ = decoded.pubkey_bytes();
+                let _ = crate::nips::nip01::compute_id(&decoded);
+            }
+        }
+    }
+
+    #[test]
+    fn fuzz_event_hex_length_checks_never_panic() {
+        // Random hex-ish field lengths around 64/128 characters: the
+        // length checks must return None instead of panicking.
+        let mut rng = Rng::new(0x5eed_e002);
+        for _ in 0..2_000 {
+            let id_len = rng.below(80);
+            let pk_len = rng.below(80);
+            let sig_len = rng.below(160);
+            let tag_count = rng.below(3);
+            let ev = Event {
+                id: rng.hex(id_len),
+                pubkey: rng.hex(pk_len),
+                created_at: rng.next_u64(),
+                kind: rng.next_u64(),
+                tags: (0..tag_count)
+                    .map(|_| {
+                        let value_count = rng.below(3);
+                        (0..value_count).map(|_| rng.hex(4)).collect()
+                    })
+                    .collect(),
+                content: crate::fuzz_tests::random_string(&mut rng, 20),
+                sig: rng.hex(sig_len),
+            };
+            assert_eq!(ev.id_bytes().is_some(), ev.id.len() == 64);
+            assert_eq!(ev.pubkey_bytes().is_some(), ev.pubkey.len() == 64);
+        }
     }
 }

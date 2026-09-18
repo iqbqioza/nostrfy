@@ -1018,6 +1018,7 @@ async fn put_blob(relay: Arc<Relay>, headers: HeaderMap, body: Body, verb: &str)
     // Spool on the blob filesystem when possible: the final store is then a
     // rename (no second full write). A missing/uncreatable directory falls
     // back to the system temp dir.
+    let drain = relay.subscribe_drain();
     let spool_dir = state.store.spool_dir();
     let spool_dir = match spool_dir.as_deref() {
         Some(dir) => match tokio::fs::create_dir_all(dir).await {
@@ -1026,12 +1027,20 @@ async fn put_blob(relay: Arc<Relay>, headers: HeaderMap, body: Body, verb: &str)
         },
         None => None,
     };
-    let (path, size, sha) =
-        match spool_upload(body, max_upload as u64, reserved, idle_timeout, spool_dir).await {
-            Ok(value) => value,
-            Err(response) => return *response,
-        };
-    let mut cleanup = TempUploadCleanup::new(path.clone());
+    let (path, size, sha) = match spool_upload(
+        body,
+        max_upload as u64,
+        reserved,
+        idle_timeout,
+        spool_dir,
+        Some(drain.clone()),
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+    let mut cleanup = TempUploadCleanup::new(path.clone(), Some(drain));
     if let Some(declared) = declared_sha
         && declared != sha
     {
@@ -1131,6 +1140,7 @@ async fn spool_upload(
     reserved: u64,
     idle_timeout: std::time::Duration,
     spool_dir: Option<&std::path::Path>,
+    drain: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Result<(std::path::PathBuf, u64, String), Box<Response>> {
     use futures_util::StreamExt;
     use sha2::{Digest, Sha256};
@@ -1147,7 +1157,7 @@ async fn spool_upload(
     path.push(storage::spool_file_name(
         TEMP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
     ));
-    let mut cleanup = TempUploadCleanup::new(path.clone());
+    let mut cleanup = TempUploadCleanup::new(path.clone(), drain);
     let mut file = match tokio::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -1247,11 +1257,19 @@ async fn spool_upload(
 
 struct TempUploadCleanup {
     path: Option<std::path::PathBuf>,
+    /// The relay drain signal, when the upload ran under the relay: once
+    /// shutdown is signaled the cleanup spawns nothing (and the startup
+    /// sweep removes the spool instead). `None` in unit tests, where the
+    /// file is always removed.
+    drain: Option<tokio::sync::watch::Receiver<bool>>,
 }
 
 impl TempUploadCleanup {
-    fn new(path: std::path::PathBuf) -> Self {
-        Self { path: Some(path) }
+    fn new(path: std::path::PathBuf, drain: Option<tokio::sync::watch::Receiver<bool>>) -> Self {
+        Self {
+            path: Some(path),
+            drain,
+        }
     }
 
     fn disarm(&mut self) {
@@ -1259,24 +1277,44 @@ impl TempUploadCleanup {
     }
 }
 
+/// Bounds the detached spool-removal tasks: a burst of aborted uploads must
+/// not spawn an unbounded number of tasks (each pins a runtime slot and a
+/// potentially large unlink). When no permit is free the removal falls back
+/// to the synchronous best-effort unlink, which is cheap and cannot pile up.
+static SPOOL_REMOVAL_LIMITS: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> =
+    std::sync::OnceLock::new();
+
+fn spool_removal_limit() -> Arc<tokio::sync::Semaphore> {
+    Arc::clone(SPOOL_REMOVAL_LIMITS.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(16))))
+}
+
 impl Drop for TempUploadCleanup {
     fn drop(&mut self) {
         let Some(path) = self.path.take() else {
             return;
         };
+        let drain = self.drain.take();
+        // Shutdown: leave the spool for the startup sweep instead of
+        // spawning work that can outlive the runtime and race the
+        // database stop.
+        if drain.as_ref().is_some_and(|rx| *rx.borrow()) {
+            log::info!(
+                "Blossom upload cleanup: shutdown signaled; leaving {} for the startup sweep",
+                path.display()
+            );
+            return;
+        }
         // Removing a large spool can block the worker for a while: hand it
         // to the runtime when one is available (Drop runs on the handler
-        // task), and fall back to a sync removal otherwise.
-        if tokio::runtime::Handle::try_current().is_ok() {
+        // task) and a removal task permit is free, and fall back to a sync
+        // removal otherwise. The permit bound keeps a storm of aborted
+        // uploads from spawning one task per spool.
+        if tokio::runtime::Handle::try_current().is_ok()
+            && let Ok(permit) = spool_removal_limit().try_acquire_owned()
+        {
             tokio::spawn(async move {
-                if let Err(e) = tokio::fs::remove_file(&path).await
-                    && e.kind() != std::io::ErrorKind::NotFound
-                {
-                    log::warn!(
-                        "cannot remove temporary Blossom upload {}: {e}",
-                        path.display()
-                    );
-                }
+                let _permit = permit;
+                remove_spool(path, drain).await;
             });
         } else if let Err(e) = std::fs::remove_file(&path)
             && e.kind() != std::io::ErrorKind::NotFound
@@ -1286,6 +1324,40 @@ impl Drop for TempUploadCleanup {
                 path.display()
             );
         }
+    }
+}
+
+/// Removes an abandoned spool file. With a drain receiver, the removal
+/// stops early when the relay shuts down: the spool stays for the next
+/// startup's sweep, which can always remove it once this process start is
+/// gone. A `None` receiver (unit tests) removes unconditionally.
+async fn remove_spool(
+    path: std::path::PathBuf,
+    mut drain: Option<tokio::sync::watch::Receiver<bool>>,
+) {
+    let removed = match drain.as_mut() {
+        Some(rx) => {
+            tokio::select! {
+                biased;
+                _ = rx.changed() => {
+                    log::info!(
+                        "Blossom upload cleanup: shutdown signaled; leaving {} for the startup sweep",
+                        path.display()
+                    );
+                    return;
+                }
+                removed = tokio::fs::remove_file(&path) => removed,
+            }
+        }
+        None => tokio::fs::remove_file(&path).await,
+    };
+    if let Err(e) = removed
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        log::warn!(
+            "cannot remove temporary Blossom upload {}: {e}",
+            path.display()
+        );
     }
 }
 
@@ -1511,7 +1583,7 @@ async fn delete_blob(
 
 /// Builds the shared Blossom state from the config (or `None` when the
 /// feature is disabled). Must be called before the router is built.
-pub(crate) async fn build_state(cfg: &Config, _relay: &Relay) -> Option<Arc<BlossomState>> {
+pub(crate) async fn build_state(cfg: &Config, relay: &Relay) -> Option<Arc<BlossomState>> {
     if cfg.blossom.host.trim().is_empty() {
         return None;
     }
@@ -1531,14 +1603,17 @@ pub(crate) async fn build_state(cfg: &Config, _relay: &Relay) -> Option<Arc<Blos
         &cfg.blossom.local_path,
         cfg.blossom.min_free_bytes,
         s3,
-        _relay.db.clone(),
+        relay.db.clone(),
+        relay.stats.clone(),
     )
     .await
     {
         Ok(store) => {
             // Remove spool files a crash (SIGKILL/power loss) left behind:
             // their Drop cleanup never ran and they would otherwise
-            // accumulate until the disk is full.
+            // accumulate until the disk is full. The sweep also logs (and
+            // counts) what it removed; no object/mapping diff is attempted
+            // (see `BlobStore::sweep_stale_spools`).
             store.sweep_stale_spools();
             let state = Arc::new(BlossomState {
                 store,
@@ -1551,17 +1626,31 @@ pub(crate) async fn build_state(cfg: &Config, _relay: &Relay) -> Option<Arc<Blos
             });
             // One-time automatic migration of legacy blobs (storage files
             // that predate the LMDB mapping), in the background so the
-            // relay starts instantly.
+            // relay starts instantly. The task observes the relay drain
+            // signal: a shutdown stops the pass without writing the marker,
+            // so the next start resumes it instead of scanning a stopped
+            // database.
             let state_for_migration = Arc::clone(&state);
-            tokio::spawn(async move {
-                match state_for_migration.store.auto_migrate_legacy().await {
-                    Ok(n) if n > 0 => {
-                        log::info!("Blossom legacy migration: mapped {n} existing blob(s)")
+            let drain = relay.subscribe_drain();
+            if *drain.borrow() {
+                log::info!("Blossom legacy migration: skipped, the relay is shutting down");
+            } else {
+                tokio::spawn(async move {
+                    match state_for_migration.store.auto_migrate_legacy(drain).await {
+                        Ok(storage::MigrationOutcome::Completed(n)) if n > 0 => {
+                            log::info!("Blossom legacy migration: mapped {n} existing blob(s)")
+                        }
+                        Ok(storage::MigrationOutcome::Completed(_)) => {}
+                        Ok(storage::MigrationOutcome::Interrupted(n)) => {
+                            log::info!(
+                                "Blossom legacy migration: stopped after {n} blob(s) for \
+                                 shutdown; the pass resumes on the next start"
+                            )
+                        }
+                        Err(e) => log::warn!("Blossom legacy migration failed: {e}"),
                     }
-                    Ok(_) => {}
-                    Err(e) => log::warn!("Blossom legacy migration failed: {e}"),
-                }
-            });
+                });
+            }
             Some(state)
         }
         Err(e) => {
@@ -2414,6 +2503,80 @@ mod tests {
         relay.db.shutdown();
     }
 
+    /// A cancelled (or shutdown-torn-down) upload must release all three
+    /// resources it holds: the per-pubkey slot, the global permit and the
+    /// disk reservation. The reservation is the easy one to leak — it lives
+    /// in the storage guard, not the handler's own state.
+    #[tokio::test]
+    async fn cancelled_upload_releases_slot_permit_and_reservation() {
+        // A nonzero floor makes the reservation counter track (0 disables
+        // the disk-full guard, and then nothing is reserved at all).
+        let relay = build_blossom_relay(1).await;
+        relay.config.write().await.limits.http_read_timeout_secs = 30;
+        let state = state_of(&relay).await.expect("blossom state");
+        let data = b"cancelled blob";
+        let sha = sha256_hex(data);
+        let (headers, pk) = auth_headers_scoped(relay.secp(), "upload", Some(&sha));
+        let handle = tokio::spawn(upload(
+            State(relay.clone()),
+            headers,
+            Body::from_stream(futures_util::stream::pending::<
+                Result<bytes::Bytes, std::io::Error>,
+            >()),
+        ));
+        // Wait until the handler holds its slot, permit and reservation.
+        let permits_full = state.max_upload_bytes.saturating_mul(4).max(1);
+        for _ in 0..200 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            let registered = state
+                .uploads_inflight
+                .lock()
+                .unwrap()
+                .get(&pk)
+                .copied()
+                .unwrap_or(0);
+            if registered == 1
+                && state.store.reserved_bytes() > 0
+                && state.upload_budget.available_permits() < permits_full
+            {
+                break;
+            }
+        }
+        assert_eq!(
+            state.uploads_inflight.lock().unwrap().get(&pk).copied(),
+            Some(1),
+            "the stalled upload must register its identity slot"
+        );
+        assert!(
+            state.store.reserved_bytes() > 0,
+            "the stalled upload must hold its spool reservation"
+        );
+        assert!(
+            state.upload_budget.available_permits() < permits_full,
+            "the stalled upload must hold its global permit"
+        );
+        // The server tears the handler future down on shutdown (drain, then
+        // the connection task drops); cancellation must return everything.
+        relay.signal_drain();
+        handle.abort();
+        let _ = handle.await;
+        assert!(
+            state.uploads_inflight.lock().unwrap().is_empty(),
+            "a cancelled upload must release its identity slot"
+        );
+        assert_eq!(
+            state.upload_budget.available_permits(),
+            permits_full,
+            "a cancelled upload must release its global permit"
+        );
+        assert_eq!(
+            state.store.reserved_bytes(),
+            0,
+            "a cancelled upload must release its disk reservation"
+        );
+        relay.db.shutdown();
+    }
+
     #[tokio::test]
     async fn trickled_upload_body_is_bounded_by_the_total_deadline() {
         // One byte per idle window passes the per-chunk check, but the
@@ -2436,6 +2599,7 @@ mod tests {
             64 * 1024,
             64 * 1024,
             std::time::Duration::from_secs(1),
+            None,
             None,
         )
         .await;
@@ -2723,9 +2887,45 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         std::fs::write(&path, b"abandoned").unwrap();
         {
-            let _cleanup = TempUploadCleanup::new(path.clone());
+            let _cleanup = TempUploadCleanup::new(path.clone(), None);
         }
         assert!(!path.exists());
+    }
+
+    /// A drained relay must not spawn a detached cleanup: the spool stays
+    /// for the next startup's sweep, which removes it once this process
+    /// start is gone. A live signal removes it as before.
+    #[tokio::test]
+    async fn drained_upload_cleanup_leaves_the_spool_for_the_startup_sweep() {
+        let path = std::env::temp_dir().join(format!(
+            "nostrfy-blossom-drain-cleanup-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, b"abandoned").unwrap();
+        {
+            let (_tx, drain) = tokio::sync::watch::channel(true);
+            let _cleanup = TempUploadCleanup::new(path.clone(), Some(drain));
+        }
+        assert!(
+            path.exists(),
+            "a drained cleanup must leave the spool for the sweep"
+        );
+        // The sender stays alive while the spawned removal runs: dropping
+        // it would (correctly) read as the relay shutting down.
+        let (_tx, drain) = tokio::sync::watch::channel(false);
+        {
+            let _cleanup = TempUploadCleanup::new(path.clone(), Some(drain));
+        }
+        let mut removed = false;
+        for _ in 0..100 {
+            if !path.exists() {
+                removed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(removed, "a live cleanup must remove the spool");
     }
 
     #[test]

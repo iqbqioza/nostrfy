@@ -366,9 +366,13 @@ pub struct DatabaseConfig {
     pub db_request_timeout_secs: u64,
     /// Skip the synchronous disk flush after every write batch (LMDB
     /// `MDB_NOSYNC`). Writes land in the OS page cache and are flushed by
-    /// the kernel later, which multiplies ingest throughput at the cost of
-    /// durability: on a power loss the most recent writes since the last
-    /// kernel flush may be lost. The default (false) flushes every batch.
+    /// the kernel later: commits cost microseconds instead of an fsync, at
+    /// the cost of durability and integrity. A power loss or OS crash can
+    /// lose acknowledged writes; if the OS persists the meta page before
+    /// the data pages it references, the database can be left corrupt
+    /// (restore from a backup). The writer force-syncs about once per
+    /// second, which bounds the loss window but not the ordering risk. The
+    /// default (false) flushes every batch.
     pub disabled_fsync: bool,
     /// Overload protection: when the database thread's queue holds more than
     /// this many pending messages (or `max_db_queue_events` events), new
@@ -1146,6 +1150,20 @@ impl Config {
             return Err(config_err(
                 "database.map_size must not exceed database.max_map_size",
             ));
+        }
+        // `disabled_fsync` (LMDB MDB_NOSYNC) skips the fsync after each
+        // commit: acknowledged writes can be lost, and a crash that leaves
+        // the meta page persisted before the data pages it references can
+        // corrupt the database. The writer force-syncs about once per
+        // second, which bounds the loss window but not the ordering risk.
+        // Warn loudly so the operator weighs it against the throughput.
+        if self.database.disabled_fsync {
+            log::warn!(
+                "database.disabled_fsync is enabled: commits skip the fsync, so a power \
+                 loss or OS crash can lose acknowledged writes and can corrupt the \
+                 database; the writer only force-syncs about once per second. Keep the \
+                 default (false) unless you have a backup and accept the risk"
+            );
         }
 
         // NIP toggles: `enabled_nips` wins silently; surface the ambiguity.
@@ -2211,6 +2229,43 @@ mod tests {
                 "config section [{section}] is missing from the known-keys list"
             );
         }
+    }
+
+    #[test]
+    fn configuration_md_full_example_uses_known_keys() {
+        // The documented full example must be authoritative: every key it
+        // shows must be a real config key. A key under the wrong section
+        // (e.g. `enabled_nip78_auth` under `[server]`) is silently ignored
+        // at runtime, so the example would teach a configuration that does
+        // not apply.
+        let docs = std::fs::read_to_string("docs/CONFIGURATION.md")
+            .expect("docs/CONFIGURATION.md is readable from the crate root");
+        let example = docs
+            .split_once("## 11. Full example")
+            .and_then(|(_, rest)| rest.split_once("```toml\n"))
+            .and_then(|(_, rest)| rest.split_once("\n```"))
+            .map(|(block, _)| block)
+            .expect("the full example TOML block must be present");
+        let value: toml::Value = toml::from_str(example).expect("the full example is valid TOML");
+        let known = known_config_keys();
+        for (section, table) in value.as_table().unwrap() {
+            let Some(keys) = known
+                .iter()
+                .find(|(s, _)| s == section)
+                .map(|(_, keys)| *keys)
+            else {
+                panic!("unknown section [{section}] in the full example");
+            };
+            for key in table.as_table().unwrap().keys() {
+                assert!(
+                    keys.contains(&key.as_str()),
+                    "[{section}].{key} from the full example is not a real config key \
+                     (it would be silently ignored)"
+                );
+            }
+        }
+        // The typed loader must accept the example too (serde shape).
+        toml::from_str::<Config>(example).expect("the full example must deserialize");
     }
 
     #[test]

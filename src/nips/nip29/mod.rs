@@ -72,6 +72,16 @@ pub(crate) const MAX_MEMBERS: usize = 10_000;
 /// the check costs O(1) instead of scanning every group per event.
 pub(crate) const MAX_TOTAL_MEMBERS: usize = 1_000_000;
 
+/// The declared-children adoption hint may hold this many ids per
+/// configured group. The hint is only a fast path for the create-time
+/// scan, so the budget is deliberately small.
+const DECLARED_CHILDREN_PER_GROUP: usize = 4;
+
+/// Absolute bound on the declared-children hint for an uncapped store
+/// (`max_groups == 0`): the hint must never grow with the history, even
+/// when the group cap is disabled.
+const MAX_DECLARED_CHILDREN: usize = 10_000;
+
 fn tag_value<'a>(event: &'a Event, name: &str) -> Option<&'a str> {
     event
         .tags
@@ -256,6 +266,22 @@ pub(crate) struct GroupsSnapshot {
     /// force a full rebuild and silently discard the rest of the state).
     #[serde(default)]
     pub ghost: HashSet<String>,
+    /// The database's group-state generation the snapshot was taken at
+    /// (see `DbClient::state_stamp`): a restore must reject a snapshot
+    /// stamped before the current generation, because it predates a
+    /// group-state removal. Present in snapshots written after the stamp
+    /// was introduced; older snapshots deserialize as 0.
+    #[serde(default)]
+    pub stamp: u64,
+    /// The database's derived-state sequence the snapshot was taken at
+    /// (see `DbClient::state_seq`): a restore must reject a snapshot whose
+    /// sequence is below the current one, because it predates a
+    /// NIP-29/NIP-43 state event (a debounced or skipped snapshot write
+    /// leaves the old sequence behind, making the newer state detectable).
+    /// Present in snapshots written after the sequence was introduced;
+    /// older snapshots deserialize as 0.
+    #[serde(default)]
+    pub seq: u64,
 }
 
 /// Verifies that a rebuild page delivered every event of its boundary
@@ -304,6 +330,11 @@ impl GroupStore {
             groups: self.groups.clone(),
             deleted: self.deleted.clone(),
             ghost: self.ghost.clone(),
+            // Filled by the persist path, which reads the database's
+            // group-state generation (`DbClient::state_stamp` and
+            // `DbClient::state_seq`).
+            stamp: 0,
+            seq: 0,
         }
     }
 
@@ -315,6 +346,38 @@ impl GroupStore {
         self.deleted = snap.deleted;
         self.ghost = snap.ghost;
         self.recompute_derived();
+    }
+
+    /// Whether a snapshot stamped `snapshot_stamp` still reflects the
+    /// database generation `current_stamp`: a snapshot from before a
+    /// group-state removal (its stamp is older) must not be restored. A
+    /// snapshot stamped at the current generation is current; one stamped
+    /// ahead can only mean the counter was reset and is the freshest state
+    /// available. A caller that cannot read `current_stamp` must fail
+    /// closed (see the startup restore path).
+    pub(crate) fn snapshot_is_current(snapshot_stamp: u64, current_stamp: u64) -> bool {
+        snapshot_stamp >= current_stamp
+    }
+
+    /// Restores `snap` only when it does not predate either the database's
+    /// `current_stamp` (a state-event removal advanced it) or `current_seq`
+    /// (a state event was stored). Returns false without touching the store
+    /// when the snapshot is stale, so the caller runs the existing rebuild
+    /// path (fail-closed): restoring it would resurrect state a removal
+    /// invalidated, or lose a state event the snapshot predates.
+    pub(crate) fn restore_checked(
+        &mut self,
+        snap: GroupsSnapshot,
+        current_stamp: u64,
+        current_seq: u64,
+    ) -> bool {
+        if !Self::snapshot_is_current(snap.stamp, current_stamp)
+            || !Self::snapshot_is_current(snap.seq, current_seq)
+        {
+            return false;
+        }
+        self.restore(snap);
+        true
     }
 
     /// Recomputes the counters derived from `groups` (after a restore or a
@@ -343,6 +406,52 @@ impl GroupStore {
         self.max_groups > 0
             && self.groups.len() + self.deleted.len() + self.ghost.len() >= self.max_groups
     }
+
+    /// The bound on the declared-children adoption hint: a small multiple
+    /// of the group cap, or the absolute [`MAX_DECLARED_CHILDREN`] when the
+    /// cap is disabled. The hint is monotonic without this bound: a 9002
+    /// listing fresh placeholder child ids would grow it forever, and
+    /// `at_capacity` never counted it.
+    fn declared_children_cap(&self) -> usize {
+        if self.max_groups == 0 {
+            MAX_DECLARED_CHILDREN
+        } else {
+            self.max_groups.saturating_mul(DECLARED_CHILDREN_PER_GROUP)
+        }
+    }
+
+    /// Drops declared child ids no live group's `children` list references
+    /// any more: they can never be adopted, so they only occupy the hint
+    /// budget. Runs when the hint is over (or at) its bound, so the scan is
+    /// bounded by the live group state.
+    fn prune_declared_children(&mut self) {
+        let live: HashSet<&str> = self
+            .groups
+            .values()
+            .flat_map(|group| group.children.iter().map(String::as_str))
+            .collect();
+        self.declared_children
+            .retain(|id| live.contains(id.as_str()));
+    }
+
+    /// Records `id` as a declared-child adoption hint, pruning unreferenced
+    /// entries when at the bound and dropping the hint entirely once the
+    /// budget is exhausted. A missing hint only costs the adoption scan a
+    /// later CREATE_GROUP would have skipped; the store stays bounded.
+    fn declare_child(&mut self, id: &str) {
+        if self.declared_children.contains(id) {
+            return;
+        }
+        let cap = self.declared_children_cap();
+        if self.declared_children.len() >= cap {
+            self.prune_declared_children();
+            if self.declared_children.len() >= cap {
+                return;
+            }
+        }
+        self.declared_children.insert(id.to_string());
+    }
+
     pub fn group(&self, id: &str) -> Option<&Group> {
         self.groups.get(id)
     }
@@ -700,12 +809,39 @@ impl GroupStore {
                             let has_roles = tag[2..].iter().any(|r| !r.is_empty());
                             overrides.insert(tag[1].as_str(), has_roles);
                         }
+                        // The retention check must only count grants the
+                        // apply loop below will actually insert: a fresh
+                        // grant skipped at the group or global member cap
+                        // would otherwise "retain" an admin that does not
+                        // exist, and the demotion of the real last admin
+                        // would leave the group admin-less. Simulate the
+                        // loop's capacity decisions in tag order.
+                        let mut group_room = MAX_MEMBERS.saturating_sub(group.members.len());
+                        let mut global_room = if self.max_total_members > 0 {
+                            self.max_total_members.saturating_sub(self.total_members)
+                        } else {
+                            usize::MAX
+                        };
+                        let mut inserted: HashSet<&str> = HashSet::new();
+                        for tag in event.tags.iter().filter(|t| t.len() >= 2 && t[0] == P) {
+                            let pk = tag[1].as_str();
+                            if group.is_member(pk) || inserted.contains(pk) {
+                                continue;
+                            }
+                            if group_room > 0 && global_room > 0 {
+                                inserted.insert(pk);
+                                group_room -= 1;
+                                global_room -= 1;
+                            }
+                        }
                         let retains_admin = group.members.iter().any(|(pk, roles)| {
                             overrides
                                 .get(pk.as_str())
                                 .copied()
                                 .unwrap_or(!roles.is_empty())
-                        }) || overrides.values().any(|has| *has);
+                        }) || inserted
+                            .iter()
+                            .any(|pk| overrides.get(*pk).copied().unwrap_or(false));
                         if !retains_admin {
                             // Drop the demotion: the event itself still
                             // stores, but the group keeps its last admin
@@ -788,6 +924,21 @@ impl GroupStore {
                 }
             }
             9002 => {
+                // Re-check the graph invariants under the write lock: two
+                // concurrent 9002 edits can each pass the read-side
+                // validation against the same state and then interleave
+                // into a cycle, drop a child another edit just adopted, or
+                // reparent through an admin whose role was revoked in
+                // between (the same TOCTOU the 9000/9001 arms close for the
+                // last-admin invariant). A rebuild replays already-validated
+                // history, so the re-check is runtime-only.
+                if !ignore_capacity && let Some(group) = self.groups.get(gid) {
+                    let relay_signed =
+                        !relay_pubkey.is_empty() && event.pubkey.eq_ignore_ascii_case(relay_pubkey);
+                    if validate_edit_metadata(self, gid, group, event, relay_signed).is_err() {
+                        return Vec::new();
+                    }
+                }
                 let (parent_before, parent_after, children_before, children_after) = {
                     match self.groups.get_mut(gid) {
                         Some(group) => {
@@ -809,10 +960,12 @@ impl GroupStore {
                 };
                 // Keep the adoption hint current: a declared child id makes
                 // a later CREATE_GROUP scan for the (deterministically
-                // smallest) adopting parent.
+                // smallest) adopting parent. The hint is bounded (see
+                // `declare_child`).
                 for child in children_after {
-                    self.declared_children.insert(child);
+                    self.declare_child(&child);
                 }
+                let mut linked_to_new_parent = false;
                 if parent_before != parent_after {
                     if let Some(old) = parent_before.clone()
                         && let Some(parent_group) = self.groups.get_mut(&old)
@@ -824,11 +977,14 @@ impl GroupStore {
                         && !parent_group.children.iter().any(|c| c == gid)
                     {
                         parent_group.children.push(gid.to_string());
-                        self.declared_children.insert(gid.to_string());
+                        linked_to_new_parent = true;
                     }
                     if let Some(group) = self.groups.get_mut(gid) {
                         group.parent = parent_after.clone();
                     }
+                }
+                if linked_to_new_parent {
+                    self.declare_child(gid);
                 }
                 // The parent side of the link: a `child` tag on the
                 // parent's 9002 declares a child (the child's own `parent`
@@ -1512,7 +1668,14 @@ impl GroupStore {
                 if let Some(gid) = crate::nips::nip29::group_id(event) {
                     seen_gids.insert(gid.to_string());
                     seen_h_gids.insert(gid.to_string());
-                } else if let Some(gid) = crate::nips::nip29::group_id_d(event) {
+                } else if (GROUP_META..=GROUP_PINS).contains(&event.kind)
+                    && let Some(gid) = crate::nips::nip29::group_id_d(event)
+                {
+                    // Only the relay-generated metadata kinds identify a
+                    // group by `d`: every addressable event (long-form
+                    // 30023, app data, ...) carries a `d` tag that must not
+                    // ghost a non-existent group or consume the group
+                    // budget. Mirrors `group_id_any`.
                     seen_gids.insert(gid.to_string());
                 }
             }
@@ -1547,10 +1710,13 @@ impl GroupStore {
     }
 
     /// Removes a group id from the ghost set once its history is confirmed
-    /// purged: the id returns to the ordinary delete tombstone, which a
-    /// fresh create may clear.
+    /// purged and downgrades it to the ordinary delete tombstone, which a
+    /// fresh create may clear. The tombstone is (re-)asserted because the
+    /// pending-purge resume may be the first path to confirm the purge and
+    /// its in-memory state need not have applied the `9008` before.
     pub(crate) fn unghost(&mut self, gid: &str) {
         self.ghost.remove(gid);
+        self.deleted.insert(gid.to_string());
     }
 }
 
@@ -1678,6 +1844,28 @@ fn validate_edit_metadata(
         {
             bail!("restricted: you are not an admin of the child group");
         }
+    }
+    // Bound the declared-children adoption hint: beyond its cap the edit is
+    // refused outright instead of silently dropping the placeholder hints
+    // (a repeated 9002 with fresh child ids would otherwise grow the hint
+    // without limit). Mirror the apply side, which prunes entries no live
+    // group lists: only the retained hint entries and the event's children
+    // occupy the budget after the edit.
+    let cap = store.declared_children_cap();
+    let live: HashSet<&str> = store
+        .groups
+        .values()
+        .flat_map(|group| group.children.iter().map(String::as_str))
+        .collect();
+    let mut declared_after: HashSet<&str> = store
+        .declared_children
+        .iter()
+        .filter(|id| live.contains(id.as_str()))
+        .map(String::as_str)
+        .collect();
+    declared_after.extend(tag_values(event, "child"));
+    if declared_after.len() > cap {
+        bail!("restricted: too many declared child groups");
     }
     Ok(())
 }
