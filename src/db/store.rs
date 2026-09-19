@@ -669,6 +669,13 @@ pub(crate) struct Store {
     /// test can arm and disarm it after the writer thread owns the store.
     #[cfg(test)]
     pub(crate) disk_full_override: Arc<std::sync::atomic::AtomicBool>,
+    /// Test-only progress counter: incremented in the same writer step that
+    /// releases one inline-completed message's accounting, so a test can
+    /// tell mid-drain progress apart from drain-end completion without
+    /// relying on reply-observation timing. Shared via `Arc` so the test's
+    /// `Store` handle observes the writer thread.
+    #[cfg(test)]
+    pub(crate) writer_releases: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// `(created_at, id, protected, group_id, is_meta)` records returned by the
@@ -859,6 +866,8 @@ impl Store {
             fail_next_scan: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(test)]
             disk_full_override: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(test)]
+            writer_releases: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
     }
 
@@ -989,6 +998,8 @@ impl Store {
             fail_next_scan: Arc::clone(&self.fail_next_scan),
             #[cfg(test)]
             disk_full_override: Arc::clone(&self.disk_full_override),
+            #[cfg(test)]
+            writer_releases: Arc::clone(&self.writer_releases),
         }
     }
 

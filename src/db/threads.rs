@@ -1565,6 +1565,15 @@ pub(crate) fn spawn(
                     // and leave their remainder to the guard's `Drop`.
                     if !deferred {
                         pending.release(accounted_msgs, accounted_events, accounted_bytes);
+                        // Test hook for the queue-accounting regression
+                        // test: count the processed message in the same
+                        // step that released its accounting, so the test can
+                        // distinguish mid-drain progress from the drain-end
+                        // drop without depending on reply timing.
+                        #[cfg(test)]
+                        store
+                            .writer_releases
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
                 // Flush the batch before blocking again: clients await

@@ -3540,24 +3540,46 @@ fn request_fails_fast_when_the_queue_is_full() {
 
 #[test]
 fn inline_writes_release_queue_accounting_before_their_reply() {
-    // Regression: the writer drain released the queued-work accounting of
-    // every drained message only at the end (right before the put flush).
-    // Inline-completed messages (`SaveAccess` and friends) send their reply
-    // inside the drain, so a caller woken by such a reply could immediately
-    // issue another write and be spuriously fail-fast ("database
-    // overloaded") while the rest of the batch was still counted. This
-    // bursts cheap inline writes that coalesce into one drain; a probe put
-    // issued right after one save's reply must be admitted even though the
-    // rest of the burst is still in flight.
+    // Regression: the writer drain used to release the queued-work
+    // accounting of every drained message only at the end (right before
+    // the put flush). Inline-completed messages (`SaveAccess` and friends)
+    // send their reply inside the drain, so a caller woken by such a reply
+    // could immediately issue another write and be spuriously fail-fast
+    // ("database overloaded") while the rest of the batch was still
+    // counted.
+    //
+    // This test observes the release itself instead of reply timing: the
+    // writer counts every released message in the test-only
+    // `Store::writer_releases` hook, in the same step as the release. Once
+    // at least two releases are observed, the shared message counter must
+    // already have dropped, even though the burst is still being
+    // processed. Without per-message release the counter only reaches zero
+    // at the drain end, so the check below cannot pass.
     let mut cfg = config();
     cfg.max_db_queue_bytes = 1_024;
     let errors = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let cap = 16;
-    let db = DbClient::open(&cfg, true, Arc::clone(&errors), 0, 128, cap, cap).unwrap();
+    // Open the store here so the test shares the writer's progress
+    // counter (`writer_releases`) with the writer thread.
+    let expiry = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let store = crate::db::store::Store::open(&cfg, Arc::clone(&expiry), 128).unwrap();
+    let released = Arc::clone(&store.writer_releases);
+    let db =
+        DbClient::open_with_store(&cfg, store, expiry, Arc::clone(&errors), 0, cap, cap).unwrap();
     let now = unix_now();
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
         for round in 0..16u64 {
+            // Quiescence: the previous round is fully drained and released,
+            // so this round starts from a clean counter.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while db.pending_msgs.load(std::sync::atomic::Ordering::Relaxed) != 0 {
+                if std::time::Instant::now() >= deadline {
+                    panic!("round {round}: the queue did not drain between rounds");
+                }
+                tokio::task::yield_now().await;
+            }
+            let base = released.load(std::sync::atomic::Ordering::Relaxed);
             let mut saves = Vec::with_capacity(cap);
             for _ in 0..cap {
                 let db = db.clone();
@@ -3566,15 +3588,35 @@ fn inline_writes_release_queue_accounting_before_their_reply() {
                         .await
                 }));
             }
-            // Wait for one save of the burst, then write immediately: the
-            // other saves are still being processed, so a drain-end release
-            // would count the queue as full while it has already replied.
-            assert!(saves.remove(0).await.unwrap(), "the burst save must commit");
+            // Wait until the writer has released at least two messages of
+            // this burst. Releases are monotonic and only ever follow a
+            // completed message arm, so from here on the shared counter
+            // must already reflect them.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                let done = released
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    .saturating_sub(base);
+                if done >= 2 {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    panic!("round {round}: the writer did not release any burst message");
+                }
+                tokio::task::yield_now().await;
+            }
+            let msgs = db.pending_msgs.load(std::sync::atomic::Ordering::Relaxed);
+            assert!(
+                msgs <= cap - 2,
+                "round {round}: two released messages must free two queue slots, got {msgs}"
+            );
+            // And a new write is admitted immediately: at most `cap - 2`
+            // slots can be occupied, so the probe cannot fail fast.
             let probe = event(1, &format!("probe-{round}"), now, vec![]);
             let out = db.put(probe, now).await;
             assert!(
                 matches!(out, PutOutcome::Stored),
-                "round {round}: a write after an inline reply must not be refused: {out:?}"
+                "round {round}: a write must be admitted while the burst drains: {out:?}"
             );
             for save in saves {
                 assert!(save.await.unwrap(), "the burst save must commit");
