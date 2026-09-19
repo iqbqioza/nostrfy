@@ -3539,6 +3539,104 @@ fn request_fails_fast_when_the_queue_is_full() {
 }
 
 #[test]
+fn inline_writes_release_queue_accounting_before_their_reply() {
+    // Regression: the writer drain used to release the queued-work
+    // accounting of every drained message only at the end (right before
+    // the put flush). Inline-completed messages (`SaveAccess` and friends)
+    // send their reply inside the drain, so a caller woken by such a reply
+    // could immediately issue another write and be spuriously fail-fast
+    // ("database overloaded") while the rest of the batch was still
+    // counted.
+    //
+    // This test observes the release itself instead of reply timing: the
+    // writer counts every released message in the test-only
+    // `Store::writer_releases` hook, in the same step as the release. Once
+    // at least two releases are observed, the shared message counter must
+    // already have dropped, even though the burst is still being
+    // processed. Without per-message release the counter only reaches zero
+    // at the drain end, so the check below cannot pass.
+    let mut cfg = config();
+    cfg.max_db_queue_bytes = 1_024;
+    let errors = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let cap = 16;
+    // Open the store here so the test shares the writer's progress
+    // counter (`writer_releases`) with the writer thread.
+    let expiry = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let store = crate::db::store::Store::open(&cfg, Arc::clone(&expiry), 128).unwrap();
+    let released = Arc::clone(&store.writer_releases);
+    let db =
+        DbClient::open_with_store(&cfg, store, expiry, Arc::clone(&errors), 0, cap, cap).unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        for round in 0..16u64 {
+            // Quiescence: the previous round is fully drained and released,
+            // so this round starts from a clean counter.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while db.pending_msgs.load(std::sync::atomic::Ordering::Relaxed) != 0 {
+                if std::time::Instant::now() >= deadline {
+                    panic!("round {round}: the queue did not drain between rounds");
+                }
+                tokio::task::yield_now().await;
+            }
+            let base = released.load(std::sync::atomic::Ordering::Relaxed);
+            let mut saves = Vec::with_capacity(cap);
+            for _ in 0..cap {
+                let db = db.clone();
+                saves.push(tokio::spawn(async move {
+                    db.save_access(crate::config::AccessControl::default())
+                        .await
+                }));
+            }
+            // Wait until the writer has released at least two messages of
+            // this burst. Releases are monotonic and only ever follow a
+            // completed message arm, so from here on the shared counter
+            // must already reflect them.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                let done = released
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    .saturating_sub(base);
+                if done >= 2 {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    panic!("round {round}: the writer did not release any burst message");
+                }
+                tokio::task::yield_now().await;
+            }
+            let msgs = db.pending_msgs.load(std::sync::atomic::Ordering::Relaxed);
+            assert!(
+                msgs <= cap - 2,
+                "round {round}: two released messages must free two queue slots, got {msgs}"
+            );
+            // And a new write is admitted immediately: at most `cap - 2`
+            // slots can be occupied, so the probe cannot fail fast.
+            let probe = event(1, &format!("probe-{round}"), now, vec![]);
+            let out = db.put(probe, now).await;
+            assert!(
+                matches!(out, PutOutcome::Stored),
+                "round {round}: a write must be admitted while the burst drains: {out:?}"
+            );
+            for save in saves {
+                assert!(save.await.unwrap(), "the burst save must commit");
+            }
+        }
+        assert_eq!(
+            db.take_overloads(),
+            0,
+            "no write may fail fast while the burst drains its inline replies"
+        );
+        assert_eq!(
+            errors.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "the burst must not report database faults"
+        );
+        db.shutdown();
+    });
+}
+
+#[test]
 fn search_works_without_word_index() {
     // NIP-50 must work even when database.search_index is disabled: the
     // relay falls back to a full scan with content term checks.
@@ -6044,6 +6142,12 @@ fn shutdown_cancellation_aborts_removals_and_leaves_pending() {
         let gid = "cancel-group";
         let tagged = event(1, "group", now, vec![vec!["h".into(), gid.into()]]);
         assert_eq!(db.put(tagged, now).await, PutOutcome::Stored);
+        // An already-expired event (stored while NIP-40 was off) gives the
+        // expiry walk a backlog to cancel.
+        db.set_expiry_enabled(false);
+        let expiring = expired_event("expires", now - 1, now);
+        assert_eq!(db.put(expiring, now).await, PutOutcome::Stored);
+        db.set_expiry_enabled(true);
 
         db.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
         let (removed, state) = db
@@ -6079,6 +6183,11 @@ fn shutdown_cancellation_aborts_removals_and_leaves_pending() {
                 .is_empty(),
             "the cancelled purge must stay resumable"
         );
+        assert_eq!(
+            db.purge_expired(now, 0).await,
+            (0, false),
+            "a cancelled expiry walk stops at the chunk boundary without removing"
+        );
 
         // Clearing the flag lets the retries complete and clear the records.
         db.cancel.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -6098,6 +6207,11 @@ fn shutdown_cancellation_aborts_removals_and_leaves_pending() {
                 .await
                 .expect("a healthy pending read must answer")
                 .is_empty()
+        );
+        assert_eq!(
+            db.purge_expired(now, 0).await,
+            (1, false),
+            "the retry after the cancellation clears the expiry backlog"
         );
     });
     db.shutdown();
@@ -6668,4 +6782,1174 @@ fn save_blossom_allow_locked_skips_the_access_lock() {
         drop(held);
         db.shutdown();
     });
+}
+
+// ----- systematic failure injection over the write paths -----
+
+/// Cloneable handles to the test-only fault hooks, kept by tests that arm
+/// a hook after the writer thread already owns its `Store`.
+struct Faults {
+    commit: Arc<std::sync::atomic::AtomicBool>,
+    disk_full: Arc<std::sync::atomic::AtomicBool>,
+    /// Shared removal-chunk countdown (`1` fails before the first chunk,
+    /// `2` after the first committed one).
+    chunk_after: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// Opens a store and a client over it, returning the fault handles: the
+/// hooks are shared `Arc`s, so a test can arm and disarm them after
+/// startup (arming before the writer starts would let the startup
+/// recovery, not the targeted operation, consume them).
+fn open_with_faults(cfg: &DatabaseConfig) -> (DbClient, Faults) {
+    let expiry = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let store = crate::db::store::Store::open(cfg, Arc::clone(&expiry), 128).unwrap();
+    let faults = Faults {
+        commit: Arc::clone(&store.fail_next_commit),
+        disk_full: Arc::clone(&store.disk_full_override),
+        chunk_after: Arc::clone(&store.fail_chunk_after),
+    };
+    let db = DbClient::open_with_store(
+        cfg,
+        store,
+        expiry,
+        Arc::new(Default::default()),
+        0,
+        128,
+        262_144,
+    )
+    .unwrap();
+    (db, faults)
+}
+
+/// Builds an event with an explicit author and a recomputed id.
+fn authored_event(
+    kind: u64,
+    pubkey: &str,
+    content: &str,
+    created: u64,
+    tags: Vec<Vec<String>>,
+) -> Event {
+    let mut e = event(kind, content, created, tags);
+    e.pubkey = pubkey.to_string();
+    e.id = nip01::compute_id(&e);
+    e
+}
+
+/// A NIP-40 event that expires at `expires`.
+fn expired_event(content: &str, created: u64, expires: u64) -> Event {
+    let mut e = event(
+        1,
+        content,
+        created,
+        vec![vec!["expiration".into(), expires.to_string()]],
+    );
+    e.id = nip01::compute_id(&e);
+    e
+}
+
+/// A one-group NIP-29 snapshot with the given id.
+fn groups_snapshot(gid: &str, now: u64) -> crate::nips::nip29::GroupsSnapshot {
+    let mut groups = crate::nips::nip29::GroupStore::with_cap(100);
+    groups.apply(
+        &crate::nips::nip29::tests::event(
+            crate::nips::nip29::CREATE_GROUP,
+            crate::nips::nip29::tests::ADMIN,
+            Some(gid),
+            vec![],
+        ),
+        "relay",
+        now,
+        false,
+        false,
+    );
+    groups.snapshot()
+}
+
+/// A one-role NIP-43 snapshot with the given role id.
+fn roles_snapshot(role: &str) -> crate::nips::nip43::RolesSnapshot {
+    let mut roles = crate::nips::nip43::RoleStore::default();
+    roles.create(role, role, "", "", None);
+    assert!(roles.assign(crate::nips::nip29::tests::USER, role));
+    roles.snapshot()
+}
+
+/// Loads the persisted group snapshot into a fresh store.
+async fn load_groups_restored(db: &DbClient) -> crate::nips::nip29::GroupStore {
+    let mut restored = crate::nips::nip29::GroupStore::with_cap(100);
+    restored.restore(db.load_groups().await.expect("a persisted group snapshot"));
+    restored
+}
+
+/// Sends one put and waits for its reply. The single-shot operations reply
+/// from inside the writer's drain (before its queued-work accounting is
+/// released), so only a *flushed* put makes the `pending_*` counters
+/// deterministic to assert right after.
+async fn writer_barrier(db: &DbClient, now: u64) {
+    assert_eq!(
+        db.put(event(1, "barrier", now, vec![]), now).await,
+        PutOutcome::Stored
+    );
+}
+
+/// Waits for the reader-side queue counters to drain. The reader sends its
+/// reply before releasing the accounting, so a completed read can still be
+/// observed with a briefly nonzero counter; the wait is a bounded poll
+/// (no fixed sleep) so the assertions that follow are deterministic.
+async fn await_reader_counters(db: &DbClient) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if db.pending_reads() == 0
+            && db.pending_read_bytes() == 0
+            && db.api_pending() == 0
+            && db.api_pending_bytes() == 0
+        {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the reader-side queue counters did not drain"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+}
+
+#[test]
+fn commit_failure_write_paths_report_failure_without_partial_state() {
+    // Every single-shot write path that honors the one-shot
+    // `fail_next_commit` hook must report the failure to its caller
+    // (`false` / `Invalid`), leave the pre-operation state untouched, count
+    // the failure as a database error (never an overload) and complete on
+    // a clean retry.
+    let cfg = config();
+    let (db, faults) = open_with_faults(&cfg);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let now = 1_700_000_000u64;
+    rt.block_on(async {
+        // Visible pre-state per path.
+        let kept = event(1, "kept", now, vec![]);
+        assert_eq!(db.put(kept.clone(), now).await, PutOutcome::Stored);
+        assert!(db.save_groups(groups_snapshot("g-a", now)).await);
+        assert!(db.save_roles(roles_snapshot("alpha")).await);
+        let access_a = crate::config::AccessControl {
+            allowed_kinds: vec![1],
+            ..Default::default()
+        };
+        let deny_a = vec![("aa".repeat(32), "a".to_string())];
+        assert!(db.save_access(access_a.clone()).await);
+        assert!(db.save_access_and_pubkeys(&access_a, &deny_a, &[]).await);
+        assert!(
+            db.blossom_add_owner("sha-keep", "text/plain", 4, 1, &"bb".repeat(32))
+                .await
+        );
+
+        let by_id = |id: &str| -> Filter {
+            serde_json::from_value(serde_json::json!({"ids": [id]})).unwrap()
+        };
+
+        // Put batch: the whole aborted batch is revoked.
+        faults
+            .commit
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let rejected = event(1, "rejected", now, vec![]);
+        let outcomes = db.put_batch(vec![(rejected.clone(), now)]).await;
+        assert!(
+            outcomes.iter().all(|o| matches!(o, PutOutcome::Invalid(_))),
+            "a failed commit must revoke every put in the batch: {outcomes:?}"
+        );
+        assert!(
+            db.query(vec![by_id(&rejected.id)], 10, now)
+                .await
+                .0
+                .is_empty(),
+            "the rolled-back put must not be visible"
+        );
+        assert_eq!(db.query(vec![by_id(&kept.id)], 10, now).await.0.len(), 1);
+        assert_eq!(db.take_errors(), 1, "the failed commit is a database error");
+
+        // Group snapshot: a failed commit must not move the snapshot.
+        faults
+            .commit
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(!db.save_groups(groups_snapshot("g-b", now)).await);
+        let restored = load_groups_restored(&db).await;
+        assert!(restored.group("g-a").is_some(), "the old snapshot survives");
+        assert!(
+            restored.group("g-b").is_none(),
+            "the failed save must not land"
+        );
+        assert_eq!(db.take_errors(), 1);
+        assert!(db.save_groups(groups_snapshot("g-b", now)).await);
+        let restored = load_groups_restored(&db).await;
+        assert!(restored.group("g-b").is_some(), "the retry must commit");
+
+        // Role snapshot.
+        faults
+            .commit
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(!db.save_roles(roles_snapshot("beta")).await);
+        let mut restored_roles = crate::nips::nip43::RoleStore::default();
+        restored_roles.restore(db.load_roles().await.expect("a persisted role snapshot"));
+        assert!(restored_roles.roles.contains_key("alpha"));
+        assert!(!restored_roles.roles.contains_key("beta"));
+        assert_eq!(db.take_errors(), 1);
+        assert!(db.save_roles(roles_snapshot("beta")).await);
+        let mut restored_roles = crate::nips::nip43::RoleStore::default();
+        restored_roles.restore(db.load_roles().await.expect("a persisted role snapshot"));
+        assert!(restored_roles.roles.contains_key("beta"));
+
+        // Clear snapshot.
+        faults
+            .commit
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(!db.clear_groups_snapshot().await);
+        assert!(
+            db.load_groups().await.is_some(),
+            "the failed clear must not land"
+        );
+        assert_eq!(db.take_errors(), 1);
+        assert!(db.clear_groups_snapshot().await);
+        assert!(db.load_groups().await.is_none(), "the retry must clear");
+
+        // Access save.
+        let access_b = crate::config::AccessControl {
+            allowed_kinds: vec![1, 2],
+            ..Default::default()
+        };
+        faults
+            .commit
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(!db.save_access(access_b.clone()).await);
+        assert!(matches!(
+            db.load_access().await,
+            LoadAccessOutcome::Loaded(access) if access.allowed_kinds == vec![1]
+        ));
+        assert_eq!(db.take_errors(), 1);
+        assert!(db.save_access(access_b).await);
+        assert!(matches!(
+            db.load_access().await,
+            LoadAccessOutcome::Loaded(access) if access.allowed_kinds == vec![1, 2]
+        ));
+
+        // Access + relay pubkeys: both keys move together or not at all.
+        let access_c = crate::config::AccessControl {
+            allowed_kinds: vec![3],
+            ..Default::default()
+        };
+        let deny_c = vec![("cc".repeat(32), "c".to_string())];
+        faults
+            .commit
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(!db.save_access_and_pubkeys(&access_c, &deny_c, &[]).await);
+        assert_eq!(
+            db.load_relay_pubkeys().await.expect("lists"),
+            (deny_a, Vec::new())
+        );
+        assert!(matches!(
+            db.load_access().await,
+            LoadAccessOutcome::Loaded(access) if access.allowed_kinds == vec![1, 2]
+        ));
+        assert_eq!(db.take_errors(), 1);
+        assert!(db.save_access_and_pubkeys(&access_c, &deny_c, &[]).await);
+        assert_eq!(
+            db.load_relay_pubkeys().await.expect("lists").0,
+            deny_c,
+            "the retry must persist both keys"
+        );
+
+        // Blossom owner add.
+        let owner = "dd".repeat(32);
+        faults
+            .commit
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            !db.blossom_add_owner("sha-new", "text/plain", 7, 2, &owner)
+                .await
+        );
+        assert!(
+            db.blossom_list(&owner, 10).await.is_empty(),
+            "the failed mapping must not appear in the reverse index"
+        );
+        assert_eq!(db.take_errors(), 1);
+        assert!(
+            db.blossom_add_owner("sha-new", "text/plain", 7, 2, &owner)
+                .await
+        );
+        assert_eq!(db.blossom_list(&owner, 10).await, vec!["sha-new"]);
+
+        // Blossom mapping batch (the one-time auto-migration path).
+        let owner_b = "ee".repeat(32);
+        let batch = || {
+            vec![(
+                "sha-batch".to_string(),
+                "text/plain".to_string(),
+                1,
+                3,
+                owner_b.clone(),
+            )]
+        };
+        faults
+            .commit
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(!db.blossom_add_mappings(batch()).await);
+        assert!(db.blossom_list(&owner_b, 10).await.is_empty());
+        assert_eq!(db.take_errors(), 1);
+        assert!(db.blossom_add_mappings(batch()).await);
+        assert_eq!(db.blossom_list(&owner_b, 10).await, vec!["sha-batch"]);
+
+        // Every queued-work reservation returned to zero; the failures were
+        // database errors, never cap (overload) rejections.
+        writer_barrier(&db, now).await;
+        await_reader_counters(&db).await;
+        assert_eq!(db.pending_msgs(), 0);
+        assert_eq!(db.pending_events(), 0);
+        assert_eq!(db.pending_bytes(), 0);
+        assert_eq!(db.pending_reads(), 0);
+        assert_eq!(db.pending_read_bytes(), 0);
+        assert_eq!(db.api_pending(), 0);
+        assert_eq!(db.take_errors(), 0, "every injected error was drained");
+        assert_eq!(db.take_overloads(), 0);
+    });
+    db.shutdown();
+}
+
+#[test]
+fn disk_full_write_paths_report_failure_without_partial_state() {
+    // The test-only disk-full override makes every guarded write path
+    // refuse before touching the map: the caller sees the failure, the
+    // pre-operation state stays, the refusal is counted as a database
+    // error and a clean retry (after the override clears) completes.
+    let cfg = config();
+    let (db, faults) = open_with_faults(&cfg);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let now = 1_700_000_000u64;
+    rt.block_on(async {
+        let kept = event(1, "kept", now, vec![]);
+        assert_eq!(db.put(kept.clone(), now).await, PutOutcome::Stored);
+        assert!(db.save_groups(groups_snapshot("g-a", now)).await);
+        assert!(db.save_roles(roles_snapshot("alpha")).await);
+        assert!(
+            db.save_access(crate::config::AccessControl::default())
+                .await
+        );
+
+        faults
+            .disk_full
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        // Put batch: every put is refused with the disk-full reason.
+        let rejected = event(1, "rejected", now, vec![]);
+        let outcomes = db.put_batch(vec![(rejected.clone(), now)]).await;
+        assert!(
+            outcomes.iter().all(
+                |o| matches!(o, PutOutcome::Invalid(reason) if reason.contains("disk is full"))
+            ),
+            "a put on a full disk must be refused: {outcomes:?}"
+        );
+        let by_id = |id: &str| -> Filter {
+            serde_json::from_value(serde_json::json!({"ids": [id]})).unwrap()
+        };
+        assert!(
+            db.query(vec![by_id(&rejected.id)], 10, now)
+                .await
+                .0
+                .is_empty()
+        );
+        assert_eq!(db.take_errors(), 1);
+
+        // Snapshot/access/Blossom writes refuse and leave the old value.
+        assert!(!db.save_groups(groups_snapshot("g-b", now)).await);
+        let restored = load_groups_restored(&db).await;
+        assert!(restored.group("g-a").is_some() && restored.group("g-b").is_none());
+        assert_eq!(db.take_errors(), 1);
+
+        assert!(!db.save_roles(roles_snapshot("beta")).await);
+        let mut restored_roles = crate::nips::nip43::RoleStore::default();
+        restored_roles.restore(db.load_roles().await.expect("a persisted role snapshot"));
+        assert!(restored_roles.roles.contains_key("alpha"));
+        assert!(!restored_roles.roles.contains_key("beta"));
+        assert_eq!(db.take_errors(), 1);
+
+        assert!(!db.clear_groups_snapshot().await);
+        assert!(db.load_groups().await.is_some());
+        assert_eq!(db.take_errors(), 1);
+
+        let access_b = crate::config::AccessControl {
+            allowed_kinds: vec![1, 2],
+            ..Default::default()
+        };
+        assert!(!db.save_access(access_b.clone()).await);
+        assert!(matches!(
+            db.load_access().await,
+            LoadAccessOutcome::Loaded(access) if access.allowed_kinds.is_empty()
+        ));
+        assert_eq!(db.take_errors(), 1);
+
+        let deny_b = vec![("cc".repeat(32), "c".to_string())];
+        assert!(!db.save_access_and_pubkeys(&access_b, &deny_b, &[]).await);
+        assert_eq!(
+            db.load_relay_pubkeys().await.expect("lists"),
+            (Vec::new(), Vec::new())
+        );
+        assert_eq!(db.take_errors(), 1);
+
+        let owner = "dd".repeat(32);
+        assert!(
+            !db.blossom_add_owner("sha-new", "text/plain", 1, 1, &owner)
+                .await
+        );
+        assert!(db.blossom_list(&owner, 10).await.is_empty());
+        assert_eq!(db.take_errors(), 1);
+        assert!(
+            !db.blossom_add_mappings(vec![(
+                "sha-batch".to_string(),
+                "text/plain".to_string(),
+                1,
+                1,
+                owner.clone(),
+            )])
+            .await
+        );
+        assert!(db.blossom_list(&owner, 10).await.is_empty());
+        assert_eq!(db.take_errors(), 1);
+
+        // Disarm: the same writes now commit.
+        faults
+            .disk_full
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(db.put(rejected.clone(), now).await, PutOutcome::Stored);
+        assert!(db.save_groups(groups_snapshot("g-b", now)).await);
+        assert!(db.save_roles(roles_snapshot("beta")).await);
+        assert!(db.save_access(access_b.clone()).await);
+        assert!(db.save_access_and_pubkeys(&access_b, &deny_b, &[]).await);
+        assert!(
+            db.blossom_add_owner("sha-new", "text/plain", 1, 1, &owner)
+                .await
+        );
+        assert!(
+            db.blossom_add_mappings(vec![(
+                "sha-batch".to_string(),
+                "text/plain".to_string(),
+                1,
+                1,
+                owner.clone(),
+            )])
+            .await
+        );
+
+        writer_barrier(&db, now).await;
+        assert_eq!(db.pending_msgs(), 0);
+        assert_eq!(db.pending_events(), 0);
+        assert_eq!(db.pending_bytes(), 0);
+        assert_eq!(db.take_errors(), 0, "every injected error was drained");
+        assert_eq!(db.take_overloads(), 0);
+    });
+    db.shutdown();
+}
+
+#[test]
+fn disk_full_removals_fail_closed_before_any_side_effect() {
+    // A full disk must fail every chunked removal before its first write
+    // (no pending record, no tombstone, no marker, nothing removed): the
+    // removal is retried once the filesystem has room again.
+    let cfg = config();
+    let (db, faults) = open_with_faults(&cfg);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let now = 1_700_000_000u64;
+    let pk = "ab".repeat(32);
+    let post = authored_event(1, &pk, "post", now - 10, vec![]);
+    let gid = "disk-full-group";
+    let tagged = event(1, "group", now - 5, vec![vec!["h".into(), gid.into()]]);
+    let wrap_recipient = "cd".repeat(32);
+    let wrap = {
+        let mut e = event(
+            crate::nips::nip62::GIFT_WRAP_KIND,
+            "wrap",
+            now - 4,
+            vec![vec!["p".into(), wrap_recipient.clone()]],
+        );
+        e.id = nip01::compute_id(&e);
+        e
+    };
+    let expiring = expired_event("expired", now - 3, now);
+    let recipient_bytes: [u8; 32] = hex::decode(&wrap_recipient).unwrap().try_into().unwrap();
+    rt.block_on(async {
+        assert_eq!(db.put(post.clone(), now).await, PutOutcome::Stored);
+        assert_eq!(db.put(tagged.clone(), now).await, PutOutcome::Stored);
+        assert_eq!(db.put(wrap.clone(), now).await, PutOutcome::Stored);
+        db.set_expiry_enabled(false);
+        assert_eq!(db.put(expiring.clone(), now).await, PutOutcome::Stored);
+        db.set_expiry_enabled(true);
+
+        faults
+            .disk_full
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let (removed, state) = db
+            .apply_deletion_checked(vec![post.id.clone()], vec![], Some(pk.clone()), now)
+            .await;
+        assert_eq!(removed, None, "a full-disk deletion must report failure");
+        assert!(!state);
+        assert!(
+            db.pending_deletions().await.expect("pending").is_empty(),
+            "a refusal before the walk must not write a delete record"
+        );
+        assert_eq!(db.take_errors(), 1);
+
+        assert_eq!(
+            db.apply_vanish_checked([0xab; 32], now).await,
+            None,
+            "a full-disk vanish must report failure"
+        );
+        assert_eq!(
+            db.vanish_counts().await.expect("counts"),
+            (0, 0),
+            "a refusal before the walk must not write a pending vanish"
+        );
+        assert_eq!(db.take_errors(), 1);
+
+        assert_eq!(db.group_purge(gid.to_string(), now).await, 0);
+        assert!(
+            db.pending_purges().await.expect("pending").is_empty(),
+            "a refusal before the walk must not write a purge record"
+        );
+        assert_eq!(db.take_errors(), 1);
+
+        assert_eq!(db.purge_expired(now, 0).await, (0, false));
+        assert_eq!(db.take_errors(), 1);
+
+        assert_eq!(
+            db.delete_gift_wraps_to_checked(recipient_bytes).await,
+            None,
+            "a full-disk gift-wrap purge must report failure"
+        );
+        assert_eq!(db.take_errors(), 1);
+
+        // Nothing moved while the disk was "full".
+        let f: Filter = serde_json::from_value(serde_json::json!({"authors": [pk]})).unwrap();
+        assert_eq!(db.query(vec![f], 10, now).await.0.len(), 1);
+        let h: Filter = serde_json::from_value(serde_json::json!({"#h": [gid]})).unwrap();
+        assert_eq!(db.query(vec![h], 10, now).await.0.len(), 1);
+        assert_eq!(db.state_stamp().await, Some(0));
+
+        // With room again, every removal completes normally.
+        faults
+            .disk_full
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            db.apply_deletion_checked(vec![post.id.clone()], vec![], Some(pk.clone()), now)
+                .await
+                .0,
+            Some(1)
+        );
+        assert_eq!(
+            db.apply_vanish_checked([0xab; 32], now).await,
+            Some((0, false)),
+            "the post was already deleted, only the marker is written"
+        );
+        assert_eq!(db.group_purge(gid.to_string(), now).await, 1);
+        db.set_expiry_enabled(true);
+        assert_eq!(db.purge_expired(now, 0).await, (1, false));
+        assert_eq!(
+            db.delete_gift_wraps_to_checked(recipient_bytes).await,
+            Some(1)
+        );
+        assert_eq!(db.take_errors(), 0);
+        assert_eq!(db.take_overloads(), 0);
+        writer_barrier(&db, now).await;
+        assert_eq!(db.pending_msgs(), 0);
+        assert_eq!(db.pending_events(), 0);
+    });
+    db.shutdown();
+}
+
+#[test]
+fn nip09_first_chunk_failure_stays_pending_until_startup_resume() {
+    // The chunk fault fails before the first removal chunk: nothing is
+    // removed, but the request record is already durable. The writer's
+    // startup resume (which runs before it serves any message) completes
+    // the deletion and reports that it removed a group-state event.
+    let cfg = config();
+    let (db, faults) = open_with_faults(&cfg);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let now = 1_700_000_000u64;
+    let pk = "ab".repeat(32);
+    let post = authored_event(1, &pk, "post", now - 20, vec![]);
+    let moderation = authored_event(9000, &pk, "mod", now - 10, vec![]);
+    let author_filter =
+        || -> Filter { serde_json::from_value(serde_json::json!({"authors": [pk]})).unwrap() };
+    rt.block_on(async {
+        assert_eq!(db.put(post.clone(), now).await, PutOutcome::Stored);
+        assert_eq!(db.put(moderation.clone(), now).await, PutOutcome::Stored);
+        faults
+            .chunk_after
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        let (removed, state) = db
+            .apply_deletion_checked(
+                vec![post.id.clone(), moderation.id.clone()],
+                vec![],
+                Some(pk.clone()),
+                now,
+            )
+            .await;
+        assert!(
+            removed.is_none(),
+            "an interrupted deletion must report failure instead of zero"
+        );
+        assert!(!state, "nothing was removed yet");
+        assert_eq!(
+            db.table_counts().await.expect("counts").delete_pending,
+            1,
+            "the record must survive the failure"
+        );
+        assert_eq!(
+            db.query(vec![author_filter()], 10, now).await.0.len(),
+            2,
+            "the interrupted walk must leave the history stored"
+        );
+        assert_eq!(db.state_stamp().await, Some(0));
+        assert_eq!(db.take_errors(), 1);
+    });
+    db.shutdown();
+
+    // A restart resumes the recorded deletion before serving any message.
+    let db = DbClient::open(
+        &cfg,
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    rt.block_on(async {
+        // The write round trip is the barrier that orders the reads after
+        // the writer's startup resume.
+        assert_eq!(
+            db.put(event(1, "barrier", now, vec![]), now).await,
+            PutOutcome::Stored
+        );
+        assert!(
+            db.resumed_deletion_state_removed(),
+            "the resume removed the moderation event and must surface it"
+        );
+        assert!(
+            db.pending_deletions()
+                .await
+                .expect("a healthy pending read must answer")
+                .is_empty()
+        );
+        assert_eq!(db.table_counts().await.expect("counts").delete_pending, 0);
+        assert_eq!(db.state_stamp().await, Some(1));
+        assert!(db.query(vec![author_filter()], 10, now).await.0.is_empty());
+    });
+    db.shutdown();
+}
+
+#[test]
+fn nip09_middle_chunk_failure_resumes_at_startup() {
+    // Three target chunks (the walk sits at chunk boundaries because the
+    // targets exceed `REMOVAL_CHUNK`): the fault fires before the second
+    // chunk, leaving the first committed, the state event in the last
+    // chunk and the request record durable. The startup resume finishes
+    // the remaining chunks and clears the record.
+    let cfg = config();
+    let (db, faults) = open_with_faults(&cfg);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let now = 1_700_000_000u64;
+    let pk = "cd".repeat(32);
+    let moderation = authored_event(9000, &pk, "mod", now, vec![]);
+    let author_filter =
+        || -> Filter { serde_json::from_value(serde_json::json!({"authors": [pk]})).unwrap() };
+    let mut targets: Vec<String> = (0..(2 * 4096)).map(|i| format!("{i:064x}")).collect();
+    targets.push(moderation.id.clone());
+    rt.block_on(async {
+        assert_eq!(db.put(moderation.clone(), now).await, PutOutcome::Stored);
+        faults
+            .chunk_after
+            .store(2, std::sync::atomic::Ordering::SeqCst);
+        let (removed, state) = db
+            .apply_deletion_checked(targets.clone(), vec![], Some(pk.clone()), now)
+            .await;
+        assert!(
+            removed.is_none(),
+            "the failed middle chunk must report failure"
+        );
+        assert!(!state, "the state event was not reached yet");
+        assert_eq!(db.table_counts().await.expect("counts").delete_pending, 1);
+        assert_eq!(
+            db.query(vec![author_filter()], 10, now).await.0.len(),
+            1,
+            "the last chunk must survive the failed earlier chunk"
+        );
+        assert_eq!(db.state_stamp().await, Some(0));
+        assert_eq!(db.take_errors(), 1);
+    });
+    db.shutdown();
+
+    let db = DbClient::open(
+        &cfg,
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    rt.block_on(async {
+        assert_eq!(
+            db.put(event(1, "barrier", now, vec![]), now).await,
+            PutOutcome::Stored
+        );
+        assert!(
+            db.resumed_deletion_state_removed(),
+            "the resume must remove the remaining moderation event"
+        );
+        assert!(
+            db.pending_deletions()
+                .await
+                .expect("a healthy pending read must answer")
+                .is_empty()
+        );
+        assert_eq!(db.state_stamp().await, Some(1));
+        assert!(db.query(vec![author_filter()], 10, now).await.0.is_empty());
+    });
+    db.shutdown();
+}
+
+#[test]
+fn vanish_first_chunk_failure_stays_pending_until_startup_resume() {
+    // The vanish fault fails before the first removal chunk: the pending
+    // record is durable, no completed marker exists, the history survives.
+    // The restart's startup resume completes the walk, writes the marker
+    // and clears the record.
+    let cfg = config();
+    let (db, faults) = open_with_faults(&cfg);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let now = 1_700_000_000u64;
+    let pk = "cd".repeat(32);
+    let pk_bytes: [u8; 32] = hex::decode(&pk).unwrap().try_into().unwrap();
+    let post = authored_event(1, &pk, "post", now - 10, vec![]);
+    let moderation = authored_event(9000, &pk, "mod", now - 5, vec![]);
+    let author_filter =
+        || -> Filter { serde_json::from_value(serde_json::json!({"authors": [pk]})).unwrap() };
+    rt.block_on(async {
+        assert_eq!(db.put(post.clone(), now).await, PutOutcome::Stored);
+        assert_eq!(db.put(moderation.clone(), now).await, PutOutcome::Stored);
+        faults
+            .chunk_after
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            db.apply_vanish_checked(pk_bytes, now).await,
+            None,
+            "the interrupted vanish must report failure"
+        );
+        assert_eq!(
+            db.vanish_counts().await.expect("counts"),
+            (0, 1),
+            "the pending record must exist without a completed marker"
+        );
+        assert_eq!(db.state_stamp().await, Some(0));
+        assert_eq!(db.query(vec![author_filter()], 10, now).await.0.len(), 2);
+        assert_eq!(db.take_errors(), 1);
+    });
+    db.shutdown();
+    // The completed marker was not written by the interrupted walk.
+    {
+        let store = crate::db::store::Store::open(
+            &cfg,
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            128,
+        )
+        .unwrap();
+        let rtxn = store.env.read_txn().unwrap();
+        assert!(
+            store.vanish.get(&rtxn, &pk_bytes).unwrap().is_none(),
+            "an interrupted vanish must not write the completed marker"
+        );
+    }
+
+    let db = DbClient::open(
+        &cfg,
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    rt.block_on(async {
+        assert_eq!(
+            db.put(event(1, "barrier", now, vec![]), now).await,
+            PutOutcome::Stored
+        );
+        assert_eq!(
+            db.vanish_counts().await.expect("counts"),
+            (1, 0),
+            "the startup resume must complete the vanish and clear the record"
+        );
+        assert_eq!(db.state_stamp().await, Some(1));
+        assert!(db.query(vec![author_filter()], 10, now).await.0.is_empty());
+        assert!(
+            matches!(
+                db.put(authored_event(1, &pk, "after", now + 1, vec![]), now + 1)
+                    .await,
+                PutOutcome::Invalid(reason) if reason.contains("vanish")
+            ),
+            "the resumed vanish must bar the pubkey"
+        );
+        assert_eq!(
+            db.apply_vanish_checked(pk_bytes, now).await,
+            Some((0, false))
+        );
+    });
+    db.shutdown();
+}
+
+#[test]
+fn vanish_middle_chunk_failure_resumes_at_startup() {
+    // 4097 authored events: the moderation state event sorts into the
+    // first `by_pubkey` chunk (smallest created_at). Failing before the
+    // second chunk leaves the first one removed with the stamp already
+    // bumped; the startup resume finishes the rest.
+    let cfg = config();
+    let (db, faults) = open_with_faults(&cfg);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let now = 1_700_000_000u64;
+    let base = now - 10_000;
+    let pk = "ef".repeat(32);
+    let pk_bytes: [u8; 32] = hex::decode(&pk).unwrap().try_into().unwrap();
+    let author_filter =
+        || -> Filter { serde_json::from_value(serde_json::json!({"authors": [pk]})).unwrap() };
+    let mut events: Vec<(Event, u64)> =
+        vec![(authored_event(9000, &pk, "mod", base, vec![]), base)];
+    for i in 0..4096 {
+        events.push((
+            authored_event(1, &pk, &format!("post-{i}"), base + 1, vec![]),
+            base + 1,
+        ));
+    }
+    rt.block_on(async {
+        let outcomes = db.put_batch(events).await;
+        assert!(
+            outcomes.iter().all(|o| matches!(o, PutOutcome::Stored)),
+            "the seed batch must store every event"
+        );
+        faults
+            .chunk_after
+            .store(2, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            db.apply_vanish_checked(pk_bytes, now).await,
+            None,
+            "the failed middle chunk must report failure"
+        );
+        assert_eq!(db.vanish_counts().await.expect("counts"), (0, 1));
+        assert_eq!(
+            db.state_stamp().await,
+            Some(1),
+            "the first chunk committed its state-stamp bump"
+        );
+        assert_eq!(
+            db.query(vec![author_filter()], 10_000, now).await.0.len(),
+            1,
+            "only the final chunk survives"
+        );
+        assert_eq!(db.take_errors(), 1);
+    });
+    db.shutdown();
+
+    let db = DbClient::open(
+        &cfg,
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    rt.block_on(async {
+        assert_eq!(
+            db.put(event(1, "barrier", now, vec![]), now).await,
+            PutOutcome::Stored
+        );
+        assert_eq!(db.vanish_counts().await.expect("counts"), (1, 0));
+        assert_eq!(db.state_stamp().await, Some(1));
+        assert!(
+            db.query(vec![author_filter()], 10_000, now)
+                .await
+                .0
+                .is_empty()
+        );
+    });
+    db.shutdown();
+}
+
+#[test]
+fn group_purge_first_chunk_failure_resumes_after_restart() {
+    // The purge fault fails before the first removal chunk: the marker and
+    // the in-progress record are durable (a replay is fail-closed), the
+    // history stays stored and the stamp is not bumped (the completion
+    // commit did not run). After a restart the caller re-issues the purge,
+    // which completes it and clears the record.
+    let cfg = config();
+    let (db, faults) = open_with_faults(&cfg);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let now = 1_700_000_000u64;
+    let gid = "first-chunk-group";
+    let tagged = |kind: u64, content: &str, created: u64| {
+        event(kind, content, created, vec![vec!["h".into(), gid.into()]])
+    };
+    let history =
+        || -> Filter { serde_json::from_value(serde_json::json!({"#h": [gid]})).unwrap() };
+    rt.block_on(async {
+        assert_eq!(
+            db.put(tagged(1, "post", now - 10), now).await,
+            PutOutcome::Stored
+        );
+        assert_eq!(
+            db.put(tagged(9000, "mod", now - 5), now).await,
+            PutOutcome::Stored
+        );
+        faults
+            .chunk_after
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(db.group_purge(gid.to_string(), now).await, 0);
+        assert_eq!(
+            db.pending_purges()
+                .await
+                .expect("a healthy read must answer"),
+            vec![(gid.to_string(), now)],
+            "the interrupted purge must stay resumable"
+        );
+        assert_eq!(
+            db.state_stamp().await,
+            Some(0),
+            "the completion commit that bumps the stamp did not run"
+        );
+        assert_eq!(db.query(vec![history()], 10, now).await.0.len(), 2);
+        // The marker is already committed: a replayed history event is
+        // rejected even though the history is still stored.
+        assert_eq!(
+            db.put(tagged(1, "replay", now), now).await,
+            PutOutcome::PreviouslyDeleted
+        );
+        assert_eq!(db.take_errors(), 1);
+    });
+    db.shutdown();
+
+    // The writer only auto-resumes vanish/delete records; the caller
+    // re-issues pending purges after startup (idempotent, furthest cut).
+    let db = DbClient::open(
+        &cfg,
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    rt.block_on(async {
+        assert_eq!(
+            db.pending_purges()
+                .await
+                .expect("a healthy read must answer"),
+            vec![(gid.to_string(), now)]
+        );
+        assert_eq!(db.group_purge(gid.to_string(), now).await, 2);
+        assert!(
+            db.pending_purges()
+                .await
+                .expect("a healthy read must answer")
+                .is_empty(),
+            "the completed re-issue must clear the record"
+        );
+        assert_eq!(db.state_stamp().await, Some(1));
+        assert!(db.query(vec![history()], 10, now).await.0.is_empty());
+    });
+    db.shutdown();
+}
+
+#[test]
+fn group_purge_middle_chunk_failure_resumes_after_restart() {
+    // 4097 h-tagged events: the moderation state event sorts into the first
+    // `by_tag` chunk (smallest created_at). The fault fires before the
+    // second chunk, leaving the first 4096 removed (the pending record
+    // durable and the stamp still untouched, since the completion commit
+    // is what bumps it). The re-issued purge after a restart finishes the
+    // walk, clears the record and bumps the stamp.
+    let cfg = config();
+    let (db, faults) = open_with_faults(&cfg);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let now = 1_700_000_000u64;
+    let base = now - 10_000;
+    let gid = "middle-chunk-group";
+    let tagged = |kind: u64, content: &str, created: u64| {
+        event(kind, content, created, vec![vec!["h".into(), gid.into()]])
+    };
+    let history =
+        || -> Filter { serde_json::from_value(serde_json::json!({"#h": [gid]})).unwrap() };
+    let mut events: Vec<(Event, u64)> = vec![(tagged(9000, "mod", base), base)];
+    for i in 0..4096 {
+        events.push((tagged(1, &format!("g-{i}"), base + 1), base + 1));
+    }
+    rt.block_on(async {
+        let outcomes = db.put_batch(events).await;
+        assert!(outcomes.iter().all(|o| matches!(o, PutOutcome::Stored)));
+        faults
+            .chunk_after
+            .store(2, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            db.group_purge(gid.to_string(), now).await,
+            0,
+            "a failed purge reports zero removed, not the partial count"
+        );
+        assert_eq!(
+            db.pending_purges()
+                .await
+                .expect("a healthy read must answer")
+                .len(),
+            1
+        );
+        assert_eq!(
+            db.state_stamp().await,
+            Some(0),
+            "the completion commit that bumps the stamp did not run"
+        );
+        assert_eq!(
+            db.query(vec![history()], 10_000, now).await.0.len(),
+            1,
+            "the final chunk survives"
+        );
+        assert_eq!(db.take_errors(), 1);
+    });
+    db.shutdown();
+
+    let db = DbClient::open(
+        &cfg,
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    rt.block_on(async {
+        assert_eq!(
+            db.pending_purges()
+                .await
+                .expect("a healthy read must answer")
+                .len(),
+            1
+        );
+        assert_eq!(db.group_purge(gid.to_string(), now).await, 1);
+        assert!(
+            db.pending_purges()
+                .await
+                .expect("a healthy read must answer")
+                .is_empty()
+        );
+        assert_eq!(db.state_stamp().await, Some(1));
+        assert!(db.query(vec![history()], 10_000, now).await.0.is_empty());
+    });
+    db.shutdown();
+}
+
+#[test]
+fn purge_expired_first_and_middle_chunk_failures_leave_a_resumable_backlog() {
+    // NIP-40 has no pending record: a failed pass simply stops at the chunk
+    // boundary and the next pass resumes it. The first half fails before
+    // any removal; the second half fails before the second chunk of a
+    // 4098-event backlog (the moderation state event sorts first), leaving
+    // the first chunk removed with the stamp already bumped.
+    let cfg = config();
+    let (db, faults) = open_with_faults(&cfg);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let now = 1_700_000_000u64;
+    let kind_filter =
+        || -> Filter { serde_json::from_value(serde_json::json!({"kinds": [1]})).unwrap() };
+    rt.block_on(async {
+        // First-chunk failure: stored while expiry is off, then purged.
+        db.set_expiry_enabled(false);
+        let e1 = expired_event("e1", now - 3, now);
+        let e2 = expired_event("e2", now - 2, now);
+        assert_eq!(db.put(e1, now).await, PutOutcome::Stored);
+        assert_eq!(db.put(e2, now).await, PutOutcome::Stored);
+        db.set_expiry_enabled(true);
+        faults
+            .chunk_after
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(db.purge_expired(now, 0).await, (0, false));
+        assert_eq!(db.take_errors(), 1);
+        // The scan hides expired events while NIP-40 is on, so read them
+        // with the feature off to observe the stored (unpurged) backlog.
+        db.set_expiry_enabled(false);
+        assert_eq!(
+            db.query(vec![kind_filter()], 10, now).await.0.len(),
+            2,
+            "a pass that never reached a chunk removes nothing"
+        );
+        db.set_expiry_enabled(true);
+        assert_eq!(db.purge_expired(now, 0).await, (2, false));
+        assert!(db.query(vec![kind_filter()], 10, now).await.0.is_empty());
+
+        // Middle-chunk failure: 4098 expired events, the moderation state
+        // event with the smallest expiration (first in the expiry index).
+        db.set_expiry_enabled(false);
+        let mut batch: Vec<(Event, u64)> = Vec::with_capacity(4098);
+        let mut state = event(9000, "mod", now - 5, vec![]);
+        state.tags = vec![vec!["expiration".into(), (now - 100).to_string()]];
+        state.id = nip01::compute_id(&state);
+        batch.push((state, now));
+        for i in 0..4097 {
+            batch.push((expired_event(&format!("x-{i}"), now - 4, now - 50), now));
+        }
+        let outcomes = db.put_batch(batch).await;
+        assert!(outcomes.iter().all(|o| matches!(o, PutOutcome::Stored)));
+        db.set_expiry_enabled(true);
+        faults
+            .chunk_after
+            .store(2, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            db.purge_expired(now, 0).await,
+            (4096, true),
+            "the first chunk committed (with its state event) before the failure"
+        );
+        assert_eq!(db.state_stamp().await, Some(1));
+        assert_eq!(db.take_errors(), 1);
+        db.set_expiry_enabled(false);
+        assert_eq!(
+            db.query(vec![kind_filter()], 10_000, now).await.0.len(),
+            2,
+            "the second chunk is still purgeable"
+        );
+        db.set_expiry_enabled(true);
+        assert_eq!(
+            db.purge_expired(now, 0).await,
+            (2, false),
+            "the state event was removed by the first pass"
+        );
+        assert!(
+            db.query(vec![kind_filter()], 10_000, now)
+                .await
+                .0
+                .is_empty()
+        );
+
+        // No bookkeeping record exists for expiry, and the failure never
+        // leaked into the writer's queued-work accounting.
+        assert_eq!(db.table_counts().await.expect("counts").purge_pending, 0);
+        assert_eq!(db.table_counts().await.expect("counts").delete_pending, 0);
+        assert_eq!(db.vanish_counts().await.expect("counts").1, 0);
+        assert_eq!(db.take_errors(), 0);
+        assert_eq!(db.take_overloads(), 0);
+        writer_barrier(&db, now).await;
+        assert_eq!(db.pending_msgs(), 0);
+        assert_eq!(db.pending_events(), 0);
+    });
+    db.shutdown();
 }

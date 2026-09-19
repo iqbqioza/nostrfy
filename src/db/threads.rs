@@ -17,10 +17,13 @@ use anyhow::anyhow;
 
 use crate::error::Result;
 
-/// Releases the writer thread's queued-work accounting for one drain. The
-/// counters are decremented when the guard drops, so a panic anywhere in
-/// the drain cannot leave the overload-protection counters elevated
-/// (which would reject every new request afterwards).
+/// Releases the writer thread's queued-work accounting for one drain.
+/// Inline-completed messages release their share via [`Self::release`] right
+/// after their arm replied; the remainder (the deferred puts, whose commit
+/// is the flush, plus any arm that returned early) is released when the
+/// guard drops. The drop happens on every exit path of the drain (including
+/// a panic mid-drain), so the overload-protection counters can never be
+/// left elevated (which would reject every new request afterwards).
 struct PendingGuard {
     msgs: usize,
     events: usize,
@@ -30,14 +33,41 @@ struct PendingGuard {
     bytes_counter: Arc<std::sync::atomic::AtomicUsize>,
 }
 
+impl PendingGuard {
+    /// Releases the accounting of one message that completed inline (its
+    /// reply was already sent). The guard's remaining fields shrink too, so
+    /// [`Drop`] subtracts only what is left, and the shared counters
+    /// saturate so a miscount can never wrap them into a permanent
+    /// fail-fast.
+    fn release(&mut self, msgs: usize, events: usize, bytes: usize) {
+        self.msgs = self.msgs.saturating_sub(msgs);
+        self.events = self.events.saturating_sub(events);
+        self.bytes = self.bytes.saturating_sub(bytes);
+        subtract_counter(&self.msgs_counter, msgs);
+        subtract_counter(&self.events_counter, events);
+        subtract_counter(&self.bytes_counter, bytes);
+    }
+}
+
+/// Subtracts from a shared queued-work counter without wrapping: an extra
+/// subtraction would otherwise leave it near `usize::MAX` and fail-fast
+/// every later request for the rest of the process.
+fn subtract_counter(counter: &std::sync::atomic::AtomicUsize, value: usize) {
+    if value == 0 {
+        return;
+    }
+    let _ = counter.fetch_update(
+        std::sync::atomic::Ordering::Relaxed,
+        std::sync::atomic::Ordering::Relaxed,
+        |current| Some(current.saturating_sub(value)),
+    );
+}
+
 impl Drop for PendingGuard {
     fn drop(&mut self) {
-        self.msgs_counter
-            .fetch_sub(self.msgs, std::sync::atomic::Ordering::Relaxed);
-        self.events_counter
-            .fetch_sub(self.events, std::sync::atomic::Ordering::Relaxed);
-        self.bytes_counter
-            .fetch_sub(self.bytes, std::sync::atomic::Ordering::Relaxed);
+        subtract_counter(&self.msgs_counter, self.msgs);
+        subtract_counter(&self.events_counter, self.events);
+        subtract_counter(&self.bytes_counter, self.bytes);
     }
 }
 
@@ -822,11 +852,15 @@ pub(crate) fn spawn(
                 // The payload bytes reserved by the senders (0 for the
                 // metadata-only messages, which the count caps bound).
                 let drained_bytes: usize = msgs.iter().map(msg_bytes).sum();
-                // Release the queued-work accounting of everything the
-                // drain processed. The guard drops on every exit path of
-                // the drain (including a panic mid-drain), so the
-                // overload-protection counters can never be left elevated.
-                let pending = PendingGuard {
+                // The drain's queued-work accounting. Messages whose arm
+                // replies inline release their share right after that arm
+                // (see the loop), so a caller woken by such a reply no
+                // longer sees its message counted; the deferred puts stay
+                // accounted until the pre-flush drop below. The guard drops
+                // on every exit path of the drain (including a panic
+                // mid-drain), so the overload-protection counters can never
+                // be left elevated.
+                let mut pending = PendingGuard {
                     msgs: drained_msgs,
                     events: drained_events,
                     bytes: drained_bytes,
@@ -853,6 +887,20 @@ pub(crate) fn spawn(
                 let mut coalesced_group_replies: Vec<oneshot::Sender<bool>> = Vec::new();
                 let mut coalesced_role_replies: Vec<oneshot::Sender<bool>> = Vec::new();
                 for (msg_index, msg) in msgs.into_iter().enumerate() {
+                    // This message's share of the drain accounting, computed
+                    // before the match consumes it. `Put`/`PutBatch` keep
+                    // their share until the pre-flush drop (their commit *is*
+                    // the flush); every other arm releases it as soon as its
+                    // reply was sent. `Msg::Shutdown` is not counted (see the
+                    // drain accounting above).
+                    let deferred = matches!(msg, Msg::Put { .. } | Msg::PutBatch { .. });
+                    let accounted_msgs = if matches!(msg, Msg::Shutdown) { 0 } else { 1 };
+                    let accounted_events = match &msg {
+                        Msg::PutBatch { events, .. } => events.len(),
+                        Msg::Put { .. } => 1,
+                        _ => 0,
+                    };
+                    let accounted_bytes = msg_bytes(&msg);
                     match msg {
                         Msg::Put {
                             event,
@@ -1511,14 +1559,32 @@ pub(crate) fn spawn(
                             }
                         }
                     }
+                    // The deferred puts keep their accounting until the
+                    // pre-flush drop; every other arm already sent its reply,
+                    // so release now. Arms that `continue`/`return` skip this
+                    // and leave their remainder to the guard's `Drop`.
+                    if !deferred {
+                        pending.release(accounted_msgs, accounted_events, accounted_bytes);
+                        // Test hook for the queue-accounting regression
+                        // test: count the processed message in the same
+                        // step that released its accounting, so the test can
+                        // distinguish mid-drain progress from the drain-end
+                        // drop without depending on reply timing.
+                        #[cfg(test)]
+                        store
+                            .writer_releases
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                 }
                 // Flush the batch before blocking again: clients await
                 // their replies, so a pending batch must not wait for the
-                // next message or every requestor deadlocks. The queued-work
-                // accounting is released *before* the flush replies, so a
-                // caller woken by the reply cannot observe a queue that is
-                // still counted as full (a transient fail-fast on an empty
-                // queue). A panic mid-drain still releases via Drop.
+                // next message or every requestor deadlocks. The inline
+                // messages already released their accounting before their
+                // replies (see the loop); the deferred puts' accounting is
+                // released *before* the flush replies, so a caller woken by
+                // a reply cannot observe a queue that is still counted as
+                // full (a transient fail-fast on an empty queue). A panic
+                // mid-drain still releases via Drop.
                 drop(pending);
                 flush_everything(&store, &thread_errors, &mut batch);
                 false
@@ -1568,4 +1634,89 @@ pub(crate) fn spawn(
         max_api_pending: Arc::new(std::sync::atomic::AtomicUsize::new(max_pending_msgs.max(1))),
         threads: std::sync::Mutex::new(handles),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Builds three counters holding `value` each.
+    fn counters(
+        value: usize,
+    ) -> (
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        (
+            Arc::new(std::sync::atomic::AtomicUsize::new(value)),
+            Arc::new(std::sync::atomic::AtomicUsize::new(value)),
+            Arc::new(std::sync::atomic::AtomicUsize::new(value)),
+        )
+    }
+
+    #[test]
+    fn pending_guard_release_subtracts_once_and_saturates() {
+        // A partial release shrinks the guard, so Drop subtracts only the
+        // remainder instead of double-subtracting the released share.
+        let (msgs, events, bytes) = counters(10);
+        let mut guard = PendingGuard {
+            msgs: 4,
+            events: 5,
+            bytes: 6,
+            msgs_counter: Arc::clone(&msgs),
+            events_counter: Arc::clone(&events),
+            bytes_counter: Arc::clone(&bytes),
+        };
+        guard.release(1, 2, 3);
+        assert_eq!(msgs.load(std::sync::atomic::Ordering::Relaxed), 9);
+        assert_eq!(events.load(std::sync::atomic::Ordering::Relaxed), 8);
+        assert_eq!(bytes.load(std::sync::atomic::Ordering::Relaxed), 7);
+        drop(guard);
+        // The remaining 3/3/3 are subtracted exactly once.
+        assert_eq!(msgs.load(std::sync::atomic::Ordering::Relaxed), 6);
+        assert_eq!(events.load(std::sync::atomic::Ordering::Relaxed), 5);
+        assert_eq!(bytes.load(std::sync::atomic::Ordering::Relaxed), 4);
+
+        // Releasing more than the guard holds (and more than the shared
+        // counters hold) saturates: no wrap into a permanent fail-fast and
+        // nothing left for Drop to subtract a second time.
+        let (msgs, events, bytes) = counters(1);
+        let mut guard = PendingGuard {
+            msgs: 2,
+            events: 2,
+            bytes: 2,
+            msgs_counter: Arc::clone(&msgs),
+            events_counter: Arc::clone(&events),
+            bytes_counter: Arc::clone(&bytes),
+        };
+        guard.release(5, 5, 5);
+        assert_eq!(msgs.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(events.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(bytes.load(std::sync::atomic::Ordering::Relaxed), 0);
+        drop(guard);
+        assert_eq!(msgs.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(events.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(bytes.load(std::sync::atomic::Ordering::Relaxed), 0);
+
+        // A zero-count release (the uncounted `Msg::Shutdown` share) is a
+        // no-op, and Drop still subtracts the full remainder.
+        let (msgs, events, bytes) = counters(7);
+        let mut guard = PendingGuard {
+            msgs: 2,
+            events: 3,
+            bytes: 4,
+            msgs_counter: Arc::clone(&msgs),
+            events_counter: Arc::clone(&events),
+            bytes_counter: Arc::clone(&bytes),
+        };
+        guard.release(0, 0, 0);
+        assert_eq!(msgs.load(std::sync::atomic::Ordering::Relaxed), 7);
+        assert_eq!(events.load(std::sync::atomic::Ordering::Relaxed), 7);
+        assert_eq!(bytes.load(std::sync::atomic::Ordering::Relaxed), 7);
+        drop(guard);
+        assert_eq!(msgs.load(std::sync::atomic::Ordering::Relaxed), 5);
+        assert_eq!(events.load(std::sync::atomic::Ordering::Relaxed), 4);
+        assert_eq!(bytes.load(std::sync::atomic::Ordering::Relaxed), 3);
+    }
 }

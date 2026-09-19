@@ -15,6 +15,8 @@ mod filter;
 mod fuzz_tests;
 mod logging;
 mod nips;
+#[cfg(test)]
+mod prop_tests;
 mod relay;
 mod server;
 mod stats;

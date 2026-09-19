@@ -4,6 +4,8 @@
 use std::sync::Arc;
 
 use super::db_error;
+#[cfg(test)]
+use super::store::take_chunk_fault;
 use super::store::{
     CREATED_LEN, GIFT_WRAP_INDEX, ID_LEN, Store, created_key, decode_pending_purge,
     decode_purged_group_marker, delegated_by, deleted_address_key, dtag_key_safe,
@@ -224,6 +226,10 @@ impl Store {
                     "NIP-09 deletion cancelled during shutdown; resuming at next startup"
                 ));
             }
+            #[cfg(test)]
+            if take_chunk_fault(&self.fail_chunk_after) {
+                return Err(anyhow::anyhow!("test-only removal chunk failure"));
+            }
             let mut wtxn = self.env.write_txn()?;
             let mut chunk_state_removed = false;
             for target in chunk {
@@ -345,6 +351,10 @@ impl Store {
                     return Err(anyhow::anyhow!(
                         "NIP-09 deletion cancelled during shutdown; resuming at next startup"
                     ));
+                }
+                #[cfg(test)]
+                if take_chunk_fault(&self.fail_chunk_after) {
+                    return Err(anyhow::anyhow!("test-only removal chunk failure"));
                 }
                 // A fresh write transaction per chunk: one address's version
                 // history is unbounded, and a single transaction across it
@@ -575,6 +585,10 @@ impl Store {
                 return Err(anyhow::anyhow!(
                     "NIP-29 group purge cancelled during shutdown; resuming at next startup"
                 ));
+            }
+            #[cfg(test)]
+            if take_chunk_fault(&self.fail_chunk_after) {
+                return Err(anyhow::anyhow!("test-only removal chunk failure"));
             }
             // Test-only: fail after the marker and in-progress record
             // committed, so the resume path runs with real crash state.
@@ -870,6 +884,10 @@ impl Store {
                     "NIP-62 vanish cancelled during shutdown; resuming at next startup"
                 ));
             }
+            #[cfg(test)]
+            if take_chunk_fault(&self.fail_chunk_after) {
+                return Err(anyhow::anyhow!("test-only removal chunk failure"));
+            }
             // Test-only: fail after the in-progress record committed (the
             // caller wrote it), so the resume path runs with real crash
             // state instead of hand-written table entries.
@@ -1025,6 +1043,14 @@ impl Store {
         loop {
             if self.cancelled() {
                 break;
+            }
+            // Test-only: fail before the nth chunk, i.e. after the first
+            // committed chunk for a countdown of `2` (a middle-chunk
+            // failure; see `take_chunk_fault`). Expiry has no pending
+            // record: the next periodic pass resumes the backlog.
+            #[cfg(test)]
+            if take_chunk_fault(&self.fail_chunk_after) {
+                return Err(anyhow::anyhow!("test-only removal chunk failure"));
             }
             // A fresh write transaction per chunk: the expired backlog is
             // unbounded, and one transaction across it pinned the writer

@@ -309,6 +309,28 @@ pub(crate) fn disk_below_margin(free: u64) -> bool {
     free < DISK_FREE_MARGIN
 }
 
+/// Test-only removal-chunk fault countdown (see the `fail_next_*_chunk`
+/// hooks): consumes one step and returns `true` when the armed check has
+/// arrived. `1` keeps the original one-shot "next chunk" semantics; `2`
+/// fails on the following check, so a walk with several chunks fails after
+/// the first committed chunk (a middle-chunk failure) instead of before it.
+/// `0` is disarmed. The countdown is consumed atomically, so arming it from
+/// a test while the writer thread runs cannot double-fire.
+#[cfg(test)]
+pub(crate) fn take_chunk_fault(counter: &std::sync::atomic::AtomicUsize) -> bool {
+    use std::sync::atomic::Ordering;
+    let mut current = counter.load(Ordering::SeqCst);
+    loop {
+        if current == 0 {
+            return false;
+        }
+        match counter.compare_exchange(current, current - 1, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return current == 1,
+            Err(actual) => current = actual,
+        }
+    }
+}
+
 /// Refuses a write when the disk hosting `env` is too full for a safe mmap
 /// commit (a write to a full disk raises SIGBUS and kills the process).
 /// For the CLI and migration paths that own no `Store` handle.
@@ -344,15 +366,12 @@ pub(crate) fn apply_put_batch(
     }
     // Disk-full guard: writing to the memory map of a file on a full disk
     // raises SIGBUS and kills the process, so refuse to commit while the
-    // free space is below the margin. Reads keep working.
-    if let Some(free) = store.free_space()
-        && disk_below_margin(free)
-    {
-        log::error!(
-            "disk is full: refusing to commit {} events ({} bytes free)",
-            puts.len(),
-            free
-        );
+    // free space is below the margin. Reads keep working. The refusal is a
+    // database fault (like the removals' guard), so it must be counted in
+    // the error metric, not silently reported only through the replies.
+    if let Err(e) = store.disk_full_error() {
+        db_error(thread_errors, &e);
+        log::error!("disk is full: refusing to commit {} events", puts.len());
         return vec![PutOutcome::Invalid("error: disk is full".into()); puts.len()];
     }
     loop {
@@ -592,12 +611,15 @@ pub(crate) struct Store {
     /// a popular query repeats over many requests; the scores tolerate a
     /// few minutes of staleness.
     pub(crate) df_cache: Arc<std::sync::Mutex<std::collections::HashMap<String, (u64, u64)>>>,
-    /// Test-only one-shot fault injection: the next `apply_put_batch`
-    /// commit is treated as a `MapFull` failure so the rollback path
-    /// (every put in the batch is revoked) is testable without filling a
-    /// real 16 MiB (map floor) environment.
+    /// Test-only one-shot fault injection: the next commit on a write path
+    /// that honors the hook (the put batch and the single-shot
+    /// snapshot/access/Blossom saves, see [`Self::commit`]) is treated as a
+    /// `MapFull` failure so the rollback path (every put in the batch is
+    /// revoked, no key moves) is testable without filling a real 16 MiB
+    /// (map floor) environment. Shared via `Arc`: the writer thread owns
+    /// the store, so a test can only arm it after startup through a clone.
     #[cfg(test)]
-    pub(crate) fail_next_commit: std::sync::atomic::AtomicBool,
+    pub(crate) fail_next_commit: Arc<std::sync::atomic::AtomicBool>,
     /// Whether commits skip the fsync (`database.disabled_fsync`): the
     /// writer thread then syncs periodically instead of only at shutdown.
     /// Set once at open (the flag is not reloadable).
@@ -626,12 +648,34 @@ pub(crate) struct Store {
     /// removal chunk fails after the in-progress record committed.
     #[cfg(test)]
     pub(crate) fail_next_delete_chunk: std::sync::atomic::AtomicBool,
-    /// Test-only one-shot fault injection: the next scan returns a store
-    /// error, so the reported read variants must answer `None` instead of
-    /// an empty successful result. Shared with the reader clones so arming
-    /// the store before the threads start reaches every reader.
+    /// Test-only removal-chunk fault countdown shared by every chunked
+    /// removal walk (delete, vanish, group purge and the NIP-40 expiry
+    /// pass): the nth check fails, so `1` fails before the first chunk and
+    /// `2` fails after the first committed chunk (a middle-chunk failure).
+    /// Kept separate from the per-path one-shot `fail_next_*_chunk` hooks
+    /// (which existing callers arm as bools); see [`take_chunk_fault`].
+    /// Shared via `Arc` so a test can arm it after startup.
+    #[cfg(test)]
+    pub(crate) fail_chunk_after: Arc<std::sync::atomic::AtomicUsize>,
+    /// Test-only scan fault injection: the next scan returns a store error,
+    /// so the reported read variants must answer `None` instead of an
+    /// empty successful result. Shared with the reader clones so arming the
+    /// store before the threads start reaches every reader.
     #[cfg(test)]
     pub(crate) fail_next_scan: Arc<std::sync::atomic::AtomicBool>,
+    /// Test-only disk-full override: while armed, [`Self::disk_full_error`]
+    /// (and therefore every guarded write path) reports a full disk without
+    /// a real full filesystem. Shared via `Arc` like the other hooks, so a
+    /// test can arm and disarm it after the writer thread owns the store.
+    #[cfg(test)]
+    pub(crate) disk_full_override: Arc<std::sync::atomic::AtomicBool>,
+    /// Test-only progress counter: incremented in the same writer step that
+    /// releases one inline-completed message's accounting, so a test can
+    /// tell mid-drain progress apart from drain-end completion without
+    /// relying on reply-observation timing. Shared via `Arc` so the test's
+    /// `Store` handle observes the writer thread.
+    #[cfg(test)]
+    pub(crate) writer_releases: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// `(created_at, id, protected, group_id, is_meta)` records returned by the
@@ -804,7 +848,7 @@ impl Store {
             map_max_size,
             df_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             #[cfg(test)]
-            fail_next_commit: std::sync::atomic::AtomicBool::new(false),
+            fail_next_commit: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             disabled_fsync: cfg.disabled_fsync,
             #[cfg(test)]
             panic_next_write: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -817,7 +861,13 @@ impl Store {
             #[cfg(test)]
             fail_next_delete_chunk: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
+            fail_chunk_after: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
             fail_next_scan: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(test)]
+            disk_full_override: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(test)]
+            writer_releases: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
     }
 
@@ -835,15 +885,27 @@ impl Store {
         false
     }
 
-    /// Free bytes on the filesystem hosting the data directory, when
-    /// statvfs succeeds.
-    /// Returns an error when the disk is too full to safely write to the
-    /// memory map (writing to a full disk raises SIGBUS and kills the
-    /// process): every writing path must refuse to commit below the margin.
-    pub(crate) fn disk_full_error(&self) -> Result<()> {
-        if let Some(free) = self.free_space()
-            && disk_below_margin(free)
+    /// Whether the filesystem hosting the data directory is too full to
+    /// safely write to the memory map (writing to a full disk raises
+    /// SIGBUS and kills the process). Test-only: an armed
+    /// `disk_full_override` reports full without touching a real
+    /// filesystem, so the failure mode is injectable on any machine.
+    pub(crate) fn disk_full(&self) -> bool {
+        #[cfg(test)]
+        if self
+            .disk_full_override
+            .load(std::sync::atomic::Ordering::Relaxed)
         {
+            return true;
+        }
+        self.free_space().is_some_and(disk_below_margin)
+    }
+
+    /// Returns an error when the disk is too full to safely write to the
+    /// memory map: every writing path must refuse to commit below the
+    /// margin (see [`Self::disk_full`]).
+    pub(crate) fn disk_full_error(&self) -> Result<()> {
+        if self.disk_full() {
             return Err(crate::error::storage_full());
         }
         Ok(())
@@ -851,6 +913,23 @@ impl Store {
 
     pub(crate) fn free_space(&self) -> Option<u64> {
         path_free_space(self.env.path())
+    }
+
+    /// Commits a write transaction, honoring the test-only one-shot
+    /// `fail_next_commit` hook: when armed, the commit is refused as a
+    /// `MapFull` and the transaction drops (aborts), so the callers'
+    /// failure semantics are testable without filling the memory map. The
+    /// production build compiles the hook out.
+    fn commit(&self, wtxn: heed::RwTxn<'_>) -> Result<()> {
+        #[cfg(test)]
+        if self
+            .fail_next_commit
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(heed::Error::Mdb(heed::MdbError::MapFull).into());
+        }
+        wtxn.commit()?;
+        Ok(())
     }
 
     pub(crate) fn size_on_disk(&self) -> u64 {
@@ -892,28 +971,35 @@ impl Store {
             indexed_words: self.indexed_words,
             map_max_size: self.map_max_size,
             df_cache: Arc::clone(&self.df_cache),
+            // The fault hooks are shared: a test keeps a clone (arming it
+            // after startup, when the writer already owns the store) and
+            // exactly one handler consumes it. The readers never commit or
+            // purge, so sharing them is harmless.
             #[cfg(test)]
-            fail_next_commit: std::sync::atomic::AtomicBool::new(false),
+            fail_next_commit: Arc::clone(&self.fail_next_commit),
             disabled_fsync: self.disabled_fsync,
-            // The panic hooks are shared: a test arms the store before the
-            // threads start, and exactly one handler (writer or reader)
-            // consumes the one-shot flag.
             #[cfg(test)]
             panic_next_write: Arc::clone(&self.panic_next_write),
             #[cfg(test)]
             panic_next_read: Arc::clone(&self.panic_next_read),
+            // The writer owns the original store, so the per-path chunk
+            // one-shots stay writer-only.
             #[cfg(test)]
             fail_next_purge_chunk: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             fail_next_vanish_chunk: std::sync::atomic::AtomicBool::new(false),
-            // The writer owns the original store, so a plain flag is
-            // enough (same lifecycle as the purge/vanish hooks).
             #[cfg(test)]
             fail_next_delete_chunk: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail_chunk_after: Arc::clone(&self.fail_chunk_after),
             // Shared like `panic_next_read`: a test arms the store before
             // the reader threads start and exactly one reader consumes it.
             #[cfg(test)]
             fail_next_scan: Arc::clone(&self.fail_next_scan),
+            #[cfg(test)]
+            disk_full_override: Arc::clone(&self.disk_full_override),
+            #[cfg(test)]
+            writer_releases: Arc::clone(&self.writer_releases),
         }
     }
 
@@ -940,7 +1026,7 @@ impl Store {
         let data = serde_json::to_vec(access)?;
         let mut wtxn = self.env.write_txn()?;
         self.access.put(&mut wtxn, b"access", &data)?;
-        wtxn.commit()?;
+        self.commit(wtxn)?;
         Ok(())
     }
 
@@ -952,7 +1038,7 @@ impl Store {
         let data = serde_json::to_vec(snap)?;
         let mut wtxn = self.env.write_txn()?;
         self.groups.put(&mut wtxn, b"groups:snapshot", &data)?;
-        wtxn.commit()?;
+        self.commit(wtxn)?;
         Ok(())
     }
 
@@ -963,7 +1049,7 @@ impl Store {
         self.disk_full_error()?;
         let mut wtxn = self.env.write_txn()?;
         self.groups.delete(&mut wtxn, b"groups:snapshot")?;
-        wtxn.commit()?;
+        self.commit(wtxn)?;
         Ok(())
     }
 
@@ -985,7 +1071,7 @@ impl Store {
         let data = serde_json::to_vec(snap)?;
         let mut wtxn = self.env.write_txn()?;
         self.roles.put(&mut wtxn, b"roles:snapshot", &data)?;
-        wtxn.commit()?;
+        self.commit(wtxn)?;
         Ok(())
     }
 
@@ -1069,7 +1155,7 @@ impl Store {
             .put(&mut wtxn, key.as_bytes(), &serde_json::to_vec(&meta)?)?;
         self.blossom
             .put(&mut wtxn, format!("own:{pubkey}:{sha256}").as_bytes(), b"")?;
-        wtxn.commit()?;
+        self.commit(wtxn)?;
         Ok(())
     }
 
@@ -1131,7 +1217,7 @@ impl Store {
                 b"",
             )?;
         }
-        wtxn.commit()?;
+        self.commit(wtxn)?;
         Ok(())
     }
 
@@ -1467,20 +1553,10 @@ impl Store {
         let mut wtxn = self.env.write_txn()?;
         self.access.put(&mut wtxn, b"access", &access_data)?;
         self.access.put(&mut wtxn, b"relay_pubkeys", &lists_data)?;
-        // Test-only fault injection (shared with the put batch path): an
-        // aborted commit must leave *both* keys at their previous values.
-        #[cfg(test)]
-        let commit = if self
-            .fail_next_commit
-            .swap(false, std::sync::atomic::Ordering::SeqCst)
-        {
-            Err(heed::Error::Mdb(heed::MdbError::MapFull))
-        } else {
-            wtxn.commit()
-        };
-        #[cfg(not(test))]
-        let commit = wtxn.commit();
-        commit?;
+        // The test-only `fail_next_commit` hook (shared with the put batch
+        // path) aborts the commit, so both keys stay at their previous
+        // values.
+        self.commit(wtxn)?;
         Ok(())
     }
 
