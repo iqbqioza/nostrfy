@@ -2004,6 +2004,15 @@ mod tests {
     /// Builds a relay with the test memory-mapped database and its live bus
     /// running, for tests that need several connections sharing one relay.
     async fn build_relay_with(private_key: &str) -> Arc<Relay> {
+        build_relay_with_limits(private_key, |_| {}).await
+    }
+
+    /// Like [`build_relay_with`], but lets the caller tune the test config
+    /// (limits, idle timeout, database sizes) before the relay is created.
+    async fn build_relay_with_limits(
+        private_key: &str,
+        tune: impl FnOnce(&mut Config),
+    ) -> Arc<Relay> {
         let mut cfg = Config::default();
         cfg.database.path = temp_db_path();
         // Small memory map: the parallel tests each open a DB, and the
@@ -2012,6 +2021,7 @@ mod tests {
         // up). The tests store a handful of events.
         cfg.database.map_size = 16 * 1024 * 1024;
         cfg.database.max_map_size = 64 * 1024 * 1024;
+        tune(&mut cfg);
         let db = crate::db::DbClient::open(
             &cfg.database,
             true,
@@ -7466,8 +7476,13 @@ mod tests {
     }
 
     /// Waits (bounded) for `ready` to hold, polling at 10 ms.
-    async fn wait_for(mut ready: impl FnMut() -> bool, what: &str) {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    async fn wait_for(ready: impl FnMut() -> bool, what: &str) {
+        wait_for_within(ready, Duration::from_secs(5), what).await;
+    }
+
+    /// Like [`wait_for`] with an explicit bound.
+    async fn wait_for_within(mut ready: impl FnMut() -> bool, timeout: Duration, what: &str) {
+        let deadline = tokio::time::Instant::now() + timeout;
         while !ready() {
             assert!(
                 tokio::time::Instant::now() < deadline,
@@ -7505,6 +7520,125 @@ mod tests {
                 _ = &mut deadline => panic!("timed out waiting for a websocket reply"),
             }
         }
+    }
+
+    /// Spawns the same axum WebSocket listener the E2E test builds inline,
+    /// serving `handle_connection` on `/`, and returns its address and task.
+    async fn spawn_ws_server(
+        relay: Arc<Relay>,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let app = axum::Router::new()
+            .route(
+                "/",
+                axum::routing::any(
+                    |ws: axum::extract::ws::WebSocketUpgrade,
+                     axum::extract::State(relay): axum::extract::State<Arc<Relay>>| async move {
+                        ws.on_upgrade(move |socket| async move {
+                            crate::ws::handle_connection(
+                                socket,
+                                relay,
+                                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                                "/".to_string(),
+                                None,
+                            )
+                            .await;
+                        })
+                    },
+                ),
+            )
+            .with_state(Arc::clone(&relay));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (addr, server)
+    }
+
+    /// Connects a real tokio-tungstenite client over a TCP socket the test
+    /// owns (so it can half-close it or set SO_LINGER). `recv_buffer` is
+    /// applied before the handshake: a tiny receive buffer makes a
+    /// non-reading client stall the server's writes deterministically
+    /// instead of absorbing the backlog into kernel buffers.
+    async fn connect_ws(
+        addr: std::net::SocketAddr,
+        recv_buffer: Option<u32>,
+    ) -> tokio_tungstenite::WebSocketStream<tokio::net::TcpStream> {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        if let Some(size) = recv_buffer {
+            socket.set_recv_buffer_size(size).unwrap();
+        }
+        let tcp = socket.connect(addr).await.unwrap();
+        tcp.set_nodelay(true).unwrap();
+        let (ws, _) = tokio_tungstenite::client_async(format!("ws://{addr}/"), tcp)
+            .await
+            .expect("the WebSocket connects");
+        ws
+    }
+
+    /// The next text frame of a tungstenite client, or `None` when the
+    /// server closed the connection (Close, EOF or a transport error);
+    /// fails on a 5-second silence. Unlike [`ws_next_json`] this tolerates
+    /// the close and returns the raw wire text (for byte-cap assertions).
+    async fn ws_next_text<S>(ws: &mut S) -> Option<String>
+    where
+        S: futures_util::Stream<
+                Item = Result<
+                    tokio_tungstenite::tungstenite::Message,
+                    tokio_tungstenite::tungstenite::Error,
+                >,
+            > + Unpin,
+    {
+        let deadline = tokio::time::sleep(Duration::from_secs(5));
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                msg = futures_util::StreamExt::next(ws) => match msg {
+                    Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) => {
+                        return Some(text.as_str().to_string());
+                    }
+                    Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_)))
+                    | Some(Err(_))
+                    | None => return None,
+                    Some(Ok(_)) => {}
+                },
+                _ = &mut deadline => panic!("timed out waiting for a websocket frame"),
+            }
+        }
+    }
+
+    /// Whether every per-connection accounting structure and both
+    /// relay-wide budgets are back at their baseline. `probes` cover the
+    /// filter components of every subscription the test opened: the live
+    /// index is only inspectable through `candidates`.
+    fn accounting_clean(relay: &Arc<Relay>, probes: &[&Event]) -> bool {
+        let connections_idle = relay
+            .stats
+            .connections_active
+            .load(std::sync::atomic::Ordering::Relaxed)
+            == 0;
+        let subscriptions_idle = relay
+            .stats
+            .subscriptions_active
+            .load(std::sync::atomic::Ordering::Relaxed)
+            == 0;
+        let index_empty = {
+            let index = relay.sub_index.read().unwrap_or_else(|p| p.into_inner());
+            probes
+                .iter()
+                .all(|event| index.candidates(event).is_empty())
+        };
+        let queues_empty = relay
+            .conn_queues
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_empty();
+        connections_idle
+            && subscriptions_idle
+            && index_empty
+            && queues_empty
+            && pending_response_budget(relay).used() == 0
+            && neg_budget(relay).used() == 0
     }
 
     #[test]
@@ -7652,6 +7786,611 @@ mod tests {
             .await;
 
             drop(ws);
+            server.abort();
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn websocket_abrupt_reset_releases_response_and_neg_state() {
+        // An abrupt TCP reset (SO_LINGER 0) while a REQ response is still
+        // pumping and a NEG-OPEN holds items must release every accounting
+        // structure within a bounded deadline: the connection and
+        // subscription counters, the live index, the delivery map and both
+        // relay-wide budgets (the pending response's RAII reservation and
+        // the NEG state's).
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_relay_with_limits("", |cfg| {
+                cfg.relay.send_auth_challenge = false;
+                cfg.limits.ws_idle_timeout_secs = 0;
+                cfg.limits.max_limit = 1_000;
+                cfg.limits.max_req_response_bytes = 1 << 20;
+                cfg.limits.max_out_queue_bytes = 4 * 1024;
+            })
+            .await;
+            let now = unix_now();
+            // The stored set is far larger than the client's receive buffer
+            // and the relay-wide queue cap, so the materialized prefix stays
+            // reserved while the client is not reading.
+            let stored: Vec<(Event, u64)> = (0..512)
+                .map(|i| {
+                    (
+                        signed_note(
+                            relay.secp(),
+                            &format!("reset-{i}-{}", "x".repeat(3_500)),
+                            now - i as u64,
+                            vec![],
+                        ),
+                        now,
+                    )
+                })
+                .collect();
+            let probe = stored[0].0.clone();
+            relay.db.put_batch(stored).await;
+
+            let (addr, server) = spawn_ws_server(Arc::clone(&relay)).await;
+            // The tiny receive buffer makes the stall deterministic (see
+            // `connect_ws`): the server cannot push the prefix into kernel
+            // buffers, so the pending reservation stays live.
+            let mut ws = connect_ws(addr, Some(4 * 1024)).await;
+            futures_util::SinkExt::send(
+                &mut ws,
+                tokio_tungstenite::tungstenite::Message::Text(
+                    json!(["REQ", "reset", {"kinds": [1]}]).to_string().into(),
+                ),
+            )
+            .await
+            .unwrap();
+            // One delivered EVENT proves the response is on the wire while
+            // the rest is still pinned.
+            let first = ws_next_text(&mut ws).await.expect("an EVENT frame");
+            let parsed: Value = serde_json::from_str(&first).unwrap();
+            assert_eq!(parsed[0], "EVENT", "the first frame must be the response");
+            assert!(
+                pending_response_budget(&relay).used() > 0,
+                "the stalled response must hold its relay-wide reservation"
+            );
+
+            // A NEG-OPEN holds its items (and their reservation) until the
+            // connection is gone. The server only reads it once the client
+            // has drained enough of the stalled response to leave the
+            // outgoing drain, so keep reading until the reservation lands.
+            futures_util::SinkExt::send(
+                &mut ws,
+                tokio_tungstenite::tungstenite::Message::Text(
+                    json!(["NEG-OPEN", "neg", {"kinds": [1]}, "61000000"])
+                        .to_string()
+                        .into(),
+                ),
+            )
+            .await
+            .unwrap();
+            let neg_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while neg_budget(&relay).used() == 0 {
+                assert!(
+                    tokio::time::Instant::now() < neg_deadline,
+                    "timed out waiting for the NEG-OPEN items to be reserved"
+                );
+                ws_next_text(&mut ws)
+                    .await
+                    .expect("the socket must stay up until the NEG-OPEN is processed");
+            }
+
+            // Abrupt reset: SO_LINGER 0 makes the close send RST instead of
+            // FIN, so the server sees a broken socket, not a close
+            // handshake.
+            ws.get_mut().set_zero_linger().unwrap();
+            drop(ws);
+
+            wait_for(
+                || accounting_clean(&relay, &[&probe]),
+                "all accounting after an abrupt reset",
+            )
+            .await;
+            server.abort();
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn websocket_half_close_serves_then_closes_cleanly() {
+        // A client that half-closes its write side (FIN) while keeping the
+        // read side open: the relay must either finish serving the in-flight
+        // REQ (EVENTs + EOSE) or close cleanly, without panicking, and must
+        // release all accounting. The relay must stay healthy for new
+        // connections afterwards.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_relay_with_limits("", |cfg| {
+                cfg.relay.send_auth_challenge = false;
+                cfg.limits.ws_idle_timeout_secs = 0;
+            })
+            .await;
+            let now = unix_now();
+            let stored: Vec<(Event, u64)> = (0..3)
+                .map(|i| {
+                    (
+                        signed_note(relay.secp(), &format!("half-{i}"), now - i as u64, vec![]),
+                        now,
+                    )
+                })
+                .collect();
+            let probe = stored[0].0.clone();
+            relay.db.put_batch(stored).await;
+
+            let (addr, server) = spawn_ws_server(Arc::clone(&relay)).await;
+            let mut ws = connect_ws(addr, None).await;
+            futures_util::SinkExt::send(
+                &mut ws,
+                tokio_tungstenite::tungstenite::Message::Text(
+                    json!(["REQ", "half", {"kinds": [1]}]).to_string().into(),
+                ),
+            )
+            .await
+            .unwrap();
+            // Half-close the write direction: the REQ is already flushed,
+            // and the server sees EOF while the client keeps reading.
+            tokio::io::AsyncWriteExt::shutdown(ws.get_mut())
+                .await
+                .unwrap();
+
+            let mut saw_eose = false;
+            let mut served = 0usize;
+            while let Some(text) = ws_next_text(&mut ws).await {
+                let msg: Value = serde_json::from_str(&text).unwrap();
+                match msg[0].as_str() {
+                    Some("EVENT") => served += 1,
+                    Some("EOSE") if msg[1] == "half" => saw_eose = true,
+                    _ => {}
+                }
+            }
+            // Tungstenite maps a TCP EOF to "connection closed", so the
+            // queued response may be abandoned when the write side is
+            // already terminated; either way the connection must close
+            // cleanly, and a response that does reach the wire must be
+            // complete (never a partial page without its EOSE).
+            assert!(
+                (served == 0 && !saw_eose) || (served == 3 && saw_eose),
+                "a half-closed REQ must be served completely or not at all \
+                 (served={served}, eose={saw_eose})"
+            );
+
+            wait_for(
+                || accounting_clean(&relay, &[&probe]),
+                "accounting after a half-close",
+            )
+            .await;
+            assert!(!server.is_finished(), "the listener must stay healthy");
+
+            // A fresh connection must still be served.
+            let mut fresh = connect_ws(addr, None).await;
+            let event = signed_note(relay.secp(), "after half-close", now, vec![]);
+            futures_util::SinkExt::send(
+                &mut fresh,
+                tokio_tungstenite::tungstenite::Message::Text(
+                    json!(["EVENT", event]).to_string().into(),
+                ),
+            )
+            .await
+            .unwrap();
+            let mut accepted = false;
+            for _ in 0..3 {
+                let msg = ws_next_json(&mut fresh).await;
+                if msg[0] == "OK" && msg[1] == event.id {
+                    assert_eq!(msg[2], true, "the event must be accepted: {msg:?}");
+                    accepted = true;
+                    break;
+                }
+            }
+            assert!(accepted, "a new connection must still be served");
+            drop(fresh);
+            wait_for(
+                || accounting_clean(&relay, &[&probe]),
+                "accounting after the health-check connection",
+            )
+            .await;
+            server.abort();
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn websocket_slow_reader_stops_at_the_response_budget() {
+        // A client that stops reading stalls the pump. The relay must never
+        // stream past `max_req_response_bytes`: when the stored response is
+        // larger, the subscription ends in a retryable CLOSED (the
+        // connection itself stays usable) and every byte and reservation is
+        // released afterwards.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_relay_with_limits("", |cfg| {
+                cfg.relay.send_auth_challenge = false;
+                cfg.limits.ws_idle_timeout_secs = 0;
+                cfg.limits.max_limit = 1_000;
+                cfg.limits.max_req_response_bytes = 128 * 1024;
+                cfg.limits.max_out_queue_bytes = 4 * 1024;
+            })
+            .await;
+            let now = unix_now();
+            let stored: Vec<(Event, u64)> = (0..512)
+                .map(|i| {
+                    (
+                        signed_note(
+                            relay.secp(),
+                            &format!("slow-{i}-{}", "y".repeat(300)),
+                            now - i as u64,
+                            vec![],
+                        ),
+                        now,
+                    )
+                })
+                .collect();
+            let probe = stored[0].0.clone();
+            relay.db.put_batch(stored).await;
+
+            let (addr, server) = spawn_ws_server(Arc::clone(&relay)).await;
+            let mut ws = connect_ws(addr, Some(4 * 1024)).await;
+            futures_util::SinkExt::send(
+                &mut ws,
+                tokio_tungstenite::tungstenite::Message::Text(
+                    json!(["REQ", "slow", {"kinds": [1]}]).to_string().into(),
+                ),
+            )
+            .await
+            .unwrap();
+            // Do not read: the tiny receive buffer stalls the socket and the
+            // materialized prefix stays pinned (and bounded).
+            wait_for(
+                || pending_response_budget(&relay).used() > 0,
+                "the stalled response to hold its reservation",
+            )
+            .await;
+            let budget = 128 * 1024u64;
+            let held = pending_response_budget(&relay).used();
+            assert!(
+                held <= budget + 8 * 1024,
+                "the pinned prefix must stay near the response budget, got {held}"
+            );
+
+            // Start reading: the pump stops at the exact budget and ends the
+            // subscription with a retryable CLOSED.
+            let mut event_bytes = 0usize;
+            let mut closed = false;
+            while let Some(text) = ws_next_text(&mut ws).await {
+                let msg: Value = serde_json::from_str(&text).unwrap();
+                match msg[0].as_str() {
+                    Some("EVENT") => event_bytes += text.len(),
+                    Some("CLOSED") if msg[1] == "slow" => {
+                        let reason = msg[2].as_str().unwrap_or("");
+                        assert!(
+                            reason.contains("response too large"),
+                            "a retryable reason is expected, got {reason}"
+                        );
+                        closed = true;
+                        break;
+                    }
+                    Some("EOSE") => {
+                        panic!("a truncated response must not claim completion")
+                    }
+                    _ => {}
+                }
+            }
+            assert!(closed, "the over-budget response must end in CLOSED");
+            assert!(
+                event_bytes <= budget as usize,
+                "the wire bytes must not exceed the response budget: {event_bytes} > {budget}"
+            );
+            // CLOSED releases the subscription; the connection stays up.
+            wait_for(
+                || {
+                    relay
+                        .stats
+                        .subscriptions_active
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        == 0
+                        && relay
+                            .stats
+                            .connections_active
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                            == 1
+                },
+                "the over-budget subscription to be released",
+            )
+            .await;
+            assert_eq!(
+                pending_response_budget(&relay).used(),
+                0,
+                "the released response must return its reservation"
+            );
+            drop(ws);
+            wait_for(
+                || accounting_clean(&relay, &[&probe]),
+                "accounting after the slow reader",
+            )
+            .await;
+            server.abort();
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn websocket_drain_flushes_pending_ok_and_closed() {
+        // Graceful drain while a live subscription, a queued CLOSED (an
+        // over-budget response) and a publisher's pending OKs are in
+        // flight: the queued completion frames must be flushed before the
+        // socket closes (within the teardown grace), and all accounting
+        // must return to baseline.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_relay_with_limits("", |cfg| {
+                cfg.relay.send_auth_challenge = false;
+                cfg.limits.ws_idle_timeout_secs = 0;
+                cfg.limits.max_req_response_bytes = 2_000;
+            })
+            .await;
+            let now = unix_now();
+            // Events that overrun the tiny response budget: the subscription
+            // ends in a CLOSED, which the subscriber does not read yet.
+            let big: Vec<(Event, u64)> = (0..4)
+                .map(|i| {
+                    (
+                        signed_kind_note_seeded(
+                            relay.secp(),
+                            9,
+                            9999,
+                            &format!("big-{i}-{}", "z".repeat(600)),
+                            now - i as u64,
+                            vec![],
+                        ),
+                        now,
+                    )
+                })
+                .collect();
+            let probe_big = big[0].0.clone();
+            relay.db.put_batch(big).await;
+
+            let (addr, server) = spawn_ws_server(Arc::clone(&relay)).await;
+
+            // The subscriber: a live REQ that stays open, plus an
+            // over-budget REQ whose CLOSED is queued and unread.
+            let mut subscriber = connect_ws(addr, None).await;
+            futures_util::SinkExt::send(
+                &mut subscriber,
+                tokio_tungstenite::tungstenite::Message::Text(
+                    json!(["REQ", "live", {"kinds": [1]}]).to_string().into(),
+                ),
+            )
+            .await
+            .unwrap();
+            let mut saw_eose = false;
+            for _ in 0..3 {
+                let msg = ws_next_json(&mut subscriber).await;
+                if msg[0] == "EOSE" && msg[1] == "live" {
+                    saw_eose = true;
+                    break;
+                }
+            }
+            assert!(saw_eose, "the live subscription must be answered");
+            futures_util::SinkExt::send(
+                &mut subscriber,
+                tokio_tungstenite::tungstenite::Message::Text(
+                    json!(["REQ", "big", {"kinds": [9999]}]).to_string().into(),
+                ),
+            )
+            .await
+            .unwrap();
+            wait_for(
+                || {
+                    relay
+                        .stats
+                        .subscriptions_total
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        >= 2
+                },
+                "the over-budget REQ to be registered",
+            )
+            .await;
+            wait_for(
+                || {
+                    relay
+                        .stats
+                        .subscriptions_active
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        == 1
+                        && pending_response_budget(&relay).used() == 0
+                },
+                "the over-budget CLOSED to be queued",
+            )
+            .await;
+
+            // The publisher: its OKs are queued (the events become visible
+            // in the database) but not read before the drain.
+            let mut publisher = connect_ws(addr, None).await;
+            let live: Vec<Event> = (0..5)
+                .map(|i| signed_note_seeded(relay.secp(), 1, &format!("live-{i}"), now, vec![]))
+                .collect();
+            let ids: Vec<String> = live.iter().map(|event| event.id.clone()).collect();
+            for event in &live {
+                futures_util::SinkExt::send(
+                    &mut publisher,
+                    tokio_tungstenite::tungstenite::Message::Text(
+                        json!(["EVENT", event]).to_string().into(),
+                    ),
+                )
+                .await
+                .unwrap();
+            }
+            let probe_live = live[0].clone();
+            let filter: Filter = serde_json::from_value(json!({"ids": ids})).unwrap();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let (stored, _) = relay
+                    .db
+                    .query_req(vec![filter.clone()], live.len(), unix_now())
+                    .await;
+                if stored.len() == live.len() {
+                    break;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "timed out waiting for the live events to be accepted"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+
+            relay.signal_drain();
+
+            // The subscriber's queued CLOSED is flushed before the close.
+            let mut saw_closed = false;
+            while let Some(text) = ws_next_text(&mut subscriber).await {
+                let msg: Value = serde_json::from_str(&text).unwrap();
+                if msg[0] == "CLOSED" && msg[1] == "big" {
+                    saw_closed = true;
+                }
+            }
+            assert!(
+                saw_closed,
+                "the pending CLOSED must be flushed before the socket closes"
+            );
+
+            // The publisher's pending OKs are flushed before the close too.
+            let mut oks = std::collections::HashSet::new();
+            while let Some(text) = ws_next_text(&mut publisher).await {
+                let msg: Value = serde_json::from_str(&text).unwrap();
+                if msg[0] == "OK" {
+                    assert_eq!(msg[2], true, "the event must be accepted: {msg:?}");
+                    oks.insert(msg[1].as_str().unwrap_or("").to_string());
+                }
+            }
+            for event in &live {
+                assert!(
+                    oks.contains(&event.id),
+                    "the OK for {} was lost in the drain",
+                    event.id
+                );
+            }
+
+            drop(subscriber);
+            drop(publisher);
+            wait_for(
+                || accounting_clean(&relay, &[&probe_live, &probe_big]),
+                "accounting after the graceful drain",
+            )
+            .await;
+            server.abort();
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn websocket_keepalive_spares_the_alive_and_reaps_the_dead() {
+        // ws_idle_timeout_secs with the keep-alive PING: a silent client
+        // that keeps reading (tungstenite auto-answers the PING with a
+        // PONG) is not reaped, while one that never reads is closed. 6s is
+        // the smallest idle timeout above the relay's 5s PING floor.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_relay_with_limits("", |cfg| {
+                cfg.relay.send_auth_challenge = false;
+                cfg.limits.ws_idle_timeout_secs = 6;
+            })
+            .await;
+            let (addr, server) = spawn_ws_server(Arc::clone(&relay)).await;
+            let probe = signed_note(relay.secp(), "keepalive", unix_now(), vec![]);
+
+            let mut alive = connect_ws(addr, None).await;
+            let mut dead = connect_ws(addr, None).await;
+            wait_for(
+                || {
+                    relay
+                        .stats
+                        .connections_active
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        == 2
+                },
+                "both connections to be accepted",
+            )
+            .await;
+
+            // Past the idle deadline (6s plus up to 2s of jitter): the
+            // polled client keeps auto-answering the PINGs.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep_until(deadline) => break,
+                    msg = futures_util::StreamExt::next(&mut alive) => match msg {
+                        Some(Ok(_)) => {}
+                        Some(Err(e)) => panic!("the polled client was closed: {e}"),
+                        None => panic!("the polled client was reaped"),
+                    },
+                }
+            }
+
+            // The dead client never answered (it never read the PING): it
+            // must be reaped, leaving only the polled connection.
+            wait_for(
+                || {
+                    relay
+                        .stats
+                        .connections_active
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        == 1
+                },
+                "the silent dead client to be reaped",
+            )
+            .await;
+            assert_eq!(
+                relay
+                    .conn_queues
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .len(),
+                1,
+                "only the alive connection may remain"
+            );
+            let close_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                match tokio::time::timeout_at(
+                    close_deadline,
+                    futures_util::StreamExt::next(&mut dead),
+                )
+                .await
+                {
+                    Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))))
+                    | Ok(None)
+                    | Ok(Some(Err(_))) => break,
+                    Ok(Some(Ok(_))) => continue,
+                    Err(_) => panic!("the dead client's socket was not closed"),
+                }
+            }
+
+            // The kept-alive connection is still fully functional.
+            futures_util::SinkExt::send(
+                &mut alive,
+                tokio_tungstenite::tungstenite::Message::Text(
+                    json!(["REQ", "kp", {"kinds": [1]}]).to_string().into(),
+                ),
+            )
+            .await
+            .unwrap();
+            let mut saw_eose = false;
+            for _ in 0..3 {
+                let msg = ws_next_json(&mut alive).await;
+                if msg[0] == "EOSE" && msg[1] == "kp" {
+                    saw_eose = true;
+                    break;
+                }
+            }
+            assert!(saw_eose, "the kept-alive connection must still be served");
+
+            drop(alive);
+            drop(dead);
+            wait_for(
+                || accounting_clean(&relay, &[&probe]),
+                "accounting after the keep-alive test",
+            )
+            .await;
             server.abort();
             relay.db.shutdown();
         });
