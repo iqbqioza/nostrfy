@@ -783,7 +783,7 @@ mod tests {
                     .load(std::sync::atomic::Ordering::SeqCst);
                 if gone
                     && !pending
-                    && let Some(snap) = relay.db.load_groups().await
+                    && let crate::db::LoadGroupsOutcome::Loaded(snap) = relay.db.load_groups().await
                 {
                     snapshot = Some(snap);
                     break;

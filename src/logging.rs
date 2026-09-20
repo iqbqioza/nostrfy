@@ -85,31 +85,36 @@ pub fn init() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         let _ = log::set_logger(&LOGGER);
+        // The global max must cover the most verbose directive: per-target
+        // filtering happens in `FileLogger::enabled`, which the macros only
+        // reach for records at or below this level.
         let level = std::env::var("RUST_LOG")
             .ok()
-            .map(|v| parse_max_level(&v))
+            .map(|v| {
+                let (directives, default) = parse_directives(&v);
+                directives
+                    .into_iter()
+                    .map(|(_, level)| level)
+                    .chain([default])
+                    .max()
+                    .unwrap_or(log::LevelFilter::Info)
+            })
             .unwrap_or(log::LevelFilter::Info);
         log::set_max_level(level);
     });
 }
 
-/// The global maximum level for a `RUST_LOG` value. Full env_logger
-/// directive semantics are out of scope — the process is a single binary,
-/// `nostrfy`, whose records all carry the `nostrfy` or `nostrfy::module`
-/// target — so this supports the documented forms: a bare level (`debug`),
-/// comma-separated directives (`nostrfy=debug,nostrfy::server=trace`) and
-/// a bare crate/module name (env_logger's shorthand for `=trace`). When a
-/// specific directive matches the crate, the most specific (longest) target
-/// wins over the bare default; a target that does not name this crate is
-/// ignored, because it cannot filter `nostrfy` records and treating it as
-/// the global level would silently change the relay's log volume. Without
-/// any usable directive the default is `info`.
-fn parse_max_level(value: &str) -> log::LevelFilter {
+/// Parsed `RUST_LOG` directives: the per-target list plus the default
+/// level (a bare level, or `info` when nothing usable is present).
+/// `FileLogger::enabled` matches a record's target against this list so
+/// `nostrfy::server=trace` traces only that module instead of collapsing
+/// to a process-wide trace level.
+fn parse_directives(value: &str) -> (Vec<(String, log::LevelFilter)>, log::LevelFilter) {
     fn matches_crate(target: &str) -> bool {
         target == "nostrfy" || target.starts_with("nostrfy::")
     }
     let mut bare: Option<log::LevelFilter> = None;
-    let mut targeted: Option<(usize, log::LevelFilter)> = None;
+    let mut targeted: Vec<(String, log::LevelFilter)> = Vec::new();
     for directive in value.split(',') {
         let directive = directive.trim();
         if directive.is_empty() {
@@ -121,7 +126,7 @@ fn parse_max_level(value: &str) -> log::LevelFilter {
                 // A bare target (`RUST_LOG=nostrfy`) is env_logger's
                 // shorthand for the most verbose level for that target.
                 Err(_) if matches_crate(directive) => {
-                    targeted = Some((directive.len(), log::LevelFilter::Trace));
+                    targeted.push((directive.to_string(), log::LevelFilter::Trace));
                 }
                 Err(_) => {}
             },
@@ -133,18 +138,62 @@ fn parse_max_level(value: &str) -> log::LevelFilter {
                 let Ok(level) = level.trim().parse::<log::LevelFilter>() else {
                     continue;
                 };
-                // Ties go to the later directive (env_logger applies the
-                // last matching directive).
-                if targeted.is_none_or(|(len, _)| target.len() >= len) {
-                    targeted = Some((target.len(), level));
-                }
+                targeted.push((target.to_string(), level));
             }
         }
     }
+    (targeted, bare.unwrap_or(log::LevelFilter::Info))
+}
+
+/// The legacy single-level view of a `RUST_LOG` value: the most specific
+/// (longest) matching target wins over the bare default, with later
+/// directives winning ties. Kept for tests; the process max level is the
+/// maximum over [`parse_directives`].
+#[cfg(test)]
+fn parse_max_level(value: &str) -> log::LevelFilter {
+    let (targeted, default) = parse_directives(value);
     targeted
+        .into_iter()
+        .max_by_key(|(target, _)| target.len())
         .map(|(_, level)| level)
-        .or(bare)
-        .unwrap_or(log::LevelFilter::Info)
+        .unwrap_or(default)
+}
+
+/// The parsed `RUST_LOG` directives for per-target filtering, parsed once.
+/// `FileLogger::enabled` consults this so `nostrfy::server=trace` traces
+/// only that module instead of collapsing to a process-wide trace level.
+static TARGET_FILTERS: std::sync::OnceLock<(Vec<(String, log::LevelFilter)>, log::LevelFilter)> =
+    std::sync::OnceLock::new();
+
+fn target_filters() -> &'static (Vec<(String, log::LevelFilter)>, log::LevelFilter) {
+    TARGET_FILTERS.get_or_init(|| {
+        std::env::var("RUST_LOG")
+            .ok()
+            .map(|v| parse_directives(&v))
+            .unwrap_or_else(|| (Vec::new(), log::LevelFilter::Info))
+    })
+}
+
+/// The level a record with `target` may log at: the longest matching
+/// directive prefix wins (exact match or a `::` boundary, like
+/// env_logger), falling back to the bare default.
+fn level_for_target(
+    directives: &[(String, log::LevelFilter)],
+    default: log::LevelFilter,
+    target: &str,
+) -> log::LevelFilter {
+    let mut level = default;
+    let mut best = 0usize;
+    for (prefix, directive) in directives {
+        let hit = target.len() >= prefix.len()
+            && target.as_bytes()[..prefix.len()] == prefix.as_bytes()[..]
+            && (target.len() == prefix.len() || target.as_bytes()[prefix.len()] == b':');
+        if hit && prefix.len() >= best {
+            best = prefix.len();
+            level = *directive;
+        }
+    }
+    level
 }
 
 /// Installs a rotating file backend (used in daemon mode).
@@ -171,6 +220,12 @@ struct FileState {
     write_failed: bool,
     /// Whether the last rotation failed (same one-report-per-streak rule).
     rotate_failed: bool,
+    /// File size at the last rotation attempt. While rotation keeps
+    /// failing (e.g. a full disk), attempts are retried only after the
+    /// file grew by another full generation, so a failing disk costs a
+    /// couple of integer compares per record instead of a directory scan
+    /// plus renames under the logger mutex.
+    rotate_attempt_size: u64,
 }
 
 impl FileLogger {
@@ -186,6 +241,7 @@ impl FileLogger {
                 size,
                 write_failed: false,
                 rotate_failed: false,
+                rotate_attempt_size: 0,
             }),
         })
     }
@@ -217,6 +273,17 @@ impl FileLogger {
         if self.max_size == 0 || state.size < self.max_size {
             return;
         }
+        // While rotation keeps failing, retry only after another full
+        // generation of growth: a full disk would otherwise pay for a
+        // directory scan plus renames on every record while holding the
+        // logger mutex. Growth on successful writes still re-arms the
+        // retry, so a recovered disk resumes rotating by itself.
+        if state.rotate_failed
+            && state.size < state.rotate_attempt_size.saturating_add(self.max_size)
+        {
+            return;
+        }
+        state.rotate_attempt_size = state.size;
         // Shift the backups up: `.N-1` -> `.N`, `.1` -> `.2`, etc. Only the
         // generations that actually exist are touched: the old loop probed
         // every index below `max_log_files`, so a large configured ceiling
@@ -319,8 +386,9 @@ fn backup_index(path: &Path, candidate: &Path) -> Option<u32> {
 }
 
 impl log::Log for FileLogger {
-    fn enabled(&self, _metadata: &log::Metadata) -> bool {
-        true
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        let (directives, default) = target_filters();
+        metadata.level() <= level_for_target(directives, *default, metadata.target())
     }
     fn log(&self, record: &log::Record) {
         let line = format_record(record);
@@ -543,6 +611,46 @@ mod tests {
     }
 
     #[test]
+    fn target_scoping_applies_per_module() {
+        use log::LevelFilter;
+        // `nostrfy::server=trace` must trace only that module, not the
+        // whole process: previously the single global level collapsed
+        // every per-target directive into process-wide verbosity.
+        let (directives, default) = parse_directives("nostrfy=info,nostrfy::server=trace");
+        assert_eq!(
+            level_for_target(&directives, default, "nostrfy::server"),
+            LevelFilter::Trace
+        );
+        assert_eq!(
+            level_for_target(&directives, default, "nostrfy::server::ws"),
+            LevelFilter::Trace,
+            "submodules inherit the longest matching prefix"
+        );
+        assert_eq!(
+            level_for_target(&directives, default, "nostrfy::db"),
+            LevelFilter::Info,
+            "other modules keep the default"
+        );
+        assert_eq!(
+            level_for_target(&directives, default, "hyper"),
+            LevelFilter::Info,
+            "unrelated targets keep the default"
+        );
+        // A bare target is env_logger's shorthand for trace on that prefix.
+        let (directives, default) = parse_directives("nostrfy");
+        assert_eq!(
+            level_for_target(&directives, default, "nostrfy::db"),
+            LevelFilter::Trace
+        );
+        // No usable directive: everything falls back to info.
+        let (directives, default) = parse_directives("hyper=debug");
+        assert_eq!(
+            level_for_target(&directives, default, "nostrfy::db"),
+            LevelFilter::Info
+        );
+    }
+
+    #[test]
     fn rotation_shifts_only_existing_backups_with_a_large_ceiling() {
         // Regression: the shift loop probed every index below
         // `max_log_files`, so a large configured ceiling made each rotation
@@ -574,6 +682,60 @@ mod tests {
         );
         assert!(backup_path(&path, 2).exists(), ".1 must shift to .2");
         assert!(backup_path(&path, 4).exists(), ".3 must shift to .4");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failing_rotation_retries_only_after_a_full_generation() {
+        // While rotation keeps failing, each record must not pay for a
+        // directory scan plus renames: attempts resume only after another
+        // full generation of growth.
+        let dir = std::env::temp_dir().join("nostrfy-log-retry-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("nostrfy.log");
+        std::fs::write(&path, "01234567").unwrap();
+        let logger = FileLogger::open(path.clone(), 8, 3).unwrap();
+        let record = || {
+            log::Record::builder()
+                .args(format_args!("x"))
+                .level(log::Level::Info)
+                .build()
+        };
+        {
+            let mut state = logger.inner.lock().unwrap();
+            // Pretend the last attempt failed: small writes below one more
+            // generation must not re-attempt.
+            state.rotate_failed = true;
+            state.rotate_attempt_size = 1000;
+        }
+        logger.log(&record());
+        {
+            let state = logger.inner.lock().unwrap();
+            assert_eq!(
+                state.rotate_attempt_size, 1000,
+                "no rotation attempt while failing"
+            );
+        }
+        assert!(
+            !backup_path(&path, 1).exists(),
+            "a skipped retry must not rotate"
+        );
+        // Past another full generation the retry must happen (the rename
+        // succeeds here, so the backup appears and the watermark moves).
+        {
+            let mut state = logger.inner.lock().unwrap();
+            state.size = 2000;
+        }
+        logger.log(&record());
+        {
+            let state = logger.inner.lock().unwrap();
+            assert!(
+                state.rotate_attempt_size >= 2000,
+                "growth must re-arm the rotation retry"
+            );
+        }
+        assert!(backup_path(&path, 1).exists(), "the retry must rotate");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

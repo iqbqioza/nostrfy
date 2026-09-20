@@ -608,11 +608,16 @@ impl BlobStore {
                 break;
             }
         }
-        let (_, db_ok) = self.db.blossom_remove_owner_checked(sha256, pubkey).await;
+        let (removed, db_ok) = self.db.blossom_remove_owner_checked(sha256, pubkey).await;
         if !db_ok {
             return Err(anyhow!("blossom mapping removal failed"));
         }
-        Ok(existed)
+        // A crash between the file removal above and a mapping failure
+        // leaves the mapping behind with no file: the retry finds no file
+        // but still owns the mapping, so it must report the completed
+        // delete (`true`) instead of 404. Only when neither the file nor
+        // the mapping existed is there nothing to delete.
+        Ok(existed || removed)
     }
 
     /// One-time automatic migration: rebuilds the sha→owner mapping from

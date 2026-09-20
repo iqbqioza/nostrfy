@@ -4732,7 +4732,7 @@ fn group_and_role_snapshots_survive_restart() {
         groups.apply(&create, "relay", now, false, false);
         db.save_groups(groups.snapshot()).await;
         let mut restored = crate::nips::nip29::GroupStore::with_cap(7);
-        restored.restore(db.load_groups().await.expect("snapshot"));
+        restored.restore(db.load_groups().await.expect_loaded("snapshot"));
         assert!(restored.group("g1").is_some(), "groups must restore");
         // The capacity cap comes from the config, not the snapshot.
         assert!(
@@ -4747,7 +4747,7 @@ fn group_and_role_snapshots_survive_restart() {
         roles.assign(crate::nips::nip29::tests::USER, "mod");
         db.save_roles(roles.snapshot()).await;
         let mut restored_roles = crate::nips::nip43::RoleStore::default();
-        restored_roles.restore(db.load_roles().await.expect("snapshot"));
+        restored_roles.restore(db.load_roles().await.expect_loaded("snapshot"));
         assert!(
             restored_roles.is_member_of(crate::nips::nip29::tests::USER),
             "roles must restore"
@@ -6876,7 +6876,11 @@ fn roles_snapshot(role: &str) -> crate::nips::nip43::RolesSnapshot {
 /// Loads the persisted group snapshot into a fresh store.
 async fn load_groups_restored(db: &DbClient) -> crate::nips::nip29::GroupStore {
     let mut restored = crate::nips::nip29::GroupStore::with_cap(100);
-    restored.restore(db.load_groups().await.expect("a persisted group snapshot"));
+    restored.restore(
+        db.load_groups()
+            .await
+            .expect_loaded("a persisted group snapshot"),
+    );
     restored
 }
 
@@ -6988,13 +6992,21 @@ fn commit_failure_write_paths_report_failure_without_partial_state() {
             .store(true, std::sync::atomic::Ordering::SeqCst);
         assert!(!db.save_roles(roles_snapshot("beta")).await);
         let mut restored_roles = crate::nips::nip43::RoleStore::default();
-        restored_roles.restore(db.load_roles().await.expect("a persisted role snapshot"));
+        restored_roles.restore(
+            db.load_roles()
+                .await
+                .expect_loaded("a persisted role snapshot"),
+        );
         assert!(restored_roles.roles.contains_key("alpha"));
         assert!(!restored_roles.roles.contains_key("beta"));
         assert_eq!(db.take_errors(), 1);
         assert!(db.save_roles(roles_snapshot("beta")).await);
         let mut restored_roles = crate::nips::nip43::RoleStore::default();
-        restored_roles.restore(db.load_roles().await.expect("a persisted role snapshot"));
+        restored_roles.restore(
+            db.load_roles()
+                .await
+                .expect_loaded("a persisted role snapshot"),
+        );
         assert!(restored_roles.roles.contains_key("beta"));
 
         // Clear snapshot.
@@ -7164,7 +7176,11 @@ fn disk_full_write_paths_report_failure_without_partial_state() {
 
         assert!(!db.save_roles(roles_snapshot("beta")).await);
         let mut restored_roles = crate::nips::nip43::RoleStore::default();
-        restored_roles.restore(db.load_roles().await.expect("a persisted role snapshot"));
+        restored_roles.restore(
+            db.load_roles()
+                .await
+                .expect_loaded("a persisted role snapshot"),
+        );
         assert!(restored_roles.roles.contains_key("alpha"));
         assert!(!restored_roles.roles.contains_key("beta"));
         assert_eq!(db.take_errors(), 1);

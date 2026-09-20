@@ -3126,6 +3126,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_after_a_mapping_failure_reports_the_completed_delete() {
+        // A crash between the file removal and a mapping failure leaves
+        // the mapping behind with no file: the retry must report the
+        // completed delete (200), not 404, and only a repeat delete with
+        // nothing left anywhere reports "not found".
+        let relay = build_blossom_relay(0).await;
+        let state = state_of(&relay).await.expect("blossom state");
+        let pk = "cc".repeat(32);
+        let data = b"delete me";
+        let sha = sha256_hex(data);
+        state
+            .store
+            .put(&pk, &sha, data, "text/plain")
+            .await
+            .unwrap();
+        // Simulate the crash window: remove the object file directly so
+        // only the mapping remains.
+        let local_path = relay.config.read().await.blossom.local_path.clone();
+        let npub = crate::nips::nip19::bech32_encode("npub", &hex::decode(&pk).unwrap()).unwrap();
+        std::fs::remove_file(local_path.join(npub).join(&sha)).unwrap();
+        assert!(
+            state.store.delete(&pk, &sha).await.unwrap(),
+            "a mapping that still lists the owner completes the delete"
+        );
+        assert!(
+            !state.store.delete(&pk, &sha).await.unwrap(),
+            "with neither file nor mapping left there is nothing to delete"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
     async fn list_caps_page_size() {
         // `?limit=` is capped at 1000 with a default of 100: a heavy
         // uploader cannot force a single unbounded JSON page.

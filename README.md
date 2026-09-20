@@ -391,7 +391,7 @@ The advertised `supported_nips` list is **dynamic**: a NIP is dropped when all t
 - **The LMDB map is opened at its configured ceiling** and never resized at runtime: resizing would require that no read transactions are active, which cannot be guaranteed with concurrent reader threads. The reservation is a sparse virtual-address mapping, so physical memory and disk grow only with the data actually written.
 - **Scan engine** — multi-range filters (`authors`, `kinds`, `#tag`) are walked with a merged newest-first iterator so a per-filter `limit` applies to the union of all ranges; NIP-67 boundary handling never splits a `created_at` tie across pages. A per-scan work budget bounds the candidates examined so a filter matching nothing cannot walk an entire index range.
 - **Panic containment** — the database thread, the reader threads and every connection task are isolated; a fault in any of them is logged and does not take the relay down.
-- **Per-IP connection accounting** — the number of active WebSocket connections per source IP is tracked and capped, so a socket flood from one host cannot evict legitimate clients.
+- **Per-IP connection accounting** — the number of active connections per source IP is tracked and capped at the accept layer (plain HTTP and WebSocket upgrades alike), so a socket flood from one host cannot evict legitimate clients.
 
 ## Performance
 

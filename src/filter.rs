@@ -993,11 +993,17 @@ mod tests {
         let mut rng = Rng::new(0x5eed_f002);
         for _ in 0..4_000 {
             let mut value = random_json(&mut rng, 3);
-            if rewrite_inbox_outbox(&mut value).is_ok() {
-                // A successfully rewritten value must still parse into a
-                // filter whenever it is an object.
+            // The rewrite must preserve parseability: an object that parsed
+            // as a filter before a successful rewrite must still parse
+            // after it (the rewrite only drops inbox/outbox keys and merges
+            // string arrays into `#p`/`authors`, all filter-compatible
+            // shapes; anything else is an `Err`).
+            let text = serde_json::to_string(&value).unwrap();
+            if serde_json::from_str::<Filter>(&text).is_ok()
+                && rewrite_inbox_outbox(&mut value).is_ok()
+            {
                 let text = serde_json::to_string(&value).unwrap();
-                let _ = serde_json::from_str::<Filter>(&text);
+                serde_json::from_str::<Filter>(&text).expect("a rewritten filter must still parse");
             }
         }
     }
