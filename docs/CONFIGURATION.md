@@ -366,7 +366,7 @@ Set this whenever a reverse proxy (nginx, Caddy, a cloud load balancer, Cloudfla
 | --- | --- | --- | --- |
 | `path` | string | `"./data"` | Database directory (LMDB) |
 | `max_dbs` | integer | `32` | LMDB max named databases (must be ≥ 19) |
-| `max_readers` | integer | `128` | LMDB max concurrent readers (must be ≥ 8) |
+| `max_readers` | integer | `128` | LMDB max concurrent readers (raised to `2 * reader_threads + 3` when lower) |
 | `map_size` | integer | `1073741824` (1 GB) | Floor for the memory map size (bytes) |
 | `max_map_size` | integer | `1099511627776` (1 TB) | Memory-map ceiling (bytes) |
 | `purge_interval_secs` | integer | `300` | NIP-40 purge interval (seconds) |
@@ -383,13 +383,13 @@ Set this whenever a reverse proxy (nginx, Caddy, a cloud load balancer, Cloudfla
 
 **`max_dbs`** — LMDB's maximum number of named databases. The relay uses 19 when `search_index = true` (18 tables plus the word index) and 18 otherwise; values below 19 are raised to 19 so the word index can always be created.
 
-**`max_readers`** — LMDB's maximum number of concurrent read transactions. Must be ≥ 8; the relay uses three threads (writer, reader, API reader).
+**`max_readers`** — LMDB's maximum number of concurrent read transactions. Values below `2 * reader_threads + 3` are raised to that floor (two slots per reader thread plus the writer/API/startup paths, which nest transactions); a lower value would fail queries with `MDB_READERS_FULL`. The documented ≥ 8 minimum is subsumed by this formula.
 
 **`map_size`** — The floor for the memory map size in bytes. The map is opened at least this large (1 GB default).
 
 **`max_map_size`** — The memory-map ceiling in bytes. The map is opened at this size as a **sparse virtual reservation** — physical disk grows only with the data actually written, so a large ceiling costs nothing until used. When the map fills, writes fail with `database map is full: increase database.max_map_size` (reads keep working). Must be ≥ `map_size`.
 
-**`purge_interval_secs`** — How often (seconds) NIP-40 expired events are physically removed from the database. Expired events are hidden from queries even between purges.
+**`purge_interval_secs`** — How often (seconds) NIP-40 expired events are physically removed from the database. Expired events are hidden from queries even between purges. Values below 10 are raised to 10 seconds (including `0`); there is no way to disable the purge pass entirely.
 
 **`search_index`** — When `true`, event content is word-indexed for fast NIP-50 search. When `false`, search still works (whole-word matching against content) but scans are slower. Toggling takes effect at startup. For a tiny VPS (0.25 vCPU / 512 MB) set `search_index = false` — it **halves the database** (41.8 MB → 20.5 MB per 10,000 events with 3 tags and 21 words in testing) and saves CPU/IO; see the Manual's [Low-spec Tuning](MANUAL.md#low-spec-vps-025-vcpu--512-mb).
 **`db_buffer_size`** — The initial per-connection WebSocket buffer in bytes (grows on demand); the kernel receive buffer is tuned separately with `limits.socket_recv_buffer_kb`.
@@ -592,6 +592,7 @@ Editing the file and sending `kill -HUP $(cat nostrfy.pid)` reloads it **without
 | --- | --- |
 | Relay identity and policies: `relay.name`, `description`, `pubkey`, `contact`, `icon`, `post_policy`, `public_url`, `reject_ephemeral`, `enabled_git`, `enabled_nip78_auth`, `require_auth`, `send_auth_challenge`, `require_pow`, `new_pubkey_min_age_secs`, `max_events_per_min_per_pubkey` | `relay.private_key` (warned about and ignored), `relay.livekit_url`/`livekit_api_key`/`livekit_api_secret`, `relay.enabled_nips`/`disabled_nips`, `relay.max_groups` |
 | `rpc.management_token`, `rpc.admin_pubkey`, `blossom.restrict_uploads`, `access.restrict_relay` | `rpc.max_admin_body_bytes` |
+| `server.inbox_write_policy`, `server.outbox_write_policy` (existing connections pick them up on the next config refresh), `relay.enabled_command_events` (read per event), `daemon.stats_file` (read on every stats tick), `database.db_buffer_size` (new connections only) | `server.host`, `server.port`, `server.ws_paths`, `server.api_host`, `server.metrics_enabled`, `server.trusted_proxies` (they shape the listener, routes and per-connection accounting built at startup) |
 | Most of `[limits]`: `max_ws_message_bytes`, `max_filters`, `max_subscriptions`, `max_limit`, `max_count`, `max_sub_id_len`, `max_content_bytes`, `max_tags`, `max_tag_value_bytes`, `max_created_at_future_secs`, `max_neg_items`, `max_sub_bytes`, `group_late_publish_secs`, the API bounds (`max_api_concurrent`, `max_api_queue_msgs`, `max_api_limit`, `max_api_offset`, `max_api_fetch`, `max_api_search_bytes`), `max_out_queue_bytes`, `max_req_response_bytes`, `ws_idle_timeout_secs` | `limits.live_buffer`, `limits.live_batch_size`, `limits.live_batch_interval_ms`, `limits.socket_recv_buffer_kb`, `limits.max_connections`, `limits.max_connections_per_ip`, `limits.http_read_timeout_secs`, `limits.max_connections_per_sec_per_ip` (they shape the accept loop built at startup), `server.trusted_proxies` (it shapes the per-connection accounting) |
 | — | `database.path`, `database.purge_interval_secs`, `database.map_size`, `database.max_map_size`, `database.max_dbs`, `database.max_readers`, `database.search_index`, `database.meta_index`, `database.reader_threads`, `database.disabled_fsync`, `database.db_request_timeout_secs`, `database.max_db_queue_msgs`, `database.max_db_queue_events`, `database.max_db_queue_bytes`, `database.max_indexed_words` |
 | — | `daemon.max_log_size_bytes`, `daemon.max_log_files`, `daemon.stats_interval_secs`, `daemon.log_file`, `daemon.pid_file` |
@@ -628,6 +629,8 @@ enabled_nip78_auth = true
 require_pow = 0
 new_pubkey_min_age_secs = 0
 max_events_per_min_per_pubkey = 0
+max_groups = 1000
+enabled_command_events = false
 
 [server]
 host = "0.0.0.0"
@@ -636,10 +639,14 @@ api_host = "api.example.com"
 metrics_enabled = true
 # Proxies on this host (nginx/Caddy); remove for direct exposure.
 trusted_proxies = ["127.0.0.1/32", "::1/128"]
+ws_paths = "root"
+inbox_write_policy = "any"
+outbox_write_policy = "any"
 
 [rpc]
 management_token = ""
 admin_pubkey = ""
+max_admin_body_bytes = 65536
 
 [limits]
 max_connections = 10000
@@ -660,6 +667,7 @@ ws_idle_timeout_secs = 300
 max_sub_bytes = 524288
 group_late_publish_secs = 604800
 max_api_concurrent = 32
+max_api_queue_msgs = 512
 max_api_limit = 500
 max_api_offset = 50000
 max_api_fetch = 55001
@@ -667,6 +675,7 @@ max_api_search_bytes = 1024
 http_read_timeout_secs = 30
 max_connections_per_sec_per_ip = 0
 max_req_response_bytes = 33554432
+socket_recv_buffer_kb = 64
 live_batch_interval_ms = 10
 live_batch_size = 64
 live_buffer = 65536
@@ -679,6 +688,8 @@ map_size = 1073741824
 max_map_size = 1099511627776
 purge_interval_secs = 300
 search_index = true
+reader_threads = 2
+meta_index = true
 disabled_fsync = false
 max_indexed_words = 32
 db_buffer_size = 2048
@@ -700,6 +711,19 @@ restrict_relay = false
 blocked_kinds = []
 allowed_kinds = []
 blocked_ips = []
+
+[blossom]
+host = ""
+storage = "local"
+local_path = "./data/images"
+max_upload_bytes = 20971520
+min_free_bytes = 33554432
+s3_endpoint = ""
+s3_region = ""
+s3_bucket = ""
+s3_access_key = ""
+s3_secret_key = ""
+restrict_uploads = false
 ```
 
 ---

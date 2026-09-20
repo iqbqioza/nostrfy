@@ -3842,7 +3842,7 @@ mod tests {
 
         relay.roles.write().await.create("mod", "Mod", "", "", None);
         assert!(relay.persist_roles().await, "the stamp is readable");
-        let saved = relay.db.load_roles().await.expect("snapshot");
+        let saved = relay.db.load_roles().await.expect_loaded("snapshot");
         assert_eq!(saved.stamp, relay.db.state_stamp().await.expect("stamp"));
         assert!(saved.roles.contains_key("mod"));
 
@@ -3872,7 +3872,7 @@ mod tests {
             262144,
         )
         .unwrap();
-        let persisted = db.load_roles().await.expect("snapshot");
+        let persisted = db.load_roles().await.expect_loaded("snapshot");
         assert!(!persisted.roles.contains_key("ghost"));
         assert_eq!(persisted.stamp, saved.stamp);
         db.shutdown();
@@ -4009,7 +4009,7 @@ mod tests {
         // pre-marking snapshot explicitly so the refusal below has a stored
         // snapshot to protect.
         assert!(relay.persist_roles().await);
-        let saved = relay.db.load_roles().await.expect("snapshot");
+        let saved = relay.db.load_roles().await.expect_loaded("snapshot");
         assert!(saved.roles.contains_key("mod"));
 
         relay.signal_drain();
@@ -4030,7 +4030,7 @@ mod tests {
             "a post-marking mutation must not be saved while stale"
         );
 
-        let persisted = relay.db.load_roles().await.expect("snapshot");
+        let persisted = relay.db.load_roles().await.expect_loaded("snapshot");
         assert!(
             persisted.roles.contains_key("mod"),
             "the stored snapshot must be untouched"
@@ -4081,7 +4081,7 @@ mod tests {
             let seq = relay.db.state_seq_group().await.expect("seq");
             assert_eq!(seq, 1, "the group event must advance the sequence");
             let stamp = relay.db.state_stamp().await.expect("stamp");
-            let saved = relay.db.load_groups().await.expect("snapshot");
+            let saved = relay.db.load_groups().await.expect_loaded("snapshot");
             let mut restored = crate::nips::nip29::GroupStore::with_cap(0);
             assert!(
                 !restored.restore_checked(saved, stamp, seq),
@@ -4116,7 +4116,11 @@ mod tests {
         let relay = build_relay().await;
         // The baseline snapshot at sequence 0.
         assert!(relay.persist_groups().await, "the baseline snapshot saves");
-        let baseline = relay.db.load_groups().await.expect("baseline snapshot");
+        let baseline = relay
+            .db
+            .load_groups()
+            .await
+            .expect_loaded("baseline snapshot");
 
         // The event's put commits, but its in-memory apply has not run yet:
         // claim the epoch the way `accept_event_verified` does.
@@ -4141,7 +4145,7 @@ mod tests {
             !relay.persist_groups().await,
             "a persist with an unapplied state event must defer"
         );
-        let saved = relay.db.load_groups().await.expect("snapshot");
+        let saved = relay.db.load_groups().await.expect_loaded("snapshot");
         assert_eq!(
             saved.seq, baseline.seq,
             "no snapshot may claim the unapplied generation"
@@ -4159,7 +4163,7 @@ mod tests {
         // current generation.
         drop(in_flight);
         assert!(relay.persist_groups().await, "the post-apply save lands");
-        let saved = relay.db.load_groups().await.expect("snapshot");
+        let saved = relay.db.load_groups().await.expect_loaded("snapshot");
         assert_eq!(saved.seq, seq, "the fresh snapshot carries the sequence");
         relay.db.shutdown();
     }
@@ -4198,7 +4202,7 @@ mod tests {
 
         let mut persisted = None;
         for _ in 0..600 {
-            if let Some(snap) = relay.db.load_groups().await
+            if let crate::db::LoadGroupsOutcome::Loaded(snap) = relay.db.load_groups().await
                 && snap.seq == relay.db.state_seq_group().await.unwrap_or(u64::MAX)
             {
                 persisted = Some(snap);
@@ -4221,7 +4225,10 @@ mod tests {
             262144,
         )
         .unwrap();
-        let saved = db.load_groups().await.expect("snapshot after reopen");
+        let saved = db
+            .load_groups()
+            .await
+            .expect_loaded("snapshot after reopen");
         let seq = db.state_seq_group().await.expect("seq");
         assert_eq!(
             saved.seq, seq,
@@ -6065,7 +6072,7 @@ mod tests {
                     .groups_rebuild
                     .pending
                     .load(std::sync::atomic::Ordering::SeqCst)
-                    && let Some(snap) = relay.db.load_groups().await
+                    && let crate::db::LoadGroupsOutcome::Loaded(snap) = relay.db.load_groups().await
                 {
                     persisted = Some(snap);
                     break;
@@ -6153,7 +6160,11 @@ mod tests {
                 });
                 ta.await.unwrap();
                 tb.await.unwrap();
-                let snap = relay.db.load_groups().await.expect("snapshot persisted");
+                let snap = relay
+                    .db
+                    .load_groups()
+                    .await
+                    .expect_loaded("snapshot persisted");
                 assert!(
                     snap.groups.contains_key(&a2) && snap.groups.contains_key(&b2),
                     "iteration {i} lost a group: {} persisted",
@@ -6590,7 +6601,7 @@ mod tests {
             .db
             .load_groups()
             .await
-            .expect("the confirmed resume must persist a snapshot");
+            .expect_loaded("the confirmed resume must persist a snapshot");
         assert!(
             snap.stamp > 0,
             "the snapshot must carry the purge's generation stamp"

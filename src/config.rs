@@ -798,7 +798,9 @@ impl Config {
             log::warn!("{warning}");
         }
         cfg.normalize_identity_keys();
-        warn_unknown_fields(&raw);
+        for warning in warn_unknown_fields(&raw) {
+            log::warn!("{warning}");
+        }
         Ok(cfg)
     }
 
@@ -2165,23 +2167,28 @@ fn known_config_keys() -> &'static [(&'static str, &'static [&'static str])] {
     ]
 }
 
-fn warn_unknown_fields(raw: &str) {
+/// Collects the unknown-section/key warnings for a raw config file.
+/// Returned (not logged) so tests can assert on them; callers log each
+/// entry. A legacy alias must never appear here (it is deprecated, not
+/// unknown).
+fn warn_unknown_fields(raw: &str) -> Vec<String> {
+    let mut warnings = Vec::new();
     let Ok(value) = raw.parse::<toml::Value>() else {
-        return;
+        return warnings;
     };
     let known = known_config_keys();
     let Some(table) = value.as_table() else {
-        return;
+        return warnings;
     };
     // Unknown top-level sections (e.g. a typo'd `[serve]` instead of
     // `[server]`) are silently ignored by serde; warn so the operator
     // notices the section never took effect.
     for (section, table) in table {
         let Some(keys) = known.iter().find(|(s, _)| s == section).map(|(_, k)| *k) else {
-            log::warn!(
+            warnings.push(format!(
                 "unknown config section [{section}] is ignored; check the spelling \
                  (the relay runs with the defaults for this section)"
-            );
+            ));
             continue;
         };
         let Some(table) = table.as_table() else {
@@ -2189,13 +2196,14 @@ fn warn_unknown_fields(raw: &str) {
         };
         for (key, _) in table {
             if !keys.contains(&key.as_str()) {
-                log::warn!(
+                warnings.push(format!(
                     "unknown config key [{section}].{key} is ignored; check the spelling \
                      (the relay runs with the default for this field)"
-                );
+                ));
             }
         }
     }
+    warnings
 }
 
 #[cfg(test)]
@@ -2266,6 +2274,60 @@ mod tests {
         }
         // The typed loader must accept the example too (serde shape).
         toml::from_str::<Config>(example).expect("the full example must deserialize");
+        // Completeness goes the other way too: every serialized field must
+        // appear in the example, or operators will not discover the key
+        // (and copy-paste runs it at an invisible default).
+        let default_value: toml::Value =
+            toml::Value::try_from(Config::default()).expect("the default config serializes");
+        let example_value: toml::Value =
+            toml::from_str(example).expect("the full example must deserialize");
+        for (section, table) in default_value.as_table().unwrap() {
+            let example_table = example_value
+                .get(section)
+                .and_then(toml::Value::as_table)
+                .unwrap_or_else(|| panic!("[{section}] is missing from the full example"));
+            for key in table.as_table().unwrap().keys() {
+                assert!(
+                    example_table.contains_key(key),
+                    "[{section}].{key} is a real config key but missing from the full example"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn shipped_examples_only_advertise_relay_side_nips() {
+        // Client-side NIPs (e.g. NIP-04) in `enabled_nips` are silently
+        // filtered out of the advertised list, so listing one in a shipped
+        // example teaches a no-op. Every example must only enable NIPs the
+        // relay can actually gate or advertise.
+        let dir = std::path::Path::new("examples");
+        let mut checked = 0;
+        let mut entries: Vec<_> = std::fs::read_dir(dir)
+            .expect("examples/ is readable from the crate root")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|e| e == "toml"))
+            .collect();
+        entries.sort();
+        for path in entries {
+            let raw = std::fs::read_to_string(&path).unwrap();
+            let cfg: Config = toml::from_str(&raw)
+                .unwrap_or_else(|e| panic!("{} must parse: {e}", path.display()));
+            checked += 1;
+            for nip in cfg
+                .relay
+                .enabled_nips
+                .iter()
+                .chain(&cfg.relay.disabled_nips)
+            {
+                assert!(
+                    RELAY_NIPS.contains(nip),
+                    "{} lists non-relay NIP {nip}, which has no relay-side behavior to toggle",
+                    path.display()
+                );
+            }
+        }
+        assert!(checked > 0, "expected example configs to check");
     }
 
     #[test]
@@ -2522,11 +2584,20 @@ max_log_files = 2
         // The legacy keys must be recognized by `warn_unknown_fields`:
         // they are deprecated, not unknown.
         let raw = "[limits]\ncount_limit = 5\n";
-        warn_unknown_fields(raw);
-        // (no assertion: the deprecated keys would produce a warning,
-        // never an "unknown config key" warning — the test guards the
-        // known-keys list via `known_keys_cover_every_serialized_field`
-        // and the alias table above.)
+        assert!(
+            warn_unknown_fields(raw).is_empty(),
+            "a deprecated alias must not warn as unknown"
+        );
+        // ...while a genuinely unknown key in the same section still does.
+        let unknown = warn_unknown_fields("[limits]\ncount_lmiiit = 5\n");
+        assert_eq!(unknown.len(), 1, "one warning per unknown key");
+        assert!(
+            unknown[0].contains("count_lmiiit"),
+            "the warning must name the key: {}",
+            unknown[0]
+        );
+        // The known-keys list guards every alias below via
+        // `known_keys_cover_every_serialized_field` and the alias table.
         let known = known_config_keys();
         for (old_section, old_key, _, _) in LEGACY_ALIASES {
             let keys = known

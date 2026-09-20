@@ -1206,11 +1206,29 @@ where
 {
     let teardown = async {
         while let Some(frame) = conn.outgoing.pop_front() {
-            conn.out_bytes = conn.out_bytes.saturating_sub(message_size(&frame.message));
+            let size = message_size(&frame.message);
+            conn.out_bytes = conn.out_bytes.saturating_sub(size);
             if sender.send(frame.message).await.is_err() {
+                // The popped frame never reached the socket: uncount it
+                // like the purge path does, and fall through to uncount
+                // the rest of the abandoned queue below.
+                conn.out_msgs = conn.out_msgs.saturating_sub(1);
+                conn.out_bytes_total = conn.out_bytes_total.saturating_sub(size as u64);
                 break;
             }
         }
+        // Grace expiry (or the send error above) abandons whatever is
+        // still queued: those frames can never be received, so uncount
+        // them instead of reporting phantom traffic.
+        let mut rest_msgs = 0u64;
+        let mut rest_bytes = 0usize;
+        for frame in std::mem::take(&mut conn.outgoing) {
+            rest_msgs += 1;
+            rest_bytes = rest_bytes.saturating_add(message_size(&frame.message));
+        }
+        conn.out_bytes = conn.out_bytes.saturating_sub(rest_bytes);
+        conn.out_msgs = conn.out_msgs.saturating_sub(rest_msgs);
+        conn.out_bytes_total = conn.out_bytes_total.saturating_sub(rest_bytes as u64);
         let _ = sender.close().await;
     };
     let _ = tokio::time::timeout(grace, teardown).await;
@@ -1638,14 +1656,17 @@ pub async fn handle_connection(
                 // inside it, and the idle deadline (raced only by the
                 // drain) could not fire here, so a stalled PING closes the
                 // connection instead of pinning it.
-                conn.out_msgs += 1;
+                // Count the ping only when it actually goes out: a
+                // failed send must not inflate the traffic counters.
                 if tokio::time::timeout(
                     teardown_grace,
                     sender.send(Message::Ping(vec![].into())),
                 )
                 .await
-                .is_err()
+                .is_ok()
                 {
+                    conn.out_msgs += 1;
+                } else {
                     break;
                 }
             }
@@ -1727,7 +1748,12 @@ pub async fn handle_connection(
     // Events received but not yet batched are accepted before closing, so
     // a client that disconnects without waiting for its OKs does not lose
     // them. The live broadcast of these events still reaches subscribers.
-    conn.flush_pending_events().await;
+    // Bounded by the teardown grace like the close below: with the DB
+    // timeout disabled (or a wedged writer) this wait would otherwise park
+    // the task — and its connection slot and subscription accounting —
+    // indefinitely. On expiry the connection closes without the final
+    // batch; its events were never queued, so nothing partial commits.
+    let _ = tokio::time::timeout(teardown_grace, conn.flush_pending_events()).await;
 
     // Final flush: deliver any queued messages (e.g. NOTICEs) before
     // closing the connection. Bounded by `teardown_grace`: a peer that
@@ -6034,6 +6060,30 @@ mod tests {
     }
 
     #[test]
+    fn teardown_abandon_uncounts_unsent_frames() {
+        // Frames that never reach the socket must not count as traffic:
+        // a teardown against a dead sink abandons the whole queue, so the
+        // flush must release every counter it charged at queue time.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            conn.send(Message::Text("[\"NOTICE\",\"a\"]".into()));
+            conn.send(Message::Text("[\"NOTICE\",\"b\"]".into()));
+            assert_eq!(conn.outgoing.len(), 2);
+            assert!(conn.out_msgs > 0 && conn.out_bytes_total > 0);
+
+            let mut sink = FailingSink;
+            flush_and_close(&mut conn, &mut sink, Duration::from_secs(5)).await;
+
+            assert!(conn.outgoing.is_empty(), "the abandoned queue is drained");
+            assert_eq!(conn.out_bytes, 0, "abandoned bytes are released");
+            assert_eq!(conn.out_msgs, 0, "unsent frames are not messages out");
+            assert_eq!(conn.out_bytes_total, 0, "unsent frames are not bytes out");
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
     fn pending_live_overflow_marks_connection_for_close() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -6076,6 +6126,47 @@ mod tests {
                             .contains("reconnect and resubscribe")
                 }),
                 "overflow must tell the client to reconnect and resubscribe"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn pending_live_hold_applies_the_safety_ceiling_when_uncapped() {
+        // `max_out_queue_bytes = 0` means "no configured cap", not "no
+        // bound": the pending-live hold must use the same safety ceiling
+        // as the drain path, or a slow reader with no configured cap
+        // could pin gigabytes in the per-response backlog.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            conn.subs
+                .insert("sub".into(), (vec![Filter::default()], 0, "\"sub\"".into()));
+            conn.enqueue_pending_req(PendingReq {
+                sub_id: "sub".into(),
+                events: Default::default(),
+                eose_hint: false,
+                truncated_or_more: false,
+                auth_hint: false,
+                sent_bytes: 0,
+                live: Default::default(),
+                live_bytes: 0,
+                eose_sent: false,
+                budget: None,
+                reserved: 0,
+            });
+            // Unset queue cap, tiny REQ budget: the safety ceiling is
+            // 2 * 100 = 200 bytes.
+            conn.out_queue_bytes = 0;
+            conn.req_response_bytes = 100;
+            // One live frame larger than the ceiling must overflow the
+            // pending backlog instead of accumulating without bound.
+            let event = signed_note(conn.relay.secp(), &"x".repeat(300), unix_now(), vec![]);
+            let json = serde_json::to_string(&event).unwrap();
+            conn.deliver_live(&event, &json, None);
+            assert!(
+                conn.live_overflowed,
+                "the pending backlog must respect the safety ceiling when uncapped"
             );
             conn.relay.db.shutdown();
         });

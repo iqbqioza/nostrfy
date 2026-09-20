@@ -249,6 +249,64 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_acquire_handover_and_drop_never_leaks_or_double_releases() {
+        // The handover/release paths race in production (the HTTP task
+        // ends while the upgrade is claimed), so exercise them from
+        // several threads at once. Every assertion is on the final
+        // state, never on timing.
+        let counter = Arc::new(IpConnCounter::default());
+        let active = Arc::new(AtomicUsize::new(0));
+        let addr = ip("198.51.100.20");
+        const MAX: usize = 64;
+        let handles: Vec<_> = (0..8u64)
+            .map(|t| {
+                let counter = Arc::clone(&counter);
+                let active = Arc::clone(&active);
+                std::thread::spawn(move || {
+                    for i in 0..500u64 {
+                        if !counter.try_acquire(addr, MAX) {
+                            continue;
+                        }
+                        active.fetch_add(1, Ordering::Relaxed);
+                        let slot = ConnSlot::new(Arc::clone(&active), Arc::clone(&counter), addr);
+                        let accept = AcceptSlotGuard::new(Arc::clone(&slot));
+                        // Deterministic interleaving: hand over on some
+                        // iterations (the accept guard must then not
+                        // release) and try a racing second handover.
+                        if (t + i) % 3 == 0
+                            && let Some(ws) = slot.handover()
+                        {
+                            assert!(
+                                slot.handover().is_none(),
+                                "a second handover must lose the race"
+                            );
+                            drop(ws);
+                        }
+                        drop(accept);
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("worker thread must not panic");
+        }
+        assert_eq!(
+            active.load(Ordering::Relaxed),
+            0,
+            "every acquired slot must be released exactly once"
+        );
+        // The cap still holds exactly: no leaked slot (which would refuse
+        // early) and no double release (which would admit too many).
+        for _ in 0..MAX {
+            assert!(counter.try_acquire(addr, MAX));
+        }
+        assert!(
+            !counter.try_acquire(addr, MAX),
+            "the per-IP cap must hold after the storm"
+        );
+    }
+
+    #[test]
     fn a_second_handover_is_refused() {
         let counter = Arc::new(IpConnCounter::default());
         let active = Arc::new(AtomicUsize::new(0));

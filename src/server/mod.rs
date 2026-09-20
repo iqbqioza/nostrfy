@@ -483,8 +483,20 @@ fn host_route_allowed(api_host: &str, blossom_host: &str, host: &str, path: &str
 /// exactly as when no snapshot exists (the next start with the NIP
 /// re-enabled rebuilds).
 async fn restore_group_state(relay: &Relay, groups_enabled: bool) -> Result<()> {
-    let Some(snapshot) = relay.db.load_groups().await else {
-        return rebuild_group_state(relay, groups_enabled).await;
+    let snapshot = match relay.db.load_groups().await {
+        crate::db::LoadGroupsOutcome::Loaded(snapshot) => snapshot,
+        crate::db::LoadGroupsOutcome::Missing => {
+            return rebuild_group_state(relay, groups_enabled).await;
+        }
+        crate::db::LoadGroupsOutcome::Failed => {
+            // The store would start empty, and every unknown group id
+            // reads as public: refuse to start rather than expose private
+            // group content, regardless of the NIP toggle.
+            return Err(anyhow::anyhow!(
+                "cannot read the persisted NIP-29 group snapshot; refusing to start with an \
+                 empty group store (missing groups would expose private content)"
+            ));
+        }
     };
     let stamp = relay.db.state_stamp().await;
     let seq = relay.db.state_seq_group().await;
@@ -584,7 +596,7 @@ async fn restore_role_state(relay: &Relay) -> Result<()> {
         return Ok(());
     }
     let needs_rebuild = match relay.db.load_roles().await {
-        Some(snap) => match (
+        crate::db::LoadRolesOutcome::Loaded(snap) => match (
             relay.db.state_stamp().await,
             relay.db.state_seq_role().await,
         ) {
@@ -613,7 +625,15 @@ async fn restore_role_state(relay: &Relay) -> Result<()> {
                 true
             }
         },
-        None => true,
+        crate::db::LoadRolesOutcome::Missing => true,
+        crate::db::LoadRolesOutcome::Failed => {
+            // An empty role store revokes every grant: refuse to start
+            // rather than silently unauthorize the relay's own moderation.
+            return Err(anyhow::anyhow!(
+                "cannot read the persisted NIP-43 role snapshot; refusing to start with \
+                 an empty role store"
+            ));
+        }
     };
     if needs_rebuild {
         if !relay
@@ -2422,6 +2442,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn startup_refuses_an_unreadable_group_snapshot_even_when_disabled() {
+        // A snapshot that cannot be read (corrupt bytes, dead reader) must
+        // stop the relay even with NIP-29 disabled: the store would start
+        // empty, and every unknown group id reads as public, so starting
+        // would silently expose private group content.
+        let relay = blossom_relay().await;
+        relay.db.shutdown();
+        let err = restore_group_state(&relay, false).await.unwrap_err();
+        assert!(
+            err.to_string().contains("refusing to start"),
+            "an unreadable snapshot must stop startup, got: {err}"
+        );
+        // The pre-existing snapshot path still distinguishes a first run:
+        // tested through the stale-snapshot test below.
+    }
+
+    #[tokio::test]
+    async fn startup_refuses_an_unreadable_role_snapshot() {
+        // Same fail-closed rule for roles: an empty role store revokes
+        // every grant, so an unreadable snapshot must stop startup rather
+        // than silently unauthorize the relay's own moderation.
+        let relay = blossom_relay().await;
+        relay.db.shutdown();
+        let err = restore_role_state(&relay).await.unwrap_err();
+        assert!(
+            err.to_string().contains("refusing to start"),
+            "an unreadable snapshot must stop startup, got: {err}"
+        );
+    }
+
+    #[tokio::test]
     async fn startup_rejects_a_stale_group_snapshot_and_resumes_purges() {
         // A snapshot stamped before a group-state removal must not be
         // restored: startup rebuilds from the surviving events instead
@@ -2457,7 +2508,7 @@ mod tests {
             .db
             .load_groups()
             .await
-            .expect("the rebuild must persist");
+            .expect_loaded("the rebuild must persist");
         assert!(
             persisted.stamp >= current,
             "the rebuilt snapshot must carry the current generation (got {})",

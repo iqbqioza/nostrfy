@@ -49,6 +49,79 @@ pub enum LoadAccessOutcome {
     Failed,
 }
 
+/// Outcome of the startup NIP-29 group-state load. `Missing` and `Failed`
+/// must stay distinct: `Missing` (first run or pre-persistence database)
+/// runs the replay migration, while `Failed` must stop the relay — with an
+/// empty group store every group id reads as public, so starting on a
+/// failed read would silently expose private group content.
+#[derive(Debug, Default)]
+pub enum LoadGroupsOutcome {
+    /// The persisted snapshot was read successfully.
+    Loaded(crate::nips::nip29::GroupsSnapshot),
+    /// No snapshot was ever persisted.
+    Missing,
+    /// The database could not answer. Also the [`Default`]: a missing reply
+    /// is a failure, never "no snapshot".
+    #[default]
+    Failed,
+}
+
+/// Outcome of the startup NIP-43 role-state load, with the same
+/// missing/failed distinction as [`LoadGroupsOutcome`]: a failed read must
+/// stop the relay instead of starting with an empty role store.
+#[derive(Debug, Default)]
+pub enum LoadRolesOutcome {
+    /// The persisted snapshot was read successfully.
+    Loaded(crate::nips::nip43::RolesSnapshot),
+    /// No snapshot was ever persisted.
+    Missing,
+    /// The database could not answer. Also the [`Default`].
+    #[default]
+    Failed,
+}
+
+impl LoadGroupsOutcome {
+    /// Tests only: unwrap the loaded snapshot. Production callers must
+    /// match explicitly so `Missing` and `Failed` take different paths.
+    #[cfg(test)]
+    pub fn expect_loaded(self, msg: &str) -> crate::nips::nip29::GroupsSnapshot {
+        match self {
+            LoadGroupsOutcome::Loaded(snap) => snap,
+            other => panic!("{msg}: {other:?}"),
+        }
+    }
+
+    /// Tests only: whether a snapshot was persisted at all.
+    #[cfg(test)]
+    pub fn is_some(&self) -> bool {
+        matches!(self, LoadGroupsOutcome::Loaded(_))
+    }
+
+    /// Tests only: whether no snapshot was persisted.
+    #[cfg(test)]
+    pub fn is_none(&self) -> bool {
+        matches!(self, LoadGroupsOutcome::Missing)
+    }
+}
+
+impl LoadRolesOutcome {
+    /// Tests only: unwrap the loaded snapshot. Production callers must
+    /// match explicitly so `Missing` and `Failed` take different paths.
+    #[cfg(test)]
+    pub fn expect_loaded(self, msg: &str) -> crate::nips::nip43::RolesSnapshot {
+        match self {
+            LoadRolesOutcome::Loaded(snap) => snap,
+            other => panic!("{msg}: {other:?}"),
+        }
+    }
+
+    /// Tests only: whether no snapshot was persisted.
+    #[cfg(test)]
+    pub fn is_none(&self) -> bool {
+        matches!(self, LoadRolesOutcome::Missing)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PutOutcome {
     Stored,
@@ -362,7 +435,7 @@ enum Msg {
     },
     /// Loads the persisted NIP-29 group state snapshot.
     LoadGroups {
-        reply: oneshot::Sender<Option<crate::nips::nip29::GroupsSnapshot>>,
+        reply: oneshot::Sender<LoadGroupsOutcome>,
     },
     /// Drops the persisted NIP-29 group state snapshot (a post-vanish
     /// rebuild failure must not leave a stale snapshot behind). The reply
@@ -379,7 +452,7 @@ enum Msg {
     },
     /// Loads the persisted NIP-43 role state snapshot.
     LoadRoles {
-        reply: oneshot::Sender<Option<crate::nips::nip43::RolesSnapshot>>,
+        reply: oneshot::Sender<LoadRolesOutcome>,
     },
     /// Adds an owner to a Blossom blob's persisted metadata (atomic);
     /// the reply carries whether the commit succeeded.
@@ -2092,7 +2165,10 @@ impl DbClient {
     /// Returns `None` when no snapshot was ever written (pre-persistence
     /// database) or the load failed: the caller runs the replay migration
     /// instead of starting empty (fail-closed).
-    pub async fn load_groups(&self) -> Option<crate::nips::nip29::GroupsSnapshot> {
+    /// Loads the persisted NIP-29 group state snapshot at startup: a
+    /// failed read is reported as [`LoadGroupsOutcome::Failed`], never
+    /// conflated with a first-run [`LoadGroupsOutcome::Missing`].
+    pub async fn load_groups(&self) -> LoadGroupsOutcome {
         self.request_read_blocking(|reply| Msg::LoadGroups { reply })
             .await
     }
@@ -2117,7 +2193,10 @@ impl DbClient {
 
     /// Loads the persisted NIP-43 role state snapshot at startup (see
     /// [`Self::load_groups`]).
-    pub async fn load_roles(&self) -> Option<crate::nips::nip43::RolesSnapshot> {
+    /// Loads the persisted NIP-43 role state snapshot at startup: a
+    /// failed read is reported as [`LoadRolesOutcome::Failed`], never
+    /// conflated with a first-run [`LoadRolesOutcome::Missing`].
+    pub async fn load_roles(&self) -> LoadRolesOutcome {
         self.request_read_blocking(|reply| Msg::LoadRoles { reply })
             .await
     }

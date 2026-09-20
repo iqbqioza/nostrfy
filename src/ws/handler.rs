@@ -1252,10 +1252,14 @@ impl super::Conn {
             // directly would let it overtake the remaining stored events.
             if let Some(idx) = self.pending_reqs.iter().position(|p| p.sub_id == *sub_id) {
                 let size = out.len();
+                let cap = self.out_queue_cap();
                 let pending = &mut self.pending_reqs[idx];
+                // The same byte-cap rule as `drain_pending_live` (including
+                // the safety ceiling when `max_out_queue_bytes` is unset):
+                // without it a slow reader with no configured cap could pin
+                // gigabytes in the per-response backlog.
                 let over = pending.live.len() >= super::OUT_QUEUE_LIMIT
-                    || (self.out_queue_bytes > 0
-                        && pending.live_bytes.saturating_add(size) > self.out_queue_bytes);
+                    || pending.live_bytes.saturating_add(size) > cap;
                 if over {
                     self.dropped += 1;
                     self.relay.stats.bump(&self.relay.stats.buffers_dropped, 1);

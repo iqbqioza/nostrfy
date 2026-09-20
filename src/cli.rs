@@ -384,11 +384,31 @@ impl Cli {
     }
 
     fn stats(&self) -> Result<()> {
-        let cfg = self.load_config()?;
-        if !cfg.daemon.stats_file.exists() {
+        // Like `stop_pid_file`, a broken config must not take the
+        // diagnostics offline: fall back to the raw-TOML paths.
+        let (stats_file, pid_file, interval_secs) = match self.load_config() {
+            Ok(cfg) => (
+                cfg.daemon.stats_file,
+                cfg.daemon.pid_file,
+                cfg.daemon.stats_interval_secs,
+            ),
+            Err(e) => {
+                warn!(
+                    "cannot load {} ({e}); resolving the stats paths leniently",
+                    self.config.display()
+                );
+                lenient_stats_paths(&self.config).ok_or_else(|| {
+                    config_err(format!(
+                        "cannot load {} ({e}) and no usable daemon.stats_file in the raw config",
+                        self.config.display()
+                    ))
+                })?
+            }
+        };
+        if !stats_file.exists() {
             return Err(config_err("nostrfy is not running (no stats file)"));
         }
-        let raw = std::fs::read_to_string(&cfg.daemon.stats_file)?;
+        let raw = std::fs::read_to_string(&stats_file)?;
         let value: serde_json::Value = serde_json::from_str(&raw)?;
         // The file is only refreshed while the daemon runs. `written_at`
         // (Unix seconds) is the snapshot's own timestamp; a stats file from
@@ -399,15 +419,16 @@ impl Cli {
             .get("written_at")
             .and_then(serde_json::Value::as_u64)
             .or_else(|| {
-                std::fs::metadata(&cfg.daemon.stats_file)
+                std::fs::metadata(&stats_file)
                     .ok()
                     .and_then(|m| m.modified().ok())
                     .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                     .map(|d| d.as_secs())
             });
         if let Some(reason) = stats_stale_reason(
-            &cfg,
-            running_pid(&cfg.daemon.pid_file).is_some(),
+            &stats_file,
+            interval_secs,
+            running_pid(&pid_file).is_some(),
             written_at,
         ) {
             return Err(config_err(reason));
@@ -1075,6 +1096,59 @@ fn wait_for_ready(cfg: &Config, pid: Option<u32>) -> Result<()> {
     wait_for_ready_within(cfg, pid, Duration::from_secs(10))
 }
 
+/// Whether `addr` answers HTTP: connects, sends a minimal `GET /health`
+/// request and requires an `HTTP/` status line. A bare TCP accept proves
+/// only that *something* holds the port — the HTTP layer can be wedged
+/// while the listener still accepts — so the readiness probe must see an
+/// actual response. Any status (200, 503, ...) counts: the point is that
+/// the server, not just the socket, is up.
+fn probe_http(addr: &std::net::SocketAddr) -> bool {
+    use std::io::{Read, Write};
+    let Ok(stream) = std::net::TcpStream::connect_timeout(addr, Duration::from_millis(500)) else {
+        return false;
+    };
+    // Bound the exchange: a peer that accepts but never answers must not
+    // park the probe past the readiness deadline.
+    if stream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .is_err()
+    {
+        return false;
+    }
+    if stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .is_err()
+    {
+        return false;
+    }
+    let mut stream = stream;
+    if stream
+        .write_all(b"GET /health HTTP/1.0\r\nHost: probe\r\n\r\n")
+        .is_err()
+    {
+        return false;
+    }
+    // The status line fits in the first bytes; read until the first LF
+    // (bounded) and require the HTTP version prefix.
+    let mut line = Vec::with_capacity(64);
+    let mut byte = [0u8; 1];
+    loop {
+        match stream.read(&mut byte) {
+            Ok(0) | Err(_) => return false,
+            Ok(_) => {
+                if byte[0] == b'\n' {
+                    break;
+                }
+                line.push(byte[0]);
+                if line.len() > 128 {
+                    return false;
+                }
+            }
+        }
+    }
+    line.starts_with(b"HTTP/")
+}
+
 fn wait_for_ready_within(cfg: &Config, pid: Option<u32>, timeout: Duration) -> Result<()> {
     // A wildcard bind address is not connectable: probe loopback, which the
     // wildcard listener also accepts.
@@ -1099,7 +1173,7 @@ fn wait_for_ready_within(cfg: &Config, pid: Option<u32>, timeout: Duration) -> R
             .map(|addrs| addrs.collect())
             .unwrap_or_default();
         for addr in addrs {
-            if std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok() {
+            if probe_http(&addr) {
                 // The connect may have reached a *foreign* listener while
                 // our child died on the bind (the probe cannot tell whose
                 // listener answered): settle briefly and re-check the child
@@ -1325,24 +1399,85 @@ fn lenient_pid_file(config_path: &Path) -> Option<PathBuf> {
 /// why it must be rejected. The stats file is only refreshed while the daemon
 /// runs, so without this check `nostrfy stats` presents the counters of a
 /// dead (or hung) daemon as live data.
-fn stats_stale_reason(cfg: &Config, running: bool, written_at: Option<u64>) -> Option<String> {
+/// Raw-TOML fallback for the stats paths, mirroring `stop_pid_file`:
+/// the `[daemon]` keys are read without parsing the rest of the file, so
+/// a broken config elsewhere cannot take the diagnostics offline. Missing
+/// keys fall back to the compiled defaults.
+fn lenient_stats_paths(config_path: &Path) -> Option<(PathBuf, PathBuf, u64)> {
+    let text = std::fs::read_to_string(config_path).ok()?;
+    let mut in_daemon = false;
+    let mut stats_file: Option<String> = None;
+    let mut pid_file: Option<String> = None;
+    let mut interval_secs: Option<u64> = None;
+    for line in text.lines() {
+        // Strip comments before looking for a section header or assignment
+        // (handles `[daemon] # comment` and `stats_file = "x" # comment`).
+        let line = line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(section) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            in_daemon = section.trim() == "daemon";
+            continue;
+        }
+        if !in_daemon {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let value = value.trim();
+        // Strip one layer of quotes when present; bare values (numbers,
+        // unquoted paths) pass through unchanged.
+        let value = value
+            .strip_prefix('"')
+            .and_then(|v| v.strip_suffix('"'))
+            .or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
+            .unwrap_or(value);
+        match key.trim() {
+            "stats_file" => stats_file = Some(value.to_string()),
+            "pid_file" => pid_file = Some(value.to_string()),
+            "stats_interval_secs" => interval_secs = value.parse().ok(),
+            _ => {}
+        }
+    }
+    let defaults = Config::default().daemon;
+    Some((
+        stats_file
+            .filter(|v| !v.is_empty())
+            .map(|v| resolve_config_path(config_path, Path::new(&v)))
+            .unwrap_or(defaults.stats_file),
+        pid_file
+            .filter(|v| !v.is_empty())
+            .map(|v| resolve_config_path(config_path, Path::new(&v)))
+            .unwrap_or(defaults.pid_file),
+        interval_secs.unwrap_or(defaults.stats_interval_secs),
+    ))
+}
+
+fn stats_stale_reason(
+    stats_file: &Path,
+    interval_secs: u64,
+    running: bool,
+    written_at: Option<u64>,
+) -> Option<String> {
     if !running {
         return Some(format!(
             "the daemon is not running; {} only holds a stale snapshot",
-            cfg.daemon.stats_file.display()
+            stats_file.display()
         ));
     }
     let Some(written_at) = written_at else {
         return Some(format!(
             "{} has no written_at timestamp and its modification time is unreadable; \
              statistics are stale",
-            cfg.daemon.stats_file.display()
+            stats_file.display()
         ));
     };
     let age = crate::util::unix_now().saturating_sub(written_at);
     // Three write intervals of slack: one missed write is a hiccup, three in
     // a row mean the writer is gone.
-    let max_age = cfg.daemon.stats_interval_secs.saturating_mul(3).max(1);
+    let max_age = interval_secs.saturating_mul(3).max(1);
     if age > max_age {
         return Some(format!(
             "statistics are stale (written {age}s ago, more than {max_age}s = 3 x \
@@ -1976,20 +2111,148 @@ name = \"nostrfy\"\n",
         cfg.daemon.stats_file = PathBuf::from("/tmp/nostrfy-stats.json");
         let now = crate::util::unix_now();
 
+        let stale = |running: bool, written_at: Option<u64>| {
+            stats_stale_reason(
+                &cfg.daemon.stats_file,
+                cfg.daemon.stats_interval_secs,
+                running,
+                written_at,
+            )
+        };
         assert!(
-            stats_stale_reason(&cfg, true, Some(now)).is_none(),
+            stale(true, Some(now)).is_none(),
             "a fresh snapshot of a running daemon is printable"
         );
         assert!(
-            stats_stale_reason(&cfg, true, Some(now.saturating_sub(10))).is_none(),
+            stale(true, Some(now.saturating_sub(10))).is_none(),
             "one missed write interval is still within the 3x slack"
         );
-        let reason = stats_stale_reason(&cfg, true, Some(now.saturating_sub(60))).unwrap();
+        let reason = stale(true, Some(now.saturating_sub(60))).unwrap();
         assert!(reason.contains("stale"), "{reason}");
-        let reason = stats_stale_reason(&cfg, false, Some(now)).unwrap();
+        let reason = stale(false, Some(now)).unwrap();
         assert!(reason.contains("not running"), "{reason}");
-        let reason = stats_stale_reason(&cfg, true, None).unwrap();
+        let reason = stale(true, None).unwrap();
         assert!(reason.contains("stale"), "{reason}");
+    }
+
+    #[test]
+    fn lenient_stats_paths_survive_a_broken_config() {
+        // `stop` already resolves the pid file leniently; the diagnostics
+        // must work the same way, or exactly the outage that needs them
+        // takes them offline.
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir()
+            .join("nostrfy-stats-broken-test")
+            .join(format!("{:x}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("nostrfy.toml");
+        // Syntactically broken TOML (strict loading must fail), with
+        // intact `[daemon]` lines the lenient reader must still find.
+        // Quoted values, comments, and a non-daemon section must not
+        // confuse it.
+        std::fs::write(
+            &config_path,
+            "[daemon] # comment\nstats_file = \"stats.json\" # comment\n\
+             pid_file = 'nostrfy.pid'\nstats_interval_secs = 7\n\
+             [relay]\n!!! this line breaks TOML parsing !!!\n",
+        )
+        .unwrap();
+        let (stats_file, pid_file, interval) =
+            lenient_stats_paths(&config_path).expect("the daemon keys must resolve");
+        assert_eq!(
+            stats_file,
+            dir.join("stats.json"),
+            "relative paths anchor to the config dir"
+        );
+        assert_eq!(pid_file, dir.join("nostrfy.pid"));
+        assert_eq!(interval, 7);
+        // Missing keys fall back to the compiled defaults, not to an error.
+        std::fs::write(&config_path, "[daemon]\n!!! broken !!!\n").unwrap();
+        let defaults = Config::default().daemon;
+        let (stats_file, pid_file, interval) =
+            lenient_stats_paths(&config_path).expect("defaults must resolve");
+        assert_eq!(stats_file, defaults.stats_file);
+        assert_eq!(pid_file, defaults.pid_file);
+        assert_eq!(interval, defaults.stats_interval_secs);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stats_reaches_the_file_check_with_a_broken_config() {
+        // End to end through `stats()`: with an unparseable config and no
+        // stats file, the error must be about the missing stats file, not
+        // about the config parse — i.e. the strict loader no longer blocks
+        // the diagnostics. (A live daemon cannot be simulated in-process:
+        // `process_alive` requires the `nostrfy` comm name.)
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir()
+            .join("nostrfy-stats-broken-e2e-test")
+            .join(format!("{:x}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("nostrfy.toml");
+        // Point at a nonexistent stats file: `stats` must fail on the
+        // missing file, proving it got past config loading to the
+        // diagnostics. (Pointing at a real stats file would exercise the
+        // staleness branch the same way.)
+        std::fs::write(
+            &config_path,
+            "[daemon]\nstats_file = \"gone.json\"\n!!! broken !!!\n",
+        )
+        .unwrap();
+        let cli = Cli {
+            config: config_path,
+            command: Command::Stats,
+            daemonized: false,
+        };
+        assert!(cli.load_config().is_err(), "the config must be unparseable");
+        let err = cli.stats().unwrap_err();
+        assert!(
+            err.to_string().contains("no stats file"),
+            "stats must reach the file check, not fail on the config: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A minimal HTTP responder for the readiness-probe tests: the probe
+    /// requires an actual `HTTP/` status line, so a bare `TcpListener`
+    /// would never satisfy it.
+    fn http_responder(bind: &str) -> (std::net::TcpListener, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind(format!("{bind}:0")).unwrap();
+        let serving = listener.try_clone().unwrap();
+        let handle = std::thread::spawn(move || {
+            for stream in serving.incoming().take(50) {
+                let Ok(mut stream) = stream else { break };
+                use std::io::Write;
+                let _ = stream.write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n");
+            }
+        });
+        (listener, handle)
+    }
+
+    #[test]
+    fn readiness_probe_requires_http_not_just_tcp() {
+        // A socket that accepts but never answers HTTP must not count as
+        // a ready relay (the HTTP layer can be wedged while the listener
+        // still accepts).
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut cfg = Config::default();
+        cfg.daemon.pid_file = std::env::temp_dir().join(format!(
+            "nostrfy-ready-tcp-only-{:x}.pid",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&cfg.daemon.pid_file);
+        cfg.server.host = "127.0.0.1".into();
+        cfg.server.port = listener.local_addr().unwrap().port();
+        let err = wait_for_ready_within(&cfg, None, Duration::from_millis(300)).unwrap_err();
+        assert!(
+            err.to_string().contains("did not become ready"),
+            "a TCP-only listener must not satisfy the probe: {err}"
+        );
+        let _ = std::fs::remove_file(&cfg.daemon.pid_file);
     }
 
     #[test]
@@ -2001,14 +2264,14 @@ name = \"nostrfy\"\n",
             std::env::temp_dir().join(format!("nostrfy-ready-{:x}-{id}.pid", std::process::id()));
         let _ = std::fs::remove_file(&cfg.daemon.pid_file);
 
-        // A live listener is detected.
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        // A live HTTP responder is detected.
+        let (listener, _responder) = http_responder("127.0.0.1");
         cfg.server.host = "127.0.0.1".into();
         cfg.server.port = listener.local_addr().unwrap().port();
         wait_for_ready_within(&cfg, None, Duration::from_secs(1)).unwrap();
 
         // A wildcard bind is probed over loopback.
-        let wildcard = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+        let (wildcard, _responder) = http_responder("0.0.0.0");
         cfg.server.host = "0.0.0.0".into();
         cfg.server.port = wildcard.local_addr().unwrap().port();
         wait_for_ready_within(&cfg, None, Duration::from_secs(1)).unwrap();

@@ -11,7 +11,9 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::store::WriteBatch;
 use super::store::{Store, flush_everything};
-use super::{LoadAccessOutcome, Msg, PutOutcome, db_error, msg_bytes};
+use super::{
+    LoadAccessOutcome, LoadGroupsOutcome, LoadRolesOutcome, Msg, PutOutcome, db_error, msg_bytes,
+};
 use crate::db::scan::SCAN_BUDGET;
 use anyhow::anyhow;
 
@@ -336,29 +338,33 @@ fn handle_read_msg(store: &Store, errors: &Arc<std::sync::atomic::AtomicU64>, ms
         Msg::LoadGroups { reply } => {
             // `Ok(None)` means no snapshot was ever written (pre-persistence
             // database): the caller runs the replay migration. An `Err`
-            // also yields `None`, and the caller treats it the same way —
-            // but logs the failure so a corrupt snapshot is visible.
-            // (A corrupt snapshot replays history, which is fail-closed:
-            // tombstones rebuild from surviving events.)
-            let snap = match store.load_groups() {
-                Ok(snap) => snap,
+            // is reported as `Failed` and never conflated with it: the
+            // startup path must refuse an empty group store it cannot
+            // tell apart from a corrupt one (every unknown group id
+            // reads as public).
+            let outcome = match store.load_groups() {
+                Ok(Some(snap)) => LoadGroupsOutcome::Loaded(snap),
+                Ok(None) => LoadGroupsOutcome::Missing,
                 Err(e) => {
                     db_error(errors, &e);
-                    None
+                    LoadGroupsOutcome::Failed
                 }
             };
-            let _ = reply.send(snap);
+            let _ = reply.send(outcome);
             false
         }
         Msg::LoadRoles { reply } => {
-            let snap = match store.load_roles() {
-                Ok(snap) => snap,
+            // Same missing/failed distinction as `LoadGroups`: an empty
+            // role store would keep authorizing deleted grants.
+            let outcome = match store.load_roles() {
+                Ok(Some(snap)) => LoadRolesOutcome::Loaded(snap),
+                Ok(None) => LoadRolesOutcome::Missing,
                 Err(e) => {
                     db_error(errors, &e);
-                    None
+                    LoadRolesOutcome::Failed
                 }
             };
-            let _ = reply.send(snap);
+            let _ = reply.send(outcome);
             false
         }
         Msg::BlossomLoad { sha256, reply } => {
@@ -1061,24 +1067,26 @@ pub(crate) fn spawn(
                                     let _ = reply.send(lists);
                                 }
                                 Msg::LoadGroups { reply } => {
-                                    let snap = match store.load_groups() {
-                                        Ok(snap) => snap,
+                                    let outcome = match store.load_groups() {
+                                        Ok(Some(snap)) => LoadGroupsOutcome::Loaded(snap),
+                                        Ok(None) => LoadGroupsOutcome::Missing,
                                         Err(e) => {
                                             db_error(&thread_errors, &e);
-                                            None
+                                            LoadGroupsOutcome::Failed
                                         }
                                     };
-                                    let _ = reply.send(snap);
+                                    let _ = reply.send(outcome);
                                 }
                                 Msg::LoadRoles { reply } => {
-                                    let snap = match store.load_roles() {
-                                        Ok(snap) => snap,
+                                    let outcome = match store.load_roles() {
+                                        Ok(Some(snap)) => LoadRolesOutcome::Loaded(snap),
+                                        Ok(None) => LoadRolesOutcome::Missing,
                                         Err(e) => {
                                             db_error(&thread_errors, &e);
-                                            None
+                                            LoadRolesOutcome::Failed
                                         }
                                     };
-                                    let _ = reply.send(snap);
+                                    let _ = reply.send(outcome);
                                 }
                                 Msg::Query {
                                     filters,

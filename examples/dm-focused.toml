@@ -13,9 +13,12 @@ description = "Private direct-message relay"
 pubkey = ""
 private_key = ""            # optional; only needed for NIP-29 metadata
 public_url = "wss://dm.example.com"
-# Only what a DM relay needs: NIP-01 (core), 04 (legacy DMs), 17 (DMs),
-# 42 (auth), 59 (gift wraps), 70 (protected events), 11, 33, 40.
-enabled_nips = [1, 4, 11, 17, 33, 40, 42, 59, 70, 78]
+# Only what a DM relay needs: NIP-01 (core), 17 (DMs), 42 (auth),
+# 59 (gift wraps), 70 (protected events), 11, 33, 40. NIP-04 is
+# client-side (legacy DM encryption): kind-4 events are stored and served
+# regardless of this list, and client-side NIPs are filtered out of the
+# advertised `supported_nips`, so listing 4 here would be a no-op.
+enabled_nips = [1, 11, 17, 33, 40, 42, 59, 70, 78]
 require_auth = false        # true = only authenticated clients may publish
 # DM writers are steady, not bursty.
 max_events_per_min_per_pubkey = 60
