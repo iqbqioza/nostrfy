@@ -220,12 +220,16 @@ async fn upload_allowed(relay: &Relay, pubkey: &str) -> anyhow::Result<()> {
     }
     // The allowlist lives in the relay database (LMDB), loaded into
     // memory at startup and refreshed on SIGHUP (`nostrfy blossom allow/deny`).
+    // Case-insensitive like the relay pubkey lists: entries arrive from
+    // operators who may type uppercase hex, while wire pubkeys are
+    // lowercase — an exact compare would deny a legitimately listed
+    // uploader over letter case (fail-closed, but a paper cut).
     let allowed = relay
         .blossom_allow
         .read()
         .await
         .iter()
-        .any(|entry| entry == pubkey);
+        .any(|entry| entry.eq_ignore_ascii_case(pubkey));
     if allowed {
         Ok(())
     } else {
@@ -1718,6 +1722,25 @@ mod tests {
         assert!(
             build_state(&cfg, &relay).await.unwrap().is_none(),
             "no host means no media state, not a failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_allowlist_matches_case_insensitively() {
+        // Entries arrive from operators who may type uppercase hex, while
+        // wire pubkeys are lowercase: an exact compare would deny a
+        // legitimately listed uploader over letter case.
+        let relay = build_blossom_relay(0).await;
+        relay.config.write().await.blossom.restrict_uploads = true;
+        let pk = "aa".repeat(32);
+        *relay.blossom_allow.write().await = vec![pk.to_ascii_uppercase()];
+        assert!(
+            upload_allowed(&relay, &pk).await.is_ok(),
+            "an allowlisted pubkey must upload regardless of entry letter case"
+        );
+        assert!(
+            upload_allowed(&relay, &"bb".repeat(32)).await.is_err(),
+            "a non-listed pubkey must still be refused"
         );
     }
 

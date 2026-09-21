@@ -110,15 +110,11 @@ pub(crate) async fn livekit_token(
 
 async fn group_allows(relay: &Relay, group: &str, pubkey: &str) -> bool {
     // NIP-86 `banpubkey` applies to token minting too: a banned pubkey is
-    // refused on every authenticated service, LiveKit included.
-    if relay
-        .access
-        .read()
-        .await
-        .blocked_pubkeys
-        .iter()
-        .any(|(pk, _)| pk.eq_ignore_ascii_case(pubkey))
-    {
+    // refused on every authenticated service, LiveKit included. The relay
+    // allowlist gates minting like publishing: on a `restrict_relay`
+    // relay a non-allowlisted pubkey cannot publish, so it must not mint
+    // room tokens either (group membership alone is not enough there).
+    if !relay.access.read().await.allows_pubkey(pubkey) {
         return false;
     }
     let groups = relay.groups.read().await;
@@ -416,6 +412,37 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "a member may mint a token");
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(json["token"].as_str().is_some_and(|t| !t.is_empty()));
+        relay.db.shutdown();
+    }
+    #[tokio::test]
+    async fn non_allowlisted_member_cannot_mint_on_restricted_relay() {
+        // The relay allowlist gates minting like publishing: on a
+        // `restrict_relay` relay a group member that is not allowlisted
+        // cannot publish, so minting a room token for them would bypass
+        // the relay policy for audio/video.
+        let relay = build_relay().await;
+        relay.groups.write().await.groups.insert(
+            "open".into(),
+            crate::nips::nip29::Group {
+                settings: crate::nips::nip29::GroupSettings {
+                    livekit: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        relay.config.write().await.access.restrict_relay = true;
+        // The gate reads the runtime access state (a SIGHUP reload copies
+        // the config flag there); set it the way the reload would.
+        relay.access.write().await.restrict_relay = true;
+        let secp = relay.secp().clone();
+        let ev = signed_token_auth(&relay, &secp, "open").await;
+        let (status, _, _) = token_status(&relay, "open", &ev).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "a non-allowlisted member must not mint on a restricted relay"
+        );
         relay.db.shutdown();
     }
 

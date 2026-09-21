@@ -502,6 +502,11 @@ pub struct Conn {
     /// served to the authenticated owner when the AUTH gate is on (cached
     /// from the config on connect and refreshed after a SIGHUP reload).
     pub(crate) nip78_restricted: bool,
+    /// Whether anonymous subscriptions are refused (cached from the config
+    /// on connect and refreshed after a SIGHUP reload): enabling
+    /// `require_auth` mid-session must cut anonymous live streams, like
+    /// the REQ/COUNT/NEG-OPEN paths already refuse them.
+    pub(crate) require_auth: bool,
     /// Last verdict of the access-list read gate (see
     /// [`Conn::access_allows_read_sync`]): the non-blocking hot path falls
     /// back to this instead of failing open when the lists are contended.
@@ -1038,6 +1043,7 @@ impl Conn {
             self.expiry_enabled = cfg.nip_enabled(40);
             self.giftwrap_restricted = cfg.nip_enabled(42);
             self.nip78_restricted = cfg.nip_enabled(78) && cfg.relay.enabled_nip78_auth;
+            self.require_auth = cfg.relay.require_auth;
             self.out_queue_bytes = cfg.limits.max_out_queue_bytes;
             self.req_response_bytes = cfg.limits.max_req_response_bytes;
             self.outbox_write_policy = cfg.server.outbox_write_policy.clone();
@@ -1289,6 +1295,7 @@ pub async fn handle_connection(
         expiry_enabled,
         giftwrap_restricted,
         nip78_restricted,
+        require_auth,
         idle_timeout,
         outbox_write_policy,
         inbox_write_policy,
@@ -1301,6 +1308,7 @@ pub async fn handle_connection(
             cfg.nip_enabled(40),
             cfg.nip_enabled(42),
             cfg.nip_enabled(78) && cfg.relay.enabled_nip78_auth,
+            cfg.relay.require_auth,
             cfg.limits.ws_idle_timeout_secs,
             cfg.server.outbox_write_policy.clone(),
             cfg.server.inbox_write_policy.clone(),
@@ -1407,6 +1415,7 @@ pub async fn handle_connection(
         expiry_enabled,
         giftwrap_restricted,
         nip78_restricted,
+        require_auth,
         access_allowed_cache: false,
         config_version: 0,
         dropped: 0,
@@ -1967,13 +1976,14 @@ mod tests {
     /// Builds a connection on a pre-built relay (for tests that need
     /// several connections sharing one relay + subscription index).
     async fn build_conn_on(relay: Arc<Relay>) -> Conn {
-        let (out_queue_bytes, expiry_enabled, giftwrap_restricted, nip78_restricted) = {
+        let (out_queue_bytes, expiry_enabled, giftwrap_restricted, nip78_restricted, require_auth) = {
             let cfg = relay.config.read().await;
             (
                 cfg.limits.max_out_queue_bytes,
                 cfg.nip_enabled(40),
                 cfg.nip_enabled(42),
                 cfg.nip_enabled(78) && cfg.relay.enabled_nip78_auth,
+                cfg.relay.require_auth,
             )
         };
         let conn_id = relay
@@ -2023,6 +2033,7 @@ mod tests {
             expiry_enabled,
             giftwrap_restricted,
             nip78_restricted,
+            require_auth,
             access_allowed_cache: false,
             config_version: 0,
             dropped: 0,
@@ -4020,6 +4031,74 @@ mod tests {
                 "a malformed event must produce a diagnostic"
             );
             conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn live_delivery_closes_subs_on_deny_and_auth_flip() {
+        // A ban or a `require_auth` flip mid-session must close the
+        // starving subscriptions with the same CLOSED the REQ path sends,
+        // instead of leaving them silent post-EOSE.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_relay_with("").await;
+            let mut conn = build_conn_on(relay.clone()).await;
+            let now = unix_now();
+            // Authenticated subscription in its post-EOSE state.
+            let authed = "aa".repeat(32);
+            conn.authed_pubkeys.push(authed.clone());
+            conn.handle_req(&[json!("sub"), json!({"kinds": [1]})])
+                .await;
+            assert!(conn.subs.contains_key("sub"));
+            conn.outgoing.clear();
+            // Banning the key mid-session: the next live event closes the
+            // subscription instead of dropping silently.
+            conn.relay
+                .access
+                .write()
+                .await
+                .blocked_pubkeys
+                .push((authed, String::new()));
+            let ev = signed_kind_note_seeded(relay.secp(), 3, 1, "live", now, vec![]);
+            conn.deliver_live(&ev, &serde_json::to_string(&ev).unwrap_or_default(), None);
+            let msgs = outgoing_json(&conn);
+            assert!(
+                msgs.iter().any(|m| m[0] == "CLOSED"
+                    && m[1] == "sub"
+                    && m[2].as_str().is_some_and(|r| r.contains("restricted"))),
+                "a denied live sub must be closed like a denied REQ: {msgs:?}"
+            );
+            assert!(
+                !msgs.iter().any(|m| m[0] == "EVENT"),
+                "no event may be delivered to a denied sub"
+            );
+            assert!(conn.subs.is_empty(), "the denied sub must be released");
+            relay.db.shutdown();
+        });
+        rt.block_on(async {
+            let relay = build_relay_with("").await;
+            let mut conn = build_conn_on(relay.clone()).await;
+            let now = unix_now();
+            // Anonymous subscription while auth is not required.
+            conn.handle_req(&[json!("sub"), json!({"kinds": [1]})])
+                .await;
+            assert!(conn.subs.contains_key("sub"));
+            conn.outgoing.clear();
+            // Enabling `require_auth` (SIGHUP) cuts the anonymous live
+            // stream; the refresh propagates the flip to the connection.
+            conn.relay.config.write().await.relay.require_auth = true;
+            conn.refresh_config_cache().await;
+            let ev = signed_kind_note_seeded(relay.secp(), 4, 1, "live", now, vec![]);
+            conn.deliver_live(&ev, &serde_json::to_string(&ev).unwrap_or_default(), None);
+            let msgs = outgoing_json(&conn);
+            assert!(
+                msgs.iter().any(|m| m[0] == "CLOSED"
+                    && m[1] == "sub"
+                    && m[2].as_str().is_some_and(|r| r.contains("auth-required"))),
+                "an anonymous live sub must be closed on a require_auth flip: {msgs:?}"
+            );
+            assert!(conn.subs.is_empty());
+            relay.db.shutdown();
         });
     }
 

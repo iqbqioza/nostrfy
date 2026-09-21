@@ -701,7 +701,7 @@ Uploads from unlisted pubkeys are rejected with `403`. The list survives restart
 - Files are served with `ETag`, `Cache-Control: immutable` and the stored content type.
 - Blob bytes never touch the relay database; the relay stores only SHA-256-to-owner metadata and the upload allowlist in LMDB. Back up both the configured blob storage and `database.path` to preserve the complete Blossom inventory and authorization state.
 - The sha256 → owner mapping is persisted in the relay database (LMDB): the relay restarts instantly, lookups read the mapping directly from the database (no in-memory index, no startup scan), and existing files keep working.
-- **Automatic migration**: on the first start after an upgrade, the relay rebuilds the mapping from blobs stored by older versions (a background scan — the table itself is created instantly, and later restarts skip the migration via a marker). No manual step is needed.
+- **Automatic migration**: on the first start after an upgrade, the relay rebuilds the mapping from blobs stored by older versions (a background scan — the table itself is created instantly, and later restarts skip the migration via a marker). No manual step is needed. While the background pass is still running, pre-upgrade blobs that it has not reached yet return `404` on GET (uploads/downloads of mapped blobs are unaffected); the pass completes on its own and the log reports the mapped count.
 - **All database upgrades are automatic**: every LMDB table is opened-or-created at startup (instant, non-destructive), and the one-time data migrations (access lists, Blossom mapping) run by themselves — see [CONFIGURATION.md](CONFIGURATION.md#upgrades-are-automatic-and-instant).
 
 ---
@@ -712,7 +712,7 @@ nostrfy supports several independent relays on one server (different ports). Eac
 
 - `server.port` — the listen port
 - `[daemon] pid_file` / `log_file` / `stats_file` — **shared values make the second instance refuse to start with `already running`**
-- `database.path` — an independent database per instance
+- `database.path` — an independent database per instance. Two instances on the same directory refuse to start (the second fails locking it): sharing one database between writers would silently split-brain the derived state.
 - `api_host` / `blossom.host` — a distinct hostname per instance when the host split is used
 
 Example:

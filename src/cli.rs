@@ -130,6 +130,23 @@ impl Cli {
             Command::Check => {
                 let cfg = self.load_config()?;
                 cfg.validate()?;
+                // A config that validates can still fail at serve time
+                // (an occupied port, an unusable database directory): probe
+                // both now so `check` does not bless a config `start`
+                // would reject. The probes are best-effort (a rival can
+                // bind between check and start); `prepare` re-checks the
+                // port right before forking.
+                ensure_port_available(&cfg)?;
+                // Acquire and release the database directory lock: proves
+                // the directory is usable and no second relay holds it.
+                drop(
+                    crate::db::lock_database_dir(&cfg.database.path).map_err(|e| {
+                        config_err(format!(
+                            "database directory {} is not usable: {e}",
+                            cfg.database.path.display()
+                        ))
+                    })?,
+                );
                 print_line(&format!("configuration OK: {}", cfg.relay.name));
                 return Ok(());
             }
@@ -212,6 +229,21 @@ impl Cli {
                 // startup work must be handled (buffered by the tokio
                 // driver), not applied as the default action.
                 let signals = crate::server::StartupSignals::register();
+                // One writer per database directory: a second relay on the
+                // same `database.path` (a different pid file or port
+                // defeats the pid/port gate) would run a split-brain second
+                // writer thread, so refuse startup instead. The lock
+                // releases itself when the holder dies and is never taken
+                // by the CLI commands, which must keep working alongside a
+                // live daemon.
+                let _db_dir_guard =
+                    crate::db::lock_database_dir(&cfg.database.path).map_err(|e| {
+                        config_err(format!(
+                            "cannot lock the database directory {}: {e}; another relay \
+                             instance may be using it",
+                            cfg.database.path.display()
+                        ))
+                    })?;
                 let db = open_db(&cfg)?;
                 run_server(self.config.clone(), cfg, db, signals).await
             }
@@ -322,6 +354,10 @@ impl Cli {
         let pid = match running_pid(&pid_file) {
             Some(pid) => pid,
             None => {
+                // No live daemon behind the file: remove the stale pid so
+                // scripts probing the file do not mistake it for a running
+                // instance (a fresh `start` works either way).
+                let _ = std::fs::remove_file(&pid_file);
                 print_line("nostrfy is not running");
                 return Ok(());
             }
@@ -859,6 +895,14 @@ impl Cli {
                      keeping the current binary"
                 ));
             };
+            // Keep the running binary for manual rollback: the post-replace
+            // probe only checks `--version`, so a binary that crashes on
+            // real startup would otherwise leave no working copy behind.
+            let backup = exe.with_extension("prev");
+            let _ = std::fs::remove_file(&backup);
+            if let Err(e) = std::fs::rename(&exe, &backup) {
+                return Err(anyhow!(format!("cannot back up the current binary: {e}")));
+            }
             std::fs::rename(&tmp, &exe)?;
             // fsync the directory so the rename survives a power loss, not
             // just a process crash.
@@ -872,6 +916,10 @@ impl Cli {
         }
         result?;
         print_line(&format!("replaced {} with nostrfy {target}", exe.display()));
+        print_line(&format!(
+            "the previous binary is kept at {}; restore it manually if the new one misbehaves",
+            exe.with_extension("prev").display()
+        ));
         // A running daemon has the old binary mapped already: tell the
         // operator to restart to apply the update.
         if self.config.exists()

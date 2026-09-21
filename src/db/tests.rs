@@ -166,6 +166,20 @@ fn tag_range_never_panics_on_boundary_inputs() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn database_dir_lock_is_exclusive() {
+    // A second relay on the same `database.path` (a different pid file or
+    // port defeats the pid/port gate) must fail fast instead of running a
+    // split-brain second writer thread.
+    let cfg = config();
+    let _first = crate::db::lock_database_dir(&cfg.path).expect("the first holder takes the lock");
+    assert!(
+        crate::db::lock_database_dir(&cfg.path).is_err(),
+        "a second lock on the same database directory must fail"
+    );
+}
+
 #[test]
 fn count_at_the_exact_cap_is_not_approximate() {
     // A walk that exhausts exactly at the request cap is complete: only a

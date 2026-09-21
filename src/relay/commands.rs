@@ -262,8 +262,24 @@ impl Relay {
                 let mut access = self.access.write().await;
                 let already = access.allowed_pubkeys.iter().any(|(p, _)| p == pk);
                 if !already {
-                    access.blocked_pubkeys.retain(|(p, _)| p != pk);
-                    access.allowed_pubkeys.push((pk.clone(), String::new()));
+                    // Command events use exact-case matching (unlike NIP-86's
+                    // case-insensitive match); the op carries the origin so
+                    // the replay keeps the same semantics.
+                    let ops = vec![
+                        crate::config::AccessOp::UnbanPubkey {
+                            pubkey: pk.clone(),
+                            insensitive: false,
+                        },
+                        crate::config::AccessOp::AllowPubkey {
+                            pubkey: pk.clone(),
+                            reason: String::new(),
+                            insensitive: false,
+                        },
+                    ];
+                    for op in &ops {
+                        crate::config::apply_access_op(&mut access, op);
+                    }
+                    self.push_access_ops(ops);
                 }
                 drop(access);
                 let persisted = self.persist_access().await;
@@ -273,8 +289,21 @@ impl Relay {
                 let mut access = self.access.write().await;
                 let already = access.blocked_pubkeys.iter().any(|(p, _)| p == pk);
                 if !already {
-                    access.allowed_pubkeys.retain(|(p, _)| p != pk);
-                    access.blocked_pubkeys.push((pk.clone(), String::new()));
+                    let ops = vec![
+                        crate::config::AccessOp::UnallowPubkey {
+                            pubkey: pk.clone(),
+                            insensitive: false,
+                        },
+                        crate::config::AccessOp::BanPubkey {
+                            pubkey: pk.clone(),
+                            reason: String::new(),
+                            insensitive: false,
+                        },
+                    ];
+                    for op in &ops {
+                        crate::config::apply_access_op(&mut access, op);
+                    }
+                    self.push_access_ops(ops);
                 }
                 drop(access);
                 let persisted = self.persist_access().await;
