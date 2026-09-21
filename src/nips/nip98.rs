@@ -195,6 +195,11 @@ impl ReplayGuard {
 /// canonical HTTP origin (`relay.public_url` mapped to `https`/`http`, or
 /// the bound `http://host:port` when unset) plus the exact request path and
 /// query; the comparison is byte-for-byte.
+///
+/// One interop allowance: for a root request the path is `/`, and clients
+/// (e.g. `nak`) send the bare origin without the trailing slash. Per
+/// RFC 3986 an empty path is equivalent to `/` for http(s), so both
+/// spellings are accepted — a strict compare 401s a correct client.
 pub fn matches_request_url(
     tag: &str,
     identity: &crate::nips::nip62::RelayIdentity<'_>,
@@ -207,7 +212,14 @@ pub fn matches_request_url(
         expected.push('?');
         expected.push_str(query);
     }
-    tag == expected
+    if tag == expected {
+        return true;
+    }
+    if request_path == "/" && request_query.is_none() {
+        let origin = identity.http_origin();
+        return tag == origin;
+    }
+    false
 }
 
 #[cfg(test)]
@@ -424,9 +436,11 @@ mod tests {
             "/ws",
             None
         ));
-        // A bare authority is not the "/" URL: the trailing slash is part
-        // of the absolute request URL.
-        assert!(!matches_request_url(
+        // A bare authority is accepted for the root URL: per RFC 3986 an
+        // empty path is equivalent to "/" for http(s), and clients (nak)
+        // send the bare origin. See the interop allowance in
+        // `matches_request_url`.
+        assert!(matches_request_url(
             "http://relay.example.com:8080",
             &identity,
             "/",
@@ -511,6 +525,46 @@ mod tests {
             &identity,
             "/ws",
             None
+        ));
+    }
+
+    #[test]
+    fn request_url_accepts_a_bare_root_origin() {
+        // Interop: clients (e.g. `nak admin`) send the origin without the
+        // trailing slash for a root request. Per RFC 3986 the empty path is
+        // equivalent to `/` for http(s), so both spellings must verify.
+        let identity = RelayIdentity::new("127.0.0.1", 8080, "ws://public.example.net");
+        assert!(matches_request_url(
+            "http://public.example.net/",
+            &identity,
+            "/",
+            None
+        ));
+        assert!(matches_request_url(
+            "http://public.example.net",
+            &identity,
+            "/",
+            None
+        ));
+        // A non-root path still requires the exact path (no slash leniency).
+        assert!(!matches_request_url(
+            "http://public.example.net",
+            &identity,
+            "/ws",
+            None
+        ));
+        // A query on a root request keeps the exact form.
+        assert!(!matches_request_url(
+            "http://public.example.net",
+            &identity,
+            "/",
+            Some("a=1")
+        ));
+        assert!(matches_request_url(
+            "http://public.example.net/?a=1",
+            &identity,
+            "/",
+            Some("a=1")
         ));
     }
 
