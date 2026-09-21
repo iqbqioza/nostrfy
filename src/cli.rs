@@ -83,6 +83,52 @@ pub enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// Migrate a strfry relay database into this relay's database.
+    ///
+    /// Reads the JSONL produced by `strfry export` (one NIP-01 event per
+    /// line, oldest first) and imports it into the configured
+    /// `database.path`, applying the NIP-09 and NIP-29 deletion side effects
+    /// so the tombstones (re-publication blocks) match. The relay must be
+    /// stopped while the migration runs; a re-run of the same export is
+    /// safe. NIP-62 vanish requests are only honored with `--apply-vanish`.
+    #[command(name = "migrate-strfry")]
+    MigrateStrfry {
+        /// Read events from this file (`-` = stdin). Ignored when
+        /// `--strfry-db` is given.
+        #[arg(
+            long,
+            value_name = "PATH",
+            default_value = "-",
+            conflicts_with = "strfry_db"
+        )]
+        input: String,
+        /// Run `strfry export` against this strfry database directory
+        /// instead of reading a file (the `strfry` binary must be on PATH
+        /// or named with `--strfry-bin`).
+        #[arg(long, value_name = "DIR")]
+        strfry_db: Option<PathBuf>,
+        /// The strfry binary to run with `--strfry-db`.
+        #[arg(long, value_name = "PATH", default_value = "strfry")]
+        strfry_bin: String,
+        /// Only export events with this created_at or newer (inclusive, for
+        /// resuming; requires `--strfry-db`).
+        #[arg(long, value_name = "UNIX", requires = "strfry_db")]
+        since: Option<u64>,
+        /// Skip id/signature verification (use only for trusted dumps).
+        #[arg(long)]
+        no_verify: bool,
+        /// Honor NIP-62 vanish requests found in the input (off by default:
+        /// strfry does not implement NIP-62, so the events those requests
+        /// name were served by strfry and are part of the migrated data).
+        #[arg(long)]
+        apply_vanish: bool,
+        /// Parse and verify the input, then exit without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Events per database write transaction.
+        #[arg(long, value_name = "N", default_value_t = 512)]
+        batch: usize,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -178,6 +224,9 @@ impl Cli {
                 };
             }
             Command::Upgrade { version, force } => return self.upgrade(version.as_deref(), *force),
+            // The migration opens the database itself (and must not
+            // daemonize): handled in `serve`, which owns the async runtime.
+            Command::MigrateStrfry { .. } => return Ok(()),
             _ => {}
         }
 
@@ -252,6 +301,7 @@ impl Cli {
                 let db = open_db(&cfg)?;
                 run_server(self.config.clone(), cfg, db, signals).await
             }
+            Command::MigrateStrfry { .. } => self.migrate_strfry().await,
             _ => Ok(()),
         }
     }
@@ -274,6 +324,156 @@ impl Cli {
         let mut cfg = Config::load(&self.config)?;
         cfg.absolutize_paths(&self.config);
         Ok(cfg)
+    }
+
+    /// `nostrfy migrate-strfry`: imports a strfry export into this relay's
+    /// database. The relay must be stopped (the database-directory lock is
+    /// taken); a dry run needs neither the lock nor the database.
+    async fn migrate_strfry(&self) -> Result<()> {
+        let Command::MigrateStrfry {
+            input,
+            strfry_db,
+            strfry_bin,
+            since,
+            no_verify,
+            apply_vanish,
+            dry_run,
+            batch,
+        } = &self.command
+        else {
+            unreachable!("migrate_strfry is only called for Command::MigrateStrfry");
+        };
+        if *batch == 0 {
+            return Err(config_err("--batch must be at least 1"));
+        }
+        let cfg = self.load_config()?;
+        cfg.validate()?;
+        // Resolve the input before touching the database: a missing file or
+        // a missing strfry binary must fail without taking the lock.
+        let mut source = if let Some(db_dir) = strfry_db {
+            print_line(&format!(
+                "running `{strfry_bin} export` against {}...",
+                db_dir.display()
+            ));
+            MigrateSource::spawn_strfry_export(strfry_bin, db_dir, *since)?
+        } else if input == "-" {
+            print_line("reading the strfry export from stdin...");
+            MigrateSource::stdin()
+        } else {
+            MigrateSource::file(Path::new(input))?
+        };
+        let opts = crate::migrate::Options {
+            verify: !*no_verify,
+            apply_vanish: *apply_vanish,
+            nip62_enabled: cfg.nip_enabled(62),
+            // Only recorded when the new-pubkey gate is configured: with the
+            // gate off the table is never reaped.
+            first_seen: cfg.relay.new_pubkey_min_age_secs > 0,
+            batch: *batch,
+            max_line_bytes: cfg.limits.max_ws_message_bytes,
+            host: cfg.server.host.clone(),
+            port: cfg.server.port,
+            public_url: cfg.relay.public_url.clone(),
+        };
+        let started = Instant::now();
+        let mut last_progress = Instant::now();
+        // The latest progress snapshot: kept so a failed migration can
+        // print a resume hint for the events that did commit.
+        let mut latest = crate::migrate::Stats::default();
+        let mut progress = |stats: &crate::migrate::Stats| {
+            latest = stats.clone();
+            // Time-based throttle: the callback runs per batch.
+            if last_progress.elapsed() >= Duration::from_secs(2) {
+                last_progress = Instant::now();
+                print_line(&format!(
+                    "  {} line(s), {} imported, {} skipped",
+                    stats.lines,
+                    stats.imported(),
+                    stats.skipped()
+                ));
+            }
+        };
+        if *dry_run {
+            let stats = crate::migrate::run(None, &mut source.reader, &opts, &mut progress).await?;
+            source.finish()?;
+            print_line(&stats.to_string());
+            print_line(&format!(
+                "dry run complete in {:.1}s; nothing was written",
+                started.elapsed().as_secs_f64()
+            ));
+            return Ok(());
+        }
+        // One writer per database directory: refuse while the relay (or
+        // another migration) holds it.
+        let _db_lock = crate::db::lock_database_dir(&cfg.database.path).map_err(|e| {
+            config_err(format!(
+                "cannot lock the database directory {}: {e}; stop the relay before \
+                 migrating",
+                cfg.database.path.display()
+            ))
+        })?;
+        let db = open_db(&cfg)?;
+        {
+            let filter: crate::filter::Filter = crate::filter::Filter::default();
+            // Best effort: a failed probe must not abort the migration.
+            if let Some((existing, _)) = db
+                .query_full_startup(vec![filter], 1, crate::util::unix_now(), false)
+                .await
+                && !existing.is_empty()
+            {
+                print_line(
+                    "warning: the target database already contains events; duplicates are \
+                     skipped (a re-run of an interrupted migration is safe)",
+                );
+            }
+        }
+        let result = crate::migrate::run(Some(&db), &mut source.reader, &opts, &mut progress).await;
+        // Flush and join the writer before reporting (and before the lock is
+        // released): the summary must reflect committed data only.
+        db.shutdown();
+        let stats = match result {
+            Ok(stats) => stats,
+            Err(e) => {
+                // Print what committed so an interrupted migration can be
+                // resumed without re-reading everything. `--since` is
+                // inclusive in strfry's export, so the boundary second is
+                // re-imported (duplicates are skipped).
+                if let Some(last) = latest.max_created_at {
+                    print_line(&format!(
+                        "{} event(s) were committed before the failure",
+                        latest.imported()
+                    ));
+                    if strfry_db.is_some() {
+                        print_line(&format!(
+                            "resume with: --strfry-db {} --since {last}",
+                            strfry_db
+                                .as_ref()
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_default()
+                        ));
+                    }
+                }
+                return Err(e);
+            }
+        };
+        source.finish()?;
+        print_line(&stats.to_string());
+        if let Some(last) = stats.max_created_at {
+            if strfry_db.is_some() {
+                print_line(&format!(
+                    "resume hint: re-run with --strfry-db and --since {last} after an \
+                     interrupted migration (--since is inclusive; duplicates are skipped)"
+                ));
+            } else {
+                print_line("re-running the same export is safe if the migration was interrupted");
+            }
+        }
+        print_line(&format!(
+            "migration complete in {:.1}s; start the relay to rebuild the derived state \
+             (NIP-29 groups, NIP-43 roles)",
+            started.elapsed().as_secs_f64()
+        ));
+        Ok(())
     }
 
     fn daemonize(&mut self, cfg: &Config) -> Result<()> {
@@ -1121,6 +1321,114 @@ fn open_db(cfg: &Config) -> Result<crate::db::DbClient> {
     // The API reader queue cap is independent from the WebSocket-side caps.
     db.set_max_api_pending(cfg.limits.max_api_queue_msgs);
     Ok(db)
+}
+
+/// The event stream for `migrate-strfry`: a file, stdin, or the stdout of a
+/// `strfry export` child process (kept alive so its exit status can be
+/// checked after the stream ends).
+struct MigrateSource {
+    reader: Box<dyn std::io::BufRead>,
+    child: Option<std::process::Child>,
+    /// The temporary strfry config written for `--strfry-db`; removed on
+    /// drop.
+    temp_config: Option<PathBuf>,
+}
+
+impl MigrateSource {
+    fn file(path: &Path) -> Result<Self> {
+        let file = std::fs::File::open(path)
+            .map_err(|e| config_err(format!("cannot open {}: {e}", path.display())))?;
+        Ok(Self {
+            reader: Box::new(std::io::BufReader::new(file)),
+            child: None,
+            temp_config: None,
+        })
+    }
+
+    fn stdin() -> Self {
+        Self {
+            reader: Box::new(std::io::BufReader::new(std::io::stdin())),
+            child: None,
+            temp_config: None,
+        }
+    }
+
+    fn spawn_strfry_export(bin: &str, db_dir: &Path, since: Option<u64>) -> Result<Self> {
+        if !db_dir.is_dir() {
+            return Err(config_err(format!(
+                "strfry database directory {} does not exist",
+                db_dir.display()
+            )));
+        }
+        // strfry accepts a minimal config (`db = "..."`); write one so the
+        // operator's own strfry.conf is not needed.
+        let config_path =
+            std::env::temp_dir().join(format!("nostrfy-strfry-export-{}.conf", std::process::id()));
+        let escaped = db_dir
+            .display()
+            .to_string()
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"");
+        std::fs::write(&config_path, format!("db = \"{escaped}\"\n")).map_err(|e| {
+            config_err(format!(
+                "cannot write the temporary strfry config {}: {e}",
+                config_path.display()
+            ))
+        })?;
+        let mut cmd = std::process::Command::new(bin);
+        cmd.arg("--config")
+            .arg(&config_path)
+            .arg("export")
+            // stderr is inherited: strfry's own error message stays visible.
+            .stdout(std::process::Stdio::piped());
+        if let Some(since) = since {
+            cmd.arg("--since").arg(since.to_string());
+        }
+        let mut child = cmd.spawn().map_err(|e| {
+            config_err(format!(
+                "cannot run `{bin}`: {e} (install strfry, set --strfry-bin, or use \
+                 --input <file>)"
+            ))
+        })?;
+        let stdout = child.stdout.take().expect("stdout was piped");
+        Ok(Self {
+            reader: Box::new(std::io::BufReader::new(stdout)),
+            child: Some(child),
+            temp_config: Some(config_path),
+        })
+    }
+
+    /// Waits for the `strfry export` child (when there is one) and reports a
+    /// non-zero exit as an error, so a truncated export cannot be reported
+    /// as a completed migration.
+    fn finish(&mut self) -> Result<()> {
+        if let Some(mut child) = self.child.take() {
+            let status = child
+                .wait()
+                .map_err(|e| config_err(format!("waiting for strfry export: {e}")))?;
+            if !status.success() {
+                return Err(config_err(format!(
+                    "strfry export exited with {status}; the migration did not complete \
+                     (re-run it)"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for MigrateSource {
+    fn drop(&mut self) {
+        // A migration that failed before `finish` leaves the export child
+        // running (it may be blocked on a full pipe): stop it.
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        if let Some(path) = self.temp_config.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 /// Prints a line to stdout, ignoring broken-pipe errors (e.g. `nostrfy stats

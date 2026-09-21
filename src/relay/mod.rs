@@ -2885,6 +2885,34 @@ impl Relay {
         self.groups_rebuild.persist(&self.db, &self.groups).await
     }
 
+    /// Publishes the relay-signed metadata events (39000/39001/39002/39005)
+    /// for every live group. Called after a rebuild from stored events: a
+    /// database whose group state was rebuilt — a migration from another
+    /// relay, or a dropped snapshot — has no (or stale) stored metadata,
+    /// and NIP-29 clients need it to display the groups. Requires the relay
+    /// key (without it the relay cannot sign metadata and NIP-29 is hidden
+    /// in NIP-11 anyway). A failed store only logs: the in-memory state is
+    /// already correct, and the next moderation event republishes.
+    pub(crate) async fn publish_group_metadata(&self) {
+        let Some(relay_pubkey) = self.relay_pubkey() else {
+            return;
+        };
+        let now = self.stamp_floor(unix_now());
+        let events = {
+            let mut groups = self.groups.write().await;
+            groups.all_metadata_events(&relay_pubkey, now)
+        };
+        let mut stored = 0usize;
+        for mut event in events {
+            if self.store_relay_event(&mut event).await.is_ok() {
+                stored += 1;
+            }
+        }
+        if stored > 0 {
+            log::info!("republished {stored} NIP-29 group metadata event(s) after the rebuild");
+        }
+    }
+
     /// Persists the live NIP-43 role state (same lifecycle as
     /// [`Self::persist_groups`]). The lock keeps a stale snapshot from
     /// overwriting a newer one: two concurrent mutations could otherwise

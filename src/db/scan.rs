@@ -11,8 +11,8 @@ use heed::types::Bytes;
 use heed::{Database, RoTxn};
 
 use super::store::{
-    ID_LEN, Store, TAG_INDEX_VALUE_MAX, WORD_INDEX_MAX, WORD_OVERFLOW, created_key, kind_key,
-    pubkey_key, tag_range, word_key,
+    ID_LEN, Store, TAG_INDEX_VALUE_MAX, WORD_INDEX_MAX, WORD_OVERFLOW, created_key,
+    deletion_marker_blocks, kind_key, pubkey_key, tag_range, word_key,
 };
 use anyhow::anyhow;
 
@@ -1664,7 +1664,11 @@ fn is_deliverable<E: crate::filter::EventFields>(
     let Ok(id) = <[u8; 32]>::try_from(id) else {
         return Ok(false);
     };
-    if ctx.deleted.get(ctx.rtxn, &id)?.is_some() {
+    if ctx
+        .deleted
+        .get(ctx.rtxn, &id)?
+        .is_some_and(|marker| deletion_marker_blocks(marker, event))
+    {
         return Ok(false);
     }
     if ctx.banned.get(ctx.rtxn, &id)?.is_some() {

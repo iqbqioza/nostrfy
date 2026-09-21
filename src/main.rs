@@ -14,6 +14,7 @@ mod filter;
 #[cfg(test)]
 mod fuzz_tests;
 mod logging;
+mod migrate;
 mod nips;
 #[cfg(test)]
 mod prop_tests;

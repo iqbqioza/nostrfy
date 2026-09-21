@@ -58,6 +58,10 @@ pub const ALL_RELAYS: &str = "ALL_RELAYS";
 /// vanished pubkey).
 pub const GIFT_WRAP_KIND: u64 = 1059;
 
+/// Kind of ephemeral NIP-59 gift wraps (never stored, but the same
+/// recipient-deletion re-publication block applies to a re-delivered copy).
+pub const EPHEMERAL_GIFT_WRAP_KIND: u64 = 21059;
+
 /// Returns `true` when the event is a request to vanish.
 pub fn is_vanish(event: &Event) -> bool {
     event.kind == VANISH_KIND

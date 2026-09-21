@@ -2057,6 +2057,44 @@ pub(crate) fn deleted_address_key(kind: u64, pubkey: &[u8], dtag: &str) -> Vec<u
     key.extend_from_slice(&replaceable_key(kind, pubkey, &safe));
     key
 }
+/// Whether a deletion marker blocks `event`. An empty marker is the relay's
+/// own unconditional tombstone (written only after an ownership check). A
+/// marker made of 32-byte pubkeys is a migration-recorded NIP-09 block
+/// scoped to those deletion authors (see
+/// [`Store::record_absent_deletion_targets`]): the event id commits to its
+/// author, so matching the author is exact. NIP-59 gift wraps are
+/// additionally matched by their `p`-tag recipients — strfry records a wrap
+/// deletion as `(wrap id, recipient)`, so a recipient's deletion request
+/// must keep blocking the wrap even though its (random) author differs.
+pub(crate) fn deletion_marker_blocks<E: crate::filter::EventFields>(
+    marker: &[u8],
+    event: &E,
+) -> bool {
+    // Unconditional, or corrupt (fail closed).
+    if marker.is_empty() || !marker.len().is_multiple_of(ID_LEN) {
+        return true;
+    }
+    let matches_pubkey = |candidate: &[u8]| marker.chunks(ID_LEN).any(|chunk| chunk == candidate);
+    if hex::decode(event.pubkey()).is_ok_and(|pubkey| matches_pubkey(&pubkey)) {
+        return true;
+    }
+    if matches!(
+        event.kind(),
+        crate::nips::nip62::GIFT_WRAP_KIND | crate::nips::nip62::EPHEMERAL_GIFT_WRAP_KIND
+    ) {
+        for tag in event.tags() {
+            if tag.len() >= 2
+                && tag[0] == "p"
+                && let Ok(recipient) = hex::decode(&tag[1])
+                && matches_pubkey(&recipient)
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 impl Store {
     // ----- event persistence -----
 
@@ -2266,7 +2304,11 @@ impl Store {
         if self.banned.get(wtxn, &id)?.is_some() {
             return Ok(PutOutcome::Invalid("blocked: event has been banned".into()));
         }
-        if self.deleted.get(wtxn, &id)?.is_some() {
+        if self
+            .deleted
+            .get(wtxn, &id)?
+            .is_some_and(|marker| deletion_marker_blocks(marker, event))
+        {
             return Ok(PutOutcome::PreviouslyDeleted);
         }
         // NIP-29: a purged group's history must not re-enter the database

@@ -1414,6 +1414,32 @@ impl GroupStore {
         out
     }
 
+    /// Builds the relay-signed metadata events (39000/39001/39002/39005)
+    /// for every live group. Used after a rebuild from stored events: a
+    /// database whose state was rebuilt — a migration from another relay,
+    /// or a dropped snapshot — has no (or stale) stored metadata, and
+    /// clients need it to display the groups.
+    pub(crate) fn all_metadata_events(&mut self, relay_pubkey: &str, now: u64) -> Vec<Event> {
+        let gids: Vec<String> = self.groups.keys().cloned().collect();
+        let mut out = Vec::with_capacity(gids.len().saturating_mul(4));
+        for gid in gids {
+            out.push(build_meta_event(
+                &gid,
+                self.groups.get(&gid),
+                relay_pubkey,
+                now,
+            ));
+            out.push(build_pins_event(
+                &gid,
+                self.groups.get(&gid),
+                relay_pubkey,
+                now,
+            ));
+            out.extend(self.membership_events(&gid, relay_pubkey, now));
+        }
+        out
+    }
+
     /// Rebuilds the in-memory group state from the stored events.
     ///
     /// Returns `false` when the rebuild could not be completed (the database

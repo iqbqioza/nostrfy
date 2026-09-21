@@ -23,6 +23,11 @@ use crate::nips::nip09;
 /// so entries the caller leaves in place cannot loop forever.
 const REMOVAL_CHUNK: usize = 4096;
 
+/// How many deleter pubkeys one migration-recorded (absent-target) tombstone
+/// keeps. Bounds the marker value when many deletion requests name the same
+/// missing id; the earliest deleters win.
+const SCOPED_TOMBSTONE_MAX: usize = 4;
+
 /// The partial outcome of a chunked removal walk: what was removed before
 /// the walk ended, whether the removed events feed the derived NIP-29 /
 /// NIP-43 state, and the failure that stopped it (if any). The counters
@@ -89,6 +94,74 @@ fn removal_chunk(
 }
 
 impl Store {
+    /// Migration-only: records NIP-09 re-publication blocks for deletion
+    /// targets that are *absent* from the database, scoped to the deletion's
+    /// author. A strfry export contains no trace of an event its author
+    /// deleted (strfry removes it physically), so replaying the deletion
+    /// request cannot write the ordinary per-id tombstone — the walk only
+    /// marks targets it can see. Without this the deleted event could be
+    /// re-published after the migration. Present targets are left to the
+    /// deletion walk (which checks ownership and writes the unconditional
+    /// tombstone), and ids that already carry an unconditional tombstone
+    /// are untouched.
+    ///
+    /// The value is one or more 32-byte deleter pubkeys (at most
+    /// [`SCOPED_TOMBSTONE_MAX`]), so only those authors' re-publication is
+    /// blocked — the event id commits to its author, and this mirrors
+    /// strfry's `(id, pubkey)` deletion record. Returns how many markers
+    /// were written or extended.
+    pub(crate) fn record_absent_deletion_targets(
+        &self,
+        pubkey: &[u8],
+        targets: &[String],
+    ) -> Result<usize> {
+        self.disk_full_error()?;
+        if pubkey.len() != ID_LEN {
+            return Ok(0);
+        }
+        let mut wtxn = self.env.write_txn()?;
+        let mut recorded = 0usize;
+        for target in targets {
+            let Ok(id) = hex::decode(target) else {
+                continue;
+            };
+            if id.len() != ID_LEN {
+                continue;
+            }
+            if self.events.get(&wtxn, &id)?.is_some() {
+                // Present: the deletion walk decides by ownership.
+                continue;
+            }
+            match self.deleted.get(&wtxn, &id)? {
+                Some(existing) => {
+                    // An unconditional (empty) or corrupt marker is left as
+                    // is; a scoped marker gains this deleter unless it is
+                    // already covered or the cap is reached (the earliest
+                    // deleters win).
+                    if existing.is_empty() || existing.len() % ID_LEN != 0 {
+                        continue;
+                    }
+                    if existing.chunks(ID_LEN).any(|chunk| chunk == pubkey) {
+                        continue;
+                    }
+                    if existing.len() >= ID_LEN * SCOPED_TOMBSTONE_MAX {
+                        continue;
+                    }
+                    let mut merged = existing.to_vec();
+                    merged.extend_from_slice(pubkey);
+                    self.deleted.put(&mut wtxn, &id, &merged)?;
+                    recorded += 1;
+                }
+                None => {
+                    self.deleted.put(&mut wtxn, &id, pubkey)?;
+                    recorded += 1;
+                }
+            }
+        }
+        wtxn.commit()?;
+        Ok(recorded)
+    }
+
     /// NIP-59: deletes every stored `kind:1059` event addressed to `pubkey`.
     ///
     /// Walks the reserved [`GIFT_WRAP_INDEX`] namespace — one narrow range

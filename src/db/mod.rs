@@ -418,6 +418,15 @@ enum Msg {
         /// skipped purge as success.
         reply: oneshot::Sender<Option<usize>>,
     },
+    /// Migration-only: records NIP-09 re-publication blocks for deletion
+    /// targets absent from the database, scoped to the deletion's author
+    /// (see `Store::record_absent_deletion_targets`). `None` when the write
+    /// failed: the migration must not report a completed run.
+    RecordAbsentDeletionTargets {
+        pubkey: Vec<u8>,
+        targets: Vec<String>,
+        reply: oneshot::Sender<Option<usize>>,
+    },
     PrefixExists {
         prefix: Vec<u8>,
         reply: oneshot::Sender<bool>,
@@ -752,6 +761,7 @@ fn msg_bytes(msg: &Msg) -> usize {
             )
             .saturating_add(request_pubkey.as_deref().map_or(0, str::len))
             .saturating_add(group.as_deref().map_or(0, str::len)),
+        Msg::RecordAbsentDeletionTargets { targets, .. } => targets.iter().map(String::len).sum(),
         _ => 0,
     }
 }
@@ -1620,6 +1630,20 @@ impl DbClient {
             .await
     }
 
+    /// Like [`Self::put_batch`], reporting a lost writer (or a dropped
+    /// reply) as `None` instead of degrading to an empty outcome vector.
+    /// The migration must not mistake a failed batch for "no events were
+    /// stored" and report a completed run. Takes shared [`Arc`]s so the
+    /// caller can apply per-event side effects after the commit without
+    /// deep-copying the batch.
+    pub async fn put_batch_checked(
+        &self,
+        events: Vec<(Arc<Event>, u64)>,
+    ) -> Option<Vec<PutOutcome>> {
+        self.request_write_checked(|reply| Msg::PutBatch { events, reply })
+            .await
+    }
+
     /// Queues a batch for the writer and returns the reply receiver
     /// without awaiting it: the connection can keep reading frames while
     /// the writer commits, instead of stalling on the commit (and letting
@@ -2016,6 +2040,25 @@ impl DbClient {
             reply,
         })
         .await
+    }
+
+    /// Migration-only: records NIP-09 re-publication blocks for deletion
+    /// targets absent from the database, scoped to the deletion's author
+    /// (see `Store::record_absent_deletion_targets`). Returns how many
+    /// markers were written, or `None` when the write failed (the migration
+    /// must not report a completed run).
+    pub async fn record_absent_deletion_targets(
+        &self,
+        pubkey: [u8; 32],
+        targets: Vec<String>,
+    ) -> Option<usize> {
+        self.request_write_checked(|reply| Msg::RecordAbsentDeletionTargets {
+            pubkey: pubkey.to_vec(),
+            targets,
+            reply,
+        })
+        .await
+        .flatten()
     }
 
     pub async fn event_id_prefix_exists(&self, prefix: &[u8]) -> bool {

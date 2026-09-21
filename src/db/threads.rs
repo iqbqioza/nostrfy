@@ -1228,6 +1228,26 @@ pub(crate) fn spawn(
                                     };
                                     let _ = reply.send(n);
                                 }
+                                Msg::RecordAbsentDeletionTargets {
+                                    pubkey,
+                                    targets,
+                                    reply,
+                                } => {
+                                    // A failed write replies `None`: the
+                                    // migration must not report a completed
+                                    // run when a re-publication block is
+                                    // missing.
+                                    let n = match store
+                                        .record_absent_deletion_targets(&pubkey, &targets)
+                                    {
+                                        Ok(n) => Some(n),
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            None
+                                        }
+                                    };
+                                    let _ = reply.send(n);
+                                }
                                 Msg::PrefixExists { prefix, reply } => {
                                     let exists = match store.event_id_prefix_exists(&prefix) {
                                         Ok(exists) => exists,
