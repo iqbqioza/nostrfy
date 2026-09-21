@@ -420,6 +420,11 @@ pub struct Conn {
     /// Byte budget for a single REQ response (`limits.max_req_response_bytes`,
     /// cached once per connection; 0 = unlimited).
     pub(crate) req_response_bytes: u64,
+    /// Maximum inbound frame size (`limits.max_ws_message_bytes`, refreshed
+    /// on SIGHUP like the queue budgets): an operator lowering the limit to
+    /// shed oversized frames must not have to wait for every existing
+    /// connection to reconnect.
+    pub(crate) max_msg_size: usize,
     /// The relay-wide pending-response byte budget shared by every
     /// connection; each materialized response reserves its size against it
     /// and over-budget responses fail with a retryable CLOSED.
@@ -1046,6 +1051,7 @@ impl Conn {
             self.require_auth = cfg.relay.require_auth;
             self.out_queue_bytes = cfg.limits.max_out_queue_bytes;
             self.req_response_bytes = cfg.limits.max_req_response_bytes;
+            self.max_msg_size = cfg.limits.max_ws_message_bytes;
             self.outbox_write_policy = cfg.server.outbox_write_policy.clone();
             self.inbox_write_policy = cfg.server.inbox_write_policy.clone();
         }
@@ -1402,6 +1408,7 @@ pub async fn handle_connection(
         out_bytes: 0,
         out_queue_bytes,
         req_response_bytes,
+        max_msg_size,
         subs: HashMap::new(),
         sub_bytes: 0,
         neg: HashMap::new(),
@@ -1555,13 +1562,12 @@ pub async fn handle_connection(
                     Ok(Message::Close(_)) => break,
                     Ok(frame) => {
                         last_activity = std::time::Instant::now();
-                        if conn.handle_frame(frame, max_msg_size).await {
-                            break;
-                        }
-                        // Refresh the cached NIP-40/NIP-42 flags only when
-                        // the config actually changed (the version bumps on
-                        // every SIGHUP reload): the hot frame path never
-                        // takes the shared config lock.
+                        // Refresh the cached flags and budgets *before*
+                        // handling the frame, so a SIGHUP-lowered
+                        // `max_ws_message_bytes` already applies to the
+                        // first frame after the reload (the version bumps
+                        // on every reload): the hot path never takes the
+                        // shared config lock otherwise.
                         let version = conn
                             .relay
                             .config_version
@@ -1569,6 +1575,9 @@ pub async fn handle_connection(
                         if version != conn.config_version {
                             conn.config_version = version;
                             conn.refresh_config_cache().await;
+                        }
+                        if conn.handle_frame(frame, conn.max_msg_size).await {
+                            break;
                         }
                     }
                 }
@@ -1604,7 +1613,18 @@ pub async fn handle_connection(
                         _ = &mut window_deadline => break,
                     };
                     last_activity = std::time::Instant::now();
-                    if conn.handle_frame(frame, max_msg_size).await {
+                    // A reload during the batch window (a SIGHUP handled
+                    // between frames) must refresh before the next frame is
+                    // size-checked, like the single-frame path above.
+                    let version = conn
+                        .relay
+                        .config_version
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    if version != conn.config_version {
+                        conn.config_version = version;
+                        conn.refresh_config_cache().await;
+                    }
+                    if conn.handle_frame(frame, conn.max_msg_size).await {
                         too_large = true;
                         break;
                     }
@@ -1612,7 +1632,7 @@ pub async fn handle_connection(
                     // it through the post-window path instead of reading the
                     // rest of the window (which let a flood of maximum-size
                     // frames pile up parsed events before validation).
-                    if conn.pending_batch_full(max_msg_size) {
+                    if conn.pending_batch_full(conn.max_msg_size) {
                         break;
                     }
                     // Slide the window: the next frame extends the batch
@@ -1976,10 +1996,18 @@ mod tests {
     /// Builds a connection on a pre-built relay (for tests that need
     /// several connections sharing one relay + subscription index).
     async fn build_conn_on(relay: Arc<Relay>) -> Conn {
-        let (out_queue_bytes, expiry_enabled, giftwrap_restricted, nip78_restricted, require_auth) = {
+        let (
+            out_queue_bytes,
+            max_msg_size,
+            expiry_enabled,
+            giftwrap_restricted,
+            nip78_restricted,
+            require_auth,
+        ) = {
             let cfg = relay.config.read().await;
             (
                 cfg.limits.max_out_queue_bytes,
+                cfg.limits.max_ws_message_bytes,
                 cfg.nip_enabled(40),
                 cfg.nip_enabled(42),
                 cfg.nip_enabled(78) && cfg.relay.enabled_nip78_auth,
@@ -2019,6 +2047,7 @@ mod tests {
             out_bytes: 0,
             out_queue_bytes,
             req_response_bytes: 0,
+            max_msg_size,
             pending_reqs: std::collections::VecDeque::new(),
             subs: HashMap::new(),
             sub_bytes: 0,
@@ -4098,6 +4127,34 @@ mod tests {
                 "an anonymous live sub must be closed on a require_auth flip: {msgs:?}"
             );
             assert!(conn.subs.is_empty());
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn max_message_size_refreshes_on_reload() {
+        // `limits.max_ws_message_bytes` is refreshed with the other cached
+        // budgets: an operator lowering it to shed oversized frames must
+        // not have to wait for every existing connection to reconnect.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_relay_with("").await;
+            let mut conn = build_conn_on(relay.clone()).await;
+            let initial = conn.max_msg_size;
+            assert!(initial > 0);
+            relay.config.write().await.limits.max_ws_message_bytes = initial / 2;
+            conn.refresh_config_cache().await;
+            assert_eq!(
+                conn.max_msg_size,
+                initial / 2,
+                "the reload must refresh the inbound frame size limit"
+            );
+            // The refreshed limit is what the frame path enforces.
+            let oversized = Message::Text("x".repeat(initial / 2 + 1).into());
+            assert!(
+                conn.handle_frame(oversized, conn.max_msg_size).await,
+                "a frame over the refreshed limit must close the connection"
+            );
             relay.db.shutdown();
         });
     }

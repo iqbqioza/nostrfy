@@ -48,6 +48,11 @@ pub(crate) const LIVE_QUEUE_CAPACITY: usize = 64;
 
 pub struct Relay {
     pub config: Arc<RwLock<Config>>,
+    /// The live access state. Runtime mutations must pair an apply with
+    /// [`Self::push_access_ops`]: `persist_access` replaces this state with
+    /// the persisted view merged with the queued ops, so an unqueued
+    /// mutation would be reverted on the next persist (and a reload would
+    /// drop it). See [`crate::config::AccessOp`].
     pub access: Arc<RwLock<AccessControl>>,
     pub db: DbClient,
     pub stats: Arc<Stats>,

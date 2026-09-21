@@ -137,16 +137,21 @@ impl Cli {
                 // bind between check and start); `prepare` re-checks the
                 // port right before forking.
                 ensure_port_available(&cfg)?;
-                // Acquire and release the database directory lock: proves
-                // the directory is usable and no second relay holds it.
-                drop(
-                    crate::db::lock_database_dir(&cfg.database.path).map_err(|e| {
-                        config_err(format!(
+                // Probe the database directory without failing on a live
+                // instance: `check` must keep working while the relay runs.
+                // A lockable directory proves it is usable; a lock held by
+                // another instance is the expected running case, not an
+                // error. Any other failure (unwritable path, bad mount) is.
+                match crate::db::lock_database_dir(&cfg.database.path) {
+                    Ok(guard) => drop(guard),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(e) => {
+                        return Err(config_err(format!(
                             "database directory {} is not usable: {e}",
                             cfg.database.path.display()
-                        ))
-                    })?,
-                );
+                        )));
+                    }
+                }
                 print_line(&format!("configuration OK: {}", cfg.relay.name));
                 return Ok(());
             }
@@ -903,7 +908,19 @@ impl Cli {
             if let Err(e) = std::fs::rename(&exe, &backup) {
                 return Err(anyhow!(format!("cannot back up the current binary: {e}")));
             }
-            std::fs::rename(&tmp, &exe)?;
+            if let Err(e) = std::fs::rename(&tmp, &exe) {
+                // The original is currently at `backup`: restore it before
+                // failing, or a failed replace would leave no binary at the
+                // configured path at all.
+                if let Err(restore) = std::fs::rename(&backup, &exe) {
+                    return Err(anyhow!(format!(
+                        "replacing the binary failed ({e}) and restoring the backup failed \
+                         ({restore}); the previous binary is at {}",
+                        backup.display()
+                    )));
+                }
+                return Err(anyhow!(format!("replacing the binary failed: {e}")));
+            }
             // fsync the directory so the rename survives a power loss, not
             // just a process crash.
             if let Ok(d) = std::fs::File::open(dir) {
@@ -2664,6 +2681,54 @@ name = \"nostrfy\"\n",
             control.blocked_ips.entries().is_empty(),
             "the entry must be removed from the persisted state"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn check_passes_while_an_instance_holds_the_database() {
+        // `nostrfy check` is routinely run while the relay is up: the
+        // database-directory probe must treat a lock held by a live
+        // instance as the expected running case, not as an unusable path.
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir()
+            .join("nostrfy-check-running-test")
+            .join(format!("{:x}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // A fixed non-ephemeral port (see the readiness-probe tests): a
+        // concurrently running test's `bind(..:0)` cannot steal it.
+        let mut picked = None;
+        for port in 8765..=8795u16 {
+            if let Ok(listener) = std::net::TcpListener::bind(("127.0.0.1", port)) {
+                picked = Some((listener, port));
+                break;
+            }
+        }
+        let (free, port) = picked.expect("a fixed test port must be bindable");
+        drop(free);
+        let config_path = dir.join("nostrfy.toml");
+        let db_path = dir.join("db");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[server]\nhost = \"127.0.0.1\"\nport = {port}\n[database]\npath = {:?}\n",
+                db_path.display().to_string()
+            ),
+        )
+        .unwrap();
+        let mut cli = Cli {
+            config: config_path,
+            command: Command::Check,
+            daemonized: false,
+        };
+        // Hold the lock like a running relay.
+        let held = crate::db::lock_database_dir(&db_path).expect("the lock file opens");
+        cli.prepare()
+            .expect("check must pass while an instance holds the database");
+        // Without a holder the probe still passes.
+        drop(held);
+        cli.prepare().expect("check must pass with the lock free");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

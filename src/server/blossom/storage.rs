@@ -620,15 +620,18 @@ impl BlobStore {
         let npub = npub_of(pubkey);
         let legacy = legacy_npub_of(pubkey);
         let mut existed = false;
+        // Both spellings are this owner's copies of the same bytes (a
+        // pre-upgrade upload under the legacy bech32m directory plus a
+        // post-upgrade one under the canonical bech32 directory). Delete
+        // must remove every copy, not stop at the first hit: a leftover
+        // legacy file would survive the owner's delete as an unserved
+        // orphan on disk. A missing file is `Ok(false)`.
         for candidate in [npub.as_str(), legacy.as_str()] {
             let hit = match &self.storage {
                 Storage::Local(s) => s.delete(candidate, sha256).await?,
                 Storage::S3(s) => s.delete(candidate, sha256).await?,
             };
             existed |= hit;
-            if hit {
-                break;
-            }
         }
         let (removed, db_ok) = self.db.blossom_remove_owner_checked(sha256, pubkey).await;
         if !db_ok {
@@ -1793,6 +1796,36 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Relaxed),
             before + 1,
             "a successful lookup must not be counted"
+        );
+        s.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn delete_removes_both_canonical_and_legacy_copies() {
+        // A pre-upgrade upload lives under the legacy bech32m directory and
+        // a post-upgrade one under the canonical bech32 directory: both are
+        // the owner's copies of the same bytes, so one delete must remove
+        // both (a leftover legacy file would survive as an unserved orphan).
+        let (s, _db_path) = store("delete-legacy").await;
+        let a = pk(1);
+        let sha = "aa".repeat(32);
+        s.put(&a, &sha, b"both copies", "text/plain").await.unwrap();
+        let legacy_dir = local(&s).root.join(legacy_npub_of(&a));
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+        let legacy_file = legacy_dir.join(&sha);
+        std::fs::write(&legacy_file, b"both copies").unwrap();
+        assert!(legacy_file.exists());
+        assert!(
+            s.delete(&a, &sha).await.unwrap(),
+            "the delete must report the copies it removed"
+        );
+        assert!(!legacy_file.exists(), "the legacy copy must be removed too");
+        assert!(
+            matches!(
+                s.open_stream(&a, &sha, 0, 1).await.unwrap(),
+                OpenOutcome::Missing
+            ),
+            "the canonical copy must be removed"
         );
         s.db.shutdown();
     }

@@ -5092,6 +5092,54 @@ fn vanish_reports_whether_group_state_was_removed() {
 }
 
 #[test]
+fn search_finds_a_word_too_long_to_index() {
+    // A word longer than the index key limit can never have its own index
+    // range, so the event must carry the overflow marker (the full-content
+    // walk). Without the marker, a query mixing an indexed term with the
+    // long term walked only the indexed term's range and missed the event.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        32,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let long = "a".repeat(600);
+        let ev = event(1, &format!("short {long}"), now, vec![]);
+        assert_eq!(db.put(ev.clone(), now).await, PutOutcome::Stored);
+        // Mixed query: the indexable term routes to the word walk, the long
+        // term can only be found through the overflow marker.
+        let f: Filter =
+            serde_json::from_value(serde_json::json!({"search": format!("zzz {long}")})).unwrap();
+        let (res, _) = db.query(vec![f], 500, now).await;
+        assert_eq!(
+            res.len(),
+            1,
+            "an event containing a too-long word must be found via the overflow walk"
+        );
+        assert_eq!(res[0].id, ev.id);
+        // A long-only query falls through to the time-range scan.
+        let f: Filter = serde_json::from_value(serde_json::json!({"search": long})).unwrap();
+        let (res, _) = db.query(vec![f], 500, now).await;
+        assert_eq!(res.len(), 1, "the long-word-only query must match");
+        // Removal drops the marker (mirroring the put rule).
+        db.apply_deletion(vec![ev.id.clone()], vec![], Some(ev.pubkey.clone()), now)
+            .await;
+        let f: Filter =
+            serde_json::from_value(serde_json::json!({"search": format!("zzz {long}")})).unwrap();
+        let (res, _) = db.query(vec![f], 500, now).await;
+        assert!(res.is_empty(), "the marker must be removed with the event");
+    });
+    db.shutdown();
+}
+
+#[test]
 fn search_limit_applies_to_the_union_of_indexed_and_overflow_matches() {
     // A limit reached while walking the indexed term ranges must not skip
     // the overflow-only matches: both ranges belong to the same merged

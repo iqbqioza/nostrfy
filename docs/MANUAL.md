@@ -578,6 +578,8 @@ From these moderation events, the relay generates the following **relay-signed s
 | `restricted` | Only members can write |
 | `hidden` | Metadata is hidden from non-members |
 | `closed` | Join requests are not auto-approved (invite codes required) |
+
+> **Invite codes accumulate and are reusable**: a `kind:9009` adds codes to the group (it does not replace the set), and a code is not consumed by a join. Up to 100 codes are kept per group. To revoke a leaked code, delete the `9009` event that created it with a NIP-09 deletion request (the group state rebuilds from the surviving events, dropping the deleted event's codes).
 | `livekit` | The group has a LiveKit audio/video room |
 
 ### Subgroups
