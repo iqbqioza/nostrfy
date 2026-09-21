@@ -909,10 +909,13 @@ impl DbClient {
         // NIP-09 deletion resumes): the server's startup state restore and
         // its stale-state check must observe the completed recovery and
         // its outcome flag, never race the writer. A receive error means
-        // the writer thread exited during startup (a panic): the client is
-        // still returned, and the missing writer surfaces as failed writes.
+        // the writer thread exited during startup (a panic): starting to
+        // serve without a writer would bind the relay and pass readiness
+        // while every write fails, so refuse startup instead.
         if threads.recovery_rx.recv().is_err() {
-            log::error!("database writer exited before completing startup recovery");
+            return Err(anyhow::anyhow!(
+                "database writer exited before completing startup recovery"
+            ));
         }
         Ok(DbClient {
             tx: threads.tx,

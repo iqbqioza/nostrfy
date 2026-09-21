@@ -27,7 +27,13 @@ pub fn strip_nostr_scheme(value: &str) -> Option<&str> {
     scheme.eq_ignore_ascii_case("Nostr").then_some(token)
 }
 
-/// Verifies an encoded NIP-98 event. When `expected_pubkey` is given the
+/// Verifies an encoded NIP-98 event. The token is accepted in both the
+/// spec's standard Base64 and the Base64url-without-padding form some
+/// client libraries emit (the Blossom endpoints already accept both, so
+/// rejecting the url-safe form here would 401 legitimate clients on the
+/// NIP-86 and LiveKit routes). Decoding is the only leniency: the JSON,
+/// signature and tag checks below are strict.
+/// When `expected_pubkey` is given the
 /// event must be authored by it; when `require_payload` is set the event
 /// must carry a `payload` tag (NIP-86 requires it); when
 /// `expected_payload_hash` is given the tag value must additionally equal
@@ -46,6 +52,7 @@ pub fn verify(
 ) -> Option<Verified> {
     let raw = base64::engine::general_purpose::STANDARD
         .decode(encoded)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(encoded))
         .ok()?;
     let event: Event = serde_json::from_slice(&raw).ok()?;
     if event.kind != AUTH_KIND {
@@ -235,6 +242,32 @@ mod tests {
 
     fn encode(ev: &Event) -> String {
         base64::engine::general_purpose::STANDARD.encode(serde_json::to_string(ev).unwrap())
+    }
+
+    fn encode_url_safe_no_pad(ev: &Event) -> String {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_string(ev).unwrap())
+    }
+
+    #[test]
+    fn verify_accepts_base64url_without_padding() {
+        // Client libraries emit the auth event in either Base64 form; the
+        // Blossom endpoints accept both, so NIP-98 verification must too
+        // (otherwise NIP-86 and LiveKit 401 legitimate clients).
+        let secp = Secp256k1::new();
+        let now = unix_now();
+        let ev = signed_event(Some("POST"), "https://relay.example.com/", now);
+        let check = |encoded: &str| {
+            verify(encoded, None, &secp, false, None, "POST", |u| {
+                u == "https://relay.example.com/"
+            })
+            .is_some()
+        };
+        assert!(check(&encode(&ev)), "standard Base64 must verify");
+        assert!(
+            check(&encode_url_safe_no_pad(&ev)),
+            "Base64url without padding must verify"
+        );
+        assert!(!check("!!!not-base64!!!"), "garbage must not verify");
     }
 
     #[test]

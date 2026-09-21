@@ -1097,11 +1097,14 @@ fn wait_for_ready(cfg: &Config, pid: Option<u32>) -> Result<()> {
 }
 
 /// Whether `addr` answers HTTP: connects, sends a minimal `GET /health`
-/// request and requires an `HTTP/` status line. A bare TCP accept proves
+/// request and requires a `2xx` status line. A bare TCP accept proves
 /// only that *something* holds the port — the HTTP layer can be wedged
 /// while the listener still accepts — so the readiness probe must see an
-/// actual response. Any status (200, 503, ...) counts: the point is that
-/// the server, not just the socket, is up.
+/// actual response. A `503` from `/health` means the relay is up but
+/// refusing writes (disk full / map full / writer gone): that state does
+/// not self-heal, so it must not count as ready for `nostrfy start` (which
+/// would otherwise report `nostrfy started` for a read-only relay and let
+/// deploy automation believe a full-disk relay is healthy).
 fn probe_http(addr: &std::net::SocketAddr) -> bool {
     use std::io::{Read, Write};
     let Ok(stream) = std::net::TcpStream::connect_timeout(addr, Duration::from_millis(500)) else {
@@ -1129,7 +1132,7 @@ fn probe_http(addr: &std::net::SocketAddr) -> bool {
         return false;
     }
     // The status line fits in the first bytes; read until the first LF
-    // (bounded) and require the HTTP version prefix.
+    // (bounded) and require a 2xx status after the HTTP version prefix.
     let mut line = Vec::with_capacity(64);
     let mut byte = [0u8; 1];
     loop {
@@ -1146,7 +1149,22 @@ fn probe_http(addr: &std::net::SocketAddr) -> bool {
             }
         }
     }
-    line.starts_with(b"HTTP/")
+    http_status_ready(&line)
+}
+
+/// Whether a raw HTTP status line reports success (`HTTP/1.x 2xx ...`).
+/// Split out for unit testing: the probe itself needs a live socket.
+fn http_status_ready(line: &[u8]) -> bool {
+    let mut parts = line.split(|b| *b == b' ');
+    let version = parts.next().unwrap_or_default();
+    if !version.starts_with(b"HTTP/") {
+        return false;
+    }
+    // 200-299: the relay is serving reads and writes. Anything else —
+    // notably the 503 `/health` returns while refusing writes — is not
+    // ready.
+    let code = parts.next().unwrap_or_default();
+    code.len() == 3 && code[0] == b'2' && code[1].is_ascii_digit() && code[2].is_ascii_digit()
 }
 
 fn wait_for_ready_within(cfg: &Config, pid: Option<u32>, timeout: Duration) -> Result<()> {
@@ -2218,19 +2236,42 @@ name = \"nostrfy\"\n",
     }
 
     /// A minimal HTTP responder for the readiness-probe tests: the probe
-    /// requires an actual `HTTP/` status line, so a bare `TcpListener`
-    /// would never satisfy it.
+    /// requires a `2xx` status line, so a bare `TcpListener` would never
+    /// satisfy it.
     fn http_responder(bind: &str) -> (std::net::TcpListener, std::thread::JoinHandle<()>) {
+        http_responder_with_status(bind, "200 OK")
+    }
+
+    /// Like [`http_responder`], with an explicit status line (a `503`
+    /// responder models a relay that is up but refusing writes).
+    fn http_responder_with_status(
+        bind: &str,
+        status: &'static str,
+    ) -> (std::net::TcpListener, std::thread::JoinHandle<()>) {
         let listener = std::net::TcpListener::bind(format!("{bind}:0")).unwrap();
         let serving = listener.try_clone().unwrap();
         let handle = std::thread::spawn(move || {
             for stream in serving.incoming().take(50) {
                 let Ok(mut stream) = stream else { break };
                 use std::io::Write;
-                let _ = stream.write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n");
+                let _ = stream.write_all(
+                    format!("HTTP/1.0 {status}\r\nContent-Length: 0\r\n\r\n").as_bytes(),
+                );
             }
         });
         (listener, handle)
+    }
+
+    #[test]
+    fn http_status_ready_accepts_only_2xx() {
+        assert!(http_status_ready(b"HTTP/1.0 200 OK\r"));
+        assert!(http_status_ready(b"HTTP/1.1 299 anything\r"));
+        assert!(!http_status_ready(b"HTTP/1.0 503 Service Unavailable\r"));
+        assert!(!http_status_ready(b"HTTP/1.1 500 Internal Server Error\r"));
+        assert!(!http_status_ready(b"HTTP/1.0 301 Moved\r"));
+        assert!(!http_status_ready(b"garbage\r"));
+        assert!(!http_status_ready(b"HTTP/1.0\r"));
+        assert!(!http_status_ready(b"HTTP/1.0 20 OK\r"));
     }
 
     #[test]
@@ -2298,6 +2339,28 @@ name = \"nostrfy\"\n",
         cfg.server.port = free_port;
         let err = wait_for_ready_within(&cfg, None, Duration::from_millis(300)).unwrap_err();
         assert!(err.to_string().contains("did not become ready"), "{err}");
+        let _ = std::fs::remove_file(&cfg.daemon.pid_file);
+    }
+
+    #[test]
+    fn readiness_probe_rejects_a_relay_refusing_writes() {
+        // A relay that answers 503 (up but refusing writes: disk full or
+        // writer gone) must not count as ready: `nostrfy start` must not
+        // report `nostrfy started` for a read-only relay.
+        let (listener, _responder) =
+            http_responder_with_status("127.0.0.1", "503 Service Unavailable");
+        let mut cfg = Config::default();
+        cfg.daemon.pid_file =
+            std::env::temp_dir().join(format!("nostrfy-ready-503-{:x}.pid", std::process::id()));
+        let _ = std::fs::remove_file(&cfg.daemon.pid_file);
+        cfg.server.host = "127.0.0.1".into();
+        cfg.server.port = listener.local_addr().unwrap().port();
+        let err = wait_for_ready_within(&cfg, None, Duration::from_millis(300)).unwrap_err();
+        assert!(
+            err.to_string().contains("did not become ready"),
+            "a 503 relay must not satisfy the probe: {err}"
+        );
+        let _ = std::fs::remove_file(&cfg.daemon.pid_file);
     }
 
     #[test]

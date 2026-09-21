@@ -246,7 +246,7 @@ Set this whenever a reverse proxy (nginx, Caddy, a cloud load balancer, Cloudfla
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
 | `max_content_bytes` | integer | `65536` | Max event content length in **characters** |
-| `max_groups` | integer | `1000` | Cap on the in-memory NIP-29 group store (active groups + deleted-group markers). Creates beyond it are rejected with `restricted: group limit reached`. Must be ≥ 1 (`0` is rejected) |
+| `max_groups` | integer | `1000` | Cap on the in-memory NIP-29 group store (active groups + deleted-group markers). Creates beyond it are rejected with `restricted: group limit reached`. Must be ≥ 1 (`0` is rejected). Canonical key `relay.max_groups` (see §3); the `[limits]` spelling is a legacy alias |
 | `max_tags` | integer | `2000` | Max tags per event |
 | `max_tag_value_bytes` | integer | `1024` | Max bytes per tag value |
 | `max_created_at_future_secs` | integer | `3600` | Tolerated future skew of `created_at` (seconds) |
@@ -586,7 +586,7 @@ Unknown keys or sections produce **warnings** (not errors), so typos are visible
 
 ## 10. Reloading at runtime (SIGHUP)
 
-Editing the file and sending `kill -HUP $(cat nostrfy.pid)` reloads it **without a restart**. The reload is **not all-or-nothing**: every setting that can be applied live is applied, even when the same file also changes a startup-only setting. Startup-only settings keep their running values; each changed one is warned about (`<key> changed in the reloaded config but the routes are fixed at startup; a restart is required to apply it`), and a changed `relay.private_key` is warned about and ignored because the signing key is fixed at startup. A file that **fails validation** is rejected as a whole (the error is logged and the old configuration stays in force).
+Editing the file and sending `kill -HUP $(cat nostrfy.pid)` reloads it **without a restart**. The reload is **not all-or-nothing**: every setting that can be applied live is applied, even when the same file also changes a startup-only setting. Startup-only settings keep their running values; each changed one is warned about (`<key> changed in the reloaded config but the routes are fixed at startup; a restart is required to apply it`), and a changed `relay.private_key` is warned about and ignored because the signing key is fixed at startup. A file that **fails validation** is rejected as a whole (the error is logged and the old configuration stays in force) — except the database-owned allow/deny lists (NIP-86 access lists, relay pubkey lists, Blossom allowlist), which still refresh from the database on every reload attempt, in the fail-safe direction.
 
 | Applies on SIGHUP | Requires `nostrfy restart` |
 | --- | --- |

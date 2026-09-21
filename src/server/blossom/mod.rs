@@ -1583,9 +1583,17 @@ async fn delete_blob(
 
 /// Builds the shared Blossom state from the config (or `None` when the
 /// feature is disabled). Must be called before the router is built.
-pub(crate) async fn build_state(cfg: &Config, relay: &Relay) -> Option<Arc<BlossomState>> {
+/// Builds the Blossom media state: `None` when no Blossom host is
+/// configured (media serving stays off), `Some` when the backend
+/// initialized. A configured host whose backend fails to initialize is an
+/// `Err`: serving the relay without its configured media would mask the
+/// outage as a healthy relay, so startup must refuse instead.
+pub(crate) async fn build_state(
+    cfg: &Config,
+    relay: &Relay,
+) -> anyhow::Result<Option<Arc<BlossomState>>> {
     if cfg.blossom.host.trim().is_empty() {
-        return None;
+        return Ok(None);
     }
     let s3 = if cfg.blossom.storage == "s3" {
         Some(storage::S3Config {
@@ -1651,12 +1659,9 @@ pub(crate) async fn build_state(cfg: &Config, relay: &Relay) -> Option<Arc<Bloss
                     }
                 });
             }
-            Some(state)
+            Ok(Some(state))
         }
-        Err(e) => {
-            log::error!("blossom storage failed to initialize: {e}");
-            None
-        }
+        Err(e) => Err(anyhow::anyhow!("blossom storage failed to initialize: {e}")),
     }
 }
 
@@ -1682,6 +1687,30 @@ mod tests {
     use super::*;
     use crate::event::Event;
     use secp256k1::{Keypair, Secp256k1, XOnlyPublicKey};
+
+    #[tokio::test]
+    async fn build_state_fails_closed_when_storage_init_fails() {
+        // A configured Blossom host whose backend cannot initialize must
+        // refuse startup (Err), not serve the relay without its media
+        // (None would mask the outage as a healthy relay).
+        let relay = build_blossom_relay(0).await;
+        let mut cfg = relay.config.read().await.clone();
+        cfg.blossom.storage = "bogus-backend".into();
+        match build_state(&cfg, &relay).await {
+            Err(e) => assert!(
+                e.to_string()
+                    .contains("blossom storage failed to initialize"),
+                "{e}"
+            ),
+            Ok(_) => panic!("an unusable backend must fail closed"),
+        }
+        // Disabled Blossom stays off without an error.
+        cfg.blossom.host.clear();
+        assert!(
+            build_state(&cfg, &relay).await.unwrap().is_none(),
+            "no host means no media state, not a failure"
+        );
+    }
 
     /// Builds a relay with the Blossom feature enabled on local storage.
     async fn build_blossom_relay(min_free_bytes: u64) -> Arc<Relay> {
@@ -1727,7 +1756,9 @@ mod tests {
         .await;
         relay.start_live_bus();
         let relay = Arc::new(relay);
-        let state = build_state(&relay.config.read().await.clone(), &relay).await;
+        let state = build_state(&relay.config.read().await.clone(), &relay)
+            .await
+            .expect("test Blossom backend must initialize");
         *relay.blossom.write().await = state;
         relay
     }

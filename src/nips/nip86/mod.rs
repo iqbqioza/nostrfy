@@ -738,6 +738,16 @@ fn is_pubkey(value: &str) -> bool {
     hex::decode(value).map(|b| b.len() == 32).unwrap_or(false)
 }
 
+/// Extracts the token from an `Authorization: Bearer <token>` header
+/// value. The scheme is case-insensitive (RFC 9110, like the NIP-98
+/// `Nostr` scheme): a case-sensitive comparison 401s clients sending
+/// `bearer` or `BEARER`. Returns `None` for another scheme or a scheme
+/// with no token.
+fn strip_bearer_scheme(value: &str) -> Option<&str> {
+    let (scheme, token) = value.split_once(' ')?;
+    scheme.eq_ignore_ascii_case("Bearer").then_some(token)
+}
+
 /// Constant-time comparison for the management token: the token must not be
 /// recoverable through response-timing differences of the comparison. The
 /// length check short-circuits (the length is not secret), and equal-length
@@ -773,7 +783,7 @@ async fn rpc_authenticated(
         && let Some(token) = headers
             .get(header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
+            .and_then(strip_bearer_scheme)
         && ct_eq(token, &cfg.rpc.management_token)
     {
         return Some("management-token".into());
@@ -874,6 +884,19 @@ mod tests {
             serde_json::to_string(&json!({ "method": method, "params": params })).unwrap(),
         )
         .await
+    }
+
+    #[test]
+    fn bearer_scheme_is_case_insensitive() {
+        // RFC 9110: auth-schemes are case-insensitive; a client sending
+        // `bearer` must authenticate like one sending `Bearer`.
+        assert_eq!(strip_bearer_scheme("Bearer tok"), Some("tok"));
+        assert_eq!(strip_bearer_scheme("bearer tok"), Some("tok"));
+        assert_eq!(strip_bearer_scheme("BEARER tok"), Some("tok"));
+        assert_eq!(strip_bearer_scheme("BeArEr tok"), Some("tok"));
+        assert_eq!(strip_bearer_scheme("Nostr tok"), None);
+        assert_eq!(strip_bearer_scheme("Bearer"), None);
+        assert_eq!(strip_bearer_scheme(""), None);
     }
 
     #[tokio::test]

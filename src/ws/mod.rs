@@ -1207,31 +1207,38 @@ where
     let teardown = async {
         while let Some(frame) = conn.outgoing.pop_front() {
             let size = message_size(&frame.message);
+            // Uncount on pop and re-count only on a delivered send:
+            // whatever the teardown's fate (drained, send error, grace
+            // expiry mid-send), a frame still queued or stuck in flight
+            // is never reported as wire traffic, and a delivered frame
+            // always is. The rest-uncount below then stays correct even
+            // when the grace drops this future mid-send.
             conn.out_bytes = conn.out_bytes.saturating_sub(size);
+            conn.out_msgs = conn.out_msgs.saturating_sub(1);
+            conn.out_bytes_total = conn.out_bytes_total.saturating_sub(size as u64);
             if sender.send(frame.message).await.is_err() {
-                // The popped frame never reached the socket: uncount it
-                // like the purge path does, and fall through to uncount
-                // the rest of the abandoned queue below.
-                conn.out_msgs = conn.out_msgs.saturating_sub(1);
-                conn.out_bytes_total = conn.out_bytes_total.saturating_sub(size as u64);
                 break;
             }
+            conn.out_msgs = conn.out_msgs.saturating_add(1);
+            conn.out_bytes_total = conn.out_bytes_total.saturating_add(size as u64);
         }
-        // Grace expiry (or the send error above) abandons whatever is
-        // still queued: those frames can never be received, so uncount
-        // them instead of reporting phantom traffic.
-        let mut rest_msgs = 0u64;
-        let mut rest_bytes = 0usize;
-        for frame in std::mem::take(&mut conn.outgoing) {
-            rest_msgs += 1;
-            rest_bytes = rest_bytes.saturating_add(message_size(&frame.message));
-        }
-        conn.out_bytes = conn.out_bytes.saturating_sub(rest_bytes);
-        conn.out_msgs = conn.out_msgs.saturating_sub(rest_msgs);
-        conn.out_bytes_total = conn.out_bytes_total.saturating_sub(rest_bytes as u64);
         let _ = sender.close().await;
     };
     let _ = tokio::time::timeout(grace, teardown).await;
+    // Grace expiry (or the send error above) abandons whatever is still
+    // queued: those frames can never be received, so uncount them instead
+    // of reporting phantom traffic. Runs unconditionally: the teardown
+    // above may have been dropped mid-send, in which case this is what
+    // releases the abandoned remainder.
+    let mut rest_msgs = 0u64;
+    let mut rest_bytes = 0usize;
+    for frame in std::mem::take(&mut conn.outgoing) {
+        rest_msgs += 1;
+        rest_bytes = rest_bytes.saturating_add(message_size(&frame.message));
+    }
+    conn.out_bytes = conn.out_bytes.saturating_sub(rest_bytes);
+    conn.out_msgs = conn.out_msgs.saturating_sub(rest_msgs);
+    conn.out_bytes_total = conn.out_bytes_total.saturating_sub(rest_bytes as u64);
 }
 
 pub async fn handle_connection(
@@ -5542,6 +5549,40 @@ mod tests {
             // its byte accounting released; the rest is abandoned.
             assert!(conn.outgoing.is_empty());
             assert_eq!(conn.out_bytes, 0);
+            // The grace dropped the teardown mid-send: the stuck frame
+            // never reached the wire, so it must not linger in the
+            // message/lifetime counters flushed to shared stats (phantom
+            // traffic after a stalling-peer disconnect).
+            assert_eq!(conn.out_msgs, 0);
+            assert_eq!(conn.out_bytes_total, 0);
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn neg_backpressure_applies_without_a_configured_queue_cap() {
+        // An unset byte cap (`0` = unlimited) used to disable the NEG
+        // backpressure gate entirely; it now falls back to the absolute
+        // control ceiling instead of bounding nothing.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            // Capped case (unchanged): 4x the configured cap refuses.
+            conn.out_queue_bytes = 100;
+            conn.out_bytes = 400;
+            assert!(!conn.neg_backpressured());
+            conn.out_bytes = 401;
+            assert!(conn.neg_backpressured());
+            // Unset cap: the control ceiling is the reference.
+            conn.out_queue_bytes = 0;
+            let ceiling = conn.out_queue_cap();
+            conn.out_bytes = ceiling.saturating_mul(4);
+            assert!(!conn.neg_backpressured());
+            conn.out_bytes = ceiling.saturating_mul(4).saturating_add(1);
+            assert!(
+                conn.neg_backpressured(),
+                "an unlimited queue must still refuse NEG past 4x the control ceiling"
+            );
             conn.relay.db.shutdown();
         });
     }

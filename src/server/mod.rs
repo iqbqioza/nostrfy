@@ -738,7 +738,7 @@ pub async fn run_server(
     // [`restore_role_state`]).
     restore_role_state(&relay).await?;
 
-    let blossom_state = blossom::build_state(&relay.config.read().await.clone(), &relay).await;
+    let blossom_state = blossom::build_state(&relay.config.read().await.clone(), &relay).await?;
     *relay.blossom.write().await = blossom_state.clone();
     let app = build_router(&relay, blossom_state).await;
 
@@ -2530,7 +2530,9 @@ mod tests {
         .await;
         // The Blossom handlers (and the root info document) require a live
         // storage state, exactly like `run_server`.
-        let state = blossom::build_state(&relay.config.read().await.clone(), &relay).await;
+        let state = blossom::build_state(&relay.config.read().await.clone(), &relay)
+            .await
+            .expect("test Blossom backend must initialize");
         *relay.blossom.write().await = state;
         Arc::new(relay)
     }

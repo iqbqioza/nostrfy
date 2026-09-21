@@ -23,6 +23,47 @@ pub fn log_errors() -> u64 {
     LOG_ERRORS.load(Ordering::Relaxed)
 }
 
+/// Logs a panic from the process-wide panic hook without deadlocking.
+/// The hook runs *before* the unwind, so a panic inside a log backend
+/// still holds the backend mutex on the panicking thread itself — a
+/// `lock()` here would block forever and hang the process instead of
+/// reporting the crash. `try_lock` falls back to a direct stderr write:
+/// a mutex held by a live thread (this one or another mid-write) can
+/// never be waited on from the hook, while a mutex poisoned by an
+/// already-dead thread is recovered and logged normally.
+pub fn log_panic(message: &str) {
+    enum Route {
+        Log,
+        Stderr,
+    }
+    let route = match LOGGER.inner.try_lock() {
+        Ok(guard) => {
+            let route = if guard.is_some() {
+                Route::Log
+            } else {
+                Route::Stderr
+            };
+            drop(guard);
+            route
+        }
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+            // The holder is dead and the guard was dropped during its
+            // unwind, so the backend state is usable: recover it like the
+            // normal log path does.
+            if poisoned.into_inner().is_some() {
+                Route::Log
+            } else {
+                Route::Stderr
+            }
+        }
+        Err(std::sync::TryLockError::WouldBlock) => Route::Stderr,
+    };
+    match route {
+        Route::Log => log::error!("{message}"),
+        Route::Stderr => eprintln!("{message}"),
+    }
+}
+
 fn bump_log_error() {
     // Saturate instead of wrapping, like the stats counters: a wrapped
     // value would hide that the logger is failing.
@@ -465,6 +506,17 @@ pub(crate) fn civil_from_days(z: i64) -> (i64, u32, u32) {
 mod tests {
     use super::*;
     use log::Log;
+
+    #[test]
+    fn panic_log_does_not_block_on_a_held_logger_mutex() {
+        // The panic hook runs before the unwind, so a panic inside a log
+        // backend still holds this mutex on the panicking thread: `lock()`
+        // would block forever. Hold it here like that panic would and
+        // require `log_panic` to return (via the stderr fallback) instead
+        // of hanging the test.
+        let _held = LOGGER.inner.lock().unwrap_or_else(|e| e.into_inner());
+        log_panic("test panic while the logger mutex is held");
+    }
 
     #[test]
     fn poison_then_log_recovers() {

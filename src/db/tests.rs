@@ -133,6 +133,40 @@ fn tag_filter_with_until_bounds_the_range() {
 }
 
 #[test]
+fn tag_range_never_panics_on_boundary_inputs() {
+    // The `tag_range` byte-slicing once panicked on an explicit `until`
+    // (wrong slice target); fuzz the boundary matrix directly so the
+    // slicing stays total: empty/huge values, maximal timestamps and
+    // inverted windows must all produce well-formed bounds.
+    use crate::db::store::tag_range;
+    let values: Vec<Vec<u8>> = vec![vec![], vec![b'x'], vec![0xff; 8], vec![0u8; 65535]];
+    let bounds = [0u64, 1, 100, u64::MAX - 1, u64::MAX];
+    for name in [b'e', 0u8, 0xff] {
+        for value in &values {
+            for &since in &bounds {
+                for &until in &bounds {
+                    let (start, end) = tag_range(name, value, since, until);
+                    let prefix_len = 1 + 1 + 4 + value.len();
+                    assert_eq!(
+                        &start[..prefix_len],
+                        &end[..prefix_len],
+                        "both bounds share the tag prefix"
+                    );
+                    assert_eq!(start.len(), prefix_len + 8 + 32);
+                    assert!(
+                        end.len() == prefix_len + 8 + 32 || end.len() == prefix_len + 8 + 32 + 1,
+                        "the maximal `until` appends one byte past the maximal id"
+                    );
+                    if since <= until {
+                        assert!(start <= end, "a non-empty window must stay ordered");
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn maximal_timestamp_is_included_by_indexed_queries() {
     let db = DbClient::open(
         &config(),
@@ -1211,6 +1245,28 @@ fn store_blossom_mapping_lifecycle() {
     }
     assert!(store.load_blossom_mapping(&sha2).unwrap().is_none());
     assert!(!store.remove_blossom_owner(&sha2, &bob).unwrap());
+}
+
+#[test]
+fn gift_wrap_deletion_refuses_an_unbuilt_index() {
+    use crate::db::store::Store;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    let cfg = config();
+    // A raw store: no writer recovery ever ran, so the recipient index
+    // was never backfilled.
+    let store = Store::open(&cfg, Arc::new(AtomicBool::new(true)), 512).unwrap();
+    let recipient = [7u8; 32];
+    // The range walk would silently miss every pre-index wrap, so the
+    // deletion must fail loudly instead (the vanish path then skips its
+    // marker and the NIP-09 path reports the failure).
+    let err = store
+        .delete_gift_wraps_to(&recipient)
+        .expect_err("an unbuilt index must fail the deletion");
+    assert!(err.to_string().contains("not built"), "{err}");
+    // After the backfill the same deletion succeeds (nothing stored).
+    assert_eq!(store.rebuild_gift_wrap_index().unwrap(), 0);
+    assert_eq!(store.delete_gift_wraps_to(&recipient).unwrap(), 0);
 }
 
 #[test]

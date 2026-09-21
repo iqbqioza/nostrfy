@@ -129,9 +129,11 @@ impl super::Conn {
     /// attacker driving rapid NEG-MSG rounds on a slow reader could
     /// otherwise accumulate gigabytes. Callers fail the round with a
     /// retryable NEG-ERR instead, bounding queued NEG bytes to a small
-    /// multiple of the per-connection cap.
-    fn neg_backpressured(&self) -> bool {
-        self.out_queue_bytes > 0 && self.out_bytes > self.out_queue_bytes.saturating_mul(4)
+    /// multiple of the per-connection cap — or of the absolute control
+    /// ceiling when the configured cap is unset (`0` still has a bound,
+    /// see [`Conn::out_queue_cap`]). `pub(crate)` for the regression test.
+    pub(crate) fn neg_backpressured(&self) -> bool {
+        self.out_bytes > self.out_queue_cap().saturating_mul(4)
     }
 
     pub(crate) async fn handle_neg_open(&mut self, rest: &[Value]) {

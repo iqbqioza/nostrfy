@@ -291,7 +291,17 @@ impl Relay {
                 // read and the write and be overwritten by the daemon's
                 // older snapshot.
                 let _guard = self.persist_blossom_allow_lock.lock().await;
-                let _state_lock = self.db.lock_access_state().await;
+                // Without the cross-process lock a concurrent CLI
+                // read-modify-write could land between the re-read below
+                // and the write and be overwritten by this older snapshot:
+                // refuse the command instead of writing unserialized.
+                let Some(_state_lock) = self.db.lock_access_state().await else {
+                    return format!(
+                        "error: {} {} could not be applied: the access state lock is unavailable",
+                        cmd.verb(),
+                        cmd.pubkey()
+                    );
+                };
                 let persisted = self.db.try_load_blossom_allow().await;
                 let mut allow = self.blossom_allow.write().await;
                 let (entries, changed) = merge_blossom_allow(persisted.as_deref(), &allow, pk);
@@ -306,7 +316,15 @@ impl Relay {
             }
             Command::BlossomDeny(pk) => {
                 let _guard = self.persist_blossom_allow_lock.lock().await;
-                let _state_lock = self.db.lock_access_state().await;
+                // Same cross-process ordering as `/blossom allow` above:
+                // refuse instead of writing unserialized.
+                let Some(_state_lock) = self.db.lock_access_state().await else {
+                    return format!(
+                        "error: {} {} could not be applied: the access state lock is unavailable",
+                        cmd.verb(),
+                        cmd.pubkey()
+                    );
+                };
                 let persisted = self.db.try_load_blossom_allow().await;
                 let mut allow = self.blossom_allow.write().await;
                 let (entries, changed) = merge_blossom_deny(persisted.as_deref(), &allow, pk);

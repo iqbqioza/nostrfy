@@ -1844,13 +1844,19 @@ impl Relay {
     /// mutation can no longer land between this snapshot and its write.
     /// The blocking `flock` is acquired on the blocking pool and the guard
     /// is held across the database await; the CLI never waits on the
-    /// daemon, so the ordering cannot deadlock.
+    /// daemon, so the ordering cannot deadlock. When the lock cannot be
+    /// taken the write is refused (`false`) instead of proceeding
+    /// unserialized — the callers already report a failed persistence as
+    /// an error, so refusing is honest and retryable.
     pub async fn persist_access(&self) -> bool {
         let db_path = self.config.read().await.database.path.clone();
         let _guard = self.persist_access_lock.lock().await;
         // The cross-process lock is taken *before* the snapshot so the CLI
         // cannot slip a read-modify-write between the capture and the write.
-        let _state_lock = crate::db::lock_access_state_async(db_path).await;
+        let Some(_state_lock) = crate::db::lock_access_state_async(db_path).await else {
+            log::warn!("cannot take the access state lock; refusing the access write");
+            return false;
+        };
         let access = self.access.read().await.clone();
         // The pubkey lists are excluded from the `access` blob and kept in
         // their own LMDB key so the CLI and NIP-86 share one source. The
