@@ -880,6 +880,11 @@ Absence filters: `no_p`, `no_e`, `no_t` and `no_d` exclude events carrying that 
 
 ## 16. Migrating from strfry
 
+> For the complete operator runbook — preparation, dry run, migration,
+> verification, cut-over, rollback and troubleshooting — see
+> [MIGRATING-FROM-STRFRY.md](MIGRATING-FROM-STRFRY.md). This section is the
+> command reference.
+
 nostrfy can import the events of a [strfry](https://github.com/hoytech/strfry)
 relay. The migration reads strfry's own export format (JSONL, one NIP-01 event
 per line, oldest first), so it works across strfry database versions and does

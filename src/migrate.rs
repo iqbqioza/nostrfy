@@ -1213,6 +1213,28 @@ mod tests {
     }
 
     #[test]
+    fn the_line_cap_boundary_is_exact() {
+        let db = test_db("line-cap");
+        let now = unix_now();
+        let event = signed(1, 1, now - 1, vec![], "cap");
+        let line = serde_json::to_string(&event).unwrap();
+        // A line exactly at the cap is accepted...
+        let mut opts = options();
+        opts.max_line_bytes = line.len();
+        let stats = run_str(&db, &format!("{line}\n"), &opts);
+        assert_eq!(stats.stored, 1, "a line at the cap must import");
+        // ...and one byte over is rejected as oversized.
+        let db2 = test_db("line-cap-over");
+        let mut opts = options();
+        opts.max_line_bytes = line.len() - 1;
+        let stats = run_str(&db2, &format!("{line}\n"), &opts);
+        assert_eq!(stats.oversized, 1);
+        assert_eq!(stats.stored, 0);
+        db.shutdown();
+        db2.shutdown();
+    }
+
+    #[test]
     fn dry_run_writes_nothing() {
         let now = unix_now();
         let event = signed(1, 1, now - 1, vec![], "dry");
