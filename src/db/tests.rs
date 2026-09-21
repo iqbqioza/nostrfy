@@ -167,6 +167,50 @@ fn tag_range_never_panics_on_boundary_inputs() {
 }
 
 #[test]
+fn count_at_the_exact_cap_is_not_approximate() {
+    // A walk that exhausts exactly at the request cap is complete: only a
+    // walk cut short by the cap reports `approximate`.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        for i in 0..3u64 {
+            let e = event(1, &format!("count me {i}"), now - 10 + i, Vec::new());
+            assert_eq!(db.put(e, now).await, PutOutcome::Stored);
+        }
+        let f: Filter = serde_json::from_value(serde_json::json!({"kinds": [1]})).unwrap();
+        let (counted, more) = db
+            .count_reported(vec![f.clone()], 3, now)
+            .await
+            .expect("count must not fail");
+        assert_eq!(counted.len(), 3);
+        assert!(!more, "an exact-cap count is complete, not approximate");
+        let (counted, more) = db
+            .count_reported(vec![f.clone()], 2, now)
+            .await
+            .expect("count must not fail");
+        assert_eq!(counted.len(), 2);
+        assert!(more, "a truncated count is approximate");
+        let (counted, more) = db
+            .count_reported(vec![f], 4, now)
+            .await
+            .expect("count must not fail");
+        assert_eq!(counted.len(), 3);
+        assert!(!more, "a below-cap count is complete");
+    });
+    db.shutdown();
+}
+
+#[test]
 fn maximal_timestamp_is_included_by_indexed_queries() {
     let db = DbClient::open(
         &config(),

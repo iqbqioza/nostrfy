@@ -323,11 +323,13 @@ fn validate_auth_event(
     if crate::nips::nip01::verify(event, secp).is_err() {
         return None;
     }
-    // BUD-11: `created_at` must be in the past — nothing more. A future
-    // `created_at` (client clock ahead) is rejected; past timestamps
-    // are valid as long as `expiration` (checked below) has not
-    // passed, so pre-signed tokens for future uploads stay valid.
-    if event.created_at > now {
+    // BUD-11: `created_at` must not lie in the future — with a small
+    // clock-skew leeway mirroring the NIP-98 auth window. A token's
+    // validity is bounded by `expiration` (checked below), so accepting a
+    // `created_at` seconds ahead only keeps skewed clients working, never
+    // extends a token's life; without the leeway every request from a
+    // clock-ahead client fails with 401.
+    if event.created_at > now.saturating_add(60) {
         return None;
     }
     if !event_tags(event, "t").any(|t| t == verb) {
@@ -335,9 +337,16 @@ fn validate_auth_event(
     }
     // BUD-11: the `expiration` tag is mandatory and must be a unix
     // timestamp in the future — a missing or unparseable value is rejected
-    // too, so an intercepted token cannot outlive its scope.
-    let exp = event_tags(event, "expiration").next()?;
-    if exp.parse::<u64>().map(|e| e <= now).unwrap_or(true) {
+    // too, so an intercepted token cannot outlive its scope. Every tag
+    // must parse and the earliest one bounds the token: honoring only the
+    // first would let a later, looser tag extend an intercepted token's
+    // life past an earlier, stricter one.
+    let mut exp: Option<u64> = None;
+    for raw in event_tags(event, "expiration") {
+        let parsed: u64 = raw.parse().ok()?;
+        exp = Some(exp.map_or(parsed, |best: u64| best.min(parsed)));
+    }
+    if exp.is_none_or(|e| e <= now) {
         return None;
     }
     // The `server` tags (when present) must name our host. BUD-11: a token
@@ -2809,6 +2818,85 @@ mod tests {
         assert_eq!(
             validate_auth_event(&secp, &ev, host, "upload", Some(&sha), now),
             None
+        );
+    }
+
+    #[test]
+    fn blossom_auth_allows_a_small_clock_skew() {
+        // Validity is bounded by `expiration`, so a `created_at` seconds
+        // in the future only keeps skewed clients working — without the
+        // leeway every request from a clock-ahead client fails with 401.
+        let secp = Secp256k1::new();
+        let now = unix_now();
+        let sha = "a".repeat(64);
+        let host = "media.example.com";
+        let ev = auth_event(
+            &secp,
+            now + 30,
+            "upload",
+            Some(now + 300),
+            Some(&sha),
+            Some(host),
+        );
+        assert_eq!(
+            validate_auth_event(&secp, &ev, host, "upload", Some(&sha), now),
+            Some(ev.pubkey.clone()),
+            "a token seconds in the future must be accepted within the skew window"
+        );
+        let ev = auth_event(
+            &secp,
+            now + 61,
+            "upload",
+            Some(now + 300),
+            Some(&sha),
+            Some(host),
+        );
+        assert_eq!(
+            validate_auth_event(&secp, &ev, host, "upload", Some(&sha), now),
+            None,
+            "a token past the skew window must still be rejected"
+        );
+    }
+
+    #[test]
+    fn blossom_auth_honors_the_earliest_expiration() {
+        // Every `expiration` tag must parse and the earliest one bounds
+        // the token: honoring only the first would let a later, looser
+        // tag extend an intercepted token's life.
+        let secp = Secp256k1::new();
+        let now = unix_now();
+        let sha = "a".repeat(64);
+        let host = "media.example.com";
+        let with_extra_expiration = |first: u64, extra: &str| {
+            let mut ev = auth_event(&secp, now, "upload", Some(first), Some(&sha), Some(host));
+            ev.tags.push(vec!["expiration".into(), extra.into()]);
+            ev.id = crate::nips::nip01::compute_id(&ev);
+            let id = ev.id_bytes().unwrap();
+            let keypair = Keypair::from_seckey_slice(&secp, &[9u8; 32]).unwrap();
+            ev.sig = secp.sign_schnorr_no_aux_rand(&id, &keypair).to_string();
+            ev
+        };
+        // A later first tag with an earlier second tag: the earlier one
+        // still bounds (accepted while it is in the future).
+        let ev = with_extra_expiration(now + 600, &(now + 300).to_string());
+        assert_eq!(
+            validate_auth_event(&secp, &ev, host, "upload", Some(&sha), now),
+            Some(ev.pubkey.clone())
+        );
+        // A past tag anywhere rejects, even behind a future first tag
+        // (the old first-only check accepted this token).
+        let ev = with_extra_expiration(now + 600, &(now - 10).to_string());
+        assert_eq!(
+            validate_auth_event(&secp, &ev, host, "upload", Some(&sha), now),
+            None,
+            "a past expiration tag must reject even behind a future first tag"
+        );
+        // An unparseable tag rejects, even behind a valid first tag.
+        let ev = with_extra_expiration(now + 600, "soon");
+        assert_eq!(
+            validate_auth_event(&secp, &ev, host, "upload", Some(&sha), now),
+            None,
+            "an unparseable expiration tag must reject"
         );
     }
 

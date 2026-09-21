@@ -1039,9 +1039,9 @@ fn check_random_filter(rt: &tokio::runtime::Runtime, harness: &mut Harness, chec
     }
     // COUNT ignores the filter's own `limit` and counts up to the request's
     // limit. The count is exact up to that cap; hitting the cap reports the
-    // result as approximate (`more`), conservatively even when the true
-    // cardinality is exactly the cap (the walk cannot know without looking
-    // past it).
+    // result as approximate (`more`) — but only when the walk was actually
+    // cut short. A walk that exhausts exactly at the cap is complete, so
+    // an exact count is not approximate.
     let count_limit = 1 + harness.rng.below(QUERY_LIMIT);
     let (counted, more) = rt
         .block_on(harness.db.count_reported(vec![filter], count_limit, now))
@@ -1053,8 +1053,8 @@ fn check_random_filter(rt: &tokio::runtime::Runtime, harness: &mut Harness, chec
     );
     assert_eq!(
         more,
-        matching.len() >= count_limit,
-        "{ctx}: COUNT completeness flag (cap hit, approximate)"
+        matching.len() > count_limit,
+        "{ctx}: COUNT completeness flag (exact cap hit is complete, not approximate)"
     );
 }
 
