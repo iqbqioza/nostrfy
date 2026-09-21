@@ -222,17 +222,40 @@ pub async fn run(
     let mut previous_created: Option<u64> = None;
     let mut out_of_order_warned = false;
     let mut reader = reader;
-    let mut line = String::new();
+    let mut line: Vec<u8> = Vec::new();
+    let mut first_line = true;
     loop {
-        line.clear();
-        if reader
-            .read_line(&mut line)
-            .context("reading the strfry export")?
-            == 0
-        {
+        // Bounded read: a hostile or corrupt line must not exhaust memory
+        // (the cap leaves room for the trailing `\r\n`).
+        let (bytes_read, truncated) = read_line_capped(
+            &mut reader,
+            opts.max_line_bytes.saturating_add(2),
+            &mut line,
+        )
+        .context("reading the strfry export")?;
+        if bytes_read == 0 {
             break;
         }
-        let trimmed = line.trim();
+        if truncated {
+            // Longer than the cap: it cannot be an acceptable event.
+            stats.lines += 1;
+            stats.oversized += 1;
+            continue;
+        }
+        // A UTF-8 BOM on the very first line (a Windows-edited file) is not
+        // part of the JSON.
+        let bytes = if first_line {
+            first_line = false;
+            strip_bom(&line)
+        } else {
+            &line[..]
+        };
+        let Ok(text) = std::str::from_utf8(bytes) else {
+            stats.lines += 1;
+            stats.malformed += 1;
+            continue;
+        };
+        let trimmed = text.trim();
         if trimmed.is_empty() {
             continue;
         }
@@ -302,6 +325,50 @@ pub async fn run(
     .await?;
     on_progress(&stats);
     Ok(stats)
+}
+
+/// Reads one line (up to and including `\n`) into `out`, keeping at most
+/// `max` bytes and discarding the rest of the line. Returns
+/// `(bytes_read, truncated)`, where `bytes_read` counts the whole line
+/// including the discarded tail. A hostile or corrupt export line must not
+/// exhaust memory; the tail is thrown away and the caller rejects the line.
+fn read_line_capped<R: BufRead>(
+    reader: &mut R,
+    max: usize,
+    out: &mut Vec<u8>,
+) -> std::io::Result<(usize, bool)> {
+    out.clear();
+    let mut total = 0usize;
+    let mut truncated = false;
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok((total, truncated));
+        }
+        let (take, has_newline) = match available.iter().position(|byte| *byte == b'\n') {
+            Some(pos) => (pos + 1, true),
+            None => (available.len(), false),
+        };
+        if !truncated {
+            let room = max.saturating_sub(out.len());
+            if take <= room {
+                out.extend_from_slice(&available[..take]);
+            } else {
+                out.extend_from_slice(&available[..room]);
+                truncated = true;
+            }
+        }
+        total = total.saturating_add(take);
+        reader.consume(take);
+        if has_newline {
+            return Ok((total, truncated));
+        }
+    }
+}
+
+/// Strips a UTF-8 byte-order mark from the start of a line, when present.
+fn strip_bom(line: &[u8]) -> &[u8] {
+    line.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(line)
 }
 
 /// Writes one batch and applies its per-event side effects in input order.
@@ -1049,6 +1116,100 @@ mod tests {
             "the recipient's deletion must block the wrap, got {outcome:?}"
         );
         db.shutdown();
+    }
+
+    #[test]
+    fn capped_reader_bounds_a_huge_line() {
+        let mut input = Vec::new();
+        input.extend_from_slice(b"short\n");
+        input.extend(std::iter::repeat_n(b'x', 10_000));
+        input.push(b'\n');
+        input.extend_from_slice(b"after\n");
+        let mut reader = std::io::Cursor::new(input);
+        let mut line = Vec::new();
+        let (n, truncated) = read_line_capped(&mut reader, 16, &mut line).unwrap();
+        assert_eq!(n, 6);
+        assert!(!truncated);
+        assert_eq!(&line, b"short\n");
+        // The huge line is consumed whole (the tail discarded) and flagged.
+        let (n, truncated) = read_line_capped(&mut reader, 16, &mut line).unwrap();
+        assert_eq!(n, 10_001);
+        assert!(truncated);
+        assert_eq!(line.len(), 16);
+        // The next line is unaffected.
+        let (_, truncated) = read_line_capped(&mut reader, 16, &mut line).unwrap();
+        assert!(!truncated);
+        assert_eq!(&line, b"after\n");
+        let (n, _) = read_line_capped(&mut reader, 16, &mut line).unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn bom_and_non_utf8_lines_are_handled() {
+        let db = test_db("bom");
+        let now = unix_now();
+        let event = signed(1, 1, now - 1, vec![], "bom");
+        let mut input = Vec::new();
+        input.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
+        input.extend_from_slice(serde_json::to_string(&event).unwrap().as_bytes());
+        input.push(b'\n');
+        // An invalid UTF-8 line is counted as malformed, not a hard error.
+        input.extend_from_slice(&[0xff, 0xfe, b'\n']);
+        input.extend_from_slice(b"not json\n");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let stats = rt.block_on(async {
+            run(Some(&db), std::io::Cursor::new(input), &options(), |_| {})
+                .await
+                .unwrap()
+        });
+        assert_eq!(stats.stored, 1, "the BOM-prefixed event must import");
+        assert_eq!(stats.malformed, 2);
+        assert_eq!(
+            visible(&db, serde_json::json!({"ids": [event.id]})).len(),
+            1
+        );
+        db.shutdown();
+    }
+
+    #[test]
+    fn random_input_never_panics_and_accounts_every_line() {
+        use crate::fuzz_tests::Rng;
+        let mut rng = Rng::new(0x5eed_1234);
+        let mut input: Vec<u8> = Vec::new();
+        for _ in 0..500 {
+            match rng.below(7) {
+                0 => input.push(b'\n'),
+                1 => input.extend_from_slice(b"   \t \n"),
+                2 => {
+                    let len = rng.below(300);
+                    for _ in 0..len {
+                        input.push(rng.next_u64() as u8);
+                    }
+                    input.push(b'\n');
+                }
+                3 => input.extend_from_slice(b"{\"kind\":1,\"content\":\"x\"}\n"),
+                4 => input.extend_from_slice(b"not json\n"),
+                5 => {
+                    let len = rng.below(2000);
+                    input.extend(std::iter::repeat_n(b'a', len));
+                    input.push(b'\n');
+                }
+                _ => input.extend_from_slice(&[0xEF, 0xBB, 0xBF, b'\n']),
+            }
+        }
+        let opts = options();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let stats = rt.block_on(async {
+            run(None, std::io::Cursor::new(input), &opts, |_| {})
+                .await
+                .expect("random input must not fail")
+        });
+        assert_eq!(
+            stats.lines,
+            stats.valid + stats.malformed + stats.oversized,
+            "every non-blank line must be accounted exactly once: {stats:?}"
+        );
+        assert_eq!(stats.imported(), 0, "a dry run stores nothing");
     }
 
     #[test]
