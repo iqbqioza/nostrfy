@@ -20,6 +20,9 @@ FROM debian:bookworm-slim
 ARG TARGETARCH
 ARG NOSTRFY_VERSION
 
+# Fetch the binary and, for Apache-2.0 compliance, the license texts and
+# NOTICE published as release assets next to it (the image redistributes
+# the binary, so it must carry them).
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl \
     && case "${TARGETARCH}" in \
@@ -38,6 +41,10 @@ RUN apt-get update \
     && (cd /tmp && sha256sum -c "${ASSET}.sha256") \
     && install -m 0755 "/tmp/${ASSET}" /usr/local/bin/nostrfy \
     && rm -f "/tmp/${ASSET}" "/tmp/${ASSET}.sha256" \
+    && mkdir -p /usr/share/licenses/nostrfy \
+    && curl -fsSL "${BASE}/LICENSE-MIT" -o /usr/share/licenses/nostrfy/LICENSE-MIT \
+    && curl -fsSL "${BASE}/LICENSE-APACHE" -o /usr/share/licenses/nostrfy/LICENSE-APACHE \
+    && curl -fsSL "${BASE}/NOTICE" -o /usr/share/licenses/nostrfy/NOTICE \
     && apt-get purge -y --auto-remove curl \
     && rm -rf /var/lib/apt/lists/*
 

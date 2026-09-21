@@ -57,8 +57,17 @@ jobs:
           mkdir -p dist
           cp target/release/nostrfy "dist/${{ matrix.asset }}"
           chmod +x "dist/${{ matrix.asset }}"
-          (cd dist && tar -czf "${{ matrix.asset }}.tar.gz" "${{ matrix.asset }}")
+          # Apache-2.0 requires recipients of the binary to receive a copy
+          # of the license (and the NOTICE when one is shipped), so the
+          # archive carries them next to the binary.
+          cp LICENSE-MIT LICENSE-APACHE NOTICE dist/
+          (cd dist && tar -czf "${{ matrix.asset }}.tar.gz" \
+            "${{ matrix.asset }}" LICENSE-MIT LICENSE-APACHE NOTICE)
           (cd dist && sha256sum "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256")
+          # The licenses travel inside the archive (and as their own release
+          # assets); keep the artifact upload to the binary, archive and
+          # checksum so the merge across build jobs cannot collide.
+          rm -f dist/LICENSE-MIT dist/LICENSE-APACHE dist/NOTICE
 
       - uses: actions/upload-artifact@v4
         with:
@@ -103,8 +112,13 @@ jobs:
             mkdir -p dist
             cp target/release/nostrfy "dist/nostrfy-freebsd-x86_64"
             chmod +x "dist/nostrfy-freebsd-x86_64"
-            (cd dist && tar -czf "nostrfy-freebsd-x86_64.tar.gz" "nostrfy-freebsd-x86_64")
+            # Apache-2.0: ship the license texts (and NOTICE) with the
+            # binary archive.
+            cp LICENSE-MIT LICENSE-APACHE NOTICE dist/
+            (cd dist && tar -czf "nostrfy-freebsd-x86_64.tar.gz" \
+              "nostrfy-freebsd-x86_64" LICENSE-MIT LICENSE-APACHE NOTICE)
             (cd dist && sha256 -r "nostrfy-freebsd-x86_64" > "nostrfy-freebsd-x86_64.sha256")
+            rm -f dist/LICENSE-MIT dist/LICENSE-APACHE dist/NOTICE
 
       - uses: actions/upload-artifact@v4
         with:
@@ -117,6 +131,8 @@ jobs:
     needs: [build, freebsd]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           path: dist
@@ -136,6 +152,9 @@ jobs:
             dist/nostrfy-freebsd-x86_64 \
             dist/nostrfy-freebsd-x86_64.tar.gz \
             dist/nostrfy-freebsd-x86_64.sha256 \
+            LICENSE-MIT \
+            LICENSE-APACHE \
+            NOTICE \
             --repo "$GITHUB_REPOSITORY" \
             --title "$GITHUB_REF_NAME" \
             --notes "See the commit history for changes in this release." \
