@@ -8,9 +8,23 @@ use crate::filter::Filter;
 use crate::nips::nip77;
 use crate::util::unix_now;
 
+/// Idle timeout for an open negentropy subscription: a sync that exchanges
+/// no message for this long is closed with a `NEG-ERR` (`closed: ...`),
+/// releasing its items and budget reservations. NIP-77 anticipates this
+/// ("relays may choose to time-out inactive queries to recover memory
+/// resources"). Without it a client could hold items (and the relay-wide
+/// budget share) forever by keeping the connection alive with PONGs, which
+/// reset the connection idle deadline but never touch NEG state. Ten
+/// minutes is generous for an interactive sync; like the other NEG caps it
+/// is a constant, not a config knob.
+pub(crate) const NEG_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
 /// NIP-77 negentropy state for one open subscription.
 pub(crate) struct NegState {
     pub(crate) items: Vec<nip77::Item>,
+    /// Last NEG-OPEN/NEG-MSG activity on this subscription, for the idle
+    /// reaper below.
+    pub(crate) last_active: std::time::Instant,
     /// Remaining NEG-MSG rounds for this subscription. The reconciliation
     /// protocol completes in a bounded number of rounds proportional to the
     /// number of divergent ranges; a peer that keeps sending NEG-MSG with
@@ -47,6 +61,45 @@ pub(crate) const MAX_NEG_OPENS: u32 = 256;
 impl super::Conn {
     pub(crate) fn send_neg_err(&mut self, sub_id: &str, reason: &str) {
         self.send_control(json!(["NEG-ERR", sub_id, reason]));
+    }
+
+    /// Closes negentropy subscriptions idle longer than
+    /// [`NEG_IDLE_TIMEOUT`]. Each close goes through [`Self::neg_err`], so
+    /// the id is released, its budget reservation dropped, and the client
+    /// told the sync is over (per NIP-77 a `NEG-ERR` closes the id) instead
+    /// of silently holding state. Runs on every NEG-OPEN/NEG-MSG (via
+    /// [`Self::touch_and_reap_neg`]) and on the keep-alive tick, so silent
+    /// holders are reaped even when the client keeps the connection itself
+    /// alive with PONGs.
+    pub(crate) fn reap_idle_negentropy(&mut self) {
+        let now = std::time::Instant::now();
+        let idle: Vec<String> = self
+            .neg
+            .iter()
+            .filter(|(_, state)| now.duration_since(state.last_active) > NEG_IDLE_TIMEOUT)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in idle {
+            self.neg_err(
+                &id,
+                "closed: negentropy subscription timed out (idle too long)",
+            );
+        }
+    }
+
+    /// Refreshes one subscription's activity clock (if it exists) and reaps
+    /// the other idle ones. Called with a validated id at the top of the
+    /// NEG-OPEN/NEG-MSG paths: a message for a live sync must refresh it
+    /// *before* the sweep, or the sweep would close the very sync the
+    /// message targets (and the flow would then emit a second, confusing
+    /// `NEG-ERR` for the same id). A message arriving after the timeout
+    /// still cannot revive the sync — it was already reaped on an earlier
+    /// sweep — which matches the connection idle deadline's semantics.
+    pub(crate) fn touch_and_reap_neg(&mut self, sub_id: &str) {
+        if let Some(state) = self.neg.get_mut(sub_id) {
+            state.last_active = std::time::Instant::now();
+        }
+        self.reap_idle_negentropy();
     }
 
     /// NIP-77: "After a NEG-ERR is issued, the subscription is considered to
@@ -107,6 +160,7 @@ impl super::Conn {
                 return;
             }
         };
+        self.touch_and_reap_neg(&sub_id);
         let max_sub_id_len = self.relay.config.read().await.limits.max_sub_id_len;
         if sub_id.len() > max_sub_id_len {
             self.neg_err(&sub_id, "error: NEG-OPEN subscription id too long");
@@ -391,6 +445,7 @@ impl super::Conn {
             sub_id.clone(),
             NegState {
                 items,
+                last_active: std::time::Instant::now(),
                 rounds_left: MAX_NEG_MSG_ROUNDS,
                 budget: Some(std::sync::Arc::clone(&self.neg_budget)),
                 reserved,
@@ -441,6 +496,7 @@ impl super::Conn {
             self.send_notice("error: NEG-MSG subscription id must be a non-empty string");
             return;
         }
+        self.touch_and_reap_neg(&sub_id);
         // NIP-77 disabled mid-session (SIGHUP reload or a command event):
         // stop the in-flight sync like any other refusal instead of letting
         // a disabled feature keep running. The configured item cap sizes

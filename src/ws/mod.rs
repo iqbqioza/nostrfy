@@ -1652,6 +1652,11 @@ pub async fn handle_connection(
                 // Keep-alive: a healthy client answers with a PONG (an
                 // inbound frame, which resets the idle timeout), so an idle
                 // subscriber stays connected while a dead peer is reaped.
+                // Reap silent negentropy syncs here too: a PONG keeps the
+                // connection alive but never touches NEG state, so without
+                // this an idle sync would hold its items and budget share
+                // forever.
+                conn.reap_idle_negentropy();
                 // The send is bounded: a peer that stopped reading parks
                 // inside it, and the idle deadline (raced only by the
                 // drain) could not fire here, so a stalled PING closes the
@@ -7307,6 +7312,7 @@ mod tests {
                 "held".into(),
                 super::negentropy::NegState {
                     items: vec![(1, [7u8; 32])],
+                    last_active: std::time::Instant::now(),
                     rounds_left: super::negentropy::MAX_NEG_MSG_ROUNDS,
                     budget: None,
                     reserved: 0,
@@ -7324,6 +7330,91 @@ mod tests {
             assert!(
                 !conn.neg.contains_key("held"),
                 "the over-budget NEG-ERR closes the subscription"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn neg_idle_subscriptions_are_reaped_and_release() {
+        // A sync that exchanges no message for longer than
+        // `NEG_IDLE_TIMEOUT` must be closed with a `NEG-ERR` (`closed:`),
+        // releasing its items and budget reservation — otherwise a client
+        // could pin state forever by keeping the connection alive with
+        // PONGs, which reset the connection idle deadline but never touch
+        // NEG state. A live sync must survive the sweep untouched.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let budget = Arc::clone(&conn.neg_budget);
+            let limit = neg_budget_bytes(conn.relay.config.read().await.limits.max_neg_items);
+            let stale_ago = super::negentropy::NEG_IDLE_TIMEOUT + std::time::Duration::from_secs(1);
+            // The stale sync holds a real reservation, like a live one.
+            assert!(budget.try_reserve(128, limit).is_some());
+            conn.neg.insert(
+                "stale".into(),
+                super::negentropy::NegState {
+                    items: vec![(1, [7u8; 32])],
+                    last_active: std::time::Instant::now() - stale_ago,
+                    rounds_left: super::negentropy::MAX_NEG_MSG_ROUNDS,
+                    budget: Some(Arc::clone(&budget)),
+                    reserved: 128,
+                },
+            );
+            conn.neg.insert(
+                "live".into(),
+                super::negentropy::NegState {
+                    items: vec![(2, [8u8; 32])],
+                    last_active: std::time::Instant::now(),
+                    rounds_left: super::negentropy::MAX_NEG_MSG_ROUNDS,
+                    budget: None,
+                    reserved: 0,
+                },
+            );
+            conn.reap_idle_negentropy();
+            assert!(
+                !conn.neg.contains_key("stale"),
+                "the idle sync must be released"
+            );
+            assert!(
+                conn.neg.contains_key("live"),
+                "a live sync must survive the sweep"
+            );
+            assert_eq!(
+                budget.used(),
+                0,
+                "the reaped sync must return its budget reservation exactly once"
+            );
+            assert!(
+                outgoing_json(&conn).iter().any(|m| m[0] == "NEG-ERR"
+                    && m[1] == "stale"
+                    && m[2].as_str().unwrap_or("").contains("closed")),
+                "the client must be told the sync is over: {:?}",
+                outgoing_json(&conn)
+            );
+            // Touching a stale subscription refreshes it instead of
+            // closing it: a message for a live sync must never produce a
+            // second, confusing NEG-ERR for the same id.
+            conn.neg.insert(
+                "slow".into(),
+                super::negentropy::NegState {
+                    items: Vec::new(),
+                    last_active: std::time::Instant::now() - stale_ago,
+                    rounds_left: 1,
+                    budget: None,
+                    reserved: 0,
+                },
+            );
+            conn.outgoing.clear();
+            conn.touch_and_reap_neg("slow");
+            assert!(
+                conn.neg.contains_key("slow"),
+                "a message for the sync itself must revive it before the sweep"
+            );
+            assert!(
+                outgoing_json(&conn).is_empty(),
+                "reviving must not emit any NEG-ERR: {:?}",
+                outgoing_json(&conn)
             );
             conn.relay.db.shutdown();
         });
@@ -7426,6 +7517,7 @@ mod tests {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let _state = super::negentropy::NegState {
                     items: Vec::new(),
+                    last_active: std::time::Instant::now(),
                     rounds_left: 1,
                     budget: Some(state_budget),
                     reserved: 128,
