@@ -7392,9 +7392,36 @@ mod tests {
                 "the client must be told the sync is over: {:?}",
                 outgoing_json(&conn)
             );
+            // A failing message must not sweep: only the id it names is
+            // affected, and other idle syncs are left for the next
+            // successful round or keep-alive tick.
+            conn.neg.insert(
+                "other".into(),
+                super::negentropy::NegState {
+                    items: Vec::new(),
+                    last_active: std::time::Instant::now() - stale_ago,
+                    rounds_left: 1,
+                    budget: None,
+                    reserved: 0,
+                },
+            );
+            conn.outgoing.clear();
+            conn.handle_neg_msg(&[json!("bad"), json!("not-hex")]).await;
+            assert!(
+                conn.neg.contains_key("other"),
+                "a failing message must not reap unrelated idle syncs"
+            );
+            assert!(
+                outgoing_json(&conn).iter().all(|m| m[1] != "other"),
+                "no NEG-ERR may name the untouched sync: {:?}",
+                outgoing_json(&conn)
+            );
             // Touching a stale subscription refreshes it instead of
             // closing it: a message for a live sync must never produce a
-            // second, confusing NEG-ERR for the same id.
+            // second, confusing NEG-ERR for the same id. (Close "other"
+            // first: the sweep below would otherwise — correctly — reap
+            // it too, which is a separate assertion from the one above.)
+            conn.handle_neg_close(&[json!("other")]);
             conn.neg.insert(
                 "slow".into(),
                 super::negentropy::NegState {

@@ -365,7 +365,7 @@ Set this whenever a reverse proxy (nginx, Caddy, a cloud load balancer, Cloudfla
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
 | `path` | string | `"./data"` | Database directory (LMDB) |
-| `max_dbs` | integer | `32` | LMDB max named databases (must be ≥ 19) |
+| `max_dbs` | integer | `32` | LMDB max named databases (raised to 22 when lower) |
 | `max_readers` | integer | `128` | LMDB max concurrent readers (raised to `2 * reader_threads + 3` when lower) |
 | `map_size` | integer | `1073741824` (1 GB) | Floor for the memory map size (bytes) |
 | `max_map_size` | integer | `1099511627776` (1 TB) | Memory-map ceiling (bytes) |
@@ -381,7 +381,7 @@ Set this whenever a reverse proxy (nginx, Caddy, a cloud load balancer, Cloudfla
 
 **`path`** — The directory holding the LMDB database files. Relative paths are resolved against the config file's directory, so they stay valid after the daemon changes its working directory. Do not point two relay instances at the same directory.
 
-**`max_dbs`** — LMDB's maximum number of named databases. The relay uses 19 when `search_index = true` (18 tables plus the word index) and 18 otherwise; values below 19 are raised to 19 so the word index can always be created.
+**`max_dbs`** — LMDB's maximum number of named databases. The relay uses 22 when `search_index = true` (21 tables plus the word index) and 21 otherwise; values below 22 are raised to 22 so every table can always be created.
 
 **`max_readers`** — LMDB's maximum number of concurrent read transactions. Values below `2 * reader_threads + 3` are raised to that floor (two slots per reader thread plus the writer/API/startup paths, which nest transactions); a lower value would fail queries with `MDB_READERS_FULL`. The documented ≥ 8 minimum is subsumed by this formula.
 
@@ -416,7 +416,7 @@ Set this whenever a reverse proxy (nginx, Caddy, a cloud load balancer, Cloudfla
 - **Data migrations** run automatically once, at startup:
   - access pubkey lists moved into their dedicated key (legacy `access` blob → `relay_pubkeys`),
   - the Blossom sha→owner mapping rebuilt from legacy files (marker key, skipped on later restarts).
-- The startup log reports `database ready at ... (19 tables, map ... MiB)` — 18 named tables plus the NIP-50 word index (18 tables when `database.search_index = false`) — and the migration checks.
+- The startup log reports `database ready at ... (22 tables, map ... MiB)` — 21 named tables plus the NIP-50 word index (21 tables when `database.search_index = false`) — and the migration checks.
 
 ---
 

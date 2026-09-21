@@ -4758,8 +4758,8 @@ fn group_and_role_snapshots_survive_restart() {
 
 #[test]
 fn sixteen_max_dbs_still_opens_with_the_word_index() {
-    // 18 named tables are created (17 plus the word index); an operator
-    // value of 16 must not fail at startup (the clamp raises it to 18).
+    // 22 named tables are created (21 plus the word index); an operator
+    // value of 16 must not fail at startup (the clamp raises it to 22).
     let mut cfg = config();
     cfg.max_dbs = 16;
     assert!(cfg.search_index);
@@ -4772,7 +4772,7 @@ fn sixteen_max_dbs_still_opens_with_the_word_index() {
         4096,
         262144,
     )
-    .expect("18 tables must fit via the clamp");
+    .expect("22 tables must fit via the clamp");
     db.shutdown();
 }
 

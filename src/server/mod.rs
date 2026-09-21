@@ -790,9 +790,21 @@ pub async fn run_server(
                         );
                     }
                 }
-                // Panicked (payload is in the panic log) or aborted: loud
-                // outside shutdown, quiet when the shutdown bound did it.
-                _ => {
+                // Panicked: the payload is in the panic log (the global
+                // hook logs it before the unwind is caught), so keep the
+                // word `panicked` here too — monitors match on it.
+                Ok(true) => {
+                    if !*shutdown.borrow() {
+                        error!(
+                            "background task {name} panicked; see the panic log for the payload, \
+                             its function is lost until restart"
+                        );
+                    }
+                }
+                // The sender was dropped without a report: the shutdown
+                // bound aborted the inner task. Loud outside shutdown,
+                // quiet when the shutdown bound did it.
+                Err(_) => {
                     if !*shutdown.borrow() {
                         error!(
                             "background task {name} ended without completing; its function is lost until restart"

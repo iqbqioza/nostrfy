@@ -16,7 +16,11 @@ use crate::util::unix_now;
 /// budget share) forever by keeping the connection alive with PONGs, which
 /// reset the connection idle deadline but never touch NEG state. Ten
 /// minutes is generous for an interactive sync; like the other NEG caps it
-/// is a constant, not a config knob.
+/// is a constant, not a config knob. Note the sweep is driven by NEG
+/// traffic and the keep-alive tick: with `ws_idle_timeout_secs = 0` there
+/// is no tick, so a fully silent sync is only reaped on the next NEG
+/// frame — but then the connection itself is immortal by operator choice,
+/// along with all of its other state.
 pub(crate) const NEG_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// NIP-77 negentropy state for one open subscription.
@@ -67,11 +71,15 @@ impl super::Conn {
     /// [`NEG_IDLE_TIMEOUT`]. Each close goes through [`Self::neg_err`], so
     /// the id is released, its budget reservation dropped, and the client
     /// told the sync is over (per NIP-77 a `NEG-ERR` closes the id) instead
-    /// of silently holding state. Runs on every NEG-OPEN/NEG-MSG (via
-    /// [`Self::touch_and_reap_neg`]) and on the keep-alive tick, so silent
-    /// holders are reaped even when the client keeps the connection itself
-    /// alive with PONGs.
+    /// of silently holding state. Runs after successful opens and rounds
+    /// (via [`Self::touch_and_reap_neg`]) and on the keep-alive tick, so
+    /// silent holders are reaped even when the client keeps the connection
+    /// itself alive with PONGs. Deliberately not on failing messages: one
+    /// bad frame must not close unrelated syncs.
     pub(crate) fn reap_idle_negentropy(&mut self) {
+        if self.neg.is_empty() {
+            return;
+        }
         let now = std::time::Instant::now();
         let idle: Vec<String> = self
             .neg
@@ -88,13 +96,13 @@ impl super::Conn {
     }
 
     /// Refreshes one subscription's activity clock (if it exists) and reaps
-    /// the other idle ones. Called with a validated id at the top of the
-    /// NEG-OPEN/NEG-MSG paths: a message for a live sync must refresh it
-    /// *before* the sweep, or the sweep would close the very sync the
-    /// message targets (and the flow would then emit a second, confusing
-    /// `NEG-ERR` for the same id). A message arriving after the timeout
-    /// still cannot revive the sync — it was already reaped on an earlier
-    /// sweep — which matches the connection idle deadline's semantics.
+    /// the other idle ones. Called only on success paths (a completed open
+    /// or a delivered round): a *failing* message must affect only its own
+    /// id, otherwise one bad frame would emit a burst of `NEG-ERR`s closing
+    /// the connection's other, unrelated syncs. Refreshing first also
+    /// guarantees the sweep never closes the very sync the message just
+    /// advanced (which would then draw a second, confusing `NEG-ERR` for
+    /// the same id).
     pub(crate) fn touch_and_reap_neg(&mut self, sub_id: &str) {
         if let Some(state) = self.neg.get_mut(sub_id) {
             state.last_active = std::time::Instant::now();
@@ -160,7 +168,6 @@ impl super::Conn {
                 return;
             }
         };
-        self.touch_and_reap_neg(&sub_id);
         let max_sub_id_len = self.relay.config.read().await.limits.max_sub_id_len;
         if sub_id.len() > max_sub_id_len {
             self.neg_err(&sub_id, "error: NEG-OPEN subscription id too long");
@@ -466,6 +473,10 @@ impl super::Conn {
             return;
         }
         self.send_neg_msg(&sub_id, &response);
+        // The open succeeded: refresh this sync and reclaim the other
+        // silent ones. Failing opens above must not sweep — one bad frame
+        // must not close unrelated syncs.
+        self.touch_and_reap_neg(&sub_id);
     }
 
     pub(crate) async fn handle_neg_msg(&mut self, rest: &[Value]) {
@@ -496,7 +507,6 @@ impl super::Conn {
             self.send_notice("error: NEG-MSG subscription id must be a non-empty string");
             return;
         }
-        self.touch_and_reap_neg(&sub_id);
         // NIP-77 disabled mid-session (SIGHUP reload or a command event):
         // stop the in-flight sync like any other refusal instead of letting
         // a disabled feature keep running. The configured item cap sizes
@@ -580,7 +590,11 @@ impl super::Conn {
                     self.neg_err(&sub_id, "blocked: overloaded, please retry");
                     return;
                 }
-                self.send_neg_msg(&sub_id, &response)
+                self.send_neg_msg(&sub_id, &response);
+                // The round succeeded: refresh this sync and reclaim the
+                // other silent ones. Failing rounds must not sweep — one
+                // bad frame must not close unrelated syncs.
+                self.touch_and_reap_neg(&sub_id)
             }
             Err(e) => {
                 self.neg_err(&sub_id, &format!("error: {e}"));

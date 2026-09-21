@@ -1548,11 +1548,11 @@ fn open_db_env(cfg: &Config) -> Result<heed::Env> {
     // process exits.
     let env = unsafe {
         heed::EnvOpenOptions::new()
-            // Mirror the store's floor: 18 named tables, plus the word
+            // Mirror the store's floor: 21 named tables, plus the word
             // index when search is on. A lower value made opening an
             // existing database fail with MDB_DBS_FULL (the CLI commands
             // must open the same tables the server created).
-            .max_dbs(cfg.database.max_dbs.max(19))
+            .max_dbs(cfg.database.max_dbs.max(22))
             .max_readers(cfg.database.max_readers.max(8))
             .map_size(map_size as usize)
             .open(&cfg.database.path)?
