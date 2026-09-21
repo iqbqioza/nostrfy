@@ -180,6 +180,63 @@ impl Drop for AccessStateLock {
     }
 }
 
+/// Exclusive cross-process guard for the database directory: held by the
+/// serving relay for its whole lifetime so a second instance on the same
+/// `database.path` (different pid file or port) fails fast instead of
+/// running a split-brain second writer (each writer thread assumes it is
+/// the only one: resumes would double-run, snapshots would
+/// last-writer-win). The lock releases itself when the holder dies, so it
+/// can never go stale. CLI commands never take it (they must keep working
+/// alongside a live daemon).
+pub(crate) struct DbDirLock {
+    #[cfg(unix)]
+    file: std::fs::File,
+}
+
+impl Drop for DbDirLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            unsafe {
+                libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+            }
+        }
+    }
+}
+
+/// Takes the exclusive database-directory lock without blocking: `Err`
+/// means another relay instance holds it (or the directory is unusable).
+/// Unix-only (`flock`); elsewhere this is a no-op guard like
+/// [`lock_access_state`].
+pub(crate) fn lock_database_dir(db_path: &std::path::Path) -> std::io::Result<DbDirLock> {
+    std::fs::create_dir_all(db_path)?;
+    let path = db_path.join("nostrfy.lock");
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            // Never truncate: the contents are never read, the inode is
+            // what `flock` locks.
+            .truncate(false)
+            .open(&path)?;
+        // SAFETY: `file` holds a valid descriptor for the call.
+        let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if ret != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(DbDirLock { file })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(DbDirLock {})
+    }
+}
+
 /// Takes the cross-process advisory lock guarding the persisted access
 /// state. Unix-only (`flock`); on other platforms the operation is not
 /// serialized across processes (the same LMDB transaction still applies).
@@ -909,10 +966,13 @@ impl DbClient {
         // NIP-09 deletion resumes): the server's startup state restore and
         // its stale-state check must observe the completed recovery and
         // its outcome flag, never race the writer. A receive error means
-        // the writer thread exited during startup (a panic): the client is
-        // still returned, and the missing writer surfaces as failed writes.
+        // the writer thread exited during startup (a panic): starting to
+        // serve without a writer would bind the relay and pass readiness
+        // while every write fails, so refuse startup instead.
         if threads.recovery_rx.recv().is_err() {
-            log::error!("database writer exited before completing startup recovery");
+            return Err(anyhow::anyhow!(
+                "database writer exited before completing startup recovery"
+            ));
         }
         Ok(DbClient {
             tx: threads.tx,
@@ -2244,6 +2304,22 @@ impl DbClient {
         self.request_read_result(|reply| Msg::LoadRelayPubkeys { reply })
             .await
             .flatten()
+    }
+
+    /// Fail-fast load of the persisted access blob for the write-through
+    /// merge (see `Relay::persist_access`): `None` refuses the write
+    /// instead of merging onto a state the database could not answer. A
+    /// missing blob (first run) merges onto an empty base, like a fresh
+    /// seed; only a failed load refuses.
+    pub async fn try_load_access(&self) -> Option<crate::config::AccessControl> {
+        match self
+            .request_read_result(|reply| Msg::LoadAccess { reply })
+            .await?
+        {
+            LoadAccessOutcome::Loaded(access) => Some(access),
+            LoadAccessOutcome::Missing => Some(crate::config::AccessControl::default()),
+            LoadAccessOutcome::Failed => None,
+        }
     }
 
     /// Adds an owner to a Blossom blob's persisted metadata. Returns

@@ -123,6 +123,10 @@ pub(crate) enum MigrationOutcome {
 pub(crate) struct BlobStore {
     storage: Storage,
     db: DbClient,
+    /// The configured free-space floor, also applied to the system temp
+    /// dir for the S3 backend (whose uploads spool there): without it a
+    /// burst of S3 uploads fills `/tmp` until writes fail mid-body.
+    min_free_bytes: u64,
     /// The relay's shared counters; the blossom code bumps
     /// `blossom_missing_objects` through this handle (the stats writer
     /// cannot poll it without reaching into the store).
@@ -167,6 +171,7 @@ impl BlobStore {
         Ok(BlobStore {
             storage,
             db,
+            min_free_bytes,
             stats,
             upload_locks: (0..Self::UPLOAD_LOCK_COUNT)
                 .map(|_| tokio::sync::Mutex::new(()))
@@ -299,10 +304,27 @@ impl BlobStore {
     }
 
     /// Reserves `size` bytes against the local free-space floor for the
-    /// duration of an upload (no-op on S3). The guard releases on drop.
+    /// duration of an upload (a plain floor check on the system temp dir
+    /// for S3, whose uploads spool there). The guard releases on drop.
     pub(crate) fn reserve_space(&self, size: u64) -> Result<SpaceReservation<'_>> {
-        if let Storage::Local(s) = &self.storage {
-            s.reserve(size)?;
+        match &self.storage {
+            Storage::Local(s) => {
+                s.reserve(size)?;
+            }
+            Storage::S3(_) => {
+                // S3 objects never touch the local disk, but the spool
+                // does: refuse below the floor instead of filling `/tmp`
+                // until a write fails mid-body. A plain check, no
+                // reservation accounting — concurrent uploads are already
+                // bounded by the upload budget, and an unreadable temp
+                // free space fails open like the local check.
+                if self.min_free_bytes > 0
+                    && free_space_of(&std::env::temp_dir())
+                        .is_some_and(|free| free < self.min_free_bytes.saturating_add(size))
+                {
+                    return Err(crate::error::storage_full());
+                }
+            }
         }
         Ok(SpaceReservation { store: self, size })
     }
@@ -598,15 +620,18 @@ impl BlobStore {
         let npub = npub_of(pubkey);
         let legacy = legacy_npub_of(pubkey);
         let mut existed = false;
+        // Both spellings are this owner's copies of the same bytes (a
+        // pre-upgrade upload under the legacy bech32m directory plus a
+        // post-upgrade one under the canonical bech32 directory). Delete
+        // must remove every copy, not stop at the first hit: a leftover
+        // legacy file would survive the owner's delete as an unserved
+        // orphan on disk. A missing file is `Ok(false)`.
         for candidate in [npub.as_str(), legacy.as_str()] {
             let hit = match &self.storage {
                 Storage::Local(s) => s.delete(candidate, sha256).await?,
                 Storage::S3(s) => s.delete(candidate, sha256).await?,
             };
             existed |= hit;
-            if hit {
-                break;
-            }
         }
         let (removed, db_ok) = self.db.blossom_remove_owner_checked(sha256, pubkey).await;
         if !db_ok {
@@ -898,6 +923,22 @@ impl Drop for SpaceReservation<'_> {
     }
 }
 
+/// Free bytes available on the filesystem hosting `path`, when statvfs
+/// succeeds (`None` on non-UTF8 paths or statvfs failure: callers fail
+/// open, matching the local floor check).
+fn free_space_of(path: &std::path::Path) -> Option<u64> {
+    let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).ok()?;
+    let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: `stat` points at a valid buffer and the path is a valid
+    // NUL-terminated string.
+    if unsafe { libc::statvfs(c_path.as_ptr(), stat.as_mut_ptr()) } == 0 {
+        let stat = unsafe { stat.assume_init() };
+        Some(stat.f_bavail.saturating_mul(stat.f_frsize))
+    } else {
+        None
+    }
+}
+
 struct LocalStore {
     root: PathBuf,
     // Kept open for the lifetime of the store so fd_root remains valid.
@@ -983,16 +1024,7 @@ impl LocalStore {
     /// Free bytes on the filesystem hosting the blob root, when statvfs
     /// succeeds (the same check the LMDB writer uses before committing).
     fn free_space(&self) -> Option<u64> {
-        let c_path = std::ffi::CString::new(self.root.as_os_str().as_encoded_bytes()).ok()?;
-        let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
-        // SAFETY: `stat` points at a valid buffer and the path is a valid
-        // NUL-terminated string.
-        if unsafe { libc::statvfs(c_path.as_ptr(), stat.as_mut_ptr()) } == 0 {
-            let stat = unsafe { stat.assume_init() };
-            Some(stat.f_bavail.saturating_mul(stat.f_frsize))
-        } else {
-            None
-        }
+        free_space_of(&self.root)
     }
 
     /// Whether the disk currently has room for an upload (the shared
@@ -1769,6 +1801,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_removes_both_canonical_and_legacy_copies() {
+        // A pre-upgrade upload lives under the legacy bech32m directory and
+        // a post-upgrade one under the canonical bech32 directory: both are
+        // the owner's copies of the same bytes, so one delete must remove
+        // both (a leftover legacy file would survive as an unserved orphan).
+        let (s, _db_path) = store("delete-legacy").await;
+        let a = pk(1);
+        let sha = "aa".repeat(32);
+        s.put(&a, &sha, b"both copies", "text/plain").await.unwrap();
+        let legacy_dir = local(&s).root.join(legacy_npub_of(&a));
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+        let legacy_file = legacy_dir.join(&sha);
+        std::fs::write(&legacy_file, b"both copies").unwrap();
+        assert!(legacy_file.exists());
+        assert!(
+            s.delete(&a, &sha).await.unwrap(),
+            "the delete must report the copies it removed"
+        );
+        assert!(!legacy_file.exists(), "the legacy copy must be removed too");
+        assert!(
+            matches!(
+                s.open_stream(&a, &sha, 0, 1).await.unwrap(),
+                OpenOutcome::Missing
+            ),
+            "the canonical copy must be removed"
+        );
+        s.db.shutdown();
+    }
+
+    #[tokio::test]
     async fn local_put_is_atomic() {
         // The final file must be written via a temp file + rename: no
         // `.tmp` leftovers, and the blob is served from its final path.
@@ -1844,6 +1906,45 @@ mod tests {
                 "min_free_bytes = 0 must disable the guard"
             );
             s.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn s3_reserve_applies_the_floor_to_the_temp_spool() {
+        // S3 objects never touch the local disk, but uploads spool to the
+        // system temp dir first: a floor that refuses local uploads must
+        // also refuse S3 ones, or a burst fills `/tmp` until writes fail
+        // mid-body.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let (db, _db_path) = db("s3-floor").await;
+            let s3 = |min_free_bytes| {
+                BlobStore::new(
+                    "s3",
+                    std::path::Path::new("/none"),
+                    min_free_bytes,
+                    Some(S3Config {
+                        endpoint: "http://127.0.0.1:1".into(),
+                        region: "us-east-1".into(),
+                        bucket: "test".into(),
+                        access_key: "ak".into(),
+                        secret_key: "sk".into(),
+                    }),
+                    db.clone(),
+                    Stats::new(),
+                )
+            };
+            // Disabled floor: allowed (no network happens at construction
+            // or reservation time).
+            let open = s3(0).await.unwrap();
+            assert!(open.reserve_space(1 << 20).is_ok());
+            // An unreachable floor: refused before any spool file exists.
+            let guarded = s3(u64::MAX).await.unwrap();
+            assert!(
+                guarded.reserve_space(1).is_err(),
+                "an S3 upload below the temp floor must be refused like a local one"
+            );
+            db.shutdown();
         });
     }
 

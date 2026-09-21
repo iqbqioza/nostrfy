@@ -3,6 +3,7 @@
 //! and add/remove-user events.
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use crate::db::PutOutcome;
 use crate::event::Event;
@@ -12,13 +13,15 @@ use crate::util::unix_now;
 
 impl super::Relay {
     /// Applies a role mutation to the live store, capturing it for replay
-    /// when a rebuild scan is in flight (see
+    /// when a rebuild is pending or in flight (see
     /// [`super::RolesRebuildBuffer`]). The capture and the live apply share
     /// the buffer lock, so a mutation is either replayed onto the freshly
     /// rebuilt store or applied after the swap — never lost in between.
     /// `mutate` returns `(result, changed)`; a refused mutation (e.g. an
     /// unknown role) is not captured, so the replay cannot apply what the
-    /// live store rejected.
+    /// live store rejected — except callers that force `changed` for
+    /// removals the revoked empty store cannot confirm (see
+    /// [`Self::apply_leave_request`]).
     pub(super) async fn mutate_roles<R>(
         &self,
         mutation: super::BufferedRoleMutation,
@@ -29,7 +32,14 @@ impl super::Relay {
             let mut roles = self.roles.write().await;
             mutate(&mut roles)
         };
-        if changed && buffer.scanning {
+        // Capture while a rebuild is pending, not just while its scan runs:
+        // the revoked window starts at marking (`dirty`, stored before the
+        // store is revoked) and ends at worker exit (`running`), but the
+        // scan flag only covers the walk itself. A mutation accepted in the
+        // pre-scan gap would otherwise never replay.
+        let rebuild_pending = self.roles_rebuild.dirty.load(Ordering::SeqCst)
+            || self.roles_rebuild.running.load(Ordering::SeqCst);
+        if changed && (buffer.scanning || rebuild_pending) {
             if buffer.mutations.len() >= super::ROLES_REBUILD_BUFFER_MAX {
                 buffer.overflow = true;
             } else {
@@ -295,6 +305,19 @@ impl super::Relay {
     /// NIP-43 leave request: removes the user from the member list and
     /// republishes it with a remove-user event.
     pub(crate) async fn apply_leave_request(&self, event: &Event) {
+        // A leave arriving while a role rebuild is in flight must still
+        // take effect: the live store is the revoked empty store, so the
+        // removal reports "not a member" and would never be captured for
+        // replay — and the rebuild would then resurrect the member from
+        // the surviving membership list. The client already got `OK`
+        // (LEAVE is ephemeral), so unlike the RPC paths there is no
+        // failure to report and retry: force-buffer the removal while a
+        // rebuild is pending (`dirty` covers mark-to-scan-start, `running`
+        // covers scan-start-to-worker-exit, with no gap: `dirty` is stored
+        // before the store is revoked). The replay applies it to the fresh
+        // store (a no-op when the member is absent).
+        let rebuild_pending = self.roles_rebuild.dirty.load(Ordering::SeqCst)
+            || self.roles_rebuild.running.load(Ordering::SeqCst);
         let removed = self
             .mutate_roles(
                 super::BufferedRoleMutation::RemovePubkey {
@@ -302,7 +325,7 @@ impl super::Relay {
                 },
                 |roles| {
                     let removed = roles.remove_pubkey(&event.pubkey);
-                    (removed, removed)
+                    (removed, removed || rebuild_pending)
                 },
             )
             .await;
@@ -319,6 +342,35 @@ impl super::Relay {
                     event.pubkey
                 );
             }
+        } else if rebuild_pending {
+            // Buffered for replay (or a no-op when the member is absent):
+            // announce the departure with a remove-user event alone.
+            // Publishing the revoked store's member list here would
+            // broadcast (and store) a wrong list, while the remove-user
+            // event tells clients exactly what happened. The next
+            // membership change republishes the full list; the replayed
+            // removal keeps the member out of it.
+            if !self.publish_remove_user(&event.pubkey).await {
+                log::warn!(
+                    "apply_leave_request: the remove-user event could not be published; {} may resurface if the rebuild scan fails",
+                    event.pubkey
+                );
+            }
         }
+    }
+
+    /// Publishes only the remove-user event for a departure applied while
+    /// the live store is revoked (see [`Self::apply_leave_request`]): the
+    /// full member list cannot be published from the empty store.
+    async fn publish_remove_user(&self, pubkey: &str) -> bool {
+        let Some(relay_pubkey) = self.relay_pubkey() else {
+            return false;
+        };
+        let now = self.stamp_floor(unix_now());
+        let event = {
+            let roles = self.roles.read().await;
+            roles.remove_user_event(pubkey, &relay_pubkey, now)
+        };
+        self.publish_relay_event(event).await
     }
 }

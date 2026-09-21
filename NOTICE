@@ -1,0 +1,12 @@
+nostrfy
+Copyright (c) 2026 iqbqioza
+
+This product is dual-licensed under the MIT License or the Apache License,
+Version 2.0, at your option. See LICENSE-MIT and LICENSE-APACHE for the full
+terms.
+
+The compiled binary includes third-party open-source components, each
+distributed under its own permissive license (MIT, Apache-2.0, BSD, ISC,
+Unicode-3.0, CC0-1.0, Zlib, Unlicense, or equivalent). Cargo.lock lists the
+exact dependency set; each crate's published license metadata carries its
+terms.

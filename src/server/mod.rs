@@ -738,7 +738,7 @@ pub async fn run_server(
     // [`restore_role_state`]).
     restore_role_state(&relay).await?;
 
-    let blossom_state = blossom::build_state(&relay.config.read().await.clone(), &relay).await;
+    let blossom_state = blossom::build_state(&relay.config.read().await.clone(), &relay).await?;
     *relay.blossom.write().await = blossom_state.clone();
     let app = build_router(&relay, blossom_state).await;
 
@@ -748,43 +748,92 @@ pub async fn run_server(
     };
     let listener = bind_listener(&bind_addr, "relay listening on ws://").await?;
 
-    let mut tasks = Vec::new();
+    let mut supervised: Vec<SupervisedTask> = Vec::new();
 
     // Supervisor: a background task that exits before shutdown would
     // silently lose its function (expiry purge, stats, discovery, SIGHUP).
     // Today that is unreachable (DB helpers return defaults, never panic),
-    // but a future panic must be loud instead of silent.
-    for (name, handle) in [
+    // but a future panic must be loud instead of silent. (The global panic
+    // hook already logs the payload; the wrapper notes the loss.)
+    for (name, work) in [
         (
             "stats_writer",
-            tokio::spawn(stats_writer(relay.clone(), shutdown_rx.clone())),
+            Box::pin(stats_writer(relay.clone(), shutdown_rx.clone()))
+                as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
         ),
         (
             "purge_loop",
-            tokio::spawn(purge_loop(relay.clone(), shutdown_rx.clone())),
+            Box::pin(purge_loop(relay.clone(), shutdown_rx.clone()))
+                as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
         ),
         (
             "nip66_publisher",
-            tokio::spawn(nip66_publisher(relay.clone(), shutdown_rx.clone())),
+            Box::pin(nip66_publisher(relay.clone(), shutdown_rx.clone()))
+                as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
         ),
-        // Spawned before the startup work (see the top of `run_server`) and
-        // kept out of the abortable set so its second-signal escalation
-        // stays armed.
-        ("reload_handler", reload_task),
     ] {
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<bool>();
+        let inner = tokio::spawn(async move {
+            let panicked =
+                futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(work))
+                    .await
+                    .is_err();
+            let _ = done_tx.send(panicked);
+        });
         let shutdown = shutdown_rx.clone();
-        tasks.push(tokio::spawn(async move {
-            match handle.await {
-                Ok(()) => {
+        let outer = tokio::spawn(async move {
+            match done_rx.await {
+                Ok(false) => {
                     if !*shutdown.borrow() {
                         error!(
                             "background task {name} exited unexpectedly; its function is lost until restart"
                         );
                     }
                 }
+                // Panicked: the payload is in the panic log (the global
+                // hook logs it before the unwind is caught), so keep the
+                // word `panicked` here too — monitors match on it.
+                Ok(true) => {
+                    if !*shutdown.borrow() {
+                        error!(
+                            "background task {name} panicked; see the panic log for the payload, \
+                             its function is lost until restart"
+                        );
+                    }
+                }
+                // The sender was dropped without a report: the shutdown
+                // bound aborted the inner task. Loud outside shutdown,
+                // quiet when the shutdown bound did it.
+                Err(_) => {
+                    if !*shutdown.borrow() {
+                        error!(
+                            "background task {name} ended without completing; its function is lost until restart"
+                        );
+                    }
+                }
+            }
+        });
+        supervised.push(SupervisedTask { outer, inner });
+    }
+    // Spawned before the startup work (see the top of `run_server`) and
+    // kept out of the abortable set so its second-signal escalation
+    // stays armed.
+    let mut tasks = Vec::new();
+    {
+        let shutdown = shutdown_rx.clone();
+        let handle = reload_task;
+        tasks.push(tokio::spawn(async move {
+            match handle.await {
+                Ok(()) => {
+                    if !*shutdown.borrow() {
+                        error!(
+                            "background task reload_handler exited unexpectedly; its function is lost until restart"
+                        );
+                    }
+                }
                 Err(e) => {
                     error!(
-                        "background task {name} panicked: {e}; its function is lost until restart"
+                        "background task reload_handler panicked: {e}; its function is lost until restart"
                     );
                 }
             }
@@ -845,11 +894,23 @@ pub async fn run_server(
     // Bound the background-task joins: a task stuck in a long database walk
     // (e.g. a mid-flight `purge_expired`) must not delay the process exit
     // without limit. Aborting drops the loop at its next await point; the
-    // database is stopped afterwards.
+    // database is stopped afterwards. Both sets join concurrently so the
+    // phase stays within a single grace (the `SHUTDOWN_BUDGET` phase
+    // accounting counts it once).
     let join_grace = TASK_JOIN_GRACE;
-    if !join_tasks_bounded(&mut tasks, join_grace).await {
+    let (tasks_done, supervised_done) = tokio::join!(
+        join_tasks_bounded(&mut tasks, join_grace),
+        join_supervised_bounded(&mut supervised, join_grace)
+    );
+    if !tasks_done {
         warn!(
             "background tasks did not stop within {}s; aborted them",
+            join_grace.as_secs()
+        );
+    }
+    if !supervised_done {
+        warn!(
+            "supervised tasks did not stop within {}s; aborted them",
             join_grace.as_secs()
         );
     }
@@ -903,6 +964,39 @@ async fn join_tasks_bounded(
     if joined.is_err() {
         for task in tasks.iter() {
             task.abort();
+        }
+    }
+    joined.is_ok()
+}
+
+/// A background task paired with its supervisor wrapper. The wrapper only
+/// observes completion and logs unexpected exits; the shutdown bound must
+/// abort the inner handle. Aborting a wrapper alone would merely detach
+/// the inner task, which would keep running (and using the database) past
+/// the bound the shutdown budget promises.
+struct SupervisedTask {
+    outer: tokio::task::JoinHandle<()>,
+    inner: tokio::task::JoinHandle<()>,
+}
+
+/// Awaits every supervised task's observer with a bound. Returns `true`
+/// when all finished within `grace`; on expiry the shutdown aborts the
+/// *inner* tasks — aborting only the observer would detach the real work,
+/// which would keep running (and using the database) past the bound.
+/// Aborting the observers too keeps no handle behind.
+async fn join_supervised_bounded(tasks: &mut [SupervisedTask], grace: std::time::Duration) -> bool {
+    let joined = tokio::time::timeout(grace, async {
+        for task in tasks.iter_mut() {
+            let _ = (&mut task.outer).await;
+        }
+    })
+    .await;
+    if joined.is_err() {
+        for task in tasks.iter() {
+            task.inner.abort();
+        }
+        for task in tasks.iter_mut() {
+            task.outer.abort();
         }
     }
     joined.is_ok()
@@ -2436,7 +2530,9 @@ mod tests {
         .await;
         // The Blossom handlers (and the root info document) require a live
         // storage state, exactly like `run_server`.
-        let state = blossom::build_state(&relay.config.read().await.clone(), &relay).await;
+        let state = blossom::build_state(&relay.config.read().await.clone(), &relay)
+            .await
+            .expect("test Blossom backend must initialize");
         *relay.blossom.write().await = state;
         Arc::new(relay)
     }
@@ -3931,6 +4027,52 @@ mod tests {
         // Finished tasks return `true` well before the grace.
         let mut quick: Vec<tokio::task::JoinHandle<()>> = vec![tokio::spawn(async {})];
         assert!(join_tasks_bounded(&mut quick, Duration::from_secs(5)).await);
+    }
+
+    #[tokio::test]
+    async fn supervised_join_aborts_the_inner_task_not_just_the_wrapper() {
+        // Regression: the shutdown bound used to abort only the supervisor
+        // wrapper, which detached the real task — the inner walk kept
+        // running (and using the database) past the bound. The abort must
+        // land on the inner handle.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let counter = std::sync::Arc::new(AtomicUsize::new(0));
+        let work = {
+            let counter = std::sync::Arc::clone(&counter);
+            Box::pin(async move {
+                loop {
+                    counter.fetch_add(1, Ordering::Relaxed);
+                    tokio::task::yield_now().await;
+                }
+                #[allow(unreachable_code)]
+                ()
+            }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        };
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<bool>();
+        let inner = tokio::spawn(async move {
+            let _ = futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(work)).await;
+            let _ = done_tx.send(false);
+        });
+        let mut supervised = vec![SupervisedTask {
+            outer: tokio::spawn(async move {
+                let _ = done_rx.await;
+            }),
+            inner,
+        }];
+        assert!(
+            !join_supervised_bounded(&mut supervised, Duration::from_millis(100)).await,
+            "a stuck inner task must hit the join bound"
+        );
+        // The inner task itself must be aborted, not just detached: its
+        // counter stops advancing.
+        let frozen = counter.load(Ordering::Relaxed);
+        assert!(frozen > 0, "the stuck task must have been running");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            frozen,
+            "the aborted inner task must stop making progress"
+        );
     }
 
     #[cfg(unix)]

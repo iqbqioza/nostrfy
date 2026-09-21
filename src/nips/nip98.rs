@@ -27,7 +27,13 @@ pub fn strip_nostr_scheme(value: &str) -> Option<&str> {
     scheme.eq_ignore_ascii_case("Nostr").then_some(token)
 }
 
-/// Verifies an encoded NIP-98 event. When `expected_pubkey` is given the
+/// Verifies an encoded NIP-98 event. The token is accepted in both the
+/// spec's standard Base64 and the Base64url-without-padding form some
+/// client libraries emit (the Blossom endpoints already accept both, so
+/// rejecting the url-safe form here would 401 legitimate clients on the
+/// NIP-86 and LiveKit routes). Decoding is the only leniency: the JSON,
+/// signature and tag checks below are strict.
+/// When `expected_pubkey` is given the
 /// event must be authored by it; when `require_payload` is set the event
 /// must carry a `payload` tag (NIP-86 requires it); when
 /// `expected_payload_hash` is given the tag value must additionally equal
@@ -46,6 +52,7 @@ pub fn verify(
 ) -> Option<Verified> {
     let raw = base64::engine::general_purpose::STANDARD
         .decode(encoded)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(encoded))
         .ok()?;
     let event: Event = serde_json::from_slice(&raw).ok()?;
     if event.kind != AUTH_KIND {
@@ -188,6 +195,11 @@ impl ReplayGuard {
 /// canonical HTTP origin (`relay.public_url` mapped to `https`/`http`, or
 /// the bound `http://host:port` when unset) plus the exact request path and
 /// query; the comparison is byte-for-byte.
+///
+/// One interop allowance: for a root request the path is `/`, and clients
+/// (e.g. `nak`) send the bare origin without the trailing slash. Per
+/// RFC 3986 an empty path is equivalent to `/` for http(s), so both
+/// spellings are accepted — a strict compare 401s a correct client.
 pub fn matches_request_url(
     tag: &str,
     identity: &crate::nips::nip62::RelayIdentity<'_>,
@@ -200,7 +212,14 @@ pub fn matches_request_url(
         expected.push('?');
         expected.push_str(query);
     }
-    tag == expected
+    if tag == expected {
+        return true;
+    }
+    if request_path == "/" && request_query.is_none() {
+        let origin = identity.http_origin();
+        return tag == origin;
+    }
+    false
 }
 
 #[cfg(test)]
@@ -235,6 +254,32 @@ mod tests {
 
     fn encode(ev: &Event) -> String {
         base64::engine::general_purpose::STANDARD.encode(serde_json::to_string(ev).unwrap())
+    }
+
+    fn encode_url_safe_no_pad(ev: &Event) -> String {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_string(ev).unwrap())
+    }
+
+    #[test]
+    fn verify_accepts_base64url_without_padding() {
+        // Client libraries emit the auth event in either Base64 form; the
+        // Blossom endpoints accept both, so NIP-98 verification must too
+        // (otherwise NIP-86 and LiveKit 401 legitimate clients).
+        let secp = Secp256k1::new();
+        let now = unix_now();
+        let ev = signed_event(Some("POST"), "https://relay.example.com/", now);
+        let check = |encoded: &str| {
+            verify(encoded, None, &secp, false, None, "POST", |u| {
+                u == "https://relay.example.com/"
+            })
+            .is_some()
+        };
+        assert!(check(&encode(&ev)), "standard Base64 must verify");
+        assert!(
+            check(&encode_url_safe_no_pad(&ev)),
+            "Base64url without padding must verify"
+        );
+        assert!(!check("!!!not-base64!!!"), "garbage must not verify");
     }
 
     #[test]
@@ -391,9 +436,11 @@ mod tests {
             "/ws",
             None
         ));
-        // A bare authority is not the "/" URL: the trailing slash is part
-        // of the absolute request URL.
-        assert!(!matches_request_url(
+        // A bare authority is accepted for the root URL: per RFC 3986 an
+        // empty path is equivalent to "/" for http(s), and clients (nak)
+        // send the bare origin. See the interop allowance in
+        // `matches_request_url`.
+        assert!(matches_request_url(
             "http://relay.example.com:8080",
             &identity,
             "/",
@@ -478,6 +525,46 @@ mod tests {
             &identity,
             "/ws",
             None
+        ));
+    }
+
+    #[test]
+    fn request_url_accepts_a_bare_root_origin() {
+        // Interop: clients (e.g. `nak admin`) send the origin without the
+        // trailing slash for a root request. Per RFC 3986 the empty path is
+        // equivalent to `/` for http(s), so both spellings must verify.
+        let identity = RelayIdentity::new("127.0.0.1", 8080, "ws://public.example.net");
+        assert!(matches_request_url(
+            "http://public.example.net/",
+            &identity,
+            "/",
+            None
+        ));
+        assert!(matches_request_url(
+            "http://public.example.net",
+            &identity,
+            "/",
+            None
+        ));
+        // A non-root path still requires the exact path (no slash leniency).
+        assert!(!matches_request_url(
+            "http://public.example.net",
+            &identity,
+            "/ws",
+            None
+        ));
+        // A query on a root request keeps the exact form.
+        assert!(!matches_request_url(
+            "http://public.example.net",
+            &identity,
+            "/",
+            Some("a=1")
+        ));
+        assert!(matches_request_url(
+            "http://public.example.net/?a=1",
+            &identity,
+            "/",
+            Some("a=1")
         ));
     }
 

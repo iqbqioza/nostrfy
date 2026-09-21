@@ -867,8 +867,12 @@ impl Store {
             // counter, so an earlier filter filling its limit cannot starve
             // a later one.
             out.begin_filter(index);
+            // The global collection cap is reached: later filters cannot
+            // contribute anything holdable, so stop. `more` is not set
+            // here: a previous filter that was cut short already set it
+            // inside its walk, while a filter that exhausted exactly at
+            // the cap is complete and must not report `approximate`.
             if out.full() {
-                more = true;
                 break;
             }
             let has_search = filter.has_search();
@@ -923,11 +927,17 @@ impl Store {
             )?;
             // A stopped walk is the global collection cap (nothing more can
             // be held), the shared work budget, or this filter's quota
-            // filling. Only the cap drops the remaining filters: a
-            // quota-filled filter is done (`more` was already set by the
-            // walk) and later filters still contribute their own quotas.
-            if stop || out.full() {
+            // filling. `stop` reports a real truncation (`more`): a
+            // quota/budget stop ends only this filter's walk — the
+            // remaining filters still contribute — while a full collector
+            // drops them (nothing more can be held, whatever stopped the
+            // walk). An exhausted walk is complete even when it filled
+            // the cap exactly, so `more` must not be set for it (an exact
+            // count is not approximate).
+            if stop {
                 more = true;
+            }
+            if out.full() {
                 break;
             }
         }
@@ -1064,10 +1074,13 @@ impl Store {
             for (_, id) in candidates {
                 if !consider(&id)? {
                     *more = true;
-                    return Ok(false);
+                    return Ok(true);
                 }
             }
-            return Ok(out.full());
+            // The gather and replay both ran to completion: every listed
+            // id was considered, so this filter is complete even when the
+            // replay filled the cap exactly.
+            return Ok(false);
         }
 
         let since = filter.since.unwrap_or(0);
@@ -1155,9 +1168,10 @@ impl Store {
                     );
                     ranges.push((start, end));
                     if !self.walk_merged(rtxn, by_word, &ranges, ascending, &mut consider, more)? {
-                        return Ok(false);
+                        return Ok(true);
                     }
-                    return Ok(out.full());
+                    // Exhausted: every range entry was considered.
+                    return Ok(false);
                 }
             }
         }
@@ -1192,9 +1206,10 @@ impl Store {
                     more,
                 )?
             {
-                return Ok(false);
+                return Ok(true);
             }
-            return Ok(out.full());
+            // Exhausted: every range entry was considered.
+            return Ok(false);
         }
 
         // Only `#`-prefixed keys are tag constraints (NIP-01); an unknown
@@ -1230,7 +1245,7 @@ impl Store {
                         // A tag attribute with no string values (e.g. a
                         // numeric `{"#a": 123}`) matches nothing: the final
                         // in-memory match requires every attribute.
-                        return Ok(out.full());
+                        return Ok(false);
                     }
                     if !self.walk_merged(
                         rtxn,
@@ -1240,9 +1255,10 @@ impl Store {
                         &mut consider,
                         more,
                     )? {
-                        return Ok(false);
+                        return Ok(true);
                     }
-                    return Ok(out.full());
+                    // Exhausted: every range entry was considered.
+                    return Ok(false);
                 }
             }
             // Multi-letter or non-alphanumeric tag names, and values too long
@@ -1268,9 +1284,10 @@ impl Store {
             if !ranges.is_empty()
                 && !self.walk_merged(rtxn, self.by_kind, &ranges, ascending, &mut consider, more)?
             {
-                return Ok(false);
+                return Ok(true);
             }
-            return Ok(out.full());
+            // Exhausted: every range entry was considered.
+            return Ok(false);
         }
 
         let start = created_key(since, &[0u8; ID_LEN]);
@@ -1282,9 +1299,9 @@ impl Store {
         );
         // A per-filter limit/budget stop only ends this filter's walk, like
         // every other index path: the remaining filters still contribute
-        // results. (Returning `true` here used to drop the rest of a
-        // multi-filter REQ whenever the first filter hit its limit, e.g. a
-        // `{"limit": 0}` filter killed the whole query.)
+        // results (the caller breaks only on a full collector, which a
+        // quota stop leaves room in). Truncation is reported through
+        // `stop`, exhaustion is complete even at the exact cap.
         if !self.walk_created_range(
             rtxn,
             self.by_created,
@@ -1294,9 +1311,9 @@ impl Store {
             &mut consider,
             more,
         )? {
-            return Ok(false);
+            return Ok(true);
         }
-        Ok(out.full())
+        Ok(false)
     }
 
     #[allow(clippy::too_many_arguments)]

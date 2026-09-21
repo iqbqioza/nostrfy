@@ -246,7 +246,7 @@ Set this whenever a reverse proxy (nginx, Caddy, a cloud load balancer, Cloudfla
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
 | `max_content_bytes` | integer | `65536` | Max event content length in **characters** |
-| `max_groups` | integer | `1000` | Cap on the in-memory NIP-29 group store (active groups + deleted-group markers). Creates beyond it are rejected with `restricted: group limit reached`. Must be ≥ 1 (`0` is rejected) |
+| `max_groups` | integer | `1000` | Cap on the in-memory NIP-29 group store (active groups + deleted-group markers). Creates beyond it are rejected with `restricted: group limit reached`. Must be ≥ 1 (`0` is rejected). Canonical key `relay.max_groups` (see §3); the `[limits]` spelling is a legacy alias |
 | `max_tags` | integer | `2000` | Max tags per event |
 | `max_tag_value_bytes` | integer | `1024` | Max bytes per tag value |
 | `max_created_at_future_secs` | integer | `3600` | Tolerated future skew of `created_at` (seconds) |
@@ -365,7 +365,7 @@ Set this whenever a reverse proxy (nginx, Caddy, a cloud load balancer, Cloudfla
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
 | `path` | string | `"./data"` | Database directory (LMDB) |
-| `max_dbs` | integer | `32` | LMDB max named databases (must be ≥ 19) |
+| `max_dbs` | integer | `32` | LMDB max named databases (raised to 22 when lower) |
 | `max_readers` | integer | `128` | LMDB max concurrent readers (raised to `2 * reader_threads + 3` when lower) |
 | `map_size` | integer | `1073741824` (1 GB) | Floor for the memory map size (bytes) |
 | `max_map_size` | integer | `1099511627776` (1 TB) | Memory-map ceiling (bytes) |
@@ -381,7 +381,7 @@ Set this whenever a reverse proxy (nginx, Caddy, a cloud load balancer, Cloudfla
 
 **`path`** — The directory holding the LMDB database files. Relative paths are resolved against the config file's directory, so they stay valid after the daemon changes its working directory. Do not point two relay instances at the same directory.
 
-**`max_dbs`** — LMDB's maximum number of named databases. The relay uses 19 when `search_index = true` (18 tables plus the word index) and 18 otherwise; values below 19 are raised to 19 so the word index can always be created.
+**`max_dbs`** — LMDB's maximum number of named databases. The relay uses 22 when `search_index = true` (21 tables plus the word index) and 21 otherwise; values below 22 are raised to 22 so every table can always be created.
 
 **`max_readers`** — LMDB's maximum number of concurrent read transactions. Values below `2 * reader_threads + 3` are raised to that floor (two slots per reader thread plus the writer/API/startup paths, which nest transactions); a lower value would fail queries with `MDB_READERS_FULL`. The documented ≥ 8 minimum is subsumed by this formula.
 
@@ -416,7 +416,7 @@ Set this whenever a reverse proxy (nginx, Caddy, a cloud load balancer, Cloudfla
 - **Data migrations** run automatically once, at startup:
   - access pubkey lists moved into their dedicated key (legacy `access` blob → `relay_pubkeys`),
   - the Blossom sha→owner mapping rebuilt from legacy files (marker key, skipped on later restarts).
-- The startup log reports `database ready at ... (19 tables, map ... MiB)` — 18 named tables plus the NIP-50 word index (18 tables when `database.search_index = false`) — and the migration checks.
+- The startup log reports `database ready at ... (22 tables, map ... MiB)` — 21 named tables plus the NIP-50 word index (21 tables when `database.search_index = false`) — and the migration checks.
 
 ---
 
@@ -586,14 +586,14 @@ Unknown keys or sections produce **warnings** (not errors), so typos are visible
 
 ## 10. Reloading at runtime (SIGHUP)
 
-Editing the file and sending `kill -HUP $(cat nostrfy.pid)` reloads it **without a restart**. The reload is **not all-or-nothing**: every setting that can be applied live is applied, even when the same file also changes a startup-only setting. Startup-only settings keep their running values; each changed one is warned about (`<key> changed in the reloaded config but the routes are fixed at startup; a restart is required to apply it`), and a changed `relay.private_key` is warned about and ignored because the signing key is fixed at startup. A file that **fails validation** is rejected as a whole (the error is logged and the old configuration stays in force).
+Editing the file and sending `kill -HUP $(cat nostrfy.pid)` reloads it **without a restart**. The reload is **not all-or-nothing**: every setting that can be applied live is applied, even when the same file also changes a startup-only setting. Startup-only settings keep their running values; each changed one is warned about (`<key> changed in the reloaded config but the routes are fixed at startup; a restart is required to apply it`), and a changed `relay.private_key` is warned about and ignored because the signing key is fixed at startup. A file that **fails validation** is rejected as a whole (the error is logged and the old configuration stays in force) — except the database-owned allow/deny lists (NIP-86 access lists, relay pubkey lists, Blossom allowlist), which still refresh from the database on every reload attempt, in the fail-safe direction.
 
 | Applies on SIGHUP | Requires `nostrfy restart` |
 | --- | --- |
 | Relay identity and policies: `relay.name`, `description`, `pubkey`, `contact`, `icon`, `post_policy`, `public_url`, `reject_ephemeral`, `enabled_git`, `enabled_nip78_auth`, `require_auth`, `send_auth_challenge`, `require_pow`, `new_pubkey_min_age_secs`, `max_events_per_min_per_pubkey` | `relay.private_key` (warned about and ignored), `relay.livekit_url`/`livekit_api_key`/`livekit_api_secret`, `relay.enabled_nips`/`disabled_nips`, `relay.max_groups` |
 | `rpc.management_token`, `rpc.admin_pubkey`, `blossom.restrict_uploads`, `access.restrict_relay` | `rpc.max_admin_body_bytes` |
 | `server.inbox_write_policy`, `server.outbox_write_policy` (existing connections pick them up on the next config refresh), `relay.enabled_command_events` (read per event), `daemon.stats_file` (read on every stats tick), `database.db_buffer_size` (new connections only) | `server.host`, `server.port`, `server.ws_paths`, `server.api_host`, `server.metrics_enabled`, `server.trusted_proxies` (they shape the listener, routes and per-connection accounting built at startup) |
-| Most of `[limits]`: `max_ws_message_bytes`, `max_filters`, `max_subscriptions`, `max_limit`, `max_count`, `max_sub_id_len`, `max_content_bytes`, `max_tags`, `max_tag_value_bytes`, `max_created_at_future_secs`, `max_neg_items`, `max_sub_bytes`, `group_late_publish_secs`, the API bounds (`max_api_concurrent`, `max_api_queue_msgs`, `max_api_limit`, `max_api_offset`, `max_api_fetch`, `max_api_search_bytes`), `max_out_queue_bytes`, `max_req_response_bytes`, `ws_idle_timeout_secs` | `limits.live_buffer`, `limits.live_batch_size`, `limits.live_batch_interval_ms`, `limits.socket_recv_buffer_kb`, `limits.max_connections`, `limits.max_connections_per_ip`, `limits.http_read_timeout_secs`, `limits.max_connections_per_sec_per_ip` (they shape the accept loop built at startup), `server.trusted_proxies` (it shapes the per-connection accounting) |
+| Most of `[limits]`: `max_ws_message_bytes`, `max_filters`, `max_subscriptions`, `max_limit`, `max_count`, `max_sub_id_len`, `max_content_bytes`, `max_tags`, `max_tag_value_bytes`, `max_created_at_future_secs`, `max_neg_items`, `max_sub_bytes`, `group_late_publish_secs`, the API bounds (`max_api_concurrent`, `max_api_queue_msgs`, `max_api_limit`, `max_api_offset`, `max_api_fetch`, `max_api_search_bytes`), `max_out_queue_bytes`, `max_req_response_bytes`, `ws_idle_timeout_secs` (existing connections keep their deadline; the new value applies to connections made after the reload) | `limits.live_buffer`, `limits.live_batch_size`, `limits.live_batch_interval_ms`, `limits.socket_recv_buffer_kb`, `limits.max_connections`, `limits.max_connections_per_ip`, `limits.http_read_timeout_secs`, `limits.max_connections_per_sec_per_ip` (they shape the accept loop built at startup), `server.trusted_proxies` (it shapes the per-connection accounting) |
 | — | `database.path`, `database.purge_interval_secs`, `database.map_size`, `database.max_map_size`, `database.max_dbs`, `database.max_readers`, `database.search_index`, `database.meta_index`, `database.reader_threads`, `database.disabled_fsync`, `database.db_request_timeout_secs`, `database.max_db_queue_msgs`, `database.max_db_queue_events`, `database.max_db_queue_bytes`, `database.max_indexed_words` |
 | — | `daemon.max_log_size_bytes`, `daemon.max_log_files`, `daemon.stats_interval_secs`, `daemon.log_file`, `daemon.pid_file` |
 | — | `blossom.host`, `blossom.storage`, `blossom.local_path`, `blossom.max_upload_bytes`, `blossom.min_free_bytes`, `blossom.s3_*` |

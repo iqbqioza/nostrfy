@@ -29,9 +29,11 @@ use crate::cli::Cli;
 
 fn main() {
     // Log every panic so that a fault in any task is visible in the logs
-    // (spawned tasks are contained; the relay keeps serving).
+    // (spawned tasks are contained; the relay keeps serving). `log_panic`
+    // never blocks on the logger mutex: the hook runs before the unwind,
+    // so a panic inside a log backend still holds it.
     std::panic::set_hook(Box::new(|info| {
-        log::error!("panic: {info}");
+        crate::logging::log_panic(&format!("panic: {info}"));
     }));
     crate::logging::init();
 

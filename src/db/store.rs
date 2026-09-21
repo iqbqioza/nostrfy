@@ -2625,13 +2625,19 @@ impl Store {
         }
         if let Some(by_word) = self.by_word {
             let words = nip50::tokenize(&event.content);
-            let overflow = words.len() > self.indexed_words;
+            let mut overflow = words.len() > self.indexed_words;
             for word in words.iter().take(self.indexed_words) {
                 let key = word_key(word, created, id);
                 // Skip rather than error: an over-long word would abort the
-                // whole write batch (see MAX_INDEX_KEY).
+                // whole write batch (see MAX_INDEX_KEY). The skip must
+                // force the overflow marker: such a word can never be found
+                // through its own index range, only through the full-content
+                // overflow walk, and without the marker a query mixing an
+                // indexed term with this long term would miss the event.
                 if key.len() <= MAX_INDEX_KEY {
                     by_word.put(wtxn, &key, b"")?;
+                } else {
+                    overflow = true;
                 }
             }
             // Long events also carry the overflow marker so the search scan
@@ -2735,12 +2741,16 @@ impl Store {
         }
         if let Some(by_word) = self.by_word {
             let words = nip50::tokenize(&event.content);
-            let overflow = words.len() > self.indexed_words;
+            let mut overflow = words.len() > self.indexed_words;
             for word in words.iter().take(self.indexed_words) {
-                // Mirror the put path for the same reason as tags above.
+                // Mirror the put path for the same reason as tags above
+                // (including the overflow-marker rule for over-long words:
+                // `delete` on a key that was never written is a no-op).
                 let key = word_key(word, event.created_at, id);
                 if key.len() <= MAX_INDEX_KEY {
                     by_word.delete(wtxn, &key)?;
+                } else {
+                    overflow = true;
                 }
             }
             if overflow {

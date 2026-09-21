@@ -457,9 +457,19 @@ src/
 
 ## License
 
-This project is licensed under the [MIT License](LICENSE).
+This project is dual-licensed under either of
+
+- the [MIT License](LICENSE-MIT), or
+- the [Apache License, Version 2.0](LICENSE-APACHE)
+
+at your option.
 
 Copyright (c) 2026 iqbqioza
 
 You are free to use, copy, modify, merge, publish, distribute, sublicense and
 sell copies of the software, subject to the license terms.
+
+Unless you explicitly state otherwise, any contribution intentionally
+submitted for inclusion in this project by you, as defined in the Apache-2.0
+license, shall be dual-licensed as above, without any additional terms or
+conditions. See [CONTRIBUTING.md](CONTRIBUTING.md).

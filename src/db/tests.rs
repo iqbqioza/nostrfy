@@ -133,6 +133,98 @@ fn tag_filter_with_until_bounds_the_range() {
 }
 
 #[test]
+fn tag_range_never_panics_on_boundary_inputs() {
+    // The `tag_range` byte-slicing once panicked on an explicit `until`
+    // (wrong slice target); fuzz the boundary matrix directly so the
+    // slicing stays total: empty/huge values, maximal timestamps and
+    // inverted windows must all produce well-formed bounds.
+    use crate::db::store::tag_range;
+    let values: Vec<Vec<u8>> = vec![vec![], vec![b'x'], vec![0xff; 8], vec![0u8; 65535]];
+    let bounds = [0u64, 1, 100, u64::MAX - 1, u64::MAX];
+    for name in [b'e', 0u8, 0xff] {
+        for value in &values {
+            for &since in &bounds {
+                for &until in &bounds {
+                    let (start, end) = tag_range(name, value, since, until);
+                    let prefix_len = 1 + 1 + 4 + value.len();
+                    assert_eq!(
+                        &start[..prefix_len],
+                        &end[..prefix_len],
+                        "both bounds share the tag prefix"
+                    );
+                    assert_eq!(start.len(), prefix_len + 8 + 32);
+                    assert!(
+                        end.len() == prefix_len + 8 + 32 || end.len() == prefix_len + 8 + 32 + 1,
+                        "the maximal `until` appends one byte past the maximal id"
+                    );
+                    if since <= until {
+                        assert!(start <= end, "a non-empty window must stay ordered");
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn database_dir_lock_is_exclusive() {
+    // A second relay on the same `database.path` (a different pid file or
+    // port defeats the pid/port gate) must fail fast instead of running a
+    // split-brain second writer thread.
+    let cfg = config();
+    let _first = crate::db::lock_database_dir(&cfg.path).expect("the first holder takes the lock");
+    assert!(
+        crate::db::lock_database_dir(&cfg.path).is_err(),
+        "a second lock on the same database directory must fail"
+    );
+}
+
+#[test]
+fn count_at_the_exact_cap_is_not_approximate() {
+    // A walk that exhausts exactly at the request cap is complete: only a
+    // walk cut short by the cap reports `approximate`.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        for i in 0..3u64 {
+            let e = event(1, &format!("count me {i}"), now - 10 + i, Vec::new());
+            assert_eq!(db.put(e, now).await, PutOutcome::Stored);
+        }
+        let f: Filter = serde_json::from_value(serde_json::json!({"kinds": [1]})).unwrap();
+        let (counted, more) = db
+            .count_reported(vec![f.clone()], 3, now)
+            .await
+            .expect("count must not fail");
+        assert_eq!(counted.len(), 3);
+        assert!(!more, "an exact-cap count is complete, not approximate");
+        let (counted, more) = db
+            .count_reported(vec![f.clone()], 2, now)
+            .await
+            .expect("count must not fail");
+        assert_eq!(counted.len(), 2);
+        assert!(more, "a truncated count is approximate");
+        let (counted, more) = db
+            .count_reported(vec![f], 4, now)
+            .await
+            .expect("count must not fail");
+        assert_eq!(counted.len(), 3);
+        assert!(!more, "a below-cap count is complete");
+    });
+    db.shutdown();
+}
+
+#[test]
 fn maximal_timestamp_is_included_by_indexed_queries() {
     let db = DbClient::open(
         &config(),
@@ -1211,6 +1303,28 @@ fn store_blossom_mapping_lifecycle() {
     }
     assert!(store.load_blossom_mapping(&sha2).unwrap().is_none());
     assert!(!store.remove_blossom_owner(&sha2, &bob).unwrap());
+}
+
+#[test]
+fn gift_wrap_deletion_refuses_an_unbuilt_index() {
+    use crate::db::store::Store;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    let cfg = config();
+    // A raw store: no writer recovery ever ran, so the recipient index
+    // was never backfilled.
+    let store = Store::open(&cfg, Arc::new(AtomicBool::new(true)), 512).unwrap();
+    let recipient = [7u8; 32];
+    // The range walk would silently miss every pre-index wrap, so the
+    // deletion must fail loudly instead (the vanish path then skips its
+    // marker and the NIP-09 path reports the failure).
+    let err = store
+        .delete_gift_wraps_to(&recipient)
+        .expect_err("an unbuilt index must fail the deletion");
+    assert!(err.to_string().contains("not built"), "{err}");
+    // After the backfill the same deletion succeeds (nothing stored).
+    assert_eq!(store.rebuild_gift_wrap_index().unwrap(), 0);
+    assert_eq!(store.delete_gift_wraps_to(&recipient).unwrap(), 0);
 }
 
 #[test]
@@ -4758,8 +4872,8 @@ fn group_and_role_snapshots_survive_restart() {
 
 #[test]
 fn sixteen_max_dbs_still_opens_with_the_word_index() {
-    // 18 named tables are created (17 plus the word index); an operator
-    // value of 16 must not fail at startup (the clamp raises it to 18).
+    // 22 named tables are created (21 plus the word index); an operator
+    // value of 16 must not fail at startup (the clamp raises it to 22).
     let mut cfg = config();
     cfg.max_dbs = 16;
     assert!(cfg.search_index);
@@ -4772,7 +4886,7 @@ fn sixteen_max_dbs_still_opens_with_the_word_index() {
         4096,
         262144,
     )
-    .expect("18 tables must fit via the clamp");
+    .expect("22 tables must fit via the clamp");
     db.shutdown();
 }
 
@@ -4975,6 +5089,54 @@ fn vanish_reports_whether_group_state_was_removed() {
         );
         db.shutdown();
     });
+}
+
+#[test]
+fn search_finds_a_word_too_long_to_index() {
+    // A word longer than the index key limit can never have its own index
+    // range, so the event must carry the overflow marker (the full-content
+    // walk). Without the marker, a query mixing an indexed term with the
+    // long term walked only the indexed term's range and missed the event.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        32,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let long = "a".repeat(600);
+        let ev = event(1, &format!("short {long}"), now, vec![]);
+        assert_eq!(db.put(ev.clone(), now).await, PutOutcome::Stored);
+        // Mixed query: the indexable term routes to the word walk, the long
+        // term can only be found through the overflow marker.
+        let f: Filter =
+            serde_json::from_value(serde_json::json!({"search": format!("zzz {long}")})).unwrap();
+        let (res, _) = db.query(vec![f], 500, now).await;
+        assert_eq!(
+            res.len(),
+            1,
+            "an event containing a too-long word must be found via the overflow walk"
+        );
+        assert_eq!(res[0].id, ev.id);
+        // A long-only query falls through to the time-range scan.
+        let f: Filter = serde_json::from_value(serde_json::json!({"search": long})).unwrap();
+        let (res, _) = db.query(vec![f], 500, now).await;
+        assert_eq!(res.len(), 1, "the long-word-only query must match");
+        // Removal drops the marker (mirroring the put rule).
+        db.apply_deletion(vec![ev.id.clone()], vec![], Some(ev.pubkey.clone()), now)
+            .await;
+        let f: Filter =
+            serde_json::from_value(serde_json::json!({"search": format!("zzz {long}")})).unwrap();
+        let (res, _) = db.query(vec![f], 500, now).await;
+        assert!(res.is_empty(), "the marker must be removed with the event");
+    });
+    db.shutdown();
 }
 
 #[test]

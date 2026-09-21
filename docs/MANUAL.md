@@ -578,6 +578,8 @@ From these moderation events, the relay generates the following **relay-signed s
 | `restricted` | Only members can write |
 | `hidden` | Metadata is hidden from non-members |
 | `closed` | Join requests are not auto-approved (invite codes required) |
+
+> **Invite codes accumulate and are reusable**: a `kind:9009` adds codes to the group (it does not replace the set), and a code is not consumed by a join. Up to 100 codes are kept per group. To revoke a leaked code, delete the `9009` event that created it with a NIP-09 deletion request (the group state rebuilds from the surviving events, dropping the deleted event's codes).
 | `livekit` | The group has a LiveKit audio/video room |
 
 ### Subgroups
@@ -701,7 +703,7 @@ Uploads from unlisted pubkeys are rejected with `403`. The list survives restart
 - Files are served with `ETag`, `Cache-Control: immutable` and the stored content type.
 - Blob bytes never touch the relay database; the relay stores only SHA-256-to-owner metadata and the upload allowlist in LMDB. Back up both the configured blob storage and `database.path` to preserve the complete Blossom inventory and authorization state.
 - The sha256 → owner mapping is persisted in the relay database (LMDB): the relay restarts instantly, lookups read the mapping directly from the database (no in-memory index, no startup scan), and existing files keep working.
-- **Automatic migration**: on the first start after an upgrade, the relay rebuilds the mapping from blobs stored by older versions (a background scan — the table itself is created instantly, and later restarts skip the migration via a marker). No manual step is needed.
+- **Automatic migration**: on the first start after an upgrade, the relay rebuilds the mapping from blobs stored by older versions (a background scan — the table itself is created instantly, and later restarts skip the migration via a marker). No manual step is needed. While the background pass is still running, pre-upgrade blobs that it has not reached yet return `404` on GET (uploads/downloads of mapped blobs are unaffected); the pass completes on its own and the log reports the mapped count.
 - **All database upgrades are automatic**: every LMDB table is opened-or-created at startup (instant, non-destructive), and the one-time data migrations (access lists, Blossom mapping) run by themselves — see [CONFIGURATION.md](CONFIGURATION.md#upgrades-are-automatic-and-instant).
 
 ---
@@ -712,7 +714,7 @@ nostrfy supports several independent relays on one server (different ports). Eac
 
 - `server.port` — the listen port
 - `[daemon] pid_file` / `log_file` / `stats_file` — **shared values make the second instance refuse to start with `already running`**
-- `database.path` — an independent database per instance
+- `database.path` — an independent database per instance. Two instances on the same directory refuse to start (the second fails locking it): sharing one database between writers would silently split-brain the derived state.
 - `api_host` / `blossom.host` — a distinct hostname per instance when the host split is used
 
 Example:
@@ -798,7 +800,7 @@ The reload is **not all-or-nothing**: every live setting is applied even when th
 
 Settings that require a **restart**: each changed one is warned about (`... a restart is required to apply it`) and keeps its running value. They are `private_key` (warned about and ignored), `api_host`, `metrics_enabled`, LiveKit settings, `enabled_nips`/`disabled_nips`, `server.host`/`port`/`ws_paths`/`trusted_proxies`, `rpc.max_admin_body_bytes`, `database.path`/`purge_interval_secs`/`map_size`/`max_map_size`/`max_dbs`/`max_readers`/`search_index`/`meta_index`/`reader_threads`/`disabled_fsync`/`db_request_timeout_secs`/`max_db_queue_msgs`/`max_db_queue_events`/`max_db_queue_bytes`/`max_indexed_words`, `daemon.max_log_size_bytes`/`max_log_files`/`stats_interval_secs`/`log_file`/`pid_file`, `limits.live_buffer`/`live_batch_size`/`live_batch_interval_ms`/`socket_recv_buffer_kb`/`max_connections`/`max_connections_per_ip`/`http_read_timeout_secs`/`max_connections_per_sec_per_ip`, all `blossom.*` except `restrict_uploads` (which applies on reload), and `relay.max_groups`. See the CONFIGURATION.md SIGHUP table for the full matrix.
 
-The `[access]` kind/IP lists are runtime-managed via NIP-86 (a config edit is ignored and warned about); `restrict_relay` applies on reload. A file that fails validation is rejected as a whole: the error is logged and the old configuration stays in force.
+The `[access]` kind/IP lists are runtime-managed via NIP-86 (a config edit is ignored and warned about); `restrict_relay` applies on reload. A file that fails validation is rejected as a whole: the error is logged and the old configuration stays in force. The database-owned allow/deny lists are the exception: they refresh from the database on every reload attempt (even a rejected one), in the fail-safe direction.
 
 ---
 

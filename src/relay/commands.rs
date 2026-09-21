@@ -262,8 +262,24 @@ impl Relay {
                 let mut access = self.access.write().await;
                 let already = access.allowed_pubkeys.iter().any(|(p, _)| p == pk);
                 if !already {
-                    access.blocked_pubkeys.retain(|(p, _)| p != pk);
-                    access.allowed_pubkeys.push((pk.clone(), String::new()));
+                    // Command events use exact-case matching (unlike NIP-86's
+                    // case-insensitive match); the op carries the origin so
+                    // the replay keeps the same semantics.
+                    let ops = vec![
+                        crate::config::AccessOp::UnbanPubkey {
+                            pubkey: pk.clone(),
+                            insensitive: false,
+                        },
+                        crate::config::AccessOp::AllowPubkey {
+                            pubkey: pk.clone(),
+                            reason: String::new(),
+                            insensitive: false,
+                        },
+                    ];
+                    for op in &ops {
+                        crate::config::apply_access_op(&mut access, op);
+                    }
+                    self.push_access_ops(ops);
                 }
                 drop(access);
                 let persisted = self.persist_access().await;
@@ -273,8 +289,21 @@ impl Relay {
                 let mut access = self.access.write().await;
                 let already = access.blocked_pubkeys.iter().any(|(p, _)| p == pk);
                 if !already {
-                    access.allowed_pubkeys.retain(|(p, _)| p != pk);
-                    access.blocked_pubkeys.push((pk.clone(), String::new()));
+                    let ops = vec![
+                        crate::config::AccessOp::UnallowPubkey {
+                            pubkey: pk.clone(),
+                            insensitive: false,
+                        },
+                        crate::config::AccessOp::BanPubkey {
+                            pubkey: pk.clone(),
+                            reason: String::new(),
+                            insensitive: false,
+                        },
+                    ];
+                    for op in &ops {
+                        crate::config::apply_access_op(&mut access, op);
+                    }
+                    self.push_access_ops(ops);
                 }
                 drop(access);
                 let persisted = self.persist_access().await;
@@ -291,7 +320,17 @@ impl Relay {
                 // read and the write and be overwritten by the daemon's
                 // older snapshot.
                 let _guard = self.persist_blossom_allow_lock.lock().await;
-                let _state_lock = self.db.lock_access_state().await;
+                // Without the cross-process lock a concurrent CLI
+                // read-modify-write could land between the re-read below
+                // and the write and be overwritten by this older snapshot:
+                // refuse the command instead of writing unserialized.
+                let Some(_state_lock) = self.db.lock_access_state().await else {
+                    return format!(
+                        "error: {} {} could not be applied: the access state lock is unavailable",
+                        cmd.verb(),
+                        cmd.pubkey()
+                    );
+                };
                 let persisted = self.db.try_load_blossom_allow().await;
                 let mut allow = self.blossom_allow.write().await;
                 let (entries, changed) = merge_blossom_allow(persisted.as_deref(), &allow, pk);
@@ -306,7 +345,15 @@ impl Relay {
             }
             Command::BlossomDeny(pk) => {
                 let _guard = self.persist_blossom_allow_lock.lock().await;
-                let _state_lock = self.db.lock_access_state().await;
+                // Same cross-process ordering as `/blossom allow` above:
+                // refuse instead of writing unserialized.
+                let Some(_state_lock) = self.db.lock_access_state().await else {
+                    return format!(
+                        "error: {} {} could not be applied: the access state lock is unavailable",
+                        cmd.verb(),
+                        cmd.pubkey()
+                    );
+                };
                 let persisted = self.db.try_load_blossom_allow().await;
                 let mut allow = self.blossom_allow.write().await;
                 let (entries, changed) = merge_blossom_deny(persisted.as_deref(), &allow, pk);

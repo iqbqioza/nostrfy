@@ -48,6 +48,11 @@ pub(crate) const LIVE_QUEUE_CAPACITY: usize = 64;
 
 pub struct Relay {
     pub config: Arc<RwLock<Config>>,
+    /// The live access state. Runtime mutations must pair an apply with
+    /// [`Self::push_access_ops`]: `persist_access` replaces this state with
+    /// the persisted view merged with the queued ops, so an unqueued
+    /// mutation would be reverted on the next persist (and a reload would
+    /// drop it). See [`crate::config::AccessOp`].
     pub access: Arc<RwLock<AccessControl>>,
     pub db: DbClient,
     pub stats: Arc<Stats>,
@@ -102,6 +107,13 @@ pub struct Relay {
     /// other, or the older snapshot lands last and loses the newer entry
     /// (a ban silently disappearing on the next restart).
     persist_access_lock: tokio::sync::Mutex<()>,
+    /// Daemon-side access-control mutations not yet written through (see
+    /// [`crate::config::AccessOp`]): applied to memory immediately, drained
+    /// onto a freshly reloaded persisted state by `persist_access`, and
+    /// replayed (not drained) by `reload_db_state`. A plain `Mutex` (never
+    /// held across an await) is enough: both drain sites already hold
+    /// `persist_access_lock`.
+    access_ops: std::sync::Mutex<Vec<crate::config::AccessOp>>,
     /// Serializes `persist_roles` snapshot capture and write (same hazard
     /// as `persist_access_lock`: a stale role snapshot must not overwrite a
     /// newer one). Shared with the role rebuild worker, which persists the
@@ -513,10 +525,12 @@ async fn read_role_generation(db: &DbClient) -> Option<(u64, u64)> {
 /// the rebuild is dirty). Mirrors [`GROUPS_REBUILD_BUFFER_MAX`].
 const ROLES_REBUILD_BUFFER_MAX: usize = 4096;
 
-/// A role mutation accepted while a rebuild scan was in flight, replayed
-/// onto the fresh store once the scan completes. The high-level action
-/// (not the published event) is buffered, so a mutation is replayed only
-/// when it actually changed the store.
+/// A role mutation accepted while a rebuild is pending or in flight,
+/// replayed onto the fresh store once the scan completes. The high-level
+/// action (not the published event) is buffered, so a mutation is replayed
+/// only when it actually changed the store — except removals the revoked
+/// empty store cannot confirm, which callers force-buffer (see
+/// [`Relay::apply_leave_request`]).
 #[derive(Debug, Clone)]
 enum BufferedRoleMutation {
     /// `create_role` / `edit_role` (both install the role definition).
@@ -636,12 +650,31 @@ struct RolesRebuild {
 }
 
 impl RolesRebuild {
-    /// Releases the buffering window after a failed or aborted scan. The
-    /// buffered mutations were applied to the live store, which stays
-    /// authoritative; the fresh store is discarded.
+    /// Releases the buffering window after a failed or aborted scan, or on
+    /// shutdown before a scan starts. The buffered mutations were applied
+    /// to the live store, which stays authoritative; the fresh store is
+    /// discarded. Buffered leaves that never reached the live store (the
+    /// revoked window) are lost here: they are counted and warned about
+    /// so the operator knows a re-leave may be needed.
     async fn leave_buffering(&self) {
         let mut buffer = self.buffer.lock().await;
         buffer.scanning = false;
+        // A dropped leave (buffered while the live store was revoked, never
+        // applied to it) resurrects its member on the next rebuild: the
+        // remove-user event published for it keeps clients correct, but the
+        // rebuild only honors membership lists. Surface the count so the
+        // operator knows a re-leave may be needed.
+        let dropped_leaves = buffer
+            .mutations
+            .iter()
+            .filter(|m| matches!(m, BufferedRoleMutation::RemovePubkey { .. }))
+            .count();
+        if dropped_leaves > 0 {
+            log::warn!(
+                "role state rebuild abandoned with {dropped_leaves} buffered leave(s) unapplied; \
+                 affected members may resurface until they leave again"
+            );
+        }
         buffer.mutations.clear();
         buffer.overflow = false;
     }
@@ -743,8 +776,11 @@ async fn roles_rebuild_worker(
     loop {
         // Shutdown: stop before starting another scan. The removal that
         // dirtied the state already cleared the live store, so the next
-        // startup rebuilds from the surviving events.
+        // startup rebuilds from the surviving events. Buffered captures
+        // (e.g. a leave accepted while revoked) are reported and dropped:
+        // the process is dying, so they can never replay.
         if *drain.borrow() {
+            state.leave_buffering().await;
             break;
         }
         if !state.dirty.swap(false, Ordering::SeqCst) {
@@ -763,6 +799,7 @@ async fn roles_rebuild_worker(
                 )) => {}
                 _ = drain.changed() => {
                     state.dirty.store(true, Ordering::SeqCst);
+                    state.leave_buffering().await;
                     break;
                 }
             }
@@ -770,10 +807,12 @@ async fn roles_rebuild_worker(
         // Enter the buffering window *before* the scan starts: a mutation
         // accepted meanwhile is captured and replayed onto the fresh store,
         // so it cannot be lost when the rebuilt store replaces the live one.
+        // Captures from the pre-scan gap (marked, worker not yet walking)
+        // are kept: they belong to this pending window, and clearing them
+        // here would drop removals the revoked store could not confirm.
         {
             let mut buffer = state.buffer.lock().await;
             buffer.scanning = true;
-            buffer.mutations.clear();
             buffer.overflow = false;
         }
         let mut fresh = RoleStore::default();
@@ -809,13 +848,27 @@ async fn roles_rebuild_worker(
                  and retrying on the next role-state removal"
             );
             state.running.store(false, Ordering::SeqCst);
+            // The worker is done: drop the post-swap captures it may have
+            // accepted while still marked running. They were applied to the live
+            // store (and scheduled for persistence) like normal mutations, so
+            // replaying them in a later rebuild would wrongly re-apply stale
+            // intent. Clearing runs after `running` is already false, so a racing
+            // mutation either lands before the clear (applied live, safe to drop)
+            // or after it (sees a closed window and stays live-only, like normal).
+            {
+                let mut buffer = state.buffer.lock().await;
+                buffer.mutations.clear();
+                buffer.overflow = false;
+            }
             return;
         }
         if state.dirty.load(Ordering::SeqCst) {
             // A role-state removal committed while the scan ran: the fresh
             // store may predate it. Keep the fail-closed live store and
-            // rebuild again.
-            state.leave_buffering().await;
+            // rebuild again. The buffered mutations are kept for the
+            // rescan — they were accepted during the same pending window,
+            // so dropping them here would lose removals the revoked store
+            // could not confirm.
             continue;
         }
         // Replay the mutations accepted during the scan onto the fresh
@@ -1497,9 +1550,17 @@ impl Relay {
         // the very first run only (when no runtime state exists yet). The
         // pubkey allow/deny lists live in the relay database (LMDB),
         // managed with `nostrfy relay allow/deny` — never in the config.
-        let mut access = match db.load_access().await {
-            crate::db::LoadAccessOutcome::Loaded(access) => access,
-            crate::db::LoadAccessOutcome::Missing => config.read().await.access.clone(),
+        let access = match db.load_access().await {
+            crate::db::LoadAccessOutcome::Loaded(access) => (access, Vec::new()),
+            crate::db::LoadAccessOutcome::Missing => {
+                // First run: the config seeds both memory and (via the op
+                // log) the first persist, so the seed survives the
+                // write-through merge instead of being overwritten by the
+                // empty database state.
+                let seed = config.read().await.access.clone();
+                let ops = crate::config::access_seed_ops(&seed);
+                (seed, ops)
+            }
             crate::db::LoadAccessOutcome::Failed => {
                 // A failed read must not be mistaken for "nothing was ever
                 // persisted": the config seed would silently replace the
@@ -1508,6 +1569,7 @@ impl Relay {
                 std::process::exit(1);
             }
         };
+        let (mut access, mut seed_ops) = access;
         // `restrict_relay` is config-owned: an older persisted blob (which
         // predates the flag) would otherwise silently override it with the
         // serde default `false`.
@@ -1525,7 +1587,12 @@ impl Relay {
                  allowlist is the authoritative allowlist",
                 access.allowed_kinds
             );
-            access.allowed_kinds.clear();
+            // Clear through the op log (not just in memory) so the next
+            // write-through persist completes the migration in the
+            // database too instead of resurrecting the stale list.
+            for kind in std::mem::take(&mut access.allowed_kinds) {
+                seed_ops.push(crate::config::AccessOp::UnallowKind { kind });
+            }
         }
         // The pubkey lists and the Blossom allowlist are stored in the
         // relay database and loaded into memory at startup (and refreshed
@@ -1577,6 +1644,7 @@ impl Relay {
             publish_rate: std::sync::Mutex::new(HashMap::new()),
             publish_rate_pruned_at: std::sync::atomic::AtomicU64::new(0),
             persist_access_lock: tokio::sync::Mutex::new(()),
+            access_ops: std::sync::Mutex::new(seed_ops),
             persist_roles_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             snapshot_persist: std::sync::Arc::new(SnapshotPersist::default()),
             persist_blossom_allow_lock: tokio::sync::Mutex::new(()),
@@ -1836,32 +1904,116 @@ impl Relay {
     /// concurrent mutations could read snapshots in one order (older first)
     /// but queue their writes in the other, so the stale lists are the last
     /// ones committed and the newer entry is lost after a restart.
-    /// Returns whether both writes committed: the NIP-86 methods surface
-    /// a failure instead of reporting a change that is only in memory.
+    /// Queues daemon-side access-control mutations for write-through
+    /// persistence (see [`crate::config::AccessOp`]). The caller applies
+    /// them to memory first (live enforcement); `persist_access` drains
+    /// them onto a freshly reloaded persisted state. A plain `Mutex`
+    /// suffices: pushes are synchronous and short, and both drain sites
+    /// hold `persist_access_lock`.
+    pub(crate) fn push_access_ops(&self, ops: Vec<crate::config::AccessOp>) {
+        let mut queued = self
+            .access_ops
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        queued.extend(ops);
+        // No cap: dropping queued intent would lose bans (fail-open). The
+        // queue drains on every successful persist and only grows while
+        // the database is failing, when the relay is broken anyway.
+        if queued.len() > 1024 {
+            log::warn!(
+                "access op log holds {} unpersisted mutations; the database is not accepting writes",
+                queued.len()
+            );
+        }
+    }
+
+    /// Drains the queued daemon access ops (see [`Self::push_access_ops`]).
+    /// Used by `persist_access`; the queue is restored on failure so a
+    /// later persist retries the same intent.
+    fn take_access_ops(&self) -> Vec<crate::config::AccessOp> {
+        std::mem::take(
+            &mut *self
+                .access_ops
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        )
+    }
+
+    /// Restores drained ops after a failed write, preserving order (the
+    /// failed batch is older than anything queued meanwhile).
+    fn unwrite_access_ops(&self, mut ops: Vec<crate::config::AccessOp>) {
+        let mut queued = self
+            .access_ops
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        ops.append(&mut *queued);
+        *queued = ops;
+    }
+
+    /// Persists the access state (see [`Self::push_access_ops`]): reloads
+    /// the persisted access blob and pubkey lists fresh, replays the queued
+    /// daemon ops onto them, and writes the merged state in one
+    /// transaction. A concurrent CLI write is therefore merged instead of
+    /// overwritten (the old snapshot-then-write lost whichever side
+    /// committed first). The merged state becomes the live truth, so a CLI
+    /// change is enforced immediately, not just at the next SIGHUP.
+    /// Returns whether the write committed: the NIP-86 methods surface a
+    /// failure instead of reporting a change that is only in memory. A
+    /// failed load or write restores the op queue and reports `false`
+    /// (fail-closed and retryable); the in-memory mutations stay live.
     ///
-    /// The snapshot and write also hold the cross-process `access.lock`
-    /// shared with the CLI's read-modify-write (`src/cli.rs`): a CLI
-    /// mutation can no longer land between this snapshot and its write.
-    /// The blocking `flock` is acquired on the blocking pool and the guard
-    /// is held across the database await; the CLI never waits on the
-    /// daemon, so the ordering cannot deadlock.
+    /// The snapshot and write hold the cross-process `access.lock` shared
+    /// with the CLI's read-modify-write (`src/cli.rs`): a CLI mutation can
+    /// no longer land between the reload and the write. The blocking
+    /// `flock` is acquired on the blocking pool and the guard is held
+    /// across the database awaits; the CLI never waits on the daemon, so
+    /// the ordering cannot deadlock. When the lock cannot be taken the
+    /// write is refused (`false`) instead of proceeding unserialized.
     pub async fn persist_access(&self) -> bool {
         let db_path = self.config.read().await.database.path.clone();
         let _guard = self.persist_access_lock.lock().await;
-        // The cross-process lock is taken *before* the snapshot so the CLI
+        // The cross-process lock is taken *before* the reload so the CLI
         // cannot slip a read-modify-write between the capture and the write.
-        let _state_lock = crate::db::lock_access_state_async(db_path).await;
-        let access = self.access.read().await.clone();
+        let Some(_state_lock) = crate::db::lock_access_state_async(db_path).await else {
+            log::warn!("cannot take the access state lock; refusing the access write");
+            return false;
+        };
+        let ops = self.take_access_ops();
+        // Reload the persisted state fresh (fail closed on load error):
+        // merging onto it is what keeps a concurrent CLI write.
+        let (Some(mut merged), Some((deny, allow))) = (
+            self.db.try_load_access().await,
+            self.db.try_load_relay_pubkeys().await,
+        ) else {
+            log::warn!("cannot reload the persisted access state; refusing the access write");
+            self.unwrite_access_ops(ops);
+            return false;
+        };
+        merged.blocked_pubkeys = deny;
+        merged.allowed_pubkeys = allow;
+        for op in &ops {
+            crate::config::apply_access_op(&mut merged, op);
+        }
+        // `restrict_relay` is config-owned (the reload always takes it from
+        // the config file): never let a stale persisted blob regress it.
+        merged.restrict_relay = self.config.read().await.access.restrict_relay;
         // The pubkey lists are excluded from the `access` blob and kept in
         // their own LMDB key so the CLI and NIP-86 share one source. The
         // blob and both lists commit in one transaction: a crash (or a
         // failed second write) must not leave the NIP-86 ban list ahead of
         // the persisted access blob.
-        let deny = access.blocked_pubkeys.clone();
-        let allow = access.allowed_pubkeys.clone();
-        self.db
-            .save_access_and_pubkeys(&access, &deny, &allow)
+        let deny = merged.blocked_pubkeys.clone();
+        let allow = merged.allowed_pubkeys.clone();
+        if !self
+            .db
+            .save_access_and_pubkeys(&merged, &deny, &allow)
             .await
+        {
+            self.unwrite_access_ops(ops);
+            return false;
+        }
+        *self.access.write().await = merged;
+        true
     }
 
     /// Reloads the database-owned access state (Blossom upload allowlist,
@@ -1898,9 +2050,24 @@ impl Relay {
             let _guard = self.persist_access_lock.lock().await;
             match self.db.try_load_relay_pubkeys().await {
                 Some((deny, allow)) => {
+                    // Merge, don't overwrite: a daemon mutation applied to
+                    // memory but not yet persisted (its op is still queued)
+                    // must survive the reload, and a concurrent CLI write
+                    // must survive too. Replaying the queued ops onto the
+                    // freshly loaded lists keeps both (every op is
+                    // idempotent, so replaying an already-persisted op is
+                    // harmless).
+                    let ops: Vec<crate::config::AccessOp> = self
+                        .access_ops
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clone();
                     let mut access = self.access.write().await;
                     access.blocked_pubkeys = deny;
                     access.allowed_pubkeys = allow;
+                    for op in &ops {
+                        crate::config::apply_access_op(&mut access, op);
+                    }
                     access.restrict_relay = restrict_relay;
                     log::info!("relay pubkey access lists reloaded from the database");
                 }
@@ -2676,6 +2843,13 @@ impl Relay {
         if event.kind == 1 {
             self.handle_command_event(&event).await;
         }
+        // Live broadcast is at-most-once per subscriber, in one respect:
+        // a REQ racing this broadcast registers its index before scanning
+        // history, which covers stored events — but an ephemeral event is
+        // never stored, so a subscription created in that microsecond
+        // window misses it with no history fallback. Fundamental to
+        // pub/sub (there is nothing to replay from); stored events cannot
+        // miss this way.
         let delivered = self.broadcast(event).await.is_ok();
         if removal_failed {
             RemovalAck::NotApplied
@@ -3799,6 +3973,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn leave_during_role_rebuild_is_buffered_not_lost() {
+        // A LEAVE arriving while the live store is revoked (a role rebuild
+        // is in flight) must still take effect: the removal reports "not a
+        // member" on the empty store, so without force-buffering the replay
+        // would never see it and the rebuild would resurrect the member.
+        // The client already got `OK` (LEAVE is ephemeral), so there is no
+        // failure to report and retry.
+        let key = "01".repeat(32);
+        let relay = build_role_relay(Some(&key)).await;
+        let member = "aa".repeat(32);
+        assert!(relay.create_role("r1", "Role 1", "", "", None).await);
+        assert!(relay.assign_role(&member, "r1").await);
+        assert!(relay.roles.read().await.is_member_of(&member));
+        // Simulate the revoked window without racing a real worker: the
+        // store is empty and a rebuild is pending.
+        relay.roles_rebuild.dirty.store(true, Ordering::SeqCst);
+        *relay.roles.write().await = RoleStore::default();
+        let mut leave = crate::event::Event {
+            id: String::new(),
+            pubkey: member.clone(),
+            created_at: crate::util::unix_now(),
+            kind: 28936,
+            tags: vec![],
+            content: String::new(),
+            sig: String::new(),
+        };
+        leave.id = crate::nips::nip01::compute_id(&leave);
+        relay.apply_leave_request(&leave).await;
+        // Not applied live (the store is revoked), but captured for replay...
+        assert!(!relay.roles.read().await.is_member_of(&member));
+        {
+            let buffer = relay.roles_rebuild.buffer.lock().await;
+            assert!(
+                buffer.mutations.iter().any(|m| matches!(
+                    m,
+                    BufferedRoleMutation::RemovePubkey { pubkey } if pubkey == &member
+                )),
+                "the leave must be buffered for the rebuild replay"
+            );
+        }
+        // ...and announced with a remove-user event (kind 8001), without
+        // the revoked store's member list.
+        let f: crate::filter::Filter =
+            serde_json::from_value(serde_json::json!({"kinds": [8001]})).unwrap();
+        let (stored, _) = relay.db.query(vec![f], 10, crate::util::unix_now()).await;
+        assert!(
+            stored.iter().any(|e| e
+                .tags
+                .iter()
+                .any(|t| t == &vec!["p".into(), member.clone()])),
+            "a remove-user event must announce the departure"
+        );
+        // The replay applies the buffered leave to the fresh store: a fresh
+        // store that still names the member (the rebuild window input)
+        // comes out without them.
+        relay.roles_rebuild.dirty.store(false, Ordering::SeqCst);
+        let mut fresh = RoleStore::default();
+        fresh.create("r1", "Role 1", "", "", None);
+        fresh.assign(&member, "r1");
+        assert!(
+            relay
+                .roles_rebuild
+                .finish_rebuild(&relay.roles, fresh)
+                .await
+        );
+        assert!(
+            !relay.roles.read().await.is_member_of(&member),
+            "the replayed leave must survive the swap"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
     async fn persist_roles_stamps_the_snapshot_and_fails_closed_without_a_stamp() {
         // The role snapshot carries the database generation (`state_stamp`)
         // so a later restore can reject it. When the generation cannot be
@@ -3902,6 +4149,104 @@ mod tests {
             .expect("the persist must proceed once the lock is released")
             .expect("the persist task must not panic");
         assert!(committed, "the access snapshot must commit after the wait");
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn access_op_log_merges_concurrent_cli_writes() {
+        // A CLI write landing between the daemon's mutation and its persist
+        // must be merged, not overwritten: the old snapshot-then-write lost
+        // whichever side committed first (a fail-open ban loss).
+        let relay = build_relay().await;
+        let daemon_ban = "aa".repeat(32);
+        let cli_ban = "bb".repeat(32);
+        // Daemon-side: ban in memory + queue the op (as `banpubkey` does),
+        // without persisting yet.
+        {
+            let op = crate::config::AccessOp::BanPubkey {
+                pubkey: daemon_ban.clone(),
+                reason: "spam".into(),
+                insensitive: true,
+            };
+            let mut access = relay.access.write().await;
+            crate::config::apply_access_op(&mut access, &op);
+            relay.push_access_ops(vec![op]);
+        }
+        // CLI-side: ban straight to the database (as `nostrfy relay deny`
+        // does: load, mutate, save under the cross-process lock).
+        {
+            let (mut deny, allow) = relay
+                .db
+                .try_load_relay_pubkeys()
+                .await
+                .expect("the pubkey lists must load");
+            deny.push((cli_ban.clone(), String::new()));
+            let access = match relay.db.load_access().await {
+                crate::db::LoadAccessOutcome::Loaded(access) => access,
+                // A fresh test database never persisted the blob: merge
+                // onto an empty base like a fresh seed.
+                crate::db::LoadAccessOutcome::Missing => crate::config::AccessControl::default(),
+                other => panic!("the access blob must load: {other:?}"),
+            };
+            assert!(
+                relay
+                    .db
+                    .save_access_and_pubkeys(&access, &deny, &allow)
+                    .await,
+                "the CLI-side write must commit"
+            );
+        }
+        // The daemon persist merges instead of overwriting.
+        assert!(relay.persist_access().await, "the merged write must commit");
+        let (deny, _) = relay
+            .db
+            .try_load_relay_pubkeys()
+            .await
+            .expect("the pubkey lists must load");
+        assert!(
+            deny.iter().any(|(p, _)| p == &daemon_ban),
+            "the daemon ban must survive the persist"
+        );
+        assert!(
+            deny.iter().any(|(p, _)| p == &cli_ban),
+            "the concurrent CLI ban must survive the persist (no overwrite)"
+        );
+        // The merged state is live immediately, not just at the next SIGHUP.
+        assert!(
+            relay.access.read().await.blocked_pubkeys.len() == 2,
+            "both bans must be enforced live"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn access_reload_replays_unpersisted_daemon_ops() {
+        // A SIGHUP reload must not clobber a daemon mutation applied to
+        // memory but not yet persisted: the queued op replays onto the
+        // freshly loaded lists.
+        let relay = build_relay().await;
+        let daemon_ban = "cc".repeat(32);
+        {
+            let op = crate::config::AccessOp::BanPubkey {
+                pubkey: daemon_ban.clone(),
+                reason: String::new(),
+                insensitive: true,
+            };
+            let mut access = relay.access.write().await;
+            crate::config::apply_access_op(&mut access, &op);
+            relay.push_access_ops(vec![op]);
+        }
+        relay.reload_db_state().await;
+        assert!(
+            relay
+                .access
+                .read()
+                .await
+                .blocked_pubkeys
+                .iter()
+                .any(|(p, _)| p == &daemon_ban),
+            "the reload must keep the unpersisted daemon ban"
+        );
         relay.db.shutdown();
     }
 
@@ -4818,8 +5163,9 @@ mod tests {
         // Two concurrent mutations must not capture snapshots in one order
         // and queue their writes in the other: the older snapshot would be
         // committed last and drop the newer entry from the persisted lists
-        // (a ban silently vanishing on the next restart). `persist_access`
-        // serializes the snapshot and both writes.
+        // (a ban silently vanishing on the next restart). Mutations go
+        // through the op log (as the NIP-86 paths do) and each persist
+        // merges onto a freshly reloaded state under one lock.
         let relay = build_relay().await;
         for i in 0..32u32 {
             let a = format!("a{i:020x}");
@@ -4828,19 +5174,29 @@ mod tests {
             let rb = relay.clone();
             let (a2, b2) = (a.clone(), b.clone());
             let ta = tokio::spawn(async move {
-                ra.access
-                    .write()
-                    .await
-                    .blocked_pubkeys
-                    .push((a2, String::new()));
+                let op = crate::config::AccessOp::BanPubkey {
+                    pubkey: a2,
+                    reason: String::new(),
+                    insensitive: true,
+                };
+                {
+                    let mut access = ra.access.write().await;
+                    crate::config::apply_access_op(&mut access, &op);
+                    ra.push_access_ops(vec![op]);
+                }
                 ra.persist_access().await;
             });
             let tb = tokio::spawn(async move {
-                rb.access
-                    .write()
-                    .await
-                    .blocked_pubkeys
-                    .push((b2, String::new()));
+                let op = crate::config::AccessOp::BanPubkey {
+                    pubkey: b2,
+                    reason: String::new(),
+                    insensitive: true,
+                };
+                {
+                    let mut access = rb.access.write().await;
+                    crate::config::apply_access_op(&mut access, &op);
+                    rb.push_access_ops(vec![op]);
+                }
                 rb.persist_access().await;
             });
             ta.await.unwrap();

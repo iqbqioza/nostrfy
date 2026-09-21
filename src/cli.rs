@@ -130,6 +130,28 @@ impl Cli {
             Command::Check => {
                 let cfg = self.load_config()?;
                 cfg.validate()?;
+                // A config that validates can still fail at serve time
+                // (an occupied port, an unusable database directory): probe
+                // both now so `check` does not bless a config `start`
+                // would reject. The probes are best-effort (a rival can
+                // bind between check and start); `prepare` re-checks the
+                // port right before forking.
+                ensure_port_available(&cfg)?;
+                // Probe the database directory without failing on a live
+                // instance: `check` must keep working while the relay runs.
+                // A lockable directory proves it is usable; a lock held by
+                // another instance is the expected running case, not an
+                // error. Any other failure (unwritable path, bad mount) is.
+                match crate::db::lock_database_dir(&cfg.database.path) {
+                    Ok(guard) => drop(guard),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(e) => {
+                        return Err(config_err(format!(
+                            "database directory {} is not usable: {e}",
+                            cfg.database.path.display()
+                        )));
+                    }
+                }
                 print_line(&format!("configuration OK: {}", cfg.relay.name));
                 return Ok(());
             }
@@ -212,6 +234,21 @@ impl Cli {
                 // startup work must be handled (buffered by the tokio
                 // driver), not applied as the default action.
                 let signals = crate::server::StartupSignals::register();
+                // One writer per database directory: a second relay on the
+                // same `database.path` (a different pid file or port
+                // defeats the pid/port gate) would run a split-brain second
+                // writer thread, so refuse startup instead. The lock
+                // releases itself when the holder dies and is never taken
+                // by the CLI commands, which must keep working alongside a
+                // live daemon.
+                let _db_dir_guard =
+                    crate::db::lock_database_dir(&cfg.database.path).map_err(|e| {
+                        config_err(format!(
+                            "cannot lock the database directory {}: {e}; another relay \
+                             instance may be using it",
+                            cfg.database.path.display()
+                        ))
+                    })?;
                 let db = open_db(&cfg)?;
                 run_server(self.config.clone(), cfg, db, signals).await
             }
@@ -322,6 +359,10 @@ impl Cli {
         let pid = match running_pid(&pid_file) {
             Some(pid) => pid,
             None => {
+                // No live daemon behind the file: remove the stale pid so
+                // scripts probing the file do not mistake it for a running
+                // instance (a fresh `start` works either way).
+                let _ = std::fs::remove_file(&pid_file);
                 print_line("nostrfy is not running");
                 return Ok(());
             }
@@ -859,7 +900,27 @@ impl Cli {
                      keeping the current binary"
                 ));
             };
-            std::fs::rename(&tmp, &exe)?;
+            // Keep the running binary for manual rollback: the post-replace
+            // probe only checks `--version`, so a binary that crashes on
+            // real startup would otherwise leave no working copy behind.
+            let backup = exe.with_extension("prev");
+            let _ = std::fs::remove_file(&backup);
+            if let Err(e) = std::fs::rename(&exe, &backup) {
+                return Err(anyhow!(format!("cannot back up the current binary: {e}")));
+            }
+            if let Err(e) = std::fs::rename(&tmp, &exe) {
+                // The original is currently at `backup`: restore it before
+                // failing, or a failed replace would leave no binary at the
+                // configured path at all.
+                if let Err(restore) = std::fs::rename(&backup, &exe) {
+                    return Err(anyhow!(format!(
+                        "replacing the binary failed ({e}) and restoring the backup failed \
+                         ({restore}); the previous binary is at {}",
+                        backup.display()
+                    )));
+                }
+                return Err(anyhow!(format!("replacing the binary failed: {e}")));
+            }
             // fsync the directory so the rename survives a power loss, not
             // just a process crash.
             if let Ok(d) = std::fs::File::open(dir) {
@@ -872,6 +933,10 @@ impl Cli {
         }
         result?;
         print_line(&format!("replaced {} with nostrfy {target}", exe.display()));
+        print_line(&format!(
+            "the previous binary is kept at {}; restore it manually if the new one misbehaves",
+            exe.with_extension("prev").display()
+        ));
         // A running daemon has the old binary mapped already: tell the
         // operator to restart to apply the update.
         if self.config.exists()
@@ -1097,11 +1162,14 @@ fn wait_for_ready(cfg: &Config, pid: Option<u32>) -> Result<()> {
 }
 
 /// Whether `addr` answers HTTP: connects, sends a minimal `GET /health`
-/// request and requires an `HTTP/` status line. A bare TCP accept proves
+/// request and requires a `2xx` status line. A bare TCP accept proves
 /// only that *something* holds the port — the HTTP layer can be wedged
 /// while the listener still accepts — so the readiness probe must see an
-/// actual response. Any status (200, 503, ...) counts: the point is that
-/// the server, not just the socket, is up.
+/// actual response. A `503` from `/health` means the relay is up but
+/// refusing writes (disk full / map full / writer gone): that state does
+/// not self-heal, so it must not count as ready for `nostrfy start` (which
+/// would otherwise report `nostrfy started` for a read-only relay and let
+/// deploy automation believe a full-disk relay is healthy).
 fn probe_http(addr: &std::net::SocketAddr) -> bool {
     use std::io::{Read, Write};
     let Ok(stream) = std::net::TcpStream::connect_timeout(addr, Duration::from_millis(500)) else {
@@ -1129,7 +1197,7 @@ fn probe_http(addr: &std::net::SocketAddr) -> bool {
         return false;
     }
     // The status line fits in the first bytes; read until the first LF
-    // (bounded) and require the HTTP version prefix.
+    // (bounded) and require a 2xx status after the HTTP version prefix.
     let mut line = Vec::with_capacity(64);
     let mut byte = [0u8; 1];
     loop {
@@ -1146,7 +1214,22 @@ fn probe_http(addr: &std::net::SocketAddr) -> bool {
             }
         }
     }
-    line.starts_with(b"HTTP/")
+    http_status_ready(&line)
+}
+
+/// Whether a raw HTTP status line reports success (`HTTP/1.x 2xx ...`).
+/// Split out for unit testing: the probe itself needs a live socket.
+fn http_status_ready(line: &[u8]) -> bool {
+    let mut parts = line.split(|b| *b == b' ');
+    let version = parts.next().unwrap_or_default();
+    if !version.starts_with(b"HTTP/") {
+        return false;
+    }
+    // 200-299: the relay is serving reads and writes. Anything else —
+    // notably the 503 `/health` returns while refusing writes — is not
+    // ready.
+    let code = parts.next().unwrap_or_default();
+    code.len() == 3 && code[0] == b'2' && code[1].is_ascii_digit() && code[2].is_ascii_digit()
 }
 
 fn wait_for_ready_within(cfg: &Config, pid: Option<u32>, timeout: Duration) -> Result<()> {
@@ -1548,11 +1631,11 @@ fn open_db_env(cfg: &Config) -> Result<heed::Env> {
     // process exits.
     let env = unsafe {
         heed::EnvOpenOptions::new()
-            // Mirror the store's floor: 18 named tables, plus the word
+            // Mirror the store's floor: 21 named tables, plus the word
             // index when search is on. A lower value made opening an
             // existing database fail with MDB_DBS_FULL (the CLI commands
             // must open the same tables the server created).
-            .max_dbs(cfg.database.max_dbs.max(19))
+            .max_dbs(cfg.database.max_dbs.max(22))
             .max_readers(cfg.database.max_readers.max(8))
             .map_size(map_size as usize)
             .open(&cfg.database.path)?
@@ -2218,19 +2301,42 @@ name = \"nostrfy\"\n",
     }
 
     /// A minimal HTTP responder for the readiness-probe tests: the probe
-    /// requires an actual `HTTP/` status line, so a bare `TcpListener`
-    /// would never satisfy it.
+    /// requires a `2xx` status line, so a bare `TcpListener` would never
+    /// satisfy it.
     fn http_responder(bind: &str) -> (std::net::TcpListener, std::thread::JoinHandle<()>) {
+        http_responder_with_status(bind, "200 OK")
+    }
+
+    /// Like [`http_responder`], with an explicit status line (a `503`
+    /// responder models a relay that is up but refusing writes).
+    fn http_responder_with_status(
+        bind: &str,
+        status: &'static str,
+    ) -> (std::net::TcpListener, std::thread::JoinHandle<()>) {
         let listener = std::net::TcpListener::bind(format!("{bind}:0")).unwrap();
         let serving = listener.try_clone().unwrap();
         let handle = std::thread::spawn(move || {
             for stream in serving.incoming().take(50) {
                 let Ok(mut stream) = stream else { break };
                 use std::io::Write;
-                let _ = stream.write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n");
+                let _ = stream.write_all(
+                    format!("HTTP/1.0 {status}\r\nContent-Length: 0\r\n\r\n").as_bytes(),
+                );
             }
         });
         (listener, handle)
+    }
+
+    #[test]
+    fn http_status_ready_accepts_only_2xx() {
+        assert!(http_status_ready(b"HTTP/1.0 200 OK\r"));
+        assert!(http_status_ready(b"HTTP/1.1 299 anything\r"));
+        assert!(!http_status_ready(b"HTTP/1.0 503 Service Unavailable\r"));
+        assert!(!http_status_ready(b"HTTP/1.1 500 Internal Server Error\r"));
+        assert!(!http_status_ready(b"HTTP/1.0 301 Moved\r"));
+        assert!(!http_status_ready(b"garbage\r"));
+        assert!(!http_status_ready(b"HTTP/1.0\r"));
+        assert!(!http_status_ready(b"HTTP/1.0 20 OK\r"));
     }
 
     #[test]
@@ -2298,6 +2404,28 @@ name = \"nostrfy\"\n",
         cfg.server.port = free_port;
         let err = wait_for_ready_within(&cfg, None, Duration::from_millis(300)).unwrap_err();
         assert!(err.to_string().contains("did not become ready"), "{err}");
+        let _ = std::fs::remove_file(&cfg.daemon.pid_file);
+    }
+
+    #[test]
+    fn readiness_probe_rejects_a_relay_refusing_writes() {
+        // A relay that answers 503 (up but refusing writes: disk full or
+        // writer gone) must not count as ready: `nostrfy start` must not
+        // report `nostrfy started` for a read-only relay.
+        let (listener, _responder) =
+            http_responder_with_status("127.0.0.1", "503 Service Unavailable");
+        let mut cfg = Config::default();
+        cfg.daemon.pid_file =
+            std::env::temp_dir().join(format!("nostrfy-ready-503-{:x}.pid", std::process::id()));
+        let _ = std::fs::remove_file(&cfg.daemon.pid_file);
+        cfg.server.host = "127.0.0.1".into();
+        cfg.server.port = listener.local_addr().unwrap().port();
+        let err = wait_for_ready_within(&cfg, None, Duration::from_millis(300)).unwrap_err();
+        assert!(
+            err.to_string().contains("did not become ready"),
+            "a 503 relay must not satisfy the probe: {err}"
+        );
+        let _ = std::fs::remove_file(&cfg.daemon.pid_file);
     }
 
     #[test]
@@ -2553,6 +2681,54 @@ name = \"nostrfy\"\n",
             control.blocked_ips.entries().is_empty(),
             "the entry must be removed from the persisted state"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn check_passes_while_an_instance_holds_the_database() {
+        // `nostrfy check` is routinely run while the relay is up: the
+        // database-directory probe must treat a lock held by a live
+        // instance as the expected running case, not as an unusable path.
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir()
+            .join("nostrfy-check-running-test")
+            .join(format!("{:x}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // A fixed non-ephemeral port (see the readiness-probe tests): a
+        // concurrently running test's `bind(..:0)` cannot steal it.
+        let mut picked = None;
+        for port in 8765..=8795u16 {
+            if let Ok(listener) = std::net::TcpListener::bind(("127.0.0.1", port)) {
+                picked = Some((listener, port));
+                break;
+            }
+        }
+        let (free, port) = picked.expect("a fixed test port must be bindable");
+        drop(free);
+        let config_path = dir.join("nostrfy.toml");
+        let db_path = dir.join("db");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[server]\nhost = \"127.0.0.1\"\nport = {port}\n[database]\npath = {:?}\n",
+                db_path.display().to_string()
+            ),
+        )
+        .unwrap();
+        let mut cli = Cli {
+            config: config_path,
+            command: Command::Check,
+            daemonized: false,
+        };
+        // Hold the lock like a running relay.
+        let held = crate::db::lock_database_dir(&db_path).expect("the lock file opens");
+        cli.prepare()
+            .expect("check must pass while an instance holds the database");
+        // Without a holder the probe still passes.
+        drop(held);
+        cli.prepare().expect("check must pass with the lock free");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -110,15 +110,11 @@ pub(crate) async fn livekit_token(
 
 async fn group_allows(relay: &Relay, group: &str, pubkey: &str) -> bool {
     // NIP-86 `banpubkey` applies to token minting too: a banned pubkey is
-    // refused on every authenticated service, LiveKit included.
-    if relay
-        .access
-        .read()
-        .await
-        .blocked_pubkeys
-        .iter()
-        .any(|(pk, _)| pk.eq_ignore_ascii_case(pubkey))
-    {
+    // refused on every authenticated service, LiveKit included. The relay
+    // allowlist gates minting like publishing: on a `restrict_relay`
+    // relay a non-allowlisted pubkey cannot publish, so it must not mint
+    // room tokens either (group membership alone is not enough there).
+    if !relay.access.read().await.allows_pubkey(pubkey) {
         return false;
     }
     let groups = relay.groups.read().await;
@@ -418,6 +414,37 @@ mod tests {
         assert!(json["token"].as_str().is_some_and(|t| !t.is_empty()));
         relay.db.shutdown();
     }
+    #[tokio::test]
+    async fn non_allowlisted_member_cannot_mint_on_restricted_relay() {
+        // The relay allowlist gates minting like publishing: on a
+        // `restrict_relay` relay a group member that is not allowlisted
+        // cannot publish, so minting a room token for them would bypass
+        // the relay policy for audio/video.
+        let relay = build_relay().await;
+        relay.groups.write().await.groups.insert(
+            "open".into(),
+            crate::nips::nip29::Group {
+                settings: crate::nips::nip29::GroupSettings {
+                    livekit: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        relay.config.write().await.access.restrict_relay = true;
+        // The gate reads the runtime access state (a SIGHUP reload copies
+        // the config flag there); set it the way the reload would.
+        relay.access.write().await.restrict_relay = true;
+        let secp = relay.secp().clone();
+        let ev = signed_token_auth(&relay, &secp, "open").await;
+        let (status, _, _) = token_status(&relay, "open", &ev).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "a non-allowlisted member must not mint on a restricted relay"
+        );
+        relay.db.shutdown();
+    }
 
     #[tokio::test]
     async fn banned_pubkey_cannot_mint_token() {
@@ -468,5 +495,77 @@ mod tests {
         .into_response();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         relay.db.shutdown();
+    }
+
+    #[test]
+    fn minted_token_is_a_verifiable_hs256_jwt() {
+        // The endpoint tests cover mint/refuse but never decode the token:
+        // a broken signer (wrong secret, malformed claims) would ship as a
+        // 200 that no LiveKit server accepts. Mint one and verify it the
+        // way a LiveKit server does: three base64url parts, HMAC-SHA256
+        // over `header.payload` with the configured secret, and the
+        // expected claims (issuer, subject pubkey, 1h expiry, room grant).
+        use base64::Engine;
+        let mut cfg = Config::default();
+        cfg.relay.livekit_api_key = "test-key".into();
+        cfg.relay.livekit_api_secret = "test-secret".into();
+        let pubkey = "ab".repeat(32);
+        let token = issue_livekit_token(&cfg, "room-a", &pubkey).unwrap();
+        let mut parts = token.split('.');
+        let (header, payload, sig) = (
+            parts.next().unwrap(),
+            parts.next().unwrap(),
+            parts.next().unwrap(),
+        );
+        assert!(parts.next().is_none(), "a JWT has exactly three parts");
+        let decode = |part: &str| {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(part)
+                .unwrap()
+        };
+        // The header pins the algorithm; the server must never mint (or a
+        // client accept) `alg: none`.
+        let header_json: serde_json::Value = serde_json::from_slice(&decode(header)).unwrap();
+        assert_eq!(header_json["alg"], "HS256");
+        // The signature verifies with the configured secret and nothing else.
+        let signing_input = format!("{header}.{payload}");
+        let mac = crate::util::hmac_sha256(
+            cfg.relay.livekit_api_secret.as_bytes(),
+            signing_input.as_bytes(),
+        );
+        assert_eq!(
+            sig,
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac),
+            "the token must verify with the configured secret"
+        );
+        let wrong = crate::util::hmac_sha256(b"wrong-secret", signing_input.as_bytes());
+        assert_ne!(
+            sig,
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(wrong),
+            "a token for one secret must not verify with another"
+        );
+        // The claims carry the issuer, the pubkey subject, a 1h expiry and
+        // the room grant.
+        let claims: serde_json::Value = serde_json::from_slice(&decode(payload)).unwrap();
+        assert_eq!(claims["iss"], "test-key");
+        assert!(
+            claims["sub"]
+                .as_str()
+                .is_some_and(|sub| sub.starts_with(&pubkey)),
+            "the subject names the minting pubkey: {claims}"
+        );
+        let now = unix_now();
+        let iat = claims["iat"].as_u64().expect("iat must be a timestamp");
+        assert!(
+            (iat as i64 - now as i64).abs() <= 5,
+            "iat must be now: {claims}"
+        );
+        assert_eq!(
+            claims["exp"].as_u64(),
+            Some(iat + 3600),
+            "the token lives one hour: {claims}"
+        );
+        assert_eq!(claims["video"]["room"], "room-a");
+        assert_eq!(claims["video"]["roomJoin"], true);
     }
 }

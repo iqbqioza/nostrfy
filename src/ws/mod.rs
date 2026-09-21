@@ -420,6 +420,11 @@ pub struct Conn {
     /// Byte budget for a single REQ response (`limits.max_req_response_bytes`,
     /// cached once per connection; 0 = unlimited).
     pub(crate) req_response_bytes: u64,
+    /// Maximum inbound frame size (`limits.max_ws_message_bytes`, refreshed
+    /// on SIGHUP like the queue budgets): an operator lowering the limit to
+    /// shed oversized frames must not have to wait for every existing
+    /// connection to reconnect.
+    pub(crate) max_msg_size: usize,
     /// The relay-wide pending-response byte budget shared by every
     /// connection; each materialized response reserves its size against it
     /// and over-budget responses fail with a retryable CLOSED.
@@ -502,6 +507,11 @@ pub struct Conn {
     /// served to the authenticated owner when the AUTH gate is on (cached
     /// from the config on connect and refreshed after a SIGHUP reload).
     pub(crate) nip78_restricted: bool,
+    /// Whether anonymous subscriptions are refused (cached from the config
+    /// on connect and refreshed after a SIGHUP reload): enabling
+    /// `require_auth` mid-session must cut anonymous live streams, like
+    /// the REQ/COUNT/NEG-OPEN paths already refuse them.
+    pub(crate) require_auth: bool,
     /// Last verdict of the access-list read gate (see
     /// [`Conn::access_allows_read_sync`]): the non-blocking hot path falls
     /// back to this instead of failing open when the lists are contended.
@@ -1038,8 +1048,10 @@ impl Conn {
             self.expiry_enabled = cfg.nip_enabled(40);
             self.giftwrap_restricted = cfg.nip_enabled(42);
             self.nip78_restricted = cfg.nip_enabled(78) && cfg.relay.enabled_nip78_auth;
+            self.require_auth = cfg.relay.require_auth;
             self.out_queue_bytes = cfg.limits.max_out_queue_bytes;
             self.req_response_bytes = cfg.limits.max_req_response_bytes;
+            self.max_msg_size = cfg.limits.max_ws_message_bytes;
             self.outbox_write_policy = cfg.server.outbox_write_policy.clone();
             self.inbox_write_policy = cfg.server.inbox_write_policy.clone();
         }
@@ -1207,31 +1219,38 @@ where
     let teardown = async {
         while let Some(frame) = conn.outgoing.pop_front() {
             let size = message_size(&frame.message);
+            // Uncount on pop and re-count only on a delivered send:
+            // whatever the teardown's fate (drained, send error, grace
+            // expiry mid-send), a frame still queued or stuck in flight
+            // is never reported as wire traffic, and a delivered frame
+            // always is. The rest-uncount below then stays correct even
+            // when the grace drops this future mid-send.
             conn.out_bytes = conn.out_bytes.saturating_sub(size);
+            conn.out_msgs = conn.out_msgs.saturating_sub(1);
+            conn.out_bytes_total = conn.out_bytes_total.saturating_sub(size as u64);
             if sender.send(frame.message).await.is_err() {
-                // The popped frame never reached the socket: uncount it
-                // like the purge path does, and fall through to uncount
-                // the rest of the abandoned queue below.
-                conn.out_msgs = conn.out_msgs.saturating_sub(1);
-                conn.out_bytes_total = conn.out_bytes_total.saturating_sub(size as u64);
                 break;
             }
+            conn.out_msgs = conn.out_msgs.saturating_add(1);
+            conn.out_bytes_total = conn.out_bytes_total.saturating_add(size as u64);
         }
-        // Grace expiry (or the send error above) abandons whatever is
-        // still queued: those frames can never be received, so uncount
-        // them instead of reporting phantom traffic.
-        let mut rest_msgs = 0u64;
-        let mut rest_bytes = 0usize;
-        for frame in std::mem::take(&mut conn.outgoing) {
-            rest_msgs += 1;
-            rest_bytes = rest_bytes.saturating_add(message_size(&frame.message));
-        }
-        conn.out_bytes = conn.out_bytes.saturating_sub(rest_bytes);
-        conn.out_msgs = conn.out_msgs.saturating_sub(rest_msgs);
-        conn.out_bytes_total = conn.out_bytes_total.saturating_sub(rest_bytes as u64);
         let _ = sender.close().await;
     };
     let _ = tokio::time::timeout(grace, teardown).await;
+    // Grace expiry (or the send error above) abandons whatever is still
+    // queued: those frames can never be received, so uncount them instead
+    // of reporting phantom traffic. Runs unconditionally: the teardown
+    // above may have been dropped mid-send, in which case this is what
+    // releases the abandoned remainder.
+    let mut rest_msgs = 0u64;
+    let mut rest_bytes = 0usize;
+    for frame in std::mem::take(&mut conn.outgoing) {
+        rest_msgs += 1;
+        rest_bytes = rest_bytes.saturating_add(message_size(&frame.message));
+    }
+    conn.out_bytes = conn.out_bytes.saturating_sub(rest_bytes);
+    conn.out_msgs = conn.out_msgs.saturating_sub(rest_msgs);
+    conn.out_bytes_total = conn.out_bytes_total.saturating_sub(rest_bytes as u64);
 }
 
 pub async fn handle_connection(
@@ -1282,6 +1301,7 @@ pub async fn handle_connection(
         expiry_enabled,
         giftwrap_restricted,
         nip78_restricted,
+        require_auth,
         idle_timeout,
         outbox_write_policy,
         inbox_write_policy,
@@ -1294,6 +1314,7 @@ pub async fn handle_connection(
             cfg.nip_enabled(40),
             cfg.nip_enabled(42),
             cfg.nip_enabled(78) && cfg.relay.enabled_nip78_auth,
+            cfg.relay.require_auth,
             cfg.limits.ws_idle_timeout_secs,
             cfg.server.outbox_write_policy.clone(),
             cfg.server.inbox_write_policy.clone(),
@@ -1387,6 +1408,7 @@ pub async fn handle_connection(
         out_bytes: 0,
         out_queue_bytes,
         req_response_bytes,
+        max_msg_size,
         subs: HashMap::new(),
         sub_bytes: 0,
         neg: HashMap::new(),
@@ -1400,6 +1422,7 @@ pub async fn handle_connection(
         expiry_enabled,
         giftwrap_restricted,
         nip78_restricted,
+        require_auth,
         access_allowed_cache: false,
         config_version: 0,
         dropped: 0,
@@ -1539,13 +1562,12 @@ pub async fn handle_connection(
                     Ok(Message::Close(_)) => break,
                     Ok(frame) => {
                         last_activity = std::time::Instant::now();
-                        if conn.handle_frame(frame, max_msg_size).await {
-                            break;
-                        }
-                        // Refresh the cached NIP-40/NIP-42 flags only when
-                        // the config actually changed (the version bumps on
-                        // every SIGHUP reload): the hot frame path never
-                        // takes the shared config lock.
+                        // Refresh the cached flags and budgets *before*
+                        // handling the frame, so a SIGHUP-lowered
+                        // `max_ws_message_bytes` already applies to the
+                        // first frame after the reload (the version bumps
+                        // on every reload): the hot path never takes the
+                        // shared config lock otherwise.
                         let version = conn
                             .relay
                             .config_version
@@ -1553,6 +1575,9 @@ pub async fn handle_connection(
                         if version != conn.config_version {
                             conn.config_version = version;
                             conn.refresh_config_cache().await;
+                        }
+                        if conn.handle_frame(frame, conn.max_msg_size).await {
+                            break;
                         }
                     }
                 }
@@ -1588,7 +1613,18 @@ pub async fn handle_connection(
                         _ = &mut window_deadline => break,
                     };
                     last_activity = std::time::Instant::now();
-                    if conn.handle_frame(frame, max_msg_size).await {
+                    // A reload during the batch window (a SIGHUP handled
+                    // between frames) must refresh before the next frame is
+                    // size-checked, like the single-frame path above.
+                    let version = conn
+                        .relay
+                        .config_version
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    if version != conn.config_version {
+                        conn.config_version = version;
+                        conn.refresh_config_cache().await;
+                    }
+                    if conn.handle_frame(frame, conn.max_msg_size).await {
                         too_large = true;
                         break;
                     }
@@ -1596,7 +1632,7 @@ pub async fn handle_connection(
                     // it through the post-window path instead of reading the
                     // rest of the window (which let a flood of maximum-size
                     // frames pile up parsed events before validation).
-                    if conn.pending_batch_full(max_msg_size) {
+                    if conn.pending_batch_full(conn.max_msg_size) {
                         break;
                     }
                     // Slide the window: the next frame extends the batch
@@ -1652,6 +1688,11 @@ pub async fn handle_connection(
                 // Keep-alive: a healthy client answers with a PONG (an
                 // inbound frame, which resets the idle timeout), so an idle
                 // subscriber stays connected while a dead peer is reaped.
+                // Reap silent negentropy syncs here too: a PONG keeps the
+                // connection alive but never touches NEG state, so without
+                // this an idle sync would hold its items and budget share
+                // forever.
+                conn.reap_idle_negentropy();
                 // The send is bounded: a peer that stopped reading parks
                 // inside it, and the idle deadline (raced only by the
                 // drain) could not fire here, so a stalled PING closes the
@@ -1955,13 +1996,22 @@ mod tests {
     /// Builds a connection on a pre-built relay (for tests that need
     /// several connections sharing one relay + subscription index).
     async fn build_conn_on(relay: Arc<Relay>) -> Conn {
-        let (out_queue_bytes, expiry_enabled, giftwrap_restricted, nip78_restricted) = {
+        let (
+            out_queue_bytes,
+            max_msg_size,
+            expiry_enabled,
+            giftwrap_restricted,
+            nip78_restricted,
+            require_auth,
+        ) = {
             let cfg = relay.config.read().await;
             (
                 cfg.limits.max_out_queue_bytes,
+                cfg.limits.max_ws_message_bytes,
                 cfg.nip_enabled(40),
                 cfg.nip_enabled(42),
                 cfg.nip_enabled(78) && cfg.relay.enabled_nip78_auth,
+                cfg.relay.require_auth,
             )
         };
         let conn_id = relay
@@ -1997,6 +2047,7 @@ mod tests {
             out_bytes: 0,
             out_queue_bytes,
             req_response_bytes: 0,
+            max_msg_size,
             pending_reqs: std::collections::VecDeque::new(),
             subs: HashMap::new(),
             sub_bytes: 0,
@@ -2011,6 +2062,7 @@ mod tests {
             expiry_enabled,
             giftwrap_restricted,
             nip78_restricted,
+            require_auth,
             access_allowed_cache: false,
             config_version: 0,
             dropped: 0,
@@ -4012,6 +4064,102 @@ mod tests {
     }
 
     #[test]
+    fn live_delivery_closes_subs_on_deny_and_auth_flip() {
+        // A ban or a `require_auth` flip mid-session must close the
+        // starving subscriptions with the same CLOSED the REQ path sends,
+        // instead of leaving them silent post-EOSE.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_relay_with("").await;
+            let mut conn = build_conn_on(relay.clone()).await;
+            let now = unix_now();
+            // Authenticated subscription in its post-EOSE state.
+            let authed = "aa".repeat(32);
+            conn.authed_pubkeys.push(authed.clone());
+            conn.handle_req(&[json!("sub"), json!({"kinds": [1]})])
+                .await;
+            assert!(conn.subs.contains_key("sub"));
+            conn.outgoing.clear();
+            // Banning the key mid-session: the next live event closes the
+            // subscription instead of dropping silently.
+            conn.relay
+                .access
+                .write()
+                .await
+                .blocked_pubkeys
+                .push((authed, String::new()));
+            let ev = signed_kind_note_seeded(relay.secp(), 3, 1, "live", now, vec![]);
+            conn.deliver_live(&ev, &serde_json::to_string(&ev).unwrap_or_default(), None);
+            let msgs = outgoing_json(&conn);
+            assert!(
+                msgs.iter().any(|m| m[0] == "CLOSED"
+                    && m[1] == "sub"
+                    && m[2].as_str().is_some_and(|r| r.contains("restricted"))),
+                "a denied live sub must be closed like a denied REQ: {msgs:?}"
+            );
+            assert!(
+                !msgs.iter().any(|m| m[0] == "EVENT"),
+                "no event may be delivered to a denied sub"
+            );
+            assert!(conn.subs.is_empty(), "the denied sub must be released");
+            relay.db.shutdown();
+        });
+        rt.block_on(async {
+            let relay = build_relay_with("").await;
+            let mut conn = build_conn_on(relay.clone()).await;
+            let now = unix_now();
+            // Anonymous subscription while auth is not required.
+            conn.handle_req(&[json!("sub"), json!({"kinds": [1]})])
+                .await;
+            assert!(conn.subs.contains_key("sub"));
+            conn.outgoing.clear();
+            // Enabling `require_auth` (SIGHUP) cuts the anonymous live
+            // stream; the refresh propagates the flip to the connection.
+            conn.relay.config.write().await.relay.require_auth = true;
+            conn.refresh_config_cache().await;
+            let ev = signed_kind_note_seeded(relay.secp(), 4, 1, "live", now, vec![]);
+            conn.deliver_live(&ev, &serde_json::to_string(&ev).unwrap_or_default(), None);
+            let msgs = outgoing_json(&conn);
+            assert!(
+                msgs.iter().any(|m| m[0] == "CLOSED"
+                    && m[1] == "sub"
+                    && m[2].as_str().is_some_and(|r| r.contains("auth-required"))),
+                "an anonymous live sub must be closed on a require_auth flip: {msgs:?}"
+            );
+            assert!(conn.subs.is_empty());
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn max_message_size_refreshes_on_reload() {
+        // `limits.max_ws_message_bytes` is refreshed with the other cached
+        // budgets: an operator lowering it to shed oversized frames must
+        // not have to wait for every existing connection to reconnect.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_relay_with("").await;
+            let mut conn = build_conn_on(relay.clone()).await;
+            let initial = conn.max_msg_size;
+            assert!(initial > 0);
+            relay.config.write().await.limits.max_ws_message_bytes = initial / 2;
+            conn.refresh_config_cache().await;
+            assert_eq!(
+                conn.max_msg_size,
+                initial / 2,
+                "the reload must refresh the inbound frame size limit"
+            );
+            // The refreshed limit is what the frame path enforces.
+            let oversized = Message::Text("x".repeat(initial / 2 + 1).into());
+            assert!(
+                conn.handle_frame(oversized, conn.max_msg_size).await,
+                "a frame over the refreshed limit must close the connection"
+            );
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
     fn deeply_nested_json_is_rejected_without_abort() {
         // serde_json enforces a recursion limit (default 128): a deeply
         // nested frame must fail parsing with a NOTICE, never abort the
@@ -5537,6 +5685,40 @@ mod tests {
             // its byte accounting released; the rest is abandoned.
             assert!(conn.outgoing.is_empty());
             assert_eq!(conn.out_bytes, 0);
+            // The grace dropped the teardown mid-send: the stuck frame
+            // never reached the wire, so it must not linger in the
+            // message/lifetime counters flushed to shared stats (phantom
+            // traffic after a stalling-peer disconnect).
+            assert_eq!(conn.out_msgs, 0);
+            assert_eq!(conn.out_bytes_total, 0);
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn neg_backpressure_applies_without_a_configured_queue_cap() {
+        // An unset byte cap (`0` = unlimited) used to disable the NEG
+        // backpressure gate entirely; it now falls back to the absolute
+        // control ceiling instead of bounding nothing.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            // Capped case (unchanged): 4x the configured cap refuses.
+            conn.out_queue_bytes = 100;
+            conn.out_bytes = 400;
+            assert!(!conn.neg_backpressured());
+            conn.out_bytes = 401;
+            assert!(conn.neg_backpressured());
+            // Unset cap: the control ceiling is the reference.
+            conn.out_queue_bytes = 0;
+            let ceiling = conn.out_queue_cap();
+            conn.out_bytes = ceiling.saturating_mul(4);
+            assert!(!conn.neg_backpressured());
+            conn.out_bytes = ceiling.saturating_mul(4).saturating_add(1);
+            assert!(
+                conn.neg_backpressured(),
+                "an unlimited queue must still refuse NEG past 4x the control ceiling"
+            );
             conn.relay.db.shutdown();
         });
     }
@@ -7307,6 +7489,7 @@ mod tests {
                 "held".into(),
                 super::negentropy::NegState {
                     items: vec![(1, [7u8; 32])],
+                    last_active: std::time::Instant::now(),
                     rounds_left: super::negentropy::MAX_NEG_MSG_ROUNDS,
                     budget: None,
                     reserved: 0,
@@ -7324,6 +7507,118 @@ mod tests {
             assert!(
                 !conn.neg.contains_key("held"),
                 "the over-budget NEG-ERR closes the subscription"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn neg_idle_subscriptions_are_reaped_and_release() {
+        // A sync that exchanges no message for longer than
+        // `NEG_IDLE_TIMEOUT` must be closed with a `NEG-ERR` (`closed:`),
+        // releasing its items and budget reservation — otherwise a client
+        // could pin state forever by keeping the connection alive with
+        // PONGs, which reset the connection idle deadline but never touch
+        // NEG state. A live sync must survive the sweep untouched.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let budget = Arc::clone(&conn.neg_budget);
+            let limit = neg_budget_bytes(conn.relay.config.read().await.limits.max_neg_items);
+            let stale_ago = super::negentropy::NEG_IDLE_TIMEOUT + std::time::Duration::from_secs(1);
+            // The stale sync holds a real reservation, like a live one.
+            assert!(budget.try_reserve(128, limit).is_some());
+            conn.neg.insert(
+                "stale".into(),
+                super::negentropy::NegState {
+                    items: vec![(1, [7u8; 32])],
+                    last_active: std::time::Instant::now() - stale_ago,
+                    rounds_left: super::negentropy::MAX_NEG_MSG_ROUNDS,
+                    budget: Some(Arc::clone(&budget)),
+                    reserved: 128,
+                },
+            );
+            conn.neg.insert(
+                "live".into(),
+                super::negentropy::NegState {
+                    items: vec![(2, [8u8; 32])],
+                    last_active: std::time::Instant::now(),
+                    rounds_left: super::negentropy::MAX_NEG_MSG_ROUNDS,
+                    budget: None,
+                    reserved: 0,
+                },
+            );
+            conn.reap_idle_negentropy();
+            assert!(
+                !conn.neg.contains_key("stale"),
+                "the idle sync must be released"
+            );
+            assert!(
+                conn.neg.contains_key("live"),
+                "a live sync must survive the sweep"
+            );
+            assert_eq!(
+                budget.used(),
+                0,
+                "the reaped sync must return its budget reservation exactly once"
+            );
+            assert!(
+                outgoing_json(&conn).iter().any(|m| m[0] == "NEG-ERR"
+                    && m[1] == "stale"
+                    && m[2].as_str().unwrap_or("").contains("closed")),
+                "the client must be told the sync is over: {:?}",
+                outgoing_json(&conn)
+            );
+            // A failing message must not sweep: only the id it names is
+            // affected, and other idle syncs are left for the next
+            // successful round or keep-alive tick.
+            conn.neg.insert(
+                "other".into(),
+                super::negentropy::NegState {
+                    items: Vec::new(),
+                    last_active: std::time::Instant::now() - stale_ago,
+                    rounds_left: 1,
+                    budget: None,
+                    reserved: 0,
+                },
+            );
+            conn.outgoing.clear();
+            conn.handle_neg_msg(&[json!("bad"), json!("not-hex")]).await;
+            assert!(
+                conn.neg.contains_key("other"),
+                "a failing message must not reap unrelated idle syncs"
+            );
+            assert!(
+                outgoing_json(&conn).iter().all(|m| m[1] != "other"),
+                "no NEG-ERR may name the untouched sync: {:?}",
+                outgoing_json(&conn)
+            );
+            // Touching a stale subscription refreshes it instead of
+            // closing it: a message for a live sync must never produce a
+            // second, confusing NEG-ERR for the same id. (Close "other"
+            // first: the sweep below would otherwise — correctly — reap
+            // it too, which is a separate assertion from the one above.)
+            conn.handle_neg_close(&[json!("other")]);
+            conn.neg.insert(
+                "slow".into(),
+                super::negentropy::NegState {
+                    items: Vec::new(),
+                    last_active: std::time::Instant::now() - stale_ago,
+                    rounds_left: 1,
+                    budget: None,
+                    reserved: 0,
+                },
+            );
+            conn.outgoing.clear();
+            conn.touch_and_reap_neg("slow");
+            assert!(
+                conn.neg.contains_key("slow"),
+                "a message for the sync itself must revive it before the sweep"
+            );
+            assert!(
+                outgoing_json(&conn).is_empty(),
+                "reviving must not emit any NEG-ERR: {:?}",
+                outgoing_json(&conn)
             );
             conn.relay.db.shutdown();
         });
@@ -7426,6 +7721,7 @@ mod tests {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let _state = super::negentropy::NegState {
                     items: Vec::new(),
+                    last_active: std::time::Instant::now(),
                     rounds_left: 1,
                     budget: Some(state_budget),
                     reserved: 128,

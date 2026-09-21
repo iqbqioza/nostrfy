@@ -1726,6 +1726,185 @@ impl<'de> serde::Deserialize<'de> for BlockedIps {
     }
 }
 
+/// One daemon-side access-control mutation, recorded for write-through
+/// persistence (see `Relay::persist_access`). The daemon applies it to
+/// memory immediately (live enforcement) and queues it; the persist drains
+/// the queue onto a freshly reloaded persisted state, so a concurrent CLI
+/// write is merged instead of overwritten — and a SIGHUP reload replays
+/// unpersisted ops instead of dropping them. Every op is idempotent, so
+/// replaying after a failed persist (or on reload) is safe. Same-entry
+/// conflicts resolve daemon-wins: the operator just acted, and the other
+/// console observes the result on its next read.
+#[derive(Debug, Clone)]
+pub enum AccessOp {
+    BanPubkey {
+        pubkey: String,
+        reason: String,
+        /// NIP-86 matches case-insensitively, command events exactly;
+        /// the replay honors the origin so both keep their semantics.
+        insensitive: bool,
+    },
+    UnbanPubkey {
+        pubkey: String,
+        insensitive: bool,
+    },
+    AllowPubkey {
+        pubkey: String,
+        reason: String,
+        insensitive: bool,
+    },
+    UnallowPubkey {
+        pubkey: String,
+        insensitive: bool,
+    },
+    DenyKind {
+        kind: u64,
+    },
+    UndenyKind {
+        kind: u64,
+    },
+    AllowKind {
+        kind: u64,
+    },
+    UnallowKind {
+        kind: u64,
+    },
+    BlockIp {
+        ip: std::net::IpAddr,
+        reason: String,
+    },
+    UnblockIp {
+        ip: std::net::IpAddr,
+    },
+}
+
+/// Applies one [`AccessOp`] to an access state. Mirrors the NIP-86 and/// command-event mutation code exactly (including which list wins on a
+/// compound change), so the in-memory apply and the persist-time replay
+/// cannot diverge.
+pub fn apply_access_op(state: &mut AccessControl, op: &AccessOp) {
+    fn pubkey_eq(insensitive: bool, entry: &str, pubkey: &str) -> bool {
+        if insensitive {
+            entry.eq_ignore_ascii_case(pubkey)
+        } else {
+            entry == pubkey
+        }
+    }
+    match op {
+        AccessOp::BanPubkey {
+            pubkey,
+            reason,
+            insensitive,
+        } => {
+            if let Some(entry) = state
+                .blocked_pubkeys
+                .iter_mut()
+                .find(|(p, _)| pubkey_eq(*insensitive, p, pubkey))
+            {
+                entry.1 = reason.clone();
+            } else {
+                state.blocked_pubkeys.push((pubkey.clone(), reason.clone()));
+            }
+        }
+        AccessOp::UnbanPubkey {
+            pubkey,
+            insensitive,
+        } => {
+            state
+                .blocked_pubkeys
+                .retain(|(p, _)| !pubkey_eq(*insensitive, p, pubkey));
+        }
+        AccessOp::AllowPubkey {
+            pubkey,
+            reason,
+            insensitive,
+        } => {
+            // Allowing also un-bans, so a ban can be reverted.
+            state
+                .blocked_pubkeys
+                .retain(|(p, _)| !pubkey_eq(*insensitive, p, pubkey));
+            if !state
+                .allowed_pubkeys
+                .iter()
+                .any(|(p, _)| pubkey_eq(*insensitive, p, pubkey))
+            {
+                state.allowed_pubkeys.push((pubkey.clone(), reason.clone()));
+            }
+        }
+        AccessOp::UnallowPubkey {
+            pubkey,
+            insensitive,
+        } => {
+            state
+                .allowed_pubkeys
+                .retain(|(p, _)| !pubkey_eq(*insensitive, p, pubkey));
+        }
+        AccessOp::DenyKind { kind } => {
+            if !state.blocked_kinds.contains(kind) {
+                state.blocked_kinds.push(*kind);
+            }
+            // A blocked kind must never be listed as allowed.
+            state.allowed_kinds.retain(|k| k != kind);
+        }
+        AccessOp::UndenyKind { kind } => {
+            state.blocked_kinds.retain(|k| k != kind);
+        }
+        AccessOp::AllowKind { kind } => {
+            if !state.allowed_kinds.contains(kind) {
+                state.allowed_kinds.push(*kind);
+            }
+        }
+        AccessOp::UnallowKind { kind } => {
+            state.allowed_kinds.retain(|k| k != kind);
+        }
+        AccessOp::BlockIp { ip, reason } => {
+            if !state.is_ip_blocked(*ip) {
+                state.blocked_ips.push(ip.to_string(), reason.clone());
+            }
+        }
+        AccessOp::UnblockIp { ip } => {
+            state.blocked_ips.remove(*ip);
+        }
+    }
+}
+
+/// Turns a config-seeded access state into op-log entries, so the first
+/// write-through persist replays (and therefore keeps) the seed instead
+/// of overwriting it with the empty database state. Only used when the
+/// persisted blob is missing (the very first run); a loaded state needs
+/// no ops because memory already matches the database.
+pub fn access_seed_ops(seed: &AccessControl) -> Vec<AccessOp> {
+    let mut ops = Vec::new();
+    for (pubkey, reason) in &seed.blocked_pubkeys {
+        ops.push(AccessOp::BanPubkey {
+            pubkey: pubkey.clone(),
+            reason: reason.clone(),
+            insensitive: true,
+        });
+    }
+    for (pubkey, reason) in &seed.allowed_pubkeys {
+        ops.push(AccessOp::AllowPubkey {
+            pubkey: pubkey.clone(),
+            reason: reason.clone(),
+            insensitive: true,
+        });
+    }
+    for kind in &seed.blocked_kinds {
+        ops.push(AccessOp::DenyKind { kind: *kind });
+    }
+    for kind in &seed.allowed_kinds {
+        ops.push(AccessOp::AllowKind { kind: *kind });
+    }
+    for (entry, reason) in seed.blocked_ips.entries() {
+        if let Ok(ip) = entry.parse::<std::net::IpAddr>() {
+            ops.push(AccessOp::BlockIp {
+                ip: crate::util::normalize_ip(ip),
+                reason: reason.clone(),
+            });
+        }
+    }
+    ops
+}
+
 /// Deserializes an access list that accepts both the current format —
 /// `[["pubkey", "reason"], ...]` — and the legacy format — `["pubkey", ...]`
 /// (plain strings). The persisted JSON and the TOML `[access]` section both
@@ -3291,6 +3470,124 @@ max_log_files = 2
         let mut cfg = Config::default();
         cfg.access.blocked_ips = vec![("not-an-ip".into(), String::new())].into();
         assert!(cfg.validate().is_err(), "blocked IPs must parse");
+    }
+
+    #[test]
+    fn access_ops_merge_concurrent_daemon_and_cli_edits() {
+        // The op log merges a daemon mutation with a concurrent CLI write
+        // instead of overwriting it: daemon bans X while the CLI bans Y.
+        let baseline = AccessControl::default();
+        let mut persisted = baseline.clone();
+        persisted.blocked_pubkeys.push(("y".into(), String::new()));
+        let mut inmem = baseline.clone();
+        apply_access_op(
+            &mut inmem,
+            &AccessOp::BanPubkey {
+                pubkey: "x".into(),
+                reason: "spam".into(),
+                insensitive: true,
+            },
+        );
+        // The persist replays the daemon op onto the freshly reloaded
+        // persisted state (not onto the stale snapshot).
+        let mut merged = persisted.clone();
+        apply_access_op(
+            &mut merged,
+            &AccessOp::BanPubkey {
+                pubkey: "x".into(),
+                reason: "spam".into(),
+                insensitive: true,
+            },
+        );
+        assert!(
+            merged.blocked_pubkeys.iter().any(|(p, _)| p == "x"),
+            "the daemon ban must survive"
+        );
+        assert!(
+            merged.blocked_pubkeys.iter().any(|(p, _)| p == "y"),
+            "the concurrent CLI ban must survive (no overwrite)"
+        );
+    }
+
+    #[test]
+    fn access_ops_honor_removals_without_resurrecting() {
+        // A daemon unban drops the entry even though the persisted state
+        // still carries it (the CLI did not touch it).
+        let mut base = AccessControl::default();
+        base.blocked_pubkeys.push(("x".into(), String::new()));
+        let mut inmem = base.clone();
+        apply_access_op(
+            &mut inmem,
+            &AccessOp::UnbanPubkey {
+                pubkey: "x".into(),
+                insensitive: true,
+            },
+        );
+        let mut merged = base.clone();
+        apply_access_op(
+            &mut merged,
+            &AccessOp::UnbanPubkey {
+                pubkey: "x".into(),
+                insensitive: true,
+            },
+        );
+        assert!(
+            merged.blocked_pubkeys.is_empty(),
+            "the unban must hold against an unchanged persisted state"
+        );
+        // A CLI removal the daemon never saw stays removed after a daemon
+        // op on another entry (no resurrection of unknown entries).
+        let mut persisted = base.clone();
+        persisted.blocked_pubkeys.clear();
+        let mut merged = persisted.clone();
+        apply_access_op(
+            &mut merged,
+            &AccessOp::BanPubkey {
+                pubkey: "y".into(),
+                reason: String::new(),
+                insensitive: true,
+            },
+        );
+        assert!(
+            !merged.blocked_pubkeys.iter().any(|(p, _)| p == "x"),
+            "a CLI-removed entry must not come back"
+        );
+        assert!(merged.blocked_pubkeys.iter().any(|(p, _)| p == "y"));
+    }
+
+    #[test]
+    fn access_ops_are_idempotent_for_reload_replay() {
+        // Reload replays unpersisted ops onto the persisted state, and a
+        // later persist replays them again: every op must be a fixed point.
+        let mut state = AccessControl::default();
+        let ops = vec![
+            AccessOp::BanPubkey {
+                pubkey: "a".into(),
+                reason: "r".into(),
+                insensitive: true,
+            },
+            AccessOp::AllowPubkey {
+                pubkey: "b".into(),
+                reason: String::new(),
+                insensitive: false,
+            },
+            AccessOp::DenyKind { kind: 4 },
+            AccessOp::BlockIp {
+                ip: "203.0.113.7".parse().unwrap(),
+                reason: String::new(),
+            },
+        ];
+        for op in &ops {
+            apply_access_op(&mut state, op);
+        }
+        let once = state.clone();
+        for op in &ops {
+            apply_access_op(&mut state, op);
+        }
+        assert_eq!(state.blocked_pubkeys, once.blocked_pubkeys);
+        assert_eq!(state.allowed_pubkeys, once.allowed_pubkeys);
+        assert_eq!(state.blocked_kinds, once.blocked_kinds);
+        assert_eq!(state.blocked_ips.entries(), once.blocked_ips.entries());
     }
 
     #[test]

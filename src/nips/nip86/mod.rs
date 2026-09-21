@@ -223,20 +223,14 @@ pub async fn rpc_handler(
             // the lists (and their persisted JSON) unambiguous.
             let pubkey = pubkey.to_ascii_lowercase();
             {
+                let op = crate::config::AccessOp::BanPubkey {
+                    pubkey: pubkey.clone(),
+                    reason: reason.to_string(),
+                    insensitive: true,
+                };
                 let mut access = relay.access.write().await;
-                if let Some(entry) = access
-                    .blocked_pubkeys
-                    .iter_mut()
-                    .find(|(p, _)| p.eq_ignore_ascii_case(&pubkey))
-                {
-                    // Re-banning updates the stored reason: `listbannedpubkeys`
-                    // must reflect the latest call, not the first one.
-                    entry.1 = reason.to_string();
-                } else {
-                    access
-                        .blocked_pubkeys
-                        .push((pubkey.to_string(), reason.to_string()));
-                }
+                crate::config::apply_access_op(&mut access, &op);
+                relay.push_access_ops(vec![op]);
             }
             // The in-memory mutation is live even when the write-through
             // persistence fails, so the audit entry must still be recorded;
@@ -258,10 +252,13 @@ pub async fn rpc_handler(
                 return rpc_err("invalid pubkey");
             }
             {
+                let op = crate::config::AccessOp::UnbanPubkey {
+                    pubkey: pubkey.to_string(),
+                    insensitive: true,
+                };
                 let mut access = relay.access.write().await;
-                access
-                    .blocked_pubkeys
-                    .retain(|(p, _)| !p.eq_ignore_ascii_case(pubkey));
+                crate::config::apply_access_op(&mut access, &op);
+                relay.push_access_ops(vec![op]);
             }
             // Same contract as `banpubkey`: the failed persistence is still
             // an applied in-memory mutation, so it must be audited.
@@ -294,21 +291,24 @@ pub async fn rpc_handler(
             // Same lowercase normalization as `banpubkey` above.
             let pubkey = pubkey.to_ascii_lowercase();
             {
-                let mut access = relay.access.write().await;
                 // NIP-86: allowing a pubkey also un-bans it (matching the
                 // legacy endpoint), so `banpubkey` can be reverted.
-                access
-                    .blocked_pubkeys
-                    .retain(|(p, _)| !p.eq_ignore_ascii_case(&pubkey));
-                if !access
-                    .allowed_pubkeys
-                    .iter()
-                    .any(|(p, _)| p.eq_ignore_ascii_case(&pubkey))
-                {
-                    access
-                        .allowed_pubkeys
-                        .push((pubkey.to_string(), reason.to_string()));
+                let ops = vec![
+                    crate::config::AccessOp::UnbanPubkey {
+                        pubkey: pubkey.clone(),
+                        insensitive: true,
+                    },
+                    crate::config::AccessOp::AllowPubkey {
+                        pubkey: pubkey.clone(),
+                        reason: reason.to_string(),
+                        insensitive: true,
+                    },
+                ];
+                let mut access = relay.access.write().await;
+                for op in &ops {
+                    crate::config::apply_access_op(&mut access, op);
                 }
+                relay.push_access_ops(ops);
             }
             // Same contract as `banpubkey`: audit the applied mutation even
             // when persisting it failed.
@@ -328,10 +328,13 @@ pub async fn rpc_handler(
                 return rpc_err("invalid pubkey");
             }
             {
+                let op = crate::config::AccessOp::UnallowPubkey {
+                    pubkey: pubkey.to_string(),
+                    insensitive: true,
+                };
                 let mut access = relay.access.write().await;
-                access
-                    .allowed_pubkeys
-                    .retain(|(p, _)| !p.eq_ignore_ascii_case(pubkey));
+                crate::config::apply_access_op(&mut access, &op);
+                relay.push_access_ops(vec![op]);
             }
             // Same contract as `banpubkey`: audit the applied mutation even
             // when persisting it failed.
@@ -356,18 +359,25 @@ pub async fn rpc_handler(
                 return rpc_err("invalid params");
             };
             {
-                let mut access = relay.access.write().await;
                 // NIP-86: allowing a kind also un-blocks it (matching the
-                // legacy endpoint), so `disallowkind` can be reverted.
-                access.blocked_kinds.retain(|k| *k != kind);
+                // legacy endpoint), so `disallowkind` can be reverted. The
+                // conditional allow mirrors the call-site rule below: an
+                // unconditional push would turn a single `allowkind` into a
+                // global allowlist that blocks every other kind.
+                let mut ops = vec![crate::config::AccessOp::UndenyKind { kind }];
+                let mut access = relay.access.write().await;
                 // `allowed_kinds` is the config allowlist, which
                 // `allows_kind` treats as exhaustive when non-empty. An
                 // unconditional push would turn a single `allowkind` into a
                 // global allowlist that blocks every other kind (and would
                 // make a later `disallowkind` report the kind as allowed).
                 if !access.allowed_kinds.is_empty() && !access.allowed_kinds.contains(&kind) {
-                    access.allowed_kinds.push(kind);
+                    ops.push(crate::config::AccessOp::AllowKind { kind });
                 }
+                for op in &ops {
+                    crate::config::apply_access_op(&mut access, op);
+                }
+                relay.push_access_ops(ops);
             }
             // Same contract as `banpubkey`: audit the applied mutation even
             // when persisting it failed.
@@ -383,14 +393,18 @@ pub async fn rpc_handler(
                 return rpc_err("invalid params");
             };
             {
-                let mut access = relay.access.write().await;
-                if !access.blocked_kinds.contains(&kind) {
-                    access.blocked_kinds.push(kind);
-                }
                 // A blocked kind must never be listed as allowed: drop it
                 // from the config allowlist (`listallowedkinds` reports that
                 // list, and `disallowkind` must leave a consistent state).
-                access.allowed_kinds.retain(|k| *k != kind);
+                let ops = vec![
+                    crate::config::AccessOp::DenyKind { kind },
+                    crate::config::AccessOp::UnallowKind { kind },
+                ];
+                let mut access = relay.access.write().await;
+                for op in &ops {
+                    crate::config::apply_access_op(&mut access, op);
+                }
+                relay.push_access_ops(ops);
             }
             // Same contract as `banpubkey`: audit the applied mutation even
             // when persisting it failed.
@@ -604,10 +618,13 @@ pub async fn rpc_handler(
             // entry is not duplicated).
             let ip = crate::util::normalize_ip(ip);
             {
+                let op = crate::config::AccessOp::BlockIp {
+                    ip,
+                    reason: reason.to_string(),
+                };
                 let mut access = relay.access.write().await;
-                if !access.is_ip_blocked(ip) {
-                    access.blocked_ips.push(ip.to_string(), reason.to_string());
-                }
+                crate::config::apply_access_op(&mut access, &op);
+                relay.push_access_ops(vec![op]);
             }
             // The in-memory block is live even when persistence fails, so
             // existing connections must still be dropped and the mutation
@@ -630,10 +647,12 @@ pub async fn rpc_handler(
             };
             let ip = crate::util::normalize_ip(ip);
             {
-                let mut access = relay.access.write().await;
                 // Remove equivalently-spelled entries too (`::1` versus
                 // `0:0:0:0:0:0:0:1`, v4-mapped versus IPv4).
-                access.blocked_ips.remove(ip);
+                let op = crate::config::AccessOp::UnblockIp { ip };
+                let mut access = relay.access.write().await;
+                crate::config::apply_access_op(&mut access, &op);
+                relay.push_access_ops(vec![op]);
             }
             // Same contract as `blockip`: the in-memory unblock is live even
             // when persistence fails, so the version must still be bumped
@@ -738,6 +757,16 @@ fn is_pubkey(value: &str) -> bool {
     hex::decode(value).map(|b| b.len() == 32).unwrap_or(false)
 }
 
+/// Extracts the token from an `Authorization: Bearer <token>` header
+/// value. The scheme is case-insensitive (RFC 9110, like the NIP-98
+/// `Nostr` scheme): a case-sensitive comparison 401s clients sending
+/// `bearer` or `BEARER`. Returns `None` for another scheme or a scheme
+/// with no token.
+fn strip_bearer_scheme(value: &str) -> Option<&str> {
+    let (scheme, token) = value.split_once(' ')?;
+    scheme.eq_ignore_ascii_case("Bearer").then_some(token)
+}
+
 /// Constant-time comparison for the management token: the token must not be
 /// recoverable through response-timing differences of the comparison. The
 /// length check short-circuits (the length is not secret), and equal-length
@@ -773,7 +802,7 @@ async fn rpc_authenticated(
         && let Some(token) = headers
             .get(header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
+            .and_then(strip_bearer_scheme)
         && ct_eq(token, &cfg.rpc.management_token)
     {
         return Some("management-token".into());
@@ -874,6 +903,19 @@ mod tests {
             serde_json::to_string(&json!({ "method": method, "params": params })).unwrap(),
         )
         .await
+    }
+
+    #[test]
+    fn bearer_scheme_is_case_insensitive() {
+        // RFC 9110: auth-schemes are case-insensitive; a client sending
+        // `bearer` must authenticate like one sending `Bearer`.
+        assert_eq!(strip_bearer_scheme("Bearer tok"), Some("tok"));
+        assert_eq!(strip_bearer_scheme("bearer tok"), Some("tok"));
+        assert_eq!(strip_bearer_scheme("BEARER tok"), Some("tok"));
+        assert_eq!(strip_bearer_scheme("BeArEr tok"), Some("tok"));
+        assert_eq!(strip_bearer_scheme("Nostr tok"), None);
+        assert_eq!(strip_bearer_scheme("Bearer"), None);
+        assert_eq!(strip_bearer_scheme(""), None);
     }
 
     #[tokio::test]
@@ -1336,10 +1378,18 @@ mod tests {
     #[tokio::test]
     async fn allowkind_extends_an_active_config_allowlist() {
         let relay = build_admin_relay().await;
-        // Simulate a config allowlist: `allowed_kinds` is exhaustive while
-        // non-empty, so `allowkind` must extend it or the call would report
-        // success while `allows_kind` still rejects the kind.
-        relay.access.write().await.allowed_kinds = vec![1];
+        // Simulate a config allowlist through the op log (as a fresh seed
+        // would): `allowed_kinds` is exhaustive while non-empty, so
+        // `allowkind` must extend it or the call would report success while
+        // `allows_kind` still rejects the kind. A direct in-memory write
+        // would bypass the op log and be dropped by the next merge.
+        {
+            let op = crate::config::AccessOp::AllowKind { kind: 1 };
+            let mut access = relay.access.write().await;
+            crate::config::apply_access_op(&mut access, &op);
+            relay.push_access_ops(vec![op]);
+        }
+        assert!(relay.persist_access().await, "the seed must persist");
         assert!(!relay.access.read().await.allows_kind(7));
         assert_eq!(
             rpc_result_of(rpc_call(&relay, "listallowedkinds", vec![]).await).await,

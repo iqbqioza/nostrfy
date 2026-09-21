@@ -176,3 +176,6 @@ else
   echo "  echo 'export PATH=\"$INSTALL_DIR:\$PATH\"' >> ~/.bashrc"
   echo "  source ~/.bashrc"
 fi
+echo
+echo "nostrfy is dual-licensed under MIT or Apache-2.0; the license texts"
+echo "ship with every release: https://github.com/iqbqioza/nostrfy/releases"

@@ -220,12 +220,16 @@ async fn upload_allowed(relay: &Relay, pubkey: &str) -> anyhow::Result<()> {
     }
     // The allowlist lives in the relay database (LMDB), loaded into
     // memory at startup and refreshed on SIGHUP (`nostrfy blossom allow/deny`).
+    // Case-insensitive like the relay pubkey lists: entries arrive from
+    // operators who may type uppercase hex, while wire pubkeys are
+    // lowercase — an exact compare would deny a legitimately listed
+    // uploader over letter case (fail-closed, but a paper cut).
     let allowed = relay
         .blossom_allow
         .read()
         .await
         .iter()
-        .any(|entry| entry == pubkey);
+        .any(|entry| entry.eq_ignore_ascii_case(pubkey));
     if allowed {
         Ok(())
     } else {
@@ -323,11 +327,13 @@ fn validate_auth_event(
     if crate::nips::nip01::verify(event, secp).is_err() {
         return None;
     }
-    // BUD-11: `created_at` must be in the past — nothing more. A future
-    // `created_at` (client clock ahead) is rejected; past timestamps
-    // are valid as long as `expiration` (checked below) has not
-    // passed, so pre-signed tokens for future uploads stay valid.
-    if event.created_at > now {
+    // BUD-11: `created_at` must not lie in the future — with a small
+    // clock-skew leeway mirroring the NIP-98 auth window. A token's
+    // validity is bounded by `expiration` (checked below), so accepting a
+    // `created_at` seconds ahead only keeps skewed clients working, never
+    // extends a token's life; without the leeway every request from a
+    // clock-ahead client fails with 401.
+    if event.created_at > now.saturating_add(60) {
         return None;
     }
     if !event_tags(event, "t").any(|t| t == verb) {
@@ -335,9 +341,16 @@ fn validate_auth_event(
     }
     // BUD-11: the `expiration` tag is mandatory and must be a unix
     // timestamp in the future — a missing or unparseable value is rejected
-    // too, so an intercepted token cannot outlive its scope.
-    let exp = event_tags(event, "expiration").next()?;
-    if exp.parse::<u64>().map(|e| e <= now).unwrap_or(true) {
+    // too, so an intercepted token cannot outlive its scope. Every tag
+    // must parse and the earliest one bounds the token: honoring only the
+    // first would let a later, looser tag extend an intercepted token's
+    // life past an earlier, stricter one.
+    let mut exp: Option<u64> = None;
+    for raw in event_tags(event, "expiration") {
+        let parsed: u64 = raw.parse().ok()?;
+        exp = Some(exp.map_or(parsed, |best: u64| best.min(parsed)));
+    }
+    if exp.is_none_or(|e| e <= now) {
         return None;
     }
     // The `server` tags (when present) must name our host. BUD-11: a token
@@ -1583,9 +1596,17 @@ async fn delete_blob(
 
 /// Builds the shared Blossom state from the config (or `None` when the
 /// feature is disabled). Must be called before the router is built.
-pub(crate) async fn build_state(cfg: &Config, relay: &Relay) -> Option<Arc<BlossomState>> {
+/// Builds the Blossom media state: `None` when no Blossom host is
+/// configured (media serving stays off), `Some` when the backend
+/// initialized. A configured host whose backend fails to initialize is an
+/// `Err`: serving the relay without its configured media would mask the
+/// outage as a healthy relay, so startup must refuse instead.
+pub(crate) async fn build_state(
+    cfg: &Config,
+    relay: &Relay,
+) -> anyhow::Result<Option<Arc<BlossomState>>> {
     if cfg.blossom.host.trim().is_empty() {
-        return None;
+        return Ok(None);
     }
     let s3 = if cfg.blossom.storage == "s3" {
         Some(storage::S3Config {
@@ -1651,12 +1672,9 @@ pub(crate) async fn build_state(cfg: &Config, relay: &Relay) -> Option<Arc<Bloss
                     }
                 });
             }
-            Some(state)
+            Ok(Some(state))
         }
-        Err(e) => {
-            log::error!("blossom storage failed to initialize: {e}");
-            None
-        }
+        Err(e) => Err(anyhow::anyhow!("blossom storage failed to initialize: {e}")),
     }
 }
 
@@ -1682,6 +1700,49 @@ mod tests {
     use super::*;
     use crate::event::Event;
     use secp256k1::{Keypair, Secp256k1, XOnlyPublicKey};
+
+    #[tokio::test]
+    async fn build_state_fails_closed_when_storage_init_fails() {
+        // A configured Blossom host whose backend cannot initialize must
+        // refuse startup (Err), not serve the relay without its media
+        // (None would mask the outage as a healthy relay).
+        let relay = build_blossom_relay(0).await;
+        let mut cfg = relay.config.read().await.clone();
+        cfg.blossom.storage = "bogus-backend".into();
+        match build_state(&cfg, &relay).await {
+            Err(e) => assert!(
+                e.to_string()
+                    .contains("blossom storage failed to initialize"),
+                "{e}"
+            ),
+            Ok(_) => panic!("an unusable backend must fail closed"),
+        }
+        // Disabled Blossom stays off without an error.
+        cfg.blossom.host.clear();
+        assert!(
+            build_state(&cfg, &relay).await.unwrap().is_none(),
+            "no host means no media state, not a failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_allowlist_matches_case_insensitively() {
+        // Entries arrive from operators who may type uppercase hex, while
+        // wire pubkeys are lowercase: an exact compare would deny a
+        // legitimately listed uploader over letter case.
+        let relay = build_blossom_relay(0).await;
+        relay.config.write().await.blossom.restrict_uploads = true;
+        let pk = "aa".repeat(32);
+        *relay.blossom_allow.write().await = vec![pk.to_ascii_uppercase()];
+        assert!(
+            upload_allowed(&relay, &pk).await.is_ok(),
+            "an allowlisted pubkey must upload regardless of entry letter case"
+        );
+        assert!(
+            upload_allowed(&relay, &"bb".repeat(32)).await.is_err(),
+            "a non-listed pubkey must still be refused"
+        );
+    }
 
     /// Builds a relay with the Blossom feature enabled on local storage.
     async fn build_blossom_relay(min_free_bytes: u64) -> Arc<Relay> {
@@ -1727,7 +1788,9 @@ mod tests {
         .await;
         relay.start_live_bus();
         let relay = Arc::new(relay);
-        let state = build_state(&relay.config.read().await.clone(), &relay).await;
+        let state = build_state(&relay.config.read().await.clone(), &relay)
+            .await
+            .expect("test Blossom backend must initialize");
         *relay.blossom.write().await = state;
         relay
     }
@@ -2778,6 +2841,85 @@ mod tests {
         assert_eq!(
             validate_auth_event(&secp, &ev, host, "upload", Some(&sha), now),
             None
+        );
+    }
+
+    #[test]
+    fn blossom_auth_allows_a_small_clock_skew() {
+        // Validity is bounded by `expiration`, so a `created_at` seconds
+        // in the future only keeps skewed clients working — without the
+        // leeway every request from a clock-ahead client fails with 401.
+        let secp = Secp256k1::new();
+        let now = unix_now();
+        let sha = "a".repeat(64);
+        let host = "media.example.com";
+        let ev = auth_event(
+            &secp,
+            now + 30,
+            "upload",
+            Some(now + 300),
+            Some(&sha),
+            Some(host),
+        );
+        assert_eq!(
+            validate_auth_event(&secp, &ev, host, "upload", Some(&sha), now),
+            Some(ev.pubkey.clone()),
+            "a token seconds in the future must be accepted within the skew window"
+        );
+        let ev = auth_event(
+            &secp,
+            now + 61,
+            "upload",
+            Some(now + 300),
+            Some(&sha),
+            Some(host),
+        );
+        assert_eq!(
+            validate_auth_event(&secp, &ev, host, "upload", Some(&sha), now),
+            None,
+            "a token past the skew window must still be rejected"
+        );
+    }
+
+    #[test]
+    fn blossom_auth_honors_the_earliest_expiration() {
+        // Every `expiration` tag must parse and the earliest one bounds
+        // the token: honoring only the first would let a later, looser
+        // tag extend an intercepted token's life.
+        let secp = Secp256k1::new();
+        let now = unix_now();
+        let sha = "a".repeat(64);
+        let host = "media.example.com";
+        let with_extra_expiration = |first: u64, extra: &str| {
+            let mut ev = auth_event(&secp, now, "upload", Some(first), Some(&sha), Some(host));
+            ev.tags.push(vec!["expiration".into(), extra.into()]);
+            ev.id = crate::nips::nip01::compute_id(&ev);
+            let id = ev.id_bytes().unwrap();
+            let keypair = Keypair::from_seckey_slice(&secp, &[9u8; 32]).unwrap();
+            ev.sig = secp.sign_schnorr_no_aux_rand(&id, &keypair).to_string();
+            ev
+        };
+        // A later first tag with an earlier second tag: the earlier one
+        // still bounds (accepted while it is in the future).
+        let ev = with_extra_expiration(now + 600, &(now + 300).to_string());
+        assert_eq!(
+            validate_auth_event(&secp, &ev, host, "upload", Some(&sha), now),
+            Some(ev.pubkey.clone())
+        );
+        // A past tag anywhere rejects, even behind a future first tag
+        // (the old first-only check accepted this token).
+        let ev = with_extra_expiration(now + 600, &(now - 10).to_string());
+        assert_eq!(
+            validate_auth_event(&secp, &ev, host, "upload", Some(&sha), now),
+            None,
+            "a past expiration tag must reject even behind a future first tag"
+        );
+        // An unparseable tag rejects, even behind a valid first tag.
+        let ev = with_extra_expiration(now + 600, "soon");
+        assert_eq!(
+            validate_auth_event(&secp, &ev, host, "upload", Some(&sha), now),
+            None,
+            "an unparseable expiration tag must reject"
         );
     }
 

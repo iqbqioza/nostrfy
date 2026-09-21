@@ -13,11 +13,11 @@
 //!    `query_req` must equal the model's. The sequence closes and reopens
 //!    the database periodically, so snapshot/pending/index recovery
 //!    regressions surface too.
-//! 2. Random filters (kinds/authors/since/until/limit) must return exactly
-//!    the model-filtered set (per-filter limit semantics included) and
-//!    `COUNT` must equal the filtered cardinality, bounded by the count
-//!    request's own limit (a count stops at the requested total, never
-//!    invents events past it).
+//! 2. Random filters (kinds/authors/since/until/limit/tags/ids/search)
+//!    must return exactly the model-filtered set (per-filter limit
+//!    semantics included) and `COUNT` must equal the filtered cardinality,
+//!    bounded by the count request's own limit (a count stops at the
+//!    requested total, never invents events past it).
 //!
 //! The helpers are local to this file (the temp-`DatabaseConfig` pattern is
 //! copied from `src/db/tests.rs`), so no other test module has to change.
@@ -484,7 +484,7 @@ fn limited_ids(matching: &[&Event], k: usize) -> BTreeSet<String> {
     out
 }
 
-fn random_filter(rng: &mut Rng, authors: &[String]) -> Filter {
+fn random_filter(rng: &mut Rng, authors: &[String], history: &[Event]) -> Filter {
     let mut filter = Filter::default();
     if rng.bool() {
         let mut kinds = Vec::new();
@@ -510,7 +510,99 @@ fn random_filter(rng: &mut Rng, authors: &[String]) -> Filter {
     if rng.bool() {
         filter.limit = Some(rng.below(6));
     }
+    // Tag filters from the generator's vocabulary (hits) mixed with
+    // never-stored values (misses): cross-checks the tag index against
+    // `Filter::matches`, the class behind the first-value-only-indexing
+    // regression. Tag values compare exactly (case-sensitive) on both
+    // paths.
+    if rng.bool() {
+        let name = ["t", "d", "h", "e", "a"][rng.below(5)];
+        let mut values = Vec::new();
+        for _ in 0..1 + rng.below(3) {
+            let value = match rng.below(3) {
+                // A value some submitted event carries (a hit while that
+                // event stays visible).
+                0 => history_tag_value(rng, history, name).unwrap_or_else(|| rng.hex(8)),
+                // A vocabulary constant the generator emits (`e`/`a`
+                // carry ids/addresses, not constants).
+                1 => match name {
+                    "t" => "prop".to_string(),
+                    "d" => D_TAGS[rng.below(D_TAGS.len())].to_string(),
+                    "h" => GROUP_IDS[rng.below(GROUP_IDS.len())].to_string(),
+                    _ => rng.hex(64),
+                },
+                // A never-stored value (a miss): hex can never spell the
+                // word constants above, and a random 64-hex id is unique.
+                _ => {
+                    let len = 1 + rng.below(64);
+                    rng.hex(len)
+                }
+            };
+            values.push(serde_json::Value::String(value));
+        }
+        filter
+            .tags
+            .insert(format!("#{name}"), serde_json::Value::Array(values));
+    }
+    // `ids`: full ids and even-length prefixes from history (hits while
+    // visible), random hex (usually a miss) and odd-length entries (match
+    // nothing by design, mirroring the historical scan). Comparison is
+    // ASCII case-insensitive on both paths, so uppercase spellings are
+    // covered too.
+    if rng.bool() {
+        let mut ids = Vec::new();
+        for _ in 0..1 + rng.below(3) {
+            let mut id = if !history.is_empty() && rng.below(2) == 0 {
+                let full = history[rng.below(history.len())].id.clone();
+                match rng.below(3) {
+                    // An even-length prefix (a hit while visible).
+                    0 => full[..2 * (1 + rng.below(31))].to_string(),
+                    // Odd length: matches nothing by design.
+                    1 => full[..2 * rng.below(32) + 1].to_string(),
+                    _ => full,
+                }
+            } else {
+                rng.hex(64)
+            };
+            if rng.below(4) == 0 {
+                id = id.to_ascii_uppercase();
+            }
+            ids.push(id);
+        }
+        filter.ids = Some(ids);
+    }
+    // NIP-50 search: the generator's content vocabulary (hits) and a
+    // never-occurring term (misses), cross-checking the word index
+    // against the in-memory term match.
+    if rng.bool() {
+        filter.search = Some(if rng.bool() {
+            "prop".to_string()
+        } else {
+            "zzz-no-such-term-zzz".to_string()
+        });
+    }
     filter
+}
+
+/// A tag value sampled from the submitted history (a hit while the event
+/// stays visible): tries a few random events for one carrying `name`.
+fn history_tag_value(rng: &mut Rng, history: &[Event], name: &str) -> Option<String> {
+    for _ in 0..8 {
+        if history.is_empty() {
+            return None;
+        }
+        let event = &history[rng.below(history.len())];
+        let values: Vec<&String> = event
+            .tags
+            .iter()
+            .filter(|tag| tag.len() >= 2 && tag[0] == name)
+            .map(|tag| &tag[1])
+            .collect();
+        if !values.is_empty() {
+            return Some(values[rng.below(values.len())].clone());
+        }
+    }
+    None
 }
 
 /// One write-sequence run: random operations against a real `DbClient` with
@@ -911,7 +1003,7 @@ fn run_visible_set_sequence(seed: u64) {
 }
 
 fn check_random_filter(rt: &tokio::runtime::Runtime, harness: &mut Harness, check: usize) {
-    let filter = random_filter(&mut harness.rng, &harness.authors);
+    let filter = random_filter(&mut harness.rng, &harness.authors, &harness.history);
     let now = harness.now;
     let ctx = format!("seed={:#x} filter-check={check} now={now}", harness.seed);
     let mut matching: Vec<&Event> = harness
@@ -947,9 +1039,9 @@ fn check_random_filter(rt: &tokio::runtime::Runtime, harness: &mut Harness, chec
     }
     // COUNT ignores the filter's own `limit` and counts up to the request's
     // limit. The count is exact up to that cap; hitting the cap reports the
-    // result as approximate (`more`), conservatively even when the true
-    // cardinality is exactly the cap (the walk cannot know without looking
-    // past it).
+    // result as approximate (`more`) — but only when the walk was actually
+    // cut short. A walk that exhausts exactly at the cap is complete, so
+    // an exact count is not approximate.
     let count_limit = 1 + harness.rng.below(QUERY_LIMIT);
     let (counted, more) = rt
         .block_on(harness.db.count_reported(vec![filter], count_limit, now))
@@ -961,8 +1053,8 @@ fn check_random_filter(rt: &tokio::runtime::Runtime, harness: &mut Harness, chec
     );
     assert_eq!(
         more,
-        matching.len() >= count_limit,
-        "{ctx}: COUNT completeness flag (cap hit, approximate)"
+        matching.len() > count_limit,
+        "{ctx}: COUNT completeness flag (exact cap hit is complete, not approximate)"
     );
 }
 

@@ -659,6 +659,21 @@ impl super::Conn {
         self.purge_queued_events_for(sub_id);
     }
 
+    /// Closes every REQ subscription with `reason`, like [`Self::handle_close`]
+    /// per id: a connection that stops being allowed (ban, `require_auth`
+    /// enabled mid-session) must not starve silently post-EOSE. NEG
+    /// subscriptions live in a separate namespace and keep their own
+    /// per-round gates.
+    fn close_all_subs(&mut self, reason: &str) {
+        // Collect first: the removal borrows `subs` mutably per id.
+        let ids: Vec<String> = self.subs.keys().cloned().collect();
+        for id in &ids {
+            self.remove_req_subscription(id);
+            self.purge_queued_events_for(id);
+            self.send_closed(id, reason);
+        }
+    }
+
     /// Rejects a REQ with CLOSED, releasing any previous subscription held
     /// under the same id first. NIP-01 treats CLOSED as terminal: without the
     /// removal a failed re-REQ would leave a ghost subscription that keeps
@@ -1204,8 +1219,19 @@ impl super::Conn {
         }
         // The access lists gate live delivery too: a denied pubkey stops
         // receiving events immediately — the list is read per event, no
-        // reconnect needed.
+        // reconnect needed. The first denied event closes the starving
+        // subscriptions with the same CLOSED the REQ path sends, instead
+        // of leaving them silent post-EOSE (a client cannot distinguish a
+        // ban from a quiet relay).
         if !self.access_allows_read_sync() {
+            self.close_all_subs("restricted: you are not allowed to subscribe");
+            return;
+        }
+        // Enabling `require_auth` mid-session must cut anonymous live
+        // streams: REQ/COUNT/NEG-OPEN already refuse them, and a flip that
+        // left live flowing would fail open.
+        if self.require_auth && !self.is_authed() {
+            self.close_all_subs("auth-required: please authenticate before subscribing");
             return;
         }
         // NIP-70/NIP-59/NIP-78/NIP-29: one consolidated visibility check
