@@ -2031,17 +2031,27 @@ fn find_closing(text: &str, close: &str) -> Option<usize> {
     None
 }
 
-/// The section name of a header line, with quotes and surrounding
-/// whitespace stripped (`[ relay ]` and `["relay"]` both name `relay`).
+/// The section path of a header line, decoded the way TOML does: `[ relay ]`,
+/// `["relay"]` and `["\u0072elay"]` all name `relay`, while `[relay.x]`
+/// names `relay.x`.
 fn header_name(inner: &str) -> String {
-    let trimmed = inner.trim();
-    let quoted = (trimmed.starts_with('"') && trimmed.ends_with('"'))
-        || (trimmed.starts_with('\'') && trimmed.ends_with('\''));
-    if quoted && trimmed.len() >= 2 {
-        trimmed[1..trimmed.len() - 1].to_string()
-    } else {
-        trimmed.to_string()
+    let header = format!("[{inner}]");
+    let Ok(toml::Value::Table(table)) = toml::from_str::<toml::Value>(&header) else {
+        return inner.trim().to_string();
+    };
+    fn first_path(table: &toml::Table, prefix: &str) -> Option<String> {
+        let (key, value) = table.iter().next()?;
+        let path = if prefix.is_empty() {
+            key.clone()
+        } else {
+            format!("{prefix}.{key}")
+        };
+        match value {
+            toml::Value::Table(inner) if !inner.is_empty() => first_path(inner, &path),
+            _ => Some(path),
+        }
     }
+    first_path(&table, "").unwrap_or_else(|| inner.trim().to_string())
 }
 
 /// Whether a trimmed line starts a TOML table (`[name]`) or an array of
@@ -2831,6 +2841,16 @@ mod tests {
         assert!(out.contains("port = 1"), "{out}");
         let cfg: Config = toml::from_str(&out).expect("the rewritten config must parse");
         assert_eq!(cfg.relay.name, "new");
+    }
+
+    #[test]
+    fn an_escaped_header_name_matches() {
+        // `["\u0072elay"]` decodes to the `relay` table; the rewrite must
+        // recognize it instead of refusing (or duplicating).
+        let text = "[\"\\u0072elay\"]\nname = \"old\"\n";
+        let out = set_config_field_in_text(text, "relay", "name", "\"new\"");
+        assert!(out.contains("name = \"new\""), "{out}");
+        assert!(!out.contains("name = \"old\""), "{out}");
     }
 
     #[test]

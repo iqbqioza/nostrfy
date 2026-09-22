@@ -1935,13 +1935,32 @@ fn wait_for_ready_within(cfg: &Config, pid: Option<u32>, timeout: Duration) -> R
             }
         }
         if Instant::now() >= deadline {
-            return Err(config_err(format!(
-                "nostrfy did not become ready within {timeout:?}: nothing is listening on \
-                 {}:{} (see {} for the daemon's error)",
-                cfg.server.host,
-                cfg.server.port,
-                cfg.daemon.log_file.display()
-            )));
+            // A large startup (a long crash-recovery resume, a huge group
+            // rebuild) can outlive the probe: say so instead of implying
+            // the daemon failed.
+            let pid = pid.or_else(|| running_pid(&cfg.daemon.pid_file));
+            let alive = child_alive(
+                &cfg.daemon.pid_file,
+                pid,
+                started.elapsed() >= PID_FILE_GRACE,
+            );
+            return Err(config_err(if alive {
+                format!(
+                    "nostrfy did not become ready within {timeout:?} (the daemon is still \
+                     starting); watch {} and /health on {}:{}",
+                    cfg.daemon.log_file.display(),
+                    cfg.server.host,
+                    cfg.server.port
+                )
+            } else {
+                format!(
+                    "nostrfy did not become ready within {timeout:?}: nothing is listening on \
+                     {}:{} (see {} for the daemon's error)",
+                    cfg.server.host,
+                    cfg.server.port,
+                    cfg.daemon.log_file.display()
+                )
+            }));
         }
         std::thread::sleep(Duration::from_millis(100));
     }

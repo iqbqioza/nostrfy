@@ -353,15 +353,40 @@ fn parse_block(
                 return;
             }
             Token::Semi | Token::Other => *index += 1,
-            // jaxn accepts quoted keys and block names; a quoted key is a
-            // single literal segment, so one containing a dot must not be
-            // flattened into a nested path (it would merge a value real
-            // strfry never reads there).
-            Token::Name(key) | Token::Str(key) => {
-                let quoted_dotted = matches!(&tokens[*index], Token::Str(_)) && key.contains('.');
-                let key = key.clone();
+            // jaxn accepts quoted keys and block names and joins a dotted
+            // path across segments (`relay."info"` and `"relay".port` name
+            // the nested paths). A *single* quoted key containing a dot is
+            // one literal segment and must not be flattened.
+            Token::Name(_) | Token::Str(_) => {
+                let first_quoted = matches!(&tokens[*index], Token::Str(_));
+                let mut key = match &tokens[*index] {
+                    Token::Name(key) | Token::Str(key) => key.clone(),
+                    _ => unreachable!("matched above"),
+                };
                 *index += 1;
-                if quoted_dotted {
+                let mut joined = false;
+                loop {
+                    if key.ends_with('.') {
+                        match tokens.get(*index) {
+                            Some(Token::Name(segment)) | Some(Token::Str(segment)) => {
+                                key.push_str(segment);
+                                *index += 1;
+                                joined = true;
+                            }
+                            _ => break,
+                        }
+                    } else if let Some(Token::Name(segment)) = tokens.get(*index)
+                        && let Some(rest) = segment.strip_prefix('.')
+                    {
+                        key.push('.');
+                        key.push_str(rest);
+                        *index += 1;
+                        joined = true;
+                    } else {
+                        break;
+                    }
+                }
+                if first_quoted && key.contains('.') && !joined {
                     match tokens.get(*index) {
                         Some(Token::Eq) => {
                             *index += 1;
@@ -1323,6 +1348,22 @@ max_tags = 100
             "db = \"/x\"\n\
              foo = [ \"\"\"a\"b] relay { port = 9999 } c\"\"\" ]\n\
              relay { port = 7777 }\n",
+        );
+        assert_eq!(cfg.get("relay.port"), Some(&Value::Int(7777)));
+    }
+
+    #[test]
+    fn a_granted_quoted_path_segment_is_merged() {
+        // jaxn joins a dotted path across quoted segments; real strfry
+        // honors `relay."info" { ... }` and `"relay".port = ...`.
+        let cfg = StrfryConfig::parse(
+            "db = \"/x\"\n\
+             relay.\"info\" { name = \"quoted segment\" }\n\
+             \"relay\".port = 7777\n",
+        );
+        assert_eq!(
+            cfg.get("relay.info.name"),
+            Some(&Value::Str("quoted segment".into()))
         );
         assert_eq!(cfg.get("relay.port"), Some(&Value::Int(7777)));
     }

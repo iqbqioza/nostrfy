@@ -199,7 +199,7 @@ impl std::fmt::Display for Stats {
         if self.unauthorized_moderation > 0 {
             writeln!(
                 f,
-                "ignored {} NIP-29 moderation event(s) from non-admins (not applied)",
+                "ignored {} NIP-29 moderation event(s) (not applied)",
                 self.unauthorized_moderation
             )?;
         }
@@ -239,8 +239,6 @@ pub async fn run(
     let mut batch: Vec<(Arc<Event>, u64)> = Vec::with_capacity(opts.batch.clamp(1, 4096));
     let mut batch_bytes = 0usize;
     let mut first_seen: Vec<([u8; 32], u64)> = Vec::new();
-    // NIP-09 gift-wrap purges, applied after the import (see `apply_nip09`).
-    let mut wrap_purges: Vec<([u8; 32], u64)> = Vec::new();
     let mut previous_created: Option<u64> = None;
     let mut out_of_order_warned = false;
     let mut reader = reader;
@@ -339,7 +337,6 @@ pub async fn run(
                 opts,
                 &identity,
                 &mut first_seen,
-                &mut wrap_purges,
             )
             .await?;
             on_progress(&stats);
@@ -353,7 +350,6 @@ pub async fn run(
         opts,
         &identity,
         &mut first_seen,
-        &mut wrap_purges,
     )
     .await?;
     on_progress(&stats);
@@ -368,15 +364,7 @@ pub async fn run(
     if let Some(db) = db {
         // NIP-09 gift-wrap purges first (they are author-scoped and
         // order-independent), then the NIP-29 actions.
-        for (pubkey, until) in &wrap_purges {
-            match db.delete_gift_wraps_to_checked(*pubkey, *until).await {
-                Some(purged) => stats.gift_wrap_purges += purged as u64,
-                None => bail!(
-                    "NIP-59 gift-wrap purge was not applied; the migration did not \
-                     complete (re-run it)"
-                ),
-            }
-        }
+        apply_gift_wrap_purges(db, &mut stats).await?;
         apply_group_side_effects(db, opts, &mut stats).await?;
     }
     Ok(stats)
@@ -436,7 +424,6 @@ async fn flush(
     opts: &Options,
     identity: &nip62::RelayIdentity<'_>,
     first_seen: &mut Vec<([u8; 32], u64)>,
-    wrap_purges: &mut Vec<([u8; 32], u64)>,
 ) -> Result<()> {
     if batch.is_empty() {
         return Ok(());
@@ -493,7 +480,7 @@ async fn flush(
             first_seen.push((pubkey, event.created_at));
         }
         match event.kind {
-            nip09::DELETION_KIND => apply_nip09(db, event, stats, wrap_purges).await?,
+            nip09::DELETION_KIND => apply_nip09(db, event, stats).await?,
             nip62::VANISH_KIND
                 if opts.apply_vanish
                     && opts.nip62_enabled
@@ -534,6 +521,84 @@ fn replay_moderation(
     }
     groups.apply(event, relay_pubkey.unwrap_or(""), unix_now(), false, true);
     true
+}
+
+/// Replays the NIP-09 gift-wrap purges from the stored deletion requests:
+/// one purge per author, bounded by their newest request's timestamp (the
+/// live relay purges the recipient's wraps when a request arrives). The
+/// replay covers the whole stored history, so a resumed run (`--since`)
+/// still purges the wraps of requests imported by an earlier run, and the
+/// per-author aggregation bounds memory.
+async fn apply_gift_wrap_purges(db: &DbClient, stats: &mut Stats) -> Result<()> {
+    let mut by_author: std::collections::HashMap<[u8; 32], u64> = std::collections::HashMap::new();
+    const PAGE: usize = 50_000;
+    let mut since: Option<u64> = None;
+    loop {
+        let mut filter: crate::filter::Filter =
+            serde_json::from_value(serde_json::json!({ "kinds": [nip09::DELETION_KIND] }))
+                .expect("static filter");
+        filter.since = since;
+        let boundary_filter = filter.clone();
+        let Some((page, more)) = db
+            .query_full_startup(vec![filter], PAGE, unix_now(), true)
+            .await
+        else {
+            bail!(
+                "could not read the stored NIP-09 requests for the gift-wrap purge; the \
+                 migration did not complete (re-run it)"
+            );
+        };
+        if page.is_empty() {
+            break;
+        }
+        let max_created = page.last().map(|event| event.created_at);
+        let boundary_count = page
+            .iter()
+            .filter(|event| Some(event.created_at) == max_created)
+            .count();
+        for event in &page {
+            if let Some(pubkey) = event.pubkey_bytes() {
+                let entry = by_author.entry(pubkey).or_insert(0);
+                *entry = (*entry).max(event.created_at);
+            }
+        }
+        if !more {
+            break;
+        }
+        // The collector can cut a second at its caps while still reporting
+        // `more`: verify the boundary before stepping past it, or a
+        // request in the cut second would be skipped (fail open).
+        let Some(boundary) = max_created else {
+            break;
+        };
+        if !crate::nips::nip29::boundary_second_complete(
+            db,
+            boundary_filter,
+            boundary,
+            boundary_count,
+        )
+        .await
+        {
+            bail!(
+                "the stored NIP-09 boundary second {boundary} is not fully collected; \
+                 the migration did not complete (re-run it)"
+            );
+        }
+        if boundary == u64::MAX {
+            break;
+        }
+        since = Some(boundary.saturating_add(1));
+    }
+    for (pubkey, until) in by_author {
+        match db.delete_gift_wraps_to_checked(pubkey, until).await {
+            Some(purged) => stats.gift_wrap_purges += purged as u64,
+            None => bail!(
+                "NIP-59 gift-wrap purge was not applied; the migration did not \
+                 complete (re-run it)"
+            ),
+        }
+    }
+    Ok(())
 }
 
 /// Applies the NIP-29 `9005`/`9008` side effects the startup rebuild will
@@ -712,12 +777,7 @@ async fn replay_stored_moderation(
 
 /// NIP-09: apply the deletion and purge the deleter's gift wraps (the relay
 /// does both after storing the request).
-async fn apply_nip09(
-    db: &DbClient,
-    event: &Event,
-    stats: &mut Stats,
-    wrap_purges: &mut Vec<([u8; 32], u64)>,
-) -> Result<()> {
+async fn apply_nip09(db: &DbClient, event: &Event, stats: &mut Stats) -> Result<()> {
     let targets = nip09::deletion_targets(event);
     let (removed, _state_removed) = db
         .apply_deletion_checked(
@@ -747,11 +807,11 @@ async fn apply_nip09(
                  not complete (re-run it)"
             ),
         }
-        // The wrap purge is deferred to after the import: deciding it
+        // The wrap purge is replayed from the stored deletion requests
+        // after the import (see `apply_gift_wrap_purges`): deciding it
         // during the stream made a same-second wrap's fate depend on the
-        // batch boundary. Bounded by the deletion's own timestamp, so a
-        // wrap created later survives.
-        wrap_purges.push((pubkey, event.created_at));
+        // batch boundary, and a resumed run must still purge the wraps of
+        // deletion requests imported earlier.
     }
     Ok(())
 }
@@ -1556,6 +1616,29 @@ mod tests {
             1,
             "a legitimate later re-create still passes"
         );
+        db.shutdown();
+    }
+
+    #[test]
+    fn a_deletion_from_an_earlier_run_still_purges_later_wraps() {
+        // The wrap purge is replayed from the stored deletion requests, so
+        // a resumed run (`--since`) purges the wraps of requests imported
+        // by an earlier run instead of losing them with the in-memory queue.
+        let db = test_db("wrap-resume");
+        let now = unix_now();
+        let recipient = keypair(1).x_only_public_key().0.to_string();
+        let deletion = signed(1, nip09::DELETION_KIND, now - 5, vec![], "");
+        run_str(&db, &jsonl(&[deletion]), &options());
+        let wrap = signed(
+            2,
+            nip62::GIFT_WRAP_KIND,
+            now - 10,
+            vec![vec!["p".into(), recipient]],
+            "",
+        );
+        let stats = run_str(&db, &jsonl(std::slice::from_ref(&wrap)), &options());
+        assert_eq!(stats.gift_wrap_purges, 1, "the stored request is replayed");
+        assert!(visible(&db, serde_json::json!({"ids": [wrap.id]})).is_empty());
         db.shutdown();
     }
 

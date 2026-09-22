@@ -686,10 +686,15 @@ impl Store {
             // An interrupted purge's record may carry a wider bound (a
             // crashed live purge is unbounded) and the create id found so
             // far: keep both.
-            let pending = self
-                .purge_pending
-                .get(&wtxn, &key)?
-                .and_then(decode_pending_purge);
+            // A present-but-undecodable record fails closed: silently
+            // treating it as "no pending" and overwriting it with the
+            // caller's bound could narrow an interrupted live purge.
+            let pending = match self.purge_pending.get(&wtxn, &key)? {
+                Some(raw) => Some(decode_pending_purge(raw).ok_or_else(|| {
+                    anyhow::anyhow!("corrupt pending group purge record ({} bytes)", raw.len())
+                })?),
+                None => None,
+            };
             let effective_until = pending
                 .as_ref()
                 .map(|(_, _, _, pending_until, _)| (*pending_until).max(until))
@@ -705,6 +710,11 @@ impl Store {
                 .as_ref()
                 .and_then(|(_, _, _, _, create)| *create)
                 .or(old_create);
+            if effective_until != until {
+                log::warn!(
+                    "group purge {gid}: an interrupted purge's wider bound                      ({effective_until}) is honoured over the requested {until}"
+                );
+            }
             let purge_now = old_now.max(now);
             // The initial cut covers `now`; each chunk below raises it to
             // the newest removed event, and the final commit merges it.
