@@ -746,7 +746,11 @@ impl Cli {
                     // A dead child must not leave its pid file behind: the
                     // next `start` would refuse to run (and `stop` would
                     // signal a recycled pid) until it is cleaned up. The
-                    // reason for the death is in the daemon log.
+                    // reason for the death is in the daemon log. Re-read the
+                    // pid file first: a slow-but-alive daemon may have
+                    // written it after the initial wait, and removing it
+                    // would make `stop`/`stats` lose track of the process.
+                    let pid = pid.or_else(|| running_pid(&cfg.daemon.pid_file));
                     if pid.is_none_or(|pid| !process_alive(pid)) {
                         let _ = std::fs::remove_file(&cfg.daemon.pid_file);
                     }

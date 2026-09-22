@@ -932,7 +932,11 @@ strfry export | nostrfy migrate-strfry
   so the export has no trace of them — a re-publication block scoped to the
   deletion's author is recorded for every `e` target (the same
   `(id, pubkey)` block strfry keeps). A third party's deletion request
-  naming someone else's event cannot block that author.
+  naming someone else's event cannot block that author. The wrap purge is
+  replayed from the stored requests, bounded by each author's newest
+  request timestamp: a wrap created after that request survives (the export
+  carries no arrival order, so a wrap whose timestamp and arrival disagree
+  may differ from the live relay).
 - NIP-29 `9005` (delete event) and `9008` (delete group) moderation events:
   the referenced events are removed, and a `9008` purges the group's stored
   history up to its own timestamp (so a group re-created after the deletion

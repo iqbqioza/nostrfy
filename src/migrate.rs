@@ -557,6 +557,14 @@ async fn apply_gift_wrap_purges(db: &DbClient, stats: &mut Stats) -> Result<()> 
             .filter(|event| Some(event.created_at) == max_created)
             .count();
         for event in &page {
+            // Only actionable requests purge wraps (the live write path
+            // rejects a request with no e/a target, and strfry applies
+            // nothing for it).
+            if nip09::deletion_targets(event).is_empty()
+                && nip09::deletion_addresses(event).is_empty()
+            {
+                continue;
+            }
             if let Some(pubkey) = event.pubkey_bytes() {
                 let entry = by_author.entry(pubkey).or_insert(0);
                 *entry = (*entry).max(event.created_at);
@@ -579,9 +587,13 @@ async fn apply_gift_wrap_purges(db: &DbClient, stats: &mut Stats) -> Result<()> 
         )
         .await
         {
-            bail!(
+            // A pathological burst (more requests in one second than the
+            // scan's caps hold) must not brick the migration: warn and
+            // advance. The missed requests' wraps survive (fail open) and a
+            // later run can purge them.
+            log::warn!(
                 "the stored NIP-09 boundary second {boundary} is not fully collected; \
-                 the migration did not complete (re-run it)"
+                 advancing (a request in that second may not purge its wraps)"
             );
         }
         if boundary == u64::MAX {
@@ -779,10 +791,17 @@ async fn replay_stored_moderation(
 /// does both after storing the request).
 async fn apply_nip09(db: &DbClient, event: &Event, stats: &mut Stats) -> Result<()> {
     let targets = nip09::deletion_targets(event);
+    let addresses = nip09::deletion_addresses(event);
+    if targets.is_empty() && addresses.is_empty() {
+        // A request with nothing to delete: the live write path rejects it
+        // and strfry applies nothing, so the event stays stored but has no
+        // side effects (it must not purge the author's gift wraps).
+        return Ok(());
+    }
     let (removed, _state_removed) = db
         .apply_deletion_checked(
             targets.clone(),
-            nip09::deletion_addresses(event),
+            addresses,
             Some(event.pubkey.clone()),
             event.created_at,
         )
@@ -1292,7 +1311,13 @@ mod tests {
             vec![vec!["p".into(), author.clone()]],
             "wrap",
         );
-        let deletion = signed(1, nip09::DELETION_KIND, now - 5, vec![], "");
+        let deletion = signed(
+            1,
+            nip09::DELETION_KIND,
+            now - 5,
+            vec![vec!["e".into(), wrap.id.clone()]],
+            "",
+        );
         let stats = run_str(&db, &jsonl(&[wrap.clone(), deletion]), &options());
         assert_eq!(stats.gift_wrap_purges, 1);
         assert!(visible(&db, serde_json::json!({"ids": [wrap.id]})).is_empty());
@@ -1620,6 +1645,28 @@ mod tests {
     }
 
     #[test]
+    fn a_request_with_no_targets_does_not_purge_wraps() {
+        // The live write path rejects a deletion request with nothing to
+        // delete, and strfry applies nothing: the recipient's wrap must
+        // survive.
+        let db = test_db("empty-deletion");
+        let now = unix_now();
+        let recipient = keypair(1).x_only_public_key().0.to_string();
+        let empty = signed(1, nip09::DELETION_KIND, now - 5, vec![], "");
+        let wrap = signed(
+            2,
+            nip62::GIFT_WRAP_KIND,
+            now - 10,
+            vec![vec!["p".into(), recipient]],
+            "",
+        );
+        let stats = run_str(&db, &jsonl(&[empty, wrap.clone()]), &options());
+        assert_eq!(stats.gift_wrap_purges, 0);
+        assert_eq!(visible(&db, serde_json::json!({"ids": [wrap.id]})).len(), 1);
+        db.shutdown();
+    }
+
+    #[test]
     fn a_deletion_from_an_earlier_run_still_purges_later_wraps() {
         // The wrap purge is replayed from the stored deletion requests, so
         // a resumed run (`--since`) purges the wraps of requests imported
@@ -1627,7 +1674,13 @@ mod tests {
         let db = test_db("wrap-resume");
         let now = unix_now();
         let recipient = keypair(1).x_only_public_key().0.to_string();
-        let deletion = signed(1, nip09::DELETION_KIND, now - 5, vec![], "");
+        let deletion = signed(
+            1,
+            nip09::DELETION_KIND,
+            now - 5,
+            vec![vec!["e".into(), "aa".repeat(32)]],
+            "",
+        );
         run_str(&db, &jsonl(&[deletion]), &options());
         let wrap = signed(
             2,
@@ -1704,7 +1757,13 @@ mod tests {
             let db = test_db("wrap-order");
             let now = unix_now();
             let recipient = keypair(1).x_only_public_key().0.to_string();
-            let deletion = signed(1, nip09::DELETION_KIND, now - 10, vec![], "");
+            let deletion = signed(
+                1,
+                nip09::DELETION_KIND,
+                now - 10,
+                vec![vec!["e".into(), "bb".repeat(32)]],
+                "",
+            );
             let later = signed(
                 2,
                 nip62::GIFT_WRAP_KIND,

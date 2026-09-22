@@ -364,14 +364,23 @@ fn parse_block(
                     _ => unreachable!("matched above"),
                 };
                 *index += 1;
-                let mut joined = false;
+                // A quoted segment containing a dot is one literal key part
+                // in jaxn (`relay."info.name"` is not `relay.info.name`), so
+                // the whole assignment is skipped: nostrfy has no mapping
+                // for a literal dotted segment, and flattening it would
+                // merge a value real strfry never reads there.
+                let mut literal_dot = first_quoted && key.contains('.');
                 loop {
                     if key.ends_with('.') {
                         match tokens.get(*index) {
                             Some(Token::Name(segment)) | Some(Token::Str(segment)) => {
+                                if matches!(tokens.get(*index), Some(Token::Str(_)))
+                                    && segment.contains('.')
+                                {
+                                    literal_dot = true;
+                                }
                                 key.push_str(segment);
                                 *index += 1;
-                                joined = true;
                             }
                             _ => break,
                         }
@@ -381,12 +390,19 @@ fn parse_block(
                         key.push('.');
                         key.push_str(rest);
                         *index += 1;
-                        joined = true;
                     } else {
                         break;
                     }
                 }
-                if first_quoted && key.contains('.') && !joined {
+                // jaxn's `key += value` appends to a member: treat it like
+                // an assignment (the appended object is then parsed as a
+                // block under the key).
+                if matches!(tokens.get(*index), Some(Token::Name(name)) if name == "+")
+                    && matches!(tokens.get(*index + 1), Some(Token::Eq))
+                {
+                    *index += 1;
+                }
+                if literal_dot {
                     match tokens.get(*index) {
                         Some(Token::Eq) => {
                             *index += 1;
@@ -469,6 +485,21 @@ fn read_scalar(tokens: &[Token], index: &mut usize) -> Option<Value> {
         // Unary plus: `+5` is 5 (jaxn allows a leading sign).
         if matches!(tokens.get(*index), Some(Token::Name(name)) if name == "+") {
             *index += 1;
+        }
+        // A tao extension (`(env "X")`, `(include ...)`): nostrfy cannot
+        // evaluate it, so record nothing instead of a truncated literal
+        // like `(env`.
+        if let Some(Token::Name(value)) = tokens.get(*index)
+            && value.starts_with('(')
+        {
+            *index += 1;
+            while let Some(token) = tokens.get(*index) {
+                *index += 1;
+                if matches!(token, Token::Name(name) if name.ends_with(')')) {
+                    break;
+                }
+            }
+            return None;
         }
         let value = match tokens.get(*index)? {
             Token::Str(value) => Value::Str(value.clone()),
@@ -1366,6 +1397,38 @@ max_tags = 100
             Some(&Value::Str("quoted segment".into()))
         );
         assert_eq!(cfg.get("relay.port"), Some(&Value::Int(7777)));
+    }
+
+    #[test]
+    fn quoted_dotted_segments_are_not_flattened() {
+        // A quoted segment is literal: `relay."info.name"` is not
+        // `relay.info.name`, and neither is `"relay.info".name`.
+        let cfg = StrfryConfig::parse(
+            "db = \"/x\"\n\
+             relay.\"info.name\" = \"a\"\n\
+             \"relay.info\".name = \"b\"\n\
+             a.\"b.c\" = 1\n\
+             \"a.b\".c = 1\n",
+        );
+        assert_eq!(cfg.get("relay.info.name"), None);
+        assert_eq!(cfg.get("a.b.c"), None);
+    }
+
+    #[test]
+    fn append_and_extension_values_are_handled() {
+        // `key += { ... }` appends a member (valid tao); an extension value
+        // `(env "X")` is not evaluable and must not be recorded as `(env`.
+        let cfg = StrfryConfig::parse(
+            "db = \"/x\"\n\
+             relay { x += { info { name = \"APPENDED\" } } info { name = \"REAL\" } }\n\
+             other { name = (env \"STRFRY_NAME\") }\n",
+        );
+        assert_eq!(cfg.get("relay.info.name"), Some(&Value::Str("REAL".into())));
+        assert_eq!(
+            cfg.get("relay.x.info.name"),
+            Some(&Value::Str("APPENDED".into()))
+        );
+        assert_eq!(cfg.get("other.name"), None);
     }
 
     #[test]

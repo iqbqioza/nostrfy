@@ -2039,19 +2039,20 @@ fn header_name(inner: &str) -> String {
     let Ok(toml::Value::Table(table)) = toml::from_str::<toml::Value>(&header) else {
         return inner.trim().to_string();
     };
-    fn first_path(table: &toml::Table, prefix: &str) -> Option<String> {
+    fn first_path(table: &toml::Table, prefix: Option<&str>) -> Option<String> {
         let (key, value) = table.iter().next()?;
-        let path = if prefix.is_empty() {
-            key.clone()
-        } else {
-            format!("{prefix}.{key}")
+        // An empty key is a real (empty) segment: `["".relay]` names the
+        // path `.relay`, never `relay`.
+        let path = match prefix {
+            None => key.clone(),
+            Some(prefix) => format!("{prefix}.{key}"),
         };
         match value {
-            toml::Value::Table(inner) if !inner.is_empty() => first_path(inner, &path),
+            toml::Value::Table(inner) if !inner.is_empty() => first_path(inner, Some(&path)),
             _ => Some(path),
         }
     }
-    first_path(&table, "").unwrap_or_else(|| inner.trim().to_string())
+    first_path(&table, None).unwrap_or_else(|| inner.trim().to_string())
 }
 
 /// Whether a trimmed line starts a TOML table (`[name]`) or an array of
@@ -2185,12 +2186,14 @@ pub(crate) fn set_config_field_in_text(
         offset += l.len();
     }
     let Some(header_start) = header_start else {
-        // No section: append one at the end.
+        // No section: append one at the end, using the file's line ending
+        // (a CRLF config stays CRLF).
+        let ending = if text.contains("\r\n") { "\r\n" } else { "\n" };
         let mut s = text.to_string();
         if !s.ends_with('\n') {
-            s.push('\n');
+            s.push_str(ending);
         }
-        s.push_str(&format!("[{section}]\n{line}\n"));
+        s.push_str(&format!("[{section}]{ending}{line}{ending}"));
         return s;
     };
 
@@ -2290,15 +2293,21 @@ pub(crate) fn set_config_field_in_text(
 
     // Case 2: no matching line — insert it right after the section header
     // line, keeping the header on its own line even when the header is the
-    // last line of the file without a trailing newline.
+    // last line of the file without a trailing newline. The inserted line
+    // uses the header's own ending, so a CRLF config stays CRLF.
+    let ending = if text[..header_end].ends_with("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
     let mut s = text.to_string();
     if header_end >= s.len() {
         // Header is the last line without a trailing newline.
-        s.push('\n');
+        s.push_str(ending);
         s.push_str(&line);
-        s.push('\n');
+        s.push_str(ending);
     } else {
-        s.insert_str(header_end, &format!("{line}\n"));
+        s.insert_str(header_end, &format!("{line}{ending}"));
     }
     s
 }
@@ -2841,6 +2850,28 @@ mod tests {
         assert!(out.contains("port = 1"), "{out}");
         let cfg: Config = toml::from_str(&out).expect("the rewritten config must parse");
         assert_eq!(cfg.relay.name, "new");
+    }
+
+    #[test]
+    fn an_empty_quoted_header_segment_does_not_match() {
+        // `["".relay]` names the path `.relay`, not `relay`: a rewrite must
+        // not land in it (a new `[relay]` section is appended instead).
+        let text = "[\"\".relay]\nname = \"trap\"\n";
+        let out = set_config_field_in_text(text, "relay", "name", "\"new\"");
+        assert!(out.contains("name = \"trap\""), "{out}");
+        assert!(out.contains("[relay]\nname = \"new\""), "appended: {out}");
+    }
+
+    #[test]
+    fn crlf_configs_keep_crlf_on_insert() {
+        let text = "[relay]\r\nname = \"old\"\r\n";
+        let out = set_config_field_in_text(text, "relay", "private_key", "\"ab\"");
+        assert!(out.contains("private_key = \"ab\"\r\n"), "{out:?}");
+        assert!(!out.contains("private_key = \"ab\"\n"), "{out:?}");
+        // Appending a whole section keeps the file's ending too.
+        let text = "[rpc]\r\nx = 1\r\n";
+        let out = set_config_field_in_text(text, "relay", "name", "\"new\"");
+        assert!(out.contains("[relay]\r\nname = \"new\"\r\n"), "{out:?}");
     }
 
     #[test]
