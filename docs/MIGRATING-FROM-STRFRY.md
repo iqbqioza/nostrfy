@@ -20,12 +20,13 @@ rollback and troubleshooting.
 
 | Migrated | Not migrated |
 | --- | --- |
-| Every stored event (replaceable/addressable semantics applied) | strfry's write policy, plugins and `strfry.conf` (set up `nostrfy.toml` by hand) |
+| Every stored event (replaceable/addressable semantics applied) | strfry settings with no nostrfy equivalent (the merge report lists each with a reason) |
 | NIP-40 expiry: already-expired events are skipped | Blossom media and its owner mappings (strfry has no Blossom server) |
 | NIP-09 deletions, including the re-publication blocks for events strfry had already deleted physically | Access lists (NIP-86 bans, relay pubkey lists, Blossom allowlist) |
 | NIP-29 `9005`/`9008` moderation side effects (deletions, group purge) | LiveKit settings and rooms |
 | First-seen timestamps (when the new-pubkey gate is configured) | NIP-62 vanish requests (opt-in, see `--apply-vanish`) |
 | NIP-29 groups, NIP-43 roles and their relay-signed metadata (`39000`-`39005`, `13534`), rebuilt and republished on the first start | The relay's own identity/keys (they live in `nostrfy.toml`) |
+| The equivalent strfry settings, offered for merge into `nostrfy.toml` (optional) | |
 
 Expected skips in the summary: **ephemeral events** (kinds `20000`-`29999`,
 which nostrfy never stores) and **already-expired events**.
@@ -105,6 +106,40 @@ nostrfy --config /etc/nostrfy/nostrfy.toml check
 
 `check` also probes the port and the database directory, so fix anything it
 reports before continuing.
+
+### Merging the strfry settings (optional)
+
+Before the database is opened, `migrate-strfry` looks for strfry's config
+(`--strfry-config <PATH>`, else `$STRFRY_CONFIG`, `./strfry.conf`,
+`/etc/strfry.conf`), prints the settings that have a nostrfy equivalent and
+differ from your `nostrfy.toml`, and asks whether to merge them:
+
+```
+strfry settings from /etc/strfry.conf:
+  relay.info.name                 -> relay.name                  My Relay -> strfry
+  relay.bind                      -> server.host                 0.0.0.0 -> 127.0.0.1
+  relay.port                      -> server.port                 8080 -> 7777
+  ...
+  note: strfry may still be listening on that port; stop it before starting nostrfy
+not merged (no nostrfy equivalent):
+  relay.writePolicy.plugin        nostrfy has no write-policy plugin interface
+  ...
+Merge these 12 setting(s) into /etc/nostrfy/nostrfy.toml? [y/N]
+```
+
+Only the listed keys are rewritten; comments and every other line are kept,
+and the merge is refused (the file is left untouched) if the result would not
+validate. A single unusable value is skipped with its reason while the rest
+still merge.
+
+- `y` applies the merge and the migration continues with the merged config
+  (so a merged `database.map_size` applies to this very migration).
+- `--merge-config` applies without asking (for scripts).
+- `--no-merge-config` skips the step entirely.
+- With no terminal (e.g. `strfry export | nostrfy migrate-strfry` in CI) the
+  proposals are printed and the merge is skipped unless `--merge-config` is
+  given.
+- `--dry-run` prints the proposals but never writes.
 
 ## 6. Step 4 — Dry run
 
@@ -270,6 +305,7 @@ rm -rf /var/lib/nostrfy            # or restore the pre-migration backup
 | First start is slow | The group/role state is being rebuilt from the imported events; it is a one-time cost, logged in the log file |
 | `database writer unavailable` while the disk or LMDB map is full | Raise `database.map_size` (and `max_map_size`), free disk space, then re-run (safe) |
 | NIP-29 metadata missing after the start | The relay has no `relay.private_key`, so it cannot sign `39000`-`39005`: run `nostrfy genkey` and restart |
+| The settings merge is not offered | strfry's config was not found: pass `--strfry-config /etc/strfry.conf` (or set `$STRFRY_CONFIG`) |
 
 ## 13. Checklist
 
@@ -278,6 +314,7 @@ rm -rf /var/lib/nostrfy            # or restore the pre-migration backup
 [ ] strfry DB backed up; nostrfy config backed up
 [ ] nostrfy.toml has database.path, public_url and private_key
 [ ] `nostrfy check` passes
+[ ] strfry settings merged (or the report reviewed and dismissed)
 [ ] dry run reviewed (no unexpected bad signatures)
 [ ] migration completed without errors
 [ ] relay starts; group/role rebuild logged

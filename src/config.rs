@@ -1988,29 +1988,34 @@ pub(crate) fn toml_escape(value: &str) -> String {
     out
 }
 
-/// Replaces (or inserts) a `field = "value"` line inside the `[relay]`
+/// Replaces (or inserts) a `key = <toml value>` line inside the `[section]`
 /// section of a config file's text, preserving every other line, comment
 /// and section. Handles three cases: a matching line already present in the
-/// `[relay]` section (replaced), no such line in `[relay]` (inserted right
-/// after the header), and no `[relay]` section at all (appended).
-/// Used by `nostrfy genkey` (private_key) and the NIP-86 relay-name changes.
-pub(crate) fn set_relay_field_in_text(text: &str, field: &str, value: &str) -> String {
-    let line = format!("{field} = \"{}\"", toml_escape(value));
+/// section (replaced), no such line (inserted right after the header), and
+/// no section at all (appended). `value` must already be a valid TOML value
+/// literal (an escaped quoted string, a number, a boolean). Used by
+/// `nostrfy genkey` (private_key), the NIP-86 relay-name changes and the
+/// strfry settings merge.
+pub(crate) fn set_config_field_in_text(
+    text: &str,
+    section: &str,
+    key: &str,
+    value: &str,
+) -> String {
+    let line = format!("{key} = {value}");
+    let header = format!("[{section}]");
 
-    // Locate a real `[relay]` section header: a line whose trimmed text
-    // starts with `[relay]` followed by `]`. A `[relay]` inside a comment or
-    // a string value is not a section header and must not match.
+    // Locate a real `[section]` header: a line whose trimmed text is the
+    // header, or the header followed by whitespace or a comment. A
+    // `[section]` inside a comment or a string value is not a section
+    // header and must not match.
     let mut header_start = None;
     let mut offset = 0;
     for l in text.split_inclusive('\n') {
         let t = l.trim();
-        // `[relay]` header line: exactly `[relay]`, or `[relay]` followed by
-        // whitespace or a comment. A `[relay]` inside a comment or a string
-        // value does not start with `[relay]` as a header.
-        if t == "[relay]"
-            || t.starts_with("[relay] ")
-            || t.starts_with("[relay]\t")
-            || t.starts_with("[relay]#")
+        if t == header
+            || t.strip_prefix(&header)
+                .is_some_and(|rest| rest.starts_with([' ', '\t', '#']))
         {
             header_start = Some(offset);
             break;
@@ -2018,12 +2023,12 @@ pub(crate) fn set_relay_field_in_text(text: &str, field: &str, value: &str) -> S
         offset += l.len();
     }
     let Some(header_start) = header_start else {
-        // No [relay] section: append one at the end.
+        // No section: append one at the end.
         let mut s = text.to_string();
         if !s.ends_with('\n') {
             s.push('\n');
         }
-        s.push_str(&format!("[relay]\n{line}\n"));
+        s.push_str(&format!("[{section}]\n{line}\n"));
         return s;
     };
 
@@ -2048,17 +2053,17 @@ pub(crate) fn set_relay_field_in_text(text: &str, field: &str, value: &str) -> S
     let section = &text[header_end..section_end];
 
     // Case 1: a matching line already exists in the section — replace it.
-    // The line must be the field itself (followed by `=`, whitespace or
-    // end-of-line), not an unrelated key that merely starts with the
-    // field name (unknown keys are warned about but never rejected, so
-    // e.g. `private_key_note = "x"` must not be clobbered by genkey).
+    // The line must be the key itself (followed by `=`, whitespace or
+    // end-of-line), not an unrelated key that merely starts with the key
+    // name (unknown keys are warned about but never rejected, so e.g.
+    // `private_key_note = "x"` must not be clobbered by genkey).
     // `split_inclusive` keeps each line's original ending, so a CRLF
     // config stays CRLF instead of being silently normalized to LF.
     let lines: Vec<&str> = section.split_inclusive('\n').collect();
     if let Some(offset) = lines.iter().position(|l| {
         l.trim_end_matches(['\n', '\r'])
             .trim_start()
-            .strip_prefix(field)
+            .strip_prefix(key)
             .is_some_and(|rest| {
                 rest.is_empty() || rest.starts_with('=') || rest.starts_with([' ', '\t'])
             })
@@ -2078,9 +2083,9 @@ pub(crate) fn set_relay_field_in_text(text: &str, field: &str, value: &str) -> S
         return s;
     }
 
-    // Case 2: no matching line — insert it right after the `[relay]`
-    // header line, keeping the header on its own line even when the header
-    // is the last line of the file without a trailing newline.
+    // Case 2: no matching line — insert it right after the section header
+    // line, keeping the header on its own line even when the header is the
+    // last line of the file without a trailing newline.
     let mut s = text.to_string();
     if header_end >= s.len() {
         // Header is the last line without a trailing newline.
@@ -2091,6 +2096,12 @@ pub(crate) fn set_relay_field_in_text(text: &str, field: &str, value: &str) -> S
         s.insert_str(header_end, &format!("{line}\n"));
     }
     s
+}
+
+/// [`set_config_field_in_text`] for a string field of the `[relay]` section.
+/// Used by `nostrfy genkey` (private_key) and the NIP-86 relay-name changes.
+pub(crate) fn set_relay_field_in_text(text: &str, field: &str, value: &str) -> String {
+    set_config_field_in_text(text, "relay", field, &format!("\"{}\"", toml_escape(value)))
 }
 
 /// Writes `text` to `path` atomically (temp file + rename) so a crash in

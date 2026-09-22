@@ -110,6 +110,18 @@ pub enum Command {
         /// The strfry binary to run with `--strfry-db`.
         #[arg(long, value_name = "PATH", default_value = "strfry")]
         strfry_bin: String,
+        /// The strfry config file to read settings from. When omitted,
+        /// strfry's own search order is used (`$STRFRY_CONFIG`,
+        /// `./strfry.conf`, `/etc/strfry.conf`).
+        #[arg(long, value_name = "PATH")]
+        strfry_config: Option<PathBuf>,
+        /// Merge the strfry settings that have a nostrfy equivalent into
+        /// `nostrfy.toml` without asking.
+        #[arg(long, conflicts_with = "no_merge_config")]
+        merge_config: bool,
+        /// Do not read or merge strfry settings.
+        #[arg(long)]
+        no_merge_config: bool,
         /// Only export events with this created_at or newer (inclusive, for
         /// resuming; requires `--strfry-db`).
         #[arg(long, value_name = "UNIX", requires = "strfry_db")]
@@ -334,6 +346,9 @@ impl Cli {
             input,
             strfry_db,
             strfry_bin,
+            strfry_config,
+            merge_config,
+            no_merge_config,
             since,
             no_verify,
             apply_vanish,
@@ -346,8 +361,20 @@ impl Cli {
         if *batch == 0 {
             return Err(config_err("--batch must be at least 1"));
         }
-        let cfg = self.load_config()?;
+        let mut cfg = self.load_config()?;
         cfg.validate()?;
+        // Offer to merge the strfry settings that have a nostrfy equivalent
+        // before the database is opened, so a merged `database.map_size`
+        // applies to this very migration.
+        if let Some(merged) = self.merge_strfry_config(
+            &cfg,
+            strfry_config.as_deref(),
+            *merge_config,
+            *no_merge_config,
+            *dry_run,
+        )? {
+            cfg = merged;
+        }
         // Resolve the input before touching the database: a missing file or
         // a missing strfry binary must fail without taking the lock.
         let mut source = if let Some(db_dir) = strfry_db {
@@ -474,6 +501,174 @@ impl Cli {
             started.elapsed().as_secs_f64()
         ));
         Ok(())
+    }
+
+    /// Offers to merge the strfry settings that have a nostrfy equivalent
+    /// into `nostrfy.toml`. Returns the reloaded config when a merge was
+    /// applied (so the migration uses the merged values), `None` otherwise.
+    /// A dry run only prints the proposals: nothing is written.
+    fn merge_strfry_config(
+        &self,
+        cfg: &Config,
+        explicit: Option<&Path>,
+        merge: bool,
+        no_merge: bool,
+        dry_run: bool,
+    ) -> Result<Option<Config>> {
+        if no_merge {
+            return Ok(None);
+        }
+        if let Some(path) = explicit
+            && !path.exists()
+        {
+            return Err(config_err(format!(
+                "strfry config {} does not exist",
+                path.display()
+            )));
+        }
+        let Some(path) = crate::strfry_config::find_config(explicit) else {
+            // No strfry config to read: nothing to merge. An explicit path
+            // was already checked above.
+            return Ok(None);
+        };
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) => {
+                print_line(&format!(
+                    "cannot read {}: {e}; skipping the settings merge",
+                    path.display()
+                ));
+                return Ok(None);
+            }
+        };
+        let strfry = crate::strfry_config::StrfryConfig::parse(&text);
+        let proposals = crate::strfry_config::proposals(&strfry, cfg);
+        // Read the target config now: the proposals are validated against it
+        // so only values that keep the merged config valid are offered. The
+        // file is written only after the operator confirms.
+        let text = match std::fs::read_to_string(&self.config) {
+            Ok(text) => text,
+            Err(e) => {
+                print_line(&format!(
+                    "cannot read {}: {e}; skipping the settings merge",
+                    self.config.display()
+                ));
+                return Ok(None);
+            }
+        };
+        // A single unusable value (e.g. a URL nostrfy rejects) must not
+        // block the rest of the merge: apply one proposal at a time and
+        // keep only the ones that leave the config valid.
+        let mut merged = text;
+        let mut applicable = Vec::new();
+        let mut rejected = Vec::new();
+        for proposal in &proposals {
+            let candidate =
+                crate::strfry_config::apply_proposals(&merged, std::slice::from_ref(proposal));
+            match crate::strfry_config::validate_merged(&candidate) {
+                Ok(()) => {
+                    merged = candidate;
+                    applicable.push(proposal);
+                }
+                Err(e) => rejected.push((proposal.strfry_key, e.to_string())),
+            }
+        }
+        let key_width = proposals
+            .iter()
+            .map(|proposal| proposal.strfry_key.len())
+            .max()
+            .unwrap_or(0)
+            .max(20);
+        let path_width = proposals
+            .iter()
+            .map(|proposal| proposal.path().len())
+            .max()
+            .unwrap_or(0);
+        print_line(&format!("strfry settings from {}:", path.display()));
+        if proposals.is_empty() {
+            print_line("  no settings differ from the nostrfy config");
+        }
+        for proposal in &applicable {
+            let current = if proposal.current.is_empty() {
+                "(empty)".to_string()
+            } else {
+                proposal.current.clone()
+            };
+            print_line(&format!(
+                "  {:<key_width$} -> {:<path_width$} {} -> {}",
+                proposal.strfry_key,
+                proposal.path(),
+                current,
+                proposal.proposed
+            ));
+        }
+        for (key, reason) in &rejected {
+            print_line(&format!("  {key:<key_width$} -> not merged: {reason}"));
+        }
+        if applicable
+            .iter()
+            .any(|proposal| proposal.path() == "server.port")
+        {
+            print_line(
+                "  note: strfry may still be listening on that port; stop it before \
+                 starting nostrfy",
+            );
+        }
+        let unmapped = crate::strfry_config::unmapped(&strfry);
+        if !unmapped.is_empty() {
+            let unmapped_width = unmapped
+                .iter()
+                .map(|(key, _)| key.len())
+                .max()
+                .unwrap_or(0)
+                .max(20);
+            print_line("not merged (no nostrfy equivalent):");
+            for (key, reason) in &unmapped {
+                print_line(&format!("  {key:<unmapped_width$} {reason}"));
+            }
+        }
+        if applicable.is_empty() {
+            return Ok(None);
+        }
+        if dry_run {
+            print_line("dry run: not merging; re-run without --dry-run to apply");
+            return Ok(None);
+        }
+        let confirmed = if merge {
+            true
+        } else {
+            match confirm_on_tty(&format!(
+                "Merge these {} setting(s) into {}? [y/N]",
+                applicable.len(),
+                self.config.display()
+            )) {
+                Some(answer) => answer,
+                None => {
+                    print_line(
+                        "not a terminal: re-run with --merge-config to apply the merge \
+                         without asking",
+                    );
+                    false
+                }
+            }
+        };
+        if !confirmed {
+            print_line("settings not merged");
+            return Ok(None);
+        }
+        if let Err(e) = crate::config::write_text_atomic(&self.config, &merged) {
+            print_line(&format!(
+                "cannot write {}: {e}; settings not merged",
+                self.config.display()
+            ));
+            return Ok(None);
+        }
+        print_line(&format!(
+            "merged {} setting(s) into {}",
+            applicable.len(),
+            self.config.display()
+        ));
+        Ok(Some(self.load_config()?))
     }
 
     fn daemonize(&mut self, cfg: &Config) -> Result<()> {
@@ -1436,6 +1631,33 @@ impl Drop for MigrateSource {
 fn print_line(text: &str) {
     use std::io::Write;
     let _ = writeln!(std::io::stdout(), "{text}");
+}
+
+/// Asks a yes/no question on the controlling terminal. Falls back to stdin
+/// only when stdin is a terminal, because the migration input may be a pipe
+/// on stdin. `None` means there is no terminal to ask (the caller skips the
+/// interactive step).
+fn confirm_on_tty(prompt: &str) -> Option<bool> {
+    use std::io::{BufRead, IsTerminal, Write};
+    if let Ok(mut tty) = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+    {
+        let _ = write!(tty, "{prompt} ");
+        let _ = tty.flush();
+        let mut reader = std::io::BufReader::new(tty.try_clone().ok()?);
+        let mut answer = String::new();
+        reader.read_line(&mut answer).ok()?;
+        return Some(answer.trim().eq_ignore_ascii_case("y"));
+    }
+    if std::io::stdin().is_terminal() {
+        print_line(prompt);
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer).ok()?;
+        return Some(answer.trim().eq_ignore_ascii_case("y"));
+    }
+    None
 }
 
 /// Flushes stdout so a completion message survives a `process::exit` (which
@@ -3188,5 +3410,118 @@ name = \"nostrfy\"\n",
     #[cfg(not(target_os = "linux"))]
     fn spawn_fake_nostrfy(_dir: &Path) -> Option<std::process::Child> {
         None
+    }
+
+    /// Builds a migration command over a tiny fixture: an empty export, a
+    /// minimal nostrfy config and a strfry config with two differing
+    /// settings.
+    fn migrate_fixture(
+        name: &str,
+        merge_config: bool,
+        no_merge_config: bool,
+        strfry_config: Option<PathBuf>,
+    ) -> (PathBuf, PathBuf, Command) {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir()
+            .join(format!("nostrfy-{name}-test"))
+            .join(format!("{:x}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = dir.join("nostrfy.toml");
+        let db = dir.join("db");
+        let export = dir.join("export.jsonl");
+        std::fs::write(&export, "").unwrap();
+        std::fs::write(
+            &config,
+            format!(
+                "[relay]\nname = \"old relay\"\n\n[server]\nhost = \"127.0.0.1\"\n\
+                 port = 8080\n\n[database]\npath = {:?}\nmap_size = 16777216\n\
+                 max_map_size = 67108864\n",
+                db.display().to_string()
+            ),
+        )
+        .unwrap();
+        let strfry_conf = dir.join("strfry.conf");
+        std::fs::write(
+            &strfry_conf,
+            "db = \"/tmp/strfry\"\nrelay {\n  port = 7777\n  info { name = \"strfry relay\" }\n}\n",
+        )
+        .unwrap();
+        let command = Command::MigrateStrfry {
+            input: export.display().to_string(),
+            strfry_db: None,
+            strfry_bin: "strfry".into(),
+            strfry_config: strfry_config.or(Some(strfry_conf)),
+            merge_config,
+            no_merge_config,
+            since: None,
+            no_verify: true,
+            apply_vanish: false,
+            dry_run: false,
+            batch: 512,
+        };
+        (dir, config, command)
+    }
+
+    #[tokio::test]
+    async fn migrate_strfry_merges_the_strfry_settings() {
+        let (dir, config, command) = migrate_fixture("merge-config", true, false, None);
+        let cli = Cli {
+            config: config.clone(),
+            command,
+            daemonized: false,
+        };
+        cli.serve().await.expect("the migration must succeed");
+        let merged = std::fs::read_to_string(&config).unwrap();
+        assert!(
+            merged.contains("name = \"strfry relay\""),
+            "the relay name must be merged: {merged}"
+        );
+        assert!(merged.contains("port = 7777"), "{merged}");
+        // The migration still ran (the DB directory exists).
+        assert!(dir.join("db").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn migrate_strfry_can_skip_the_settings_merge() {
+        let (dir, config, command) = migrate_fixture("no-merge-config", false, true, None);
+        let cli = Cli {
+            config: config.clone(),
+            command,
+            daemonized: false,
+        };
+        cli.serve().await.expect("the migration must succeed");
+        let text = std::fs::read_to_string(&config).unwrap();
+        assert!(
+            text.contains("name = \"old relay\""),
+            "the config must be untouched: {text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn migrate_strfry_rejects_a_missing_strfry_config() {
+        let (dir, config, command) = migrate_fixture(
+            "missing-strfry-config",
+            true,
+            false,
+            Some(PathBuf::from("/nonexistent/strfry.conf")),
+        );
+        let cli = Cli {
+            config: config.clone(),
+            command,
+            daemonized: false,
+        };
+        let err = cli.serve().await.unwrap_err();
+        assert!(
+            err.to_string().contains("does not exist"),
+            "a missing explicit strfry config must fail: {err}"
+        );
+        // The config was not touched.
+        let text = std::fs::read_to_string(&config).unwrap();
+        assert!(text.contains("name = \"old relay\""), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

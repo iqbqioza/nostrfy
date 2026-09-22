@@ -21,6 +21,7 @@ mod prop_tests;
 mod relay;
 mod server;
 mod stats;
+mod strfry_config;
 mod util;
 mod ws;
 

@@ -950,8 +950,9 @@ clients can display the migrated groups and members.
 
 ### What is not migrated
 
-- strfry's write policy, plugins and other config: set up `nostrfy.toml` by
-  hand (`relay.info.*` maps to `relay.name`/`description`/`contact`/`icon`).
+- Settings with no nostrfy equivalent (write policy, plugins, per-kind read
+  gating, ...): the merge report lists each one with the reason and the
+  suggested replacement.
 - Blossom media and its owner mappings (strfry has no Blossom server).
 - Access lists (NIP-86 bans, relay pubkey lists, Blossom allowlist).
 - NIP-62 vanish requests, unless `--apply-vanish` is given: strfry does not
@@ -960,6 +961,22 @@ clients can display the migrated groups and members.
   the config), a request targeting this relay deletes the author's history
   and records the permanent vanish marker.
 
+### Merging the strfry settings
+
+Before the database is opened, `migrate-strfry` looks for strfry's config
+(`--strfry-config`, then `$STRFRY_CONFIG`, `./strfry.conf`,
+`/etc/strfry.conf`), prints the settings that have a nostrfy equivalent and
+differ from the current `nostrfy.toml`, and asks whether to merge them. Only
+the listed keys are touched; comments and all other lines are preserved, and
+the merge is refused (leaving the file untouched) if the result would not
+validate. Keys with no nostrfy equivalent are listed with the reason and the
+suggested replacement.
+
+The prompt reads from the controlling terminal, so it also works when the
+export is piped on stdin. `--merge-config` applies without asking (for
+scripts), `--no-merge-config` skips the step, and `--dry-run` only prints the
+proposals.
+
 ### Options
 
 | Option | Meaning |
@@ -967,6 +984,9 @@ clients can display the migrated groups and members.
 | `--input <PATH>` | JSONL file to read (`-` = stdin; the default) |
 | `--strfry-db <DIR>` | Run `strfry export` against this database directory |
 | `--strfry-bin <PATH>` | The strfry binary to run (default `strfry`) |
+| `--strfry-config <PATH>` | The strfry config to read settings from (default: strfry's search order) |
+| `--merge-config` | Merge the equivalent strfry settings into `nostrfy.toml` without asking |
+| `--no-merge-config` | Do not read or merge strfry settings |
 | `--since <UNIX>` | Only export events newer than or equal to this timestamp (with `--strfry-db`; inclusive, for resuming) |
 | `--no-verify` | Skip id/signature verification (trusted dumps only) |
 | `--apply-vanish` | Honor NIP-62 vanish requests found in the input |
