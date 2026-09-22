@@ -1557,6 +1557,17 @@ struct MigrateSource {
 
 impl MigrateSource {
     fn file(path: &Path) -> Result<Self> {
+        // `File::open` succeeds on a directory; the read would fail only
+        // after the DB lock and the settings merge already ran. A pipe or
+        // device (e.g. `/dev/null`) is a valid input.
+        let metadata = std::fs::metadata(path)
+            .map_err(|e| config_err(format!("cannot open {}: {e}", path.display())))?;
+        if metadata.is_dir() {
+            return Err(config_err(format!(
+                "cannot open {}: is a directory",
+                path.display()
+            )));
+        }
         let file = std::fs::File::open(path)
             .map_err(|e| config_err(format!("cannot open {}: {e}", path.display())))?;
         Ok(Self {

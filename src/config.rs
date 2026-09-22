@@ -2007,89 +2007,83 @@ fn is_table_header(line: &str) -> bool {
     rest.is_empty() || rest.starts_with([' ', '\t', '#'])
 }
 
-/// Marks each line of `text` that contains any part of a TOML multi-line
-/// string (`"""…"""` or `'''…'''`). A line-based editor must never treat the
+/// Marks each line of `text` that STARTS inside a TOML multi-line string
+/// (`"""..."""` or `'''...'''`). A line-based editor must never treat the
 /// content of such a string as structure: it may contain a line that looks
-/// like a table header or an assignment.
+/// like a table header or an assignment. A line that merely *opens* a
+/// multi-line string (`key = """...`) is not flagged: its structure before
+/// the opener is real, and the caller extends the replacement over the
+/// value's continuation lines.
 fn multiline_string_lines(text: &str) -> Vec<bool> {
     let mut flags = Vec::new();
-    let mut line_flagged = false;
-    // The active multi-line delimiter, or `None` outside one.
     let mut multi: Option<char> = None;
-    // The active single-line string quote, or `None`.
-    let mut string: Option<char> = None;
-    let mut escaped = false;
-    let mut comment = false;
-    let mut chars = text.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '\n' {
-            flags.push(line_flagged);
-            line_flagged = false;
-            // A single-line string and a comment never span lines.
-            string = None;
-            escaped = false;
-            comment = false;
-            continue;
-        }
-        if let Some(delim) = multi {
-            line_flagged = true;
-            if delim == '"' {
-                if escaped {
-                    escaped = false;
-                    continue;
-                }
-                if ch == '\\' {
-                    escaped = true;
-                    continue;
-                }
+    for line in text.split_inclusive('\n') {
+        flags.push(multi.is_some());
+        let mut string: Option<char> = None;
+        let mut escaped = false;
+        let mut comment = false;
+        let mut chars = line.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '\n' {
+                break;
             }
-            if ch == delim && chars.peek() == Some(&delim) {
-                chars.next();
-                if chars.peek() == Some(&delim) {
-                    chars.next();
-                    multi = None;
+            if let Some(delim) = multi {
+                if delim == '"' {
+                    if escaped {
+                        escaped = false;
+                        continue;
+                    }
+                    if ch == '\\' {
+                        escaped = true;
+                        continue;
+                    }
                 }
-            }
-            continue;
-        }
-        if comment {
-            continue;
-        }
-        if let Some(quote) = string {
-            if ch == quote {
-                if quote == '"' && escaped {
-                    escaped = false;
-                } else {
-                    string = None;
+                if ch == delim && chars.peek() == Some(&delim) {
+                    let mut lookahead = chars.clone();
+                    lookahead.next();
+                    if lookahead.next() == Some(delim) {
+                        chars.next();
+                        chars.next();
+                        multi = None;
+                    }
                 }
                 continue;
             }
-            if quote == '"' && ch == '\\' {
-                escaped = !escaped;
+            if comment {
                 continue;
             }
-            escaped = false;
-            continue;
-        }
-        match ch {
-            '#' => comment = true,
-            '"' | '\'' => {
-                let delim = ch;
-                let mut lookahead = chars.clone();
-                if lookahead.next() == Some(delim) && lookahead.next() == Some(delim) {
-                    chars.next();
-                    chars.next();
-                    multi = Some(delim);
-                    line_flagged = true;
-                } else {
-                    string = Some(delim);
+            if let Some(quote) = string {
+                if ch == quote {
+                    if quote == '"' && escaped {
+                        escaped = false;
+                    } else {
+                        string = None;
+                    }
+                    continue;
                 }
+                if quote == '"' && ch == '\\' {
+                    escaped = !escaped;
+                    continue;
+                }
+                escaped = false;
+                continue;
             }
-            _ => {}
+            match ch {
+                '#' => comment = true,
+                '"' | '\'' => {
+                    let delim = ch;
+                    let mut lookahead = chars.clone();
+                    if lookahead.next() == Some(delim) && lookahead.next() == Some(delim) {
+                        chars.next();
+                        chars.next();
+                        multi = Some(delim);
+                    } else {
+                        string = Some(delim);
+                    }
+                }
+                _ => {}
+            }
         }
-    }
-    if !text.ends_with('\n') {
-        flags.push(line_flagged);
     }
     flags
 }
@@ -2191,12 +2185,31 @@ pub(crate) fn set_config_field_in_text(
                     rest.is_empty() || rest.starts_with('=') || rest.starts_with([' ', '\t'])
                 })
     }) {
+        // A matched line that opens a multi-line string owns its value's
+        // continuation lines: replace the whole span, or the orphaned
+        // continuation would corrupt the file (and a second key would be
+        // inserted by an unvalidated writer like `genkey`).
+        let flagged = |index: usize| {
+            string_lines
+                .get(section_line + index)
+                .copied()
+                .unwrap_or(false)
+        };
+        let mut value_end = offset;
+        if lines.len() > offset + 1 && flagged(offset + 1) {
+            value_end = offset + 1;
+            while value_end + 1 < lines.len() && flagged(value_end + 1) {
+                value_end += 1;
+            }
+        }
         let mut new_section = String::with_capacity(section.len() + line.len());
         for (i, l) in lines.iter().enumerate() {
             if i == offset {
                 let indent: String = l.chars().take_while(|c| c.is_whitespace()).collect();
                 let ending = if l.ends_with("\r\n") { "\r\n" } else { "\n" };
                 new_section.push_str(&format!("{indent}{line}{ending}"));
+            } else if i > offset && i <= value_end {
+                // The multi-line value's continuation lines are dropped.
             } else {
                 new_section.push_str(l);
             }
@@ -2726,6 +2739,32 @@ mod tests {
             out.contains("[relay]\nname = \"new\""),
             "the key is inserted into [relay]: {out}"
         );
+    }
+
+    #[test]
+    fn a_multiline_value_is_replaced_as_a_whole() {
+        // A key whose value spans multiple lines must be replaced with its
+        // continuation lines: replacing only the opening line would leave
+        // orphaned content (and an unvalidated writer like `genkey` would
+        // corrupt the file with a second key).
+        let text = "[relay]\nname = \"\"\"old\nvalue\"\"\"\nport = 1\n";
+        let out = set_config_field_in_text(text, "relay", "name", "\"new\"");
+        assert!(out.contains("name = \"new\""), "{out}");
+        assert!(!out.contains("old"), "{out}");
+        assert!(!out.contains("value\"\"\""), "{out}");
+        assert!(out.contains("port = 1"), "{out}");
+        let cfg: Config = toml::from_str(&out).expect("the rewritten config must parse");
+        assert_eq!(cfg.relay.name, "new");
+    }
+
+    #[test]
+    fn a_key_after_a_multiline_value_is_found() {
+        // A real key on a line that follows a closed multi-line string must
+        // still be replaceable.
+        let text = "[relay]\nconf = \"\"\"\n[limits]\n\"\"\"\nname = \"old\"\n";
+        let out = set_config_field_in_text(text, "relay", "name", "\"new\"");
+        assert!(out.contains("name = \"new\""), "{out}");
+        assert!(out.contains("\"\"\"\n[limits]\n\"\"\""), "{out}");
     }
 
     #[test]

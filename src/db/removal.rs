@@ -647,7 +647,17 @@ impl Store {
     /// re-issues the purge, which is idempotent and keeps the furthest cut.
     /// The completion commit folds the newest removed timestamp into the
     /// cut, clears the in-progress record and bumps the derived-state stamp.
+    #[cfg(test)]
     pub(crate) fn purge_group(&self, gid: &str, now: u64) -> Result<usize> {
+        self.purge_group_until(gid, now, u64::MAX)
+    }
+
+    /// [`Self::purge_group`] bounded to events with `created_at <= until`.
+    /// The migration uses it with the `9008`'s own timestamp so a group
+    /// re-created after the deletion keeps its newer events; the live relay
+    /// passes `u64::MAX` (it removes every stored `h`-tagged event,
+    /// including future-dated re-publications, and raises the cut).
+    pub(crate) fn purge_group_until(&self, gid: &str, now: u64, until: u64) -> Result<usize> {
         self.disk_full_error()?;
         let key = purged_group_key(gid);
         // Merge with an earlier purge of the same id: the furthest purge
@@ -666,13 +676,28 @@ impl Store {
             let cut = old_cut.max(now);
             self.purged_groups
                 .put(&mut wtxn, &key, &encode_purged_group_marker(purge_now, cut))?;
-            self.purge_pending
-                .put(&mut wtxn, &key, &encode_pending_purge(gid, purge_now, cut))?;
+            self.purge_pending.put(
+                &mut wtxn,
+                &key,
+                &encode_pending_purge(gid, purge_now, cut, until),
+            )?;
             wtxn.commit()?;
             (purge_now, cut)
         };
         let start = tag_key(b'h', gid.as_bytes(), 0, &[0u8; ID_LEN]);
-        let end = tag_key(b'h', gid.as_bytes(), u64::MAX, &[0xffu8; ID_LEN]);
+        let end = if until == u64::MAX {
+            tag_key(b'h', gid.as_bytes(), u64::MAX, &[0xffu8; ID_LEN])
+        } else {
+            crate::db::store::range_end(
+                tag_key(
+                    b'h',
+                    gid.as_bytes(),
+                    until.saturating_add(1),
+                    &[0u8; ID_LEN],
+                ),
+                until,
+            )
+        };
         let mut last_key: Option<Vec<u8>> = None;
         let mut removed = 0usize;
         let mut max_created = 0u64;
@@ -751,21 +776,21 @@ impl Store {
         Ok(removed)
     }
 
-    /// Started-but-unfinished group purges as `(gid, purge_now)`: each was
-    /// recorded before its first removal chunk and not cleared, so the
-    /// caller re-runs `purge_group(gid, purge_now)` to finish it (the walk
-    /// is idempotent and the marker keeps the furthest cut). A malformed
-    /// record is an error, so a caller that fails closed never treats a
-    /// corrupt pending table as "nothing to resume".
-    pub(crate) fn pending_purges(&self) -> Result<Vec<(String, u64)>> {
+    /// Started-but-unfinished group purges as `(gid, purge_now, until)`:
+    /// each was recorded before its first removal chunk and not cleared, so
+    /// the caller re-runs `purge_group_until(gid, purge_now, until)` to
+    /// finish it (the walk is idempotent and the marker keeps the furthest
+    /// cut). A malformed record is an error, so a caller that fails closed
+    /// never treats a corrupt pending table as "nothing to resume".
+    pub(crate) fn pending_purges(&self) -> Result<Vec<(String, u64, u64)>> {
         let rtxn = self.env.read_txn()?;
         let mut out = Vec::new();
         for item in self.purge_pending.iter(&rtxn)? {
             let (_, raw) = item?;
-            let (gid, purge_now, _) = decode_pending_purge(raw).ok_or_else(|| {
+            let (gid, purge_now, _, until) = decode_pending_purge(raw).ok_or_else(|| {
                 anyhow::anyhow!("corrupt pending purge record ({} bytes)", raw.len())
             })?;
-            out.push((gid, purge_now));
+            out.push((gid, purge_now, until));
         }
         Ok(out)
     }

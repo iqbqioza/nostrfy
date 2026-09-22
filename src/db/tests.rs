@@ -5352,7 +5352,7 @@ fn pending_group_purge_is_reported_and_resumable() {
             db.pending_purges()
                 .await
                 .expect("a healthy pending read must answer"),
-            vec![(gid.to_string(), now)],
+            vec![(gid.to_string(), now, u64::MAX)],
             "the interrupted purge must be recorded"
         );
         // The re-issued purge finishes the walk and clears the record.
@@ -7899,7 +7899,7 @@ fn group_purge_first_chunk_failure_resumes_after_restart() {
             db.pending_purges()
                 .await
                 .expect("a healthy read must answer"),
-            vec![(gid.to_string(), now)],
+            vec![(gid.to_string(), now, u64::MAX)],
             "the interrupted purge must stay resumable"
         );
         assert_eq!(
@@ -7935,7 +7935,7 @@ fn group_purge_first_chunk_failure_resumes_after_restart() {
             db.pending_purges()
                 .await
                 .expect("a healthy read must answer"),
-            vec![(gid.to_string(), now)]
+            vec![(gid.to_string(), now, u64::MAX)]
         );
         assert_eq!(db.group_purge(gid.to_string(), now).await, 2);
         assert!(

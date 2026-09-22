@@ -108,6 +108,7 @@ fn tokenize(text: &str) -> Vec<Token> {
                     tokens.push(Token::Str(read_string(&mut chars, delim)));
                 }
             }
+            '+' => tokens.push(Token::Name("+".into())),
             '[' => {
                 skip_balanced(&mut chars);
                 tokens.push(Token::Other);
@@ -144,12 +145,17 @@ fn tokenize(text: &str) -> Vec<Token> {
 /// Parses a decimal or `0x`-hex integer the way jaxn does (strfry accepts
 /// hex for every numeric setting).
 fn parse_int(word: &str) -> Option<i64> {
-    if let Some(hex) = word
+    let (negative, rest) = match word.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, word),
+    };
+    if let Some(hex) = rest
         .strip_prefix("0x")
-        .or_else(|| word.strip_prefix("0X"))
+        .or_else(|| rest.strip_prefix("0X"))
         .filter(|hex| !hex.is_empty())
     {
-        return i64::from_str_radix(hex, 16).ok();
+        let value = i64::from_str_radix(hex, 16).ok()?;
+        return Some(if negative { -value } else { value });
     }
     word.parse::<i64>().ok()
 }
@@ -161,6 +167,18 @@ fn read_multiline_string(
     chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
     delim: char,
 ) -> String {
+    // jaxn's `mqstring` strips one newline (LF or CRLF) right after the
+    // opening delimiter; keeping it would merge a different value.
+    if chars.peek() == Some(&'\r') {
+        let mut lookahead = chars.clone();
+        lookahead.next();
+        if lookahead.peek() == Some(&'\n') {
+            chars.next();
+            chars.next();
+        }
+    } else if chars.peek() == Some(&'\n') {
+        chars.next();
+    }
     let mut out = String::new();
     while let Some(ch) = chars.next() {
         if ch == delim && chars.peek() == Some(&delim) {
@@ -287,11 +305,16 @@ fn skip_balanced(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
                     return;
                 }
             }
-            '"' => {
-                read_string(chars, '"');
-            }
-            '\'' => {
-                read_string(chars, '\'');
+            '"' | '\'' => {
+                let delim = ch;
+                let mut lookahead = chars.clone();
+                if lookahead.next() == Some(delim) && lookahead.next() == Some(delim) {
+                    chars.next();
+                    chars.next();
+                    read_multiline_string(chars, delim);
+                } else {
+                    read_string(chars, delim);
+                }
             }
             '#' => skip_line_comment(chars),
             '/' => match chars.peek() {
@@ -394,6 +417,10 @@ fn parse_block(
 /// concatenates strings, `1 + 2` adds numbers).
 fn read_scalar(tokens: &[Token], index: &mut usize) -> Option<Value> {
     fn one(tokens: &[Token], index: &mut usize) -> Option<Value> {
+        // Unary plus: `+5` is 5 (jaxn allows a leading sign).
+        if matches!(tokens.get(*index), Some(Token::Name(name)) if name == "+") {
+            *index += 1;
+        }
         let value = match tokens.get(*index)? {
             Token::Str(value) => Value::Str(value.clone()),
             Token::Int(value) => Value::Int(*value),
@@ -835,11 +862,11 @@ pub(crate) fn unmapped(
     // the operator knows the value was seen.
     if let Some(Value::Int(value)) = strfry.get("dbParams.mapsize")
         && *value > 0
-        && *value as u64 <= nostrfy.database.max_map_size as u64
+        && (*value as u64) < nostrfy.database.max_map_size as u64
     {
         out.push((
             "dbParams.mapsize",
-            "not larger than nostrfy's database.max_map_size (the map is opened at \
+            "smaller than nostrfy's database.max_map_size (the map is opened at \
              max_map_size)",
         ));
     }
@@ -1235,6 +1262,45 @@ max_tags = 100
         // The parser must survive an absurd nesting depth; the over-deep
         // levels are ignored rather than crashing the process.
         assert!(cfg.get("a").is_none());
+    }
+
+    #[test]
+    fn strips_the_newline_after_a_triple_quote() {
+        // jaxn's `mqstring` strips one newline right after the opening
+        // delimiter; keeping it would merge a different value.
+        let cfg =
+            StrfryConfig::parse("db = \"/x\"\nrelay { info { name = \"\"\"\nMy Relay\"\"\" } }\n");
+        assert_eq!(
+            cfg.get("relay.info.name"),
+            Some(&Value::Str("My Relay".into()))
+        );
+    }
+
+    #[test]
+    fn unspaced_plus_and_signed_hex_are_parsed() {
+        let cfg = StrfryConfig::parse(
+            "db = \"/x\"\n\
+             relay { port = 7000+77 maxReqFilterSize = 0x10+0x10 maxWebsocketPayloadSize = -0x10 }\n",
+        );
+        assert_eq!(cfg.get("relay.port"), Some(&Value::Int(7077)));
+        assert_eq!(cfg.get("relay.maxReqFilterSize"), Some(&Value::Int(32)));
+        assert_eq!(
+            cfg.get("relay.maxWebsocketPayloadSize"),
+            Some(&Value::Int(-16))
+        );
+    }
+
+    #[test]
+    fn an_array_with_a_triple_quoted_string_does_not_derail() {
+        // The array skipper must understand triple quotes: an odd quote or
+        // a `]` inside the string otherwise ends the array early and the
+        // rest is tokenized as real config.
+        let cfg = StrfryConfig::parse(
+            "db = \"/x\"\n\
+             foo = [ \"\"\"a\"b] relay { port = 9999 } c\"\"\" ]\n\
+             relay { port = 7777 }\n",
+        );
+        assert_eq!(cfg.get("relay.port"), Some(&Value::Int(7777)));
     }
 
     #[test]

@@ -1191,8 +1191,13 @@ pub(crate) fn spawn(
                                         report.group_state_removed,
                                     ));
                                 }
-                                Msg::GroupPurge { group, now, reply } => {
-                                    let n = match store.purge_group(&group, now) {
+                                Msg::GroupPurge {
+                                    group,
+                                    now,
+                                    until,
+                                    reply,
+                                } => {
+                                    let n = match store.purge_group_until(&group, now, until) {
                                         Ok(n) => n,
                                         Err(e) => {
                                             db_error(&thread_errors, &e);

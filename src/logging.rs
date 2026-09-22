@@ -83,12 +83,21 @@ static LOGGER: Logger = Logger {
 /// otherwise repeat every warning once per proposal.
 static SUPPRESSED: AtomicU64 = AtomicU64::new(0);
 
+/// Restores the suppression count even when the closure unwinds, so a
+/// panic cannot silence logging for the rest of the process.
+struct SuppressGuard;
+
+impl Drop for SuppressGuard {
+    fn drop(&mut self) {
+        SUPPRESSED.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// Runs `f` with logging suppressed.
 pub fn suppressed<T>(f: impl FnOnce() -> T) -> T {
     SUPPRESSED.fetch_add(1, Ordering::SeqCst);
-    let out = f();
-    SUPPRESSED.fetch_sub(1, Ordering::SeqCst);
-    out
+    let _guard = SuppressGuard;
+    f()
 }
 
 struct Logger {

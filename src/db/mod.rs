@@ -398,6 +398,9 @@ enum Msg {
         /// The purge cut recorded in the group's marker: re-published events
         /// created before it are rejected (see `Store::purge_group`).
         now: u64,
+        /// Upper bound (`created_at <= until`) of the walk; `u64::MAX` for
+        /// the live unbounded purge.
+        until: u64,
         reply: oneshot::Sender<usize>,
     },
     Vanish {
@@ -588,7 +591,7 @@ enum Msg {
     /// (see `Store::pending_purges`). `None` when the table could not be
     /// read: the caller fails closed instead of treating it as "none".
     PendingPurges {
-        reply: oneshot::Sender<Option<Vec<(String, u64)>>>,
+        reply: oneshot::Sender<Option<Vec<(String, u64, u64)>>>,
     },
     /// Started-but-unfinished NIP-09 deletions. `None` when the table
     /// could not be read: the caller fails closed instead of treating an
@@ -1937,8 +1940,20 @@ impl DbClient {
     /// NIP-29 `kind:9008`: purges every stored event tagged with the deleted
     /// group id.
     pub async fn group_purge(&self, group: String, now: u64) -> usize {
-        self.request_write(|reply| Msg::GroupPurge { group, now, reply })
-            .await
+        self.group_purge_until(group, now, u64::MAX).await
+    }
+
+    /// [`Self::group_purge`] bounded to events with `created_at <= until`
+    /// (the migration uses the `9008`'s own timestamp so a re-created
+    /// group's later events survive).
+    pub async fn group_purge_until(&self, group: String, now: u64, until: u64) -> usize {
+        self.request_write(|reply| Msg::GroupPurge {
+            group,
+            now,
+            until,
+            reply,
+        })
+        .await
     }
 
     /// Every vanished pubkey (raw 32-byte keys) for the startup rebuilds.
@@ -2499,7 +2514,7 @@ impl DbClient {
     /// finish the walk (idempotent, keeps the furthest cut). `None` when
     /// the database could not answer: the caller fails closed instead of
     /// treating unpurged (ghosted) groups as done.
-    pub async fn pending_purges(&self) -> Option<Vec<(String, u64)>> {
+    pub async fn pending_purges(&self) -> Option<Vec<(String, u64, u64)>> {
         self.request_read_startup(|reply| Msg::PendingPurges { reply })
             .await
             .flatten()

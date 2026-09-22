@@ -1903,18 +1903,23 @@ pub(crate) fn decode_purged_group_marker(raw: &[u8]) -> (u64, u64) {
 }
 
 /// Encodes a [`PURGE_PENDING`] record: `gid length (BE u32) || gid bytes ||
-/// purge time (BE u64) || cut (BE u64)`.
-pub(crate) fn encode_pending_purge(gid: &str, purge_now: u64, cut: u64) -> Vec<u8> {
-    let mut value = Vec::with_capacity(4 + gid.len() + 16);
+/// purge time (BE u64) || cut (BE u64) || until (BE u64, optional)`.
+/// `until` bounds the walk (`created_at <= until`); a migration-recorded
+/// purge uses the 9008's own timestamp so a re-created group's later events
+/// survive. Records written before the field existed decode as unbounded.
+pub(crate) fn encode_pending_purge(gid: &str, purge_now: u64, cut: u64, until: u64) -> Vec<u8> {
+    let mut value = Vec::with_capacity(4 + gid.len() + 24);
     value.extend_from_slice(&(gid.len() as u32).to_be_bytes());
     value.extend_from_slice(gid.as_bytes());
     value.extend_from_slice(&purge_now.to_be_bytes());
     value.extend_from_slice(&cut.to_be_bytes());
+    value.extend_from_slice(&until.to_be_bytes());
     value
 }
 
-/// Decodes a [`PURGE_PENDING`] record into `(gid, purge time, cut)`.
-pub(crate) fn decode_pending_purge(raw: &[u8]) -> Option<(String, u64, u64)> {
+/// Decodes a [`PURGE_PENDING`] record into `(gid, purge time, cut, until)`.
+/// A record without the trailing `until` decodes as unbounded (`u64::MAX`).
+pub(crate) fn decode_pending_purge(raw: &[u8]) -> Option<(String, u64, u64, u64)> {
     let gid_len = u32::from_be_bytes(raw.get(..4)?.try_into().ok()?) as usize;
     let gid = raw.get(4..4 + gid_len)?;
     let purge_now = u64::from_be_bytes(raw.get(4 + gid_len..4 + gid_len + 8)?.try_into().ok()?);
@@ -1923,7 +1928,12 @@ pub(crate) fn decode_pending_purge(raw: &[u8]) -> Option<(String, u64, u64)> {
             .try_into()
             .ok()?,
     );
-    Some((String::from_utf8(gid.to_vec()).ok()?, purge_now, cut))
+    let until = raw
+        .get(4 + gid_len + 16..4 + gid_len + 24)
+        .and_then(|bytes| bytes.try_into().ok())
+        .map(u64::from_be_bytes)
+        .unwrap_or(u64::MAX);
+    Some((String::from_utf8(gid.to_vec()).ok()?, purge_now, cut, until))
 }
 
 /// Encodes a [`DELETE_PENDING`] record: the full deletion request

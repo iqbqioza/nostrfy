@@ -231,21 +231,6 @@ pub async fn run(
 ) -> Result<Stats> {
     let secp = Secp256k1::new();
     let identity = nip62::RelayIdentity::new(&opts.host, opts.port, &opts.public_url);
-    // NIP-29 authorization replay: the relay's live write path only lets a
-    // group admin (or the relay's own key) moderate, but strfry stores every
-    // signed event. A 9005/9008 side effect must not act on an event the
-    // relay itself would have rejected. The replay is seeded from the
-    // moderation events already stored so a resume or a merge into an
-    // existing database authorizes against the state they built.
-    let mut groups = db.map(|_| crate::nips::nip29::GroupStore::with_cap(opts.max_groups));
-    if let (Some(db), Some(store)) = (db, groups.as_mut()) {
-        seed_group_state(db, store, opts.relay_pubkey.as_deref(), &[]).await?;
-    }
-    // Group deletes this run refused in stream order. After the import a
-    // rank-ordered replay (the same order the startup rebuild uses) decides
-    // which of them the rebuild would still apply; those events are removed
-    // so a restart cannot change the state the migration established.
-    let mut refused_purges: Vec<RefusedPurge> = Vec::new();
     let now = unix_now();
     let mut stats = Stats::default();
     // The configured batch bounds the count; cap the pre-allocation so an
@@ -333,13 +318,6 @@ pub async fn run(
             continue;
         }
         batch_bytes = batch_bytes.saturating_add(trimmed.len());
-        // A 9008 purges the group's stored history: flush it as its own
-        // batch. The purge walk removes every `h`-tagged event stored at
-        // that point, so without the flush the events that follow the 9008
-        // in the export (a re-created group) would already be committed and
-        // would be purged too (and their timestamps would permanently
-        // block the re-creation).
-        let group_purge = event.kind == 9008;
         // A honored NIP-62 vanish blocks the author permanently: flush it on
         // its own so the events that follow in the export meet the marker at
         // put time instead of being committed in the same batch and staying
@@ -350,11 +328,7 @@ pub async fn run(
             && nip62::is_vanish(&event)
             && nip62::targets_us(&event, &identity);
         batch.push((Arc::new(event), now));
-        if group_purge
-            || vanish
-            || batch.len() >= opts.batch.max(1)
-            || batch_bytes >= MAX_BATCH_BYTES
-        {
+        if vanish || batch.len() >= opts.batch.max(1) || batch_bytes >= MAX_BATCH_BYTES {
             flush(
                 db,
                 &mut batch,
@@ -363,8 +337,6 @@ pub async fn run(
                 opts,
                 &identity,
                 &mut first_seen,
-                groups.as_mut(),
-                &mut refused_purges,
             )
             .await?;
             on_progress(&stats);
@@ -378,51 +350,19 @@ pub async fn run(
         opts,
         &identity,
         &mut first_seen,
-        groups.as_mut(),
-        &mut refused_purges,
     )
     .await?;
     on_progress(&stats);
-    // A stored group delete the rebuild would apply even though the
-    // migration refused it (same-second rank ordering): remove it so both
-    // decide alike. The replay also seeds nothing here; it only reports
-    // which refused events pass the gate.
-    if let Some(db) = db
-        && !refused_purges.is_empty()
-    {
-        let mut groups = crate::nips::nip29::GroupStore::with_cap(opts.max_groups);
-        let rebuild_would_apply = seed_group_state(
-            db,
-            &mut groups,
-            opts.relay_pubkey.as_deref(),
-            &refused_purges,
-        )
-        .await?;
-        for id in &rebuild_would_apply {
-            let Some(refused) = refused_purges.iter().find(|refused| refused.id == *id) else {
-                continue;
-            };
-            let (removed, _) = db
-                .apply_deletion_checked(
-                    vec![refused.id.clone()],
-                    Vec::new(),
-                    Some(refused.pubkey.clone()),
-                    refused.created_at,
-                )
-                .await;
-            if removed.is_none() {
-                bail!(
-                    "could not remove the refused NIP-29 group delete; the migration did                      not complete (re-run it)"
-                );
-            }
-        }
-        if !rebuild_would_apply.is_empty() {
-            log::warn!(
-                "removed {} NIP-29 group delete(s) refused in arrival order that the \
-                 restart rebuild would otherwise have applied",
-                rebuild_would_apply.len()
-            );
-        }
+    // NIP-29 `9005`/`9008` side effects are applied after the import, in the
+    // same rank order the startup rebuild uses. strfry's export orders
+    // same-second events by id, so deciding (and deleting) during the
+    // stream would disagree with the first restart: a delete the export
+    // placed before its group's create would be refused, while the rebuild
+    // (create first) applies it. Applying them here keeps the two
+    // consistent by construction, and the purge is bounded by the 9008's
+    // own timestamp so a re-created group's later events survive.
+    if let Some(db) = db {
+        apply_group_side_effects(db, opts, &mut stats).await?;
     }
     Ok(stats)
 }
@@ -481,8 +421,6 @@ async fn flush(
     opts: &Options,
     identity: &nip62::RelayIdentity<'_>,
     first_seen: &mut Vec<([u8; 32], u64)>,
-    groups: Option<&mut crate::nips::nip29::GroupStore>,
-    refused_purges: &mut Vec<RefusedPurge>,
 ) -> Result<()> {
     if batch.is_empty() {
         return Ok(());
@@ -518,7 +456,6 @@ async fn flush(
             events.len()
         );
     }
-    let mut groups = groups;
     for ((event, _), outcome) in events.iter().zip(outcomes.iter()) {
         stats.record(outcome);
         let accepted = matches!(
@@ -539,32 +476,6 @@ async fn flush(
         {
             first_seen.push((pubkey, event.created_at));
         }
-        // Keep the NIP-29 authorization state in step with the accepted
-        // events and learn whether a moderation event's author is allowed
-        // to act (the live write path enforces the same rule; strfry
-        // stored these events without any NIP-29 validation).
-        let mut authorized = true;
-        if let Some(store) = groups.as_deref_mut()
-            && is_group_event(event.kind)
-        {
-            authorized = replay_moderation(store, event, opts.relay_pubkey.as_deref());
-            if !authorized {
-                stats.unauthorized_moderation += 1;
-                // Track group deletes separately: the startup rebuild ranks
-                // same-second events differently than arrival, so one it
-                // would still apply must be removed after the import (a
-                // stored delete the rebuild applies without the purge would
-                // hide a group whose content was never removed, exposing it
-                // on a re-create).
-                if event.kind == 9008 {
-                    refused_purges.push(RefusedPurge {
-                        id: event.id.clone(),
-                        pubkey: event.pubkey.clone(),
-                        created_at: event.created_at,
-                    });
-                }
-            }
-        }
         match event.kind {
             nip09::DELETION_KIND => apply_nip09(db, event, stats).await?,
             nip62::VANISH_KIND
@@ -575,8 +486,6 @@ async fn flush(
             {
                 apply_vanish(db, event, stats).await?
             }
-            9005 if authorized => apply_group_deletion(db, event, stats).await?,
-            9008 if authorized => apply_group_purge(db, event, stats).await?,
             _ => {}
         }
     }
@@ -584,13 +493,6 @@ async fn flush(
         db.touch_first_seen_batch(std::mem::take(first_seen)).await;
     }
     Ok(())
-}
-
-/// Whether an event participates in the NIP-29 group state machine.
-fn is_group_event(kind: u64) -> bool {
-    (crate::nips::nip29::MOD_MIN..=crate::nips::nip29::MOD_MAX).contains(&kind)
-        || kind == crate::nips::nip29::JOIN
-        || kind == crate::nips::nip29::LEAVE
 }
 
 /// Replays one event into the NIP-29 authorization state, returning whether
@@ -618,43 +520,48 @@ fn replay_moderation(
     true
 }
 
-/// A group-delete event the migration refused in stream order but the
-/// startup rebuild might still apply (it ranks same-second events by kind,
-/// so a create may precede an earlier-arriving 9008). Keeping it stored
-/// would let the restart change the state the migration established, so it
-/// is removed after the import once the rank-ordered replay confirms the
-/// rebuild would apply it.
-#[derive(Debug, Clone)]
-struct RefusedPurge {
-    id: String,
-    pubkey: String,
-    created_at: u64,
+/// Applies the NIP-29 `9005`/`9008` side effects the startup rebuild will
+/// honor: replays the stored moderation events in the rebuild's order
+/// (the relay's live write path only lets a group admin or the relay key
+/// moderate, but strfry stores every signed event) and applies each
+/// authorized action.
+async fn apply_group_side_effects(db: &DbClient, opts: &Options, stats: &mut Stats) -> Result<()> {
+    let mut groups = crate::nips::nip29::GroupStore::with_cap(opts.max_groups);
+    let (actions, refused) =
+        replay_stored_moderation(db, &mut groups, opts.relay_pubkey.as_deref()).await?;
+    stats.unauthorized_moderation += refused;
+    for event in &actions {
+        match event.kind {
+            9005 => apply_group_deletion(db, event, stats).await?,
+            9008 => apply_group_purge(db, event, stats).await?,
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
-/// Seeds the NIP-29 authorization replay with the moderation events already
-/// stored: a resumed migration (`--since`) or a merge into an existing
-/// database must authorize a `9005`/`9008` against the state its
-/// predecessors built.
+/// Replays the stored NIP-29 moderation events in the same
+/// `(created_at, group_rank, kind, id)` order as the startup rebuild,
+/// returning the authorized `9005`/`9008` events in order and how many
+/// moderation events the gate refused.
 ///
-/// The replay uses the same `(created_at, group_rank, kind, id)` order as
-/// the startup rebuild (a create precedes a same-second delete), and it
-/// verifies a cut page boundary before advancing, exactly like the rebuild:
-/// a silently dropped second would authorize against a wrong state.
-///
-/// `watch` lists events whose authorization is of interest: the returned
-/// ids are the watched ones the replay authorized.
-async fn seed_group_state(
+/// The replay covers the whole stored history, so a resumed migration
+/// (`--since`) or a merge into an existing database authorizes against the
+/// state its predecessors built. A cut page boundary is verified like the
+/// rebuild: a silently dropped second would authorize against an
+/// incomplete state.
+async fn replay_stored_moderation(
     db: &DbClient,
     groups: &mut crate::nips::nip29::GroupStore,
     relay_pubkey: Option<&str>,
-    watch: &[RefusedPurge],
-) -> Result<Vec<String>> {
+) -> Result<(Vec<Event>, u64)> {
     let kinds: Vec<u64> = (crate::nips::nip29::MOD_MIN..=crate::nips::nip29::MOD_MAX)
         .chain([crate::nips::nip29::JOIN, crate::nips::nip29::LEAVE])
         .collect();
     const PAGE: usize = 50_000;
     let mut since: Option<u64> = None;
-    let mut authorized = Vec::new();
+    let mut actions = Vec::new();
+    let mut refused = 0u64;
     loop {
         let mut filter: crate::filter::Filter =
             serde_json::from_value(serde_json::json!({ "kinds": kinds })).expect("static filter");
@@ -692,10 +599,12 @@ async fn seed_group_state(
             .filter(|event| Some(event.created_at) == max_created)
             .count();
         for event in page {
-            if replay_moderation(groups, &event, relay_pubkey)
-                && watch.iter().any(|refused| refused.id == event.id)
-            {
-                authorized.push(event.id);
+            if replay_moderation(groups, &event, relay_pubkey) {
+                if matches!(event.kind, 9005 | 9008) {
+                    actions.push(event);
+                }
+            } else {
+                refused += 1;
             }
         }
         if !more {
@@ -726,7 +635,7 @@ async fn seed_group_state(
         }
         since = Some(boundary.saturating_add(1));
     }
-    Ok(authorized)
+    Ok((actions, refused))
 }
 
 /// NIP-09: apply the deletion and purge the deleter's gift wraps (the relay
@@ -804,16 +713,23 @@ async fn apply_group_purge(db: &DbClient, event: &Event, stats: &mut Stats) -> R
     // a re-created group's posts — must stay acceptable. The live relay
     // uses `now()` because it processes the event when it arrives; a
     // historical import must use the event's own time.
-    let removed = db.group_purge(gid.to_string(), event.created_at).await;
+    // Bounded by the 9008's own created_at: events imported after it (a
+    // re-created group) survive, and the marker's cut is its timestamp. A
+    // historical merge must not remove newer already-stored events either.
+    let removed = db
+        .group_purge_until(gid.to_string(), event.created_at, event.created_at)
+        .await;
     stats.group_purges += 1;
     stats.group_purge_removed += removed as u64;
     // The purge reports a failure as zero removed (indistinguishable from
     // "nothing to purge"), so completion is confirmed by the absence of any
-    // stored event tagged with the group id — including the 9008 itself.
+    // stored event tagged with the group id up to the cut — including the
+    // 9008 itself. Events after the cut (a re-created group) may remain.
     // A failed query stays fail-closed: it must not be mistaken for a
     // completed purge.
-    let filter: Filter =
+    let mut filter: Filter =
         serde_json::from_value(serde_json::json!({ "#h": [gid] })).expect("static filter");
+    filter.until = Some(event.created_at);
     let Some((remaining, _)) = db
         .query_full_startup(vec![filter], 1, unix_now(), false)
         .await
@@ -1505,36 +1421,74 @@ mod tests {
     }
 
     #[test]
-    fn a_refused_purge_the_rebuild_would_apply_is_removed() {
-        // The 9008 arrives before its group's create in the same second: the
-        // stream-order replay refuses it (unknown group), but the startup
-        // rebuild ranks the create first and would apply it, marking the
-        // group deleted without a purge (its stored posts would surface on a
-        // re-create). The migration removes such an event so both agree.
-        let db = test_db("refused-purge");
+    fn a_same_second_delete_before_create_is_applied_in_rank_order() {
+        // strfry's export orders same-second events by id, so a delete can
+        // precede its group's create. The startup rebuild ranks the create
+        // first and applies the delete; the migration's deferred pass uses
+        // the same order and purges up to the delete's timestamp, so the
+        // first restart does not change the state.
+        let db = test_db("rank-order-purge");
         let now = unix_now();
         let delete = signed(1, 9008, now - 30, vec![vec!["h".into(), "g".into()]], "");
         let create = signed(1, 9007, now - 30, vec![vec!["h".into(), "g".into()]], "");
-        let post = signed(1, 9, now - 20, vec![vec!["h".into(), "g".into()]], "post");
+        let post = signed(1, 9, now - 30, vec![vec!["h".into(), "g".into()]], "post");
+        let recreate = signed(1, 9007, now - 20, vec![vec!["h".into(), "g".into()]], "");
+        let new_post = signed(1, 9, now - 10, vec![vec!["h".into(), "g".into()]], "new");
         let stats = run_str(
             &db,
-            &jsonl(&[delete.clone(), create.clone(), post.clone()]),
+            &jsonl(&[
+                delete.clone(),
+                create,
+                post.clone(),
+                recreate.clone(),
+                new_post.clone(),
+            ]),
             &options(),
         );
-        assert_eq!(stats.group_purges, 0, "the stream-order replay refused it");
+        assert_eq!(
+            stats.group_purges, 1,
+            "the rank replay authorizes the delete"
+        );
+        assert_eq!(stats.unauthorized_moderation, 0);
+        assert!(visible(&db, serde_json::json!({"ids": [delete.id]})).is_empty());
         assert!(
-            visible(&db, serde_json::json!({"ids": [delete.id]})).is_empty(),
-            "the refused 9008 must be removed so the rebuild cannot apply it"
+            visible(&db, serde_json::json!({"ids": [post.id]})).is_empty(),
+            "history up to the delete's timestamp is purged"
         );
         assert_eq!(
-            visible(&db, serde_json::json!({"ids": [post.id]})).len(),
+            visible(&db, serde_json::json!({"ids": [recreate.id]})).len(),
             1,
-            "the group and its posts stay"
+            "a later re-create survives the bounded purge"
         );
-        // A re-run does not bring it back (the removal wrote a tombstone).
-        let stats = run_str(&db, &jsonl(&[delete, create, post.clone()]), &options());
-        assert_eq!(stats.previously_deleted, 1);
-        assert_eq!(visible(&db, serde_json::json!({"ids": [post.id]})).len(), 1);
+        assert_eq!(
+            visible(&db, serde_json::json!({"ids": [new_post.id]})).len(),
+            1
+        );
+        db.shutdown();
+    }
+
+    #[test]
+    fn a_historical_purge_does_not_remove_newer_stored_events() {
+        // A merge into an existing database: the re-created group's events
+        // were imported by an earlier run, and a later run's historical
+        // 9008 must purge only up to its own timestamp (the unbounded walk
+        // used to remove them and raise the cut past them).
+        let db = test_db("historical-purge");
+        let now = unix_now();
+        let recreate = signed(1, 9007, now - 10, vec![vec!["h".into(), "g".into()]], "");
+        let new_post = signed(1, 9, now - 5, vec![vec!["h".into(), "g".into()]], "new");
+        run_str(&db, &jsonl(&[recreate, new_post.clone()]), &options());
+        let create = signed(1, 9007, now - 30, vec![vec!["h".into(), "g".into()]], "");
+        let old_post = signed(1, 9, now - 20, vec![vec!["h".into(), "g".into()]], "old");
+        let delete = signed(1, 9008, now - 15, vec![vec!["h".into(), "g".into()]], "");
+        let stats = run_str(&db, &jsonl(&[create, old_post, delete.clone()]), &options());
+        assert_eq!(stats.group_purges, 1);
+        assert!(visible(&db, serde_json::json!({"ids": [delete.id]})).is_empty());
+        assert_eq!(
+            visible(&db, serde_json::json!({"ids": [new_post.id]})).len(),
+            1,
+            "the newer re-created post survives the bounded purge"
+        );
         db.shutdown();
     }
 

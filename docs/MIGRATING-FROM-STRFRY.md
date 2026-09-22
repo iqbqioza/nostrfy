@@ -25,7 +25,7 @@ rollback and troubleshooting.
 | NIP-09 deletions, including the re-publication blocks for events strfry had already deleted physically | Access lists (NIP-86 bans, relay pubkey lists, Blossom allowlist) |
 | NIP-29 `9005`/`9008` moderation side effects (deletions, group purge) | LiveKit settings and rooms |
 | First-seen timestamps (when the new-pubkey gate is configured) | NIP-62 vanish requests (opt-in, see `--apply-vanish`) |
-| NIP-29 groups, NIP-43 roles and their relay-signed metadata (`39000`-`39005`, `13534`), rebuilt and republished on the first start | The relay's own identity/keys (they live in `nostrfy.toml`) |
+| NIP-29 groups, NIP-43 roles and their relay-signed metadata (`39000`/`39001`/`39002`/`39005`, `13534`), rebuilt and republished on the first start | The relay's own identity/keys (they live in `nostrfy.toml`) |
 | The equivalent strfry settings, offered for merge into `nostrfy.toml` (optional) | |
 
 Expected skips in the summary: **ephemeral events** (kinds `20000`-`29999`,
@@ -312,7 +312,7 @@ rm -rf /var/lib/nostrfy            # or restore the pre-migration backup
 | High `expired`/`ephemeral` counts | Expected: nostrfy never stores ephemeral events, and expired events are dropped |
 | First start is slow | The group/role state is being rebuilt from the imported events; it is a one-time cost, logged in the log file |
 | `database writer unavailable` while the disk or LMDB map is full | Raise `database.map_size` (and `max_map_size`), free disk space, then re-run (safe) |
-| NIP-29 metadata missing after the start | The relay has no `relay.private_key`, so it cannot sign `39000`-`39005`: run `nostrfy genkey` and restart |
+| NIP-29 metadata missing after the start | The relay has no `relay.private_key`, so it cannot sign `39000`/`39001`/`39002`/`39005`: run `nostrfy genkey` and restart |
 | The settings merge is not offered | strfry's config was not found: pass `--strfry-config /etc/strfry.conf` (or set `$STRFRY_CONFIG`) |
 
 ## 13. Checklist
@@ -328,7 +328,7 @@ rm -rf /var/lib/nostrfy            # or restore the pre-migration backup
 [ ] relay starts; group/role rebuild logged
 [ ] event counts match (minus ephemeral/expired)
 [ ] deleted events stay gone (re-publish rejected)
-[ ] group metadata (39000-39005) and 13534 present
+[ ] group metadata (39000/39001/39002/39005) and 13534 present
 [ ] private-group visibility checked anonymously and as a member
 [ ] reverse proxy / DNS / client relay lists updated
 [ ] strfry backup retained until the cut-over is confirmed

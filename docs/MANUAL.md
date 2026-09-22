@@ -935,15 +935,15 @@ strfry export | nostrfy migrate-strfry
   naming someone else's event cannot block that author.
 - NIP-29 `9005` (delete event) and `9008` (delete group) moderation events:
   the referenced events are removed, and a `9008` purges the group's stored
-  history with a re-publication cut at the `9008`'s own timestamp (so a
-  group re-created after the deletion keeps its newer events). An
-  incomplete purge aborts the migration. strfry stores every signed event
-  without NIP-29 validation, so a moderation event whose author is not a
-  group admin (or the relay key) is stored but not applied; the summary
-  reports how many were ignored, and the startup rebuild ignores them too.
-  A refused group delete that the restart rebuild would still apply (it
-  ranks same-second events differently than arrival) is removed instead, so
-  a restart cannot change the state the migration established.
+  history up to its own timestamp (so a group re-created after the deletion
+  keeps its newer events). An incomplete purge aborts the migration. The
+  side effects are applied after the import in the same order the startup
+  rebuild replays stored events (strfry's export orders same-second events
+  by id, so deciding during the stream could disagree with the first
+  restart). strfry stores every signed event without NIP-29 validation, so
+  a moderation event whose author is not a group admin (or the relay key)
+  is stored but not applied; the summary reports how many were ignored, and
+  the startup rebuild ignores them too.
 - First-seen timestamps, when `relay.new_pubkey_min_age_secs` is set, so
   migrated authors are not treated as brand-new accounts.
 

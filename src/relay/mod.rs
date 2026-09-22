@@ -3160,7 +3160,7 @@ impl Relay {
     /// list is fail-closed: the restored/rebuilt ghosts and the database's
     /// pending records stay in place. Idempotent when nothing is pending.
     pub(crate) async fn resume_pending_purges(&self) {
-        let pending: Vec<(String, u64)> = match self.db.pending_purges().await {
+        let pending: Vec<(String, u64, u64)> = match self.db.pending_purges().await {
             Some(pending) => pending,
             None => {
                 // The recorded purges are unknown: some pending purge may
@@ -3173,8 +3173,8 @@ impl Relay {
                 return;
             }
         };
-        for (gid, purge_now) in pending {
-            self.resume_pending_purge(&gid, purge_now).await;
+        for (gid, purge_now, until) in pending {
+            self.resume_pending_purge(&gid, purge_now, until).await;
         }
     }
 
@@ -3183,7 +3183,7 @@ impl Relay {
     /// ordinary delete tombstone and persists. Kept separate from the
     /// database read so the resume path is testable without a real
     /// mid-walk failure.
-    async fn resume_pending_purge(&self, gid: &str, purge_now: u64) {
+    async fn resume_pending_purge(&self, gid: &str, purge_now: u64, until: u64) {
         // The id must stay ghosted until the purge is confirmed: mark it
         // (and persist) before touching the database, so a crash mid-resume
         // cannot restore a snapshot that would let a create expose the
@@ -3195,7 +3195,10 @@ impl Relay {
                  stays fail-closed"
             );
         }
-        let removed = self.db.group_purge(gid.to_string(), purge_now).await;
+        let removed = self
+            .db
+            .group_purge_until(gid.to_string(), purge_now, until)
+            .await;
         self.stats.bump(&self.stats.events_deleted, removed as u64);
         if self.group_purge_confirmed(gid).await {
             // The history is gone: downgrade to the ordinary tombstone,
@@ -6891,7 +6894,7 @@ mod tests {
                 .put(
                     &mut wtxn,
                     &purged_group_key("g1"),
-                    &encode_pending_purge("g1", now, now),
+                    &encode_pending_purge("g1", now, now, u64::MAX),
                 )
                 .unwrap();
             wtxn.commit().unwrap();
@@ -6924,7 +6927,7 @@ mod tests {
 
         assert_eq!(
             relay.db.pending_purges().await,
-            Some(vec![("g1".to_string(), now)]),
+            Some(vec![("g1".to_string(), now, u64::MAX)]),
             "the seeded pending purge must be visible at startup"
         );
 
