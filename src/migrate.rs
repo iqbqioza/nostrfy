@@ -626,14 +626,11 @@ async fn apply_group_side_effects(db: &DbClient, opts: &Options, stats: &mut Sta
     // removed a state event repeats (a purge always can, so it repeats
     // once); the replay is then exactly what the restart will do.
     let mut applied: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut dropped: std::collections::HashSet<String> = std::collections::HashSet::new();
     loop {
         let mut groups = crate::nips::nip29::GroupStore::with_cap(opts.max_groups);
         let (actions, refused) =
             replay_stored_moderation(db, &mut groups, opts.relay_pubkey.as_deref()).await?;
-        // The last round replays the final database: its refusal count is
-        // exactly what the startup rebuild will ignore (accumulating over
-        // rounds would double-count).
-        stats.unauthorized_moderation = refused;
         let mut fresh = Vec::new();
         for event in actions {
             if applied.insert(event.id.clone()) {
@@ -641,6 +638,9 @@ async fn apply_group_side_effects(db: &DbClient, opts: &Options, stats: &mut Sta
             }
         }
         if fresh.is_empty() {
+            // The state is stable: this replay is exactly what the startup
+            // rebuild will do, so its refused events are final and removed.
+            drop_refused_moderation(db, &refused, &mut dropped, stats).await?;
             break;
         }
         let mut state_changed = false;
@@ -655,15 +655,50 @@ async fn apply_group_side_effects(db: &DbClient, opts: &Options, stats: &mut Sta
             }
         }
         if !state_changed {
+            drop_refused_moderation(db, &refused, &mut dropped, stats).await?;
             break;
         }
     }
     Ok(())
 }
 
+/// Removes the moderation events the final replay refused: the live relay
+/// would not have stored them, and the rebuild (which no longer
+/// re-authorizes stored events, so a restart cannot drop legitimate ones)
+/// would otherwise apply them. The author-scoped tombstone keeps a re-run
+/// from re-importing them.
+async fn drop_refused_moderation(
+    db: &DbClient,
+    refused: &[Event],
+    dropped: &mut std::collections::HashSet<String>,
+    stats: &mut Stats,
+) -> Result<()> {
+    for event in refused {
+        if !dropped.insert(event.id.clone()) {
+            continue;
+        }
+        let (removed, _) = db
+            .apply_deletion_checked(
+                vec![event.id.clone()],
+                Vec::new(),
+                Some(event.pubkey.clone()),
+                event.created_at,
+            )
+            .await;
+        if removed.is_none() {
+            bail!(
+                "could not remove a refused NIP-29 moderation event; the migration did \
+                 not complete (re-run it)"
+            );
+        }
+        stats.unauthorized_moderation += 1;
+    }
+    Ok(())
+}
+
 /// Replays the stored NIP-29 moderation events in the same
 /// `(created_at, group_rank, kind, id)` order as the startup rebuild,
-/// returning the authorized `9005`/`9008` events in order and how many
+/// returning the authorized `9005`/`9008` events in order and the
 /// moderation events the gate refused.
 ///
 /// The replay covers the whole stored history, so a resumed migration
@@ -675,7 +710,7 @@ async fn replay_stored_moderation(
     db: &DbClient,
     groups: &mut crate::nips::nip29::GroupStore,
     relay_pubkey: Option<&str>,
-) -> Result<(Vec<Event>, u64)> {
+) -> Result<(Vec<Event>, Vec<Event>)> {
     let kinds: Vec<u64> = (crate::nips::nip29::MOD_MIN..=crate::nips::nip29::MOD_MAX)
         .chain([crate::nips::nip29::JOIN, crate::nips::nip29::LEAVE])
         .collect();
@@ -699,7 +734,7 @@ async fn replay_stored_moderation(
     const PAGE: usize = 50_000;
     let mut since: Option<u64> = None;
     let mut actions = Vec::new();
-    let mut refused = 0u64;
+    let mut refused = Vec::new();
     loop {
         let mut filter: crate::filter::Filter =
             serde_json::from_value(serde_json::json!({ "kinds": kinds })).expect("static filter");
@@ -753,7 +788,7 @@ async fn replay_stored_moderation(
                     actions.push(event);
                 }
             } else {
-                refused += 1;
+                refused.push(event);
             }
         }
         if !more {
