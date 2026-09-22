@@ -353,7 +353,9 @@ fn parse_block(
                 return;
             }
             Token::Semi | Token::Other => *index += 1,
-            Token::Name(key) => {
+            // jaxn accepts quoted keys and block names; treat them like
+            // bare names so a quoted config still merges.
+            Token::Name(key) | Token::Str(key) => {
                 let key = key.clone();
                 *index += 1;
                 match tokens.get(*index) {

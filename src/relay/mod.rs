@@ -2826,7 +2826,7 @@ impl Relay {
             // retry is a duplicate and cannot resume it (the next restart's
             // expiry/name maintenance does not re-run it either).
             if let Some(pubkey) = event.pubkey_bytes() {
-                match self.db.delete_gift_wraps_to_checked(pubkey).await {
+                match self.db.delete_gift_wraps_to_checked(pubkey, u64::MAX).await {
                     Some(purged) => self.stats.bump(&self.stats.events_deleted, purged as u64),
                     None => {
                         log::error!("NIP-59 gift-wrap purge was not applied");
@@ -3119,9 +3119,14 @@ impl Relay {
     /// so the id is confirmed clean only when no stored `h`-tagged event
     /// remains. A failed or truncated query fails closed: the id stays
     /// ghosted rather than becoming re-creatable with its history intact.
-    async fn group_purge_confirmed(&self, gid: &str) -> bool {
-        let filter: crate::filter::Filter =
+    async fn group_purge_confirmed(&self, gid: &str, until: u64) -> bool {
+        let mut filter: crate::filter::Filter =
             serde_json::from_value(serde_json::json!({ "#h": [gid] })).expect("static filter");
+        // A migration-recorded purge is bounded: events after the cut are
+        // the re-created group's and must not fail the confirmation.
+        if until != u64::MAX {
+            filter.until = Some(until);
+        }
         match self
             .db
             .query_full_startup(vec![filter], 1, unix_now(), false)
@@ -3200,12 +3205,22 @@ impl Relay {
             .group_purge_until(gid.to_string(), purge_now, until)
             .await;
         self.stats.bump(&self.stats.events_deleted, removed as u64);
-        if self.group_purge_confirmed(gid).await {
-            // The history is gone: downgrade to the ordinary tombstone,
-            // like the 9008 path.
-            self.unghost_confirmed(gid).await;
-            if self.persist_groups_outcome().await == PersistOutcome::Failed {
-                log::error!("could not persist the confirmed group purge for {gid}");
+        if self.group_purge_confirmed(gid, until).await {
+            if until == u64::MAX {
+                // The history is gone: downgrade to the ordinary tombstone,
+                // like the 9008 path.
+                self.unghost_confirmed(gid).await;
+                if self.persist_groups_outcome().await == PersistOutcome::Failed {
+                    log::error!("could not persist the confirmed group purge for {gid}");
+                }
+            } else {
+                // A bounded (migration) purge leaves the re-created group's
+                // later events: clear the fail-closed ghost and rebuild the
+                // state from the survivors. The tombstone is only restored
+                // for an id the rebuild does not reconstruct, so a
+                // legitimate re-creation is revealed.
+                self.unghost_confirmed(gid).await;
+                self.mark_group_state_stale().await;
             }
         } else {
             log::error!(
@@ -3478,7 +3493,7 @@ impl Relay {
             // delete tombstone (which a create may clear).
             let removed = self.db.group_purge(gid.to_string(), unix_now()).await;
             self.stats.bump(&self.stats.events_deleted, removed as u64);
-            if self.group_purge_confirmed(gid).await {
+            if self.group_purge_confirmed(gid, u64::MAX).await {
                 // The history is gone: the id may be re-created normally.
                 self.unghost_confirmed(gid).await;
                 if self.persist_groups_outcome().await == PersistOutcome::Failed {
@@ -6894,7 +6909,7 @@ mod tests {
                 .put(
                     &mut wtxn,
                     &purged_group_key("g1"),
-                    &encode_pending_purge("g1", now, now, u64::MAX),
+                    &encode_pending_purge("g1", now, now, u64::MAX, None),
                 )
                 .unwrap();
             wtxn.commit().unwrap();
@@ -7024,6 +7039,163 @@ mod tests {
             ),
             "a resumed, confirmed purge must leave the id re-creatable"
         );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_bounded_pending_purge_resumes_and_reveals_the_recreated_group() {
+        // A migration-recorded purge is bounded by the 9008's timestamp: a
+        // crash mid-purge leaves the re-created group's later events, and
+        // the resume must confirm against the bound (an unbounded
+        // confirmation would keep the id ghosted for the whole session)
+        // and rebuild the state from the survivors.
+        use crate::db::PutOutcome;
+        use crate::db::store::{
+            Store, encode_pending_purge, encode_purged_group_marker, purged_group_key,
+        };
+
+        let now = crate::util::unix_now();
+        let mut cfg = crate::config::Config::default();
+        cfg.database.map_size = 16 * 1024 * 1024;
+        cfg.database.max_map_size = 64 * 1024 * 1024;
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        cfg.database.path = std::env::temp_dir()
+            .join("nostrfy-resume-bounded-purge")
+            .join(format!("{:x}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&cfg.database.path);
+        let expiry = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let store = Store::open(&cfg.database, std::sync::Arc::clone(&expiry), 128)
+            .expect("the scratch store opens");
+        let secp = secp256k1::Secp256k1::new();
+        let admin = secp256k1::Keypair::from_seckey_slice(&secp, &[4u8; 32]).unwrap();
+        let create = signed_group_event(
+            &secp,
+            &admin,
+            crate::nips::nip29::CREATE_GROUP,
+            "g1",
+            vec![],
+            now.saturating_sub(10),
+        );
+        let create_id: [u8; 32] = create.id_bytes().expect("a valid id");
+        let message = signed_group_event(&secp, &admin, 1, "g1", vec![], now.saturating_sub(10));
+        let delete = signed_group_event(
+            &secp,
+            &admin,
+            crate::nips::nip29::DELETE_GROUP,
+            "g1",
+            vec![],
+            now,
+        );
+        let recreate = signed_group_event(
+            &secp,
+            &admin,
+            crate::nips::nip29::CREATE_GROUP,
+            "g1",
+            vec![],
+            now.saturating_add(1),
+        );
+        let new_post = signed_group_event(&secp, &admin, 1, "g1", vec![], now.saturating_add(2));
+        {
+            // The events were imported before the purge started: store them
+            // first, then seed what a bounded `purge_group_until`'s first
+            // commit leaves (the marker and the in-progress record, both
+            // carrying the bound and the purged create's id).
+            let mut wtxn = store.env.write_txn().unwrap();
+            for event in [&create, &message, &delete, &recreate, &new_post] {
+                store.put_event_in(&mut wtxn, event, now).unwrap();
+            }
+            wtxn.commit().unwrap();
+            let mut wtxn = store.env.write_txn().unwrap();
+            store
+                .purged_groups
+                .put(
+                    &mut wtxn,
+                    &purged_group_key("g1"),
+                    &encode_purged_group_marker(now, now, Some(&create_id)),
+                )
+                .unwrap();
+            store
+                .purge_pending
+                .put(
+                    &mut wtxn,
+                    &purged_group_key("g1"),
+                    &encode_pending_purge("g1", now, now, now, Some(&create_id)),
+                )
+                .unwrap();
+            wtxn.commit().unwrap();
+        }
+        let db = crate::db::DbClient::open_with_store(
+            &cfg.database,
+            store,
+            expiry,
+            std::sync::Arc::new(Default::default()),
+            0,
+            128,
+            4096,
+        )
+        .unwrap();
+        let config = std::sync::Arc::new(tokio::sync::RwLock::new(cfg));
+        let mut relay = Relay::new(
+            config,
+            db,
+            crate::stats::Stats::new(),
+            "",
+            crate::relay::LiveBusConfig {
+                buffer: 1024,
+                batch_interval_ms: 10,
+                batch_size: 64,
+            },
+        )
+        .await;
+        relay.start_live_bus();
+        let relay = std::sync::Arc::new(relay);
+
+        relay.resume_pending_purges().await;
+
+        assert_eq!(
+            relay.db.pending_purges().await,
+            Some(Vec::new()),
+            "the bounded resume must clear the pending record"
+        );
+        let filter: crate::filter::Filter =
+            serde_json::from_value(serde_json::json!({"#h": ["g1"]})).unwrap();
+        let stored = relay.db.query(vec![filter], 10, now).await.0;
+        assert_eq!(
+            stored.len(),
+            2,
+            "only the re-created group's later events may remain"
+        );
+        assert!(
+            stored.iter().any(|event| event.id == recreate.id)
+                && stored.iter().any(|event| event.id == new_post.id),
+            "the re-created group's events must survive"
+        );
+        assert!(
+            matches!(
+                relay.db.put(create, now).await,
+                PutOutcome::PreviouslyDeleted
+            ),
+            "an exact replay of the purged create must stay blocked"
+        );
+        // The scheduled rebuild reconstructs the group from the survivors.
+        for _ in 0..100 {
+            if relay.groups.read().await.group("g1").is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let groups = relay.groups.read().await;
+        assert!(
+            groups.group("g1").is_some(),
+            "the re-created group must be visible after the resume"
+        );
+        assert!(
+            !groups.ghost_group_ids().contains(&"g1".to_string())
+                && !groups.deleted_group_ids().contains(&"g1".to_string()),
+            "the id must not stay ghosted or deleted"
+        );
+        drop(groups);
         relay.db.shutdown();
     }
 

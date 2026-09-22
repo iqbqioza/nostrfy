@@ -1319,12 +1319,12 @@ fn gift_wrap_deletion_refuses_an_unbuilt_index() {
     // deletion must fail loudly instead (the vanish path then skips its
     // marker and the NIP-09 path reports the failure).
     let err = store
-        .delete_gift_wraps_to(&recipient)
+        .delete_gift_wraps_to(&recipient, u64::MAX)
         .expect_err("an unbuilt index must fail the deletion");
     assert!(err.to_string().contains("not built"), "{err}");
     // After the backfill the same deletion succeeds (nothing stored).
     assert_eq!(store.rebuild_gift_wrap_index().unwrap(), 0);
-    assert_eq!(store.delete_gift_wraps_to(&recipient).unwrap(), 0);
+    assert_eq!(store.delete_gift_wraps_to(&recipient, u64::MAX).unwrap(), 0);
 }
 
 #[test]
@@ -1971,8 +1971,12 @@ fn group_purge_marker_merges_and_keeps_one_record() {
         let rtxn = store.env.read_txn().unwrap();
         assert_eq!(store.purged_groups.len(&rtxn).unwrap(), 1);
         let raw = store.purged_groups.get(&rtxn, &key).unwrap().unwrap();
-        assert_eq!(raw.len(), 16, "the marker carries (purge time, cut)");
-        assert_eq!(decode_purged_group_marker(raw), (now, now));
+        assert_eq!(
+            raw.len(),
+            48,
+            "the marker carries (purge time, cut, create id)"
+        );
+        assert_eq!(decode_purged_group_marker(raw), (now, now, None));
     }
     // A future-dated event is removed by a later purge and raises the cut.
     let future = tagged("future", now + 300);
@@ -1990,15 +1994,23 @@ fn group_purge_marker_merges_and_keeps_one_record() {
     let raw = store.purged_groups.get(&rtxn, &key).unwrap().unwrap();
     assert_eq!(
         decode_purged_group_marker(raw),
-        (now, now + 300),
+        (now, now + 300, None),
         "the purge time and cut must not regress"
     );
     // Round trip and the legacy 8-byte marker read as `(cut, cut)`.
     assert_eq!(
-        decode_purged_group_marker(&encode_purged_group_marker(7, 9)),
-        (7, 9)
+        decode_purged_group_marker(&encode_purged_group_marker(7, 9, None)),
+        (7, 9, None)
     );
-    assert_eq!(decode_purged_group_marker(&7u64.to_be_bytes()), (7, 7));
+    let create = [7u8; 32];
+    assert_eq!(
+        decode_purged_group_marker(&encode_purged_group_marker(7, 9, Some(&create))),
+        (7, 9, Some(create))
+    );
+    assert_eq!(
+        decode_purged_group_marker(&7u64.to_be_bytes()),
+        (7, 7, None)
+    );
 }
 
 #[test]
@@ -4609,7 +4621,7 @@ fn gift_wrap_index_backfills_legacy_wraps() {
     assert!(!store.gift_wrap_index_needs_rebuild().unwrap());
     // The backfilled entry makes the mixed-case recipient lookup find it.
     let removed = store
-        .delete_gift_wraps_to(&hex::decode(recipient).unwrap())
+        .delete_gift_wraps_to(&hex::decode(recipient).unwrap(), u64::MAX)
         .unwrap();
     assert_eq!(removed, 1);
 }
@@ -7496,7 +7508,8 @@ fn disk_full_removals_fail_closed_before_any_side_effect() {
         assert_eq!(db.take_errors(), 1);
 
         assert_eq!(
-            db.delete_gift_wraps_to_checked(recipient_bytes).await,
+            db.delete_gift_wraps_to_checked(recipient_bytes, u64::MAX)
+                .await,
             None,
             "a full-disk gift-wrap purge must report failure"
         );
@@ -7528,7 +7541,8 @@ fn disk_full_removals_fail_closed_before_any_side_effect() {
         db.set_expiry_enabled(true);
         assert_eq!(db.purge_expired(now, 0).await, (1, false));
         assert_eq!(
-            db.delete_gift_wraps_to_checked(recipient_bytes).await,
+            db.delete_gift_wraps_to_checked(recipient_bytes, u64::MAX)
+                .await,
             Some(1)
         );
         assert_eq!(db.take_errors(), 0);

@@ -940,10 +940,15 @@ strfry export | nostrfy migrate-strfry
   side effects are applied after the import in the same order the startup
   rebuild replays stored events (strfry's export orders same-second events
   by id, so deciding during the stream could disagree with the first
-  restart). strfry stores every signed event without NIP-29 validation, so
-  a moderation event whose author is not a group admin (or the relay key)
-  is stored but not applied; the summary reports how many were ignored, and
-  the startup rebuild ignores them too.
+  restart). A purged group's original create event stays blocked on a
+  re-run (the marker records its id), so re-running the migration cannot
+  resurrect the group. strfry stores every signed event without NIP-29
+  validation, so a moderation event whose author is not a group admin (or
+  the relay key) is stored but not applied; the summary reports how many
+  were ignored, and the startup rebuild ignores them too. (A `9008` whose
+  own event the import removes before the replay — a NIP-09 request naming
+  it, or `--apply-vanish` for its author — is not replayed, so its purge is
+  skipped; re-running without that removal applies it.)
 - First-seen timestamps, when `relay.new_pubkey_min_age_secs` is set, so
   migrated authors are not treated as brand-new accounts.
 

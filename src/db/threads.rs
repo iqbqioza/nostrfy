@@ -1223,8 +1223,12 @@ pub(crate) fn spawn(
                                     };
                                     let _ = reply.send(outcome);
                                 }
-                                Msg::GiftWrapPurge { pubkey, reply } => {
-                                    let n = match store.delete_gift_wraps_to(&pubkey) {
+                                Msg::GiftWrapPurge {
+                                    pubkey,
+                                    until,
+                                    reply,
+                                } => {
+                                    let n = match store.delete_gift_wraps_to(&pubkey, until) {
                                         Ok(n) => Some(n),
                                         Err(e) => {
                                             db_error(&thread_errors, &e);

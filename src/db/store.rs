@@ -1873,53 +1873,84 @@ pub(crate) fn purged_group_key(gid: &str) -> [u8; 32] {
 }
 
 /// Encodes a [`PURGED_GROUPS`] marker value: `(purge time, cut)`, both BE
-/// u64. The purge time bounds the `kind:9007` re-create exception (only a
-/// create *before* the purge is rejected); the cut bounds `h`-tagged
-/// re-publications (`created_at <= cut` is rejected), and includes the
-/// newest removed event's timestamp so same-second and future-dated
-/// purged content cannot be replayed.
-pub(crate) fn encode_purged_group_marker(purge_now: u64, cut: u64) -> [u8; 16] {
-    let mut value = [0u8; 16];
+/// u64, followed by the id of the purged `kind:9007` create (all-zero when
+/// the purge removed none). The purge time bounds the `kind:9007` re-create
+/// exception (only a create *before* the purge is rejected); the cut bounds
+/// `h`-tagged re-publications (`created_at <= cut` is rejected), and
+/// includes the newest removed event's timestamp so same-second and
+/// future-dated purged content cannot be replayed. The create id blocks an
+/// exact replay of the purged create, which the same-second re-create
+/// exception would otherwise let back in.
+pub(crate) fn encode_purged_group_marker(
+    purge_now: u64,
+    cut: u64,
+    create_id: Option<&[u8; 32]>,
+) -> [u8; 48] {
+    let mut value = [0u8; 48];
     value[..8].copy_from_slice(&purge_now.to_be_bytes());
-    value[8..].copy_from_slice(&cut.to_be_bytes());
+    value[8..16].copy_from_slice(&cut.to_be_bytes());
+    if let Some(id) = create_id {
+        value[16..48].copy_from_slice(id);
+    }
     value
 }
 
-/// Decodes a [`PURGED_GROUPS`] marker value into `(purge time, cut)`.
-/// Legacy 8-byte markers (written before the value carried the purge time)
-/// count as `(cut, cut)`: the purge time is unknown, so reusing the cut
-/// keeps the re-create exception as strict as before, and malformed short
-/// values block nothing (`(0, 0)`).
-pub(crate) fn decode_purged_group_marker(raw: &[u8]) -> (u64, u64) {
+/// Decodes a [`PURGED_GROUPS`] marker value into
+/// `(purge time, cut, purged create id)`. Legacy 8-byte markers (written
+/// before the value carried the purge time) count as `(cut, cut)`: the
+/// purge time is unknown, so reusing the cut keeps the re-create exception
+/// as strict as before, and malformed short values block nothing
+/// (`(0, 0, None)`).
+pub(crate) fn decode_purged_group_marker(raw: &[u8]) -> (u64, u64, Option<[u8; 32]>) {
     let u64_at = |bytes: &[u8]| u64::from_be_bytes(bytes.try_into().expect("checked length"));
-    if raw.len() >= 16 {
-        (u64_at(&raw[..8]), u64_at(&raw[8..16]))
+    if raw.len() >= 48 {
+        let id: [u8; 32] = raw[16..48].try_into().expect("checked length");
+        let create_id = (id != [0u8; 32]).then_some(id);
+        (u64_at(&raw[..8]), u64_at(&raw[8..16]), create_id)
+    } else if raw.len() >= 16 {
+        (u64_at(&raw[..8]), u64_at(&raw[8..16]), None)
     } else if raw.len() >= 8 {
         let cut = u64_at(&raw[..8]);
-        (cut, cut)
+        (cut, cut, None)
     } else {
-        (0, 0)
+        (0, 0, None)
     }
 }
 
 /// Encodes a [`PURGE_PENDING`] record: `gid length (BE u32) || gid bytes ||
-/// purge time (BE u64) || cut (BE u64) || until (BE u64, optional)`.
+/// purge time (BE u64) || cut (BE u64) || until (BE u64) || create id (32
+/// bytes, all-zero when none)`.
 /// `until` bounds the walk (`created_at <= until`); a migration-recorded
 /// purge uses the 9008's own timestamp so a re-created group's later events
-/// survive. Records written before the field existed decode as unbounded.
-pub(crate) fn encode_pending_purge(gid: &str, purge_now: u64, cut: u64, until: u64) -> Vec<u8> {
-    let mut value = Vec::with_capacity(4 + gid.len() + 24);
+/// survive. The create id is the purged `kind:9007` event, so a resume can
+/// keep blocking its exact replay. Records written before these fields
+/// existed decode with `until = u64::MAX` and no create id.
+pub(crate) fn encode_pending_purge(
+    gid: &str,
+    purge_now: u64,
+    cut: u64,
+    until: u64,
+    create_id: Option<&[u8; 32]>,
+) -> Vec<u8> {
+    let mut value = Vec::with_capacity(4 + gid.len() + 56);
     value.extend_from_slice(&(gid.len() as u32).to_be_bytes());
     value.extend_from_slice(gid.as_bytes());
     value.extend_from_slice(&purge_now.to_be_bytes());
     value.extend_from_slice(&cut.to_be_bytes());
     value.extend_from_slice(&until.to_be_bytes());
+    value.extend_from_slice(create_id.copied().unwrap_or([0u8; 32]).as_slice());
     value
 }
 
-/// Decodes a [`PURGE_PENDING`] record into `(gid, purge time, cut, until)`.
-/// A record without the trailing `until` decodes as unbounded (`u64::MAX`).
-pub(crate) fn decode_pending_purge(raw: &[u8]) -> Option<(String, u64, u64, u64)> {
+/// A decoded [`PURGE_PENDING`] record:
+/// `(gid, purge time, cut, until, purged create id)`.
+pub(crate) type PendingPurge = (String, u64, u64, u64, Option<[u8; 32]>);
+
+/// Decodes a [`PURGE_PENDING`] record. The exact length is
+/// validated: a truncated record must fail closed (resuming it unbounded
+/// could remove a re-created group's later events), while the two legacy
+/// layouts decode with `until = u64::MAX` and no create id.
+pub(crate) fn decode_pending_purge(raw: &[u8]) -> Option<PendingPurge> {
     let gid_len = u32::from_be_bytes(raw.get(..4)?.try_into().ok()?) as usize;
     let gid = raw.get(4..4 + gid_len)?;
     let purge_now = u64::from_be_bytes(raw.get(4 + gid_len..4 + gid_len + 8)?.try_into().ok()?);
@@ -1928,12 +1959,39 @@ pub(crate) fn decode_pending_purge(raw: &[u8]) -> Option<(String, u64, u64, u64)
             .try_into()
             .ok()?,
     );
-    let until = raw
-        .get(4 + gid_len + 16..4 + gid_len + 24)
-        .and_then(|bytes| bytes.try_into().ok())
-        .map(u64::from_be_bytes)
-        .unwrap_or(u64::MAX);
-    Some((String::from_utf8(gid.to_vec()).ok()?, purge_now, cut, until))
+    let (until, create_id) = match raw.len() {
+        // Legacy: no `until` (unbounded), no create id.
+        n if n == 4 + gid_len + 16 => (u64::MAX, None),
+        n if n == 4 + gid_len + 24 => {
+            let until = u64::from_be_bytes(
+                raw.get(4 + gid_len + 16..4 + gid_len + 24)?
+                    .try_into()
+                    .ok()?,
+            );
+            (until, None)
+        }
+        n if n == 4 + gid_len + 56 => {
+            let until = u64::from_be_bytes(
+                raw.get(4 + gid_len + 16..4 + gid_len + 24)?
+                    .try_into()
+                    .ok()?,
+            );
+            let id: [u8; 32] = raw
+                .get(4 + gid_len + 24..4 + gid_len + 56)?
+                .try_into()
+                .ok()?;
+            (until, (id != [0u8; 32]).then_some(id))
+        }
+        // A truncated or trailing-junk record: fail closed.
+        _ => return None,
+    };
+    Some((
+        String::from_utf8(gid.to_vec()).ok()?,
+        purge_now,
+        cut,
+        until,
+        create_id,
+    ))
 }
 
 /// Encodes a [`DELETE_PENDING`] record: the full deletion request
@@ -2243,9 +2301,13 @@ impl Store {
             let Some(raw) = self.purged_groups.get(wtxn, &purged_group_key(&tag[1]))? else {
                 continue;
             };
-            let (purge_now, cut) = decode_purged_group_marker(raw);
+            let (purge_now, cut, purged_create) = decode_purged_group_marker(raw);
             let blocked = if event.kind == crate::nips::nip29::CREATE_GROUP {
+                // The purged create itself must stay blocked even at the
+                // purge second (a re-import would otherwise resurrect it);
+                // a legitimate re-create is a different event.
                 event.created_at < purge_now
+                    || purged_create.is_some_and(|id| Some(id) == event.id_bytes())
             } else {
                 event.created_at <= cut
             };

@@ -1991,34 +1991,43 @@ pub(crate) fn toml_escape(value: &str) -> String {
 /// Whether a trimmed line starts a TOML table (`[name]`) or an array of
 /// tables (`[[name]]`), optionally followed by whitespace or a comment.
 fn is_table_header(line: &str) -> bool {
-    let rest = if let Some(rest) = line.strip_prefix("[[") {
+    let (name, rest) = if let Some(rest) = line.strip_prefix("[[") {
         let Some(end) = rest.find("]]") else {
             return false;
         };
-        &rest[end + 2..]
+        (&rest[..end], &rest[end + 2..])
     } else if let Some(rest) = line.strip_prefix('[') {
         let Some(end) = rest.find(']') else {
             return false;
         };
-        &rest[end + 1..]
+        (&rest[..end], &rest[end + 1..])
     } else {
         return false;
     };
+    // A table name is a key or a quoted string, never a value list: an
+    // array element line like `[1, 2]` must not bound a section.
+    if name.contains(',') || name.contains('=') {
+        return false;
+    }
     rest.is_empty() || rest.starts_with([' ', '\t', '#'])
 }
 
-/// Marks each line of `text` that STARTS inside a TOML multi-line string
+/// Marks each line of `text` that is data rather than structure: a line
+/// that STARTS inside a TOML multi-line string or a multi-line array
 /// (`"""..."""` or `'''...'''`). A line-based editor must never treat the
 /// content of such a string as structure: it may contain a line that looks
 /// like a table header or an assignment. A line that merely *opens* a
 /// multi-line string (`key = """...`) is not flagged: its structure before
 /// the opener is real, and the caller extends the replacement over the
 /// value's continuation lines.
-fn multiline_string_lines(text: &str) -> Vec<bool> {
+fn non_structural_lines(text: &str) -> Vec<bool> {
     let mut flags = Vec::new();
     let mut multi: Option<char> = None;
+    // Bracket depth outside strings/comments: a line inside a multi-line
+    // array (e.g. its `[1, 2]` element) is data, not structure.
+    let mut array_depth = 0usize;
     for line in text.split_inclusive('\n') {
-        flags.push(multi.is_some());
+        flags.push(multi.is_some() || array_depth > 0);
         let mut string: Option<char> = None;
         let mut escaped = false;
         let mut comment = false;
@@ -2070,6 +2079,8 @@ fn multiline_string_lines(text: &str) -> Vec<bool> {
             }
             match ch {
                 '#' => comment = true,
+                '[' => array_depth += 1,
+                ']' => array_depth = array_depth.saturating_sub(1),
                 '"' | '\'' => {
                     let delim = ch;
                     let mut lookahead = chars.clone();
@@ -2107,7 +2118,7 @@ pub(crate) fn set_config_field_in_text(
     // Lines that are part of a TOML multi-line string never carry
     // structure: their content may look like a table header or an
     // assignment but must not be treated as one.
-    let string_lines = multiline_string_lines(text);
+    let string_lines = non_structural_lines(text);
 
     // Locate a real `[section]` header: a line whose trimmed text is the
     // header, or the header followed by whitespace or a comment. A
@@ -2753,6 +2764,20 @@ mod tests {
         assert!(!out.contains("old"), "{out}");
         assert!(!out.contains("value\"\"\""), "{out}");
         assert!(out.contains("port = 1"), "{out}");
+        let cfg: Config = toml::from_str(&out).expect("the rewritten config must parse");
+        assert_eq!(cfg.relay.name, "new");
+    }
+
+    #[test]
+    fn a_multiline_array_does_not_bound_the_section() {
+        // A nested-array element line like `[1, 2]` is data, not a header:
+        // a key after it must still be replaceable (an unvalidated writer
+        // like `genkey` would otherwise insert a duplicate key).
+        let text = "[relay]\nmatrix = [\n  [1, 2]\n]\nname = \"old\"\n";
+        let out = set_config_field_in_text(text, "relay", "name", "\"new\"");
+        assert!(out.contains("name = \"new\""), "{out}");
+        assert!(!out.contains("name = \"old\""), "{out}");
+        assert!(out.contains("[1, 2]"), "the array survives: {out}");
         let cfg: Config = toml::from_str(&out).expect("the rewritten config must parse");
         assert_eq!(cfg.relay.name, "new");
     }

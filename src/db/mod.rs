@@ -417,6 +417,10 @@ enum Msg {
     /// NIP-59: delete gift wraps addressed to a pubkey (on NIP-09 deletion).
     GiftWrapPurge {
         pubkey: Vec<u8>,
+        /// Upper bound (`created_at <= until`) of the walk; `u64::MAX` for
+        /// the live path, the deletion's timestamp for the migration (a
+        /// wrap imported later must survive, matching the live order).
+        until: u64,
         /// `None` when the walk failed: the checked caller must not treat a
         /// skipped purge as success.
         reply: oneshot::Sender<Option<usize>>,
@@ -2044,14 +2048,24 @@ impl DbClient {
     /// NIP-59: deletes `kind:1059` gift wraps p-tagging `pubkey`.
     #[cfg(test)]
     pub async fn delete_gift_wraps_to(&self, pubkey: [u8; 32]) -> usize {
-        self.delete_gift_wraps_to_checked(pubkey).await.unwrap_or(0)
+        self.delete_gift_wraps_to_checked(pubkey, u64::MAX)
+            .await
+            .unwrap_or(0)
     }
 
     /// Like [`Self::delete_gift_wraps_to`], reporting a fail-fast/lost
-    /// writer or a failed removal walk as `None`.
-    pub async fn delete_gift_wraps_to_checked(&self, pubkey: [u8; 32]) -> Option<usize> {
+    /// writer or a failed removal walk as `None`. `until` bounds the walk
+    /// (`created_at <= until`): the migration passes the deletion's own
+    /// timestamp so wraps imported after it survive (the live path passes
+    /// `u64::MAX` and removes every stored wrap).
+    pub async fn delete_gift_wraps_to_checked(
+        &self,
+        pubkey: [u8; 32],
+        until: u64,
+    ) -> Option<usize> {
         self.request_write(|reply| Msg::GiftWrapPurge {
             pubkey: pubkey.to_vec(),
+            until,
             reply,
         })
         .await

@@ -526,15 +526,43 @@ fn replay_moderation(
 /// moderate, but strfry stores every signed event) and applies each
 /// authorized action.
 async fn apply_group_side_effects(db: &DbClient, opts: &Options, stats: &mut Stats) -> Result<()> {
-    let mut groups = crate::nips::nip29::GroupStore::with_cap(opts.max_groups);
-    let (actions, refused) =
-        replay_stored_moderation(db, &mut groups, opts.relay_pubkey.as_deref()).await?;
-    stats.unauthorized_moderation += refused;
-    for event in &actions {
-        match event.kind {
-            9005 => apply_group_deletion(db, event, stats).await?,
-            9008 => apply_group_purge(db, event, stats).await?,
-            _ => {}
+    // A `9005` that removes a state event changes the state later actions
+    // are authorized against, and the startup rebuild sees the post-delete
+    // database: reconcile to a fixpoint so the two cannot disagree. Each
+    // round applies only actions not yet applied, and only a round that
+    // removed a state event repeats (a purge always can, so it repeats
+    // once); the replay is then exactly what the restart will do.
+    let mut applied: std::collections::HashSet<String> = std::collections::HashSet::new();
+    loop {
+        let mut groups = crate::nips::nip29::GroupStore::with_cap(opts.max_groups);
+        let (actions, refused) =
+            replay_stored_moderation(db, &mut groups, opts.relay_pubkey.as_deref()).await?;
+        // The last round replays the final database: its refusal count is
+        // exactly what the startup rebuild will ignore (accumulating over
+        // rounds would double-count).
+        stats.unauthorized_moderation = refused;
+        let mut fresh = Vec::new();
+        for event in actions {
+            if applied.insert(event.id.clone()) {
+                fresh.push(event);
+            }
+        }
+        if fresh.is_empty() {
+            break;
+        }
+        let mut state_changed = false;
+        for event in &fresh {
+            match event.kind {
+                9005 => state_changed |= apply_group_deletion(db, event, stats).await?,
+                9008 => {
+                    apply_group_purge(db, event, stats).await?;
+                    state_changed = true;
+                }
+                _ => {}
+            }
+        }
+        if !state_changed {
+            break;
         }
     }
     Ok(())
@@ -558,6 +586,23 @@ async fn replay_stored_moderation(
     let kinds: Vec<u64> = (crate::nips::nip29::MOD_MIN..=crate::nips::nip29::MOD_MAX)
         .chain([crate::nips::nip29::JOIN, crate::nips::nip29::LEAVE])
         .collect();
+    // The rebuild skips joins by vanished authors and strips their `p`
+    // tags from 9000 grants; the replay must do the same or it would
+    // authorize against a state the restart will not reproduce.
+    let mut vanished: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if db
+        .vanish_pubkeys_each(|key| {
+            vanished.insert(hex::encode(key));
+            vanished.insert(hex::encode_upper(key));
+        })
+        .await
+        .is_none()
+    {
+        bail!(
+            "could not read the vanished-pubkey list for the moderation replay; the \
+             migration did not complete (re-run it)"
+        );
+    }
     const PAGE: usize = 50_000;
     let mut since: Option<u64> = None;
     let mut actions = Vec::new();
@@ -598,7 +643,18 @@ async fn replay_stored_moderation(
             .iter()
             .filter(|event| Some(event.created_at) == max_created)
             .count();
-        for event in page {
+        for mut event in page {
+            if event.kind == crate::nips::nip29::JOIN && vanished.contains(&event.pubkey) {
+                continue;
+            }
+            if event.kind == 9000 {
+                event
+                    .tags
+                    .retain(|tag| tag.len() < 2 || tag[0] != "p" || !vanished.contains(&tag[1]));
+                if event.tags.is_empty() {
+                    continue;
+                }
+            }
             if replay_moderation(groups, &event, relay_pubkey) {
                 if matches!(event.kind, 9005 | 9008) {
                     actions.push(event);
@@ -670,7 +726,12 @@ async fn apply_nip09(db: &DbClient, event: &Event, stats: &mut Stats) -> Result<
                  not complete (re-run it)"
             ),
         }
-        match db.delete_gift_wraps_to_checked(pubkey).await {
+        // Bounded by the deletion's own timestamp: a wrap imported after the
+        // request (created later) must survive, matching the live order.
+        match db
+            .delete_gift_wraps_to_checked(pubkey, event.created_at)
+            .await
+        {
             Some(purged) => stats.gift_wrap_purges += purged as u64,
             None => bail!(
                 "NIP-59 gift-wrap purge was not applied; the migration did not \
@@ -682,11 +743,14 @@ async fn apply_nip09(db: &DbClient, event: &Event, stats: &mut Stats) -> Result<
 }
 
 /// NIP-29 `kind:9005`: delete the referenced events, scoped to the group.
-async fn apply_group_deletion(db: &DbClient, event: &Event, stats: &mut Stats) -> Result<()> {
+/// Returns whether a NIP-29/43 state event was removed: only then does the
+/// authorization replay need to run again (the live relay marks the derived
+/// state stale for the same reason).
+async fn apply_group_deletion(db: &DbClient, event: &Event, stats: &mut Stats) -> Result<bool> {
     let Some(gid) = nip29::group_id(event) else {
-        return Ok(());
+        return Ok(false);
     };
-    let (removed, _state_removed) = db
+    let (removed, state_removed) = db
         .apply_group_deletion_checked(nip29::delete_targets(event), gid.to_string())
         .await;
     if removed.is_none() {
@@ -696,7 +760,7 @@ async fn apply_group_deletion(db: &DbClient, event: &Event, stats: &mut Stats) -
         );
     }
     stats.group_deletions += 1;
-    Ok(())
+    Ok(state_removed)
 }
 
 /// NIP-29 `kind:9008`: purge the group's stored events and verify the purge
@@ -1438,7 +1502,7 @@ mod tests {
             &db,
             &jsonl(&[
                 delete.clone(),
-                create,
+                create.clone(),
                 post.clone(),
                 recreate.clone(),
                 new_post.clone(),
@@ -1464,6 +1528,94 @@ mod tests {
             visible(&db, serde_json::json!({"ids": [new_post.id]})).len(),
             1
         );
+        // A re-run must not resurrect the purged create: the marker
+        // records its id, which the same-second re-create exception would
+        // otherwise let back in.
+        let stats = run_str(
+            &db,
+            &jsonl(&[delete, create, post, recreate.clone(), new_post.clone()]),
+            &options(),
+        );
+        assert_eq!(stats.group_purges, 0, "the purge was already applied");
+        assert_eq!(
+            visible(&db, serde_json::json!({"ids": [recreate.id]})).len(),
+            1,
+            "a legitimate later re-create still passes"
+        );
+        db.shutdown();
+    }
+
+    #[test]
+    fn a_deletion_that_changes_admin_state_is_reconciled() {
+        // A 9005 that removes an admin-removal event changes the state the
+        // later actions are authorized against: the pass must reconcile to
+        // the state the restart rebuilds, or a 9008 the restart applies
+        // would be skipped (fail-open).
+        let db = test_db("fixpoint");
+        let now = unix_now();
+        let b_pk = keypair(2).x_only_public_key().0.to_string();
+        let create = signed(1, 9007, now - 40, vec![vec!["h".into(), "g".into()]], "");
+        let post = signed(1, 9, now - 35, vec![vec!["h".into(), "g".into()]], "post");
+        let grant = signed(
+            1,
+            9000,
+            now - 30,
+            vec![
+                vec!["h".into(), "g".into()],
+                vec!["p".into(), b_pk.clone(), "admin".into()],
+            ],
+            "",
+        );
+        let remove = signed(
+            1,
+            9001,
+            now - 25,
+            vec![vec!["h".into(), "g".into()], vec!["p".into(), b_pk.clone()]],
+            "",
+        );
+        let del_remove = signed(
+            1,
+            9005,
+            now - 20,
+            vec![
+                vec!["h".into(), "g".into()],
+                vec!["e".into(), remove.id.clone()],
+            ],
+            "",
+        );
+        let purge = signed(2, 9008, now - 10, vec![vec!["h".into(), "g".into()]], "");
+        let stats = run_str(
+            &db,
+            &jsonl(&[create, post, grant, remove, del_remove, purge]),
+            &options(),
+        );
+        assert_eq!(stats.group_deletions, 1);
+        assert_eq!(
+            stats.group_purges, 1,
+            "the 9008 is authorized once the 9001 it depended on is deleted"
+        );
+        db.shutdown();
+    }
+
+    #[test]
+    fn a_wrap_imported_after_the_deletion_survives() {
+        // The live relay purges only the wraps stored when the request
+        // arrives; a wrap imported later must survive regardless of the
+        // batch size (the unbounded walk removed it).
+        let db = test_db("wrap-order");
+        let now = unix_now();
+        let recipient = keypair(1).x_only_public_key().0.to_string();
+        let deletion = signed(1, nip09::DELETION_KIND, now - 10, vec![], "");
+        let wrap = signed(
+            2,
+            nip62::GIFT_WRAP_KIND,
+            now - 5,
+            vec![vec!["p".into(), recipient]],
+            "",
+        );
+        let stats = run_str(&db, &jsonl(&[deletion, wrap.clone()]), &options());
+        assert_eq!(stats.gift_wrap_purges, 0, "the later wrap survives");
+        assert_eq!(visible(&db, serde_json::json!({"ids": [wrap.id]})).len(), 1);
         db.shutdown();
     }
 
