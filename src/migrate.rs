@@ -122,9 +122,10 @@ pub struct Stats {
     pub group_purges: u64,
     /// Events removed by those purges.
     pub group_purge_removed: u64,
-    /// NIP-29 moderation events (9000-9020) whose author was not an admin:
-    /// they are stored (strfry kept them) but their side effects and state
-    /// changes are not applied.
+    /// NIP-29 moderation events (9000-9020) the live write path would have
+    /// refused: they are removed during the import (the relay would not
+    /// have stored them, and leaving them would let the trusting restart
+    /// rebuild apply them).
     pub unauthorized_moderation: u64,
     /// NIP-62 vanishes applied (only with `apply_vanish`).
     pub vanishes: u64,
@@ -507,17 +508,17 @@ fn replay_moderation(
     event: &Event,
     relay_pubkey: Option<&str>,
 ) -> bool {
-    if (crate::nips::nip29::MOD_MIN..=crate::nips::nip29::MOD_MAX).contains(&event.kind)
-        && !relay_pubkey.is_some_and(|pk| pk.eq_ignore_ascii_case(&event.pubkey))
+    // The live write path's own validation, applied at the event's position
+    // in the replay: whatever live would have rejected (a non-admin's
+    // moderation, a last-admin demotion, invalid metadata, a duplicate
+    // join, ...) is refused and later removed, and everything else is
+    // applied. Using the live gate keeps the migrated set exactly what the
+    // relay would have stored in this order.
+    if groups
+        .validate_write_for_relay(event, relay_pubkey)
+        .is_err()
     {
-        let authorized = match crate::nips::nip29::group_id(event).and_then(|gid| groups.group(gid))
-        {
-            Some(group) => group.is_admin(&event.pubkey),
-            None => event.kind == crate::nips::nip29::CREATE_GROUP,
-        };
-        if !authorized {
-            return false;
-        }
+        return false;
     }
     groups.apply(event, relay_pubkey.unwrap_or(""), unix_now(), false, true);
     true
@@ -631,31 +632,35 @@ async fn apply_group_side_effects(db: &DbClient, opts: &Options, stats: &mut Sta
         let mut groups = crate::nips::nip29::GroupStore::with_cap(opts.max_groups);
         let (actions, refused) =
             replay_stored_moderation(db, &mut groups, opts.relay_pubkey.as_deref()).await?;
-        let mut fresh = Vec::new();
-        for event in actions {
-            if applied.insert(event.id.clone()) {
-                fresh.push(event);
-            }
-        }
-        if fresh.is_empty() {
-            // The state is stable: this replay is exactly what the startup
-            // rebuild will do, so its refused events are final and removed.
-            drop_refused_moderation(db, &refused, &mut dropped, stats).await?;
-            break;
-        }
         let mut state_changed = false;
-        for event in &fresh {
+        for event in &actions {
+            if applied.contains(&event.id) {
+                continue;
+            }
+            applied.insert(event.id.clone());
             match event.kind {
-                9005 => state_changed |= apply_group_deletion(db, event, stats).await?,
+                9005 => {
+                    if apply_group_deletion(db, event, stats).await? {
+                        // The removed state event changes the state the
+                        // actions after it are authorized against, and the
+                        // in-memory replay cannot undo an applied event:
+                        // stop this round and re-authorize the rest.
+                        state_changed = true;
+                        break;
+                    }
+                }
                 9008 => {
                     apply_group_purge(db, event, stats).await?;
                     state_changed = true;
+                    break;
                 }
                 _ => {}
             }
         }
         if !state_changed {
-            drop_refused_moderation(db, &refused, &mut dropped, stats).await?;
+            // The replay is stable: it is exactly what the startup rebuild
+            // will do, so its refused events are final and removed.
+            drop_refused_moderation(db, &refused, &applied, &mut dropped, stats).await?;
             break;
         }
     }
@@ -665,16 +670,22 @@ async fn apply_group_side_effects(db: &DbClient, opts: &Options, stats: &mut Sta
 /// Removes the moderation events the final replay refused: the live relay
 /// would not have stored them, and the rebuild (which no longer
 /// re-authorizes stored events, so a restart cannot drop legitimate ones)
-/// would otherwise apply them. The author-scoped tombstone keeps a re-run
-/// from re-importing them.
+/// would otherwise apply them. The removal writes a per-id tombstone, so a
+/// re-run cannot re-import them.
+///
+/// An event whose side effect was already applied (`applied`) is kept and
+/// not counted: the final replay is over the post-deletion database, so an
+/// event accepted by the live relay before a later `9005` removed its
+/// author's grant replays as refused even though it was legitimate.
 async fn drop_refused_moderation(
     db: &DbClient,
     refused: &[Event],
+    applied: &std::collections::HashSet<String>,
     dropped: &mut std::collections::HashSet<String>,
     stats: &mut Stats,
 ) -> Result<()> {
     for event in refused {
-        if !dropped.insert(event.id.clone()) {
+        if applied.contains(&event.id) || !dropped.insert(event.id.clone()) {
             continue;
         }
         let (removed, _) = db
@@ -1254,8 +1265,9 @@ mod tests {
     fn unauthorized_group_moderation_is_not_applied() {
         // strfry stores every signed event, so the export can contain
         // moderation events nostrfy's write path would have rejected. A
-        // non-admin's 9005/9008 must not delete or purge (the events stay
-        // stored; the startup rebuild ignores them too).
+        // non-admin's 9005/9008 must not delete or purge, and the refused
+        // events are removed from the import (the relay would not have
+        // stored them).
         let db = test_db("unauthorized-moderation");
         let now = unix_now();
         let create = signed(1, 9007, now - 40, vec![vec!["h".into(), "g".into()]], "");
@@ -1698,6 +1710,134 @@ mod tests {
         let stats = run_str(&db, &jsonl(&[empty, wrap.clone()]), &options());
         assert_eq!(stats.gift_wrap_purges, 0);
         assert_eq!(visible(&db, serde_json::json!({"ids": [wrap.id]})).len(), 1);
+        db.shutdown();
+    }
+
+    #[test]
+    fn a_purge_after_a_revoked_grant_is_not_applied() {
+        // The 9005 removes B's grant before B's 9008: the fixpoint must not
+        // apply the purge with the stale (pre-revocation) state.
+        let db = test_db("revoked-purge");
+        let now = unix_now();
+        let b_pk = keypair(2).x_only_public_key().0.to_string();
+        let create = signed(1, 9007, now - 50, vec![vec!["h".into(), "g".into()]], "");
+        let grant = signed(
+            1,
+            9000,
+            now - 40,
+            vec![
+                vec!["h".into(), "g".into()],
+                vec!["p".into(), b_pk, "admin".into()],
+            ],
+            "",
+        );
+        let revoke = signed(
+            1,
+            9005,
+            now - 30,
+            vec![
+                vec!["h".into(), "g".into()],
+                vec!["e".into(), grant.id.clone()],
+            ],
+            "",
+        );
+        let post = signed(1, 9, now - 20, vec![vec!["h".into(), "g".into()]], "post");
+        let purge = signed(2, 9008, now - 10, vec![vec!["h".into(), "g".into()]], "");
+        let stats = run_str(
+            &db,
+            &jsonl(&[create, grant, revoke, post.clone(), purge]),
+            &options(),
+        );
+        assert_eq!(stats.group_deletions, 1, "the revocation applies");
+        assert_eq!(
+            stats.group_purges, 0,
+            "the revoked admin's purge must not be applied"
+        );
+        assert_eq!(
+            visible(&db, serde_json::json!({"ids": [post.id]})).len(),
+            1,
+            "the group and its post survive"
+        );
+        db.shutdown();
+    }
+
+    #[test]
+    fn a_legitimate_9005_is_kept_when_a_later_action_revokes_its_author() {
+        // B's 9005 was authorized when the live relay accepted it (B was an
+        // admin); a later 9005 revoking the grant must not make the
+        // migration drop it or misreport it as ignored.
+        let db = test_db("kept-legit-9005");
+        let now = unix_now();
+        let b_pk = keypair(2).x_only_public_key().0.to_string();
+        let create = signed(1, 9007, now - 50, vec![vec!["h".into(), "g".into()]], "");
+        let grant = signed(
+            1,
+            9000,
+            now - 40,
+            vec![
+                vec!["h".into(), "g".into()],
+                vec!["p".into(), b_pk, "admin".into()],
+            ],
+            "",
+        );
+        let post = signed(1, 9, now - 35, vec![vec!["h".into(), "g".into()]], "post");
+        let b_delete = signed(
+            2,
+            9005,
+            now - 30,
+            vec![
+                vec!["h".into(), "g".into()],
+                vec!["e".into(), post.id.clone()],
+            ],
+            "",
+        );
+        let revoke = signed(
+            1,
+            9005,
+            now - 20,
+            vec![
+                vec!["h".into(), "g".into()],
+                vec!["e".into(), grant.id.clone()],
+            ],
+            "",
+        );
+        let stats = run_str(
+            &db,
+            &jsonl(&[create, grant, post.clone(), b_delete.clone(), revoke]),
+            &options(),
+        );
+        assert_eq!(stats.group_deletions, 2);
+        assert_eq!(stats.unauthorized_moderation, 0);
+        assert!(visible(&db, serde_json::json!({"ids": [post.id]})).is_empty());
+        assert_eq!(
+            visible(&db, serde_json::json!({"ids": [b_delete.id]})).len(),
+            1,
+            "the legitimate 9005 stays stored"
+        );
+        db.shutdown();
+    }
+
+    #[test]
+    fn live_invalid_moderation_is_refused() {
+        // The migration uses the live write-path validation: a last-admin
+        // demotion is refused and removed like live would reject it.
+        let db = test_db("live-invalid");
+        let now = unix_now();
+        let a_pk = keypair(1).x_only_public_key().0.to_string();
+        let create = signed(1, 9007, now - 50, vec![vec!["h".into(), "g".into()]], "");
+        let demote = signed(
+            1,
+            9000,
+            now - 40,
+            vec![vec!["h".into(), "g".into()], vec!["p".into(), a_pk]],
+            "",
+        );
+        let stats = run_str(&db, &jsonl(&[create, demote.clone()]), &options());
+        assert_eq!(stats.unauthorized_moderation, 1);
+        assert!(
+            visible(&db, serde_json::json!({"ids": [demote.id]})).is_empty(),
+            "the refused demotion is removed"
+        );
         db.shutdown();
     }
 
