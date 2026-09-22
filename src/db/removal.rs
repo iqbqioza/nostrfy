@@ -25,7 +25,9 @@ const REMOVAL_CHUNK: usize = 4096;
 
 /// How many deleter pubkeys one migration-recorded (absent-target) tombstone
 /// keeps. Bounds the marker value when many deletion requests name the same
-/// missing id; the earliest deleters win.
+/// missing id; beyond the bound the marker becomes unconditional (the id
+/// was deleted by many keys, and dropping the extra deleter would fail open
+/// when it is the author's own deletion).
 const SCOPED_TOMBSTONE_MAX: usize = 4;
 
 /// The partial outcome of a chunked removal walk: what was removed before

@@ -1988,6 +1988,112 @@ pub(crate) fn toml_escape(value: &str) -> String {
     out
 }
 
+/// Whether a trimmed line starts a TOML table (`[name]`) or an array of
+/// tables (`[[name]]`), optionally followed by whitespace or a comment.
+fn is_table_header(line: &str) -> bool {
+    let rest = if let Some(rest) = line.strip_prefix("[[") {
+        let Some(end) = rest.find("]]") else {
+            return false;
+        };
+        &rest[end + 2..]
+    } else if let Some(rest) = line.strip_prefix('[') {
+        let Some(end) = rest.find(']') else {
+            return false;
+        };
+        &rest[end + 1..]
+    } else {
+        return false;
+    };
+    rest.is_empty() || rest.starts_with([' ', '\t', '#'])
+}
+
+/// Marks each line of `text` that contains any part of a TOML multi-line
+/// string (`"""…"""` or `'''…'''`). A line-based editor must never treat the
+/// content of such a string as structure: it may contain a line that looks
+/// like a table header or an assignment.
+fn multiline_string_lines(text: &str) -> Vec<bool> {
+    let mut flags = Vec::new();
+    let mut line_flagged = false;
+    // The active multi-line delimiter, or `None` outside one.
+    let mut multi: Option<char> = None;
+    // The active single-line string quote, or `None`.
+    let mut string: Option<char> = None;
+    let mut escaped = false;
+    let mut comment = false;
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\n' {
+            flags.push(line_flagged);
+            line_flagged = false;
+            // A single-line string and a comment never span lines.
+            string = None;
+            escaped = false;
+            comment = false;
+            continue;
+        }
+        if let Some(delim) = multi {
+            line_flagged = true;
+            if delim == '"' {
+                if escaped {
+                    escaped = false;
+                    continue;
+                }
+                if ch == '\\' {
+                    escaped = true;
+                    continue;
+                }
+            }
+            if ch == delim && chars.peek() == Some(&delim) {
+                chars.next();
+                if chars.peek() == Some(&delim) {
+                    chars.next();
+                    multi = None;
+                }
+            }
+            continue;
+        }
+        if comment {
+            continue;
+        }
+        if let Some(quote) = string {
+            if ch == quote {
+                if quote == '"' && escaped {
+                    escaped = false;
+                } else {
+                    string = None;
+                }
+                continue;
+            }
+            if quote == '"' && ch == '\\' {
+                escaped = !escaped;
+                continue;
+            }
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '#' => comment = true,
+            '"' | '\'' => {
+                let delim = ch;
+                let mut lookahead = chars.clone();
+                if lookahead.next() == Some(delim) && lookahead.next() == Some(delim) {
+                    chars.next();
+                    chars.next();
+                    multi = Some(delim);
+                    line_flagged = true;
+                } else {
+                    string = Some(delim);
+                }
+            }
+            _ => {}
+        }
+    }
+    if !text.ends_with('\n') {
+        flags.push(line_flagged);
+    }
+    flags
+}
+
 /// Replaces (or inserts) a `key = <toml value>` line inside the `[section]`
 /// section of a config file's text, preserving every other line, comment
 /// and section. Handles three cases: a matching line already present in the
@@ -2004,18 +2110,23 @@ pub(crate) fn set_config_field_in_text(
 ) -> String {
     let line = format!("{key} = {value}");
     let header = format!("[{section}]");
+    // Lines that are part of a TOML multi-line string never carry
+    // structure: their content may look like a table header or an
+    // assignment but must not be treated as one.
+    let string_lines = multiline_string_lines(text);
 
     // Locate a real `[section]` header: a line whose trimmed text is the
     // header, or the header followed by whitespace or a comment. A
-    // `[section]` inside a comment or a string value is not a section
-    // header and must not match.
+    // `[section]` inside a comment, a string value or a multi-line string
+    // is not a section header and must not match.
     let mut header_start = None;
     let mut offset = 0;
-    for l in text.split_inclusive('\n') {
+    for (index, l) in text.split_inclusive('\n').enumerate() {
         let t = l.trim();
-        if t == header
-            || t.strip_prefix(&header)
-                .is_some_and(|rest| rest.starts_with([' ', '\t', '#']))
+        if !string_lines.get(index).copied().unwrap_or(false)
+            && (t == header
+                || t.strip_prefix(&header)
+                    .is_some_and(|rest| rest.starts_with([' ', '\t', '#'])))
         {
             header_start = Some(offset);
             break;
@@ -2039,19 +2150,19 @@ pub(crate) fn set_config_field_in_text(
         .map(|i| header_start + i + 1)
         .unwrap_or(text.len());
 
-    // Bound the section at the next table header line. A header may carry a
-    // trailing comment (`[rpc] # management`), which bounds the section
-    // just like a bare `[rpc]`: missing it let the slice below extend into
-    // the next section and overwrite an unrelated key.
+    // Bound the section at the next table header line: a bare `[rpc]`, a
+    // header with a trailing comment (`[rpc] # management`) or an
+    // `[[array-of-tables]]`. Missing any of these let the slice below
+    // extend into the next table and overwrite an unrelated key.
+    let section_line = text[..header_end].matches('\n').count();
     let mut section_end = text.len();
     let mut cursor = header_end;
-    for l in text[header_end..].split_inclusive('\n') {
-        let t = l.trim();
-        if t.starts_with('[')
-            && t.find(']').is_some_and(|end| {
-                let rest = &t[end + 1..];
-                rest.is_empty() || rest.starts_with([' ', '\t', '#'])
-            })
+    for (index, l) in text[header_end..].split_inclusive('\n').enumerate() {
+        if !string_lines
+            .get(section_line + index)
+            .copied()
+            .unwrap_or(false)
+            && is_table_header(l.trim())
         {
             section_end = cursor;
             break;
@@ -2068,13 +2179,17 @@ pub(crate) fn set_config_field_in_text(
     // `split_inclusive` keeps each line's original ending, so a CRLF
     // config stays CRLF instead of being silently normalized to LF.
     let lines: Vec<&str> = section.split_inclusive('\n').collect();
-    if let Some(offset) = lines.iter().position(|l| {
-        l.trim_end_matches(['\n', '\r'])
-            .trim_start()
-            .strip_prefix(key)
-            .is_some_and(|rest| {
-                rest.is_empty() || rest.starts_with('=') || rest.starts_with([' ', '\t'])
-            })
+    if let Some(offset) = lines.iter().enumerate().position(|(index, l)| {
+        !string_lines
+            .get(section_line + index)
+            .copied()
+            .unwrap_or(false)
+            && l.trim_end_matches(['\n', '\r'])
+                .trim_start()
+                .strip_prefix(key)
+                .is_some_and(|rest| {
+                    rest.is_empty() || rest.starts_with('=') || rest.starts_with([' ', '\t'])
+                })
     }) {
         let mut new_section = String::with_capacity(section.len() + line.len());
         for (i, l) in lines.iter().enumerate() {
@@ -2567,6 +2682,49 @@ mod tests {
         assert!(
             out.contains("host = \"\""),
             "the later section's key must stay untouched: {out}"
+        );
+    }
+
+    #[test]
+    fn multiline_strings_are_not_treated_as_structure() {
+        // A `[limits]` line inside a multi-line string is content, not a
+        // header: the edit must stay in `[server]` (and append a real
+        // section) instead of rewriting the string.
+        let text = "[server]\nconf = \"\"\"\n[limits]\n\"\"\"\n\nmax_tags = 5\nport = 8080\n";
+        let out = set_config_field_in_text(text, "limits", "max_tags", "7");
+        assert!(
+            out.contains("\"\"\"\n[limits]\n\"\"\""),
+            "the string content stays: {out}"
+        );
+        assert!(
+            out.contains("[limits]\nmax_tags = 7"),
+            "a real section is appended: {out}"
+        );
+        assert!(out.contains("max_tags = 5"), "the server key stays: {out}");
+        // A key line inside a multi-line string is not replaced either.
+        let text = "[limits]\nnote = \"\"\"\nmax_tags = 999\n\"\"\"\nmax_tags = 100\n";
+        let out = set_config_field_in_text(text, "limits", "max_tags", "7");
+        assert!(
+            out.contains("max_tags = 999"),
+            "the string content stays: {out}"
+        );
+        assert!(out.contains("max_tags = 7"), "{out}");
+        assert!(!out.contains("max_tags = 100"), "{out}");
+    }
+
+    #[test]
+    fn array_of_tables_bounds_the_section() {
+        // `[[relay.items]]` starts a new table: the `[relay]` section ends
+        // before it, so an insertion lands in `[relay]`, not in the array.
+        let text = "[relay]\ndescription = \"keep\"\n\n[[relay.items]]\nname = \"old-item\"\n";
+        let out = set_config_field_in_text(text, "relay", "name", "\"new\"");
+        assert!(
+            out.contains("name = \"old-item\""),
+            "the array table stays: {out}"
+        );
+        assert!(
+            out.contains("[relay]\nname = \"new\""),
+            "the key is inserted into [relay]: {out}"
         );
     }
 

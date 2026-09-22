@@ -112,7 +112,7 @@ pub enum Command {
         strfry_bin: String,
         /// The strfry config file to read settings from. When omitted,
         /// strfry's own search order is used (`$STRFRY_CONFIG`,
-        /// `./strfry.conf`, `/etc/strfry.conf`).
+        /// `/etc/strfry.conf`, `./strfry.conf`).
         #[arg(long, value_name = "PATH")]
         strfry_config: Option<PathBuf>,
         /// Merge the strfry settings that have a nostrfy equivalent into
@@ -360,6 +360,14 @@ impl Cli {
         };
         if *batch == 0 {
             return Err(config_err("--batch must be at least 1"));
+        }
+        if since.is_some() && strfry_db.is_none() {
+            // Clap waives `requires = "strfry_db"` when the conflicting
+            // `--input` is given; silently ignoring `--since` would import
+            // events the operator meant to skip.
+            return Err(config_err(
+                "--since only applies with --strfry-db (it bounds the export)",
+            ));
         }
         let mut cfg = self.load_config()?;
         cfg.validate()?;
@@ -615,7 +623,7 @@ impl Cli {
                  starting nostrfy",
             );
         }
-        let unmapped = crate::strfry_config::unmapped(&strfry);
+        let unmapped = crate::strfry_config::unmapped(&strfry, cfg);
         if !unmapped.is_empty() {
             let unmapped_width = unmapped
                 .iter()
@@ -1574,20 +1582,37 @@ impl MigrateSource {
             )));
         }
         // strfry accepts a minimal config (`db = "..."`); write one so the
-        // operator's own strfry.conf is not needed.
-        let config_path =
-            std::env::temp_dir().join(format!("nostrfy-strfry-export-{}.conf", std::process::id()));
+        // operator's own strfry.conf is not needed. The name is unique and
+        // created exclusively: a predictable name in a world-writable temp
+        // directory could be pre-created as a symlink and redirect the write.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let config_path = std::env::temp_dir().join(format!(
+            "nostrfy-strfry-export-{}-{nanos}.conf",
+            std::process::id()
+        ));
         let escaped = db_dir
             .display()
             .to_string()
             .replace('\\', "\\\\")
             .replace('"', "\\\"");
-        std::fs::write(&config_path, format!("db = \"{escaped}\"\n")).map_err(|e| {
-            config_err(format!(
+        let write_temp = || -> std::io::Result<()> {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&config_path)?;
+            file.write_all(format!("db = \"{escaped}\"\n").as_bytes())
+        };
+        if let Err(e) = write_temp() {
+            let _ = std::fs::remove_file(&config_path);
+            return Err(config_err(format!(
                 "cannot write the temporary strfry config {}: {e}",
                 config_path.display()
-            ))
-        })?;
+            )));
+        }
         let mut cmd = std::process::Command::new(bin);
         cmd.arg("--config")
             .arg(&config_path)

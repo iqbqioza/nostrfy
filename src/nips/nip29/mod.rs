@@ -1787,7 +1787,11 @@ impl GroupStore {
 /// Replay order of group events within the same second: the create/delete
 /// establish the group before the member/settings operations, joins and
 /// leaves come last.
-fn group_rank(kind: u64) -> u8 {
+/// The same-second ordering rank used by the rebuild replay: the
+/// group-establishing events (create/delete) apply first, then the
+/// member/settings operations, then joins/leaves. Shared with the
+/// migration's authorization replay so both orders agree.
+pub(crate) fn group_rank(kind: u64) -> u8 {
     match kind {
         9007 | 9008 => 0,
         9021 | 9022 => 2,

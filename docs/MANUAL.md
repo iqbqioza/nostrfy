@@ -941,6 +941,9 @@ strfry export | nostrfy migrate-strfry
   without NIP-29 validation, so a moderation event whose author is not a
   group admin (or the relay key) is stored but not applied; the summary
   reports how many were ignored, and the startup rebuild ignores them too.
+  A refused group delete that the restart rebuild would still apply (it
+  ranks same-second events differently than arrival) is removed instead, so
+  a restart cannot change the state the migration established.
 - First-seen timestamps, when `relay.new_pubkey_min_age_secs` is set, so
   migrated authors are not treated as brand-new accounts.
 

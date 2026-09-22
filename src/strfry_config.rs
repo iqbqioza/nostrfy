@@ -39,7 +39,7 @@ impl StrfryConfig {
         let tokens = tokenize(text);
         let mut values = BTreeMap::new();
         let mut index = 0;
-        parse_block(&tokens, &mut index, "", &mut values);
+        parse_block(&tokens, &mut index, "", &mut values, 0);
         StrfryConfig { values }
     }
 
@@ -95,8 +95,19 @@ fn tokenize(text: &str) -> Vec<Token> {
             '}' => tokens.push(Token::RBrace),
             '=' | ':' => tokens.push(Token::Eq),
             ';' | ',' => tokens.push(Token::Semi),
-            '"' => tokens.push(Token::Str(read_string(&mut chars, '"'))),
-            '\'' => tokens.push(Token::Str(read_string(&mut chars, '\''))),
+            '"' | '\'' => {
+                // A triple quote opens a multi-line string whose content
+                // may contain structure-like lines; consume it as one value.
+                let delim = ch;
+                let mut lookahead = chars.clone();
+                if lookahead.next() == Some(delim) && lookahead.next() == Some(delim) {
+                    chars.next();
+                    chars.next();
+                    tokens.push(Token::Str(read_multiline_string(&mut chars, delim)));
+                } else {
+                    tokens.push(Token::Str(read_string(&mut chars, delim)));
+                }
+            }
             '[' => {
                 skip_balanced(&mut chars);
                 tokens.push(Token::Other);
@@ -105,7 +116,10 @@ fn tokenize(text: &str) -> Vec<Token> {
                 let mut word = String::from(ch);
                 while let Some(c) = chars.peek() {
                     if c.is_whitespace()
-                        || matches!(c, '{' | '}' | '=' | ':' | ';' | ',' | '#' | '"' | '[')
+                        || matches!(
+                            c,
+                            '{' | '}' | '=' | ':' | ';' | ',' | '#' | '"' | '\'' | '[' | '/' | '+'
+                        )
                     {
                         break;
                     }
@@ -116,7 +130,7 @@ fn tokenize(text: &str) -> Vec<Token> {
                     tokens.push(Token::Bool(true));
                 } else if word == "false" {
                     tokens.push(Token::Bool(false));
-                } else if let Ok(number) = word.parse::<i64>() {
+                } else if let Some(number) = parse_int(&word) {
                     tokens.push(Token::Int(number));
                 } else {
                     tokens.push(Token::Name(word));
@@ -125,6 +139,42 @@ fn tokenize(text: &str) -> Vec<Token> {
         }
     }
     tokens
+}
+
+/// Parses a decimal or `0x`-hex integer the way jaxn does (strfry accepts
+/// hex for every numeric setting).
+fn parse_int(word: &str) -> Option<i64> {
+    if let Some(hex) = word
+        .strip_prefix("0x")
+        .or_else(|| word.strip_prefix("0X"))
+        .filter(|hex| !hex.is_empty())
+    {
+        return i64::from_str_radix(hex, 16).ok();
+    }
+    word.parse::<i64>().ok()
+}
+
+/// Reads a triple-quoted multi-line string body (the opening delimiter was
+/// consumed). The closing delimiter is the first occurrence of the same
+/// three characters; an unterminated string consumes the rest of the file.
+fn read_multiline_string(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    delim: char,
+) -> String {
+    let mut out = String::new();
+    while let Some(ch) = chars.next() {
+        if ch == delim && chars.peek() == Some(&delim) {
+            let mut lookahead = chars.clone();
+            lookahead.next();
+            if lookahead.next() == Some(delim) {
+                chars.next();
+                chars.next();
+                break;
+            }
+        }
+        out.push(ch);
+    }
+    out
 }
 
 /// Skips the rest of a `#` or `//` comment (the marker was consumed).
@@ -260,12 +310,18 @@ fn skip_balanced(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
     }
 }
 
+/// Maximum block nesting the parser recurses into. Real configs are a few
+/// levels deep; an absurdly nested (hostile or corrupt) file must not
+/// overflow the stack.
+const MAX_PARSE_DEPTH: usize = 64;
+
 /// Parses assignments and nested blocks under `prefix` into `values`.
 fn parse_block(
     tokens: &[Token],
     index: &mut usize,
     prefix: &str,
     values: &mut BTreeMap<String, Value>,
+    depth: usize,
 ) {
     while *index < tokens.len() {
         match &tokens[*index] {
@@ -283,23 +339,20 @@ fn parse_block(
                         match tokens.get(*index) {
                             Some(Token::LBrace) => {
                                 *index += 1;
-                                parse_block(tokens, index, &format!("{prefix}{key}."), values);
-                            }
-                            Some(Token::Str(value)) => {
-                                values.insert(format!("{prefix}{key}"), Value::Str(value.clone()));
-                                *index += 1;
-                            }
-                            Some(Token::Int(value)) => {
-                                values.insert(format!("{prefix}{key}"), Value::Int(*value));
-                                *index += 1;
-                            }
-                            Some(Token::Bool(value)) => {
-                                values.insert(format!("{prefix}{key}"), Value::Bool(*value));
-                                *index += 1;
-                            }
-                            Some(Token::Name(value)) => {
-                                values.insert(format!("{prefix}{key}"), Value::Str(value.clone()));
-                                *index += 1;
+                                if depth < MAX_PARSE_DEPTH {
+                                    parse_block(
+                                        tokens,
+                                        index,
+                                        &format!("{prefix}{key}."),
+                                        values,
+                                        depth + 1,
+                                    );
+                                } else {
+                                    // Too deep: skip the block without
+                                    // recursing (the remaining values are
+                                    // ignored rather than overflowing).
+                                    skip_block(tokens, index);
+                                }
                             }
                             // The tokenizer turns `[ ... ]` into a single
                             // `Other` token: record the key as an array so
@@ -308,18 +361,79 @@ fn parse_block(
                                 values.insert(format!("{prefix}{key}"), Value::List);
                                 *index += 1;
                             }
-                            _ => {}
+                            _ => {
+                                if let Some(value) = read_scalar(tokens, index) {
+                                    values.insert(format!("{prefix}{key}"), value);
+                                }
+                            }
                         }
                     }
                     Some(Token::LBrace) => {
                         *index += 1;
-                        parse_block(tokens, index, &format!("{prefix}{key}."), values);
+                        if depth < MAX_PARSE_DEPTH {
+                            parse_block(
+                                tokens,
+                                index,
+                                &format!("{prefix}{key}."),
+                                values,
+                                depth + 1,
+                            );
+                        } else {
+                            skip_block(tokens, index);
+                        }
                     }
                     _ => *index += 1,
                 }
             }
             _ => *index += 1,
         }
+    }
+}
+
+/// Reads a scalar value, applying jaxn's `+` concatenation (`"a" + "b"`
+/// concatenates strings, `1 + 2` adds numbers).
+fn read_scalar(tokens: &[Token], index: &mut usize) -> Option<Value> {
+    fn one(tokens: &[Token], index: &mut usize) -> Option<Value> {
+        let value = match tokens.get(*index)? {
+            Token::Str(value) => Value::Str(value.clone()),
+            Token::Int(value) => Value::Int(*value),
+            Token::Bool(value) => Value::Bool(*value),
+            Token::Name(value) => Value::Str(value.clone()),
+            _ => return None,
+        };
+        *index += 1;
+        Some(value)
+    }
+    let mut value = one(tokens, index)?;
+    while matches!(tokens.get(*index), Some(Token::Name(name)) if name == "+") {
+        *index += 1;
+        let next = one(tokens, index)?;
+        value = match (value, next) {
+            (Value::Str(left), Value::Str(right)) => Value::Str(left + &right),
+            (Value::Int(left), Value::Int(right)) => Value::Int(left.saturating_add(right)),
+            // A mixed or invalid concatenation keeps the left value, like
+            // the reference parser's error tolerance.
+            (left, _) => left,
+        };
+    }
+    Some(value)
+}
+
+/// Skips a `{ ... }` block without recursing (the opening brace was
+/// consumed by the caller).
+fn skip_block(tokens: &[Token], index: &mut usize) {
+    let mut depth = 0usize;
+    while *index < tokens.len() {
+        match &tokens[*index] {
+            Token::LBrace => depth += 1,
+            Token::RBrace if depth == 0 => {
+                *index += 1;
+                return;
+            }
+            Token::RBrace => depth -= 1,
+            _ => {}
+        }
+        *index += 1;
     }
 }
 
@@ -687,7 +801,10 @@ pub(crate) fn proposals(strfry: &StrfryConfig, nostrfy: &Config) -> Vec<Proposal
 
 /// The strfry keys/blocks present in the config that are not merged, with
 /// the reason.
-pub(crate) fn unmapped(strfry: &StrfryConfig) -> Vec<(&'static str, &'static str)> {
+pub(crate) fn unmapped(
+    strfry: &StrfryConfig,
+    nostrfy: &Config,
+) -> Vec<(&'static str, &'static str)> {
     let mut out: Vec<(&'static str, &'static str)> = UNMAPPED
         .iter()
         .filter(|(key, _)| strfry.get(key).is_some() || strfry.has_prefix(&format!("{key}.")))
@@ -702,6 +819,28 @@ pub(crate) fn unmapped(strfry: &StrfryConfig) -> Vec<(&'static str, &'static str
         out.push((
             "relay.info.pubkey",
             "nostrfy requires a 64-hex pubkey; convert the npub before merging",
+        ));
+    }
+    // A `maxFilterLimitCount = 0` disables COUNT on strfry; nostrfy has no
+    // equivalent, so keeping its value silently would leave COUNT enabled.
+    if matches!(strfry.get("relay.maxFilterLimitCount"), Some(Value::Int(0))) {
+        out.push((
+            "relay.maxFilterLimitCount",
+            "0 disables COUNT on strfry; disable NIP-45 with relay.disabled_nips = [45] \
+             or lower limits.max_count",
+        ));
+    }
+    // A mapsize that is not an increase is covered by nostrfy's existing
+    // `database.max_map_size` (the size the map is opened at); report it so
+    // the operator knows the value was seen.
+    if let Some(Value::Int(value)) = strfry.get("dbParams.mapsize")
+        && *value > 0
+        && *value as u64 <= nostrfy.database.max_map_size as u64
+    {
+        out.push((
+            "dbParams.mapsize",
+            "not larger than nostrfy's database.max_map_size (the map is opened at \
+             max_map_size)",
         ));
     }
     out
@@ -726,8 +865,13 @@ pub(crate) fn apply_proposals(text: &str, proposals: &[Proposal]) -> String {
 /// that would produce an invalid config is refused before the file is
 /// touched.
 pub(crate) fn validate_merged(text: &str) -> Result<(), String> {
-    let cfg: Config = toml::from_str(text).map_err(|e| e.to_string())?;
-    cfg.validate().map_err(|e| e.to_string())
+    // The merge applies and validates one proposal at a time, so the
+    // warnings `validate` emits would repeat once per proposal; the
+    // returned error is unaffected.
+    crate::logging::suppressed(|| {
+        let cfg: Config = toml::from_str(text).map_err(|e| e.to_string())?;
+        cfg.validate().map_err(|e| e.to_string())
+    })
 }
 
 /// Finds the strfry config to read, in strfry's own order: an explicit path
@@ -738,7 +882,7 @@ pub(crate) fn find_config(explicit: Option<&Path>) -> Option<(PathBuf, bool)> {
     if let Some(path) = explicit {
         return Some((path.to_path_buf(), true));
     }
-    if let Ok(path) = std::env::var("STRFRY_CONFIG") {
+    if let Some(path) = std::env::var_os("STRFRY_CONFIG") {
         return Some((PathBuf::from(path), true));
     }
     for candidate in ["/etc/strfry.conf", "strfry.conf"] {
@@ -944,7 +1088,7 @@ max_tags = 100
     #[test]
     fn reports_unmapped_present_keys_only() {
         let cfg = parsed();
-        let unmapped = unmapped(&cfg);
+        let unmapped = unmapped(&cfg, &Config::default());
         let keys: Vec<&str> = unmapped.iter().map(|(key, _)| *key).collect();
         assert!(keys.contains(&"db"));
         assert!(keys.contains(&"relay.writePolicy.plugin"));
@@ -957,6 +1101,9 @@ max_tags = 100
         // Keys absent from the file are not reported.
         assert!(!keys.contains(&"relay.info.banner"));
         assert!(!keys.contains(&"relay.filterValidation.enabled"));
+        // A mapsize below nostrfy's reservation is reported as not merged
+        // (the sample's 10 TB is larger and is proposed instead).
+        assert!(!keys.contains(&"dbParams.mapsize"));
     }
 
     #[test]
@@ -1014,7 +1161,7 @@ max_tags = 100
                 .any(|p| p.path() == "relay.pubkey")
         );
         assert!(
-            !unmapped(&cfg)
+            !unmapped(&cfg, &nostrfy)
                 .iter()
                 .any(|(key, _)| *key == "relay.info.pubkey")
         );
@@ -1029,7 +1176,7 @@ max_tags = 100
                 .any(|p| p.path() == "relay.pubkey")
         );
         assert!(
-            unmapped(&cfg)
+            unmapped(&cfg, &nostrfy)
                 .iter()
                 .any(|(key, _)| *key == "relay.info.pubkey")
         );
@@ -1057,6 +1204,37 @@ max_tags = 100
                 .iter()
                 .any(|p| p.path() == "limits.max_count")
         );
+    }
+
+    #[test]
+    fn parses_triple_quoted_concat_hex_and_trailing_comments() {
+        let cfg = StrfryConfig::parse(
+            "db = \"/x\"\n\
+             relay {\n\
+               info { name = \"\"\"multi\nline\"\"\" description = 'a' + 'b' }\n\
+               port = 0x1f91\n\
+               bind = \"127.0.0.1\" maxReqFilterSize = 200//comment\n\
+             }\n",
+        );
+        assert_eq!(
+            cfg.get("relay.info.name"),
+            Some(&Value::Str("multi\nline".into()))
+        );
+        assert_eq!(
+            cfg.get("relay.info.description"),
+            Some(&Value::Str("ab".into()))
+        );
+        assert_eq!(cfg.get("relay.port"), Some(&Value::Int(0x1f91)));
+        assert_eq!(cfg.get("relay.maxReqFilterSize"), Some(&Value::Int(200)));
+    }
+
+    #[test]
+    fn deeply_nested_blocks_do_not_overflow_the_stack() {
+        let text = format!("a{}{}", "{".repeat(5000), "}".repeat(5000));
+        let cfg = StrfryConfig::parse(&text);
+        // The parser must survive an absurd nesting depth; the over-deep
+        // levels are ignored rather than crashing the process.
+        assert!(cfg.get("a").is_none());
     }
 
     #[test]
