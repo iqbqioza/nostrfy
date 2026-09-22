@@ -1408,7 +1408,13 @@ impl Cli {
         // defaulted umask must not leave the private key readable by
         // other users on the host.
         let text = std::fs::read_to_string(&self.config)?;
-        crate::config::write_text_atomic(&self.config, &set_private_key_in_text(&text, &key))?;
+        let updated = crate::config::rewrite_config_checked(
+            &text,
+            "relay",
+            "private_key",
+            &format!("\"{}\"", crate::config::toml_escape(&key)),
+        )?;
+        crate::config::write_text_atomic(&self.config, &updated)?;
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&self.config, std::fs::Permissions::from_mode(0o600))?;
 
@@ -1691,6 +1697,16 @@ impl Drop for MigrateSource {
 
 /// Prints a line to stdout, ignoring broken-pipe errors (e.g. `nostrfy stats
 /// | head`): a closed pipe must not panic the process like `println!` does.
+#[cfg(test)]
+fn set_private_key_in_text(text: &str, key: &str) -> String {
+    crate::config::set_config_field_in_text(
+        text,
+        "relay",
+        "private_key",
+        &format!("\"{}\"", crate::config::toml_escape(key)),
+    )
+}
+
 fn print_line(text: &str) {
     use std::io::Write;
     let _ = writeln!(std::io::stdout(), "{text}");
@@ -2037,13 +2053,6 @@ fn generate_secret_key_hex() -> Result<String> {
         }
     }
     Err(anyhow!("failed to generate a valid secret key"))
-}
-
-/// Replaces (or inserts) the `relay.private_key` value in a config file's
-/// text, preserving every other line, comment and section. Delegates to the
-/// shared [`crate::config::set_relay_field_in_text`] helper.
-fn set_private_key_in_text(text: &str, key: &str) -> String {
-    crate::config::set_relay_field_in_text(text, "private_key", key)
 }
 
 /// Resolves a possibly relative path against the current directory so that it

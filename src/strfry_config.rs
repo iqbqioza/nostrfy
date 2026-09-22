@@ -353,11 +353,33 @@ fn parse_block(
                 return;
             }
             Token::Semi | Token::Other => *index += 1,
-            // jaxn accepts quoted keys and block names; treat them like
-            // bare names so a quoted config still merges.
+            // jaxn accepts quoted keys and block names; a quoted key is a
+            // single literal segment, so one containing a dot must not be
+            // flattened into a nested path (it would merge a value real
+            // strfry never reads there).
             Token::Name(key) | Token::Str(key) => {
+                let quoted_dotted = matches!(&tokens[*index], Token::Str(_)) && key.contains('.');
                 let key = key.clone();
                 *index += 1;
+                if quoted_dotted {
+                    match tokens.get(*index) {
+                        Some(Token::Eq) => {
+                            *index += 1;
+                            if matches!(tokens.get(*index), Some(Token::LBrace)) {
+                                *index += 1;
+                                skip_block(tokens, index);
+                            } else if tokens.get(*index).is_some() {
+                                *index += 1;
+                            }
+                        }
+                        Some(Token::LBrace) => {
+                            *index += 1;
+                            skip_block(tokens, index);
+                        }
+                        _ => *index += 1,
+                    }
+                    continue;
+                }
                 match tokens.get(*index) {
                     Some(Token::Eq) => {
                         *index += 1;
@@ -1303,6 +1325,14 @@ max_tags = 100
              relay { port = 7777 }\n",
         );
         assert_eq!(cfg.get("relay.port"), Some(&Value::Int(7777)));
+    }
+
+    #[test]
+    fn a_quoted_dotted_key_is_not_flattened() {
+        // jaxn treats a quoted key as one literal segment: it must not be
+        // recorded as a nested path real strfry never reads.
+        let cfg = StrfryConfig::parse("db = \"/x\"\nrelay { \"info.name\" = \"dotted\" }\n");
+        assert_eq!(cfg.get("relay.info.name"), None);
     }
 
     #[test]

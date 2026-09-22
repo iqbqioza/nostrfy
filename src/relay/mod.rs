@@ -2129,7 +2129,22 @@ impl Relay {
         };
         match std::fs::read_to_string(&path) {
             Ok(text) => {
-                let updated = crate::config::set_relay_field_in_text(&text, field, value);
+                let updated = match crate::config::rewrite_config_checked(
+                    &text,
+                    "relay",
+                    field,
+                    &format!("\"{}\"", crate::config::toml_escape(value)),
+                ) {
+                    Ok(updated) => updated,
+                    Err(e) => {
+                        log::warn!(
+                            "cannot persist relay.{field} to {}: {e}; the change applies \
+                             until the next config reload",
+                            path.display()
+                        );
+                        return;
+                    }
+                };
                 if let Err(e) = crate::config::write_text_atomic(&path, &updated) {
                     log::warn!(
                         "cannot persist relay.{field} to {}: {e}; the change applies \

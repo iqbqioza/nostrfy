@@ -279,6 +279,13 @@ clients can retrieve (paginate with `until` on large databases).
 An interrupted run leaves a consistent database: every committed batch is
 durable and re-running is safe.
 
+> **Do not start the relay before re-running.** The NIP-29 group side
+> effects (`9005`/`9008`) are applied after the import; an interrupted run
+> has stored those events but not their deletions yet, so the first start
+> could serve group history the deletion was meant to remove. Re-run the
+> migration first: it completes the side effects (the purge is idempotent)
+> and only then start the relay.
+
 - **You exported to a file / piped**: re-run the same command. Duplicates are
   skipped, and the deletion blocks are re-applied.
 - **You used `--strfry-db`**: the summary prints a resume hint like

@@ -2014,6 +2014,103 @@ fn group_purge_marker_merges_and_keeps_one_record() {
 }
 
 #[test]
+fn a_resumed_purge_keeps_the_raised_cut() {
+    // A crash after a chunk removed a future-dated event must not lose the
+    // raised cut: the pending record carries it, so the resume's marker
+    // still blocks a re-broadcast of that event.
+    let cfg = config();
+    let (db, faults) = open_with_faults(&cfg);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let now = unix_now();
+        let gid = "resume-cut";
+        let tagged = |content: &str, created: u64| {
+            event(1, content, created, vec![vec!["h".into(), gid.into()]])
+        };
+        let old = tagged("old", now - 10);
+        let future = tagged("future", now + 300);
+        for e in [&old, &future] {
+            assert_eq!(db.put(e.clone(), now).await, PutOutcome::Stored);
+        }
+        // Fail after the first removal chunk committed: the marker and the
+        // pending (with the raised cut) are durable, the walk is not done.
+        faults
+            .chunk_after
+            .store(2, std::sync::atomic::Ordering::SeqCst);
+        let _ = db.group_purge_until(gid.to_string(), now, u64::MAX).await;
+        faults
+            .chunk_after
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+        // The resume finishes the (now empty) walk and must keep the cut
+        // raised by the already-removed future-dated event.
+        let _ = db.group_purge_until(gid.to_string(), now, u64::MAX).await;
+        assert_eq!(
+            db.put(future, now).await,
+            PutOutcome::PreviouslyDeleted,
+            "the resumed purge must keep the cut raised by the removed event"
+        );
+    });
+    db.shutdown();
+}
+
+#[test]
+fn a_bounded_purge_keeps_a_wider_pending_bound() {
+    // A crashed live purge is unbounded: a later migration's bounded purge
+    // must not narrow it, or the history the live purge still owed would
+    // be served.
+    use crate::db::store::{
+        Store, encode_pending_purge, encode_purged_group_marker, purged_group_key,
+    };
+    let store = Store::open(
+        &config(),
+        Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        128,
+    )
+    .unwrap();
+    let now = 1_700_000_000u64;
+    let gid = "wide-pending";
+    let tagged = |content: &str, created: u64| {
+        event(1, content, created, vec![vec!["h".into(), gid.into()]])
+    };
+    for (content, created) in [("old", now - 10), ("newer", now + 100)] {
+        let e = tagged(content, created);
+        let mut wtxn = store.env.write_txn().unwrap();
+        assert_eq!(
+            store.put_event_in(&mut wtxn, &e, now).unwrap(),
+            PutOutcome::Stored
+        );
+        wtxn.commit().unwrap();
+    }
+    {
+        // What a crashed live purge leaves: the marker and an unbounded
+        // pending record.
+        let mut wtxn = store.env.write_txn().unwrap();
+        let key = purged_group_key(gid);
+        store
+            .purged_groups
+            .put(&mut wtxn, &key, &encode_purged_group_marker(now, now, None))
+            .unwrap();
+        store
+            .purge_pending
+            .put(
+                &mut wtxn,
+                &key,
+                &encode_pending_purge(gid, now, now, u64::MAX, None),
+            )
+            .unwrap();
+        wtxn.commit().unwrap();
+    }
+    // The migration's bounded purge must honour the wider pending bound.
+    assert_eq!(store.purge_group_until(gid, now - 5, now - 5).unwrap(), 2);
+    let rtxn = store.env.read_txn().unwrap();
+    assert_eq!(store.purge_pending.len(&rtxn).unwrap(), 0);
+    assert!(
+        store.events.is_empty(&rtxn).unwrap(),
+        "the merged unbounded walk must remove the newer event too"
+    );
+}
+
+#[test]
 fn purge_marker_survives_reopen() {
     // Durability: the marker is persisted with the database, so a restart
     // cannot let the purged history back in.

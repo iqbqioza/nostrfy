@@ -676,7 +676,7 @@ impl Store {
         // Merge with an earlier purge of the same id: the furthest purge
         // time (for the re-create exception) and the furthest cut cover
         // every already-rejected generation.
-        let (mut purge_now, mut cut, mut create_id) = {
+        let (mut purge_now, mut cut, mut create_id, effective_until) = {
             let mut wtxn = self.env.write_txn()?;
             let (old_now, old_cut, old_create) = self
                 .purged_groups
@@ -694,14 +694,21 @@ impl Store {
                 .as_ref()
                 .map(|(_, _, _, pending_until, _)| (*pending_until).max(until))
                 .unwrap_or(until);
+            // The pending record's cut covers events an interrupted walk
+            // already removed (whose timestamps are gone): merging it keeps
+            // the marker's cut from regressing on the resume.
+            let pending_cut = pending
+                .as_ref()
+                .map(|(_, _, pending_cut, _, _)| *pending_cut)
+                .unwrap_or(0);
             let create_id = pending
                 .as_ref()
                 .and_then(|(_, _, _, _, create)| *create)
                 .or(old_create);
             let purge_now = old_now.max(now);
-            // The initial cut covers `now`; the final commit below raises
-            // it to the newest removed event.
-            let cut = old_cut.max(now);
+            // The initial cut covers `now`; each chunk below raises it to
+            // the newest removed event, and the final commit merges it.
+            let cut = old_cut.max(pending_cut).max(now);
             self.purged_groups.put(
                 &mut wtxn,
                 &key,
@@ -713,17 +720,17 @@ impl Store {
                 &encode_pending_purge(gid, purge_now, cut, effective_until, create_id.as_ref()),
             )?;
             wtxn.commit()?;
-            (purge_now, cut, create_id)
+            (purge_now, cut, create_id, effective_until)
         };
         let start = tag_key(b'h', gid.as_bytes(), 0, &[0u8; ID_LEN]);
         let end = crate::db::store::range_end(
             tag_key(
                 b'h',
                 gid.as_bytes(),
-                until.saturating_add(1),
+                effective_until.saturating_add(1),
                 &[0u8; ID_LEN],
             ),
-            until,
+            effective_until,
         );
         let mut last_key: Option<Vec<u8>> = None;
         let mut removed = 0usize;
@@ -766,7 +773,6 @@ impl Store {
                 break;
             }
             last_key = Some(entries.last().unwrap().0.clone());
-            let mut found_create = false;
             for (_, id) in entries {
                 let Some(raw) = self.events.get(&wtxn, &id)? else {
                     continue;
@@ -778,28 +784,22 @@ impl Store {
                     max_created = max_created.max(event.created_at);
                     if event.kind == crate::nips::nip29::CREATE_GROUP && id.len() == ID_LEN {
                         create_id = Some(id.as_slice().try_into().expect("checked length"));
-                        found_create = true;
                     }
                 }
                 self.remove_event(&mut wtxn, &id)?;
                 removed += 1;
             }
-            // Persist a newly found create id with the chunk that removed
-            // it, so a crash before completion cannot lose it (a re-import
-            // would otherwise resurrect the group).
-            if found_create {
-                self.purge_pending.put(
-                    &mut wtxn,
-                    &key,
-                    &encode_pending_purge(
-                        gid,
-                        purge_now,
-                        cut.max(max_created),
-                        until,
-                        create_id.as_ref(),
-                    ),
-                )?;
-            }
+            // Persist the raised cut (and any create id) with the chunk
+            // that produced it: a crash before completion must not lose
+            // either (the cut would regress and a future-dated removed
+            // event would be accepted again; the create id would let an
+            // exact replay resurrect the group).
+            cut = cut.max(max_created);
+            self.purge_pending.put(
+                &mut wtxn,
+                &key,
+                &encode_pending_purge(gid, purge_now, cut, effective_until, create_id.as_ref()),
+            )?;
             wtxn.commit()?;
         }
         // Completion commit: re-merge the marker (a legacy 8-byte marker was

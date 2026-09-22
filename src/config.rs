@@ -1988,28 +1988,66 @@ pub(crate) fn toml_escape(value: &str) -> String {
     out
 }
 
+/// Splits a table header line into `(name, is_array)`, honoring quoted
+/// names so a `]` inside them is not mistaken for the closing bracket. The
+/// remainder must be empty, whitespace or a comment.
+fn parse_table_header(line: &str) -> Option<(&str, bool)> {
+    let (inner, rest, is_array) = if let Some(rest) = line.strip_prefix("[[") {
+        let end = find_closing(rest, "]]")?;
+        (&rest[..end], &rest[end + 2..], true)
+    } else {
+        let rest = line.strip_prefix('[')?;
+        let end = find_closing(rest, "]")?;
+        (&rest[..end], &rest[end + 1..], false)
+    };
+    if !(rest.is_empty() || rest.starts_with([' ', '\t', '#'])) {
+        return None;
+    }
+    Some((inner, is_array))
+}
+
+/// Finds the closing bracket sequence outside quoted segments.
+fn find_closing(text: &str, close: &str) -> Option<usize> {
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut index = 0;
+    while index < text.len() {
+        let ch = text[index..].chars().next()?;
+        if let Some(open) = quote {
+            if open == '"' && escaped {
+                escaped = false;
+            } else if open == '"' && ch == '\\' {
+                escaped = true;
+            } else if ch == open {
+                quote = None;
+            }
+        } else if ch == '"' || ch == '\'' {
+            quote = Some(ch);
+        } else if text[index..].starts_with(close) {
+            return Some(index);
+        }
+        index += ch.len_utf8();
+    }
+    None
+}
+
+/// The section name of a header line, with quotes and surrounding
+/// whitespace stripped (`[ relay ]` and `["relay"]` both name `relay`).
+fn header_name(inner: &str) -> String {
+    let trimmed = inner.trim();
+    let quoted = (trimmed.starts_with('"') && trimmed.ends_with('"'))
+        || (trimmed.starts_with('\'') && trimmed.ends_with('\''));
+    if quoted && trimmed.len() >= 2 {
+        trimmed[1..trimmed.len() - 1].to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 /// Whether a trimmed line starts a TOML table (`[name]`) or an array of
 /// tables (`[[name]]`), optionally followed by whitespace or a comment.
 fn is_table_header(line: &str) -> bool {
-    let (name, rest) = if let Some(rest) = line.strip_prefix("[[") {
-        let Some(end) = rest.find("]]") else {
-            return false;
-        };
-        (&rest[..end], &rest[end + 2..])
-    } else if let Some(rest) = line.strip_prefix('[') {
-        let Some(end) = rest.find(']') else {
-            return false;
-        };
-        (&rest[..end], &rest[end + 1..])
-    } else {
-        return false;
-    };
-    // A table name is a key or a quoted string, never a value list: an
-    // array element line like `[1, 2]` must not bound a section.
-    if name.contains(',') || name.contains('=') {
-        return false;
-    }
-    rest.is_empty() || rest.starts_with([' ', '\t', '#'])
+    parse_table_header(line).is_some()
 }
 
 /// Marks each line of `text` that is data rather than structure: a line
@@ -2114,7 +2152,6 @@ pub(crate) fn set_config_field_in_text(
     value: &str,
 ) -> String {
     let line = format!("{key} = {value}");
-    let header = format!("[{section}]");
     // Lines that are part of a TOML multi-line string never carry
     // structure: their content may look like a table header or an
     // assignment but must not be treated as one.
@@ -2129,9 +2166,8 @@ pub(crate) fn set_config_field_in_text(
     for (index, l) in text.split_inclusive('\n').enumerate() {
         let t = l.trim();
         if !string_lines.get(index).copied().unwrap_or(false)
-            && (t == header
-                || t.strip_prefix(&header)
-                    .is_some_and(|rest| rest.starts_with([' ', '\t', '#'])))
+            && parse_table_header(t)
+                .is_some_and(|(name, is_array)| !is_array && header_name(name) == section)
         {
             header_start = Some(offset);
             break;
@@ -2184,6 +2220,8 @@ pub(crate) fn set_config_field_in_text(
     // `split_inclusive` keeps each line's original ending, so a CRLF
     // config stays CRLF instead of being silently normalized to LF.
     let lines: Vec<&str> = section.split_inclusive('\n').collect();
+    let quoted_double = format!("\"{key}\"");
+    let quoted_single = format!("'{key}'");
     if let Some(offset) = lines.iter().enumerate().position(|(index, l)| {
         !string_lines
             .get(section_line + index)
@@ -2192,6 +2230,16 @@ pub(crate) fn set_config_field_in_text(
             && l.trim_end_matches(['\n', '\r'])
                 .trim_start()
                 .strip_prefix(key)
+                .or_else(|| {
+                    l.trim_end_matches(['\n', '\r'])
+                        .trim_start()
+                        .strip_prefix(quoted_double.as_str())
+                })
+                .or_else(|| {
+                    l.trim_end_matches(['\n', '\r'])
+                        .trim_start()
+                        .strip_prefix(quoted_single.as_str())
+                })
                 .is_some_and(|rest| {
                     rest.is_empty() || rest.starts_with('=') || rest.starts_with([' ', '\t'])
                 })
@@ -2245,10 +2293,22 @@ pub(crate) fn set_config_field_in_text(
     s
 }
 
-/// [`set_config_field_in_text`] for a string field of the `[relay]` section.
-/// Used by `nostrfy genkey` (private_key) and the NIP-86 relay-name changes.
-pub(crate) fn set_relay_field_in_text(text: &str, field: &str, value: &str) -> String {
-    set_config_field_in_text(text, "relay", field, &format!("\"{}\"", toml_escape(value)))
+/// [`set_config_field_in_text`] plus a parse check of the result, for the
+/// writers that do not validate before publishing (`genkey`, NIP-86): an
+/// exotic spelling the line matcher did not recognize (a quoted or dotted
+/// header/key) would otherwise turn into a duplicate key and break the
+/// next start.
+pub(crate) fn rewrite_config_checked(
+    text: &str,
+    section: &str,
+    key: &str,
+    value: &str,
+) -> anyhow::Result<String> {
+    let rewritten = set_config_field_in_text(text, section, key, value);
+    toml::from_str::<Config>(&rewritten).map_err(|e| {
+        anyhow::anyhow!("the rewritten config would be invalid ({e}); refusing to write it")
+    })?;
+    Ok(rewritten)
 }
 
 /// Writes `text` to `path` atomically (temp file + rename) so a crash in
@@ -2673,6 +2733,11 @@ mod tests {
         assert!(checked > 0, "expected example configs to check");
     }
 
+    #[cfg(test)]
+    fn set_relay_field_in_text(text: &str, field: &str, value: &str) -> String {
+        set_config_field_in_text(text, "relay", field, &format!("\"{}\"", toml_escape(value)))
+    }
+
     #[test]
     fn set_relay_field_does_not_clobber_prefix_matches() {
         // Unknown keys are warned about but never rejected, so a line that
@@ -2766,6 +2831,31 @@ mod tests {
         assert!(out.contains("port = 1"), "{out}");
         let cfg: Config = toml::from_str(&out).expect("the rewritten config must parse");
         assert_eq!(cfg.relay.name, "new");
+    }
+
+    #[test]
+    fn quoted_table_names_and_headers_are_matched() {
+        // A quoted name with a comma is a real table, not an array element:
+        // the edit must stay in `[relay]`.
+        let text = "[relay]\ndescription = \"keep\"\n\n[\"a,b\"]\nname = \"other\"\n";
+        let out = set_config_field_in_text(text, "relay", "name", "\"new\"");
+        assert!(out.contains("name = \"other\""), "{out}");
+        assert!(out.contains("[relay]\nname = \"new\""), "{out}");
+        // Whitespace and quoted spellings of the target table match.
+        for text in [
+            "[ relay ]\nname = \"old\"\n",
+            "[\"relay\"]\nname = \"old\"\n",
+            "['relay']\nname = \"old\"\n",
+        ] {
+            let out = set_config_field_in_text(text, "relay", "name", "\"new\"");
+            assert!(out.contains("name = \"new\""), "{text} => {out}");
+            assert!(!out.contains("name = \"old\""), "{text} => {out}");
+        }
+        // A quoted key inside the section is replaced, not duplicated.
+        let text = "[relay]\n\"private_key\" = \"old\"\n";
+        let out = set_config_field_in_text(text, "relay", "private_key", "\"new\"");
+        assert!(out.contains("private_key = \"new\""), "{out}");
+        assert!(!out.contains("\"private_key\""), "{out}");
     }
 
     #[test]

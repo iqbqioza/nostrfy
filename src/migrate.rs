@@ -239,6 +239,8 @@ pub async fn run(
     let mut batch: Vec<(Arc<Event>, u64)> = Vec::with_capacity(opts.batch.clamp(1, 4096));
     let mut batch_bytes = 0usize;
     let mut first_seen: Vec<([u8; 32], u64)> = Vec::new();
+    // NIP-09 gift-wrap purges, applied after the import (see `apply_nip09`).
+    let mut wrap_purges: Vec<([u8; 32], u64)> = Vec::new();
     let mut previous_created: Option<u64> = None;
     let mut out_of_order_warned = false;
     let mut reader = reader;
@@ -337,6 +339,7 @@ pub async fn run(
                 opts,
                 &identity,
                 &mut first_seen,
+                &mut wrap_purges,
             )
             .await?;
             on_progress(&stats);
@@ -350,6 +353,7 @@ pub async fn run(
         opts,
         &identity,
         &mut first_seen,
+        &mut wrap_purges,
     )
     .await?;
     on_progress(&stats);
@@ -362,6 +366,17 @@ pub async fn run(
     // consistent by construction, and the purge is bounded by the 9008's
     // own timestamp so a re-created group's later events survive.
     if let Some(db) = db {
+        // NIP-09 gift-wrap purges first (they are author-scoped and
+        // order-independent), then the NIP-29 actions.
+        for (pubkey, until) in &wrap_purges {
+            match db.delete_gift_wraps_to_checked(*pubkey, *until).await {
+                Some(purged) => stats.gift_wrap_purges += purged as u64,
+                None => bail!(
+                    "NIP-59 gift-wrap purge was not applied; the migration did not \
+                     complete (re-run it)"
+                ),
+            }
+        }
         apply_group_side_effects(db, opts, &mut stats).await?;
     }
     Ok(stats)
@@ -421,6 +436,7 @@ async fn flush(
     opts: &Options,
     identity: &nip62::RelayIdentity<'_>,
     first_seen: &mut Vec<([u8; 32], u64)>,
+    wrap_purges: &mut Vec<([u8; 32], u64)>,
 ) -> Result<()> {
     if batch.is_empty() {
         return Ok(());
@@ -477,7 +493,7 @@ async fn flush(
             first_seen.push((pubkey, event.created_at));
         }
         match event.kind {
-            nip09::DELETION_KIND => apply_nip09(db, event, stats).await?,
+            nip09::DELETION_KIND => apply_nip09(db, event, stats, wrap_purges).await?,
             nip62::VANISH_KIND
                 if opts.apply_vanish
                     && opts.nip62_enabled
@@ -696,7 +712,12 @@ async fn replay_stored_moderation(
 
 /// NIP-09: apply the deletion and purge the deleter's gift wraps (the relay
 /// does both after storing the request).
-async fn apply_nip09(db: &DbClient, event: &Event, stats: &mut Stats) -> Result<()> {
+async fn apply_nip09(
+    db: &DbClient,
+    event: &Event,
+    stats: &mut Stats,
+    wrap_purges: &mut Vec<([u8; 32], u64)>,
+) -> Result<()> {
     let targets = nip09::deletion_targets(event);
     let (removed, _state_removed) = db
         .apply_deletion_checked(
@@ -726,18 +747,11 @@ async fn apply_nip09(db: &DbClient, event: &Event, stats: &mut Stats) -> Result<
                  not complete (re-run it)"
             ),
         }
-        // Bounded by the deletion's own timestamp: a wrap imported after the
-        // request (created later) must survive, matching the live order.
-        match db
-            .delete_gift_wraps_to_checked(pubkey, event.created_at)
-            .await
-        {
-            Some(purged) => stats.gift_wrap_purges += purged as u64,
-            None => bail!(
-                "NIP-59 gift-wrap purge was not applied; the migration did not \
-                 complete (re-run it)"
-            ),
-        }
+        // The wrap purge is deferred to after the import: deciding it
+        // during the stream made a same-second wrap's fate depend on the
+        // batch boundary. Bounded by the deletion's own timestamp, so a
+        // wrap created later survives.
+        wrap_purges.push((pubkey, event.created_at));
     }
     Ok(())
 }
@@ -1601,22 +1615,44 @@ mod tests {
     fn a_wrap_imported_after_the_deletion_survives() {
         // The live relay purges only the wraps stored when the request
         // arrives; a wrap imported later must survive regardless of the
-        // batch size (the unbounded walk removed it).
-        let db = test_db("wrap-order");
-        let now = unix_now();
-        let recipient = keypair(1).x_only_public_key().0.to_string();
-        let deletion = signed(1, nip09::DELETION_KIND, now - 10, vec![], "");
-        let wrap = signed(
-            2,
-            nip62::GIFT_WRAP_KIND,
-            now - 5,
-            vec![vec!["p".into(), recipient]],
-            "",
-        );
-        let stats = run_str(&db, &jsonl(&[deletion, wrap.clone()]), &options());
-        assert_eq!(stats.gift_wrap_purges, 0, "the later wrap survives");
-        assert_eq!(visible(&db, serde_json::json!({"ids": [wrap.id]})).len(), 1);
-        db.shutdown();
+        // batch size. The purge is deferred, so a same-second wrap is
+        // deterministic too.
+        for batch in [1usize, 512] {
+            let db = test_db("wrap-order");
+            let now = unix_now();
+            let recipient = keypair(1).x_only_public_key().0.to_string();
+            let deletion = signed(1, nip09::DELETION_KIND, now - 10, vec![], "");
+            let later = signed(
+                2,
+                nip62::GIFT_WRAP_KIND,
+                now - 5,
+                vec![vec!["p".into(), recipient.clone()]],
+                "",
+            );
+            let same_second = signed(
+                3,
+                nip62::GIFT_WRAP_KIND,
+                now - 10,
+                vec![vec!["p".into(), recipient]],
+                "",
+            );
+            let stats = run_str(
+                &db,
+                &jsonl(&[deletion, same_second.clone(), later.clone()]),
+                &Options { batch, ..options() },
+            );
+            assert_eq!(stats.gift_wrap_purges, 1, "batch {batch}");
+            assert_eq!(
+                visible(&db, serde_json::json!({"ids": [later.id]})).len(),
+                1,
+                "a later wrap survives (batch {batch})"
+            );
+            assert!(
+                visible(&db, serde_json::json!({"ids": [same_second.id]})).is_empty(),
+                "a same-second wrap is purged deterministically (batch {batch})"
+            );
+            db.shutdown();
+        }
     }
 
     #[test]
