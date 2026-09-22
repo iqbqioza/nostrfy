@@ -63,6 +63,9 @@ pub struct Options {
     /// Whether NIP-62 is enabled in the nostrfy config; a disabled NIP
     /// means the relay would not honor a live vanish either.
     pub nip62_enabled: bool,
+    /// Whether NIP-40 is enabled in the nostrfy config: a dry run uses it
+    /// to classify already-expired events like the put path would.
+    pub nip40_enabled: bool,
     /// Record the first-seen timestamp of each imported author (only
     /// meaningful, and only set, when the new-pubkey gate is configured).
     pub first_seen: bool,
@@ -76,6 +79,12 @@ pub struct Options {
     pub host: String,
     pub port: u16,
     pub public_url: String,
+    /// The relay's own public key (hex), when `relay.private_key` is
+    /// configured: NIP-29 moderation signed by it is authorized (the relay
+    /// is the group master key).
+    pub relay_pubkey: Option<String>,
+    /// The configured NIP-29 group cap, for the authorization replay.
+    pub max_groups: usize,
 }
 
 /// Counters for one migration run.
@@ -113,6 +122,10 @@ pub struct Stats {
     pub group_purges: u64,
     /// Events removed by those purges.
     pub group_purge_removed: u64,
+    /// NIP-29 moderation events (9000-9020) whose author was not an admin:
+    /// they are stored (strfry kept them) but their side effects and state
+    /// changes are not applied.
+    pub unauthorized_moderation: u64,
     /// NIP-62 vanishes applied (only with `apply_vanish`).
     pub vanishes: u64,
     /// Events removed by those vanishes.
@@ -183,6 +196,13 @@ impl std::fmt::Display for Stats {
             self.previously_deleted,
             self.invalid
         )?;
+        if self.unauthorized_moderation > 0 {
+            writeln!(
+                f,
+                "ignored {} NIP-29 moderation event(s) from non-admins (stored, not applied)",
+                self.unauthorized_moderation
+            )?;
+        }
         write!(
             f,
             "side effects: {} NIP-09 deletion(s) ({} absent-target block(s)), \
@@ -211,6 +231,16 @@ pub async fn run(
 ) -> Result<Stats> {
     let secp = Secp256k1::new();
     let identity = nip62::RelayIdentity::new(&opts.host, opts.port, &opts.public_url);
+    // NIP-29 authorization replay: the relay's live write path only lets a
+    // group admin (or the relay's own key) moderate, but strfry stores every
+    // signed event. A 9005/9008 side effect must not act on an event the
+    // relay itself would have rejected. The replay is seeded from the
+    // moderation events already stored so a resume or a merge into an
+    // existing database authorizes against the state they built.
+    let mut groups = db.map(|_| crate::nips::nip29::GroupStore::with_cap(opts.max_groups));
+    if let (Some(db), Some(store)) = (db, groups.as_mut()) {
+        seed_group_state(db, store, opts.relay_pubkey.as_deref()).await?;
+    }
     let now = unix_now();
     let mut stats = Stats::default();
     // The configured batch bounds the count; cap the pre-allocation so an
@@ -298,8 +328,28 @@ pub async fn run(
             continue;
         }
         batch_bytes = batch_bytes.saturating_add(trimmed.len());
+        // A 9008 purges the group's stored history: flush it as its own
+        // batch. The purge walk removes every `h`-tagged event stored at
+        // that point, so without the flush the events that follow the 9008
+        // in the export (a re-created group) would already be committed and
+        // would be purged too (and their timestamps would permanently
+        // block the re-creation).
+        let group_purge = event.kind == 9008;
+        // A honored NIP-62 vanish blocks the author permanently: flush it on
+        // its own so the events that follow in the export meet the marker at
+        // put time instead of being committed in the same batch and staying
+        // visible.
+        let vanish = event.kind == nip62::VANISH_KIND
+            && opts.apply_vanish
+            && opts.nip62_enabled
+            && nip62::is_vanish(&event)
+            && nip62::targets_us(&event, &identity);
         batch.push((Arc::new(event), now));
-        if batch.len() >= opts.batch.max(1) || batch_bytes >= MAX_BATCH_BYTES {
+        if group_purge
+            || vanish
+            || batch.len() >= opts.batch.max(1)
+            || batch_bytes >= MAX_BATCH_BYTES
+        {
             flush(
                 db,
                 &mut batch,
@@ -308,6 +358,7 @@ pub async fn run(
                 opts,
                 &identity,
                 &mut first_seen,
+                groups.as_mut(),
             )
             .await?;
             on_progress(&stats);
@@ -321,6 +372,7 @@ pub async fn run(
         opts,
         &identity,
         &mut first_seen,
+        groups.as_mut(),
     )
     .await?;
     on_progress(&stats);
@@ -381,6 +433,7 @@ async fn flush(
     opts: &Options,
     identity: &nip62::RelayIdentity<'_>,
     first_seen: &mut Vec<([u8; 32], u64)>,
+    groups: Option<&mut crate::nips::nip29::GroupStore>,
 ) -> Result<()> {
     if batch.is_empty() {
         return Ok(());
@@ -388,8 +441,21 @@ async fn flush(
     let events = std::mem::take(batch);
     *batch_bytes = 0;
     let Some(db) = db else {
-        // Dry run: every parsed and verified event is "valid".
-        stats.valid += events.len() as u64;
+        // Dry run: no database, so classify with the same rules the put
+        // path would apply before storage (ephemeral kinds and NIP-40
+        // expiry are never stored) and count the rest as valid. Deletion
+        // side effects cannot be predicted without the database.
+        for (event, now) in &events {
+            if (20000..30000).contains(&event.kind) {
+                stats.ephemeral += 1;
+            } else if opts.nip40_enabled
+                && crate::nips::nip40::expiry(event).is_some_and(|exp| exp <= *now)
+            {
+                stats.expired += 1;
+            } else {
+                stats.valid += 1;
+            }
+        }
         return Ok(());
     };
     let outcomes = db.put_batch_checked(events.clone()).await.ok_or_else(|| {
@@ -403,6 +469,7 @@ async fn flush(
             events.len()
         );
     }
+    let mut groups = groups;
     for ((event, _), outcome) in events.iter().zip(outcomes.iter()) {
         stats.record(outcome);
         let accepted = matches!(
@@ -423,6 +490,19 @@ async fn flush(
         {
             first_seen.push((pubkey, event.created_at));
         }
+        // Keep the NIP-29 authorization state in step with the accepted
+        // events and learn whether a moderation event's author is allowed
+        // to act (the live write path enforces the same rule; strfry
+        // stored these events without any NIP-29 validation).
+        let mut authorized = true;
+        if let Some(store) = groups.as_deref_mut()
+            && is_group_event(event.kind)
+        {
+            authorized = replay_moderation(store, event, opts.relay_pubkey.as_deref());
+            if !authorized {
+                stats.unauthorized_moderation += 1;
+            }
+        }
         match event.kind {
             nip09::DELETION_KIND => apply_nip09(db, event, stats).await?,
             nip62::VANISH_KIND
@@ -433,13 +513,91 @@ async fn flush(
             {
                 apply_vanish(db, event, stats).await?
             }
-            9005 => apply_group_deletion(db, event, stats).await?,
-            9008 => apply_group_purge(db, event, stats).await?,
+            9005 if authorized => apply_group_deletion(db, event, stats).await?,
+            9008 if authorized => apply_group_purge(db, event, stats).await?,
             _ => {}
         }
     }
     if opts.first_seen && !first_seen.is_empty() {
         db.touch_first_seen_batch(std::mem::take(first_seen)).await;
+    }
+    Ok(())
+}
+
+/// Whether an event participates in the NIP-29 group state machine.
+fn is_group_event(kind: u64) -> bool {
+    (crate::nips::nip29::MOD_MIN..=crate::nips::nip29::MOD_MAX).contains(&kind)
+        || kind == crate::nips::nip29::JOIN
+        || kind == crate::nips::nip29::LEAVE
+}
+
+/// Replays one event into the NIP-29 authorization state, returning whether
+/// a moderation event's author is allowed to act. The rule mirrors the live
+/// write path: the relay's own key is the group master key, an existing
+/// group requires an admin, and an unknown group only accepts a create.
+fn replay_moderation(
+    groups: &mut crate::nips::nip29::GroupStore,
+    event: &Event,
+    relay_pubkey: Option<&str>,
+) -> bool {
+    if (crate::nips::nip29::MOD_MIN..=crate::nips::nip29::MOD_MAX).contains(&event.kind)
+        && !relay_pubkey.is_some_and(|pk| pk.eq_ignore_ascii_case(&event.pubkey))
+    {
+        let authorized = match crate::nips::nip29::group_id(event).and_then(|gid| groups.group(gid))
+        {
+            Some(group) => group.is_admin(&event.pubkey),
+            None => event.kind == crate::nips::nip29::CREATE_GROUP,
+        };
+        if !authorized {
+            return false;
+        }
+    }
+    groups.apply(event, relay_pubkey.unwrap_or(""), unix_now(), false, true);
+    true
+}
+
+/// Seeds the NIP-29 authorization replay with the moderation events already
+/// stored: a resumed migration (`--since`) or a merge into an existing
+/// database must authorize a `9005`/`9008` against the state its
+/// predecessors built.
+async fn seed_group_state(
+    db: &DbClient,
+    groups: &mut crate::nips::nip29::GroupStore,
+    relay_pubkey: Option<&str>,
+) -> Result<()> {
+    let kinds: Vec<u64> = (crate::nips::nip29::MOD_MIN..=crate::nips::nip29::MOD_MAX)
+        .chain([crate::nips::nip29::JOIN, crate::nips::nip29::LEAVE])
+        .collect();
+    const PAGE: usize = 50_000;
+    let mut since: Option<u64> = None;
+    loop {
+        let mut filter: crate::filter::Filter =
+            serde_json::from_value(serde_json::json!({ "kinds": kinds })).expect("static filter");
+        filter.since = since;
+        let Some((mut page, more)) = db
+            .query_full_startup(vec![filter], PAGE, unix_now(), true)
+            .await
+        else {
+            bail!(
+                "could not read the stored NIP-29 state for the moderation replay; the \
+                 migration did not complete (re-run it)"
+            );
+        };
+        if page.is_empty() {
+            break;
+        }
+        page.sort_by(|a, b| (a.created_at, a.kind, &a.id).cmp(&(b.created_at, b.kind, &b.id)));
+        let max_created = page.last().map(|event| event.created_at);
+        for event in page {
+            replay_moderation(groups, &event, relay_pubkey);
+        }
+        if !more {
+            break;
+        }
+        match max_created {
+            Some(ts) if ts < u64::MAX => since = Some(ts.saturating_add(1)),
+            _ => break,
+        }
     }
     Ok(())
 }
@@ -607,12 +765,15 @@ mod tests {
             verify: true,
             apply_vanish: false,
             nip62_enabled: true,
+            nip40_enabled: true,
             first_seen: false,
             batch: 3,
             max_line_bytes: 1024 * 1024,
             host: "127.0.0.1".into(),
             port: 8080,
             public_url: String::new(),
+            relay_pubkey: None,
+            max_groups: 0,
         }
     }
 
@@ -836,6 +997,7 @@ mod tests {
     fn group_delete_event_writes_tombstones() {
         let db = test_db("group-9005");
         let now = unix_now();
+        let create = signed(1, 9007, now - 20, vec![vec!["h".into(), "g1".into()]], "");
         let post = signed(1, 9, now - 10, vec![vec!["h".into(), "g1".into()]], "post");
         let delete = signed(
             1,
@@ -847,8 +1009,73 @@ mod tests {
             ],
             "",
         );
-        let stats = run_str(&db, &jsonl(&[post.clone(), delete]), &options());
+        let stats = run_str(&db, &jsonl(&[create, post.clone(), delete]), &options());
         assert_eq!(stats.group_deletions, 1);
+        assert!(visible(&db, serde_json::json!({"ids": [post.id]})).is_empty());
+        db.shutdown();
+    }
+
+    #[test]
+    fn unauthorized_group_moderation_is_not_applied() {
+        // strfry stores every signed event, so the export can contain
+        // moderation events nostrfy's write path would have rejected. A
+        // non-admin's 9005/9008 must not delete or purge (the events stay
+        // stored; the startup rebuild ignores them too).
+        let db = test_db("unauthorized-moderation");
+        let now = unix_now();
+        let create = signed(1, 9007, now - 40, vec![vec!["h".into(), "g".into()]], "");
+        let post = signed(1, 9, now - 30, vec![vec!["h".into(), "g".into()]], "post");
+        let bad_delete = signed(
+            2,
+            9005,
+            now - 20,
+            vec![
+                vec!["h".into(), "g".into()],
+                vec!["e".into(), post.id.clone()],
+            ],
+            "",
+        );
+        let bad_purge = signed(2, 9008, now - 10, vec![vec!["h".into(), "g".into()]], "");
+        let stats = run_str(
+            &db,
+            &jsonl(&[create, post.clone(), bad_delete, bad_purge]),
+            &options(),
+        );
+        assert_eq!(stats.group_deletions, 0);
+        assert_eq!(stats.group_purges, 0);
+        assert_eq!(stats.unauthorized_moderation, 2);
+        assert_eq!(
+            visible(&db, serde_json::json!({"ids": [post.id]})).len(),
+            1,
+            "an unauthorized 9005 must not delete the post"
+        );
+        assert_eq!(
+            visible(&db, serde_json::json!({"kinds": [9007]})).len(),
+            1,
+            "an unauthorized 9008 must not purge the group"
+        );
+        // The relay's own key is the master key: its 9005 applies.
+        let relay_key = keypair(3);
+        let relay_pubkey = relay_key.x_only_public_key().0.to_string();
+        let relay_delete = signed(
+            3,
+            9005,
+            now - 5,
+            vec![
+                vec!["h".into(), "g".into()],
+                vec!["e".into(), post.id.clone()],
+            ],
+            "",
+        );
+        let stats = run_str(
+            &db,
+            &jsonl(&[relay_delete]),
+            &Options {
+                relay_pubkey: Some(relay_pubkey),
+                ..options()
+            },
+        );
+        assert_eq!(stats.group_deletions, 1, "the relay-signed 9005 applies");
         assert!(visible(&db, serde_json::json!({"ids": [post.id]})).is_empty());
         db.shutdown();
     }
@@ -862,6 +1089,7 @@ mod tests {
         let delete = signed(1, 9008, now - 5, vec![vec!["h".into(), "g2".into()]], "");
         let stats = run_str(&db, &jsonl(&[create, post, delete]), &options());
         assert_eq!(stats.group_purges, 1);
+        assert_eq!(stats.unauthorized_moderation, 0);
         assert!(
             visible(&db, serde_json::json!({})).is_empty(),
             "every h-tagged event (including the 9008) must be purged"
@@ -919,6 +1147,39 @@ mod tests {
             "the note and the vanish request itself (created_at <= until) are removed"
         );
         assert!(visible(&db, serde_json::json!({"ids": [note.id]})).is_empty());
+        db.shutdown();
+    }
+
+    #[test]
+    fn vanish_blocks_later_events_in_the_same_batch() {
+        // The export is oldest-first; with a large batch the events after
+        // the request used to be committed before the vanish marker was
+        // written and stayed visible (the live relay blocks the author
+        // permanently).
+        let db = test_db("vanish-order");
+        let now = unix_now();
+        let before = signed(1, 1, now - 10, vec![], "before");
+        let vanish = signed(
+            1,
+            nip62::VANISH_KIND,
+            now - 5,
+            vec![vec!["relay".into(), "ALL_RELAYS".into()]],
+            "",
+        );
+        let after = signed(1, 1, now - 1, vec![], "after");
+        let mut opts = options();
+        opts.apply_vanish = true;
+        opts.batch = 512;
+        let stats = run_str(&db, &jsonl(&[before, vanish, after]), &opts);
+        assert_eq!(stats.vanishes, 1);
+        assert_eq!(
+            stats.invalid, 1,
+            "the post-request event must be blocked by the marker"
+        );
+        assert!(
+            visible(&db, serde_json::json!({})).is_empty(),
+            "nothing of the vanished author stays visible"
+        );
         db.shutdown();
     }
 
@@ -1035,6 +1296,43 @@ mod tests {
     }
 
     #[test]
+    fn a_tombstone_overflow_falls_back_to_an_unconditional_block() {
+        // More deleters than the scoped list holds: dropping the extra one
+        // would fail open when it is the author's own deletion (the target
+        // is absent precisely because strfry deleted it on the author's
+        // request), so the marker becomes unconditional.
+        let db = test_db("nip09-overflow");
+        let now = unix_now();
+        let target = signed(9, 1, now - 20, vec![], "gone");
+        let mut events = Vec::new();
+        for seed in 1..=4u8 {
+            events.push(signed(
+                seed,
+                nip09::DELETION_KIND,
+                now - 10 + u64::from(seed),
+                vec![vec!["e".into(), target.id.clone()]],
+                "",
+            ));
+        }
+        events.push(signed(
+            9,
+            nip09::DELETION_KIND,
+            now - 4,
+            vec![vec!["e".into(), target.id.clone()]],
+            "",
+        ));
+        let stats = run_str(&db, &jsonl(&events), &options());
+        assert_eq!(stats.deletion_blocks, 5);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let outcome = rt.block_on(db.put(target, unix_now()));
+        assert!(
+            matches!(outcome, PutOutcome::PreviouslyDeleted),
+            "the author's block must be effective after the overflow, got {outcome:?}"
+        );
+        db.shutdown();
+    }
+
+    #[test]
     fn group_recreate_after_purge_keeps_the_new_posts() {
         // The purge marker's cut must be the 9008's created_at: a group
         // re-created after the deletion has its own, newer events, and the
@@ -1050,7 +1348,13 @@ mod tests {
         let stats = run_str(
             &db,
             &jsonl(&[create, old_post, delete, recreate, new_post]),
-            &options(),
+            // A batch large enough to hold the whole input: the 9008 must
+            // still be flushed on its own, or the re-created group's events
+            // (later in the export) would be purged with the old history.
+            &Options {
+                batch: 512,
+                ..options()
+            },
         );
         assert_eq!(stats.group_purges, 1);
         let posts = visible(&db, serde_json::json!({"kinds": [9]}));

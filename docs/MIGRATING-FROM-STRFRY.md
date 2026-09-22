@@ -110,8 +110,8 @@ reports before continuing.
 ### Merging the strfry settings (optional)
 
 Before the database is opened, `migrate-strfry` looks for strfry's config
-(`--strfry-config <PATH>`, else `$STRFRY_CONFIG`, `./strfry.conf`,
-`/etc/strfry.conf`), prints the settings that have a nostrfy equivalent and
+(`--strfry-config <PATH>`, else `$STRFRY_CONFIG`, `/etc/strfry.conf`,
+`./strfry.conf`), prints the settings that have a nostrfy equivalent and
 differ from your `nostrfy.toml`, and asks whether to merge them:
 
 ```
@@ -127,19 +127,23 @@ not merged (no nostrfy equivalent):
 Merge these 12 setting(s) into /etc/nostrfy/nostrfy.toml? [y/N]
 ```
 
-Only the listed keys are rewritten; comments and every other line are kept,
-and the merge is refused (the file is left untouched) if the result would not
-validate. A single unusable value is skipped with its reason while the rest
-still merge.
+Only the listed keys are rewritten; comments and every other line are kept.
+A single unusable value (for example an npub `relay.info.pubkey`, which
+nostrfy cannot use) is skipped with its reason while the rest still merge,
+and the file is never left invalid.
 
 - `y` applies the merge and the migration continues with the merged config
-  (so a merged `database.map_size` applies to this very migration).
+  (so a merged `database.max_map_size` applies to this very migration).
 - `--merge-config` applies without asking (for scripts).
 - `--no-merge-config` skips the step entirely.
 - With no terminal (e.g. `strfry export | nostrfy migrate-strfry` in CI) the
   proposals are printed and the merge is skipped unless `--merge-config` is
   given.
 - `--dry-run` prints the proposals but never writes.
+- An explicitly named config (`--strfry-config` or `$STRFRY_CONFIG`) that
+  cannot be read is an error; an auto-discovered one is skipped with a note.
+- The prompt waits for an answer (Ctrl-C aborts); in scripts use
+  `--merge-config` so nothing blocks.
 
 ## 6. Step 4 — Dry run
 
@@ -168,6 +172,10 @@ skipped 0 event(s): 0 malformed, 0 oversized, 0 bad signature, ...
 A non-zero `bad signature` count means the export contains events strfry
 accepted without verification (e.g. imported with `--no-verify`); they will
 be skipped. If you trust them, pass `--no-verify` to import them anyway.
+
+The dry run classifies ephemeral and already-expired events (they are never
+stored) but does not simulate the NIP-09/NIP-29 deletion side effects, which
+need the database: expect the real run's side-effect counts to be non-zero.
 
 ## 7. Step 5 — Migrate
 

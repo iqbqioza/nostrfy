@@ -145,6 +145,20 @@ impl Store {
                         continue;
                     }
                     if existing.len() >= ID_LEN * SCOPED_TOMBSTONE_MAX {
+                        // More deleters than the scoped list holds. Dropping
+                        // this one would fail open when it is the author's
+                        // own deletion (the target is absent from the source
+                        // precisely because strfry deleted it on the
+                        // author's request), so fall back to an
+                        // unconditional tombstone: the event id was deleted
+                        // by many keys, and NIP-09 makes the deletion
+                        // permanent for that id.
+                        log::warn!(
+                            "deletion target {target} has more than {SCOPED_TOMBSTONE_MAX} \
+                             deleters; recording an unconditional re-publication block"
+                        );
+                        self.deleted.put(&mut wtxn, &id, &[])?;
+                        recorded += 1;
                         continue;
                     }
                     let mut merged = existing.to_vec();

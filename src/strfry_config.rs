@@ -75,16 +75,28 @@ fn tokenize(text: &str) -> Vec<Token> {
     while let Some(ch) = chars.next() {
         match ch {
             c if c.is_whitespace() => {}
-            '#' => {
-                while chars.peek().is_some_and(|c| *c != '\n') {
+            // strfry parses its config as jaxn, which accepts `#`, `//` and
+            // `/* ... */` comments. Missing the latter two merged
+            // commented-out assignments or let a commented-out brace
+            // derail the nesting.
+            '#' => skip_line_comment(&mut chars),
+            '/' => match chars.peek() {
+                Some('/') => {
                     chars.next();
+                    skip_line_comment(&mut chars);
                 }
-            }
+                Some('*') => {
+                    chars.next();
+                    skip_block_comment(&mut chars);
+                }
+                _ => tokens.push(Token::Name("/".into())),
+            },
             '{' => tokens.push(Token::LBrace),
             '}' => tokens.push(Token::RBrace),
             '=' | ':' => tokens.push(Token::Eq),
             ';' | ',' => tokens.push(Token::Semi),
-            '"' => tokens.push(Token::Str(read_string(&mut chars))),
+            '"' => tokens.push(Token::Str(read_string(&mut chars, '"'))),
+            '\'' => tokens.push(Token::Str(read_string(&mut chars, '\''))),
             '[' => {
                 skip_balanced(&mut chars);
                 tokens.push(Token::Other);
@@ -115,27 +127,105 @@ fn tokenize(text: &str) -> Vec<Token> {
     tokens
 }
 
-/// Reads a quoted string body (the opening quote was consumed), honoring
-/// `\\`/`\"` escapes.
-fn read_string(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> String {
-    let mut out = String::new();
-    let mut escaped = false;
+/// Skips the rest of a `#` or `//` comment (the marker was consumed).
+fn skip_line_comment(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    while chars.peek().is_some_and(|c| *c != '\n') {
+        chars.next();
+    }
+}
+
+/// Skips a `/* ... */` block comment (the opening `/*` was consumed). An
+/// unterminated comment consumes the rest of the file, like the grammar's
+/// end-of-input acceptance.
+fn skip_block_comment(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    let mut star = false;
     for ch in chars.by_ref() {
-        if escaped {
+        if star && ch == '/' {
+            return;
+        }
+        star = ch == '*';
+    }
+}
+
+/// Reads a quoted string body (the opening quote was consumed), decoding the
+/// jaxn escapes strfry accepts (`\" \' \\ \/ \b \f \n \r \t \v \0`,
+/// `\uXXXX` and `\u{...}`). An unknown escape keeps its backslash: silently
+/// dropping it would merge a different value than strfry read.
+fn read_string(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, quote: char) -> String {
+    let mut out = String::new();
+    while let Some(ch) = chars.next() {
+        if ch == quote {
+            break;
+        }
+        if ch != '\\' {
             out.push(ch);
-            escaped = false;
             continue;
         }
-        match ch {
-            '\\' => escaped = true,
-            '"' => break,
-            _ => out.push(ch),
+        match chars.next() {
+            Some('"') => out.push('"'),
+            Some('\'') => out.push('\''),
+            Some('\\') => out.push('\\'),
+            Some('/') => out.push('/'),
+            Some('b') => out.push('\u{0008}'),
+            Some('f') => out.push('\u{000C}'),
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('t') => out.push('\t'),
+            Some('v') => out.push('\u{000B}'),
+            Some('0') => out.push('\0'),
+            Some('u') => match read_unicode_escape(chars) {
+                Some(decoded) => out.push(decoded),
+                None => out.push_str("\\u"),
+            },
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
         }
     }
     out
 }
 
-/// Skips a balanced `[...]` array (the opening bracket was consumed).
+/// Reads the tail of a `\u` escape (the `u` was consumed): `{codepoint}` or
+/// four hex digits, combining a UTF-16 surrogate pair when present.
+fn read_unicode_escape(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option<char> {
+    if chars.peek() == Some(&'{') {
+        chars.next();
+        let mut hex = String::new();
+        for ch in chars.by_ref() {
+            if ch == '}' {
+                break;
+            }
+            hex.push(ch);
+        }
+        return char::from_u32(u32::from_str_radix(&hex, 16).ok()?);
+    }
+    let mut hex = String::new();
+    for _ in 0..4 {
+        hex.push(chars.next()?);
+    }
+    let code = u32::from_str_radix(&hex, 16).ok()?;
+    if (0xD800..0xDC00).contains(&code) {
+        // A high surrogate: the low half must follow as `\uXXXX`.
+        if chars.next() == Some('\\') && chars.next() == Some('u') {
+            let mut low = String::new();
+            for _ in 0..4 {
+                low.push(chars.next()?);
+            }
+            let low = u32::from_str_radix(&low, 16).ok()?;
+            if (0xDC00..0xE000).contains(&low) {
+                return char::from_u32(0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00));
+            }
+        }
+        return None;
+    }
+    char::from_u32(code)
+}
+
+/// Skips a balanced `[...]` array (the opening bracket was consumed),
+/// honoring strings and comments so a `[`/`]` inside them cannot derail the
+/// scan.
 fn skip_balanced(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
     let mut depth = 1;
     while let Some(ch) = chars.next() {
@@ -148,8 +238,23 @@ fn skip_balanced(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
                 }
             }
             '"' => {
-                read_string(chars);
+                read_string(chars, '"');
             }
+            '\'' => {
+                read_string(chars, '\'');
+            }
+            '#' => skip_line_comment(chars),
+            '/' => match chars.peek() {
+                Some('/') => {
+                    chars.next();
+                    skip_line_comment(chars);
+                }
+                Some('*') => {
+                    chars.next();
+                    skip_block_comment(chars);
+                }
+                _ => {}
+            },
             _ => {}
         }
     }
@@ -404,7 +509,6 @@ const STRING_MAP: &[(&str, &str, &str)] = &[
     ("relay.info.description", "relay", "description"),
     ("relay.info.contact", "relay", "contact"),
     ("relay.info.icon", "relay", "icon"),
-    ("relay.info.pubkey", "relay", "pubkey"),
     ("relay.auth.serviceUrl", "relay", "public_url"),
     ("relay.bind", "server", "host"),
 ];
@@ -496,7 +600,6 @@ pub(crate) fn proposals(strfry: &StrfryConfig, nostrfy: &Config) -> Vec<Proposal
             ("relay", "description") => &nostrfy.relay.description,
             ("relay", "contact") => &nostrfy.relay.contact,
             ("relay", "icon") => &nostrfy.relay.icon,
-            ("relay", "pubkey") => &nostrfy.relay.pubkey,
             ("relay", "public_url") => &nostrfy.relay.public_url,
             ("server", "host") => &nostrfy.server.host,
             _ => continue,
@@ -523,7 +626,14 @@ pub(crate) fn proposals(strfry: &StrfryConfig, nostrfy: &Config) -> Vec<Proposal
         if strfry_key == "relay.maxFilterLimitCount" && *value == 0 {
             continue;
         }
-        if *value <= 0 || *value == current {
+        // `0` is meaningful for these two and reads the same way in
+        // nostrfy: no future-dated event (`created_at > now`) and no
+        // configured outgoing-queue cap.
+        let zero_ok = matches!(
+            strfry_key,
+            "events.rejectEventsNewerThanSeconds" | "relay.maxPendingOutboundBytes"
+        );
+        if *value < 0 || (*value == 0 && !zero_ok) || *value == current {
             continue;
         }
         out.push(Proposal {
@@ -535,20 +645,39 @@ pub(crate) fn proposals(strfry: &StrfryConfig, nostrfy: &Config) -> Vec<Proposal
             value_toml: value.to_string(),
         });
     }
-    // The LMDB map size: strfry's `mapsize` is the whole map, nostrfy's
-    // `map_size` is the initial map (it grows to `max_map_size`). Only
-    // offer it when it fits under nostrfy's configured ceiling, or the
-    // merged config would fail validation.
+    // `relay.info.pubkey` accepts an npub or 32-byte hex on strfry;
+    // nostrfy's `relay.pubkey` must be 64-hex, so only a hex value can be
+    // merged (a non-hex value is reported as unmapped below).
+    if let Some(Value::Str(value)) = strfry.get("relay.info.pubkey") {
+        let hex = value.to_ascii_lowercase();
+        if hex.len() == 64
+            && hex.chars().all(|c| c.is_ascii_hexdigit())
+            && hex != nostrfy.relay.pubkey
+        {
+            out.push(Proposal {
+                strfry_key: "relay.info.pubkey",
+                section: "relay",
+                key: "pubkey",
+                current: nostrfy.relay.pubkey.clone(),
+                proposed: hex.clone(),
+                value_toml: format!("\"{hex}\""),
+            });
+        }
+    }
+    // The LMDB map: strfry's `mapsize` is the whole reservation, and
+    // nostrfy opens its map at `database.max_map_size` (the map is never
+    // resized). Only an increase is offered: a smaller strfry map is
+    // already covered by the nostrfy value, while raising the ceiling
+    // prevents a map-full during or after the migration.
     if let Some(Value::Int(value)) = strfry.get("dbParams.mapsize")
         && *value > 0
-        && *value as u64 <= nostrfy.database.max_map_size as u64
-        && *value as u64 != nostrfy.database.map_size as u64
+        && *value as u64 > nostrfy.database.max_map_size as u64
     {
         out.push(Proposal {
             strfry_key: "dbParams.mapsize",
             section: "database",
-            key: "map_size",
-            current: nostrfy.database.map_size.to_string(),
+            key: "max_map_size",
+            current: nostrfy.database.max_map_size.to_string(),
             proposed: value.to_string(),
             value_toml: value.to_string(),
         });
@@ -559,11 +688,23 @@ pub(crate) fn proposals(strfry: &StrfryConfig, nostrfy: &Config) -> Vec<Proposal
 /// The strfry keys/blocks present in the config that are not merged, with
 /// the reason.
 pub(crate) fn unmapped(strfry: &StrfryConfig) -> Vec<(&'static str, &'static str)> {
-    UNMAPPED
+    let mut out: Vec<(&'static str, &'static str)> = UNMAPPED
         .iter()
         .filter(|(key, _)| strfry.get(key).is_some() || strfry.has_prefix(&format!("{key}.")))
         .copied()
-        .collect()
+        .collect();
+    // A non-hex `relay.info.pubkey` (an npub, which strfry accepts) cannot
+    // be merged: nostrfy requires 64 hex characters.
+    if let Some(Value::Str(value)) = strfry.get("relay.info.pubkey")
+        && !value.is_empty()
+        && !(value.len() == 64 && value.chars().all(|c| c.is_ascii_hexdigit()))
+    {
+        out.push((
+            "relay.info.pubkey",
+            "nostrfy requires a 64-hex pubkey; convert the npub before merging",
+        ));
+    }
+    out
 }
 
 /// Applies the proposals to the config text, preserving comments and every
@@ -589,22 +730,21 @@ pub(crate) fn validate_merged(text: &str) -> Result<(), String> {
     cfg.validate().map_err(|e| e.to_string())
 }
 
-/// Finds the strfry config to read, in strfry's own search order: an
-/// explicit path, `$STRFRY_CONFIG`, `./strfry.conf`, `/etc/strfry.conf`.
-pub(crate) fn find_config(explicit: Option<&Path>) -> Option<PathBuf> {
+/// Finds the strfry config to read, in strfry's own order: an explicit path
+/// (the flag or `$STRFRY_CONFIG`, returned even when it does not exist so
+/// the caller can report it), then `/etc/strfry.conf`, then `./strfry.conf`.
+/// The boolean is true for an explicitly requested path.
+pub(crate) fn find_config(explicit: Option<&Path>) -> Option<(PathBuf, bool)> {
     if let Some(path) = explicit {
-        return path.exists().then(|| path.to_path_buf());
+        return Some((path.to_path_buf(), true));
     }
     if let Ok(path) = std::env::var("STRFRY_CONFIG") {
-        let path = PathBuf::from(path);
-        if path.exists() {
-            return Some(path);
-        }
+        return Some((PathBuf::from(path), true));
     }
-    for candidate in ["strfry.conf", "/etc/strfry.conf"] {
+    for candidate in ["/etc/strfry.conf", "strfry.conf"] {
         let path = PathBuf::from(candidate);
         if path.exists() {
-            return Some(path);
+            return Some((path, false));
         }
     }
     None
@@ -722,12 +862,13 @@ relay {
         }
         // An empty strfry value is not proposed.
         assert!(!paths.contains(&"relay.pubkey".into()));
-        // strfry's 10 TB map exceeds nostrfy's ceiling: skipped.
-        assert!(!paths.contains(&"database.map_size".into()));
+        // strfry's 10 TB map exceeds nostrfy's ceiling: raised to
+        // `database.max_map_size` (the map is opened at that size).
+        assert!(paths.contains(&"database.max_map_size".into()));
     }
 
     #[test]
-    fn skips_the_zero_count_cap_and_oversized_mapsize() {
+    fn skips_the_zero_count_cap_and_smaller_mapsize() {
         let mut cfg = parsed();
         // maxFilterLimitCount = 0 means "disable COUNT" on strfry.
         cfg.values
@@ -739,22 +880,27 @@ relay {
                 .any(|p| p.path() == "limits.max_count"),
             "a disabled COUNT must not map to max_count = 0"
         );
-        // strfry's default 10 TB map exceeds nostrfy's 1 TB ceiling.
+        // A strfry map smaller than nostrfy's reservation is already
+        // covered: no proposal.
         cfg.values
-            .insert("dbParams.mapsize".into(), Value::Int(10_995_116_277_760));
+            .insert("dbParams.mapsize".into(), Value::Int(512 * 1024 * 1024));
         assert!(
             !proposals(&cfg, &nostrfy)
                 .iter()
-                .any(|p| p.path() == "database.map_size"),
-            "a map size above max_map_size must not be proposed"
+                .any(|p| p.path() == "database.max_map_size"),
+            "a smaller map size must not be proposed"
         );
-        cfg.values
-            .insert("dbParams.mapsize".into(), Value::Int(2_147_483_648));
+        // A larger one raises the ceiling so the migration cannot run into
+        // a full map.
+        cfg.values.insert(
+            "dbParams.mapsize".into(),
+            Value::Int(2 * 1024 * 1024 * 1024 * 1024),
+        );
         assert!(
             proposals(&cfg, &nostrfy)
                 .iter()
-                .any(|p| p.path() == "database.map_size"),
-            "a map size under the ceiling is proposed"
+                .any(|p| p.path() == "database.max_map_size"),
+            "a larger map size is proposed"
         );
     }
 
@@ -814,6 +960,106 @@ max_tags = 100
     }
 
     #[test]
+    fn parses_jaxn_comments_and_strings() {
+        // strfry reads `//` and `/* ... */` comments and single-quoted
+        // strings; missing them merged commented-out assignments or let a
+        // commented-out brace derail the nesting.
+        let cfg = StrfryConfig::parse(
+            "db = \"/x\"\n\
+             // relay.bind = \"9.9.9.9\"\n\
+             /* relay.negentropy { maxSyncEvents = 1 } */\n\
+             relay {\n\
+               // {\n\
+               info { name = 'single quoted' description = \"caf\\u00e9\\nnext\" }\n\
+               port = 7777\n\
+             }\n",
+        );
+        assert_eq!(cfg.get("relay.port"), Some(&Value::Int(7777)));
+        assert_eq!(
+            cfg.get("relay.info.name"),
+            Some(&Value::Str("single quoted".into()))
+        );
+        assert_eq!(
+            cfg.get("relay.info.description"),
+            Some(&Value::Str("caf\u{e9}\nnext".into()))
+        );
+        // The commented-out assignments must not become values.
+        assert_eq!(cfg.get("relay.bind"), None);
+        assert_eq!(cfg.get("relay.negentropy.maxSyncEvents"), None);
+    }
+
+    #[test]
+    fn array_comments_do_not_derail_the_scan() {
+        let cfg = StrfryConfig::parse(
+            "db = \"/x\"\n\
+             foo = [ # [note\n 1 ]\n\
+             relay { info { name = \"after\" } port = 7777 }\n",
+        );
+        assert_eq!(
+            cfg.get("relay.info.name"),
+            Some(&Value::Str("after".into()))
+        );
+        assert_eq!(cfg.get("relay.port"), Some(&Value::Int(7777)));
+    }
+
+    #[test]
+    fn hex_pubkey_is_merged_and_npub_is_reported() {
+        let mut cfg = parsed();
+        cfg.values
+            .insert("relay.info.pubkey".into(), Value::Str("aa".repeat(32)));
+        let nostrfy = Config::default();
+        assert!(
+            proposals(&cfg, &nostrfy)
+                .iter()
+                .any(|p| p.path() == "relay.pubkey")
+        );
+        assert!(
+            !unmapped(&cfg)
+                .iter()
+                .any(|(key, _)| *key == "relay.info.pubkey")
+        );
+
+        // strfry also accepts an npub; nostrfy requires 64 hex, so it is
+        // reported instead of proposed (and rejected by validation).
+        cfg.values
+            .insert("relay.info.pubkey".into(), Value::Str("npub1qqq".into()));
+        assert!(
+            !proposals(&cfg, &nostrfy)
+                .iter()
+                .any(|p| p.path() == "relay.pubkey")
+        );
+        assert!(
+            unmapped(&cfg)
+                .iter()
+                .any(|(key, _)| *key == "relay.info.pubkey")
+        );
+    }
+
+    #[test]
+    fn meaningful_zeros_are_merged() {
+        let mut cfg = parsed();
+        cfg.values
+            .insert("events.rejectEventsNewerThanSeconds".into(), Value::Int(0));
+        cfg.values
+            .insert("relay.maxPendingOutboundBytes".into(), Value::Int(0));
+        let nostrfy = Config::default();
+        let paths: Vec<String> = proposals(&cfg, &nostrfy)
+            .iter()
+            .map(Proposal::path)
+            .collect();
+        assert!(paths.contains(&"limits.max_created_at_future_secs".into()));
+        assert!(paths.contains(&"limits.max_out_queue_bytes".into()));
+        // `maxFilterLimitCount = 0` stays excluded (COUNT is disabled).
+        cfg.values
+            .insert("relay.maxFilterLimitCount".into(), Value::Int(0));
+        assert!(
+            !proposals(&cfg, &nostrfy)
+                .iter()
+                .any(|p| p.path() == "limits.max_count")
+        );
+    }
+
+    #[test]
     fn find_config_prefers_the_explicit_path() {
         let dir =
             std::env::temp_dir().join(format!("nostrfy-strfry-config-test-{}", std::process::id()));
@@ -821,8 +1067,13 @@ max_tags = 100
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("custom.conf");
         std::fs::write(&path, "db = \"/x\"\n").unwrap();
-        assert_eq!(find_config(Some(&path)), Some(path.clone()));
-        assert_eq!(find_config(Some(&dir.join("missing.conf"))), None);
+        assert_eq!(find_config(Some(&path)), Some((path.clone(), true)));
+        // An explicit path is returned even when missing: the caller reports
+        // it instead of silently falling back to another file.
+        assert_eq!(
+            find_config(Some(&dir.join("missing.conf"))),
+            Some((dir.join("missing.conf"), true))
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

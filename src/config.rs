@@ -2039,12 +2039,20 @@ pub(crate) fn set_config_field_in_text(
         .map(|i| header_start + i + 1)
         .unwrap_or(text.len());
 
-    // Bound the section at the next `[section]` header line.
+    // Bound the section at the next table header line. A header may carry a
+    // trailing comment (`[rpc] # management`), which bounds the section
+    // just like a bare `[rpc]`: missing it let the slice below extend into
+    // the next section and overwrite an unrelated key.
     let mut section_end = text.len();
     let mut cursor = header_end;
     for l in text[header_end..].split_inclusive('\n') {
         let t = l.trim();
-        if t.starts_with('[') && t.ends_with(']') {
+        if t.starts_with('[')
+            && t.find(']').is_some_and(|end| {
+                let rest = &t[end + 1..];
+                rest.is_empty() || rest.starts_with([' ', '\t', '#'])
+            })
+        {
             section_end = cursor;
             break;
         }
@@ -2120,6 +2128,12 @@ fn stricter_mode(captured: u32, current: u32) -> u32 {
 pub(crate) fn write_text_atomic(path: &Path, text: &str) -> anyhow::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    // A symlinked config is written through to its target: the atomic
+    // rename would otherwise replace the link with a regular file and leave
+    // the target stale. A path that cannot be resolved (a missing file)
+    // keeps the original.
+    let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let path = resolved.as_path();
     // A unique, exclusively-created temp file: the old fixed `path.tmp`
     // name let two concurrent writers (NIP-86 config updates, `genkey`)
     // truncate each other's temp, so one rename could publish a
@@ -2539,6 +2553,24 @@ mod tests {
     }
 
     #[test]
+    fn section_with_a_trailing_comment_still_bounds_the_section() {
+        // A header with a trailing comment (`[rpc] # management`) is a real
+        // table boundary: without recognizing it the edit slipped into the
+        // next section and overwrote an unrelated key (e.g. `blossom.host`).
+        let text = "[server]\nport = 8080\n\n[rpc] # management\nmanagement_token = \"\"\n\n\
+                    [blossom] # uploads\nhost = \"\"\n";
+        let out = set_config_field_in_text(text, "server", "host", "\"0.0.0.0\"");
+        assert!(
+            out.contains("[server]\nhost = \"0.0.0.0\"\nport = 8080"),
+            "the key is inserted into its own section: {out}"
+        );
+        assert!(
+            out.contains("host = \"\""),
+            "the later section's key must stay untouched: {out}"
+        );
+    }
+
+    #[test]
     fn legacy_aliases_apply_and_warn() {
         // A config written for the old layout is accepted: every legacy
         // key lands in its new location.
@@ -2926,6 +2958,21 @@ max_log_files = 2
             &std::fs::metadata(&plain).unwrap().permissions(),
         ) & 0o777;
         assert_eq!(mode, 0o644, "a plain config keeps its mode");
+        // A symlinked config is written through to its target: the link
+        // must survive and the target must hold the new content.
+        let real = dir.join("real.toml");
+        std::fs::write(&real, "a = 1").unwrap();
+        let link = dir.join("link.toml");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        write_text_atomic(&link, "a = 3").unwrap();
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the symlink must not be replaced by a regular file"
+        );
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "a = 3");
         // When the rename cannot complete (the target is a directory),
         // the temp is removed again and nothing world-readable is left
         // behind.

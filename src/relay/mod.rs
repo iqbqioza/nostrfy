@@ -1019,6 +1019,7 @@ fn schedule_groups_rebuild(
     db: DbClient,
     groups: std::sync::Arc<RwLock<GroupStore>>,
     config: std::sync::Arc<RwLock<Config>>,
+    relay_pubkey: Option<String>,
     state: std::sync::Arc<GroupsRebuild>,
     drain: tokio::sync::watch::Receiver<bool>,
 ) {
@@ -1030,7 +1031,14 @@ fn schedule_groups_rebuild(
         // it exits, so this request is covered.
         return;
     }
-    tokio::spawn(groups_rebuild_worker(db, groups, config, state, drain));
+    tokio::spawn(groups_rebuild_worker(
+        db,
+        groups,
+        config,
+        relay_pubkey,
+        state,
+        drain,
+    ));
 }
 
 /// The coalesced group-state rebuild worker. Holds the single-flight lock,
@@ -1057,6 +1065,7 @@ async fn groups_rebuild_worker(
     db: DbClient,
     groups: std::sync::Arc<RwLock<GroupStore>>,
     config: std::sync::Arc<RwLock<Config>>,
+    relay_pubkey: Option<String>,
     state: std::sync::Arc<GroupsRebuild>,
     mut drain: tokio::sync::watch::Receiver<bool>,
 ) {
@@ -1131,6 +1140,7 @@ async fn groups_rebuild_worker(
             let rebuilt = tokio::select! {
                 rebuilt = fresh.rebuild_after_vanish(
                     &db,
+                    relay_pubkey.as_deref(),
                     previous,
                     previous_deleted,
                     previous_ghost,
@@ -1253,7 +1263,7 @@ async fn groups_rebuild_worker(
     // and the next startup rebuilds instead.
     state.running.store(false, Ordering::SeqCst);
     if state.dirty.load(Ordering::SeqCst) && !*drain.borrow() {
-        schedule_groups_rebuild(db, groups, config, state, drain);
+        schedule_groups_rebuild(db, groups, config, relay_pubkey, state, drain);
     }
 }
 
@@ -3076,6 +3086,7 @@ impl Relay {
             self.db.clone(),
             Arc::clone(&self.groups),
             Arc::clone(&self.config),
+            self.relay_pubkey.clone(),
             Arc::clone(&self.groups_rebuild),
             self.subscribe_drain(),
         );
@@ -4468,7 +4479,7 @@ mod tests {
             // The rebuild path (what startup runs instead) recovers it.
             let mut rebuilt = crate::nips::nip29::GroupStore::with_cap(0);
             assert!(
-                rebuilt.rebuild(&relay.db).await,
+                rebuilt.rebuild(&relay.db, None).await,
                 "the replay rebuild must succeed"
             );
             assert!(

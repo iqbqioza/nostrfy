@@ -937,7 +937,10 @@ strfry export | nostrfy migrate-strfry
   the referenced events are removed, and a `9008` purges the group's stored
   history with a re-publication cut at the `9008`'s own timestamp (so a
   group re-created after the deletion keeps its newer events). An
-  incomplete purge aborts the migration.
+  incomplete purge aborts the migration. strfry stores every signed event
+  without NIP-29 validation, so a moderation event whose author is not a
+  group admin (or the relay key) is stored but not applied; the summary
+  reports how many were ignored, and the startup rebuild ignores them too.
 - First-seen timestamps, when `relay.new_pubkey_min_age_secs` is set, so
   migrated authors are not treated as brand-new accounts.
 
@@ -964,18 +967,24 @@ clients can display the migrated groups and members.
 ### Merging the strfry settings
 
 Before the database is opened, `migrate-strfry` looks for strfry's config
-(`--strfry-config`, then `$STRFRY_CONFIG`, `./strfry.conf`,
-`/etc/strfry.conf`), prints the settings that have a nostrfy equivalent and
+(`--strfry-config`, then `$STRFRY_CONFIG`, `/etc/strfry.conf`,
+`./strfry.conf`), prints the settings that have a nostrfy equivalent and
 differ from the current `nostrfy.toml`, and asks whether to merge them. Only
 the listed keys are touched; comments and all other lines are preserved, and
-the merge is refused (leaving the file untouched) if the result would not
-validate. Keys with no nostrfy equivalent are listed with the reason and the
-suggested replacement.
+a value that would make the config invalid is skipped with its reason while
+the rest still merge. Keys with no nostrfy equivalent are listed with the
+reason and the suggested replacement.
 
 The prompt reads from the controlling terminal, so it also works when the
 export is piped on stdin. `--merge-config` applies without asking (for
 scripts), `--no-merge-config` skips the step, and `--dry-run` only prints the
-proposals.
+proposals. An explicitly named config that cannot be read is an error;
+an auto-discovered file that cannot be read is skipped with a note.
+
+The values are copied as-is, but one behaviour differs: strfry disconnects a
+client that overruns `relay.maxPendingOutboundBytes`, while nostrfy drops
+frames and closes the live subscriptions at `limits.max_out_queue_bytes`
+(the mapped field).
 
 ### Options
 

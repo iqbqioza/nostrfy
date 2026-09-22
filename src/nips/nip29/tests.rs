@@ -378,7 +378,7 @@ fn vanish_rebuild_does_not_recreate_membership_of_private_groups() {
         db.apply_vanish(vanished, now).await;
 
         let mut store = GroupStore::default();
-        assert!(store.rebuild(&db).await, "the rebuild must complete");
+        assert!(store.rebuild(&db, None).await, "the rebuild must complete");
         let group = store.group("g1").expect("the group survives");
         assert!(
             !group.is_member(OTHER),
@@ -1026,10 +1026,100 @@ fn rebuild_keeps_join_membership() {
         );
 
         let mut store = GroupStore::default();
-        assert!(store.rebuild(&db).await, "the rebuild must complete");
+        assert!(store.rebuild(&db, None).await, "the rebuild must complete");
         let g = store.group("g1").expect("group rebuilt");
         assert!(g.is_admin(ADMIN), "creator is admin after rebuild");
         assert!(g.is_member(OTHER), "JOIN membership survives rebuild");
+    });
+}
+
+#[test]
+fn rebuild_ignores_moderation_from_non_admins() {
+    // strfry stores every signed event without NIP-29 validation, so a
+    // migrated database can contain moderation events the relay's own write
+    // path would have rejected. Replaying them must not let a non-admin
+    // escalate (a 9000 grant) or destroy the group (a 9008); the relay's
+    // own key stays the master key.
+    use crate::db::DbClient;
+    use crate::nips::nip01;
+    use std::sync::Arc;
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = std::env::temp_dir()
+        .join("nostrfy-nip29-rebuild-auth")
+        .join(format!("{:x}-{id}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&path);
+    let cfg = crate::config::DatabaseConfig {
+        path,
+        map_size: 16 * 1024 * 1024,
+        max_map_size: 32 * 1024 * 1024,
+        ..Default::default()
+    };
+    let db = DbClient::open(
+        &cfg,
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let now = 1_700_000_000;
+        let mut create = event(CREATE_GROUP, ADMIN, Some("g1"), vec![]);
+        create.created_at = now;
+        create.id = nip01::compute_id(&create);
+        assert_eq!(db.put(create, now).await, crate::db::PutOutcome::Stored);
+        // A non-admin grants themselves a role and deletes the group.
+        let mut grant = event(
+            9000,
+            OTHER,
+            Some("g1"),
+            vec![
+                vec!["p".into(), OTHER.into()],
+                vec!["role".into(), "admin".into()],
+            ],
+        );
+        grant.created_at = now + 1;
+        grant.id = nip01::compute_id(&grant);
+        assert_eq!(db.put(grant, now + 1).await, crate::db::PutOutcome::Stored);
+        let mut delete = event(9008, OTHER, Some("g1"), vec![]);
+        delete.created_at = now + 2;
+        delete.id = nip01::compute_id(&delete);
+        assert_eq!(db.put(delete, now + 2).await, crate::db::PutOutcome::Stored);
+
+        let mut store = GroupStore::default();
+        assert!(store.rebuild(&db, None).await, "the rebuild must complete");
+        let group = store
+            .group("g1")
+            .expect("the unauthorized 9008 must not delete the group");
+        assert!(
+            !group.is_admin(OTHER),
+            "an unauthorized 9000 must not grant admin"
+        );
+        assert!(group.is_admin(ADMIN), "the creator stays admin");
+
+        // The relay's own key is the master key: its moderation replays.
+        let relay_pk = "ff".repeat(32);
+        let mut relay_delete = event(9008, &relay_pk, Some("g1"), vec![]);
+        relay_delete.created_at = now + 3;
+        relay_delete.id = nip01::compute_id(&relay_delete);
+        assert_eq!(
+            db.put(relay_delete, now + 3).await,
+            crate::db::PutOutcome::Stored
+        );
+        let mut store = GroupStore::default();
+        assert!(
+            store.rebuild(&db, Some(&relay_pk)).await,
+            "the rebuild must complete"
+        );
+        assert!(
+            store.group("g1").is_none(),
+            "the relay-signed 9008 is applied"
+        );
+        db.shutdown();
     });
 }
 
@@ -1090,7 +1180,7 @@ fn rebuild_ghosts_group_whose_only_surviving_events_are_relay_metadata() {
         }
 
         let mut store = GroupStore::default();
-        assert!(store.rebuild(&db).await, "the rebuild must complete");
+        assert!(store.rebuild(&db, None).await, "the rebuild must complete");
         assert!(
             store.ghost.contains("g1"),
             "a group with only relay metadata must be ghosted"
@@ -1154,7 +1244,7 @@ fn rebuild_ghosts_a_group_whose_only_surviving_events_are_ordinary_posts() {
         assert_eq!(db.put(plain, now).await, crate::db::PutOutcome::Stored);
 
         let mut store = GroupStore::default();
-        assert!(store.rebuild(&db).await, "the rebuild must complete");
+        assert!(store.rebuild(&db, None).await, "the rebuild must complete");
         assert!(
             store.ghost.contains("g1"),
             "a post-only group must be ghosted"
@@ -1217,7 +1307,7 @@ fn rebuild_ghosts_a_deleted_group_whose_purge_never_completed() {
             assert_eq!(db.put(ev.clone(), now).await, crate::db::PutOutcome::Stored);
         }
         let mut store = GroupStore::default();
-        assert!(store.rebuild(&db).await, "the rebuild must complete");
+        assert!(store.rebuild(&db, None).await, "the rebuild must complete");
         assert!(
             store.deleted.contains("g1"),
             "the replayed 9008 leaves the delete tombstone"
@@ -1272,7 +1362,7 @@ fn rebuild_fails_closed_when_the_database_is_unavailable() {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let mut store = GroupStore::default();
         assert!(
-            !store.rebuild(&db).await,
+            !store.rebuild(&db, None).await,
             "an unanswered rebuild must fail closed"
         );
         assert!(
@@ -2205,7 +2295,7 @@ fn rebuild_ignores_d_tags_on_non_group_kinds() {
             crate::db::PutOutcome::Stored
         );
         let mut store = GroupStore::default();
-        assert!(store.rebuild(&db).await, "the rebuild must complete");
+        assert!(store.rebuild(&db, None).await, "the rebuild must complete");
         assert!(
             store.ghost.is_empty(),
             "a non-group `d` tag must not ghost a group: {:?}",

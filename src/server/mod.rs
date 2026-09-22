@@ -545,7 +545,13 @@ async fn rebuild_group_state(relay: &Relay, groups_enabled: bool) -> Result<()> 
         );
         return Ok(());
     }
-    if !relay.groups.write().await.rebuild(&relay.db).await {
+    if !relay
+        .groups
+        .write()
+        .await
+        .rebuild(&relay.db, relay.relay_pubkey_ref())
+        .await
+    {
         return Err(anyhow::anyhow!(
             "NIP-29 group state rebuild failed: refusing to start with an \
              incomplete group store (missing groups would expose private content)"

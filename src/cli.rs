@@ -363,20 +363,9 @@ impl Cli {
         }
         let mut cfg = self.load_config()?;
         cfg.validate()?;
-        // Offer to merge the strfry settings that have a nostrfy equivalent
-        // before the database is opened, so a merged `database.map_size`
-        // applies to this very migration.
-        if let Some(merged) = self.merge_strfry_config(
-            &cfg,
-            strfry_config.as_deref(),
-            *merge_config,
-            *no_merge_config,
-            *dry_run,
-        )? {
-            cfg = merged;
-        }
-        // Resolve the input before touching the database: a missing file or
-        // a missing strfry binary must fail without taking the lock.
+        // Resolve the input before touching the database or the config: a
+        // missing file or a missing strfry binary must fail without taking
+        // the lock or rewriting `nostrfy.toml`.
         let mut source = if let Some(db_dir) = strfry_db {
             print_line(&format!(
                 "running `{strfry_bin} export` against {}...",
@@ -388,19 +377,6 @@ impl Cli {
             MigrateSource::stdin()
         } else {
             MigrateSource::file(Path::new(input))?
-        };
-        let opts = crate::migrate::Options {
-            verify: !*no_verify,
-            apply_vanish: *apply_vanish,
-            nip62_enabled: cfg.nip_enabled(62),
-            // Only recorded when the new-pubkey gate is configured: with the
-            // gate off the table is never reaped.
-            first_seen: cfg.relay.new_pubkey_min_age_secs > 0,
-            batch: *batch,
-            max_line_bytes: cfg.limits.max_ws_message_bytes,
-            host: cfg.server.host.clone(),
-            port: cfg.server.port,
-            public_url: cfg.relay.public_url.clone(),
         };
         let started = Instant::now();
         let mut last_progress = Instant::now();
@@ -421,17 +397,28 @@ impl Cli {
             }
         };
         if *dry_run {
+            // The settings proposals are printed, never written.
+            self.merge_strfry_config(
+                &cfg,
+                strfry_config.as_deref(),
+                *merge_config,
+                *no_merge_config,
+                true,
+            )?;
+            let opts = migrate_options(&cfg, *no_verify, *apply_vanish, *batch);
             let stats = crate::migrate::run(None, &mut source.reader, &opts, &mut progress).await?;
             source.finish()?;
             print_line(&stats.to_string());
             print_line(&format!(
-                "dry run complete in {:.1}s; nothing was written",
+                "dry run complete in {:.1}s; nothing was written (NIP-09/NIP-29 side \
+                 effects are not simulated without the database)",
                 started.elapsed().as_secs_f64()
             ));
             return Ok(());
         }
         // One writer per database directory: refuse while the relay (or
-        // another migration) holds it.
+        // another migration) holds it. Taken before the settings merge so
+        // no pre-flight failure can leave a rewritten config behind.
         let _db_lock = crate::db::lock_database_dir(&cfg.database.path).map_err(|e| {
             config_err(format!(
                 "cannot lock the database directory {}: {e}; stop the relay before \
@@ -439,6 +426,19 @@ impl Cli {
                 cfg.database.path.display()
             ))
         })?;
+        // Offer to merge the strfry settings that have a nostrfy equivalent
+        // before the database is opened, so a merged `database.map_size`
+        // applies to this very migration.
+        if let Some(merged) = self.merge_strfry_config(
+            &cfg,
+            strfry_config.as_deref(),
+            *merge_config,
+            *no_merge_config,
+            false,
+        )? {
+            cfg = merged;
+        }
+        let opts = migrate_options(&cfg, *no_verify, *apply_vanish, *batch);
         let db = open_db(&cfg)?;
         {
             let filter: crate::filter::Filter = crate::filter::Filter::default();
@@ -526,13 +526,21 @@ impl Cli {
                 path.display()
             )));
         }
-        let Some(path) = crate::strfry_config::find_config(explicit) else {
-            // No strfry config to read: nothing to merge. An explicit path
-            // was already checked above.
+        let Some((path, explicit_path)) = crate::strfry_config::find_config(explicit) else {
+            // No strfry config to read: nothing to merge.
             return Ok(None);
         };
         let text = match std::fs::read_to_string(&path) {
             Ok(text) => text,
+            // An explicitly requested config (the flag or `$STRFRY_CONFIG`)
+            // that cannot be read is an error; only an auto-discovered file
+            // is skipped with a note.
+            Err(e) if explicit_path => {
+                return Err(config_err(format!(
+                    "cannot read strfry config {}: {e}",
+                    path.display()
+                )));
+            }
             Err(e) => {
                 print_line(&format!(
                     "cannot read {}: {e}; skipping the settings merge",
@@ -546,20 +554,13 @@ impl Cli {
         // Read the target config now: the proposals are validated against it
         // so only values that keep the merged config valid are offered. The
         // file is written only after the operator confirms.
-        let text = match std::fs::read_to_string(&self.config) {
-            Ok(text) => text,
-            Err(e) => {
-                print_line(&format!(
-                    "cannot read {}: {e}; skipping the settings merge",
-                    self.config.display()
-                ));
-                return Ok(None);
-            }
-        };
+        let text = std::fs::read_to_string(&self.config)
+            .map_err(|e| config_err(format!("cannot read {}: {e}", self.config.display())))?;
         // A single unusable value (e.g. a URL nostrfy rejects) must not
         // block the rest of the merge: apply one proposal at a time and
         // keep only the ones that leave the config valid.
-        let mut merged = text;
+        let original = text;
+        let mut merged = original.clone();
         let mut applicable = Vec::new();
         let mut rejected = Vec::new();
         for proposal in &proposals {
@@ -656,13 +657,30 @@ impl Cli {
             print_line("settings not merged");
             return Ok(None);
         }
-        if let Err(e) = crate::config::write_text_atomic(&self.config, &merged) {
-            print_line(&format!(
+        // The operator may have edited the file while the prompt waited (or
+        // another process did): a wholesale rewrite would silently drop the
+        // edit, so abort instead.
+        match std::fs::read_to_string(&self.config) {
+            Ok(current) if current != original => {
+                return Err(config_err(format!(
+                    "{} changed while the merge was being prepared; re-run the migration",
+                    self.config.display()
+                )));
+            }
+            Ok(_) => {}
+            Err(e) => {
+                return Err(config_err(format!(
+                    "cannot re-read {}: {e}",
+                    self.config.display()
+                )));
+            }
+        }
+        crate::config::write_text_atomic(&self.config, &merged).map_err(|e| {
+            config_err(format!(
                 "cannot write {}: {e}; settings not merged",
                 self.config.display()
-            ));
-            return Ok(None);
-        }
+            ))
+        })?;
         print_line(&format!(
             "merged {} setting(s) into {}",
             applicable.len(),
@@ -1574,17 +1592,26 @@ impl MigrateSource {
         cmd.arg("--config")
             .arg(&config_path)
             .arg("export")
+            // The export must not consume the migration's stdin (which may
+            // carry the export itself in another input mode).
+            .stdin(std::process::Stdio::null())
             // stderr is inherited: strfry's own error message stays visible.
             .stdout(std::process::Stdio::piped());
         if let Some(since) = since {
             cmd.arg("--since").arg(since.to_string());
         }
-        let mut child = cmd.spawn().map_err(|e| {
-            config_err(format!(
-                "cannot run `{bin}`: {e} (install strfry, set --strfry-bin, or use \
-                 --input <file>)"
-            ))
-        })?;
+        let mut child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(e) => {
+                // The guard that removes the temp config is only built on
+                // success: clean up here or the file leaks.
+                let _ = std::fs::remove_file(&config_path);
+                return Err(config_err(format!(
+                    "cannot run `{bin}`: {e} (install strfry, set --strfry-bin, or use \
+                     --input <file>)"
+                )));
+            }
+        };
         let stdout = child.stdout.take().expect("stdout was piped");
         Ok(Self {
             reader: Box::new(std::io::BufReader::new(stdout)),
@@ -1633,6 +1660,46 @@ fn print_line(text: &str) {
     let _ = writeln!(std::io::stdout(), "{text}");
 }
 
+/// The relay's own public key (hex) derived from `relay.private_key`, for
+/// the NIP-29 authorization checks. `None` when no (valid) key is set.
+fn relay_pubkey_of(cfg: &Config) -> Option<String> {
+    let bytes = hex::decode(&cfg.relay.private_key).ok()?;
+    let secret = secp256k1::SecretKey::from_slice(&bytes).ok()?;
+    let secp = secp256k1::Secp256k1::new();
+    let keypair = secp256k1::Keypair::from_seckey_slice(&secp, &secret.secret_bytes()).ok()?;
+    Some(
+        secp256k1::XOnlyPublicKey::from_keypair(&keypair)
+            .0
+            .to_string(),
+    )
+}
+
+/// The migration options derived from a config (built after the settings
+/// merge so the merged values apply to this run).
+fn migrate_options(
+    cfg: &Config,
+    no_verify: bool,
+    apply_vanish: bool,
+    batch: usize,
+) -> crate::migrate::Options {
+    crate::migrate::Options {
+        verify: !no_verify,
+        apply_vanish,
+        nip62_enabled: cfg.nip_enabled(62),
+        nip40_enabled: cfg.nip_enabled(40),
+        // Only recorded when the new-pubkey gate is configured: with the
+        // gate off the table is never reaped.
+        first_seen: cfg.relay.new_pubkey_min_age_secs > 0,
+        batch,
+        max_line_bytes: cfg.limits.max_ws_message_bytes,
+        host: cfg.server.host.clone(),
+        port: cfg.server.port,
+        public_url: cfg.relay.public_url.clone(),
+        relay_pubkey: relay_pubkey_of(cfg),
+        max_groups: cfg.relay.max_groups,
+    }
+}
+
 /// Asks a yes/no question on the controlling terminal. Falls back to stdin
 /// only when stdin is a terminal, because the migration input may be a pipe
 /// on stdin. `None` means there is no terminal to ask (the caller skips the
@@ -1649,15 +1716,21 @@ fn confirm_on_tty(prompt: &str) -> Option<bool> {
         let mut reader = std::io::BufReader::new(tty.try_clone().ok()?);
         let mut answer = String::new();
         reader.read_line(&mut answer).ok()?;
-        return Some(answer.trim().eq_ignore_ascii_case("y"));
+        return Some(is_yes(&answer));
     }
     if std::io::stdin().is_terminal() {
         print_line(prompt);
         let mut answer = String::new();
         std::io::stdin().read_line(&mut answer).ok()?;
-        return Some(answer.trim().eq_ignore_ascii_case("y"));
+        return Some(is_yes(&answer));
     }
     None
+}
+
+/// Whether a prompt answer means yes: `y` or `yes`, case-insensitive.
+fn is_yes(answer: &str) -> bool {
+    let answer = answer.trim();
+    answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes")
 }
 
 /// Flushes stdout so a completion message survives a `process::exit` (which
@@ -3523,5 +3596,51 @@ name = \"nostrfy\"\n",
         let text = std::fs::read_to_string(&config).unwrap();
         assert!(text.contains("name = \"old relay\""), "{text}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn migrate_strfry_rejects_an_unreadable_strfry_config() {
+        // An explicitly requested config that exists but cannot be read is
+        // an error, not a silent skip (only an auto-discovered file is
+        // skipped with a note).
+        let (dir, config, _) = migrate_fixture("unreadable-strfry-config", true, false, None);
+        let cli = Cli {
+            config: config.clone(),
+            command: Command::MigrateStrfry {
+                input: dir.join("export.jsonl").display().to_string(),
+                strfry_db: None,
+                strfry_bin: "strfry".into(),
+                // A directory: it exists, but reading it fails.
+                strfry_config: Some(dir.clone()),
+                merge_config: true,
+                no_merge_config: false,
+                since: None,
+                no_verify: true,
+                apply_vanish: false,
+                dry_run: false,
+                batch: 512,
+            },
+            daemonized: false,
+        };
+        let err = cli.serve().await.unwrap_err();
+        assert!(
+            err.to_string().contains("cannot read strfry config"),
+            "a directory given as the strfry config must fail: {err}"
+        );
+        let text = std::fs::read_to_string(&config).unwrap();
+        assert!(text.contains("name = \"old relay\""), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prompt_answers_accept_y_and_yes() {
+        assert!(is_yes("y"));
+        assert!(is_yes("Y\n"));
+        assert!(is_yes("yes"));
+        assert!(is_yes(" Yes \n"));
+        assert!(!is_yes("n"));
+        assert!(!is_yes("no"));
+        assert!(!is_yes(""));
+        assert!(!is_yes("yeah"));
     }
 }

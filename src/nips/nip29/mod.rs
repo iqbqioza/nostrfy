@@ -1463,8 +1463,9 @@ impl GroupStore {
     /// one page instead of the whole history (the old implementation
     /// materialized and sorted every stored group event before applying
     /// anything).
-    pub async fn rebuild(&mut self, db: &DbClient) -> bool {
-        self.rebuild_inner(db, None, Vec::new(), Vec::new()).await
+    pub async fn rebuild(&mut self, db: &DbClient, relay_pubkey: Option<&str>) -> bool {
+        self.rebuild_inner(db, relay_pubkey, None, Vec::new(), Vec::new())
+            .await
     }
 
     /// Rebuilds after a vanish, seeding the hidden markers from the
@@ -1479,17 +1480,25 @@ impl GroupStore {
     pub async fn rebuild_after_vanish(
         &mut self,
         db: &DbClient,
+        relay_pubkey: Option<&str>,
         previous: Vec<String>,
         previous_deleted: Vec<String>,
         previous_ghost: Vec<String>,
     ) -> bool {
-        self.rebuild_inner(db, Some(previous), previous_deleted, previous_ghost)
-            .await
+        self.rebuild_inner(
+            db,
+            relay_pubkey,
+            Some(previous),
+            previous_deleted,
+            previous_ghost,
+        )
+        .await
     }
 
     async fn rebuild_inner(
         &mut self,
         db: &DbClient,
+        relay_pubkey: Option<&str>,
         previous: Option<Vec<String>>,
         previous_deleted: Vec<String>,
         previous_ghost: Vec<String>,
@@ -1547,6 +1556,7 @@ impl GroupStore {
         // correct.
         const PAGE: usize = 50_000;
         let mut since: Option<u64> = None;
+        let mut skipped_unauthorized = 0usize;
         loop {
             let mut filter: Filter =
                 serde_json::from_value(json!({ "kinds": kinds })).expect("static filter");
@@ -1608,7 +1618,28 @@ impl GroupStore {
                         continue;
                     }
                 }
-                self.apply(&event, "", unix_now(), false, true);
+                // A moderation event is only replayed when its author was
+                // authorized at that point. strfry accepts every signed
+                // event without NIP-29 validation, so a migrated database
+                // can contain grants, deletions and purges the relay's own
+                // write path would have rejected; replaying them would let
+                // a non-admin escalate or destroy a group on the first
+                // restart. The rule mirrors the live admin gate in
+                // `validate_write_inner` (the relay's key is the master
+                // key, an unknown group accepts only a create).
+                if (MOD_MIN..=MOD_MAX).contains(&event.kind)
+                    && !relay_pubkey.is_some_and(|pk| pk.eq_ignore_ascii_case(&event.pubkey))
+                {
+                    let authorized = match group_id(&event).and_then(|gid| self.groups.get(gid)) {
+                        Some(group) => group.is_admin(&event.pubkey),
+                        None => event.kind == CREATE_GROUP,
+                    };
+                    if !authorized {
+                        skipped_unauthorized += 1;
+                        continue;
+                    }
+                }
+                self.apply(&event, relay_pubkey.unwrap_or(""), unix_now(), false, true);
             }
             if !more {
                 // The collector reported no truncation: every remaining
@@ -1628,6 +1659,13 @@ impl GroupStore {
         // are re-seeded from the pre-rebuild state because the scan cannot
         // reconstruct an id whose events the purge removed (a confirmed
         // purge must stay re-creatable, not become a permanent ghost).
+        if skipped_unauthorized > 0 {
+            log::warn!(
+                "ignored {skipped_unauthorized} NIP-29 moderation event(s) whose author is \
+                 not a group admin: they were stored without NIP-29 validation (e.g. \
+                 migrated from strfry) and are not applied"
+            );
+        }
         if let Some(previous) = previous {
             self.restore_hidden(previous, previous_deleted, previous_ghost);
             return true;
