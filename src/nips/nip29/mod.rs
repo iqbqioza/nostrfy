@@ -1414,6 +1414,32 @@ impl GroupStore {
         out
     }
 
+    /// Builds the relay-signed metadata events (39000/39001/39002/39005)
+    /// for every live group. Used after a rebuild from stored events: a
+    /// database whose state was rebuilt — a migration from another relay,
+    /// or a dropped snapshot — has no (or stale) stored metadata, and
+    /// clients need it to display the groups.
+    pub(crate) fn all_metadata_events(&mut self, relay_pubkey: &str, now: u64) -> Vec<Event> {
+        let gids: Vec<String> = self.groups.keys().cloned().collect();
+        let mut out = Vec::with_capacity(gids.len().saturating_mul(4));
+        for gid in gids {
+            out.push(build_meta_event(
+                &gid,
+                self.groups.get(&gid),
+                relay_pubkey,
+                now,
+            ));
+            out.push(build_pins_event(
+                &gid,
+                self.groups.get(&gid),
+                relay_pubkey,
+                now,
+            ));
+            out.extend(self.membership_events(&gid, relay_pubkey, now));
+        }
+        out
+    }
+
     /// Rebuilds the in-memory group state from the stored events.
     ///
     /// Returns `false` when the rebuild could not be completed (the database
@@ -1437,8 +1463,9 @@ impl GroupStore {
     /// one page instead of the whole history (the old implementation
     /// materialized and sorted every stored group event before applying
     /// anything).
-    pub async fn rebuild(&mut self, db: &DbClient) -> bool {
-        self.rebuild_inner(db, None, Vec::new(), Vec::new()).await
+    pub async fn rebuild(&mut self, db: &DbClient, relay_pubkey: Option<&str>) -> bool {
+        self.rebuild_inner(db, relay_pubkey, None, Vec::new(), Vec::new())
+            .await
     }
 
     /// Rebuilds after a vanish, seeding the hidden markers from the
@@ -1453,17 +1480,25 @@ impl GroupStore {
     pub async fn rebuild_after_vanish(
         &mut self,
         db: &DbClient,
+        relay_pubkey: Option<&str>,
         previous: Vec<String>,
         previous_deleted: Vec<String>,
         previous_ghost: Vec<String>,
     ) -> bool {
-        self.rebuild_inner(db, Some(previous), previous_deleted, previous_ghost)
-            .await
+        self.rebuild_inner(
+            db,
+            relay_pubkey,
+            Some(previous),
+            previous_deleted,
+            previous_ghost,
+        )
+        .await
     }
 
     async fn rebuild_inner(
         &mut self,
         db: &DbClient,
+        relay_pubkey: Option<&str>,
         previous: Option<Vec<String>>,
         previous_deleted: Vec<String>,
         previous_ghost: Vec<String>,
@@ -1582,7 +1617,14 @@ impl GroupStore {
                         continue;
                     }
                 }
-                self.apply(&event, "", unix_now(), false, true);
+                // Every stored moderation event is replayed. The relay
+                // applied it in arrival order when it was accepted, and a
+                // second rebuild-time authorization would drop legitimate
+                // events whose rank-ordered position differs from their
+                // arrival: migrated databases are made faithful by the
+                // migration itself, which refuses to import moderation its
+                // own replay would reject.
+                self.apply(&event, relay_pubkey.unwrap_or(""), unix_now(), false, true);
             }
             if !more {
                 // The collector reported no truncation: every remaining
@@ -1723,7 +1765,11 @@ impl GroupStore {
 /// Replay order of group events within the same second: the create/delete
 /// establish the group before the member/settings operations, joins and
 /// leaves come last.
-fn group_rank(kind: u64) -> u8 {
+/// The same-second ordering rank used by the rebuild replay: the
+/// group-establishing events (create/delete) apply first, then the
+/// member/settings operations, then joins/leaves. Shared with the
+/// migration's authorization replay so both orders agree.
+pub(crate) fn group_rank(kind: u64) -> u8 {
     match kind {
         9007 | 9008 => 0,
         9021 | 9022 => 2,

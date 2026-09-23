@@ -1319,12 +1319,12 @@ fn gift_wrap_deletion_refuses_an_unbuilt_index() {
     // deletion must fail loudly instead (the vanish path then skips its
     // marker and the NIP-09 path reports the failure).
     let err = store
-        .delete_gift_wraps_to(&recipient)
+        .delete_gift_wraps_to(&recipient, u64::MAX)
         .expect_err("an unbuilt index must fail the deletion");
     assert!(err.to_string().contains("not built"), "{err}");
     // After the backfill the same deletion succeeds (nothing stored).
     assert_eq!(store.rebuild_gift_wrap_index().unwrap(), 0);
-    assert_eq!(store.delete_gift_wraps_to(&recipient).unwrap(), 0);
+    assert_eq!(store.delete_gift_wraps_to(&recipient, u64::MAX).unwrap(), 0);
 }
 
 #[test]
@@ -1971,8 +1971,12 @@ fn group_purge_marker_merges_and_keeps_one_record() {
         let rtxn = store.env.read_txn().unwrap();
         assert_eq!(store.purged_groups.len(&rtxn).unwrap(), 1);
         let raw = store.purged_groups.get(&rtxn, &key).unwrap().unwrap();
-        assert_eq!(raw.len(), 16, "the marker carries (purge time, cut)");
-        assert_eq!(decode_purged_group_marker(raw), (now, now));
+        assert_eq!(
+            raw.len(),
+            48,
+            "the marker carries (purge time, cut, create id)"
+        );
+        assert_eq!(decode_purged_group_marker(raw), (now, now, None));
     }
     // A future-dated event is removed by a later purge and raises the cut.
     let future = tagged("future", now + 300);
@@ -1990,15 +1994,120 @@ fn group_purge_marker_merges_and_keeps_one_record() {
     let raw = store.purged_groups.get(&rtxn, &key).unwrap().unwrap();
     assert_eq!(
         decode_purged_group_marker(raw),
-        (now, now + 300),
+        (now, now + 300, None),
         "the purge time and cut must not regress"
     );
     // Round trip and the legacy 8-byte marker read as `(cut, cut)`.
     assert_eq!(
-        decode_purged_group_marker(&encode_purged_group_marker(7, 9)),
-        (7, 9)
+        decode_purged_group_marker(&encode_purged_group_marker(7, 9, None)),
+        (7, 9, None)
     );
-    assert_eq!(decode_purged_group_marker(&7u64.to_be_bytes()), (7, 7));
+    let create = [7u8; 32];
+    assert_eq!(
+        decode_purged_group_marker(&encode_purged_group_marker(7, 9, Some(&create))),
+        (7, 9, Some(create))
+    );
+    assert_eq!(
+        decode_purged_group_marker(&7u64.to_be_bytes()),
+        (7, 7, None)
+    );
+}
+
+#[test]
+fn a_resumed_purge_keeps_the_raised_cut() {
+    // A crash after a chunk removed a future-dated event must not lose the
+    // raised cut: the pending record carries it, so the resume's marker
+    // still blocks a re-broadcast of that event.
+    let cfg = config();
+    let (db, faults) = open_with_faults(&cfg);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let now = unix_now();
+        let gid = "resume-cut";
+        let tagged = |content: &str, created: u64| {
+            event(1, content, created, vec![vec!["h".into(), gid.into()]])
+        };
+        let old = tagged("old", now - 10);
+        let future = tagged("future", now + 300);
+        for e in [&old, &future] {
+            assert_eq!(db.put(e.clone(), now).await, PutOutcome::Stored);
+        }
+        // Fail after the first removal chunk committed: the marker and the
+        // pending (with the raised cut) are durable, the walk is not done.
+        faults
+            .chunk_after
+            .store(2, std::sync::atomic::Ordering::SeqCst);
+        let _ = db.group_purge_until(gid.to_string(), now, u64::MAX).await;
+        faults
+            .chunk_after
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+        // The resume finishes the (now empty) walk and must keep the cut
+        // raised by the already-removed future-dated event.
+        let _ = db.group_purge_until(gid.to_string(), now, u64::MAX).await;
+        assert_eq!(
+            db.put(future, now).await,
+            PutOutcome::PreviouslyDeleted,
+            "the resumed purge must keep the cut raised by the removed event"
+        );
+    });
+    db.shutdown();
+}
+
+#[test]
+fn a_bounded_purge_keeps_a_wider_pending_bound() {
+    // A crashed live purge is unbounded: a later migration's bounded purge
+    // must not narrow it, or the history the live purge still owed would
+    // be served.
+    use crate::db::store::{
+        Store, encode_pending_purge, encode_purged_group_marker, purged_group_key,
+    };
+    let store = Store::open(
+        &config(),
+        Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        128,
+    )
+    .unwrap();
+    let now = 1_700_000_000u64;
+    let gid = "wide-pending";
+    let tagged = |content: &str, created: u64| {
+        event(1, content, created, vec![vec!["h".into(), gid.into()]])
+    };
+    for (content, created) in [("old", now - 10), ("newer", now + 100)] {
+        let e = tagged(content, created);
+        let mut wtxn = store.env.write_txn().unwrap();
+        assert_eq!(
+            store.put_event_in(&mut wtxn, &e, now).unwrap(),
+            PutOutcome::Stored
+        );
+        wtxn.commit().unwrap();
+    }
+    {
+        // What a crashed live purge leaves: the marker and an unbounded
+        // pending record.
+        let mut wtxn = store.env.write_txn().unwrap();
+        let key = purged_group_key(gid);
+        store
+            .purged_groups
+            .put(&mut wtxn, &key, &encode_purged_group_marker(now, now, None))
+            .unwrap();
+        store
+            .purge_pending
+            .put(
+                &mut wtxn,
+                &key,
+                &encode_pending_purge(gid, now, now, u64::MAX, None),
+            )
+            .unwrap();
+        wtxn.commit().unwrap();
+    }
+    // The migration's bounded purge must honour the wider pending bound.
+    assert_eq!(store.purge_group_until(gid, now - 5, now - 5).unwrap(), 2);
+    let rtxn = store.env.read_txn().unwrap();
+    assert_eq!(store.purge_pending.len(&rtxn).unwrap(), 0);
+    assert!(
+        store.events.is_empty(&rtxn).unwrap(),
+        "the merged unbounded walk must remove the newer event too"
+    );
 }
 
 #[test]
@@ -4609,7 +4718,7 @@ fn gift_wrap_index_backfills_legacy_wraps() {
     assert!(!store.gift_wrap_index_needs_rebuild().unwrap());
     // The backfilled entry makes the mixed-case recipient lookup find it.
     let removed = store
-        .delete_gift_wraps_to(&hex::decode(recipient).unwrap())
+        .delete_gift_wraps_to(&hex::decode(recipient).unwrap(), u64::MAX)
         .unwrap();
     assert_eq!(removed, 1);
 }
@@ -5352,7 +5461,7 @@ fn pending_group_purge_is_reported_and_resumable() {
             db.pending_purges()
                 .await
                 .expect("a healthy pending read must answer"),
-            vec![(gid.to_string(), now)],
+            vec![(gid.to_string(), now, u64::MAX)],
             "the interrupted purge must be recorded"
         );
         // The re-issued purge finishes the walk and clears the record.
@@ -7496,7 +7605,8 @@ fn disk_full_removals_fail_closed_before_any_side_effect() {
         assert_eq!(db.take_errors(), 1);
 
         assert_eq!(
-            db.delete_gift_wraps_to_checked(recipient_bytes).await,
+            db.delete_gift_wraps_to_checked(recipient_bytes, u64::MAX)
+                .await,
             None,
             "a full-disk gift-wrap purge must report failure"
         );
@@ -7528,7 +7638,8 @@ fn disk_full_removals_fail_closed_before_any_side_effect() {
         db.set_expiry_enabled(true);
         assert_eq!(db.purge_expired(now, 0).await, (1, false));
         assert_eq!(
-            db.delete_gift_wraps_to_checked(recipient_bytes).await,
+            db.delete_gift_wraps_to_checked(recipient_bytes, u64::MAX)
+                .await,
             Some(1)
         );
         assert_eq!(db.take_errors(), 0);
@@ -7899,7 +8010,7 @@ fn group_purge_first_chunk_failure_resumes_after_restart() {
             db.pending_purges()
                 .await
                 .expect("a healthy read must answer"),
-            vec![(gid.to_string(), now)],
+            vec![(gid.to_string(), now, u64::MAX)],
             "the interrupted purge must stay resumable"
         );
         assert_eq!(
@@ -7935,7 +8046,7 @@ fn group_purge_first_chunk_failure_resumes_after_restart() {
             db.pending_purges()
                 .await
                 .expect("a healthy read must answer"),
-            vec![(gid.to_string(), now)]
+            vec![(gid.to_string(), now, u64::MAX)]
         );
         assert_eq!(db.group_purge(gid.to_string(), now).await, 2);
         assert!(

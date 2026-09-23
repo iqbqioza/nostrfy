@@ -12,6 +12,7 @@ The guides are written to be friendly and practical, with real command examples 
 | [Configuration Reference (CONFIGURATION.md)](CONFIGURATION.md) | Every option of `nostrfy.toml` with defaults, validation rules and a full example | You want to tune the relay or check what a setting does |
 | [HTTP REST API Reference (API.md)](API.md) | The `/api/v1` endpoint: paths, parameters, responses, pagination, errors | You want to query events from scripts or other programs |
 | [Troubleshooting (TROUBLESHOOTING.md)](TROUBLESHOOTING.md) | Common errors and their step-by-step fixes | You hit an error or something behaves unexpectedly |
+| [Migrating from strfry (MIGRATING-FROM-STRFRY.md)](MIGRATING-FROM-STRFRY.md) | The complete runbook for moving a strfry relay's events into nostrfy: preparation, dry run, migration, verification, cut-over, rollback | You are switching from strfry to nostrfy |
 
 ## Quick Start (30-second guide)
 

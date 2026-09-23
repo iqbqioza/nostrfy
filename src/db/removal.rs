@@ -23,6 +23,13 @@ use crate::nips::nip09;
 /// so entries the caller leaves in place cannot loop forever.
 const REMOVAL_CHUNK: usize = 4096;
 
+/// How many deleter pubkeys one migration-recorded (absent-target) tombstone
+/// keeps. Bounds the marker value when many deletion requests name the same
+/// missing id; beyond the bound the marker becomes unconditional (the id
+/// was deleted by many keys, and dropping the extra deleter would fail open
+/// when it is the author's own deletion).
+const SCOPED_TOMBSTONE_MAX: usize = 4;
+
 /// The partial outcome of a chunked removal walk: what was removed before
 /// the walk ended, whether the removed events feed the derived NIP-29 /
 /// NIP-43 state, and the failure that stopped it (if any). The counters
@@ -89,6 +96,88 @@ fn removal_chunk(
 }
 
 impl Store {
+    /// Migration-only: records NIP-09 re-publication blocks for deletion
+    /// targets that are *absent* from the database, scoped to the deletion's
+    /// author. A strfry export contains no trace of an event its author
+    /// deleted (strfry removes it physically), so replaying the deletion
+    /// request cannot write the ordinary per-id tombstone — the walk only
+    /// marks targets it can see. Without this the deleted event could be
+    /// re-published after the migration. Present targets are left to the
+    /// deletion walk (which checks ownership and writes the unconditional
+    /// tombstone), and ids that already carry an unconditional tombstone
+    /// are untouched.
+    ///
+    /// The value is one or more 32-byte deleter pubkeys (at most
+    /// [`SCOPED_TOMBSTONE_MAX`]), so only those authors' re-publication is
+    /// blocked — the event id commits to its author, and this mirrors
+    /// strfry's `(id, pubkey)` deletion record. Returns how many markers
+    /// were written or extended.
+    pub(crate) fn record_absent_deletion_targets(
+        &self,
+        pubkey: &[u8],
+        targets: &[String],
+    ) -> Result<usize> {
+        self.disk_full_error()?;
+        if pubkey.len() != ID_LEN {
+            return Ok(0);
+        }
+        let mut wtxn = self.env.write_txn()?;
+        let mut recorded = 0usize;
+        for target in targets {
+            let Ok(id) = hex::decode(target) else {
+                continue;
+            };
+            if id.len() != ID_LEN {
+                continue;
+            }
+            if self.events.get(&wtxn, &id)?.is_some() {
+                // Present: the deletion walk decides by ownership.
+                continue;
+            }
+            match self.deleted.get(&wtxn, &id)? {
+                Some(existing) => {
+                    // An unconditional (empty) or corrupt marker is left as
+                    // is; a scoped marker gains this deleter unless it is
+                    // already covered or the cap is reached (the earliest
+                    // deleters win).
+                    if existing.is_empty() || existing.len() % ID_LEN != 0 {
+                        continue;
+                    }
+                    if existing.chunks(ID_LEN).any(|chunk| chunk == pubkey) {
+                        continue;
+                    }
+                    if existing.len() >= ID_LEN * SCOPED_TOMBSTONE_MAX {
+                        // More deleters than the scoped list holds. Dropping
+                        // this one would fail open when it is the author's
+                        // own deletion (the target is absent from the source
+                        // precisely because strfry deleted it on the
+                        // author's request), so fall back to an
+                        // unconditional tombstone: the event id was deleted
+                        // by many keys, and NIP-09 makes the deletion
+                        // permanent for that id.
+                        log::warn!(
+                            "deletion target {target} has more than {SCOPED_TOMBSTONE_MAX} \
+                             deleters; recording an unconditional re-publication block"
+                        );
+                        self.deleted.put(&mut wtxn, &id, &[])?;
+                        recorded += 1;
+                        continue;
+                    }
+                    let mut merged = existing.to_vec();
+                    merged.extend_from_slice(pubkey);
+                    self.deleted.put(&mut wtxn, &id, &merged)?;
+                    recorded += 1;
+                }
+                None => {
+                    self.deleted.put(&mut wtxn, &id, pubkey)?;
+                    recorded += 1;
+                }
+            }
+        }
+        wtxn.commit()?;
+        Ok(recorded)
+    }
+
     /// NIP-59: deletes every stored `kind:1059` event addressed to `pubkey`.
     ///
     /// Walks the reserved [`GIFT_WRAP_INDEX`] namespace — one narrow range
@@ -97,7 +186,7 @@ impl Store {
     /// implementation had to scan every `p` entry (the store's most expensive
     /// deletion path, reachable from any NIP-09 deletion request) just to
     /// catch hex case variants.
-    fn remove_gift_wraps_for(&self, pubkey: &[u8], removed: &mut usize) -> Result<()> {
+    fn remove_gift_wraps_for(&self, pubkey: &[u8], until: u64, removed: &mut usize) -> Result<()> {
         // The recipient index is backfilled once at startup; when its
         // marker is missing (the rebuild failed or never ran) the range
         // walk below would silently miss every pre-index wrap. Refuse
@@ -109,8 +198,13 @@ impl Store {
         }
         let start = tag_key(GIFT_WRAP_INDEX, pubkey, 0, &[0u8; ID_LEN]);
         let end = crate::db::store::range_end(
-            tag_key(GIFT_WRAP_INDEX, pubkey, u64::MAX, &[0xffu8; ID_LEN]),
-            u64::MAX,
+            tag_key(
+                GIFT_WRAP_INDEX,
+                pubkey,
+                until.saturating_add(1),
+                &[0u8; ID_LEN],
+            ),
+            until,
         );
         let mut last_key: Option<Vec<u8>> = None;
         loop {
@@ -558,32 +652,96 @@ impl Store {
     /// re-issues the purge, which is idempotent and keeps the furthest cut.
     /// The completion commit folds the newest removed timestamp into the
     /// cut, clears the in-progress record and bumps the derived-state stamp.
+    #[cfg(test)]
     pub(crate) fn purge_group(&self, gid: &str, now: u64) -> Result<usize> {
+        self.purge_group_until(gid, now, u64::MAX)
+    }
+
+    /// [`Self::purge_group`] bounded to events with `created_at <= until`.
+    /// The migration uses it with the `9008`'s own timestamp so a group
+    /// re-created after the deletion keeps its newer events; the live relay
+    /// passes `u64::MAX` (it removes every stored `h`-tagged event,
+    /// including future-dated re-publications, and raises the cut).
+    ///
+    /// The marker records the id of the purged `kind:9007` create (when one
+    /// was removed) so an exact replay of it stays blocked: the re-create
+    /// exception (`created_at >= purge_now` passes) would otherwise let a
+    /// re-imported original create resurrect the group. A pending record
+    /// from an interrupted purge is merged, never narrowed: a crashed live
+    /// purge keeps its unbounded recovery, and the create id found so far
+    /// survives the resume.
+    pub(crate) fn purge_group_until(&self, gid: &str, now: u64, until: u64) -> Result<usize> {
         self.disk_full_error()?;
         let key = purged_group_key(gid);
         // Merge with an earlier purge of the same id: the furthest purge
         // time (for the re-create exception) and the furthest cut cover
         // every already-rejected generation.
-        let (mut purge_now, mut cut) = {
+        let (mut purge_now, mut cut, mut create_id, effective_until) = {
             let mut wtxn = self.env.write_txn()?;
-            let (old_now, old_cut) = self
+            let (old_now, old_cut, old_create) = self
                 .purged_groups
                 .get(&wtxn, &key)?
                 .map(decode_purged_group_marker)
-                .unwrap_or((0, 0));
+                .unwrap_or((0, 0, None));
+            // An interrupted purge's record may carry a wider bound (a
+            // crashed live purge is unbounded) and the create id found so
+            // far: keep both.
+            // A present-but-undecodable record fails closed: silently
+            // treating it as "no pending" and overwriting it with the
+            // caller's bound could narrow an interrupted live purge.
+            let pending = match self.purge_pending.get(&wtxn, &key)? {
+                Some(raw) => Some(decode_pending_purge(raw).ok_or_else(|| {
+                    anyhow::anyhow!("corrupt pending group purge record ({} bytes)", raw.len())
+                })?),
+                None => None,
+            };
+            let effective_until = pending
+                .as_ref()
+                .map(|(_, _, _, pending_until, _)| (*pending_until).max(until))
+                .unwrap_or(until);
+            // The pending record's cut covers events an interrupted walk
+            // already removed (whose timestamps are gone): merging it keeps
+            // the marker's cut from regressing on the resume.
+            let pending_cut = pending
+                .as_ref()
+                .map(|(_, _, pending_cut, _, _)| *pending_cut)
+                .unwrap_or(0);
+            let create_id = pending
+                .as_ref()
+                .and_then(|(_, _, _, _, create)| *create)
+                .or(old_create);
+            if effective_until != until {
+                log::warn!(
+                    "group purge {gid}: an interrupted purge's wider bound                      ({effective_until}) is honoured over the requested {until}"
+                );
+            }
             let purge_now = old_now.max(now);
-            // The initial cut covers `now`; the final commit below raises
-            // it to the newest removed event.
-            let cut = old_cut.max(now);
-            self.purged_groups
-                .put(&mut wtxn, &key, &encode_purged_group_marker(purge_now, cut))?;
-            self.purge_pending
-                .put(&mut wtxn, &key, &encode_pending_purge(gid, purge_now, cut))?;
+            // The initial cut covers `now`; each chunk below raises it to
+            // the newest removed event, and the final commit merges it.
+            let cut = old_cut.max(pending_cut).max(now);
+            self.purged_groups.put(
+                &mut wtxn,
+                &key,
+                &encode_purged_group_marker(purge_now, cut, create_id.as_ref()),
+            )?;
+            self.purge_pending.put(
+                &mut wtxn,
+                &key,
+                &encode_pending_purge(gid, purge_now, cut, effective_until, create_id.as_ref()),
+            )?;
             wtxn.commit()?;
-            (purge_now, cut)
+            (purge_now, cut, create_id, effective_until)
         };
         let start = tag_key(b'h', gid.as_bytes(), 0, &[0u8; ID_LEN]);
-        let end = tag_key(b'h', gid.as_bytes(), u64::MAX, &[0xffu8; ID_LEN]);
+        let end = crate::db::store::range_end(
+            tag_key(
+                b'h',
+                gid.as_bytes(),
+                effective_until.saturating_add(1),
+                &[0u8; ID_LEN],
+            ),
+            effective_until,
+        );
         let mut last_key: Option<Vec<u8>> = None;
         let mut removed = 0usize;
         let mut max_created = 0u64;
@@ -634,10 +792,24 @@ impl Store {
                 // this purge and then accepted again on replay.
                 if let Ok(event) = serde_json::from_slice::<Event>(raw) {
                     max_created = max_created.max(event.created_at);
+                    if event.kind == crate::nips::nip29::CREATE_GROUP && id.len() == ID_LEN {
+                        create_id = Some(id.as_slice().try_into().expect("checked length"));
+                    }
                 }
                 self.remove_event(&mut wtxn, &id)?;
                 removed += 1;
             }
+            // Persist the raised cut (and any create id) with the chunk
+            // that produced it: a crash before completion must not lose
+            // either (the cut would regress and a future-dated removed
+            // event would be accepted again; the create id would let an
+            // exact replay resurrect the group).
+            cut = cut.max(max_created);
+            self.purge_pending.put(
+                &mut wtxn,
+                &key,
+                &encode_pending_purge(gid, purge_now, cut, effective_until, create_id.as_ref()),
+            )?;
             wtxn.commit()?;
         }
         // Completion commit: re-merge the marker (a legacy 8-byte marker was
@@ -647,36 +819,42 @@ impl Store {
         // the absence of) group history, and the derived state must be
         // rebuilt from the surviving events.
         let mut wtxn = self.env.write_txn()?;
-        let (old_now, old_cut) = self
+        let (old_now, old_cut, old_create) = self
             .purged_groups
             .get(&wtxn, &key)?
             .map(decode_purged_group_marker)
-            .unwrap_or((0, 0));
+            .unwrap_or((0, 0, None));
         purge_now = purge_now.max(old_now);
         cut = cut.max(old_cut).max(max_created);
-        self.purged_groups
-            .put(&mut wtxn, &key, &encode_purged_group_marker(purge_now, cut))?;
+        if create_id.is_none() {
+            create_id = old_create;
+        }
+        self.purged_groups.put(
+            &mut wtxn,
+            &key,
+            &encode_purged_group_marker(purge_now, cut, create_id.as_ref()),
+        )?;
         self.purge_pending.delete(&mut wtxn, &key)?;
         self.bump_state_stamp(&mut wtxn)?;
         wtxn.commit()?;
         Ok(removed)
     }
 
-    /// Started-but-unfinished group purges as `(gid, purge_now)`: each was
-    /// recorded before its first removal chunk and not cleared, so the
-    /// caller re-runs `purge_group(gid, purge_now)` to finish it (the walk
-    /// is idempotent and the marker keeps the furthest cut). A malformed
-    /// record is an error, so a caller that fails closed never treats a
-    /// corrupt pending table as "nothing to resume".
-    pub(crate) fn pending_purges(&self) -> Result<Vec<(String, u64)>> {
+    /// Started-but-unfinished group purges as `(gid, purge_now, until)`:
+    /// each was recorded before its first removal chunk and not cleared, so
+    /// the caller re-runs `purge_group_until(gid, purge_now, until)` to
+    /// finish it (the walk is idempotent and the marker keeps the furthest
+    /// cut). A malformed record is an error, so a caller that fails closed
+    /// never treats a corrupt pending table as "nothing to resume".
+    pub(crate) fn pending_purges(&self) -> Result<Vec<(String, u64, u64)>> {
         let rtxn = self.env.read_txn()?;
         let mut out = Vec::new();
         for item in self.purge_pending.iter(&rtxn)? {
             let (_, raw) = item?;
-            let (gid, purge_now, _) = decode_pending_purge(raw).ok_or_else(|| {
+            let (gid, purge_now, _, until, _) = decode_pending_purge(raw).ok_or_else(|| {
                 anyhow::anyhow!("corrupt pending purge record ({} bytes)", raw.len())
             })?;
-            out.push((gid, purge_now));
+            out.push((gid, purge_now, until));
         }
         Ok(out)
     }
@@ -965,7 +1143,7 @@ impl Store {
         // variant with one narrow range. A failure here must not write the
         // marker below: the re-delivered request (or the startup resume)
         // has to finish the wraps.
-        self.remove_gift_wraps_for(pubkey, &mut removed)?;
+        self.remove_gift_wraps_for(pubkey, u64::MAX, &mut removed)?;
 
         // The completed marker and the pending clear commit together: a
         // crash between them would otherwise leave a pending record whose
@@ -990,10 +1168,10 @@ impl Store {
     /// pubkey when that pubkey signs a NIP-09 deletion request. Wraps are
     /// signed by random keys, so they cannot be deleted by their recipient
     /// through the normal deletion flow.
-    pub(crate) fn delete_gift_wraps_to(&self, pubkey: &[u8]) -> Result<usize> {
+    pub(crate) fn delete_gift_wraps_to(&self, pubkey: &[u8], until: u64) -> Result<usize> {
         self.disk_full_error()?;
         let mut removed = 0usize;
-        self.remove_gift_wraps_for(pubkey, &mut removed)?;
+        self.remove_gift_wraps_for(pubkey, until, &mut removed)?;
         Ok(removed)
     }
 

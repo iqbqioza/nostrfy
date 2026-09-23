@@ -286,6 +286,7 @@ nostrfy blossom list
 | `nostrfy relay allow <pubkey>` / `deny <pubkey>` / `list` | Manage the relay pubkey allow/deny lists (persisted in LMDB, applied on SIGHUP) |
 | `nostrfy access unblockip <ip>` | Remove an IP from the persisted NIP-86 blocked-IP list (self-lockout recovery; restart to apply) |
 | `nostrfy upgrade [version]` | Update the relay binary to the latest GitHub release (or a given version): downloads the asset for this platform, verifies it runs and atomically replaces the binary (`--force` reinstalls the current version; a running daemon needs `nostrfy restart` to pick it up) |
+| `nostrfy migrate-strfry` | Migrate a strfry relay database into this relay: reads `strfry export` JSONL (or runs `strfry export` itself with `--strfry-db`) and imports the events with their NIP-09/NIP-29 deletion side effects. The relay must be stopped; a re-run is safe; `--dry-run` shows what would be imported. It also offers to merge the equivalent `strfry.conf` settings into `nostrfy.toml` (`--merge-config` applies without asking). See the [step-by-step migration guide](docs/MIGRATING-FROM-STRFRY.md) |
 
 All commands accept `--config <path>` (default `./nostrfy.toml`).
 

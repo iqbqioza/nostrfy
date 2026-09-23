@@ -378,7 +378,7 @@ fn vanish_rebuild_does_not_recreate_membership_of_private_groups() {
         db.apply_vanish(vanished, now).await;
 
         let mut store = GroupStore::default();
-        assert!(store.rebuild(&db).await, "the rebuild must complete");
+        assert!(store.rebuild(&db, None).await, "the rebuild must complete");
         let group = store.group("g1").expect("the group survives");
         assert!(
             !group.is_member(OTHER),
@@ -1026,10 +1026,72 @@ fn rebuild_keeps_join_membership() {
         );
 
         let mut store = GroupStore::default();
-        assert!(store.rebuild(&db).await, "the rebuild must complete");
+        assert!(store.rebuild(&db, None).await, "the rebuild must complete");
         let g = store.group("g1").expect("group rebuilt");
         assert!(g.is_admin(ADMIN), "creator is admin after rebuild");
         assert!(g.is_member(OTHER), "JOIN membership survives rebuild");
+    });
+}
+
+#[test]
+fn rebuild_trusts_the_stored_moderation_set() {
+    // The migration refuses to import moderation its replay would reject,
+    // so the rebuild replays every stored moderation event. Re-authorizing
+    // here would drop legitimate events whose rank-ordered position differs
+    // from their live arrival order (a same-second demotion or settings
+    // edit accepted by the live relay), changing relay state across a
+    // restart.
+    use crate::db::DbClient;
+    use crate::nips::nip01;
+    use std::sync::Arc;
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = std::env::temp_dir()
+        .join("nostrfy-nip29-rebuild-trust")
+        .join(format!("{:x}-{id}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&path);
+    let cfg = crate::config::DatabaseConfig {
+        path,
+        map_size: 16 * 1024 * 1024,
+        max_map_size: 32 * 1024 * 1024,
+        ..Default::default()
+    };
+    let db = DbClient::open(
+        &cfg,
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let now = 1_700_000_000;
+        let mut create = event(CREATE_GROUP, ADMIN, Some("g1"), vec![]);
+        create.created_at = now;
+        create.id = nip01::compute_id(&create);
+        assert_eq!(db.put(create, now).await, crate::db::PutOutcome::Stored);
+        // Stored moderation is replayed as-is: the migration is the gate,
+        // not the rebuild.
+        let mut grant = event(
+            9000,
+            OTHER,
+            Some("g1"),
+            vec![vec!["p".into(), OTHER.into(), "admin".into()]],
+        );
+        grant.created_at = now + 1;
+        grant.id = nip01::compute_id(&grant);
+        assert_eq!(db.put(grant, now + 1).await, crate::db::PutOutcome::Stored);
+        let mut store = GroupStore::default();
+        assert!(store.rebuild(&db, None).await, "the rebuild must complete");
+        let group = store.group("g1").expect("the group is rebuilt");
+        assert!(
+            group.is_admin(OTHER),
+            "the stored grant is applied without re-authorization"
+        );
+        db.shutdown();
     });
 }
 
@@ -1090,7 +1152,7 @@ fn rebuild_ghosts_group_whose_only_surviving_events_are_relay_metadata() {
         }
 
         let mut store = GroupStore::default();
-        assert!(store.rebuild(&db).await, "the rebuild must complete");
+        assert!(store.rebuild(&db, None).await, "the rebuild must complete");
         assert!(
             store.ghost.contains("g1"),
             "a group with only relay metadata must be ghosted"
@@ -1154,7 +1216,7 @@ fn rebuild_ghosts_a_group_whose_only_surviving_events_are_ordinary_posts() {
         assert_eq!(db.put(plain, now).await, crate::db::PutOutcome::Stored);
 
         let mut store = GroupStore::default();
-        assert!(store.rebuild(&db).await, "the rebuild must complete");
+        assert!(store.rebuild(&db, None).await, "the rebuild must complete");
         assert!(
             store.ghost.contains("g1"),
             "a post-only group must be ghosted"
@@ -1217,7 +1279,7 @@ fn rebuild_ghosts_a_deleted_group_whose_purge_never_completed() {
             assert_eq!(db.put(ev.clone(), now).await, crate::db::PutOutcome::Stored);
         }
         let mut store = GroupStore::default();
-        assert!(store.rebuild(&db).await, "the rebuild must complete");
+        assert!(store.rebuild(&db, None).await, "the rebuild must complete");
         assert!(
             store.deleted.contains("g1"),
             "the replayed 9008 leaves the delete tombstone"
@@ -1272,7 +1334,7 @@ fn rebuild_fails_closed_when_the_database_is_unavailable() {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let mut store = GroupStore::default();
         assert!(
-            !store.rebuild(&db).await,
+            !store.rebuild(&db, None).await,
             "an unanswered rebuild must fail closed"
         );
         assert!(
@@ -2205,7 +2267,7 @@ fn rebuild_ignores_d_tags_on_non_group_kinds() {
             crate::db::PutOutcome::Stored
         );
         let mut store = GroupStore::default();
-        assert!(store.rebuild(&db).await, "the rebuild must complete");
+        assert!(store.rebuild(&db, None).await, "the rebuild must complete");
         assert!(
             store.ghost.is_empty(),
             "a non-group `d` tag must not ghost a group: {:?}",

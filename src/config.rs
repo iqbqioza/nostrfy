@@ -1988,29 +1988,197 @@ pub(crate) fn toml_escape(value: &str) -> String {
     out
 }
 
-/// Replaces (or inserts) a `field = "value"` line inside the `[relay]`
+/// Splits a table header line into `(name, is_array)`, honoring quoted
+/// names so a `]` inside them is not mistaken for the closing bracket. The
+/// remainder must be empty, whitespace or a comment.
+fn parse_table_header(line: &str) -> Option<(&str, bool)> {
+    let (inner, rest, is_array) = if let Some(rest) = line.strip_prefix("[[") {
+        let end = find_closing(rest, "]]")?;
+        (&rest[..end], &rest[end + 2..], true)
+    } else {
+        let rest = line.strip_prefix('[')?;
+        let end = find_closing(rest, "]")?;
+        (&rest[..end], &rest[end + 1..], false)
+    };
+    if !(rest.is_empty() || rest.starts_with([' ', '\t', '#'])) {
+        return None;
+    }
+    Some((inner, is_array))
+}
+
+/// Finds the closing bracket sequence outside quoted segments.
+fn find_closing(text: &str, close: &str) -> Option<usize> {
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut index = 0;
+    while index < text.len() {
+        let ch = text[index..].chars().next()?;
+        if let Some(open) = quote {
+            if open == '"' && escaped {
+                escaped = false;
+            } else if open == '"' && ch == '\\' {
+                escaped = true;
+            } else if ch == open {
+                quote = None;
+            }
+        } else if ch == '"' || ch == '\'' {
+            quote = Some(ch);
+        } else if text[index..].starts_with(close) {
+            return Some(index);
+        }
+        index += ch.len_utf8();
+    }
+    None
+}
+
+/// The section path of a header line, decoded the way TOML does: `[ relay ]`,
+/// `["relay"]` and `["\u0072elay"]` all name `relay`, while `[relay.x]`
+/// names `relay.x`.
+fn header_name(inner: &str) -> String {
+    let header = format!("[{inner}]");
+    let Ok(toml::Value::Table(table)) = toml::from_str::<toml::Value>(&header) else {
+        return inner.trim().to_string();
+    };
+    fn first_path(table: &toml::Table, prefix: Option<&str>) -> Option<String> {
+        let (key, value) = table.iter().next()?;
+        // An empty key is a real (empty) segment: `["".relay]` names the
+        // path `.relay`, never `relay`.
+        let path = match prefix {
+            None => key.clone(),
+            Some(prefix) => format!("{prefix}.{key}"),
+        };
+        match value {
+            toml::Value::Table(inner) if !inner.is_empty() => first_path(inner, Some(&path)),
+            _ => Some(path),
+        }
+    }
+    first_path(&table, None).unwrap_or_else(|| inner.trim().to_string())
+}
+
+/// Whether a trimmed line starts a TOML table (`[name]`) or an array of
+/// tables (`[[name]]`), optionally followed by whitespace or a comment.
+fn is_table_header(line: &str) -> bool {
+    parse_table_header(line).is_some()
+}
+
+/// Marks each line of `text` that is data rather than structure: a line
+/// that STARTS inside a TOML multi-line string or a multi-line array
+/// (`"""..."""` or `'''...'''`). A line-based editor must never treat the
+/// content of such a string as structure: it may contain a line that looks
+/// like a table header or an assignment. A line that merely *opens* a
+/// multi-line string (`key = """...`) is not flagged: its structure before
+/// the opener is real, and the caller extends the replacement over the
+/// value's continuation lines.
+fn non_structural_lines(text: &str) -> Vec<bool> {
+    let mut flags = Vec::new();
+    let mut multi: Option<char> = None;
+    // Bracket depth outside strings/comments: a line inside a multi-line
+    // array (e.g. its `[1, 2]` element) is data, not structure.
+    let mut array_depth = 0usize;
+    for line in text.split_inclusive('\n') {
+        flags.push(multi.is_some() || array_depth > 0);
+        let mut string: Option<char> = None;
+        let mut escaped = false;
+        let mut comment = false;
+        let mut chars = line.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '\n' {
+                break;
+            }
+            if let Some(delim) = multi {
+                if delim == '"' {
+                    if escaped {
+                        escaped = false;
+                        continue;
+                    }
+                    if ch == '\\' {
+                        escaped = true;
+                        continue;
+                    }
+                }
+                if ch == delim && chars.peek() == Some(&delim) {
+                    let mut lookahead = chars.clone();
+                    lookahead.next();
+                    if lookahead.next() == Some(delim) {
+                        chars.next();
+                        chars.next();
+                        multi = None;
+                    }
+                }
+                continue;
+            }
+            if comment {
+                continue;
+            }
+            if let Some(quote) = string {
+                if ch == quote {
+                    if quote == '"' && escaped {
+                        escaped = false;
+                    } else {
+                        string = None;
+                    }
+                    continue;
+                }
+                if quote == '"' && ch == '\\' {
+                    escaped = !escaped;
+                    continue;
+                }
+                escaped = false;
+                continue;
+            }
+            match ch {
+                '#' => comment = true,
+                '[' => array_depth += 1,
+                ']' => array_depth = array_depth.saturating_sub(1),
+                '"' | '\'' => {
+                    let delim = ch;
+                    let mut lookahead = chars.clone();
+                    if lookahead.next() == Some(delim) && lookahead.next() == Some(delim) {
+                        chars.next();
+                        chars.next();
+                        multi = Some(delim);
+                    } else {
+                        string = Some(delim);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    flags
+}
+
+/// Replaces (or inserts) a `key = <toml value>` line inside the `[section]`
 /// section of a config file's text, preserving every other line, comment
 /// and section. Handles three cases: a matching line already present in the
-/// `[relay]` section (replaced), no such line in `[relay]` (inserted right
-/// after the header), and no `[relay]` section at all (appended).
-/// Used by `nostrfy genkey` (private_key) and the NIP-86 relay-name changes.
-pub(crate) fn set_relay_field_in_text(text: &str, field: &str, value: &str) -> String {
-    let line = format!("{field} = \"{}\"", toml_escape(value));
+/// section (replaced), no such line (inserted right after the header), and
+/// no section at all (appended). `value` must already be a valid TOML value
+/// literal (an escaped quoted string, a number, a boolean). Used by
+/// `nostrfy genkey` (private_key), the NIP-86 relay-name changes and the
+/// strfry settings merge.
+pub(crate) fn set_config_field_in_text(
+    text: &str,
+    section: &str,
+    key: &str,
+    value: &str,
+) -> String {
+    let line = format!("{key} = {value}");
+    // Lines that are part of a TOML multi-line string never carry
+    // structure: their content may look like a table header or an
+    // assignment but must not be treated as one.
+    let string_lines = non_structural_lines(text);
 
-    // Locate a real `[relay]` section header: a line whose trimmed text
-    // starts with `[relay]` followed by `]`. A `[relay]` inside a comment or
-    // a string value is not a section header and must not match.
+    // Locate a real `[section]` header: a line whose trimmed text is the
+    // header, or the header followed by whitespace or a comment. A
+    // `[section]` inside a comment, a string value or a multi-line string
+    // is not a section header and must not match.
     let mut header_start = None;
     let mut offset = 0;
-    for l in text.split_inclusive('\n') {
+    for (index, l) in text.split_inclusive('\n').enumerate() {
         let t = l.trim();
-        // `[relay]` header line: exactly `[relay]`, or `[relay]` followed by
-        // whitespace or a comment. A `[relay]` inside a comment or a string
-        // value does not start with `[relay]` as a header.
-        if t == "[relay]"
-            || t.starts_with("[relay] ")
-            || t.starts_with("[relay]\t")
-            || t.starts_with("[relay]#")
+        if !string_lines.get(index).copied().unwrap_or(false)
+            && parse_table_header(t)
+                .is_some_and(|(name, is_array)| !is_array && header_name(name) == section)
         {
             header_start = Some(offset);
             break;
@@ -2018,12 +2186,14 @@ pub(crate) fn set_relay_field_in_text(text: &str, field: &str, value: &str) -> S
         offset += l.len();
     }
     let Some(header_start) = header_start else {
-        // No [relay] section: append one at the end.
+        // No section: append one at the end, using the file's line ending
+        // (a CRLF config stays CRLF).
+        let ending = if text.contains("\r\n") { "\r\n" } else { "\n" };
         let mut s = text.to_string();
         if !s.ends_with('\n') {
-            s.push('\n');
+            s.push_str(ending);
         }
-        s.push_str(&format!("[relay]\n{line}\n"));
+        s.push_str(&format!("[{section}]{ending}{line}{ending}"));
         return s;
     };
 
@@ -2034,12 +2204,20 @@ pub(crate) fn set_relay_field_in_text(text: &str, field: &str, value: &str) -> S
         .map(|i| header_start + i + 1)
         .unwrap_or(text.len());
 
-    // Bound the section at the next `[section]` header line.
+    // Bound the section at the next table header line: a bare `[rpc]`, a
+    // header with a trailing comment (`[rpc] # management`) or an
+    // `[[array-of-tables]]`. Missing any of these let the slice below
+    // extend into the next table and overwrite an unrelated key.
+    let section_line = text[..header_end].matches('\n').count();
     let mut section_end = text.len();
     let mut cursor = header_end;
-    for l in text[header_end..].split_inclusive('\n') {
-        let t = l.trim();
-        if t.starts_with('[') && t.ends_with(']') {
+    for (index, l) in text[header_end..].split_inclusive('\n').enumerate() {
+        if !string_lines
+            .get(section_line + index)
+            .copied()
+            .unwrap_or(false)
+            && is_table_header(l.trim())
+        {
             section_end = cursor;
             break;
         }
@@ -2048,27 +2226,62 @@ pub(crate) fn set_relay_field_in_text(text: &str, field: &str, value: &str) -> S
     let section = &text[header_end..section_end];
 
     // Case 1: a matching line already exists in the section — replace it.
-    // The line must be the field itself (followed by `=`, whitespace or
-    // end-of-line), not an unrelated key that merely starts with the
-    // field name (unknown keys are warned about but never rejected, so
-    // e.g. `private_key_note = "x"` must not be clobbered by genkey).
+    // The line must be the key itself (followed by `=`, whitespace or
+    // end-of-line), not an unrelated key that merely starts with the key
+    // name (unknown keys are warned about but never rejected, so e.g.
+    // `private_key_note = "x"` must not be clobbered by genkey).
     // `split_inclusive` keeps each line's original ending, so a CRLF
     // config stays CRLF instead of being silently normalized to LF.
     let lines: Vec<&str> = section.split_inclusive('\n').collect();
-    if let Some(offset) = lines.iter().position(|l| {
-        l.trim_end_matches(['\n', '\r'])
-            .trim_start()
-            .strip_prefix(field)
-            .is_some_and(|rest| {
-                rest.is_empty() || rest.starts_with('=') || rest.starts_with([' ', '\t'])
-            })
+    let quoted_double = format!("\"{key}\"");
+    let quoted_single = format!("'{key}'");
+    if let Some(offset) = lines.iter().enumerate().position(|(index, l)| {
+        !string_lines
+            .get(section_line + index)
+            .copied()
+            .unwrap_or(false)
+            && l.trim_end_matches(['\n', '\r'])
+                .trim_start()
+                .strip_prefix(key)
+                .or_else(|| {
+                    l.trim_end_matches(['\n', '\r'])
+                        .trim_start()
+                        .strip_prefix(quoted_double.as_str())
+                })
+                .or_else(|| {
+                    l.trim_end_matches(['\n', '\r'])
+                        .trim_start()
+                        .strip_prefix(quoted_single.as_str())
+                })
+                .is_some_and(|rest| {
+                    rest.is_empty() || rest.starts_with('=') || rest.starts_with([' ', '\t'])
+                })
     }) {
+        // A matched line that opens a multi-line string owns its value's
+        // continuation lines: replace the whole span, or the orphaned
+        // continuation would corrupt the file (and a second key would be
+        // inserted by an unvalidated writer like `genkey`).
+        let flagged = |index: usize| {
+            string_lines
+                .get(section_line + index)
+                .copied()
+                .unwrap_or(false)
+        };
+        let mut value_end = offset;
+        if lines.len() > offset + 1 && flagged(offset + 1) {
+            value_end = offset + 1;
+            while value_end + 1 < lines.len() && flagged(value_end + 1) {
+                value_end += 1;
+            }
+        }
         let mut new_section = String::with_capacity(section.len() + line.len());
         for (i, l) in lines.iter().enumerate() {
             if i == offset {
                 let indent: String = l.chars().take_while(|c| c.is_whitespace()).collect();
                 let ending = if l.ends_with("\r\n") { "\r\n" } else { "\n" };
                 new_section.push_str(&format!("{indent}{line}{ending}"));
+            } else if i > offset && i <= value_end {
+                // The multi-line value's continuation lines are dropped.
             } else {
                 new_section.push_str(l);
             }
@@ -2078,19 +2291,43 @@ pub(crate) fn set_relay_field_in_text(text: &str, field: &str, value: &str) -> S
         return s;
     }
 
-    // Case 2: no matching line — insert it right after the `[relay]`
-    // header line, keeping the header on its own line even when the header
-    // is the last line of the file without a trailing newline.
+    // Case 2: no matching line — insert it right after the section header
+    // line, keeping the header on its own line even when the header is the
+    // last line of the file without a trailing newline. The inserted line
+    // uses the header's own ending, so a CRLF config stays CRLF.
+    let ending = if text[..header_end].ends_with("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
     let mut s = text.to_string();
     if header_end >= s.len() {
         // Header is the last line without a trailing newline.
-        s.push('\n');
+        s.push_str(ending);
         s.push_str(&line);
-        s.push('\n');
+        s.push_str(ending);
     } else {
-        s.insert_str(header_end, &format!("{line}\n"));
+        s.insert_str(header_end, &format!("{line}{ending}"));
     }
     s
+}
+
+/// [`set_config_field_in_text`] plus a parse check of the result, for the
+/// writers that do not validate before publishing (`genkey`, NIP-86): an
+/// exotic spelling the line matcher did not recognize (a quoted or dotted
+/// header/key) would otherwise turn into a duplicate key and break the
+/// next start.
+pub(crate) fn rewrite_config_checked(
+    text: &str,
+    section: &str,
+    key: &str,
+    value: &str,
+) -> anyhow::Result<String> {
+    let rewritten = set_config_field_in_text(text, section, key, value);
+    toml::from_str::<Config>(&rewritten).map_err(|e| {
+        anyhow::anyhow!("the rewritten config would be invalid ({e}); refusing to write it")
+    })?;
+    Ok(rewritten)
 }
 
 /// Writes `text` to `path` atomically (temp file + rename) so a crash in
@@ -2109,6 +2346,12 @@ fn stricter_mode(captured: u32, current: u32) -> u32 {
 pub(crate) fn write_text_atomic(path: &Path, text: &str) -> anyhow::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    // A symlinked config is written through to its target: the atomic
+    // rename would otherwise replace the link with a regular file and leave
+    // the target stale. A path that cannot be resolved (a missing file)
+    // keeps the original.
+    let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let path = resolved.as_path();
     // A unique, exclusively-created temp file: the old fixed `path.tmp`
     // name let two concurrent writers (NIP-86 config updates, `genkey`)
     // truncate each other's temp, so one rename could publish a
@@ -2509,6 +2752,11 @@ mod tests {
         assert!(checked > 0, "expected example configs to check");
     }
 
+    #[cfg(test)]
+    fn set_relay_field_in_text(text: &str, field: &str, value: &str) -> String {
+        set_config_field_in_text(text, "relay", field, &format!("\"{}\"", toml_escape(value)))
+    }
+
     #[test]
     fn set_relay_field_does_not_clobber_prefix_matches() {
         // Unknown keys are warned about but never rejected, so a line that
@@ -2525,6 +2773,164 @@ mod tests {
         let out = set_relay_field_in_text(text, "private_key", "ab");
         assert!(out.contains("private_key = \"ab\""), "{out}");
         assert!(out.contains("private_key_note = \"x\""), "{out}");
+    }
+
+    #[test]
+    fn section_with_a_trailing_comment_still_bounds_the_section() {
+        // A header with a trailing comment (`[rpc] # management`) is a real
+        // table boundary: without recognizing it the edit slipped into the
+        // next section and overwrote an unrelated key (e.g. `blossom.host`).
+        let text = "[server]\nport = 8080\n\n[rpc] # management\nmanagement_token = \"\"\n\n\
+                    [blossom] # uploads\nhost = \"\"\n";
+        let out = set_config_field_in_text(text, "server", "host", "\"0.0.0.0\"");
+        assert!(
+            out.contains("[server]\nhost = \"0.0.0.0\"\nport = 8080"),
+            "the key is inserted into its own section: {out}"
+        );
+        assert!(
+            out.contains("host = \"\""),
+            "the later section's key must stay untouched: {out}"
+        );
+    }
+
+    #[test]
+    fn multiline_strings_are_not_treated_as_structure() {
+        // A `[limits]` line inside a multi-line string is content, not a
+        // header: the edit must stay in `[server]` (and append a real
+        // section) instead of rewriting the string.
+        let text = "[server]\nconf = \"\"\"\n[limits]\n\"\"\"\n\nmax_tags = 5\nport = 8080\n";
+        let out = set_config_field_in_text(text, "limits", "max_tags", "7");
+        assert!(
+            out.contains("\"\"\"\n[limits]\n\"\"\""),
+            "the string content stays: {out}"
+        );
+        assert!(
+            out.contains("[limits]\nmax_tags = 7"),
+            "a real section is appended: {out}"
+        );
+        assert!(out.contains("max_tags = 5"), "the server key stays: {out}");
+        // A key line inside a multi-line string is not replaced either.
+        let text = "[limits]\nnote = \"\"\"\nmax_tags = 999\n\"\"\"\nmax_tags = 100\n";
+        let out = set_config_field_in_text(text, "limits", "max_tags", "7");
+        assert!(
+            out.contains("max_tags = 999"),
+            "the string content stays: {out}"
+        );
+        assert!(out.contains("max_tags = 7"), "{out}");
+        assert!(!out.contains("max_tags = 100"), "{out}");
+    }
+
+    #[test]
+    fn array_of_tables_bounds_the_section() {
+        // `[[relay.items]]` starts a new table: the `[relay]` section ends
+        // before it, so an insertion lands in `[relay]`, not in the array.
+        let text = "[relay]\ndescription = \"keep\"\n\n[[relay.items]]\nname = \"old-item\"\n";
+        let out = set_config_field_in_text(text, "relay", "name", "\"new\"");
+        assert!(
+            out.contains("name = \"old-item\""),
+            "the array table stays: {out}"
+        );
+        assert!(
+            out.contains("[relay]\nname = \"new\""),
+            "the key is inserted into [relay]: {out}"
+        );
+    }
+
+    #[test]
+    fn a_multiline_value_is_replaced_as_a_whole() {
+        // A key whose value spans multiple lines must be replaced with its
+        // continuation lines: replacing only the opening line would leave
+        // orphaned content (and an unvalidated writer like `genkey` would
+        // corrupt the file with a second key).
+        let text = "[relay]\nname = \"\"\"old\nvalue\"\"\"\nport = 1\n";
+        let out = set_config_field_in_text(text, "relay", "name", "\"new\"");
+        assert!(out.contains("name = \"new\""), "{out}");
+        assert!(!out.contains("old"), "{out}");
+        assert!(!out.contains("value\"\"\""), "{out}");
+        assert!(out.contains("port = 1"), "{out}");
+        let cfg: Config = toml::from_str(&out).expect("the rewritten config must parse");
+        assert_eq!(cfg.relay.name, "new");
+    }
+
+    #[test]
+    fn an_empty_quoted_header_segment_does_not_match() {
+        // `["".relay]` names the path `.relay`, not `relay`: a rewrite must
+        // not land in it (a new `[relay]` section is appended instead).
+        let text = "[\"\".relay]\nname = \"trap\"\n";
+        let out = set_config_field_in_text(text, "relay", "name", "\"new\"");
+        assert!(out.contains("name = \"trap\""), "{out}");
+        assert!(out.contains("[relay]\nname = \"new\""), "appended: {out}");
+    }
+
+    #[test]
+    fn crlf_configs_keep_crlf_on_insert() {
+        let text = "[relay]\r\nname = \"old\"\r\n";
+        let out = set_config_field_in_text(text, "relay", "private_key", "\"ab\"");
+        assert!(out.contains("private_key = \"ab\"\r\n"), "{out:?}");
+        assert!(!out.contains("private_key = \"ab\"\n"), "{out:?}");
+        // Appending a whole section keeps the file's ending too.
+        let text = "[rpc]\r\nx = 1\r\n";
+        let out = set_config_field_in_text(text, "relay", "name", "\"new\"");
+        assert!(out.contains("[relay]\r\nname = \"new\"\r\n"), "{out:?}");
+    }
+
+    #[test]
+    fn an_escaped_header_name_matches() {
+        // `["\u0072elay"]` decodes to the `relay` table; the rewrite must
+        // recognize it instead of refusing (or duplicating).
+        let text = "[\"\\u0072elay\"]\nname = \"old\"\n";
+        let out = set_config_field_in_text(text, "relay", "name", "\"new\"");
+        assert!(out.contains("name = \"new\""), "{out}");
+        assert!(!out.contains("name = \"old\""), "{out}");
+    }
+
+    #[test]
+    fn quoted_table_names_and_headers_are_matched() {
+        // A quoted name with a comma is a real table, not an array element:
+        // the edit must stay in `[relay]`.
+        let text = "[relay]\ndescription = \"keep\"\n\n[\"a,b\"]\nname = \"other\"\n";
+        let out = set_config_field_in_text(text, "relay", "name", "\"new\"");
+        assert!(out.contains("name = \"other\""), "{out}");
+        assert!(out.contains("[relay]\nname = \"new\""), "{out}");
+        // Whitespace and quoted spellings of the target table match.
+        for text in [
+            "[ relay ]\nname = \"old\"\n",
+            "[\"relay\"]\nname = \"old\"\n",
+            "['relay']\nname = \"old\"\n",
+        ] {
+            let out = set_config_field_in_text(text, "relay", "name", "\"new\"");
+            assert!(out.contains("name = \"new\""), "{text} => {out}");
+            assert!(!out.contains("name = \"old\""), "{text} => {out}");
+        }
+        // A quoted key inside the section is replaced, not duplicated.
+        let text = "[relay]\n\"private_key\" = \"old\"\n";
+        let out = set_config_field_in_text(text, "relay", "private_key", "\"new\"");
+        assert!(out.contains("private_key = \"new\""), "{out}");
+        assert!(!out.contains("\"private_key\""), "{out}");
+    }
+
+    #[test]
+    fn a_multiline_array_does_not_bound_the_section() {
+        // A nested-array element line like `[1, 2]` is data, not a header:
+        // a key after it must still be replaceable (an unvalidated writer
+        // like `genkey` would otherwise insert a duplicate key).
+        let text = "[relay]\nmatrix = [\n  [1, 2]\n]\nname = \"old\"\n";
+        let out = set_config_field_in_text(text, "relay", "name", "\"new\"");
+        assert!(out.contains("name = \"new\""), "{out}");
+        assert!(!out.contains("name = \"old\""), "{out}");
+        assert!(out.contains("[1, 2]"), "the array survives: {out}");
+        let cfg: Config = toml::from_str(&out).expect("the rewritten config must parse");
+        assert_eq!(cfg.relay.name, "new");
+    }
+
+    #[test]
+    fn a_key_after_a_multiline_value_is_found() {
+        // A real key on a line that follows a closed multi-line string must
+        // still be replaceable.
+        let text = "[relay]\nconf = \"\"\"\n[limits]\n\"\"\"\nname = \"old\"\n";
+        let out = set_config_field_in_text(text, "relay", "name", "\"new\"");
+        assert!(out.contains("name = \"new\""), "{out}");
+        assert!(out.contains("\"\"\"\n[limits]\n\"\"\""), "{out}");
     }
 
     #[test]
@@ -2915,6 +3321,21 @@ max_log_files = 2
             &std::fs::metadata(&plain).unwrap().permissions(),
         ) & 0o777;
         assert_eq!(mode, 0o644, "a plain config keeps its mode");
+        // A symlinked config is written through to its target: the link
+        // must survive and the target must hold the new content.
+        let real = dir.join("real.toml");
+        std::fs::write(&real, "a = 1").unwrap();
+        let link = dir.join("link.toml");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        write_text_atomic(&link, "a = 3").unwrap();
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the symlink must not be replaced by a regular file"
+        );
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "a = 3");
         // When the rename cannot complete (the target is a directory),
         // the temp is removed again and nothing world-readable is left
         // behind.

@@ -20,6 +20,7 @@ This manual explains every feature of **nostrfy**, a Nostr relay server, step by
 13. [Reloading Configuration (SIGHUP)](#13-reloading-configuration-sighup)
 14. [Large-Scale Deployments](#14-large-scale-deployments)
 15. [When You Are Stuck](#15-when-you-are-stuck)
+16. [Migrating from strfry](#16-migrating-from-strfry)
 
 ---
 
@@ -875,3 +876,152 @@ subscribers are matched by the reader pool without the writer's lock.
 See [Troubleshooting (TROUBLESHOOTING.md)](TROUBLESHOOTING.md) for common errors and their fixes.
 
 Absence filters: `no_p`, `no_e`, `no_t` and `no_d` exclude events carrying that tag before pagination (e.g. `no_p=true` keeps only top-level posts — mentions, replies and DMs are dropped).
+---
+
+## 16. Migrating from strfry
+
+> For the complete operator runbook — preparation, dry run, migration,
+> verification, cut-over, rollback and troubleshooting — see
+> [MIGRATING-FROM-STRFRY.md](MIGRATING-FROM-STRFRY.md). This section is the
+> command reference.
+
+nostrfy can import the events of a [strfry](https://github.com/hoytech/strfry)
+relay. The migration reads strfry's own export format (JSONL, one NIP-01 event
+per line, oldest first), so it works across strfry database versions and does
+not depend on strfry's internal LMDB schema.
+
+**Stop the relay first.** The migration writes directly to `database.path`
+and refuses to run while a daemon (or another migration) holds the database
+directory. It is safe to re-run: duplicates are skipped and the deletion
+side effects are re-applied, so an interrupted migration can simply be run
+again.
+
+### Option A: let nostrfy run `strfry export`
+
+```sh
+nostrfy migrate-strfry --strfry-db /var/lib/strfry-db
+```
+
+The `strfry` binary must be on `PATH` (or named with `--strfry-bin`).
+nostrfy writes a minimal temporary strfry config (`db = "..."`) and runs
+`strfry export` itself; the operator's own `strfry.conf` is not needed.
+Use `--since <unix>` to resume from a previous run's hint (`--since` is
+inclusive, so the boundary second is re-imported and skipped as
+duplicates).
+
+### Option B: export yourself
+
+```sh
+strfry export > /tmp/strfry-export.jsonl
+nostrfy migrate-strfry --input /tmp/strfry-export.jsonl
+```
+
+`--input -` (the default) reads from stdin, so a pipe works too:
+
+```sh
+strfry export | nostrfy migrate-strfry
+```
+
+### What is migrated
+
+- Every stored event, through the normal storage path: replaceable and
+  addressable semantics, NIP-40 expiry (already-expired events are skipped),
+  the NIP-50 word index and the gift-wrap recipient index.
+- NIP-09 deletion requests: the deletion is applied, the deleter's gift
+  wraps are purged, and — because strfry removes deleted events physically,
+  so the export has no trace of them — a re-publication block scoped to the
+  deletion's author is recorded for every `e` target (the same
+  `(id, pubkey)` block strfry keeps). A third party's deletion request
+  naming someone else's event cannot block that author. The wrap purge is
+  replayed from the stored requests, bounded by each author's newest
+  request timestamp: a wrap created after that request survives (the export
+  carries no arrival order, so a wrap whose timestamp and arrival disagree
+  may differ from the live relay).
+- NIP-29 `9005` (delete event) and `9008` (delete group) moderation events:
+  the referenced events are removed, and a `9008` purges the group's stored
+  history up to its own timestamp (so a group re-created after the deletion
+  keeps its newer events). An incomplete purge aborts the migration. The
+  side effects are applied after the import in the same order the startup
+  rebuild replays stored events (strfry's export orders same-second events
+  by id, so deciding during the stream could disagree with the first
+  restart). A purged group's original create event stays blocked on a
+  re-run (the marker records its id), so re-running the migration cannot
+  resurrect the group. strfry stores every signed event without NIP-29
+  validation, so a moderation event whose author is not a group admin (or
+  the relay key), or that lacks an `h` tag, is removed during the import —
+  the live relay would have rejected it, and leaving it stored would let
+  the trusting restart rebuild apply it; the summary reports how many were
+  ignored. A refused `9005` is kept (the rebuild's state machine ignores
+  `9005`, so it cannot change the derived state), and an authorized `9005`
+  that deletes a group's create keeps the id ghosted: a later re-create for
+  that id is removed so the old history cannot become world-readable. The
+  replay uses the `(created_at, rank, kind, id)` order, which approximates
+  the live arrival order: a same-second event whose live acceptance
+  depended on arrival may differ. (A `9008` whose
+  own event the import removes before the replay — a NIP-09 request naming
+  it, or `--apply-vanish` for its author — is not replayed, so its purge is
+  skipped; re-running without that removal applies it.)
+- First-seen timestamps, when `relay.new_pubkey_min_age_secs` is set, so
+  migrated authors are not treated as brand-new accounts.
+
+NIP-29 groups and NIP-43 roles are rebuilt from the stored events on the
+first relay start after the migration (it may take a moment on a large
+database). The relay then republishes the derived relay-signed metadata —
+NIP-29 `39000`/`39001`/`39002`/`39005` for every group and the NIP-43
+`13534` membership list (protected, served to authenticated clients) — so
+clients can display the migrated groups and members.
+
+### What is not migrated
+
+- Settings with no nostrfy equivalent (write policy, plugins, per-kind read
+  gating, ...): the merge report lists each one with the reason and the
+  suggested replacement.
+- Blossom media and its owner mappings (strfry has no Blossom server).
+- Access lists (NIP-86 bans, relay pubkey lists, Blossom allowlist).
+- NIP-62 vanish requests, unless `--apply-vanish` is given: strfry does not
+  implement NIP-62, so the events those requests name were served by strfry
+  and are part of the migrated data. With the flag (and NIP-62 enabled in
+  the config), a request targeting this relay deletes the author's history
+  and records the permanent vanish marker.
+
+### Merging the strfry settings
+
+Before the database is opened, `migrate-strfry` looks for strfry's config
+(`--strfry-config`, then `$STRFRY_CONFIG`, `/etc/strfry.conf`,
+`./strfry.conf`), prints the settings that have a nostrfy equivalent and
+differ from the current `nostrfy.toml`, and asks whether to merge them. Only
+the listed keys are touched; comments and all other lines are preserved, and
+a value that would make the config invalid is skipped with its reason while
+the rest still merge. Keys with no nostrfy equivalent are listed with the
+reason and the suggested replacement.
+
+The prompt reads from the controlling terminal, so it also works when the
+export is piped on stdin. `--merge-config` applies without asking (for
+scripts), `--no-merge-config` skips the step, and `--dry-run` only prints the
+proposals. An explicitly named config that cannot be read is an error;
+an auto-discovered file that cannot be read is skipped with a note.
+
+The values are copied as-is, but one behaviour differs: strfry disconnects a
+client that overruns `relay.maxPendingOutboundBytes`, while nostrfy drops
+frames and closes the live subscriptions at `limits.max_out_queue_bytes`
+(the mapped field).
+
+### Options
+
+| Option | Meaning |
+| --- | --- |
+| `--input <PATH>` | JSONL file to read (`-` = stdin; the default) |
+| `--strfry-db <DIR>` | Run `strfry export` against this database directory |
+| `--strfry-bin <PATH>` | The strfry binary to run (default `strfry`) |
+| `--strfry-config <PATH>` | The strfry config to read settings from (default: strfry's search order) |
+| `--merge-config` | Merge the equivalent strfry settings into `nostrfy.toml` without asking |
+| `--no-merge-config` | Do not read or merge strfry settings |
+| `--since <UNIX>` | Only export events newer than or equal to this timestamp (with `--strfry-db`; inclusive, for resuming) |
+| `--no-verify` | Skip id/signature verification (trusted dumps only) |
+| `--apply-vanish` | Honor NIP-62 vanish requests found in the input |
+| `--dry-run` | Parse and verify only; write nothing (no database needed) |
+| `--batch <N>` | Events per database transaction (default 512) |
+
+Start with `--dry-run` to see what would be imported. The final summary
+reports stored/replaced/duplicate counts, the skip reasons and the deletion
+side effects applied.

@@ -545,12 +545,22 @@ async fn rebuild_group_state(relay: &Relay, groups_enabled: bool) -> Result<()> 
         );
         return Ok(());
     }
-    if !relay.groups.write().await.rebuild(&relay.db).await {
+    if !relay
+        .groups
+        .write()
+        .await
+        .rebuild(&relay.db, relay.relay_pubkey_ref())
+        .await
+    {
         return Err(anyhow::anyhow!(
             "NIP-29 group state rebuild failed: refusing to start with an \
              incomplete group store (missing groups would expose private content)"
         ));
     }
+    // The rebuilt state has no (or stale) relay-signed metadata: publish the
+    // current 39000/39001/39002/39005 for every group so clients can see
+    // them (a migrated database never had them).
+    relay.publish_group_metadata().await;
     relay.persist_groups().await;
     Ok(())
 }
@@ -647,6 +657,15 @@ async fn restore_role_state(relay: &Relay) -> Result<()> {
                 "NIP-43 role state rebuild failed: refusing to start with an \
                  incomplete role store"
             ));
+        }
+        // The rebuilt store has no (or stale) published membership list:
+        // republish it so NIP-43 clients see the current members (a
+        // migrated database never had it). Publish before the snapshot
+        // persist: storing the 13534 event advances the role-state
+        // sequence, and the snapshot must carry the post-publish
+        // generation.
+        if !relay.publish_membership(None).await {
+            warn!("could not republish the NIP-43 membership list after the rebuild");
         }
         relay.persist_roles().await;
     }
@@ -2485,6 +2504,7 @@ async fn apply_reloaded_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::event::Event;
     use std::net::SocketAddr;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -2492,6 +2512,12 @@ mod tests {
 
     /// A relay with a configured Blossom host, for the info-document tests.
     async fn blossom_relay() -> Arc<Relay> {
+        blossom_relay_with_key("").await
+    }
+
+    /// Like [`blossom_relay`], with a relay key (NIP-29/43 relay-signed
+    /// event generation).
+    async fn blossom_relay_with_key(key: &str) -> Arc<Relay> {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut cfg = crate::config::Config::default();
@@ -2520,7 +2546,7 @@ mod tests {
             config,
             db,
             crate::stats::Stats::new(),
-            "",
+            key,
             crate::relay::LiveBusConfig {
                 buffer: 1024,
                 batch_interval_ms: 10,
@@ -2535,6 +2561,151 @@ mod tests {
             .expect("test Blossom backend must initialize");
         *relay.blossom.write().await = state;
         Arc::new(relay)
+    }
+
+    /// A stored group-state event with an arbitrary (unverified) signature:
+    /// the rebuild trusts stored events, so tests seed history this way.
+    fn stored_event(kind: u64, pubkey: &str, tags: Vec<Vec<String>>, created: u64) -> Event {
+        let mut event = Event {
+            id: String::new(),
+            pubkey: pubkey.to_string(),
+            created_at: created,
+            kind,
+            tags,
+            content: String::new(),
+            sig: "00".repeat(64),
+        };
+        event.id = crate::nips::nip01::compute_id(&event);
+        event
+    }
+
+    #[tokio::test]
+    async fn group_rebuild_republishes_metadata() {
+        // A database rebuilt from events (a migration, or a dropped
+        // snapshot) has no stored 39000-39005; the startup rebuild must
+        // publish the current state so clients can display the groups.
+        let key = "01".repeat(32);
+        let relay = blossom_relay_with_key(&key).await;
+        let admin = "aa".repeat(32);
+        let member = "bb".repeat(32);
+        let now = crate::util::unix_now();
+        let events = [
+            stored_event(9007, &admin, vec![vec!["h".into(), "g1".into()]], now - 30),
+            stored_event(
+                9002,
+                &admin,
+                vec![
+                    vec!["h".into(), "g1".into()],
+                    vec!["name".into(), "Group One".into()],
+                ],
+                now - 20,
+            ),
+            stored_event(
+                9000,
+                &admin,
+                vec![
+                    vec!["h".into(), "g1".into()],
+                    vec!["p".into(), member.clone()],
+                ],
+                now - 10,
+            ),
+        ];
+        for event in events {
+            assert!(
+                matches!(
+                    relay.db.put(event, now).await,
+                    crate::db::PutOutcome::Stored
+                ),
+                "the seed event must store"
+            );
+        }
+        startup_group_state(&relay, true)
+            .await
+            .expect("the rebuild must succeed");
+        let filter: crate::filter::Filter =
+            serde_json::from_value(serde_json::json!({"kinds": [39000]})).unwrap();
+        let (meta, _) = relay.db.query(vec![filter], 10, now).await;
+        assert_eq!(meta.len(), 1, "the group metadata must be republished");
+        assert!(
+            meta[0]
+                .tags
+                .iter()
+                .any(|t| t.len() == 2 && t[0] == "name" && t[1] == "Group One"),
+            "the metadata must carry the rebuilt settings: {:?}",
+            meta[0].tags
+        );
+        let filter: crate::filter::Filter =
+            serde_json::from_value(serde_json::json!({"kinds": [39002]})).unwrap();
+        let (members, _) = relay.db.query(vec![filter], 10, now).await;
+        assert_eq!(members.len(), 1, "the member list must be republished");
+        assert!(
+            members[0]
+                .tags
+                .iter()
+                .any(|t| t.len() >= 2 && t[1] == member),
+            "the member must be listed: {:?}",
+            members[0].tags
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn role_rebuild_republishes_the_membership_list() {
+        // Same for NIP-43: a rebuilt role store must publish the current
+        // 13534 membership list, or clients see no members after a
+        // migration.
+        let key = "01".repeat(32);
+        let relay = blossom_relay_with_key(&key).await;
+        let relay_pubkey = relay.relay_pubkey().unwrap();
+        let member = "bb".repeat(32);
+        let now = crate::util::unix_now();
+        let role = stored_event(
+            33534,
+            &relay_pubkey,
+            vec![
+                vec!["d".into(), "mod".into()],
+                vec!["label".into(), "Moderator".into()],
+            ],
+            now - 30,
+        );
+        let membership = stored_event(
+            13534,
+            &relay_pubkey,
+            vec![vec!["member".into(), member.clone(), "mod".into()]],
+            now - 20,
+        );
+        for event in [role, membership] {
+            assert!(matches!(
+                relay.db.put(event, now).await,
+                crate::db::PutOutcome::Stored
+            ));
+        }
+        restore_role_state(&relay)
+            .await
+            .expect("the role rebuild must succeed");
+        assert!(
+            relay.roles.read().await.is_member_of(&member),
+            "the rebuilt store must know the member"
+        );
+        // The republished list replaced the stored one (it is newer), so
+        // exactly one 13534 exists and it is not the seed event.
+        let filter: crate::filter::Filter =
+            serde_json::from_value(serde_json::json!({"kinds": [13534]})).unwrap();
+        let (lists, _) = relay.db.query(vec![filter], 10, now).await;
+        assert_eq!(lists.len(), 1, "the membership list must be republished");
+        assert!(
+            lists[0]
+                .tags
+                .iter()
+                .any(|t| t.len() >= 2 && t[0] == "member" && t[1] == member),
+            "the republished list must name the member: {:?}",
+            lists[0].tags
+        );
+        assert_eq!(
+            lists[0].pubkey, relay_pubkey,
+            "the list must be signed by the relay key"
+        );
+        relay.db.shutdown();
     }
 
     #[tokio::test]

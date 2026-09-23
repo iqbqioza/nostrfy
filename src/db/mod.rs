@@ -398,6 +398,9 @@ enum Msg {
         /// The purge cut recorded in the group's marker: re-published events
         /// created before it are rejected (see `Store::purge_group`).
         now: u64,
+        /// Upper bound (`created_at <= until`) of the walk; `u64::MAX` for
+        /// the live unbounded purge.
+        until: u64,
         reply: oneshot::Sender<usize>,
     },
     Vanish {
@@ -414,8 +417,21 @@ enum Msg {
     /// NIP-59: delete gift wraps addressed to a pubkey (on NIP-09 deletion).
     GiftWrapPurge {
         pubkey: Vec<u8>,
+        /// Upper bound (`created_at <= until`) of the walk; `u64::MAX` for
+        /// the live path, the deletion's timestamp for the migration (a
+        /// wrap imported later must survive, matching the live order).
+        until: u64,
         /// `None` when the walk failed: the checked caller must not treat a
         /// skipped purge as success.
+        reply: oneshot::Sender<Option<usize>>,
+    },
+    /// Migration-only: records NIP-09 re-publication blocks for deletion
+    /// targets absent from the database, scoped to the deletion's author
+    /// (see `Store::record_absent_deletion_targets`). `None` when the write
+    /// failed: the migration must not report a completed run.
+    RecordAbsentDeletionTargets {
+        pubkey: Vec<u8>,
+        targets: Vec<String>,
         reply: oneshot::Sender<Option<usize>>,
     },
     PrefixExists {
@@ -579,7 +595,7 @@ enum Msg {
     /// (see `Store::pending_purges`). `None` when the table could not be
     /// read: the caller fails closed instead of treating it as "none".
     PendingPurges {
-        reply: oneshot::Sender<Option<Vec<(String, u64)>>>,
+        reply: oneshot::Sender<Option<Vec<(String, u64, u64)>>>,
     },
     /// Started-but-unfinished NIP-09 deletions. `None` when the table
     /// could not be read: the caller fails closed instead of treating an
@@ -752,6 +768,7 @@ fn msg_bytes(msg: &Msg) -> usize {
             )
             .saturating_add(request_pubkey.as_deref().map_or(0, str::len))
             .saturating_add(group.as_deref().map_or(0, str::len)),
+        Msg::RecordAbsentDeletionTargets { targets, .. } => targets.iter().map(String::len).sum(),
         _ => 0,
     }
 }
@@ -1620,6 +1637,20 @@ impl DbClient {
             .await
     }
 
+    /// Like [`Self::put_batch`], reporting a lost writer (or a dropped
+    /// reply) as `None` instead of degrading to an empty outcome vector.
+    /// The migration must not mistake a failed batch for "no events were
+    /// stored" and report a completed run. Takes shared [`Arc`]s so the
+    /// caller can apply per-event side effects after the commit without
+    /// deep-copying the batch.
+    pub async fn put_batch_checked(
+        &self,
+        events: Vec<(Arc<Event>, u64)>,
+    ) -> Option<Vec<PutOutcome>> {
+        self.request_write_checked(|reply| Msg::PutBatch { events, reply })
+            .await
+    }
+
     /// Queues a batch for the writer and returns the reply receiver
     /// without awaiting it: the connection can keep reading frames while
     /// the writer commits, instead of stalling on the commit (and letting
@@ -1913,8 +1944,20 @@ impl DbClient {
     /// NIP-29 `kind:9008`: purges every stored event tagged with the deleted
     /// group id.
     pub async fn group_purge(&self, group: String, now: u64) -> usize {
-        self.request_write(|reply| Msg::GroupPurge { group, now, reply })
-            .await
+        self.group_purge_until(group, now, u64::MAX).await
+    }
+
+    /// [`Self::group_purge`] bounded to events with `created_at <= until`
+    /// (the migration uses the `9008`'s own timestamp so a re-created
+    /// group's later events survive).
+    pub async fn group_purge_until(&self, group: String, now: u64, until: u64) -> usize {
+        self.request_write(|reply| Msg::GroupPurge {
+            group,
+            now,
+            until,
+            reply,
+        })
+        .await
     }
 
     /// Every vanished pubkey (raw 32-byte keys) for the startup rebuilds.
@@ -2005,17 +2048,46 @@ impl DbClient {
     /// NIP-59: deletes `kind:1059` gift wraps p-tagging `pubkey`.
     #[cfg(test)]
     pub async fn delete_gift_wraps_to(&self, pubkey: [u8; 32]) -> usize {
-        self.delete_gift_wraps_to_checked(pubkey).await.unwrap_or(0)
+        self.delete_gift_wraps_to_checked(pubkey, u64::MAX)
+            .await
+            .unwrap_or(0)
     }
 
     /// Like [`Self::delete_gift_wraps_to`], reporting a fail-fast/lost
-    /// writer or a failed removal walk as `None`.
-    pub async fn delete_gift_wraps_to_checked(&self, pubkey: [u8; 32]) -> Option<usize> {
+    /// writer or a failed removal walk as `None`. `until` bounds the walk
+    /// (`created_at <= until`): the migration passes the deletion's own
+    /// timestamp so wraps imported after it survive (the live path passes
+    /// `u64::MAX` and removes every stored wrap).
+    pub async fn delete_gift_wraps_to_checked(
+        &self,
+        pubkey: [u8; 32],
+        until: u64,
+    ) -> Option<usize> {
         self.request_write(|reply| Msg::GiftWrapPurge {
             pubkey: pubkey.to_vec(),
+            until,
             reply,
         })
         .await
+    }
+
+    /// Migration-only: records NIP-09 re-publication blocks for deletion
+    /// targets absent from the database, scoped to the deletion's author
+    /// (see `Store::record_absent_deletion_targets`). Returns how many
+    /// markers were written, or `None` when the write failed (the migration
+    /// must not report a completed run).
+    pub async fn record_absent_deletion_targets(
+        &self,
+        pubkey: [u8; 32],
+        targets: Vec<String>,
+    ) -> Option<usize> {
+        self.request_write_checked(|reply| Msg::RecordAbsentDeletionTargets {
+            pubkey: pubkey.to_vec(),
+            targets,
+            reply,
+        })
+        .await
+        .flatten()
     }
 
     pub async fn event_id_prefix_exists(&self, prefix: &[u8]) -> bool {
@@ -2456,7 +2528,7 @@ impl DbClient {
     /// finish the walk (idempotent, keeps the furthest cut). `None` when
     /// the database could not answer: the caller fails closed instead of
     /// treating unpurged (ghosted) groups as done.
-    pub async fn pending_purges(&self) -> Option<Vec<(String, u64)>> {
+    pub async fn pending_purges(&self) -> Option<Vec<(String, u64, u64)>> {
         self.request_read_startup(|reply| Msg::PendingPurges { reply })
             .await
             .flatten()

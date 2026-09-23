@@ -78,12 +78,37 @@ static LOGGER: Logger = Logger {
     inner: Mutex::new(None),
 };
 
+/// While non-zero, every record is dropped. Used by the incremental config
+/// merge validation, which runs the checks once per proposal and would
+/// otherwise repeat every warning once per proposal.
+static SUPPRESSED: AtomicU64 = AtomicU64::new(0);
+
+/// Restores the suppression count even when the closure unwinds, so a
+/// panic cannot silence logging for the rest of the process.
+struct SuppressGuard;
+
+impl Drop for SuppressGuard {
+    fn drop(&mut self) {
+        SUPPRESSED.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Runs `f` with logging suppressed.
+pub fn suppressed<T>(f: impl FnOnce() -> T) -> T {
+    SUPPRESSED.fetch_add(1, Ordering::SeqCst);
+    let _guard = SuppressGuard;
+    f()
+}
+
 struct Logger {
     inner: Mutex<Option<Box<dyn log::Log + Send + Sync>>>,
 }
 
 impl log::Log for Logger {
     fn enabled(&self, metadata: &log::Metadata) -> bool {
+        if SUPPRESSED.load(Ordering::Relaxed) > 0 {
+            return false;
+        }
         // A poisoned mutex (a thread panicked while holding it) must not
         // take the logging down with it: the inner state is still valid,
         // so the guard is recovered with `into_inner`.
@@ -94,6 +119,9 @@ impl log::Log for Logger {
             .is_none_or(|l| l.enabled(metadata))
     }
     fn log(&self, record: &log::Record) {
+        if SUPPRESSED.load(Ordering::Relaxed) > 0 {
+            return;
+        }
         if let Some(l) = self
             .inner
             .lock()

@@ -1191,8 +1191,13 @@ pub(crate) fn spawn(
                                         report.group_state_removed,
                                     ));
                                 }
-                                Msg::GroupPurge { group, now, reply } => {
-                                    let n = match store.purge_group(&group, now) {
+                                Msg::GroupPurge {
+                                    group,
+                                    now,
+                                    until,
+                                    reply,
+                                } => {
+                                    let n = match store.purge_group_until(&group, now, until) {
                                         Ok(n) => n,
                                         Err(e) => {
                                             db_error(&thread_errors, &e);
@@ -1218,8 +1223,32 @@ pub(crate) fn spawn(
                                     };
                                     let _ = reply.send(outcome);
                                 }
-                                Msg::GiftWrapPurge { pubkey, reply } => {
-                                    let n = match store.delete_gift_wraps_to(&pubkey) {
+                                Msg::GiftWrapPurge {
+                                    pubkey,
+                                    until,
+                                    reply,
+                                } => {
+                                    let n = match store.delete_gift_wraps_to(&pubkey, until) {
+                                        Ok(n) => Some(n),
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            None
+                                        }
+                                    };
+                                    let _ = reply.send(n);
+                                }
+                                Msg::RecordAbsentDeletionTargets {
+                                    pubkey,
+                                    targets,
+                                    reply,
+                                } => {
+                                    // A failed write replies `None`: the
+                                    // migration must not report a completed
+                                    // run when a re-publication block is
+                                    // missing.
+                                    let n = match store
+                                        .record_absent_deletion_targets(&pubkey, &targets)
+                                    {
                                         Ok(n) => Some(n),
                                         Err(e) => {
                                             db_error(&thread_errors, &e);
