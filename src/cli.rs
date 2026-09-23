@@ -2107,6 +2107,38 @@ fn resolve_config_path(config_path: &Path, path: &Path) -> PathBuf {
     base.join(path)
 }
 
+/// Strips a TOML `#` comment, respecting single/double-quoted strings so a
+/// `#` inside `pid_file = "/tmp/#foo.pid"` survives while a trailing
+/// `pid_file = "x" # comment` is cut. Double-quoted escapes (`\"`, `\\`)
+/// are honored; single-quoted literals have no escapes.
+fn strip_inline_comment(line: &str) -> &str {
+    let mut in_double = false;
+    let mut in_single = false;
+    let mut escaped = false;
+    for (i, c) in line.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match c {
+            '\\' if in_double => escaped = true,
+            '"' if !in_single => in_double = !in_double,
+            '\'' if !in_double => in_single = !in_single,
+            '#' if !in_double && !in_single => return line[..i].trim_end(),
+            _ => {}
+        }
+    }
+    line
+}
+
+/// Whether a comment-stripped line is the `[daemon]` section header,
+/// accepting quoted (`["daemon"]`) and spaced (`[ "daemon" ]`) spellings.
+fn is_daemon_section(line: &str) -> Option<bool> {
+    let inner = line.strip_prefix('[')?.strip_suffix(']')?;
+    let name = inner.trim().trim_matches('"').trim_matches('\'').trim();
+    Some(name == "daemon")
+}
+
 /// Extracts `daemon.pid_file` from the raw config text without parsing the
 /// whole file, so `stop`/`restart` still find the daemon when an unrelated
 /// edit left the TOML unparseable. Only a simple `pid_file = "..."` inside
@@ -2117,13 +2149,14 @@ fn lenient_pid_file(config_path: &Path) -> Option<PathBuf> {
     let mut in_daemon = false;
     for line in text.lines() {
         // Strip comments before looking for a section header or assignment
-        // (handles `[daemon] # comment` and `pid_file = "x" # comment`).
-        let line = line.split('#').next().unwrap_or("").trim();
+        // (handles `[daemon] # comment` and `pid_file = "x" # comment`,
+        // preserving a `#` inside quoted values).
+        let line = strip_inline_comment(line).trim();
         if line.is_empty() {
             continue;
         }
-        if let Some(section) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
-            in_daemon = section.trim() == "daemon";
+        if let Some(is_daemon) = is_daemon_section(line) {
+            in_daemon = is_daemon;
             continue;
         }
         if !in_daemon {
@@ -2165,13 +2198,14 @@ fn lenient_stats_paths(config_path: &Path) -> Option<(PathBuf, PathBuf, u64)> {
     let mut interval_secs: Option<u64> = None;
     for line in text.lines() {
         // Strip comments before looking for a section header or assignment
-        // (handles `[daemon] # comment` and `stats_file = "x" # comment`).
-        let line = line.split('#').next().unwrap_or("").trim();
+        // (handles `[daemon] # comment` and `stats_file = "x" # comment`,
+        // preserving a `#` inside quoted values).
+        let line = strip_inline_comment(line).trim();
         if line.is_empty() {
             continue;
         }
-        if let Some(section) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
-            in_daemon = section.trim() == "daemon";
+        if let Some(is_daemon) = is_daemon_section(line) {
+            in_daemon = is_daemon;
             continue;
         }
         if !in_daemon {
