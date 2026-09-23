@@ -415,8 +415,22 @@ impl Store {
         }
 
         // NIP-09 `a` tags: remove every version of the referenced
-        // addressable events published up to the deletion request.
+        // addressable events published up to the deletion request. Never
+        // scoped to a group: NIP-29 `kind:9005` carries only `e` tags, so a
+        // group-scoped request with addresses would delete another group's
+        // addressable content without the `e`-tag path's group check above.
+        // No caller passes both today; skip the walk (fail closed) if one
+        // ever does, but still clear the pending record below.
+        let group_scoped_addrs = group.is_some() && !addresses.is_empty();
+        if group_scoped_addrs {
+            log::warn!(
+                "ignoring NIP-09 a-tag targets of a group-scoped deletion request"
+            );
+        }
         for address in addresses {
+            if group_scoped_addrs {
+                continue;
+            }
             // The author may delete their own address; a NIP-26 delegator
             // may delete versions published on their behalf (checked per
             // version below, mirroring the `e`-tag path). Compare decoded
