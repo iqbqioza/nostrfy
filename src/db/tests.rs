@@ -2791,7 +2791,11 @@ fn schema_upgrade_creates_missing_tables_instantly() {
             &"cc".repeat(32),
         )
         .await;
-        let meta = db.blossom_load(&"bb".repeat(32)).await.unwrap();
+        let meta = db
+            .blossom_load_checked(&"bb".repeat(32))
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(meta.owners.len(), 1);
         assert!(!db.blossom_migration_done().await);
     });

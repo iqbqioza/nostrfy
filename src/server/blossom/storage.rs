@@ -462,10 +462,12 @@ impl BlobStore {
                  orphan that a later upload of the same bytes overwrites"
             ));
         }
-        if existed && let Some(meta) = self.db.blossom_load(sha256).await {
+        if let Some(meta) = existing {
             // A re-upload keeps the original mapping (add_owner only
             // appends the owner): answer with the stored values so the PUT
-            // descriptor agrees with GET/list.
+            // descriptor agrees with GET/list. Reuses the pre-upload read
+            // instead of re-loading unchecked (a lookup hiccup would fall
+            // through to the new size/mime and disagree).
             return Ok((
                 Descriptor {
                     sha256: sha256.to_string(),
@@ -2469,7 +2471,12 @@ mod tests {
         // The mapping is untouched: the loser did not become an owner, and
         // the full list is intact. No re-read classification happens, so a
         // storage fault can never be misreported as 409.
-        let meta = s.db.blossom_load(&sha).await.expect("the mapping exists");
+        let meta = s
+            .db
+            .blossom_load_checked(&sha)
+            .await
+            .expect("the mapping exists")
+            .expect("the mapping exists");
         assert_eq!(meta.owners.len(), MAX_BLOB_OWNERS);
         assert!(!meta.owners.iter().any(|o| o == &pk(99)));
     }
