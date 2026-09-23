@@ -2428,3 +2428,41 @@ fn capacity_blocked_create_emits_nothing() {
         "a duplicate create for a live group still republishes"
     );
 }
+
+#[test]
+fn invite_code_validation_dedupes_duplicates() {
+    // Validation must count distinct fresh codes like the apply side
+    // inserts them: an event repeating one new code must not be rejected
+    // when a single copy would fit (the 9000 member count already
+    // deduplicates the same way).
+    let mut store = GroupStore::default();
+    let now = 1_700_000_000;
+    store.apply(
+        &event(CREATE_GROUP, ADMIN, Some("g1"), vec![]),
+        "relay",
+        now,
+        false,
+        false,
+    );
+    for i in 0..99u32 {
+        store
+            .groups
+            .get_mut("g1")
+            .unwrap()
+            .invites
+            .insert(format!("code-{i}"));
+    }
+    let dup = event(
+        9009,
+        ADMIN,
+        Some("g1"),
+        vec![
+            vec!["code".into(), "new".into()],
+            vec!["code".into(), "new".into()],
+        ],
+    );
+    assert!(
+        store.validate_write(&dup).is_ok(),
+        "duplicate fresh codes must count once"
+    );
+}

@@ -624,10 +624,14 @@ impl GroupStore {
             // Invite codes accumulate without consumption: bound the 9009
             // additions so repeated events cannot grow the set without
             // limit (the apply side stops inserting at the same bound).
+            // Deduplicated like the 9000 member count below: the apply
+            // side inserts into a set, so counting occurrences would
+            // reject an event the apply would allow.
             if event.kind == 9009 {
                 let fresh = tag_values(event, CODE)
                     .filter(|c| !group.has_invite(c))
-                    .count();
+                    .collect::<std::collections::HashSet<_>>()
+                    .len();
                 if group.invites.len().saturating_add(fresh) > MAX_INVITES {
                     bail!("restricted: too many invite codes");
                 }
