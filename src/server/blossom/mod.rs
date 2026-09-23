@@ -1502,7 +1502,25 @@ async fn list(
     // a stale cursor cannot loop over duplicates forever.
     let (after_uploaded, after_sha) = match cursor {
         Some(sha) => match state.store.find(sha).await {
-            Ok(Some(desc)) => (Some(desc.uploaded.max(0) as u64), Some(sha.to_string())),
+            Ok(Some(desc)) => {
+                // Owner-scoped cursor: `find` is global, so a cursor naming
+                // another owner's blob would position this owner's page and
+                // reveal the foreign hash exists (existence oracle). Treat
+                // a cursor the lister does not own like an unknown one —
+                // an empty page — so only owned cursors paginate.
+                match state.store.has(&pubkey, sha).await {
+                    Ok(true) => (Some(desc.uploaded.max(0) as u64), Some(sha.to_string())),
+                    Ok(false) => {
+                        let empty: Vec<Value> = Vec::new();
+                        return (
+                            [(axum::http::header::CONTENT_TYPE, "application/json")],
+                            serde_json::to_string(&empty).unwrap(),
+                        )
+                            .into_response();
+                    }
+                    Err(e) => return store_error(e),
+                }
+            }
             Err(e) => return store_error(e),
             Ok(None) => {
                 let empty: Vec<Value> = Vec::new();
