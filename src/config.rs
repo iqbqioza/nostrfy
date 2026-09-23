@@ -1172,7 +1172,13 @@ impl Config {
             let valid_chars = value.chars().all(|c| {
                 c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':' | '[' | ']')
             });
-            if value.contains('/') || !valid_chars || bare_host_has_port(value.trim()) {
+            // Brackets alone (`[]`, `[`, `]`) normalize to an empty host
+            // that no request Host header can match: the split routes
+            // would 404 everywhere, exactly what this check exists to
+            // prevent.
+            let empty_core = value.trim().trim_matches(['[', ']']).is_empty();
+            if value.contains('/') || !valid_chars || empty_core || bare_host_has_port(value.trim())
+            {
                 return Err(config_err(format!(
                     "{name} must be a bare hostname (no scheme, port, path or whitespace), got {value:?}"
                 )));
@@ -3834,9 +3840,8 @@ max_log_files = 2
         );
         cfg.blossom.host = String::new();
         // Whitespace (a silent 404 for the whole API), a scheme, a path
-        // and a port are all rejected — including a bracketed IPv6
-        // literal with a port, which would otherwise normalize to a host
-        // that never matches a request Host header (silent 404).
+        // and a port are all rejected — including bare brackets, which
+        // normalize to an empty host that no request can match.
         for bad in [
             "api host",
             "api.example.com ",
@@ -3846,6 +3851,9 @@ max_log_files = 2
             "api.x:8080",
             "[::1]:8080",
             "::1",
+            "[]",
+            "[",
+            "]",
         ] {
             cfg.server.api_host = bad.into();
             assert!(

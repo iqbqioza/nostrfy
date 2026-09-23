@@ -381,7 +381,9 @@ impl GroupStore {
     }
 
     /// Recomputes the counters derived from `groups` (after a restore or a
-    /// bulk mutation).
+    /// bulk mutation), and drops throttle stamps of groups that no longer
+    /// exist: the stamp map covers live groups only, so a restored store
+    /// never throttles a re-created id on a deleted incarnation's stamp.
     fn recompute_derived(&mut self) {
         self.total_members = self.groups.values().map(|group| group.members.len()).sum();
         self.declared_children = self
@@ -389,6 +391,8 @@ impl GroupStore {
             .values()
             .flat_map(|group| group.children.iter().cloned())
             .collect();
+        self.members_published_at
+            .retain(|gid, _| self.groups.contains_key(gid));
     }
 
     /// Whether `fresh` more members would exceed the global member budget.
@@ -1180,6 +1184,11 @@ impl GroupStore {
             DELETE_GROUP => {
                 if let Some(group) = self.groups.remove(gid) {
                     self.total_members = self.total_members.saturating_sub(group.members.len());
+                    // The throttle stamp belongs to the deleted incarnation:
+                    // without this a delete+create cycle within the window
+                    // would skip the fresh 39002, and dead entries would
+                    // accumulate alongside the delete tombstones.
+                    self.members_published_at.remove(gid);
                     // Children become roots.
                     for child in group.children {
                         if let Some(child_group) = self.groups.get_mut(&child) {
