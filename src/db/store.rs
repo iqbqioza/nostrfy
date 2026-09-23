@@ -2439,10 +2439,17 @@ impl Store {
             if let Some(tomb) = self
                 .deleted
                 .get(wtxn, &deleted_address_key(event.kind, &pubkey, dtag))?
-                && tomb.len() >= CREATED_LEN
-                && event.created_at <= u64::from_be_bytes(tomb[..CREATED_LEN].try_into().unwrap())
             {
-                return Ok(PutOutcome::PreviouslyDeleted);
+                // A short value at an address key is corrupt (only 8-byte
+                // cuts are ever written): fail closed like the id-tombstone
+                // path instead of treating it as absent, which would admit
+                // a deleted version. The next deletion heals the entry.
+                if tomb.len() < CREATED_LEN
+                    || event.created_at
+                        <= u64::from_be_bytes(tomb[..CREATED_LEN].try_into().unwrap())
+                {
+                    return Ok(PutOutcome::PreviouslyDeleted);
+                }
             }
             let old = self.replaceable.get(wtxn, &rkey)?;
             let had_old = old

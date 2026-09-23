@@ -7256,6 +7256,50 @@ fn authored_event(
     e
 }
 
+#[test]
+fn corrupt_address_tombstone_fails_closed() {
+    // A short value at an `a`-tag address key is corrupt (only 8-byte cuts
+    // are ever written): like the id-tombstone path it must block
+    // re-publication instead of being treated as absent.
+    use crate::db::store::{Store, deleted_address_key};
+    let cfg = config();
+    let expiry = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let store = Store::open(&cfg, Arc::clone(&expiry), 128).unwrap();
+    let now = unix_now();
+    let pubkey = "aa".repeat(32);
+    let ev = authored_event(
+        30001,
+        &pubkey,
+        "v1",
+        now,
+        vec![vec!["d".into(), "del".into()]],
+    );
+    let pk_bytes = hex::decode(&pubkey).unwrap();
+    let akey = deleted_address_key(30001, &pk_bytes, "del");
+    // Sanity: with no tombstone the event stores (rolled back).
+    {
+        let mut wtxn = store.env.write_txn().unwrap();
+        assert!(matches!(
+            store.put_event_in(&mut wtxn, &ev, now).unwrap(),
+            PutOutcome::Stored
+        ));
+    }
+    // Plant a corrupt (short) tombstone and confirm the version is
+    // blocked rather than admitted.
+    {
+        let mut wtxn = store.env.write_txn().unwrap();
+        store.deleted.put(&mut wtxn, &akey, b"corrupt").unwrap();
+        wtxn.commit().unwrap();
+    }
+    {
+        let mut wtxn = store.env.write_txn().unwrap();
+        assert!(matches!(
+            store.put_event_in(&mut wtxn, &ev, now).unwrap(),
+            PutOutcome::PreviouslyDeleted
+        ));
+    }
+}
+
 /// A NIP-40 event that expires at `expires`.
 fn expired_event(content: &str, created: u64, expires: u64) -> Event {
     let mut e = event(
