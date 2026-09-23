@@ -677,6 +677,21 @@ fn alias_bool(v: &toml::Value, key: &str, warnings: &mut Vec<String>) -> bool {
     }
 }
 
+/// A string legacy alias: a non-string value is warned about instead of
+/// being silently dropped to `""` (a credential silently cleared disables
+/// NIP-86 while the operator believes it migrated).
+fn alias_str(v: &toml::Value, key: &str, warnings: &mut Vec<String>) -> String {
+    match v.as_str() {
+        Some(s) => s.to_string(),
+        None => {
+            warnings.push(format!(
+                "deprecated config key {key} expects a string; the value was ignored"
+            ));
+            String::new()
+        }
+    }
+}
+
 /// Applies the legacy aliases found in `raw` to `cfg`. The old keys are
 /// recognized (never flagged as unknown) and their values land in the new
 /// locations. Returns the warnings to log: one per applied alias, plus the
@@ -719,10 +734,10 @@ fn apply_legacy_aliases(raw: &str, cfg: &mut Config) -> Vec<String> {
         ));
         match (*old_section, *old_key) {
             ("server", "management_token") => {
-                cfg.rpc.management_token = v.as_str().unwrap_or_default().to_string()
+                cfg.rpc.management_token = alias_str(v, "server.management_token", &mut warnings)
             }
             ("server", "admin_pubkey") => {
-                cfg.rpc.admin_pubkey = v.as_str().unwrap_or_default().to_string()
+                cfg.rpc.admin_pubkey = alias_str(v, "server.admin_pubkey", &mut warnings)
             }
             ("relay", "enable_git") => {
                 cfg.relay.enabled_git = alias_bool(v, "relay.enable_git", &mut warnings)
@@ -3148,6 +3163,32 @@ map_max_size = 1073741824
             cfg.rpc.admin_pubkey,
             "ab".repeat(32),
             "the identity key is normalized at the config boundary"
+        );
+    }
+
+    #[test]
+    fn invalid_legacy_string_credentials_warn_and_ignore() {
+        // A non-string legacy credential must not silently clear NIP-86
+        // credentials while the operator believes they migrated: the
+        // value is ignored (the field default) with an explicit warning,
+        // like the boolean aliases.
+        let raw = "[server]\nmanagement_token = 123\nadmin_pubkey = true\n";
+        let cfg: Config = toml::from_str(raw).unwrap();
+        let mut cfg = cfg;
+        let warnings = apply_legacy_aliases(raw, &mut cfg);
+        assert_eq!(cfg.rpc.management_token, "");
+        assert_eq!(cfg.rpc.admin_pubkey, "");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("server.management_token") && w.contains("string")),
+            "a mistyped management_token must warn explicitly: {warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("server.admin_pubkey") && w.contains("string")),
+            "a mistyped admin_pubkey must warn explicitly: {warnings:?}"
         );
     }
 
