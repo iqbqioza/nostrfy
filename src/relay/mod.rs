@@ -94,9 +94,9 @@ pub struct Relay {
     pub api_limit: Arc<ApiLimiter>,
     /// Per-pubkey sliding window of accepted event timestamps
     /// (`relay.max_events_per_min_per_pubkey`). Bounded: at most 10k
-    /// pubkeys are tracked — a full map never clears (tracked windows are
-    /// preserved); fresh pubkeys alone are fail-open until old windows
-    /// expire.
+    /// pubkeys are tracked — a full map evicts expired windows at most once
+    /// per second and otherwise rejects fresh pubkeys (fail-closed, so an
+    /// untracked identity cannot bypass the configured limit).
     publish_rate: std::sync::Mutex<HashMap<String, std::collections::VecDeque<u64>>>,
     /// When the publish-rate map was last pruned. The map is bounded, and
     /// pruning it is a full scan: a flood of fresh pubkeys must not run that

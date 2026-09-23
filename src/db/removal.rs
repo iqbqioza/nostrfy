@@ -415,8 +415,20 @@ impl Store {
         }
 
         // NIP-09 `a` tags: remove every version of the referenced
-        // addressable events published up to the deletion request.
+        // addressable events published up to the deletion request. Never
+        // scoped to a group: NIP-29 `kind:9005` carries only `e` tags, so a
+        // group-scoped request with addresses would delete another group's
+        // addressable content without the `e`-tag path's group check above.
+        // No caller passes both today; skip the walk (fail closed) if one
+        // ever does, but still clear the pending record below.
+        let group_scoped_addrs = group.is_some() && !addresses.is_empty();
+        if group_scoped_addrs {
+            log::warn!("ignoring NIP-09 a-tag targets of a group-scoped deletion request");
+        }
         for address in addresses {
+            if group_scoped_addrs {
+                continue;
+            }
             // The author may delete their own address; a NIP-26 delegator
             // may delete versions published on their behalf (checked per
             // version below, mirroring the `e`-tag path). Compare decoded
@@ -429,6 +441,12 @@ impl Store {
                     .is_some_and(|(a, b)| a == b)
             });
             let mut delegated_any = false;
+            // Whether the delegated address tombstone already rode along in
+            // a committed chunk transaction below: crash-safe without waiting
+            // for the post-walk merge (which stays as the idempotent
+            // backstop). Unmatched delegations never set it, so they still
+            // leave no tombstone.
+            let mut delegated_tombstoned = false;
             let Ok(pubkey) = hex::decode(&address.pubkey) else {
                 continue;
             };
@@ -530,6 +548,16 @@ impl Store {
                             continue;
                         }
                         delegated_any = true;
+                        // Commit the address guard atomically with its first
+                        // removal: a crash after this chunk commits leaves the
+                        // tombstone behind, so the resume (finding zero
+                        // versions) no longer loses the guard and old
+                        // versions stay blocked. Same cut as the post-walk
+                        // merge, which stays idempotent.
+                        if !delegated_tombstoned {
+                            self.merge_address_tombstone_in(&mut wtxn, &akey, request_created)?;
+                            delegated_tombstoned = true;
+                        }
                     }
                     self.deleted.put(&mut wtxn, id, b"")?;
                     // Every slot under this range is keyed by `address.kind`
@@ -576,18 +604,32 @@ impl Store {
     }
 
     /// Merges the NIP-09 `a`-tag tombstone at `akey` with the request's
-    /// `cut`, keeping the furthest cut, and commits it. A tombstone written
-    /// before the versions are removed keeps a crash or MapFull mid-walk
-    /// from leaving the removals without their re-publication guard.
-    fn merge_address_tombstone(&self, akey: &[u8], cut: u64) -> Result<()> {
-        let mut wtxn = self.env.write_txn()?;
-        let merged = match self.deleted.get(&wtxn, akey)? {
+    /// `cut`, keeping the furthest cut, into the given transaction (no
+    /// commit): lets a chunk commit removals and their re-publication guard
+    /// atomically (see the delegated path in `apply_deletion_walk`).
+    fn merge_address_tombstone_in(
+        &self,
+        wtxn: &mut heed::RwTxn,
+        akey: &[u8],
+        cut: u64,
+    ) -> Result<()> {
+        let merged = match self.deleted.get(wtxn, akey)? {
             Some(old) if old.len() >= CREATED_LEN => {
                 cut.max(u64::from_be_bytes(old[..CREATED_LEN].try_into().unwrap()))
             }
             _ => cut,
         };
-        self.deleted.put(&mut wtxn, akey, &merged.to_be_bytes())?;
+        self.deleted.put(wtxn, akey, &merged.to_be_bytes())?;
+        Ok(())
+    }
+
+    /// Merges the NIP-09 `a`-tag tombstone at `akey` with the request's
+    /// `cut`, keeping the furthest cut, and commits it. A tombstone written
+    /// before the versions are removed keeps a crash or MapFull mid-walk
+    /// from leaving the removals without their re-publication guard.
+    fn merge_address_tombstone(&self, akey: &[u8], cut: u64) -> Result<()> {
+        let mut wtxn = self.env.write_txn()?;
+        self.merge_address_tombstone_in(&mut wtxn, akey, cut)?;
         wtxn.commit()?;
         Ok(())
     }
@@ -1179,9 +1221,10 @@ impl Store {
 
     /// Removes every stored event whose NIP-40 expiration has arrived, then
     /// reaps `first_seen` entries older than `first_seen_min_age` seconds
-    /// (0 disables the reap): once a pubkey is older than the new-pubkey
-    /// gate, the entry can never reject it again, so keeping it only grows
-    /// the table forever.
+    /// (0 disables the reap): reaping bounds the table, at the cost of
+    /// re-arming the new-pubkey gate for a returning idle pubkey (its next
+    /// event passes once as "new" and re-establishes the clock, so an event
+    /// immediately after may be gated for `min_age` seconds).
     ///
     /// The returned report carries the partial counters on a failed chunk
     /// (the backlog is unbounded, so a MapFull mid-pass must not hide the

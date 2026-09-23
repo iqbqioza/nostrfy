@@ -125,8 +125,14 @@ pub fn respond(items: &[Item], client_message: &[u8]) -> anyhow::Result<Vec<u8>>
     let mut ranges = parse_message(client_message, MAX_NEG_RANGES_PER_MSG)?;
     // NIP-77: every message covers the complete timestamp/ID space. A
     // message whose final explicit range does not reach infinity implicitly
-    // appends a Skip range to infinity.
-    if ranges.last().is_none_or(|range| range.upper.ts != u64::MAX) {
+    // appends a Skip range to infinity. Infinity is (u64::MAX, empty): a
+    // bound at the maximal timestamp with a non-empty prefix still excludes
+    // the tail beyond that prefix (see `item_cmp`), so it must not count
+    // as covering infinity.
+    if ranges
+        .last()
+        .is_none_or(|range| range.upper.ts != u64::MAX || !range.upper.prefix.is_empty())
+    {
         ranges.push(Range {
             upper: Bound {
                 ts: u64::MAX,

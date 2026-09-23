@@ -2791,7 +2791,11 @@ fn schema_upgrade_creates_missing_tables_instantly() {
             &"cc".repeat(32),
         )
         .await;
-        let meta = db.blossom_load(&"bb".repeat(32)).await.unwrap();
+        let meta = db
+            .blossom_load_checked(&"bb".repeat(32))
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(meta.owners.len(), 1);
         assert!(!db.blossom_migration_done().await);
     });
@@ -4026,6 +4030,44 @@ fn query_directed_ascending() {
         assert_eq!(ids, vec![now - 200, now - 100]);
         assert!(more);
     });
+}
+
+#[test]
+fn query_directed_ascending_ids() {
+    // The `ids` branch must honor the scan direction like every other
+    // branch: with `ascending` a multi-id `limit` keeps the oldest events,
+    // otherwise the newest. Reachability is currently narrow (WS uses
+    // newest-first; REST single-id makes the cutoff moot), so this pins the
+    // contract for future `query_directed` callers.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let e1 = event(1, "first", now - 200, vec![]);
+        let e2 = event(1, "second", now - 100, vec![]);
+        let e3 = event(1, "third", now, vec![]);
+        for e in [&e1, &e2, &e3] {
+            assert_eq!(db.put(e.clone(), now).await, PutOutcome::Stored);
+        }
+        let ids = vec![e3.id.clone(), e1.id.clone()];
+        let f: Filter = serde_json::from_value(serde_json::json!({"ids": ids})).unwrap();
+        let (desc, _) = db.query_directed(vec![f.clone()], 1, now, false, 0).await;
+        assert_eq!(desc.len(), 1);
+        assert_eq!(desc[0].id, e3.id, "newest-first keeps the newest id");
+        let (asc, _) = db.query_directed(vec![f], 1, now, true, 0).await;
+        assert_eq!(asc.len(), 1);
+        assert_eq!(asc[0].id, e1.id, "ascending keeps the oldest id");
+    });
+    db.shutdown();
 }
 
 #[test]
@@ -7855,6 +7897,100 @@ fn nip09_middle_chunk_failure_resumes_at_startup() {
         );
         assert_eq!(db.state_stamp().await, Some(1));
         assert!(db.query(vec![author_filter()], 10, now).await.0.is_empty());
+    });
+    db.shutdown();
+}
+
+#[test]
+fn delegated_address_tombstone_survives_a_mid_walk_crash() {
+    // A delegated NIP-09 `a`-tag deletion must not lose its address guard
+    // when a crash lands between a committed removal chunk and the
+    // post-walk tombstone merge: the guard now rides along in the same
+    // chunk transaction as its first removal, so the resume (finding zero
+    // versions) still blocks re-publication of old versions. Unmatched
+    // delegations still leave no tombstone. Backward compatible: no pending
+    // format change, the tombstone key/value are unchanged.
+    use secp256k1::{Keypair, Secp256k1};
+    use sha2::{Digest, Sha256};
+    let cfg = config();
+    let (db, faults) = open_with_faults(&cfg);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let now = 1_700_000_000u64;
+    let secp = Secp256k1::new();
+    let delegator_kp = Keypair::from_seckey_slice(&secp, &[11u8; 32]).unwrap();
+    let delegatee_kp = Keypair::from_seckey_slice(&secp, &[12u8; 32]).unwrap();
+    let delegator = hex::encode(delegator_kp.x_only_public_key().0.serialize());
+    let delegatee = hex::encode(delegatee_kp.x_only_public_key().0.serialize());
+    let conditions = "kind=30001";
+    let payload = format!("nostr:delegation:{delegatee}:{conditions}");
+    let message: [u8; 32] = Sha256::digest(payload.as_bytes()).into();
+    let token = secp
+        .sign_schnorr_no_aux_rand(&message, &delegator_kp)
+        .to_string();
+    let mut ev = authored_event(
+        30001,
+        &delegatee,
+        "delegated profile",
+        now,
+        vec![
+            vec!["d".into(), "del".into()],
+            vec![
+                "delegation".into(),
+                delegator.clone(),
+                conditions.into(),
+                token,
+            ],
+        ],
+    );
+    ev.id = nip01::compute_id(&ev);
+    let addr = crate::nips::nip09::Address {
+        kind: 30001,
+        pubkey: delegatee.clone(),
+        d: "del".into(),
+    };
+    rt.block_on(async {
+        assert_eq!(db.put(ev.clone(), now).await, PutOutcome::Stored);
+        // Fail after the first committed chunk (countdown 2): the chunk
+        // holding the removal commits, then the walk errors before the
+        // post-walk tombstone merge.
+        faults
+            .chunk_after
+            .store(2, std::sync::atomic::Ordering::SeqCst);
+        let (removed, _) = db
+            .apply_deletion_checked(vec![], vec![addr.clone()], Some(delegator.clone()), now)
+            .await;
+        assert!(removed.is_none(), "the mid-walk crash must report failure");
+        // The version is gone.
+        let f: Filter = serde_json::from_value(serde_json::json!({"kinds": [30001]})).unwrap();
+        assert!(db.query(vec![f], 10, now).await.0.is_empty());
+        // A never-stored old version of the same address (different id, no
+        // per-id tombstone) must still be blocked by the address guard —
+        // without the in-chunk tombstone it would be Stored here.
+        let mut older = authored_event(
+            30001,
+            &delegatee,
+            "forged old version",
+            now,
+            vec![vec!["d".into(), "del".into()]],
+        );
+        older.id = nip01::compute_id(&older);
+        assert!(
+            matches!(
+                db.put(older.clone(), now).await,
+                PutOutcome::PreviouslyDeleted
+            ),
+            "the crashed delegated deletion must still guard the address"
+        );
+        // Replaying the request (the startup resume path) completes cleanly
+        // and keeps the guard.
+        let (removed, _) = db
+            .apply_deletion_checked(vec![], vec![addr], Some(delegator), now)
+            .await;
+        assert_eq!(removed, Some(0));
+        assert!(
+            matches!(db.put(older, now).await, PutOutcome::PreviouslyDeleted),
+            "the resumed deletion must keep guarding the address"
+        );
     });
     db.shutdown();
 }

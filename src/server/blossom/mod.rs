@@ -501,10 +501,13 @@ fn store_error(e: anyhow::Error) -> Response {
 /// range (inclusive end, clamped to the blob size) and an error for an
 /// unsatisfiable or malformed range (416 with `Content-Range: bytes */`).
 fn parse_range(header: &str, size: usize) -> anyhow::Result<Option<(usize, usize)>> {
-    let Some(spec) = header
-        .trim()
-        .strip_prefix("bytes=")
-        .or_else(|| header.trim().strip_prefix("Bytes="))
+    // RFC 7233 §2.1: range units are case-insensitive (`bytes=`, `BYTES=`,
+    // `Bytes=` are equivalent). A non-bytes unit is ignored (200).
+    let trimmed = header.trim();
+    let Some(spec) = trimmed
+        .get(..6)
+        .filter(|prefix| prefix.eq_ignore_ascii_case("bytes="))
+        .map(|_| &trimmed[6..])
     else {
         return Ok(None); // not a byte range: ignore
     };
@@ -1499,7 +1502,25 @@ async fn list(
     // a stale cursor cannot loop over duplicates forever.
     let (after_uploaded, after_sha) = match cursor {
         Some(sha) => match state.store.find(sha).await {
-            Ok(Some(desc)) => (Some(desc.uploaded.max(0) as u64), Some(sha.to_string())),
+            Ok(Some(desc)) => {
+                // Owner-scoped cursor: `find` is global, so a cursor naming
+                // another owner's blob would position this owner's page and
+                // reveal the foreign hash exists (existence oracle). Treat
+                // a cursor the lister does not own like an unknown one —
+                // an empty page — so only owned cursors paginate.
+                match state.store.has(&pubkey, sha).await {
+                    Ok(true) => (Some(desc.uploaded.max(0) as u64), Some(sha.to_string())),
+                    Ok(false) => {
+                        let empty: Vec<Value> = Vec::new();
+                        return (
+                            [(axum::http::header::CONTENT_TYPE, "application/json")],
+                            serde_json::to_string(&empty).unwrap(),
+                        )
+                            .into_response();
+                    }
+                    Err(e) => return store_error(e),
+                }
+            }
             Err(e) => return store_error(e),
             Ok(None) => {
                 let empty: Vec<Value> = Vec::new();

@@ -497,6 +497,13 @@ impl GroupStore {
             bail!("invalid: group events must carry only one h tag");
         }
         let Some(gid) = group_id(event) else {
+            // NIP-29 group actions MUST carry an `h` tag (mirrors the intake
+            // precheck): without it the event names no group to validate
+            // against, so accepting it here would let a direct caller bypass
+            // the requirement. Ordinary events without `h` are unaffected.
+            if is_group_action(event) {
+                bail!("invalid: group events must carry an h tag");
+            }
             return Ok(());
         };
         // A ghosted id must never be resurrected by a create: its create
@@ -786,7 +793,7 @@ impl GroupStore {
                 if removed {
                     self.total_members = self.total_members.saturating_sub(1);
                 }
-                if emit {
+                if emit && removed {
                     out.push(build_remove_user(gid, &member, relay_pubkey, now));
                     out.extend(self.membership_events(gid, relay_pubkey, now));
                 }
@@ -861,9 +868,14 @@ impl GroupStore {
                         if group.members.len() >= MAX_MEMBERS && !group.is_member(&tag[1]) {
                             continue;
                         }
+                        // Count members added earlier in this same event:
+                        // `total_members` only grows after the loop, so a
+                        // bare `>=` check would admit N fresh members past
+                        // a nearly-full budget (concurrent fill between
+                        // validation and apply makes the stale read real).
                         let over_global = !ignore_capacity
                             && self.max_total_members > 0
-                            && self.total_members >= self.max_total_members
+                            && self.total_members.saturating_add(added) >= self.max_total_members
                             && !group.is_member(&tag[1]);
                         if over_global {
                             continue;

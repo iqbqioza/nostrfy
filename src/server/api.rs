@@ -1488,7 +1488,17 @@ pub async fn api_relay_kinds_handler(
             }
         }
     }
-    let limit = params.limit.unwrap_or(20).min(100);
+    let limit = {
+        let mut limit = params.limit.unwrap_or(20).min(100);
+        // `max_api_limit` is the ceiling for the API `limit` parameter
+        // (0 = no bound): an operator setting below the hardcoded 100 must
+        // still be honored here like everywhere else `bound_params` runs.
+        let max_limit = relay.config.read().await.limits.max_api_limit;
+        if max_limit > 0 {
+            limit = limit.min(max_limit);
+        }
+        limit
+    };
     // Sort on tuples: indexing into a `Value` for every comparison was the
     // hot part of the aggregation.
     let mut kinds: Vec<(u64, u64)> = counts.into_iter().collect();
@@ -1545,7 +1555,16 @@ pub async fn api_top_authors_handler(
             }
         }
     }
-    let limit = params.limit.unwrap_or(20).min(100);
+    let limit = {
+        let mut limit = params.limit.unwrap_or(20).min(100);
+        // See the kinds aggregation above: honor a restrictive
+        // `max_api_limit` here too.
+        let max_limit = relay.config.read().await.limits.max_api_limit;
+        if max_limit > 0 {
+            limit = limit.min(max_limit);
+        }
+        limit
+    };
     // Tuple sort (see the kinds aggregation above).
     let mut authors: Vec<(&str, u64)> = counts.into_iter().collect();
     authors.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));

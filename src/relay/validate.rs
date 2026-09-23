@@ -440,10 +440,12 @@ impl super::Relay {
             bail!("invalid: delegation failed");
         }
 
-        if cfg.nip_enabled(13)
-            && cfg.relay.require_pow > 0
-            && !nip13::verify(event, cfg.relay.require_pow)
-        {
+        // NIP-13: enforce the configured difficulty whenever it is set,
+        // regardless of NIP advertisement (like the unconditional NIP-42
+        // AUTH rule below). Gating enforcement on the toggle would silently
+        // disable the operator's spam defense when NIP-13 is hidden from
+        // `supported_nips`.
+        if cfg.relay.require_pow > 0 && !nip13::verify(event, cfg.relay.require_pow) {
             bail!("pow: difficulty requirement not reached");
         }
 

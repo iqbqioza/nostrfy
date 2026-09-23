@@ -1455,20 +1455,62 @@ struct PidFileGuard {
 
 impl PidFileGuard {
     fn create(path: &Path) -> Result<Self> {
-        if let Some(pid) = running_pid(path) {
-            return Err(config_err(format!(
-                "already running (pid {pid}); use 'nostrfy stop' or 'nostrfy restart'"
-            )));
-        }
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
         {
             std::fs::create_dir_all(parent)
                 .map_err(|e| config_err(format!("cannot create {}: {e}", parent.display())))?;
         }
-        // A stale pid file (a dead pid) is overwritten; the live-pid check
-        // above and this write are not atomic, but the caller has already
-        // validated the config and no live instance exists.
+        // Atomically claim the pid file so two concurrent `start`s cannot
+        // both pass the live check and split-brain the database: `create_new`
+        // fails when the file already exists. A stale file (dead pid) is
+        // removed and retried once; a live pid errors out.
+        for _ in 0..2 {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+            {
+                Ok(mut file) => {
+                    use std::io::Write;
+                    if let Err(e) = writeln!(file, "{}", std::process::id()) {
+                        return Err(config_err(format!(
+                            "cannot write the pid file {}: {e}",
+                            path.display()
+                        )));
+                    }
+                    return Ok(PidFileGuard {
+                        path: path.to_path_buf(),
+                    });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if let Some(pid) = running_pid(path) {
+                        return Err(config_err(format!(
+                            "already running (pid {pid}); use 'nostrfy stop' or 'nostrfy restart'"
+                        )));
+                    }
+                    // Stale (or unreadable) pid file: remove and retry once.
+                    // A concurrent starter winning the race leaves a live
+                    // pid behind, which the retry then reports above.
+                    let _ = std::fs::remove_file(path);
+                    continue;
+                }
+                Err(e) => {
+                    return Err(config_err(format!(
+                        "cannot write the pid file {}: {e}",
+                        path.display()
+                    )));
+                }
+            }
+        }
+        // The retry found another stale file again (or lost a tight race):
+        // fall back to a plain overwrite of the dead pid file.
+        if running_pid(path).is_some() {
+            let pid = running_pid(path).unwrap_or(0);
+            return Err(config_err(format!(
+                "already running (pid {pid}); use 'nostrfy stop' or 'nostrfy restart'"
+            )));
+        }
         std::fs::write(path, format!("{}\n", std::process::id())).map_err(|e| {
             config_err(format!("cannot write the pid file {}: {e}", path.display()))
         })?;
@@ -1514,11 +1556,14 @@ fn ensure_port_available(cfg: &Config) -> Result<()> {
     for addr in addrs {
         resolved = true;
         match std::net::TcpListener::bind(addr) {
-            // The port is free: the listener is closed immediately so the
-            // daemon child can bind it.
+            // The port is free on this address: close immediately so the
+            // daemon child can bind it, but keep checking the rest — a
+            // hostname resolving to several addresses (e.g. `localhost`
+            // as v4+v6) must be free on all of them, or the child dies on
+            // the taken one while the parent proceeds to the readiness
+            // probe.
             Ok(listener) => {
                 drop(listener);
-                return Ok(());
             }
             Err(e) => last_error = Some(e),
         }
@@ -1528,6 +1573,9 @@ fn ensure_port_available(cfg: &Config) -> Result<()> {
             "cannot resolve {}: no address",
             cfg.server.host
         )));
+    }
+    if last_error.is_none() {
+        return Ok(());
     }
     Err(config_err(format!(
         "cannot bind to {}:{}: {} (is another process already using the port?)",
@@ -2107,6 +2155,38 @@ fn resolve_config_path(config_path: &Path, path: &Path) -> PathBuf {
     base.join(path)
 }
 
+/// Strips a TOML `#` comment, respecting single/double-quoted strings so a
+/// `#` inside `pid_file = "/tmp/#foo.pid"` survives while a trailing
+/// `pid_file = "x" # comment` is cut. Double-quoted escapes (`\"`, `\\`)
+/// are honored; single-quoted literals have no escapes.
+fn strip_inline_comment(line: &str) -> &str {
+    let mut in_double = false;
+    let mut in_single = false;
+    let mut escaped = false;
+    for (i, c) in line.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match c {
+            '\\' if in_double => escaped = true,
+            '"' if !in_single => in_double = !in_double,
+            '\'' if !in_double => in_single = !in_single,
+            '#' if !in_double && !in_single => return line[..i].trim_end(),
+            _ => {}
+        }
+    }
+    line
+}
+
+/// Whether a comment-stripped line is the `[daemon]` section header,
+/// accepting quoted (`["daemon"]`) and spaced (`[ "daemon" ]`) spellings.
+fn is_daemon_section(line: &str) -> Option<bool> {
+    let inner = line.strip_prefix('[')?.strip_suffix(']')?;
+    let name = inner.trim().trim_matches('"').trim_matches('\'').trim();
+    Some(name == "daemon")
+}
+
 /// Extracts `daemon.pid_file` from the raw config text without parsing the
 /// whole file, so `stop`/`restart` still find the daemon when an unrelated
 /// edit left the TOML unparseable. Only a simple `pid_file = "..."` inside
@@ -2117,13 +2197,14 @@ fn lenient_pid_file(config_path: &Path) -> Option<PathBuf> {
     let mut in_daemon = false;
     for line in text.lines() {
         // Strip comments before looking for a section header or assignment
-        // (handles `[daemon] # comment` and `pid_file = "x" # comment`).
-        let line = line.split('#').next().unwrap_or("").trim();
+        // (handles `[daemon] # comment` and `pid_file = "x" # comment`,
+        // preserving a `#` inside quoted values).
+        let line = strip_inline_comment(line).trim();
         if line.is_empty() {
             continue;
         }
-        if let Some(section) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
-            in_daemon = section.trim() == "daemon";
+        if let Some(is_daemon) = is_daemon_section(line) {
+            in_daemon = is_daemon;
             continue;
         }
         if !in_daemon {
@@ -2165,13 +2246,14 @@ fn lenient_stats_paths(config_path: &Path) -> Option<(PathBuf, PathBuf, u64)> {
     let mut interval_secs: Option<u64> = None;
     for line in text.lines() {
         // Strip comments before looking for a section header or assignment
-        // (handles `[daemon] # comment` and `stats_file = "x" # comment`).
-        let line = line.split('#').next().unwrap_or("").trim();
+        // (handles `[daemon] # comment` and `stats_file = "x" # comment`,
+        // preserving a `#` inside quoted values).
+        let line = strip_inline_comment(line).trim();
         if line.is_empty() {
             continue;
         }
-        if let Some(section) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
-            in_daemon = section.trim() == "daemon";
+        if let Some(is_daemon) = is_daemon_section(line) {
+            in_daemon = is_daemon;
             continue;
         }
         if !in_daemon {
@@ -2506,11 +2588,35 @@ fn process_alive(pid: u32) -> bool {
         return false;
     }
     // Best-effort name check: a reused pid running a different program is
-    // not our daemon.
+    // not our daemon. Accept the released binary name as well as our own
+    // executable's file name, so a renamed binary still detects its daemon
+    // (otherwise `start` allows a split-brain second writer and `stop`
+    // claims "not running"). `comm` truncates to 15 bytes, so compare
+    // truncated.
     match process_name(pid) {
-        Some(name) => name == "nostrfy",
+        Some(name) => {
+            name == "nostrfy" || Some(name.as_str()) == current_exe_comm_name().as_deref()
+        }
         None => true,
     }
+}
+
+/// Our own executable's `comm` name (file name truncated to Linux's
+/// `TASK_COMM_LEN - 1` = 15 bytes), for the renamed-binary check above.
+/// `None` when the file name is unavailable.
+fn current_exe_comm_name() -> Option<String> {
+    let name = std::env::current_exe()
+        .ok()?
+        .file_name()?
+        .to_str()?
+        .to_string();
+    // `comm` holds raw bytes truncated to 15; file names are usually
+    // ASCII here, but truncate on a char boundary to be safe.
+    let mut end = name.len().min(15);
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    Some(name[..end].to_string())
 }
 
 /// The process name of `pid`: `/proc/<pid>/comm` on Linux, the
