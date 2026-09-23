@@ -2506,11 +2506,35 @@ fn process_alive(pid: u32) -> bool {
         return false;
     }
     // Best-effort name check: a reused pid running a different program is
-    // not our daemon.
+    // not our daemon. Accept the released binary name as well as our own
+    // executable's file name, so a renamed binary still detects its daemon
+    // (otherwise `start` allows a split-brain second writer and `stop`
+    // claims "not running"). `comm` truncates to 15 bytes, so compare
+    // truncated.
     match process_name(pid) {
-        Some(name) => name == "nostrfy",
+        Some(name) => {
+            name == "nostrfy" || Some(name.as_str()) == current_exe_comm_name().as_deref()
+        }
         None => true,
     }
+}
+
+/// Our own executable's `comm` name (file name truncated to Linux's
+/// `TASK_COMM_LEN - 1` = 15 bytes), for the renamed-binary check above.
+/// `None` when the file name is unavailable.
+fn current_exe_comm_name() -> Option<String> {
+    let name = std::env::current_exe()
+        .ok()?
+        .file_name()?
+        .to_str()?
+        .to_string();
+    // `comm` holds raw bytes truncated to 15; file names are usually
+    // ASCII here, but truncate on a char boundary to be safe.
+    let mut end = name.len().min(15);
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    Some(name[..end].to_string())
 }
 
 /// The process name of `pid`: `/proc/<pid>/comm` on Linux, the
