@@ -786,7 +786,7 @@ impl GroupStore {
                 if removed {
                     self.total_members = self.total_members.saturating_sub(1);
                 }
-                if emit {
+                if emit && removed {
                     out.push(build_remove_user(gid, &member, relay_pubkey, now));
                     out.extend(self.membership_events(gid, relay_pubkey, now));
                 }
