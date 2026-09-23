@@ -1282,7 +1282,7 @@ pub(crate) fn spawn(
                                         Ok(banned) => banned,
                                         Err(e) => {
                                             db_error(&thread_errors, &e);
-                                            false
+                                            (false, false)
                                         }
                                     };
                                     let _ = reply.send(banned);

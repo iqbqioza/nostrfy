@@ -643,19 +643,38 @@ impl Store {
     }
 
     /// NIP-86 banevent: marks the event as banned, removes it from storage
-    /// and rejects future re-publication.
-    pub(crate) fn apply_ban(&self, id: &[u8], reason: &str) -> Result<bool> {
+    /// and rejects future re-publication. Like every other removal path, a
+    /// removed NIP-29/NIP-43 state event advances the derived-state stamp
+    /// in the same transaction (otherwise a restart restores the banned
+    /// grant from a still-current snapshot), and reports it so the caller
+    /// rebuilds the live derived state.
+    pub(crate) fn apply_ban(&self, id: &[u8], reason: &str) -> Result<(bool, bool)> {
         self.disk_full_error()?;
         let mut wtxn = self.env.write_txn()?;
         self.banned.put(&mut wtxn, id, reason.as_bytes())?;
-        let removed = if self.events.get(&wtxn, id)?.is_some() {
-            self.remove_event(&mut wtxn, id)?;
-            true
-        } else {
-            false
+        let mut state_removed = false;
+        let removed = match self.events.get(&wtxn, id)? {
+            Some(raw) => {
+                // Classify before removing: only a stored NIP-29/NIP-43
+                // state event invalidates the derived state (an event that
+                // fails to parse is still removed, but, like the e-tag
+                // path, cannot be classified as state).
+                if serde_json::from_slice::<Event>(raw)
+                    .map(|event| is_group_state_kind(event.kind))
+                    .unwrap_or(false)
+                {
+                    state_removed = true;
+                }
+                self.remove_event(&mut wtxn, id)?;
+                if state_removed {
+                    self.bump_state_stamp(&mut wtxn)?;
+                }
+                true
+            }
+            None => false,
         };
         wtxn.commit()?;
-        Ok(removed)
+        Ok((removed, state_removed))
     }
 
     pub(crate) fn apply_unban(&self, id: &[u8]) -> Result<bool> {

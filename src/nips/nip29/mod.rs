@@ -662,6 +662,12 @@ impl GroupStore {
             // (nobody could then issue 9000/9001/9002 again). A member's own
             // LEAVE is exempt (NIP-29: any user may leave), so an admin-less
             // group is possible; the relay's own key can still manage it.
+            // The guard only protects groups that still have an admin: on
+            // an already admin-less group there is no last admin to lose,
+            // and only the relay key reaches this check there (anyone else
+            // fails the admin check above), so plain adds and removals
+            // must stay available for operator cleanup.
+            let group_has_admin = group.members.values().any(|roles| !roles.is_empty());
             let admin_removed: HashSet<String> = match event.kind {
                 9000 => event
                     .tags
@@ -700,7 +706,7 @@ impl GroupStore {
                         .copied()
                         .unwrap_or(!roles.is_empty())
                 }) || overrides.values().any(|has| *has);
-                if !retains_admin {
+                if group_has_admin && !retains_admin {
                     bail!("restricted: the group must retain at least one admin");
                 }
                 return Ok(());
@@ -709,7 +715,7 @@ impl GroupStore {
                 .members
                 .iter()
                 .any(|(pk, roles)| !roles.is_empty() && !admin_removed.contains(pk));
-            if !retains_admin {
+            if group_has_admin && !retains_admin {
                 bail!("restricted: the group must retain at least one admin");
             }
             return Ok(());
@@ -857,7 +863,11 @@ impl GroupStore {
                         }) || inserted
                             .iter()
                             .any(|pk| overrides.get(*pk).copied().unwrap_or(false));
-                        if !retains_admin {
+                        // Like validation: an already admin-less group has
+                        // no last admin to protect (only the relay key can
+                        // reach here with such an event).
+                        let group_has_admin = group.members.values().any(|roles| !roles.is_empty());
+                        if group_has_admin && !retains_admin {
                             // Drop the demotion: the event itself still
                             // stores, but the group keeps its last admin
                             // (the relay key can manage the group anyway).
@@ -922,7 +932,10 @@ impl GroupStore {
                         .members
                         .iter()
                         .any(|(pk, roles)| !roles.is_empty() && !removing.contains(&pk.as_str()));
-                    if !ignore_capacity && !retains_admin {
+                    // Like validation and the 9000 arm: an already
+                    // admin-less group has no last admin to protect.
+                    let group_has_admin = group.members.values().any(|roles| !roles.is_empty());
+                    if !ignore_capacity && group_has_admin && !retains_admin {
                         // Drop the removal at runtime: the event itself
                         // still stores, but the group keeps its last admin
                         // (the relay key can manage the group regardless).

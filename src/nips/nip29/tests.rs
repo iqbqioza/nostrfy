@@ -1547,6 +1547,66 @@ fn relay_key_can_restore_an_adminless_group() {
 }
 
 #[test]
+fn relay_key_can_prune_an_adminless_group() {
+    // The last-admin guard protects groups that still have an admin; on an
+    // already admin-less group there is no last admin to lose, and only
+    // the relay key reaches the guard there (anyone else fails the admin
+    // check). The operator must be able to prune dead membership instead
+    // of only deleting the group.
+    let relay_pk = "ff".repeat(64);
+    let mut store = seeded();
+    let leave = event(LEAVE, ADMIN, Some("g1"), vec![]);
+    store.apply(&leave, "", 2, false, false);
+    assert!(
+        !store
+            .group("g1")
+            .unwrap()
+            .members
+            .values()
+            .any(|r| !r.is_empty()),
+        "the group is admin-less after the last admin leaves"
+    );
+    // A plain add without roles: keeps the group admin-less, removes
+    // nothing, so the guard must not fire for the relay key.
+    let add = event(
+        9000,
+        &relay_pk,
+        Some("g1"),
+        vec![vec![P.into(), USER.into()]],
+    );
+    assert!(
+        store
+            .validate_write_for_relay(&add, Some(&relay_pk))
+            .is_ok(),
+        "the relay key may add plain members to an admin-less group"
+    );
+    store.apply(&add, &relay_pk, 3, false, false);
+    assert!(store.group("g1").unwrap().is_member(USER));
+    // Removing a plain member: same exemption, and the apply side must
+    // honor it instead of dropping the removal.
+    let remove = event(
+        9001,
+        &relay_pk,
+        Some("g1"),
+        vec![vec![P.into(), OTHER.into()]],
+    );
+    assert!(
+        store
+            .validate_write_for_relay(&remove, Some(&relay_pk))
+            .is_ok(),
+        "the relay key may prune an admin-less group"
+    );
+    store.apply(&remove, &relay_pk, 4, false, false);
+    assert!(
+        !store.group("g1").unwrap().is_member(OTHER),
+        "the pruned member must actually leave"
+    );
+    // Anyone else still fails the admin check on the admin-less group.
+    let rogue = event(9001, USER, Some("g1"), vec![vec![P.into(), USER.into()]]);
+    assert!(store.validate_write(&rogue).is_err());
+}
+
+#[test]
 fn relay_key_can_reparent_subgroups() {
     // The relay's own key is the group master key: it must be able to set
     // a parent (or adopt a child) without holding an explicit role in

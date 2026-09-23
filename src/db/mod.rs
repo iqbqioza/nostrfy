@@ -450,7 +450,10 @@ enum Msg {
     Ban {
         id: Vec<u8>,
         reason: String,
-        reply: oneshot::Sender<bool>,
+        /// `(removed, state_removed)`: whether the event was stored, and
+        /// whether a removed NIP-29/NIP-43 state event invalidated the
+        /// derived state (see [`Store::apply_ban`]).
+        reply: oneshot::Sender<(bool, bool)>,
     },
     Unban {
         id: Vec<u8>,
@@ -2173,8 +2176,11 @@ impl DbClient {
     }
 
     /// Bans an event id (NIP-86 banevent): removes it from storage and
-    /// prevents re-publication. Returns whether the event was stored.
-    pub async fn ban_event(&self, id: [u8; 32], reason: &str) -> bool {
+    /// prevents re-publication. Returns whether the event was stored and
+    /// whether a removed NIP-29/NIP-43 state event invalidated the derived
+    /// state (the caller must then rebuild it instead of trusting the
+    /// live groups/roles and the persisted snapshots).
+    pub async fn ban_event(&self, id: [u8; 32], reason: &str) -> (bool, bool) {
         self.request_write(|reply| Msg::Ban {
             id: id.to_vec(),
             reason: reason.to_string(),

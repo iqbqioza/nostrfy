@@ -693,10 +693,18 @@ pub async fn rpc_handler(
             // Like the neighboring mutations, a failed store must not be
             // reported as success: the ban would silently disappear on the
             // next restart.
-            let banned = relay.db.ban_event(id, reason).await;
+            let (banned, state_removed) = relay.db.ban_event(id, reason).await;
             audit!(&relay, &identity, "banevent", params);
             if !banned {
                 return rpc_err("error: cannot persist the event ban");
+            }
+            if state_removed {
+                // A banned NIP-29/NIP-43 state event invalidates the live
+                // derived state like any other removal of one (the database
+                // already advanced its stamp, so a restart rebuilds instead
+                // of resurrecting the banned grant).
+                relay.mark_group_state_stale().await;
+                relay.mark_roles_stale().await;
             }
             rpc_ok(json!(true))
         }
