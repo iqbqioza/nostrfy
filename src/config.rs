@@ -1574,10 +1574,11 @@ impl Config {
         }
 
         // Blossom file server: the storage backend must be known, and S3
-        // storage needs its credentials. The backend value is validated even
-        // while the feature is disabled (`host == ""`) so a latent typo does
-        // not surface only when the operator later enables the host via
-        // SIGHUP (when the reload would be rejected and the old config kept).
+        // storage needs its credentials. The backend value and the upload
+        // size bounds are validated even while the feature is disabled
+        // (`host == ""`) so a latent typo does not surface only when the
+        // operator later enables the host via SIGHUP (when the reload
+        // would be rejected and the old config kept).
         let b = &self.blossom;
         if !["local", "s3"].contains(&b.storage.as_str()) {
             return Err(config_err(format!(
@@ -1585,19 +1586,19 @@ impl Config {
                 b.storage
             )));
         }
+        if b.max_upload_bytes == 0 {
+            return Err(config_err("blossom.max_upload_bytes must be at least 1"));
+        }
+        // The upload budget semaphore grants one permit per byte and a
+        // request takes `max_upload_bytes` of them: above `u32::MAX` the
+        // per-request acquisition is clamped, so the configured
+        // concurrency limit (4 uploads) would no longer hold.
+        if b.max_upload_bytes > u32::MAX as usize {
+            return Err(config_err(
+                "blossom.max_upload_bytes must not exceed 4294967295",
+            ));
+        }
         if !b.host.trim().is_empty() {
-            if b.max_upload_bytes == 0 {
-                return Err(config_err("blossom.max_upload_bytes must be at least 1"));
-            }
-            // The upload budget semaphore grants one permit per byte and a
-            // request takes `max_upload_bytes` of them: above `u32::MAX` the
-            // per-request acquisition is clamped, so the configured
-            // concurrency limit (4 uploads) would no longer hold.
-            if b.max_upload_bytes > u32::MAX as usize {
-                return Err(config_err(
-                    "blossom.max_upload_bytes must not exceed 4294967295",
-                ));
-            }
             match b.storage.as_str() {
                 "local" => {
                     if b.local_path.as_os_str().is_empty() {
@@ -4243,6 +4244,25 @@ max_log_files = 2
         assert!(
             cfg.validate().is_err(),
             "an unknown storage backend must fail even while disabled"
+        );
+    }
+
+    #[test]
+    fn validation_rejects_upload_bounds_even_when_disabled() {
+        // The upload size bounds are validated even while the feature is
+        // disabled, so a latent typo does not surface only when the host
+        // is enabled later via SIGHUP (when the reload is rejected).
+        let mut cfg = Config::default();
+        cfg.blossom.host = String::new();
+        cfg.blossom.max_upload_bytes = 0;
+        assert!(
+            cfg.validate().is_err(),
+            "a zero upload bound must fail even while disabled"
+        );
+        cfg.blossom.max_upload_bytes = u32::MAX as usize + 1;
+        assert!(
+            cfg.validate().is_err(),
+            "an oversized upload bound must fail even while disabled"
         );
     }
 

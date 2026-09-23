@@ -2383,3 +2383,86 @@ fn recreated_group_republishes_member_list() {
         "a recreated group must republish its 39002"
     );
 }
+
+#[test]
+fn capacity_blocked_create_emits_nothing() {
+    // A create refused by the group cap must not store or broadcast bare
+    // metadata for a group that was never created (two concurrent creates
+    // can both pass the read-side validation and serialize on the write
+    // lock; the loser previously emitted phantom 39000/39001/39002). A
+    // duplicate create for a live group still republishes its metadata.
+    let mut store = GroupStore::with_cap(1);
+    let now = 1_700_000_000;
+    store.apply(
+        &event(CREATE_GROUP, ADMIN, Some("g1"), vec![]),
+        "relay",
+        now,
+        true,
+        false,
+    );
+    assert!(store.group("g1").is_some());
+    let out = store.apply(
+        &event(CREATE_GROUP, ADMIN, Some("g2"), vec![]),
+        "relay",
+        now,
+        true,
+        false,
+    );
+    assert!(
+        store.group("g2").is_none(),
+        "an at-capacity group must not be created"
+    );
+    assert!(
+        out.is_empty(),
+        "a blocked create must not emit phantom metadata: {out:?}"
+    );
+    let out = store.apply(
+        &event(CREATE_GROUP, ADMIN, Some("g1"), vec![]),
+        "relay",
+        now,
+        true,
+        false,
+    );
+    assert!(
+        out.iter().any(|e| e.kind == GROUP_META),
+        "a duplicate create for a live group still republishes"
+    );
+}
+
+#[test]
+fn invite_code_validation_dedupes_duplicates() {
+    // Validation must count distinct fresh codes like the apply side
+    // inserts them: an event repeating one new code must not be rejected
+    // when a single copy would fit (the 9000 member count already
+    // deduplicates the same way).
+    let mut store = GroupStore::default();
+    let now = 1_700_000_000;
+    store.apply(
+        &event(CREATE_GROUP, ADMIN, Some("g1"), vec![]),
+        "relay",
+        now,
+        false,
+        false,
+    );
+    for i in 0..99u32 {
+        store
+            .groups
+            .get_mut("g1")
+            .unwrap()
+            .invites
+            .insert(format!("code-{i}"));
+    }
+    let dup = event(
+        9009,
+        ADMIN,
+        Some("g1"),
+        vec![
+            vec!["code".into(), "new".into()],
+            vec!["code".into(), "new".into()],
+        ],
+    );
+    assert!(
+        store.validate_write(&dup).is_ok(),
+        "duplicate fresh codes must count once"
+    );
+}
