@@ -1508,7 +1508,18 @@ impl S3Store {
             // bucket with many blobs is not downloaded during the
             // migration.
             let mut out = Vec::new();
-            let mut via_meta: std::collections::HashSet<String> = std::collections::HashSet::new();
+            // Meta-backed entries resolved below; derived (blob-only)
+            // entries live in `out` until the dedup.
+            let mut from_meta: Vec<LegacyEntry> = Vec::new();
+            // Shas seen with a successfully fetched meta on this page,
+            // paired with their owner: the same content uploaded by two
+            // pubkeys (one with a legacy meta, one blob-only) must keep
+            // both owners — keying by sha alone would drop the second
+            // owner's derived entry. Recorded only for metas that actually
+            // resolve (like the local pass): a blob whose meta cannot be
+            // fetched still migrates as a derived entry.
+            let mut via_meta: std::collections::HashSet<(String, String)> =
+                std::collections::HashSet::new();
             let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(16));
             let mut tasks = tokio::task::JoinSet::new();
             for (key, size) in keys {
@@ -1526,8 +1537,6 @@ impl S3Store {
                     if sha.len() != 64 || hex::decode(sha).is_err() {
                         continue;
                     }
-                    let sha = sha.to_ascii_lowercase();
-                    via_meta.insert(sha);
                     let client = self.client.clone();
                     let semaphore = std::sync::Arc::clone(&semaphore);
                     tasks.spawn(async move {
@@ -1568,7 +1577,11 @@ impl S3Store {
                 if let Ok(Some(raw)) = raw
                     && let Ok(meta) = serde_json::from_slice::<serde_json::Value>(&raw)
                 {
-                    out.push((
+                    // Recorded only for metas that actually resolve (like
+                    // the local pass): a blob whose meta cannot be fetched
+                    // still migrates as a derived entry below.
+                    via_meta.insert((sha.clone(), pubkey.clone()));
+                    from_meta.push((
                         sha,
                         crate::server::blossom::sanitize_mime(meta["mime"].as_str().unwrap_or("")),
                         meta["size"].as_u64().unwrap_or(0),
@@ -1577,8 +1590,13 @@ impl S3Store {
                     ));
                 }
             }
-            // The derived entries must not duplicate meta-backed ones.
-            out.retain(|(sha, _, _, _, _)| !via_meta.contains(sha));
+            // The derived entries must not duplicate meta-backed ones of
+            // the same owner (a blob and its meta can land on different
+            // pages; same-sha duplicates across pages rewrite the same
+            // mapping bytes). Meta entries are appended after this filter,
+            // never subjected to it.
+            out.retain(|(sha, _, _, _, pubkey)| !via_meta.contains(&(sha.clone(), pubkey.clone())));
+            out.append(&mut from_meta);
             // Emit in bounded chunks so one giant page cannot spike memory
             // (S3 pages are ~1000 keys, far below the chunk size, but the
             // bound holds regardless of server behavior).
@@ -2793,5 +2811,54 @@ mod scan_debug {
         );
         assert_eq!(entries[0].0, "ab".repeat(32), "the hash is normalized");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn s3_scan_legacy_keeps_both_owners_of_shared_content() {
+        // Same content uploaded by two pubkeys on one listing page, one
+        // with a legacy meta and one blob-only: both owners must migrate.
+        // Keying the meta dedup by sha alone dropped the second owner's
+        // derived entry, losing their ownership.
+        let (endpoint, bucket) = crate::server::blossom::s3::mock_server::build_mock().await;
+        let pub_a = "aa".repeat(32);
+        let pub_b = "bb".repeat(32);
+        let npub_a = npub_of(&pub_a);
+        let npub_b = npub_of(&pub_b);
+        let sha = "cc".repeat(32);
+        bucket.lock().unwrap().insert(
+            format!("{npub_a}/{sha}.meta.json"),
+            br#"{"mime":"image/png","size":5,"uploaded":7}"#.to_vec(),
+        );
+        bucket
+            .lock()
+            .unwrap()
+            .insert(format!("{npub_b}/{sha}"), b"hello".to_vec());
+        let s = S3Store::new(S3Config {
+            endpoint,
+            region: "us-east-1".into(),
+            bucket: "bucket".into(),
+            access_key: "ak".into(),
+            secret_key: "sk".into(),
+        })
+        .await
+        .unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        s.scan_legacy(tx).await.unwrap();
+        let mut entries = Vec::new();
+        while let Some(chunk) = rx.recv().await {
+            entries.extend(chunk);
+        }
+        assert!(
+            entries
+                .iter()
+                .any(|(s, _, _, _, p)| s == &sha && p == &pub_a),
+            "the meta owner's entry must migrate: {entries:?}"
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|(s, _, _, _, p)| s == &sha && p == &pub_b),
+            "the blob-only second owner must migrate too: {entries:?}"
+        );
     }
 }
