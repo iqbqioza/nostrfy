@@ -1628,11 +1628,23 @@ impl Config {
 }
 
 /// Whether a bare hostname contains a `:` outside IPv6 brackets (i.e. a
-/// port). `[::1]` is fine; `media.example.com:8080` and the unbracketed
-/// `::1` (the host-split matching brackets IPv6 literals, so the
-/// unbracketed form could never match a Host header) are not.
+/// port). `[::1]` is fine; `media.example.com:8080`, the unbracketed `::1`
+/// (the host-split matching brackets IPv6 literals, so the unbracketed
+/// form could never match a Host header), and a bracketed literal with a
+/// port (`[::1]:8080`, which normalizes to an unmatchable host) are not.
 fn bare_host_has_port(host: &str) -> bool {
-    host.contains(':') && !host.starts_with('[')
+    let host = host.trim();
+    if let Some(rest) = host.strip_prefix('[') {
+        // Bracketed IPv6 literal: only a `:` after the closing bracket is
+        // a port (`[::1]` itself just contains the literal's colons).
+        match rest.split_once(']') {
+            Some((_, tail)) => !tail.is_empty(),
+            // Unbalanced bracket: other checks reject it; fail closed here.
+            None => host.contains(':'),
+        }
+    } else {
+        host.contains(':')
+    }
 }
 
 /// Whether a string is a 64-hex pubkey or a parseable `npub1...`.
@@ -3781,7 +3793,9 @@ max_log_files = 2
         );
         cfg.blossom.host = String::new();
         // Whitespace (a silent 404 for the whole API), a scheme, a path
-        // and a port are all rejected.
+        // and a port are all rejected — including a bracketed IPv6
+        // literal with a port, which would otherwise normalize to a host
+        // that never matches a request Host header (silent 404).
         for bad in [
             "api host",
             "api.example.com ",
@@ -3789,6 +3803,8 @@ max_log_files = 2
             "https://api.x",
             "api.x/",
             "api.x:8080",
+            "[::1]:8080",
+            "::1",
         ] {
             cfg.server.api_host = bad.into();
             assert!(
