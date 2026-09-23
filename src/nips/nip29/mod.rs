@@ -497,6 +497,13 @@ impl GroupStore {
             bail!("invalid: group events must carry only one h tag");
         }
         let Some(gid) = group_id(event) else {
+            // NIP-29 group actions MUST carry an `h` tag (mirrors the intake
+            // precheck): without it the event names no group to validate
+            // against, so accepting it here would let a direct caller bypass
+            // the requirement. Ordinary events without `h` are unaffected.
+            if is_group_action(event) {
+                bail!("invalid: group events must carry an h tag");
+            }
             return Ok(());
         };
         // A ghosted id must never be resurrected by a create: its create
