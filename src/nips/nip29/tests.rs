@@ -2324,3 +2324,62 @@ fn subgroup_adoption_is_deterministic_and_works_uncapped() {
     );
     assert_eq!(store.group("child").unwrap().parent.as_deref(), Some("g1"));
 }
+
+#[test]
+fn recreated_group_republishes_member_list() {
+    // Deleting a group must drop its member-list throttle stamp: a
+    // delete+create cycle within the throttle window must still publish a
+    // fresh 39002 (previously the deleted incarnation's stamp skipped it
+    // for groups over the eager member bound).
+    let mut store = GroupStore::default();
+    let now = 1_700_000_000;
+    store.apply(
+        &event(CREATE_GROUP, ADMIN, Some("g1"), vec![]),
+        "relay",
+        now,
+        false,
+        false,
+    );
+    // Grow past the eager bound so the throttle engages.
+    for i in 0..1001u64 {
+        store
+            .groups
+            .get_mut("g1")
+            .unwrap()
+            .members
+            .insert(format!("{i:064x}"), Default::default());
+    }
+    let out = store.membership_events("g1", "relay", now);
+    assert!(
+        out.iter().any(|e| e.kind == GROUP_MEMBERS),
+        "a large group publishes its 39002 once"
+    );
+    // Delete and re-create within the throttle window, then regrow.
+    store.apply(
+        &event(DELETE_GROUP, ADMIN, Some("g1"), vec![]),
+        "relay",
+        now,
+        false,
+        false,
+    );
+    store.apply(
+        &event(CREATE_GROUP, ADMIN, Some("g1"), vec![]),
+        "relay",
+        now,
+        false,
+        false,
+    );
+    for i in 0..1001u64 {
+        store
+            .groups
+            .get_mut("g1")
+            .unwrap()
+            .members
+            .insert(format!("{i:064x}"), Default::default());
+    }
+    let out = store.membership_events("g1", "relay", now);
+    assert!(
+        out.iter().any(|e| e.kind == GROUP_MEMBERS),
+        "a recreated group must republish its 39002"
+    );
+}
