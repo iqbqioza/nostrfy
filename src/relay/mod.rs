@@ -4129,6 +4129,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn leave_marked_mid_flight_is_buffered_not_lost() {
+        // The rebuild mark landing between the leave's pending snapshot and
+        // its mutation must not lose the leave: the mutation re-reads the
+        // pending flags under the write lock (marking stores `dirty`
+        // before revoking under the same lock), so a removal on the
+        // already-revoked empty store is still force-buffered for the
+        // replay. The buffer lock orders the interleaving deterministically:
+        // the spawned leave snapshots (both flags false) and blocks on the
+        // held lock, the test marks and revokes, then releases.
+        let key = "01".repeat(32);
+        let relay = build_role_relay(Some(&key)).await;
+        let member = "bb".repeat(32);
+        assert!(relay.create_role("r1", "Role 1", "", "", None).await);
+        assert!(relay.assign_role(&member, "r1").await);
+        let guard = relay.roles_rebuild.buffer.lock().await;
+        let mut leave = crate::event::Event {
+            id: String::new(),
+            pubkey: member.clone(),
+            created_at: crate::util::unix_now(),
+            kind: 28936,
+            tags: vec![],
+            content: String::new(),
+            sig: String::new(),
+        };
+        leave.id = crate::nips::nip01::compute_id(&leave);
+        let task = tokio::spawn({
+            let relay = std::sync::Arc::clone(&relay);
+            async move { relay.apply_leave_request(&leave).await }
+        });
+        // Let the spawned leave run to the held buffer lock (its snapshot
+        // already sees both flags false).
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        // The mark lands mid-flight: flag first, then revoke the store.
+        relay.roles_rebuild.dirty.store(true, Ordering::SeqCst);
+        *relay.roles.write().await = RoleStore::default();
+        drop(guard);
+        task.await.expect("the leave task must complete");
+        {
+            let buffer = relay.roles_rebuild.buffer.lock().await;
+            assert!(
+                buffer.mutations.iter().any(|m| matches!(
+                    m,
+                    BufferedRoleMutation::RemovePubkey { pubkey } if pubkey == &member
+                )),
+                "a leave marked mid-flight must still be buffered for replay"
+            );
+        }
+        let f: crate::filter::Filter =
+            serde_json::from_value(serde_json::json!({"kinds": [8001]})).unwrap();
+        let (stored, _) = relay.db.query(vec![f], 10, crate::util::unix_now()).await;
+        assert!(
+            stored.iter().any(|e| e
+                .tags
+                .iter()
+                .any(|t| t == &vec!["p".into(), member.clone()])),
+            "the mid-flight leave must still announce its departure"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
     async fn persist_roles_stamps_the_snapshot_and_fails_closed_without_a_stamp() {
         // The role snapshot carries the database generation (`state_stamp`)
         // so a later restore can reject it. When the generation cannot be
