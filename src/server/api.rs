@@ -1315,6 +1315,11 @@ pub async fn api_related_handler(
             "the id must be a 64-character hex string",
         );
     }
+    // Normalized like every other path hash (`parse_author_identifier`,
+    // `split_blob`): `#e`/`#q` tag values compare case-sensitively while
+    // stored references are lowercase, so an uppercase spelling would
+    // otherwise match nothing.
+    let hex_id = hex_id.to_ascii_lowercase();
     // Bound the query parameters like every other handler: without the
     // cap an unauthenticated request could collect and serialize the
     // whole scan budget (~200k events) and OOM the relay.
@@ -2997,6 +3002,23 @@ mod tests {
             let (_, Json(resp)) = api_related_handler(
                 State(relay.clone()),
                 Path(root.id.clone()),
+                Query(ApiParams::default()),
+            )
+            .await;
+            let mut contents: Vec<String> = resp["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|e| e["content"].as_str().unwrap().to_string())
+                .collect();
+            contents.sort();
+            assert_eq!(contents, vec!["quote".to_string(), "reply".to_string()]);
+            // An uppercase spelling of the id must find the same references
+            // (`#e`/`#q` values compare case-sensitively; stored ones are
+            // lowercase).
+            let (_, Json(resp)) = api_related_handler(
+                State(relay.clone()),
+                Path(root.id.to_ascii_uppercase()),
                 Query(ApiParams::default()),
             )
             .await;
