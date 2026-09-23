@@ -4033,6 +4033,45 @@ fn query_directed_ascending() {
 }
 
 #[test]
+fn query_directed_ascending_ids() {
+    // The `ids` branch must honor the scan direction like every other
+    // branch: with `ascending` a multi-id `limit` keeps the oldest events,
+    // otherwise the newest. Reachability is currently narrow (WS uses
+    // newest-first; REST single-id makes the cutoff moot), so this pins the
+    // contract for future `query_directed` callers.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let e1 = event(1, "first", now - 200, vec![]);
+        let e2 = event(1, "second", now - 100, vec![]);
+        let e3 = event(1, "third", now, vec![]);
+        for e in [&e1, &e2, &e3] {
+            assert_eq!(db.put(e.clone(), now).await, PutOutcome::Stored);
+        }
+        let ids = vec![e3.id.clone(), e1.id.clone()];
+        let f: Filter =
+            serde_json::from_value(serde_json::json!({"ids": ids})).unwrap();
+        let (desc, _) = db.query_directed(vec![f.clone()], 1, now, false, 0).await;
+        assert_eq!(desc.len(), 1);
+        assert_eq!(desc[0].id, e3.id, "newest-first keeps the newest id");
+        let (asc, _) = db.query_directed(vec![f], 1, now, true, 0).await;
+        assert_eq!(asc.len(), 1);
+        assert_eq!(asc[0].id, e1.id, "ascending keeps the oldest id");
+    });
+    db.shutdown();
+}
+
+#[test]
 fn deleted_replaceable_can_be_re_published() {
     // Regression: remove_event must clear the replaceable slot, otherwise an
     // NIP-09-deleted replaceable event could not be re-published with an

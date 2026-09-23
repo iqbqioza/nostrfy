@@ -1004,14 +1004,15 @@ impl Store {
         };
 
         if let Some(ids) = &filter.ids {
-            // NIP-01: `limit: n` returns the last n events ordered by
-            // `created_at`. The events database is keyed by id, so walking
+            // NIP-01: `limit: n` keeps the boundary n events of the
+            // chronological walk (newest-first by default, oldest-first for
+            // ascending). The events database is keyed by id, so walking
             // `ids` in filter order says nothing about chronology. Gather
-            // the candidates first, then replay them newest-first so the
+            // the candidates first, then replay them in walk order so the
             // per-filter boundary cuts the same way as a chronological index
             // walk. Every id is still checked (each maps to at most one
             // event): `{"ids": [A, B], "limit": 1}` must find B even when A
-            // is older.
+            // is older (or A even when B is newer, ascending).
             let mut candidates: Vec<(u64, Vec<u8>)> = Vec::new();
             'gather: for id in ids {
                 let Ok(decoded) = hex::decode(id) else {
@@ -1070,7 +1071,11 @@ impl Store {
                     }
                 }
             }
-            candidates.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+            if ascending {
+                candidates.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+            } else {
+                candidates.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+            }
             for (_, id) in candidates {
                 if !consider(&id)? {
                     *more = true;
