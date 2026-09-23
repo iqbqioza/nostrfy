@@ -501,10 +501,13 @@ fn store_error(e: anyhow::Error) -> Response {
 /// range (inclusive end, clamped to the blob size) and an error for an
 /// unsatisfiable or malformed range (416 with `Content-Range: bytes */`).
 fn parse_range(header: &str, size: usize) -> anyhow::Result<Option<(usize, usize)>> {
-    let Some(spec) = header
-        .trim()
-        .strip_prefix("bytes=")
-        .or_else(|| header.trim().strip_prefix("Bytes="))
+    // RFC 7233 §2.1: range units are case-insensitive (`bytes=`, `BYTES=`,
+    // `Bytes=` are equivalent). A non-bytes unit is ignored (200).
+    let trimmed = header.trim();
+    let Some(spec) = trimmed
+        .get(..6)
+        .filter(|prefix| prefix.eq_ignore_ascii_case("bytes="))
+        .map(|_| &trimmed[6..])
     else {
         return Ok(None); // not a byte range: ignore
     };
