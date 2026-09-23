@@ -1889,6 +1889,48 @@ fn group_purge_removes_only_that_groups_events() {
 }
 
 #[test]
+fn group_purge_removes_unindexed_long_group_ids() {
+    // An `h` value beyond the index key limit is stored but never indexed
+    // (queries find it via the time-scan fallback): the purge walk must
+    // use the same fallback instead of an unusable index range, or the
+    // history stays stored while the marker bricks the id.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let gid = "g".repeat(500);
+        let ev = event(1, "long group", now, vec![vec!["h".into(), gid.clone()]]);
+        assert_eq!(db.put(ev.clone(), now).await, PutOutcome::Stored);
+        let f: Filter = serde_json::from_value(serde_json::json!({"#h": [gid]})).unwrap();
+        assert_eq!(
+            db.query(vec![f], 500, now).await.0.len(),
+            1,
+            "the scan fallback finds unindexed long ids"
+        );
+        assert_eq!(
+            db.group_purge(gid.clone(), now).await,
+            Some(1),
+            "the purge must remove the unindexed history too"
+        );
+        let f: Filter = serde_json::from_value(serde_json::json!({"#h": [gid]})).unwrap();
+        assert!(
+            db.query(vec![f], 500, now).await.0.is_empty(),
+            "no history may survive the purge"
+        );
+    });
+    db.shutdown();
+}
+
+#[test]
 fn purged_group_history_cannot_be_republished() {
     // NIP-29: the per-group purge marker (one record, not one tombstone per
     // purged event) blocks a re-broadcast of the purged history after the
