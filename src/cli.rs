@@ -927,7 +927,11 @@ impl Cli {
                 let _lock = lock_access_state(&cfg)?;
                 let mut state = load_access_state(&cfg)?;
                 let hex = normalize_pubkey(pubkey);
-                if !state.blossom_allow.iter().any(|e| e == &hex) {
+                if !state
+                    .blossom_allow
+                    .iter()
+                    .any(|e| pubkey_entry_matches(e, &hex))
+                {
                     state.blossom_allow.push(hex.clone());
                     save_access_state(&cfg, &state)?;
                     print_line(&format!("allowed {hex} to upload (added to the allowlist)"));
@@ -940,7 +944,9 @@ impl Cli {
                 let mut state = load_access_state(&cfg)?;
                 let hex = normalize_pubkey(pubkey);
                 let before = state.blossom_allow.len();
-                state.blossom_allow.retain(|e| e != &hex);
+                state
+                    .blossom_allow
+                    .retain(|e| !pubkey_entry_matches(e, &hex));
                 if state.blossom_allow.len() != before {
                     save_access_state(&cfg, &state)?;
                     print_line(&format!("denied {hex} (removed from the allowlist)"));
@@ -1012,10 +1018,16 @@ impl Cli {
                 // that must be persisted even when it is already allowed
                 // (e.g. after a NIP-86 `banpubkey` put it on both lists).
                 let deny_before = state.relay_deny.len();
-                state.relay_deny.retain(|(p, _)| p != &hex);
+                state
+                    .relay_deny
+                    .retain(|(p, _)| !pubkey_entry_matches(p, &hex));
                 let was_denied = state.relay_deny.len() != deny_before;
                 changed |= was_denied;
-                if !state.relay_allow.iter().any(|(p, _)| p == &hex) {
+                if !state
+                    .relay_allow
+                    .iter()
+                    .any(|(p, _)| pubkey_entry_matches(p, &hex))
+                {
                     state.relay_allow.push((hex.clone(), String::new()));
                     changed = true;
                     print_line(&format!("allowed {hex} to publish"));
@@ -1031,10 +1043,16 @@ impl Cli {
                 let hex = normalize_pubkey(pubkey);
                 // Symmetric: removing an existing allow entry is a change.
                 let allow_before = state.relay_allow.len();
-                state.relay_allow.retain(|(p, _)| p != &hex);
+                state
+                    .relay_allow
+                    .retain(|(p, _)| !pubkey_entry_matches(p, &hex));
                 let was_allowed = state.relay_allow.len() != allow_before;
                 changed |= was_allowed;
-                if !state.relay_deny.iter().any(|(p, _)| p == &hex) {
+                if !state
+                    .relay_deny
+                    .iter()
+                    .any(|(p, _)| pubkey_entry_matches(p, &hex))
+                {
                     state.relay_deny.push((hex.clone(), String::new()));
                     changed = true;
                     print_line(&format!("denied {hex}: its events are now rejected"));
@@ -2569,6 +2587,16 @@ fn normalize_pubkey(value: &str) -> String {
         .unwrap_or_else(|| value.to_ascii_lowercase())
 }
 
+/// Whether a persisted allow/deny entry names `hex`: enforcement
+/// (`AccessControl::allows_pubkey`, the Blossom allowlist check) compares
+/// case-insensitively, and rows written before the lowercase
+/// normalization may be uppercase — an exact compare would leave such
+/// rows behind while reporting success (e.g. `relay allow` printing
+/// "allowed" while the legacy uppercase deny still blocks).
+fn pubkey_entry_matches(entry: &str, hex: &str) -> bool {
+    entry.eq_ignore_ascii_case(hex)
+}
+
 /// Whether a string is a 64-hex pubkey or a parseable `npub1...`.
 fn is_pubkey_or_npub(value: &str) -> bool {
     crate::config::is_pubkey_or_npub(value)
@@ -2795,6 +2823,26 @@ name = \"nostrfy\"\n",
         let out = set_private_key_in_text(text, KEY);
         assert!(out.ends_with(&format!("[relay]\nprivate_key = \"{KEY}\"\n")));
         assert!(out.starts_with("[server]\nport = 8080\n"));
+    }
+
+    #[test]
+    fn pubkey_entry_matches_ignores_hex_case() {
+        // Enforcement compares allow/deny rows case-insensitively while
+        // rows written before the lowercase normalization may be
+        // uppercase: the CLI must match them too, or `allow`/`deny`
+        // silently leaves stale rows that still take effect (e.g. `relay
+        // allow` printing "allowed" while the legacy uppercase deny
+        // still blocks).
+        let lower = "aa".repeat(32);
+        let upper = lower.to_ascii_uppercase();
+        assert!(pubkey_entry_matches(&upper, &lower));
+        assert!(pubkey_entry_matches(&lower, &lower));
+        assert!(!pubkey_entry_matches(&"bb".repeat(32), &lower));
+        // The allow flow's retain predicate removes a legacy uppercase
+        // deny row.
+        let mut deny = vec![(upper.clone(), String::new())];
+        deny.retain(|(p, _)| !pubkey_entry_matches(p, &lower));
+        assert!(deny.is_empty(), "legacy uppercase rows must be removable");
     }
 
     #[test]
