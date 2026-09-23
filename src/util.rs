@@ -165,7 +165,18 @@ fn parse_forwarded_entry(entry: &str) -> Option<IpAddr> {
         return Some(ip);
     }
     if let Some(rest) = entry.strip_prefix('[') {
-        let (ip, _) = rest.split_once(']')?;
+        let (ip, tail) = rest.split_once(']')?;
+        // Like the `host:port` branch below, anything after the bracket
+        // must be empty or a numeric port: `[::1]garbage` is malformed and
+        // fails the whole chain closed (falls back to the peer) instead of
+        // parsing as the bracketed address.
+        let tail_ok = tail.is_empty()
+            || tail
+                .strip_prefix(':')
+                .is_some_and(|port| !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()));
+        if !tail_ok {
+            return None;
+        }
         return ip.parse().ok();
     }
     let (ip, port) = entry.rsplit_once(':')?;
@@ -355,6 +366,18 @@ mod tests {
         assert_eq!(
             client_ip(peer, Some("203.0.113.9, garbage"), &trusted),
             peer
+        );
+        // Garbage after a bracketed address is malformed too, like a
+        // non-numeric `host:port` suffix.
+        assert_eq!(
+            client_ip(peer, Some("[203.0.113.9]garbage"), &trusted),
+            peer
+        );
+        assert_eq!(client_ip(peer, Some("[::1]x"), &trusted), peer);
+        // Bare brackets and a numeric bracketed port stay accepted.
+        assert_eq!(
+            client_ip(peer, Some("[203.0.113.9]"), &trusted),
+            "203.0.113.9".parse::<IpAddr>().unwrap()
         );
         // An all-trusted chain names no client: fall back to the peer.
         assert_eq!(
