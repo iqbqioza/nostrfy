@@ -1514,11 +1514,14 @@ fn ensure_port_available(cfg: &Config) -> Result<()> {
     for addr in addrs {
         resolved = true;
         match std::net::TcpListener::bind(addr) {
-            // The port is free: the listener is closed immediately so the
-            // daemon child can bind it.
+            // The port is free on this address: close immediately so the
+            // daemon child can bind it, but keep checking the rest — a
+            // hostname resolving to several addresses (e.g. `localhost`
+            // as v4+v6) must be free on all of them, or the child dies on
+            // the taken one while the parent proceeds to the readiness
+            // probe.
             Ok(listener) => {
                 drop(listener);
-                return Ok(());
             }
             Err(e) => last_error = Some(e),
         }
@@ -1528,6 +1531,9 @@ fn ensure_port_available(cfg: &Config) -> Result<()> {
             "cannot resolve {}: no address",
             cfg.server.host
         )));
+    }
+    if last_error.is_none() {
+        return Ok(());
     }
     Err(config_err(format!(
         "cannot bind to {}:{}: {} (is another process already using the port?)",
