@@ -1633,10 +1633,7 @@ impl Config {
             // exempt so a local MinIO can still be used for testing.
             if b.storage == "s3" {
                 let endpoint = b.s3_endpoint.trim().to_ascii_lowercase();
-                let loopback = endpoint.starts_with("http://127.0.0.1")
-                    || endpoint.starts_with("http://localhost")
-                    || endpoint.starts_with("http://[::1]");
-                if !endpoint.starts_with("https://") && !loopback {
+                if !endpoint.starts_with("https://") && !is_loopback_http_endpoint(&endpoint) {
                     return Err(config_err(format!(
                         "blossom.s3_endpoint must use https:// (plain http is only allowed \
                          for loopback hosts); got {:?}",
@@ -1647,6 +1644,34 @@ impl Config {
         }
         Ok(())
     }
+}
+
+/// Whether an S3 endpoint URL is plain HTTP to a loopback host (the only
+/// case where SigV4 credentials may travel unencrypted): the host must
+/// match exactly, so a prefix match like `http://127.0.0.1.evil.com`
+/// is rejected — otherwise the secret would be sent in cleartext
+/// off-host. The input is expected trimmed and lowercased already.
+fn is_loopback_http_endpoint(endpoint: &str) -> bool {
+    let Some(rest) = endpoint.strip_prefix("http://") else {
+        return false;
+    };
+    // The authority ends at the first path/query/fragment delimiter.
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    // Strip an optional `:port` (IPv6 literals keep their brackets here).
+    // Anything else after the bracket is malformed: fail closed instead
+    // of treating a broken authority as loopback.
+    let host = if let Some(rest) = authority.strip_prefix('[') {
+        let Some((host, tail)) = rest.split_once(']') else {
+            return false;
+        };
+        if !tail.is_empty() && !tail.starts_with(':') {
+            return false;
+        }
+        host
+    } else {
+        authority.split(':').next().unwrap_or(authority)
+    };
+    matches!(host, "127.0.0.1" | "localhost" | "::1")
 }
 
 /// Whether a bare hostname contains a `:` outside IPv6 brackets (i.e. a
@@ -4320,6 +4345,21 @@ max_log_files = 2
             s3cfg("http://localhost:9000").validate().is_ok(),
             "localhost stays usable for a local MinIO"
         );
+        assert!(
+            s3cfg("http://[::1]:9000").validate().is_ok(),
+            "bracketed loopback stays usable for a local MinIO"
+        );
+        for evil in [
+            "http://127.0.0.1.evil.com",
+            "http://localhost.evil.com/x",
+            "http://[::1]evil",
+            "http://[::1",
+        ] {
+            assert!(
+                s3cfg(evil).validate().is_err(),
+                "a loopback-prefixed off-host endpoint must be rejected: {evil}"
+            );
+        }
     }
 
     #[test]

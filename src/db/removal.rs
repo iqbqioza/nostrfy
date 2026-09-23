@@ -7,10 +7,11 @@ use super::db_error;
 #[cfg(test)]
 use super::store::take_chunk_fault;
 use super::store::{
-    CREATED_LEN, GIFT_WRAP_INDEX, ID_LEN, Store, created_key, decode_pending_purge,
-    decode_purged_group_marker, delegated_by, deleted_address_key, dtag_key_safe,
-    encode_pending_deletion, encode_pending_purge, encode_purged_group_marker, is_group_state_kind,
-    pending_deletion_key, pubkey_key, purged_group_key, replaceable_key, tag_key,
+    CREATED_LEN, GIFT_WRAP_INDEX, ID_LEN, Store, TAG_INDEX_VALUE_MAX, created_key,
+    decode_pending_purge, decode_purged_group_marker, delegated_by, deleted_address_key,
+    dtag_key_safe, encode_pending_deletion, encode_pending_purge, encode_purged_group_marker,
+    is_group_state_kind, pending_deletion_key, pubkey_key, purged_group_key, replaceable_key,
+    tag_key,
 };
 use crate::error::Result;
 use crate::event::Event;
@@ -811,6 +812,14 @@ impl Store {
             ),
             effective_until,
         );
+        // Ids beyond the index key limit are stored but never tag-indexed
+        // (the write path skips over-long keys instead of aborting the
+        // batch): the tag-index range above cannot see them, so the walk
+        // falls back to a bounded time-range scan with an in-memory `h`
+        // match, mirroring the query engine's fallback for the same ids.
+        let overlong = gid.len() > TAG_INDEX_VALUE_MAX;
+        let created_start = created_key(0, &[0u8; ID_LEN]);
+        let created_end = created_key(effective_until, &[0xffu8; ID_LEN]);
         let mut last_key: Option<Vec<u8>> = None;
         let mut removed = 0usize;
         let mut max_created = 0u64;
@@ -839,15 +848,27 @@ impl Store {
             // unbounded, and one transaction across the whole purge pinned
             // the writer while a MapFull aborted everything.
             let mut wtxn = self.env.write_txn()?;
-            let lower = match &last_key {
-                Some(k) => std::ops::Bound::Excluded(k.as_slice()),
-                None => std::ops::Bound::Included(start.as_slice()),
+            let entries = if overlong {
+                let lower = match &last_key {
+                    Some(k) => std::ops::Bound::Excluded(k.as_slice()),
+                    None => std::ops::Bound::Included(created_start.as_slice()),
+                };
+                removal_chunk(
+                    self.by_created,
+                    &wtxn,
+                    (lower, std::ops::Bound::Included(created_end.as_slice())),
+                )?
+            } else {
+                let lower = match &last_key {
+                    Some(k) => std::ops::Bound::Excluded(k.as_slice()),
+                    None => std::ops::Bound::Included(start.as_slice()),
+                };
+                removal_chunk(
+                    self.by_tag,
+                    &wtxn,
+                    (lower, std::ops::Bound::Excluded(end.as_slice())),
+                )?
             };
-            let entries = removal_chunk(
-                self.by_tag,
-                &wtxn,
-                (lower, std::ops::Bound::Excluded(end.as_slice())),
-            )?;
             if entries.is_empty() {
                 break;
             }
@@ -859,7 +880,25 @@ impl Store {
                 // The removed event's timestamp raises the cut: without it
                 // a same-second or future-dated event would be removed by
                 // this purge and then accepted again on replay.
-                if let Ok(event) = serde_json::from_slice::<Event>(raw) {
+                if overlong {
+                    // Only `h`-tagged events of this group may go: the
+                    // time range is unscoped, so match in memory (an event
+                    // that fails to parse cannot be classified and stays).
+                    let Ok(event) = serde_json::from_slice::<Event>(raw) else {
+                        continue;
+                    };
+                    if !event
+                        .tags
+                        .iter()
+                        .any(|t| t.len() >= 2 && t[0] == "h" && t[1].as_str() == gid)
+                    {
+                        continue;
+                    }
+                    max_created = max_created.max(event.created_at);
+                    if event.kind == crate::nips::nip29::CREATE_GROUP && id.len() == ID_LEN {
+                        create_id = Some(id.as_slice().try_into().expect("checked length"));
+                    }
+                } else if let Ok(event) = serde_json::from_slice::<Event>(raw) {
                     max_created = max_created.max(event.created_at);
                     if event.kind == crate::nips::nip29::CREATE_GROUP && id.len() == ID_LEN {
                         create_id = Some(id.as_slice().try_into().expect("checked length"));
