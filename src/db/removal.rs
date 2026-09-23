@@ -208,6 +208,14 @@ impl Store {
         );
         let mut last_key: Option<Vec<u8>> = None;
         loop {
+            if self.cancelled() {
+                // A SIGTERM mid-walk stops at the chunk boundary like every
+                // other removal walk: the vanish caller keeps its pending
+                // record and resumes at the next startup (fail-closed).
+                return Err(anyhow::anyhow!(
+                    "gift-wrap removal cancelled during shutdown"
+                ));
+            }
             // A fresh write transaction per chunk: one pubkey's wrap index
             // can hold an unbounded number of entries, and a single
             // transaction across the whole walk pinned the writer (a

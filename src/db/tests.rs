@@ -6579,6 +6579,66 @@ fn shutdown_cancellation_aborts_removals_and_leaves_pending() {
 }
 
 #[test]
+fn shutdown_cancellation_aborts_gift_wrap_purge() {
+    // remove_gift_wraps_for is a chunked walk like the other removals, so
+    // a SIGTERM mid-walk must stop it at the chunk boundary instead of
+    // walking to completion while the process is shutting down.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let recipient = "aa".repeat(32);
+        let recipient_bytes: [u8; 32] = hex::decode(&recipient).unwrap().try_into().unwrap();
+        for (i, author) in ["bb".repeat(32), "cc".repeat(32), "dd".repeat(32)]
+            .iter()
+            .enumerate()
+        {
+            let wrap = authored_event(
+                1059,
+                author,
+                &format!("wrap-{i}"),
+                now,
+                vec![vec!["p".into(), recipient.clone()]],
+            );
+            assert_eq!(db.put(wrap, now).await, PutOutcome::Stored);
+        }
+        let wraps =
+            || -> Filter { serde_json::from_value(serde_json::json!({"kinds": [1059]})).unwrap() };
+        assert_eq!(db.query(vec![wraps()], 10, now).await.0.len(), 3);
+        db.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            db.delete_gift_wraps_to_checked(recipient_bytes, u64::MAX)
+                .await,
+            None,
+            "a cancelled gift-wrap purge must report failure, not walk on"
+        );
+        assert_eq!(
+            db.query(vec![wraps()], 10, now).await.0.len(),
+            3,
+            "the cancelled purge must not remove anything"
+        );
+        db.cancel.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            db.delete_gift_wraps_to_checked(recipient_bytes, u64::MAX)
+                .await,
+            Some(3),
+            "the retry after the cancellation removes the wraps"
+        );
+        assert!(db.query(vec![wraps()], 10, now).await.0.is_empty());
+    });
+    db.shutdown();
+}
+
+#[test]
 fn save_access_and_pubkeys_is_atomic() {
     // The access blob and the relay pubkey lists must move together: a
     // failed commit leaves *both* keys at their previous values.
