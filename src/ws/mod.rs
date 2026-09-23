@@ -4132,6 +4132,44 @@ mod tests {
     }
 
     #[test]
+    fn read_verdict_denies_mixed_banned_and_clean_keys() {
+        // A banned key holder must not regain reads by pairing the banned
+        // key with a clean one: any blocked authenticated key denies the
+        // connection ("never serve these pubkeys"), since the per-event
+        // visibility checks union over every authenticated key.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_relay_with("").await;
+            let mut conn = build_conn_on(relay.clone()).await;
+            let banned = "aa".repeat(32);
+            let clean = "bb".repeat(32);
+            conn.authed_pubkeys.push(banned.clone());
+            conn.authed_pubkeys.push(clean.clone());
+            conn.relay
+                .access
+                .write()
+                .await
+                .blocked_pubkeys
+                .push((banned.clone(), String::new()));
+            assert!(
+                !conn.access_allows_read().await,
+                "any blocked key must deny reads"
+            );
+            conn.authed_pubkeys.retain(|pk| pk != &banned);
+            assert!(
+                conn.access_allows_read().await,
+                "the clean key alone still reads"
+            );
+            conn.authed_pubkeys.clear();
+            assert!(
+                conn.access_allows_read().await,
+                "anonymous connections still read"
+            );
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
     fn max_message_size_refreshes_on_reload() {
         // `limits.max_ws_message_bytes` is refreshed with the other cached
         // budgets: an operator lowering it to shed oversized frames must
