@@ -79,13 +79,20 @@ pub struct TagMatchPlan {
 
 impl TagMatchPlan {
     /// Builds the plan from a filter's tag attribute map. Unknown
-    /// (non-`#`) keys are ignored, like [`Filter::matches`].
+    /// (non-`#`) keys are ignored, like [`Filter::matches`]. A `#` key with
+    /// an empty tag name matches nothing on every path: the live index
+    /// never wakes empty-name subscriptions (it only looks up non-empty
+    /// tag names), so history must not find them either.
     fn new(tags: &serde_json::Map<String, Value>) -> Self {
         let mut plan = TagMatchPlan::default();
         for (name, value) in tags {
             let Some(tag_name) = name.strip_prefix('#') else {
                 continue;
             };
+            if tag_name.is_empty() {
+                plan.impossible = true;
+                return plan;
+            }
             let values: std::collections::HashSet<String> =
                 tag_values(value).map(str::to_string).collect();
             if values.is_empty() {
@@ -579,6 +586,19 @@ mod tests {
         assert!(f.matches(&e));
         let f: Filter = serde_json::from_value(serde_json::json!({"#t": ["go"]})).unwrap();
         assert!(!f.matches(&e));
+    }
+
+    #[test]
+    fn empty_tag_name_matches_nothing() {
+        // A `#` key with an empty tag name must match nothing on every
+        // path: the live index never wakes such subscriptions, so history
+        // must not find them either (previously the full-scan fallback
+        // returned `["","x"]` events from history while live missed them).
+        let e = ev(1, vec![vec!["".into(), "x".into()]]);
+        let f: Filter = serde_json::from_value(serde_json::json!({"#": ["x"]})).unwrap();
+        assert!(!f.matches(&e));
+        let plain = ev(1, vec![vec!["t".into(), "x".into()]]);
+        assert!(!f.matches(&plain));
     }
 
     /// An [`EventFields`] wrapper that counts how often the event's tags
