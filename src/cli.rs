@@ -1455,20 +1455,63 @@ struct PidFileGuard {
 
 impl PidFileGuard {
     fn create(path: &Path) -> Result<Self> {
-        if let Some(pid) = running_pid(path) {
-            return Err(config_err(format!(
-                "already running (pid {pid}); use 'nostrfy stop' or 'nostrfy restart'"
-            )));
-        }
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
         {
             std::fs::create_dir_all(parent)
                 .map_err(|e| config_err(format!("cannot create {}: {e}", parent.display())))?;
         }
-        // A stale pid file (a dead pid) is overwritten; the live-pid check
-        // above and this write are not atomic, but the caller has already
-        // validated the config and no live instance exists.
+        // Atomically claim the pid file so two concurrent `start`s cannot
+        // both pass the live check and split-brain the database: `create_new`
+        // fails when the file already exists. A stale file (dead pid) is
+        // removed and retried once; a live pid errors out.
+        for _ in 0..2 {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+            {
+                Ok(mut file) => {
+                    use std::io::Write;
+                    if let Err(e) = writeln!(file, "{}", std::process::id())
+                    {
+                        return Err(config_err(format!(
+                            "cannot write the pid file {}: {e}",
+                            path.display()
+                        )));
+                    }
+                    return Ok(PidFileGuard {
+                        path: path.to_path_buf(),
+                    });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if let Some(pid) = running_pid(path) {
+                        return Err(config_err(format!(
+                            "already running (pid {pid}); use 'nostrfy stop' or 'nostrfy restart'"
+                        )));
+                    }
+                    // Stale (or unreadable) pid file: remove and retry once.
+                    // A concurrent starter winning the race leaves a live
+                    // pid behind, which the retry then reports above.
+                    let _ = std::fs::remove_file(path);
+                    continue;
+                }
+                Err(e) => {
+                    return Err(config_err(format!(
+                        "cannot write the pid file {}: {e}",
+                        path.display()
+                    )));
+                }
+            }
+        }
+        // The retry found another stale file again (or lost a tight race):
+        // fall back to a plain overwrite of the dead pid file.
+        if running_pid(path).is_some() {
+            let pid = running_pid(path).unwrap_or(0);
+            return Err(config_err(format!(
+                "already running (pid {pid}); use 'nostrfy stop' or 'nostrfy restart'"
+            )));
+        }
         std::fs::write(path, format!("{}\n", std::process::id())).map_err(|e| {
             config_err(format!("cannot write the pid file {}: {e}", path.display()))
         })?;
