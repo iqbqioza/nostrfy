@@ -1179,9 +1179,10 @@ impl Store {
 
     /// Removes every stored event whose NIP-40 expiration has arrived, then
     /// reaps `first_seen` entries older than `first_seen_min_age` seconds
-    /// (0 disables the reap): once a pubkey is older than the new-pubkey
-    /// gate, the entry can never reject it again, so keeping it only grows
-    /// the table forever.
+    /// (0 disables the reap): reaping bounds the table, at the cost of
+    /// re-arming the new-pubkey gate for a returning idle pubkey (its next
+    /// event passes once as "new" and re-establishes the clock, so an event
+    /// immediately after may be gated for `min_age` seconds).
     ///
     /// The returned report carries the partial counters on a failed chunk
     /// (the backlog is unbounded, so a MapFull mid-pass must not hide the
