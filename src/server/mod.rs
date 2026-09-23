@@ -2408,7 +2408,13 @@ async fn apply_reloaded_config(
     // reload must never be all-or-nothing, or an
     // unrelated edit would silently disable a
     // CLI-visible change.
-    db.set_expiry_enabled(new_config.nip_enabled(40));
+    //
+    // NIP toggles are restart-required (their running values are kept
+    // below): the database flag must follow the running config, not the
+    // reloaded file's, or toggling NIP-40 via SIGHUP would half-apply —
+    // the database enforcing the new value while the swapped config (and
+    // every connection cache refreshed from it) keeps the old one.
+    db.set_expiry_enabled(old.nip_enabled(40));
     api_limit.set_max(new_config.limits.max_api_concurrent);
     db.set_max_api_pending(new_config.limits.max_api_queue_msgs);
     // The kind/IP access lists are runtime-managed via NIP-86
@@ -2980,6 +2986,41 @@ mod tests {
             "the reloaded ceiling of 1 must be enforced"
         );
         drop(first);
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn reload_keeps_nip40_expiry_with_running_value() {
+        // NIP toggles are restart-required: a SIGHUP toggling NIP-40 must
+        // not half-apply with the database enforcing the file's value
+        // while the swapped config (and the connection caches refreshed
+        // from it) keeps the running one.
+        let relay = blossom_relay().await;
+        let now = unix_now();
+        assert!(relay.config.read().await.nip_enabled(40));
+        let expired = stored_event(
+            1,
+            &"aa".repeat(32),
+            vec![vec!["expiration".into(), (now - 10).to_string()]],
+            now - 20,
+        );
+        assert!(matches!(
+            relay.db.put(expired.clone(), now).await,
+            crate::db::PutOutcome::Expired
+        ));
+        let old = relay.config.read().await.clone();
+        let mut new_config = old.clone();
+        new_config.relay.disabled_nips = vec![40];
+        assert!(!new_config.nip_enabled(40));
+        apply_reloaded_config(&old, new_config, &relay, &relay.db, &relay.api_limit).await;
+        assert!(
+            relay.config.read().await.nip_enabled(40),
+            "the NIP toggle keeps its running value"
+        );
+        assert!(matches!(
+            relay.db.put(expired, now).await,
+            crate::db::PutOutcome::Expired
+        ));
         relay.db.shutdown();
     }
 
