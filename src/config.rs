@@ -146,7 +146,8 @@ pub struct RelayConfig {
     /// minute (a sliding 60-second window). 0 disables the check.
     pub max_events_per_min_per_pubkey: u64,
     /// Cap on the in-memory NIP-29 group store (active groups plus
-    /// deleted-group markers). 0 = unlimited.
+    /// deleted-group markers). Must be at least 1 (unbounded stores would
+    /// let group-id churn grow memory without limit).
     pub max_groups: usize,
     /// When true, connections must complete a NIP-42 AUTH exchange before
     /// they may publish or subscribe.
