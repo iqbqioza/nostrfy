@@ -2357,9 +2357,12 @@ impl Store {
         // NIP-62: "Relays MUST ensure that the deleted events cannot be
         // re-broadcasted into the relay." Gift wraps addressed to a vanished
         // pubkey are signed by random keys, so the author checks above cannot
-        // catch them: reject any kind:1059 whose `p` tag names a vanished
-        // recipient.
-        if event.kind == crate::nips::nip62::GIFT_WRAP_KIND {
+        // catch them: reject any kind:1059 or kind:21059 whose `p` tag names
+        // a vanished recipient (21059 is ephemeral and never stored, but it
+        // would otherwise still be delivered live).
+        if event.kind == crate::nips::nip62::GIFT_WRAP_KIND
+            || event.kind == crate::nips::nip62::EPHEMERAL_GIFT_WRAP_KIND
+        {
             for tag in &event.tags {
                 if tag.len() >= 2
                     && tag[0] == "p"
