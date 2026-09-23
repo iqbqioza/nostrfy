@@ -1171,7 +1171,14 @@ impl GroupStore {
                         ));
                     }
                 }
-                if emit {
+                if emit && self.groups.contains_key(gid) {
+                    // Emit only for a live group: a create blocked by the
+                    // capacity cap (two concurrent creates racing past the
+                    // read-side validation, like the 9000/9001 write-lock
+                    // re-checks that drop instead) must not store or
+                    // broadcast bare metadata for a group that was never
+                    // created. A duplicate create for an existing group
+                    // still republishes its metadata below.
                     out.push(build_meta_event(
                         gid,
                         self.groups.get(gid),
