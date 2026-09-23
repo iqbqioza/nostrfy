@@ -1140,10 +1140,12 @@ impl Store {
 
         // NIP-59 gift wraps addressed to the vanished pubkey: the reserved
         // recipient index (keyed by the decoded pubkey) finds every hex case
-        // variant with one narrow range. A failure here must not write the
+        // variant with one narrow range. Bounded by the request like the
+        // authored history above: a wrap created after the request is not
+        // part of the vanished history. A failure here must not write the
         // marker below: the re-delivered request (or the startup resume)
         // has to finish the wraps.
-        self.remove_gift_wraps_for(pubkey, u64::MAX, &mut removed)?;
+        self.remove_gift_wraps_for(pubkey, until_created, &mut removed)?;
 
         // The completed marker and the pending clear commit together: a
         // crash between them would otherwise leave a pending record whose

@@ -1134,7 +1134,7 @@ async fn apply_group_purge(db: &DbClient, event: &Event, stats: &mut Stats) -> R
         .group_purge_until(gid.to_string(), event.created_at, event.created_at)
         .await;
     stats.group_purges += 1;
-    stats.group_purge_removed += removed as u64;
+    stats.group_purge_removed += removed.unwrap_or(0) as u64;
     // The purge reports a failure as zero removed (indistinguishable from
     // "nothing to purge"), so completion is confirmed by the absence of any
     // stored event tagged with the group id up to the cut — including the
@@ -1160,7 +1160,10 @@ async fn apply_group_purge(db: &DbClient, event: &Event, stats: &mut Stats) -> R
             remaining.len()
         );
     }
-    log::info!("migrate-strfry: purged group {gid} ({removed} event(s))");
+    log::info!(
+        "migrate-strfry: purged group {gid} ({} event(s))",
+        removed.unwrap_or(0)
+    );
     Ok(())
 }
 

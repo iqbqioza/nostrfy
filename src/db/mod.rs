@@ -401,7 +401,9 @@ enum Msg {
         /// Upper bound (`created_at <= until`) of the walk; `u64::MAX` for
         /// the live unbounded purge.
         until: u64,
-        reply: oneshot::Sender<usize>,
+        /// `None` when the walk failed: callers confirm completion with an
+        /// independent query instead of treating zero as success.
+        reply: oneshot::Sender<Option<usize>>,
     },
     Vanish {
         pubkey: Vec<u8>,
@@ -1942,15 +1944,16 @@ impl DbClient {
     }
 
     /// NIP-29 `kind:9008`: purges every stored event tagged with the deleted
-    /// group id.
-    pub async fn group_purge(&self, group: String, now: u64) -> usize {
+    /// group id. `None` when the walk failed: callers confirm completion
+    /// with an independent query instead of treating zero as success.
+    pub async fn group_purge(&self, group: String, now: u64) -> Option<usize> {
         self.group_purge_until(group, now, u64::MAX).await
     }
 
     /// [`Self::group_purge`] bounded to events with `created_at <= until`
     /// (the migration uses the `9008`'s own timestamp so a re-created
     /// group's later events survive).
-    pub async fn group_purge_until(&self, group: String, now: u64, until: u64) -> usize {
+    pub async fn group_purge_until(&self, group: String, now: u64, until: u64) -> Option<usize> {
         self.request_write(|reply| Msg::GroupPurge {
             group,
             now,

@@ -939,7 +939,7 @@ impl Harness {
                 let group = GROUP_IDS[self.rng.below(GROUP_IDS.len())].to_string();
                 let wanted = self.model.purge_group(&group, self.now);
                 let got = rt.block_on(self.db.group_purge(group, self.now));
-                assert_eq!(got, wanted, "{ctx}: NIP-29 group purge removed count");
+                assert_eq!(got, Some(wanted), "{ctx}: NIP-29 group purge removed count");
             }
             // NIP-40 periodic purge: expired events leave storage.
             _ => {

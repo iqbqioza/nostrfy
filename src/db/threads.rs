@@ -1198,10 +1198,10 @@ pub(crate) fn spawn(
                                     reply,
                                 } => {
                                     let n = match store.purge_group_until(&group, now, until) {
-                                        Ok(n) => n,
+                                        Ok(n) => Some(n),
                                         Err(e) => {
                                             db_error(&thread_errors, &e);
-                                            0
+                                            None
                                         }
                                     };
                                     let _ = reply.send(n);
@@ -1582,7 +1582,15 @@ pub(crate) fn spawn(
                                     }
                                     match wtxn.commit() {
                                         Ok(()) => {}
-                                        Err(e) => db_error(&thread_errors, &e.into()),
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e.into());
+                                            // The whole batch rolled back:
+                                            // report every entry as
+                                            // unrecorded (too young) instead
+                                            // of the optimistically built
+                                            // results.
+                                            out = vec![(false, u64::MAX); out.len()];
+                                        }
                                     }
                                     let _ = reply.send(out);
                                 }
