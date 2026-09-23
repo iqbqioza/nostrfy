@@ -1509,12 +1509,16 @@ async fn list(
         },
         None => Some(100),
     };
-    let cursor = params.get("cursor").map(String::as_str);
+    // Normalized like the path pubkey above: stored hashes are lowercase
+    // and the LMDB lookup is case-sensitive, so an uppercase (but
+    // well-formed) cursor must paginate like its lowercase spelling
+    // instead of missing the lookup and yielding an empty page.
+    let cursor: Option<String> = params.get("cursor").map(|c| c.to_ascii_lowercase());
     // BUD-12: the cursor is the previous page's last sha256. Its upload
     // time positions the scan in the uploaded-order index; an unknown (but
     // well-formed) cursor yields an empty page — never the first page — so
     // a stale cursor cannot loop over duplicates forever.
-    let (after_uploaded, after_sha) = match cursor {
+    let (after_uploaded, after_sha) = match cursor.as_deref() {
         Some(sha) => match state.store.find(sha).await {
             Ok(Some(desc)) => {
                 // Owner-scoped cursor: `find` is global, so a cursor naming
@@ -3486,6 +3490,22 @@ mod tests {
                 "a paged blob must not repeat on the next page"
             );
         }
+        // An uppercase spelling of the same cursor must paginate
+        // identically (stored hashes are lowercase; the lookup is
+        // case-sensitive).
+        let upper = list(
+            State(relay.clone()),
+            headers.clone(),
+            AxPath(pk.clone()),
+            query(Some("2"), Some(&cursor.to_ascii_uppercase())),
+        )
+        .await;
+        let upper = page(upper).await;
+        assert_eq!(
+            upper,
+            serde_json::Value::Array(second.to_vec()),
+            "an uppercase cursor must advance like its lowercase spelling"
+        );
         let resp = list(State(relay.clone()), headers, AxPath(pk), query(None, None)).await;
         let items = page(resp).await;
         assert!(
