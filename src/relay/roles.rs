@@ -325,10 +325,28 @@ impl super::Relay {
                 },
                 |roles| {
                     let removed = roles.remove_pubkey(&event.pubkey);
-                    (removed, removed || rebuild_pending)
+                    // Re-read inside the mutation (under the write lock),
+                    // not just from the pre-lock snapshot above: a rebuild
+                    // marked in between would otherwise be missed, and a
+                    // removal landing on the already-revoked empty store
+                    // would report "not a member" and never be buffered —
+                    // losing the leave while the rebuild resurrects the
+                    // member. Marking stores `dirty` before revoking under
+                    // the same write lock, so observing the revoked store
+                    // here implies observing the mark.
+                    let pending = self.roles_rebuild.dirty.load(Ordering::SeqCst)
+                        || self.roles_rebuild.running.load(Ordering::SeqCst);
+                    (removed, removed || pending)
                 },
             )
             .await;
+        // Re-read: the rebuild may have started between the pre-lock
+        // snapshot and the mutation, in which case the departure was
+        // buffered for replay and is announced below like the
+        // snapshot-pending case.
+        let rebuild_pending = rebuild_pending
+            || self.roles_rebuild.dirty.load(Ordering::SeqCst)
+            || self.roles_rebuild.running.load(Ordering::SeqCst);
         if removed {
             self.schedule_roles_persist();
             // A failed republish would let the rebuild resurrect the

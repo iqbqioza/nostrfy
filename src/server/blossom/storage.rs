@@ -1539,9 +1539,13 @@ impl S3Store {
                 }
                 // Blobs without a meta (metadata moved to LMDB): the size
                 // comes from the listing; mime falls back to octet-stream.
+                // Normalized like the local pass and the meta path: GET
+                // lowercases, so an uppercase legacy name must not migrate
+                // to an unreachable uppercase mapping (nor dodge the
+                // `via_meta` dedup below, which holds lowercase hashes).
                 if file.len() == 64 && hex::decode(file).is_ok() {
                     out.push((
-                        file.to_string(),
+                        file.to_ascii_lowercase(),
                         "application/octet-stream".to_string(),
                         size,
                         0,

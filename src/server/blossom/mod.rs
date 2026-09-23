@@ -915,6 +915,18 @@ async fn head_blob(
             format!("bytes {start}-{end}/{size}").parse().unwrap(),
         );
     }
+    if ranged && honored {
+        // A 206 must not be cached as if it were the full blob (mirrors
+        // GET): drop the immutable cache header and mark the Range
+        // variance (the same URL can serve different bytes).
+        response
+            .headers_mut()
+            .remove(axum::http::header::CACHE_CONTROL);
+        response.headers_mut().insert(
+            axum::http::header::VARY,
+            axum::http::HeaderValue::from_static("Range"),
+        );
+    }
     harden_blob_response(&mut response, &desc.mime);
     response
 }
@@ -3152,6 +3164,23 @@ mod tests {
             resp.headers()[axum::http::header::CONTENT_RANGE],
             format!("bytes 100-199/{}", data.len())
         );
+        // A 206 must not be cached as if it were the full blob (mirrors
+        // GET): no immutable cache header, and a Range variance marker.
+        assert!(
+            resp.headers()
+                .get(axum::http::header::CACHE_CONTROL)
+                .is_none(),
+            "a HEAD 206 must not carry the full-blob immutable cache header"
+        );
+        assert_eq!(resp.headers()[axum::http::header::VARY], "Range");
+        // A full HEAD keeps the immutable cache header and needs no Vary.
+        let resp = head_blob(State(relay.clone()), HeaderMap::new(), AxPath(sha.clone())).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()[axum::http::header::CACHE_CONTROL],
+            "public, max-age=31536000, immutable"
+        );
+        assert!(resp.headers().get(axum::http::header::VARY).is_none());
         // An unsatisfiable range is a 416 with `Content-Range: bytes */`.
         let mut headers = HeaderMap::new();
         headers.insert(axum::http::header::RANGE, "bytes=999999-".parse().unwrap());
