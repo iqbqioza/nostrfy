@@ -875,8 +875,7 @@ impl GroupStore {
                         // validation and apply makes the stale read real).
                         let over_global = !ignore_capacity
                             && self.max_total_members > 0
-                            && self.total_members.saturating_add(added)
-                                >= self.max_total_members
+                            && self.total_members.saturating_add(added) >= self.max_total_members
                             && !group.is_member(&tag[1]);
                         if over_global {
                             continue;

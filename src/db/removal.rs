@@ -423,9 +423,7 @@ impl Store {
         // ever does, but still clear the pending record below.
         let group_scoped_addrs = group.is_some() && !addresses.is_empty();
         if group_scoped_addrs {
-            log::warn!(
-                "ignoring NIP-09 a-tag targets of a group-scoped deletion request"
-            );
+            log::warn!("ignoring NIP-09 a-tag targets of a group-scoped deletion request");
         }
         for address in addresses {
             if group_scoped_addrs {
@@ -557,11 +555,7 @@ impl Store {
                         // versions stay blocked. Same cut as the post-walk
                         // merge, which stays idempotent.
                         if !delegated_tombstoned {
-                            self.merge_address_tombstone_in(
-                                &mut wtxn,
-                                &akey,
-                                request_created,
-                            )?;
+                            self.merge_address_tombstone_in(&mut wtxn, &akey, request_created)?;
                             delegated_tombstoned = true;
                         }
                     }

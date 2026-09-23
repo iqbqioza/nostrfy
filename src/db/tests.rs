@@ -4059,8 +4059,7 @@ fn query_directed_ascending_ids() {
             assert_eq!(db.put(e.clone(), now).await, PutOutcome::Stored);
         }
         let ids = vec![e3.id.clone(), e1.id.clone()];
-        let f: Filter =
-            serde_json::from_value(serde_json::json!({"ids": ids})).unwrap();
+        let f: Filter = serde_json::from_value(serde_json::json!({"ids": ids})).unwrap();
         let (desc, _) = db.query_directed(vec![f.clone()], 1, now, false, 0).await;
         assert_eq!(desc.len(), 1);
         assert_eq!(desc[0].id, e3.id, "newest-first keeps the newest id");
@@ -7960,13 +7959,9 @@ fn delegated_address_tombstone_survives_a_mid_walk_crash() {
         let (removed, _) = db
             .apply_deletion_checked(vec![], vec![addr.clone()], Some(delegator.clone()), now)
             .await;
-        assert!(
-            removed.is_none(),
-            "the mid-walk crash must report failure"
-        );
+        assert!(removed.is_none(), "the mid-walk crash must report failure");
         // The version is gone.
-        let f: Filter =
-            serde_json::from_value(serde_json::json!({"kinds": [30001]})).unwrap();
+        let f: Filter = serde_json::from_value(serde_json::json!({"kinds": [30001]})).unwrap();
         assert!(db.query(vec![f], 10, now).await.0.is_empty());
         // A never-stored old version of the same address (different id, no
         // per-id tombstone) must still be blocked by the address guard —
@@ -7993,10 +7988,7 @@ fn delegated_address_tombstone_survives_a_mid_walk_crash() {
             .await;
         assert_eq!(removed, Some(0));
         assert!(
-            matches!(
-                db.put(older, now).await,
-                PutOutcome::PreviouslyDeleted
-            ),
+            matches!(db.put(older, now).await, PutOutcome::PreviouslyDeleted),
             "the resumed deletion must keep guarding the address"
         );
     });

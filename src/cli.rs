@@ -1473,8 +1473,7 @@ impl PidFileGuard {
             {
                 Ok(mut file) => {
                     use std::io::Write;
-                    if let Err(e) = writeln!(file, "{}", std::process::id())
-                    {
+                    if let Err(e) = writeln!(file, "{}", std::process::id()) {
                         return Err(config_err(format!(
                             "cannot write the pid file {}: {e}",
                             path.display()

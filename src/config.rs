@@ -734,50 +734,91 @@ fn apply_legacy_aliases(raw: &str, cfg: &mut Config) -> Vec<String> {
                 cfg.relay.send_auth_challenge =
                     alias_bool(v, "server.send_auth_challenge", &mut warnings)
             }
-            ("limits", "require_pow") => cfg.relay.require_pow = alias_int::<u8>(v, &format!("[{old_section}].{old_key}")),
+            ("limits", "require_pow") => {
+                cfg.relay.require_pow = alias_int::<u8>(v, &format!("[{old_section}].{old_key}"))
+            }
             ("limits", "new_pubkey_min_age_secs") => {
-                cfg.relay.new_pubkey_min_age_secs = alias_int::<u64>(v, &format!("[{old_section}].{old_key}"))
+                cfg.relay.new_pubkey_min_age_secs =
+                    alias_int::<u64>(v, &format!("[{old_section}].{old_key}"))
             }
             ("limits", "max_events_per_min_per_pubkey") => {
-                cfg.relay.max_events_per_min_per_pubkey = alias_int::<u64>(v, &format!("[{old_section}].{old_key}"))
+                cfg.relay.max_events_per_min_per_pubkey =
+                    alias_int::<u64>(v, &format!("[{old_section}].{old_key}"))
             }
-            ("limits", "max_groups") => cfg.relay.max_groups = alias_int::<usize>(v, &format!("[{old_section}].{old_key}")),
+            ("limits", "max_groups") => {
+                cfg.relay.max_groups = alias_int::<usize>(v, &format!("[{old_section}].{old_key}"))
+            }
             ("limits", "max_ws_message_size") => {
-                cfg.limits.max_ws_message_bytes = alias_int::<usize>(v, &format!("[{old_section}].{old_key}"))
+                cfg.limits.max_ws_message_bytes =
+                    alias_int::<usize>(v, &format!("[{old_section}].{old_key}"))
             }
-            ("limits", "count_limit") => cfg.limits.max_count = alias_int::<usize>(v, &format!("[{old_section}].{old_key}")),
-            ("limits", "neg_max_items") => cfg.limits.max_neg_items = alias_int::<usize>(v, &format!("[{old_section}].{old_key}")),
+            ("limits", "count_limit") => {
+                cfg.limits.max_count = alias_int::<usize>(v, &format!("[{old_section}].{old_key}"))
+            }
+            ("limits", "neg_max_items") => {
+                cfg.limits.max_neg_items =
+                    alias_int::<usize>(v, &format!("[{old_section}].{old_key}"))
+            }
             ("limits", "max_created_at_future") => {
-                cfg.limits.max_created_at_future_secs = alias_int::<u64>(v, &format!("[{old_section}].{old_key}"))
+                cfg.limits.max_created_at_future_secs =
+                    alias_int::<u64>(v, &format!("[{old_section}].{old_key}"))
             }
             ("limits", "max_conn_per_sec_per_ip") => {
-                cfg.limits.max_connections_per_sec_per_ip = alias_int::<u64>(v, &format!("[{old_section}].{old_key}"))
+                cfg.limits.max_connections_per_sec_per_ip =
+                    alias_int::<u64>(v, &format!("[{old_section}].{old_key}"))
             }
             ("limits", "api_max_concurrent") => {
-                cfg.limits.max_api_concurrent = alias_int::<usize>(v, &format!("[{old_section}].{old_key}"))
+                cfg.limits.max_api_concurrent =
+                    alias_int::<usize>(v, &format!("[{old_section}].{old_key}"))
             }
-            ("limits", "api_max_limit") => cfg.limits.max_api_limit = alias_int::<usize>(v, &format!("[{old_section}].{old_key}")),
-            ("limits", "api_max_offset") => cfg.limits.max_api_offset = alias_int::<usize>(v, &format!("[{old_section}].{old_key}")),
+            ("limits", "api_max_limit") => {
+                cfg.limits.max_api_limit =
+                    alias_int::<usize>(v, &format!("[{old_section}].{old_key}"))
+            }
+            ("limits", "api_max_offset") => {
+                cfg.limits.max_api_offset =
+                    alias_int::<usize>(v, &format!("[{old_section}].{old_key}"))
+            }
             ("limits", "api_max_search_bytes") => {
-                cfg.limits.max_api_search_bytes = alias_int::<usize>(v, &format!("[{old_section}].{old_key}"))
+                cfg.limits.max_api_search_bytes =
+                    alias_int::<usize>(v, &format!("[{old_section}].{old_key}"))
             }
             ("limits", "max_admin_body_bytes") => {
-                cfg.rpc.max_admin_body_bytes = alias_int::<usize>(v, &format!("[{old_section}].{old_key}"))
+                cfg.rpc.max_admin_body_bytes =
+                    alias_int::<usize>(v, &format!("[{old_section}].{old_key}"))
             }
             ("limits", "max_indexed_words") => {
-                cfg.database.max_indexed_words = alias_int::<usize>(v, &format!("[{old_section}].{old_key}"))
+                cfg.database.max_indexed_words =
+                    alias_int::<usize>(v, &format!("[{old_section}].{old_key}"))
             }
-            ("limits", "buffer_size") => cfg.database.db_buffer_size = alias_int::<usize>(v, &format!("[{old_section}].{old_key}")),
+            ("limits", "buffer_size") => {
+                cfg.database.db_buffer_size =
+                    alias_int::<usize>(v, &format!("[{old_section}].{old_key}"))
+            }
             ("limits", "db_request_timeout_secs") => {
-                cfg.database.db_request_timeout_secs = alias_int::<u64>(v, &format!("[{old_section}].{old_key}"))
+                cfg.database.db_request_timeout_secs =
+                    alias_int::<u64>(v, &format!("[{old_section}].{old_key}"))
             }
-            ("limits", "db_queue_msgs") => cfg.database.max_db_queue_msgs = alias_int::<usize>(v, &format!("[{old_section}].{old_key}")),
+            ("limits", "db_queue_msgs") => {
+                cfg.database.max_db_queue_msgs =
+                    alias_int::<usize>(v, &format!("[{old_section}].{old_key}"))
+            }
             ("limits", "db_queue_events") => {
-                cfg.database.max_db_queue_events = alias_int::<usize>(v, &format!("[{old_section}].{old_key}"))
+                cfg.database.max_db_queue_events =
+                    alias_int::<usize>(v, &format!("[{old_section}].{old_key}"))
             }
-            ("database", "map_max_size") => cfg.database.max_map_size = alias_int::<usize>(v, &format!("[{old_section}].{old_key}")),
-            ("daemon", "log_max_size_bytes") => cfg.daemon.max_log_size_bytes = alias_int::<u64>(v, &format!("[{old_section}].{old_key}")),
-            ("daemon", "log_max_files") => cfg.daemon.max_log_files = alias_int::<u32>(v, &format!("[{old_section}].{old_key}")),
+            ("database", "map_max_size") => {
+                cfg.database.max_map_size =
+                    alias_int::<usize>(v, &format!("[{old_section}].{old_key}"))
+            }
+            ("daemon", "log_max_size_bytes") => {
+                cfg.daemon.max_log_size_bytes =
+                    alias_int::<u64>(v, &format!("[{old_section}].{old_key}"))
+            }
+            ("daemon", "log_max_files") => {
+                cfg.daemon.max_log_files =
+                    alias_int::<u32>(v, &format!("[{old_section}].{old_key}"))
+            }
             _ => {}
         }
     }

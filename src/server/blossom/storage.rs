@@ -2471,12 +2471,11 @@ mod tests {
         // The mapping is untouched: the loser did not become an owner, and
         // the full list is intact. No re-read classification happens, so a
         // storage fault can never be misreported as 409.
-        let meta = s
-            .db
-            .blossom_load_checked(&sha)
-            .await
-            .expect("the mapping exists")
-            .expect("the mapping exists");
+        let meta =
+            s.db.blossom_load_checked(&sha)
+                .await
+                .expect("the mapping exists")
+                .expect("the mapping exists");
         assert_eq!(meta.owners.len(), MAX_BLOB_OWNERS);
         assert!(!meta.owners.iter().any(|o| o == &pk(99)));
     }
