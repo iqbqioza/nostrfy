@@ -3042,44 +3042,52 @@ impl Relay {
         if targets.is_empty() {
             return touch;
         }
-        let mut kinds: Vec<u64> = (nip29::MOD_MIN..=nip29::MOD_MAX)
+        // The lookup is only a per-family existence check, so one event per
+        // family is enough: a single capped page over both families could
+        // fill up on one side (a deletion naming 64 group-state ids plus a
+        // role-state id) and miss the other store, leaving deleted role
+        // grants live (or vice versa).
+        let group_kinds: Vec<u64> = (nip29::MOD_MIN..=nip29::MOD_MAX)
             .chain([nip29::JOIN, nip29::LEAVE])
             .collect();
-        kinds.extend([
+        let role_kinds = vec![
             nip43::ROLE_DEFINITION,
             nip43::MEMBERSHIP_LIST,
             nip43::ADD_USER,
             nip43::REMOVE_USER,
             nip43::JOIN,
             nip43::LEAVE,
-        ]);
-        let filter = crate::filter::Filter {
-            ids: Some(targets),
-            kinds: Some(kinds),
-            ..Default::default()
-        };
-        // The lookup is only a relevance check, so a bounded page is enough:
-        // either store is marked stale if any of the targets is one of its
-        // state kinds.
-        match self
-            .db
-            .query_full_startup(vec![filter], 64, unix_now(), false)
-            .await
-        {
-            Some((events, _)) => {
-                for found in &events {
-                    let classified = classify(found.kind);
-                    touch.groups |= classified.groups;
-                    touch.roles |= classified.roles;
+        ];
+        for (kinds, is_group) in [(group_kinds, true), (role_kinds, false)] {
+            let filter = crate::filter::Filter {
+                ids: Some(targets.clone()),
+                kinds: Some(kinds),
+                ..Default::default()
+            };
+            match self
+                .db
+                .query_full_startup(vec![filter], 1, unix_now(), false)
+                .await
+            {
+                Some((events, _)) => {
+                    if !events.is_empty() {
+                        if is_group {
+                            touch.groups = true;
+                        } else {
+                            touch.roles = true;
+                        }
+                    }
                 }
-                touch
+                // The database did not answer: assume the deletion matters.
+                None => {
+                    return StateTouch {
+                        groups: true,
+                        roles: true,
+                    };
+                }
             }
-            // The database did not answer: assume the deletion matters.
-            None => StateTouch {
-                groups: true,
-                roles: true,
-            },
         }
+        touch
     }
 
     /// Marks the in-memory group state as stale after events it derives
@@ -3116,7 +3124,7 @@ impl Relay {
     /// keeps its older generation stamp, so the next startup rejects it and
     /// rebuilds from the surviving events; `persist_roles` refuses to
     /// overwrite it until the rebuild completes.
-    async fn mark_roles_stale(&self) {
+    pub(crate) async fn mark_roles_stale(&self) {
         self.roles_rebuild.dirty.store(true, Ordering::SeqCst);
         *self.roles.write().await = RoleStore::default();
         schedule_roles_rebuild(
@@ -3219,7 +3227,8 @@ impl Relay {
             .db
             .group_purge_until(gid.to_string(), purge_now, until)
             .await;
-        self.stats.bump(&self.stats.events_deleted, removed as u64);
+        self.stats
+            .bump(&self.stats.events_deleted, removed.unwrap_or(0) as u64);
         if self.group_purge_confirmed(gid, until).await {
             if until == u64::MAX {
                 // The history is gone: downgrade to the ordinary tombstone,
@@ -3502,12 +3511,14 @@ impl Relay {
             // create on the same id installs a public group, which would
             // otherwise expose the old (possibly private) history. The
             // purge records a per-group cut in the database, so a later
-            // re-broadcast of the purged history stays rejected. The purge
-            // reports a failure as zero removed, so success is confirmed by
-            // the state below: only then does the id return to the ordinary
-            // delete tombstone (which a create may clear).
+            // re-broadcast of the purged history stays rejected. A failed
+            // purge reports `None` (its removed count stays out of the
+            // stats), so success is confirmed by the state below: only then
+            // does the id return to the ordinary delete tombstone (which a
+            // create may clear).
             let removed = self.db.group_purge(gid.to_string(), unix_now()).await;
-            self.stats.bump(&self.stats.events_deleted, removed as u64);
+            self.stats
+                .bump(&self.stats.events_deleted, removed.unwrap_or(0) as u64);
             if self.group_purge_confirmed(gid, u64::MAX).await {
                 // The history is gone: the id may be re-created normally.
                 self.unghost_confirmed(gid).await;
@@ -6828,6 +6839,55 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         false
+    }
+
+    #[tokio::test]
+    async fn deletion_touching_both_stores_marks_both() {
+        // A single capped page over both families could fill up on one
+        // side (a deletion naming 64 group-state ids plus a role-state
+        // id) and miss the other store, leaving deleted role grants live.
+        // The relevance check is per family, so one event per side suffices.
+        let relay = build_relay().await;
+        let secp = secp256k1::Secp256k1::new();
+        let keypair = secp256k1::Keypair::from_seckey_slice(&secp, &[7u8; 32]).unwrap();
+        let now = crate::util::unix_now();
+        let mut target_ids = Vec::new();
+        // The role event is older than the 64 group events: a single capped
+        // page filled newest-first can never contain it, so the old code
+        // could not mark the role store.
+        for i in 0..64u64 {
+            let event = signed_group_event(
+                &secp,
+                &keypair,
+                9000,
+                "g1",
+                vec![vec!["p".into(), format!("m{i:04}")]],
+                now.saturating_sub(50),
+            );
+            target_ids.push(event.id.clone());
+            relay.db.put(event, now).await;
+        }
+        let role = signed_group_event(
+            &secp,
+            &keypair,
+            crate::nips::nip43::ROLE_DEFINITION,
+            "g1",
+            vec![],
+            now.saturating_sub(100),
+        );
+        target_ids.push(role.id.clone());
+        relay.db.put(role, now).await;
+        let mut tags = vec![];
+        for id in &target_ids {
+            tags.push(vec!["e".into(), id.clone()]);
+        }
+        let deletion = signed_group_event(&secp, &keypair, 5, "g1", tags, now);
+        let touch = relay.deletion_touches_group_state(&deletion).await;
+        assert!(
+            touch.groups && touch.roles,
+            "a deletion touching both families must mark both, got {touch:?}"
+        );
+        relay.db.shutdown();
     }
 
     #[tokio::test]

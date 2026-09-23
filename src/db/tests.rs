@@ -998,6 +998,50 @@ fn gift_wraps_with_mixed_case_p_are_deleted() {
 }
 
 #[test]
+fn vanish_wrap_purge_respects_the_request_bound() {
+    // A gift wrap created after the vanish request is not part of the
+    // vanished history and must survive, like the authored events the
+    // by_pubkey walk already bounds.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let recipient = "d83130de0d1386592fe7b9f407f5f1ae8f1db91d772e484b3d81df0fa2e88f24";
+        let old_wrap = event(1059, "old", now, vec![vec!["p".into(), recipient.into()]]);
+        let new_wrap = event(
+            1059,
+            "new",
+            now + 100,
+            vec![vec!["p".into(), recipient.into()]],
+        );
+        assert_eq!(db.put(old_wrap.clone(), now).await, PutOutcome::Stored);
+        assert_eq!(db.put(new_wrap.clone(), now).await, PutOutcome::Stored);
+        let recipient_bytes = hex::decode(recipient).unwrap();
+        let removed = db
+            .apply_vanish(recipient_bytes.try_into().unwrap(), now)
+            .await;
+        assert_eq!(
+            removed, 1,
+            "only the wrap within the request bound is removed"
+        );
+        let filter: crate::filter::Filter =
+            serde_json::from_value(serde_json::json!({ "ids": [new_wrap.id] })).unwrap();
+        let (events, _) = db.query(vec![filter], 10, now).await;
+        assert_eq!(events.len(), 1, "the later wrap must survive the vanish");
+    });
+    db.shutdown();
+}
+
+#[test]
 
 // ----- database growth -----
 fn map_grows_beyond_initial_size() {
@@ -1785,7 +1829,7 @@ fn group_purge_removes_only_that_groups_events() {
         for e in [&g1, &g2, &plain] {
             assert_eq!(db.put(e.clone(), now).await, PutOutcome::Stored);
         }
-        assert_eq!(db.group_purge("group-1".into(), now).await, 1);
+        assert_eq!(db.group_purge("group-1".into(), now).await, Some(1));
         let f: Filter = serde_json::from_value(serde_json::json!({"#h": ["group-1"]})).unwrap();
         let (res, _) = db.query(vec![f], 500, now).await;
         assert!(res.is_empty(), "the purged group must have no events");
@@ -1833,7 +1877,7 @@ fn purged_group_history_cannot_be_republished() {
         for e in [&old, &other, &plain] {
             assert_eq!(db.put(e.clone(), now).await, PutOutcome::Stored);
         }
-        assert_eq!(db.group_purge("group-9".into(), now).await, 1);
+        assert_eq!(db.group_purge("group-9".into(), now).await, Some(1));
         // The purged event is gone and a re-broadcast is refused without a
         // per-event tombstone.
         assert_eq!(
@@ -1863,7 +1907,7 @@ fn purged_group_history_cannot_be_republished() {
         assert_eq!(db.put(plain_new, now).await, PutOutcome::Stored);
         // A second purge moves the cut: the previously accepted event is
         // removed and its replay is blocked too.
-        assert_eq!(db.group_purge("group-9".into(), now + 1).await, 1);
+        assert_eq!(db.group_purge("group-9".into(), now + 1).await, Some(1));
         let fresh = event(
             1,
             "after the purge",
@@ -1909,7 +1953,7 @@ fn purge_marker_blocks_same_second_and_future_dated_replays() {
         for e in [&old, &same, &future] {
             assert_eq!(db.put(e.clone(), now).await, PutOutcome::Stored);
         }
-        assert_eq!(db.group_purge("group-marker".into(), now).await, 3);
+        assert_eq!(db.group_purge("group-marker".into(), now).await, Some(3));
 
         // Every removed generation is rejected on replay: older, same
         // second and future dated alike.
@@ -2142,7 +2186,7 @@ fn purge_marker_survives_reopen() {
             for e in [&old, &same] {
                 assert_eq!(db.put(e.clone(), now).await, PutOutcome::Stored);
             }
-            assert_eq!(db.group_purge("reopen-group".into(), now).await, 2);
+            assert_eq!(db.group_purge("reopen-group".into(), now).await, Some(2));
             db.shutdown();
         }
         let db = DbClient::open(
@@ -4915,7 +4959,7 @@ fn corrupt_short_keys_do_not_panic_the_removal_walks() {
     rt.block_on(async {
         assert_eq!(
             db.group_purge(gid.into(), now).await,
-            1,
+            Some(1),
             "the valid event is still purged"
         );
         assert_eq!(
@@ -5446,11 +5490,11 @@ fn pending_group_purge_is_reported_and_resumable() {
     .unwrap();
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
-        // The failed walk reports zero removed, but the marker is already
+        // The failed walk reports failure, but the marker is already
         // committed: the group's history stays stored while a replay is
         // fail-closed.
         let history: Filter = serde_json::from_value(serde_json::json!({"#h": [gid]})).unwrap();
-        assert_eq!(db.group_purge(gid.into(), now).await, 0);
+        assert_eq!(db.group_purge(gid.into(), now).await, None);
         assert_eq!(
             db.query(vec![history.clone()], 10, now).await.0.len(),
             3,
@@ -5465,7 +5509,7 @@ fn pending_group_purge_is_reported_and_resumable() {
             "the interrupted purge must be recorded"
         );
         // The re-issued purge finishes the walk and clears the record.
-        assert_eq!(db.group_purge(gid.into(), now).await, 3);
+        assert_eq!(db.group_purge(gid.into(), now).await, Some(3));
         assert!(
             db.pending_purges()
                 .await
@@ -5477,7 +5521,7 @@ fn pending_group_purge_is_reported_and_resumable() {
         // An idempotent re-run keeps the furthest cut: the future-dated
         // event's timestamp was folded in, so a replay between the purge
         // time and that event is still rejected.
-        assert_eq!(db.group_purge(gid.into(), now).await, 0);
+        assert_eq!(db.group_purge(gid.into(), now).await, Some(0));
         assert_eq!(
             db.put(tagged("between", now + 50), now).await,
             PutOutcome::PreviouslyDeleted
@@ -5819,7 +5863,7 @@ fn state_stamp_advances_with_group_state_removals() {
         let gid = "stamp-group";
         let tagged = event(1, "group post", now, vec![vec!["h".into(), gid.into()]]);
         assert_eq!(db.put(tagged, now).await, PutOutcome::Stored);
-        assert_eq!(db.group_purge(gid.into(), now).await, 1);
+        assert_eq!(db.group_purge(gid.into(), now).await, Some(1));
         assert_eq!(db.state_stamp().await, Some(3));
         db.shutdown();
     });
@@ -6446,7 +6490,11 @@ fn shutdown_cancellation_aborts_removals_and_leaves_pending() {
             1,
             "the cancelled vanish must leave its pending record"
         );
-        assert_eq!(db.group_purge(gid.into(), now).await, 0);
+        assert_eq!(
+            db.group_purge(gid.into(), now).await,
+            None,
+            "a cancelled purge reports failure, not zero removed"
+        );
         assert!(
             !db.pending_purges()
                 .await
@@ -6472,7 +6520,7 @@ fn shutdown_cancellation_aborts_removals_and_leaves_pending() {
                 .expect("a healthy pending read must answer")
                 .is_empty()
         );
-        assert_eq!(db.group_purge(gid.into(), now).await, 1);
+        assert_eq!(db.group_purge(gid.into(), now).await, Some(1));
         assert!(
             db.pending_purges()
                 .await
@@ -7594,7 +7642,11 @@ fn disk_full_removals_fail_closed_before_any_side_effect() {
         );
         assert_eq!(db.take_errors(), 1);
 
-        assert_eq!(db.group_purge(gid.to_string(), now).await, 0);
+        assert_eq!(
+            db.group_purge(gid.to_string(), now).await,
+            None,
+            "a full-disk purge must report failure, not zero removed"
+        );
         assert!(
             db.pending_purges().await.expect("pending").is_empty(),
             "a refusal before the walk must not write a purge record"
@@ -7634,7 +7686,7 @@ fn disk_full_removals_fail_closed_before_any_side_effect() {
             Some((0, false)),
             "the post was already deleted, only the marker is written"
         );
-        assert_eq!(db.group_purge(gid.to_string(), now).await, 1);
+        assert_eq!(db.group_purge(gid.to_string(), now).await, Some(1));
         db.set_expiry_enabled(true);
         assert_eq!(db.purge_expired(now, 0).await, (1, false));
         assert_eq!(
@@ -8005,7 +8057,11 @@ fn group_purge_first_chunk_failure_resumes_after_restart() {
         faults
             .chunk_after
             .store(1, std::sync::atomic::Ordering::SeqCst);
-        assert_eq!(db.group_purge(gid.to_string(), now).await, 0);
+        assert_eq!(
+            db.group_purge(gid.to_string(), now).await,
+            None,
+            "an interrupted purge reports failure, not zero removed"
+        );
         assert_eq!(
             db.pending_purges()
                 .await
@@ -8048,7 +8104,7 @@ fn group_purge_first_chunk_failure_resumes_after_restart() {
                 .expect("a healthy read must answer"),
             vec![(gid.to_string(), now, u64::MAX)]
         );
-        assert_eq!(db.group_purge(gid.to_string(), now).await, 2);
+        assert_eq!(db.group_purge(gid.to_string(), now).await, Some(2));
         assert!(
             db.pending_purges()
                 .await
@@ -8093,8 +8149,8 @@ fn group_purge_middle_chunk_failure_resumes_after_restart() {
             .store(2, std::sync::atomic::Ordering::SeqCst);
         assert_eq!(
             db.group_purge(gid.to_string(), now).await,
-            0,
-            "a failed purge reports zero removed, not the partial count"
+            None,
+            "a failed purge reports failure, not the partial count"
         );
         assert_eq!(
             db.pending_purges()
@@ -8135,7 +8191,7 @@ fn group_purge_middle_chunk_failure_resumes_after_restart() {
                 .len(),
             1
         );
-        assert_eq!(db.group_purge(gid.to_string(), now).await, 1);
+        assert_eq!(db.group_purge(gid.to_string(), now).await, Some(1));
         assert!(
             db.pending_purges()
                 .await
