@@ -861,9 +861,15 @@ impl GroupStore {
                         if group.members.len() >= MAX_MEMBERS && !group.is_member(&tag[1]) {
                             continue;
                         }
+                        // Count members added earlier in this same event:
+                        // `total_members` only grows after the loop, so a
+                        // bare `>=` check would admit N fresh members past
+                        // a nearly-full budget (concurrent fill between
+                        // validation and apply makes the stale read real).
                         let over_global = !ignore_capacity
                             && self.max_total_members > 0
-                            && self.total_members >= self.max_total_members
+                            && self.total_members.saturating_add(added)
+                                >= self.max_total_members
                             && !group.is_member(&tag[1]);
                         if over_global {
                             continue;
