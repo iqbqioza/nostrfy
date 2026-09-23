@@ -948,9 +948,16 @@ strfry export | nostrfy migrate-strfry
   re-run (the marker records its id), so re-running the migration cannot
   resurrect the group. strfry stores every signed event without NIP-29
   validation, so a moderation event whose author is not a group admin (or
-  the relay key) is removed during the import — the live relay would have
-  rejected it, and leaving it stored would let it apply on the first
-  restart; the summary reports how many were ignored. (A `9008` whose
+  the relay key), or that lacks an `h` tag, is removed during the import —
+  the live relay would have rejected it, and leaving it stored would let
+  the trusting restart rebuild apply it; the summary reports how many were
+  ignored. A refused `9005` is kept (the rebuild's state machine ignores
+  `9005`, so it cannot change the derived state), and an authorized `9005`
+  that deletes a group's create keeps the id ghosted: a later re-create for
+  that id is removed so the old history cannot become world-readable. The
+  replay uses the `(created_at, rank, kind, id)` order, which approximates
+  the live arrival order: a same-second event whose live acceptance
+  depended on arrival may differ. (A `9008` whose
   own event the import removes before the replay — a NIP-09 request naming
   it, or `--apply-vanish` for its author — is not replayed, so its purge is
   skipped; re-running without that removal applies it.)

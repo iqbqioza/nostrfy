@@ -508,17 +508,30 @@ fn replay_moderation(
     event: &Event,
     relay_pubkey: Option<&str>,
 ) -> bool {
-    // The live write path's own validation, applied at the event's position
-    // in the replay: whatever live would have rejected (a non-admin's
-    // moderation, a last-admin demotion, invalid metadata, a duplicate
-    // join, ...) is refused and later removed, and everything else is
-    // applied. Using the live gate keeps the migrated set exactly what the
-    // relay would have stored in this order.
-    if groups
-        .validate_write_for_relay(event, relay_pubkey)
-        .is_err()
-    {
+    // The authorization gate only: the relay's own key is the master key,
+    // an existing group requires an admin, and an unknown group only
+    // accepts a create (a group action without an `h` tag is refused, like
+    // the live write path). The state-dependent invariants (last-admin,
+    // metadata validation, caps, duplicate joins) are deliberately NOT
+    // checked here: they are order-sensitive, and the rank-ordered replay
+    // cannot know the live arrival order, so applying the rebuild's state
+    // machine (`ignore_capacity`) is the least destructive choice. The
+    // rebuild replays every stored event, so whatever this gate accepts is
+    // what the first restart derives.
+    if crate::nips::nip29::is_group_action(event) && crate::nips::nip29::group_id(event).is_none() {
         return false;
+    }
+    if (crate::nips::nip29::MOD_MIN..=crate::nips::nip29::MOD_MAX).contains(&event.kind)
+        && !relay_pubkey.is_some_and(|pk| pk.eq_ignore_ascii_case(&event.pubkey))
+    {
+        let authorized = match crate::nips::nip29::group_id(event).and_then(|gid| groups.group(gid))
+        {
+            Some(group) => group.is_admin(&event.pubkey),
+            None => event.kind == crate::nips::nip29::CREATE_GROUP,
+        };
+        if !authorized {
+            return false;
+        }
     }
     groups.apply(event, relay_pubkey.unwrap_or(""), unix_now(), false, true);
     true
@@ -628,41 +641,133 @@ async fn apply_group_side_effects(db: &DbClient, opts: &Options, stats: &mut Sta
     // once); the replay is then exactly what the restart will do.
     let mut applied: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut dropped: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut deleted_creates: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut final_refused;
     loop {
-        let mut groups = crate::nips::nip29::GroupStore::with_cap(opts.max_groups);
-        let (actions, refused) =
-            replay_stored_moderation(db, &mut groups, opts.relay_pubkey.as_deref()).await?;
-        let mut state_changed = false;
-        for event in &actions {
-            if applied.contains(&event.id) {
-                continue;
-            }
-            applied.insert(event.id.clone());
-            match event.kind {
-                9005 => {
-                    if apply_group_deletion(db, event, stats).await? {
-                        // The removed state event changes the state the
-                        // actions after it are authorized against, and the
-                        // in-memory replay cannot undo an applied event:
-                        // stop this round and re-authorize the rest.
+        // Fixpoint: apply the authorized actions, re-authorizing after
+        // every state change (the in-memory replay cannot undo an applied
+        // event).
+        loop {
+            let mut groups = crate::nips::nip29::GroupStore::with_cap(opts.max_groups);
+            let (actions, refused) =
+                replay_stored_moderation(db, &mut groups, opts.relay_pubkey.as_deref()).await?;
+            final_refused = refused;
+            let mut state_changed = false;
+            for event in &actions {
+                if applied.contains(&event.id) {
+                    continue;
+                }
+                applied.insert(event.id.clone());
+                match event.kind {
+                    9005 => {
+                        if apply_group_deletion(db, event, &mut deleted_creates, stats).await? {
+                            state_changed = true;
+                            break;
+                        }
+                    }
+                    9008 => {
+                        apply_group_purge(db, event, stats).await?;
                         state_changed = true;
                         break;
                     }
+                    _ => {}
                 }
-                9008 => {
-                    apply_group_purge(db, event, stats).await?;
-                    state_changed = true;
-                    break;
-                }
-                _ => {}
+            }
+            if !state_changed {
+                break;
             }
         }
-        if !state_changed {
-            // The replay is stable: it is exactly what the startup rebuild
-            // will do, so its refused events are final and removed.
-            drop_refused_moderation(db, &refused, &applied, &mut dropped, stats).await?;
+        // Ghost reconciliation: remove the creates that a deleted create's
+        // ghost must keep out. The state changes, so the fixpoint re-runs.
+        if deleted_creates.is_empty() {
             break;
         }
+        let mut removed_create = false;
+        for gid in deleted_creates.drain() {
+            let filter: Filter = serde_json::from_value(
+                serde_json::json!({ "kinds": [nip29::CREATE_GROUP], "#h": [gid] }),
+            )
+            .expect("static filter");
+            let Some((events, _)) = db
+                .query_full_startup(vec![filter], 100, unix_now(), true)
+                .await
+            else {
+                bail!(
+                    "could not read the re-created group {gid}; the migration did not \
+                     complete (re-run it)"
+                );
+            };
+            for event in events {
+                let (removed, _) = db
+                    .apply_deletion_checked(
+                        vec![event.id.clone()],
+                        Vec::new(),
+                        Some(event.pubkey.clone()),
+                        event.created_at,
+                    )
+                    .await;
+                if removed.is_none() {
+                    bail!(
+                        "could not remove the re-created group {gid}; the migration did \
+                         not complete (re-run it)"
+                    );
+                }
+                stats.unauthorized_moderation += 1;
+                removed_create = true;
+            }
+        }
+        if !removed_create {
+            break;
+        }
+    }
+    drop_refused_moderation(db, &final_refused, &applied, &mut dropped, stats).await?;
+    drop_fake_group_metadata(db, opts.relay_pubkey.as_deref(), &mut dropped, stats).await?;
+    Ok(())
+}
+
+/// Removes group metadata (`39000`-`39005`) not signed by the relay's own
+/// key: the live write path rejects those, so the migration must not import
+/// them (a stored fake `39000` would be served as group metadata).
+async fn drop_fake_group_metadata(
+    db: &DbClient,
+    relay_pubkey: Option<&str>,
+    dropped: &mut std::collections::HashSet<String>,
+    stats: &mut Stats,
+) -> Result<()> {
+    let filter: Filter = serde_json::from_value(
+        serde_json::json!({ "kinds": [39000, 39001, 39002, 39003, 39004, 39005] }),
+    )
+    .expect("static filter");
+    const PAGE: usize = 50_000;
+    let Some((events, _)) = db
+        .query_full_startup(vec![filter], PAGE, unix_now(), true)
+        .await
+    else {
+        bail!(
+            "could not read the stored group metadata; the migration did not complete \
+             (re-run it)"
+        );
+    };
+    for event in events {
+        let relay_signed = relay_pubkey.is_some_and(|pk| pk.eq_ignore_ascii_case(&event.pubkey));
+        if relay_signed || !dropped.insert(event.id.clone()) {
+            continue;
+        }
+        let (removed, _) = db
+            .apply_deletion_checked(
+                vec![event.id.clone()],
+                Vec::new(),
+                Some(event.pubkey.clone()),
+                event.created_at,
+            )
+            .await;
+        if removed.is_none() {
+            bail!(
+                "could not remove an unsigned group metadata event; the migration did \
+                 not complete (re-run it)"
+            );
+        }
+        stats.unauthorized_moderation += 1;
     }
     Ok(())
 }
@@ -685,7 +790,11 @@ async fn drop_refused_moderation(
     stats: &mut Stats,
 ) -> Result<()> {
     for event in refused {
-        if applied.contains(&event.id) || !dropped.insert(event.id.clone()) {
+        // A refused 9005 is kept: the rebuild's state machine ignores 9005
+        // (its deletion was applied to the database when authorized), so
+        // keeping it cannot change the derived state, while dropping it
+        // made a re-run remove an event an earlier run had accepted.
+        if event.kind == 9005 || applied.contains(&event.id) || !dropped.insert(event.id.clone()) {
             continue;
         }
         let (removed, _) = db
@@ -885,12 +994,35 @@ async fn apply_nip09(db: &DbClient, event: &Event, stats: &mut Stats) -> Result<
 /// Returns whether a NIP-29/43 state event was removed: only then does the
 /// authorization replay need to run again (the live relay marks the derived
 /// state stale for the same reason).
-async fn apply_group_deletion(db: &DbClient, event: &Event, stats: &mut Stats) -> Result<bool> {
+async fn apply_group_deletion(
+    db: &DbClient,
+    event: &Event,
+    deleted_creates: &mut std::collections::HashSet<String>,
+    stats: &mut Stats,
+) -> Result<bool> {
     let Some(gid) = nip29::group_id(event) else {
         return Ok(false);
     };
+    let targets = nip29::delete_targets(event);
+    // A create deleted here must not be replaced by a later create: the
+    // live relay ghosts the id while surviving events reference it, and a
+    // stored re-create would make the group public and expose the old
+    // (possibly private) history.
+    for target in &targets {
+        let filter: Filter =
+            serde_json::from_value(serde_json::json!({ "ids": [target] })).expect("static filter");
+        if let Some((events, _)) = db
+            .query_full_startup(vec![filter], 1, unix_now(), true)
+            .await
+            && let Some(found) = events.first()
+            && found.kind == nip29::CREATE_GROUP
+            && let Some(target_gid) = nip29::group_id(found)
+        {
+            deleted_creates.insert(target_gid.to_string());
+        }
+    }
     let (removed, state_removed) = db
-        .apply_group_deletion_checked(nip29::delete_targets(event), gid.to_string())
+        .apply_group_deletion_checked(targets, gid.to_string())
         .await;
     if removed.is_none() {
         bail!(
@@ -1285,12 +1417,15 @@ mod tests {
         let bad_purge = signed(2, 9008, now - 10, vec![vec!["h".into(), "g".into()]], "");
         let stats = run_str(
             &db,
-            &jsonl(&[create, post.clone(), bad_delete, bad_purge]),
+            &jsonl(&[create, post.clone(), bad_delete.clone(), bad_purge.clone()]),
             &options(),
         );
         assert_eq!(stats.group_deletions, 0);
         assert_eq!(stats.group_purges, 0);
-        assert_eq!(stats.unauthorized_moderation, 2);
+        assert_eq!(
+            stats.unauthorized_moderation, 1,
+            "only the refused 9008 is removed; a refused 9005 stays stored"
+        );
         assert_eq!(
             visible(&db, serde_json::json!({"ids": [post.id]})).len(),
             1,
@@ -1301,6 +1436,17 @@ mod tests {
             1,
             "an unauthorized 9008 must not purge the group"
         );
+        assert_eq!(
+            visible(&db, serde_json::json!({"ids": [bad_purge.id]})).len(),
+            0,
+            "the refused 9008 is removed"
+        );
+        assert_eq!(
+            visible(&db, serde_json::json!({"ids": [bad_delete.id]})).len(),
+            1,
+            "the refused 9005 stays stored (a no-op for the rebuild)"
+        );
+
         // The relay's own key is the master key: its 9005 applies.
         let relay_key = keypair(3);
         let relay_pubkey = relay_key.x_only_public_key().0.to_string();
@@ -1818,10 +1964,60 @@ mod tests {
     }
 
     #[test]
-    fn live_invalid_moderation_is_refused() {
-        // The migration uses the live write-path validation: a last-admin
-        // demotion is refused and removed like live would reject it.
-        let db = test_db("live-invalid");
+    fn a_recreate_after_a_deleted_create_is_ghosted() {
+        // An authorized 9005 deleting the group's create must keep the id
+        // ghosted: the live relay refuses a re-create while events survive,
+        // and a stored re-create would make the old (possibly private)
+        // history public after the first restart.
+        let db = test_db("ghost-recreate");
+        let now = unix_now();
+        let create = signed(1, 9007, now - 60, vec![vec!["h".into(), "g".into()]], "");
+        let private = signed(
+            1,
+            9002,
+            now - 50,
+            vec![vec!["h".into(), "g".into()], vec!["private".into()]],
+            "",
+        );
+        let post = signed(1, 9, now - 40, vec![vec!["h".into(), "g".into()]], "secret");
+        let del_create = signed(
+            1,
+            9005,
+            now - 30,
+            vec![
+                vec!["h".into(), "g".into()],
+                vec!["e".into(), create.id.clone()],
+            ],
+            "",
+        );
+        let recreate = signed(1, 9007, now - 20, vec![vec!["h".into(), "g".into()]], "");
+        let stats = run_str(
+            &db,
+            &jsonl(&[create, private, post.clone(), del_create, recreate.clone()]),
+            &options(),
+        );
+        assert_eq!(stats.group_deletions, 1);
+        assert!(
+            visible(&db, serde_json::json!({"ids": [recreate.id]})).is_empty(),
+            "the re-create after a deleted create is ghosted"
+        );
+        assert_eq!(
+            visible(&db, serde_json::json!({"ids": [post.id]})).len(),
+            1,
+            "the surviving history stays stored (the rebuild withholds it)"
+        );
+        db.shutdown();
+    }
+
+    #[test]
+    fn order_dependent_invariants_follow_the_rebuild() {
+        // The migration checks authorization only: state-dependent
+        // invariants (last-admin, metadata validation, caps) are
+        // order-sensitive, and the rank-ordered replay cannot know the live
+        // arrival order. Applying the rebuild's state machine (which also
+        // replays without re-validating) keeps the migrated state exactly
+        // what the first restart derives.
+        let db = test_db("order-invariants");
         let now = unix_now();
         let a_pk = keypair(1).x_only_public_key().0.to_string();
         let create = signed(1, 9007, now - 50, vec![vec!["h".into(), "g".into()]], "");
@@ -1833,10 +2029,11 @@ mod tests {
             "",
         );
         let stats = run_str(&db, &jsonl(&[create, demote.clone()]), &options());
-        assert_eq!(stats.unauthorized_moderation, 1);
-        assert!(
-            visible(&db, serde_json::json!({"ids": [demote.id]})).is_empty(),
-            "the refused demotion is removed"
+        assert_eq!(stats.unauthorized_moderation, 0);
+        assert_eq!(
+            visible(&db, serde_json::json!({"ids": [demote.id]})).len(),
+            1,
+            "the demotion is applied and kept, like the rebuild applies it"
         );
         db.shutdown();
     }
