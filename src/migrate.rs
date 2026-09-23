@@ -684,36 +684,76 @@ async fn apply_group_side_effects(db: &DbClient, opts: &Options, stats: &mut Sta
         }
         let mut removed_create = false;
         for gid in deleted_creates.drain() {
-            let filter: Filter = serde_json::from_value(
-                serde_json::json!({ "kinds": [nip29::CREATE_GROUP], "#h": [gid] }),
-            )
-            .expect("static filter");
-            let Some((events, _)) = db
-                .query_full_startup(vec![filter], 100, unix_now(), true)
-                .await
-            else {
-                bail!(
-                    "could not read the re-created group {gid}; the migration did not \
-                     complete (re-run it)"
-                );
-            };
-            for event in events {
-                let (removed, _) = db
-                    .apply_deletion_checked(
-                        vec![event.id.clone()],
-                        Vec::new(),
-                        Some(event.pubkey.clone()),
-                        event.created_at,
-                    )
-                    .await;
-                if removed.is_none() {
+            const PAGE: usize = 100;
+            let mut since: Option<u64> = None;
+            loop {
+                let mut filter: Filter = serde_json::from_value(
+                    serde_json::json!({ "kinds": [nip29::CREATE_GROUP], "#h": [gid] }),
+                )
+                .expect("static filter");
+                filter.since = since;
+                let boundary_filter = filter.clone();
+                let Some((events, more)) = db
+                    .query_full_startup(vec![filter], PAGE, unix_now(), true)
+                    .await
+                else {
                     bail!(
-                        "could not remove the re-created group {gid}; the migration did \
-                         not complete (re-run it)"
+                        "could not read the re-created group {gid}; the migration did \
+                         complete (re-run it)"
+                    );
+                };
+                if events.is_empty() {
+                    break;
+                }
+                let max_created = events.last().map(|event| event.created_at);
+                let boundary_count = events
+                    .iter()
+                    .filter(|event| Some(event.created_at) == max_created)
+                    .count();
+                for event in events {
+                    let (removed, _) = db
+                        .apply_deletion_checked(
+                            vec![event.id.clone()],
+                            Vec::new(),
+                            Some(event.pubkey.clone()),
+                            event.created_at,
+                        )
+                        .await;
+                    if removed.is_none() {
+                        bail!(
+                            "could not remove the re-created group {gid}; the migration \
+                             did not complete (re-run it)"
+                        );
+                    }
+                    stats.unauthorized_moderation += 1;
+                    removed_create = true;
+                }
+                if !more {
+                    break;
+                }
+                // A cut page boundary is verified like the rebuild: a
+                // silently dropped re-create would stay servable after a
+                // restart.
+                let Some(boundary) = max_created else {
+                    break;
+                };
+                if !crate::nips::nip29::boundary_second_complete(
+                    db,
+                    boundary_filter,
+                    boundary,
+                    boundary_count,
+                )
+                .await
+                {
+                    bail!(
+                        "the re-created group {gid} boundary second {boundary} is not fully \\
+                         collected; the migration did not complete (re-run it)"
                     );
                 }
-                stats.unauthorized_moderation += 1;
-                removed_create = true;
+                if boundary == u64::MAX {
+                    break;
+                }
+                since = Some(boundary.saturating_add(1));
             }
         }
         if !removed_create {
@@ -734,40 +774,79 @@ async fn drop_fake_group_metadata(
     dropped: &mut std::collections::HashSet<String>,
     stats: &mut Stats,
 ) -> Result<()> {
-    let filter: Filter = serde_json::from_value(
-        serde_json::json!({ "kinds": [39000, 39001, 39002, 39003, 39004, 39005] }),
-    )
-    .expect("static filter");
     const PAGE: usize = 50_000;
-    let Some((events, _)) = db
-        .query_full_startup(vec![filter], PAGE, unix_now(), true)
-        .await
-    else {
-        bail!(
-            "could not read the stored group metadata; the migration did not complete \
-             (re-run it)"
-        );
-    };
-    for event in events {
-        let relay_signed = relay_pubkey.is_some_and(|pk| pk.eq_ignore_ascii_case(&event.pubkey));
-        if relay_signed || !dropped.insert(event.id.clone()) {
-            continue;
-        }
-        let (removed, _) = db
-            .apply_deletion_checked(
-                vec![event.id.clone()],
-                Vec::new(),
-                Some(event.pubkey.clone()),
-                event.created_at,
-            )
-            .await;
-        if removed.is_none() {
+    let mut since: Option<u64> = None;
+    loop {
+        let mut filter: Filter = serde_json::from_value(
+            serde_json::json!({ "kinds": [39000, 39001, 39002, 39003, 39004, 39005] }),
+        )
+        .expect("static filter");
+        filter.since = since;
+        let boundary_filter = filter.clone();
+        let Some((events, more)) = db
+            .query_full_startup(vec![filter], PAGE, unix_now(), true)
+            .await
+        else {
             bail!(
-                "could not remove an unsigned group metadata event; the migration did \
+                "could not read the stored group metadata; the migration did not complete \
+                 (re-run it)"
+            );
+        };
+        if events.is_empty() {
+            break;
+        }
+        let max_created = events.last().map(|event| event.created_at);
+        let boundary_count = events
+            .iter()
+            .filter(|event| Some(event.created_at) == max_created)
+            .count();
+        for event in events {
+            let relay_signed =
+                relay_pubkey.is_some_and(|pk| pk.eq_ignore_ascii_case(&event.pubkey));
+            if relay_signed || !dropped.insert(event.id.clone()) {
+                continue;
+            }
+            let (removed, _) = db
+                .apply_deletion_checked(
+                    vec![event.id.clone()],
+                    Vec::new(),
+                    Some(event.pubkey.clone()),
+                    event.created_at,
+                )
+                .await;
+            if removed.is_none() {
+                bail!(
+                    "could not remove an unsigned group metadata event; the migration did \
                  not complete (re-run it)"
+                );
+            }
+            stats.unauthorized_moderation += 1;
+        }
+        if !more {
+            break;
+        }
+        // A cut page boundary is verified like the rebuild: a silently
+        // dropped fake would stay servable as group metadata.
+        let Some(boundary) = max_created else {
+            break;
+        };
+        if !crate::nips::nip29::boundary_second_complete(
+            db,
+            boundary_filter,
+            boundary,
+            boundary_count,
+        )
+        .await
+        {
+            bail!(
+                "the stored group metadata boundary second {boundary} is not fully \\
+                 collected; the migration did not complete (re-run it)"
             );
         }
-        stats.unauthorized_moderation += 1;
+        if boundary == u64::MAX {
+            break;
+        }
+        since = Some(boundary.saturating_add(1));
     }
     Ok(())
 }
@@ -1949,7 +2028,13 @@ mod tests {
         );
         let stats = run_str(
             &db,
-            &jsonl(&[create, grant, post.clone(), b_delete.clone(), revoke]),
+            &jsonl(&[
+                create.clone(),
+                grant.clone(),
+                post.clone(),
+                b_delete.clone(),
+                revoke.clone(),
+            ]),
             &options(),
         );
         assert_eq!(stats.group_deletions, 2);
@@ -1960,6 +2045,34 @@ mod tests {
             1,
             "the legitimate 9005 stays stored"
         );
+        // A re-run must not remove it: the second run replays the
+        // post-deletion database, where B's 9005 replays as refused, but
+        // the side effect was already applied in the first run.
+        let second = run_str(
+            &db,
+            &jsonl(&[
+                create.clone(),
+                grant.clone(),
+                post.clone(),
+                b_delete.clone(),
+                revoke.clone(),
+            ]),
+            &options(),
+        );
+        assert_eq!(
+            second.duplicate, 3,
+            "create and both 9005s are duplicates on the re-run"
+        );
+        assert_eq!(
+            second.previously_deleted, 2,
+            "the deleted post and grant stay blocked"
+        );
+        assert_eq!(
+            visible(&db, serde_json::json!({"ids": [b_delete.id]})).len(),
+            1,
+            "the re-run must not remove the accepted 9005"
+        );
+        assert!(visible(&db, serde_json::json!({"ids": [post.id]})).is_empty());
         db.shutdown();
     }
 
@@ -2006,6 +2119,27 @@ mod tests {
             1,
             "the surviving history stays stored (the rebuild withholds it)"
         );
+        // The first start must ghost the id and withhold the surviving
+        // history from everyone, including members.
+        let post = visible(&db, serde_json::json!({"ids": [post.id]}));
+        assert_eq!(post.len(), 1);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut store = crate::nips::nip29::GroupStore::default();
+            assert!(store.rebuild(&db, None).await);
+            assert!(
+                store.ghost_group_ids().contains(&"g".to_string()),
+                "the id with a deleted create and surviving events is ghosted"
+            );
+            assert!(
+                !store.visible_to(&post[0], None),
+                "anonymous readers must not see ghosted history"
+            );
+            assert!(
+                !store.visible_to(&post[0], Some(&post[0].pubkey)),
+                "members must not see ghosted history either"
+            );
+        });
         db.shutdown();
     }
 
@@ -2210,9 +2344,11 @@ mod tests {
         let stats = run_str(
             &db,
             &jsonl(&[create, old_post, delete, recreate, new_post]),
-            // A batch large enough to hold the whole input: the 9008 must
-            // still be flushed on its own, or the re-created group's events
-            // (later in the export) would be purged with the old history.
+            // A batch large enough to hold the whole input: the deferred pass
+            // applies the 9008 in the rebuild's rank order with a purge
+            // bounded by the 9008's timestamp, so the re-created group's
+            // events (later in the export) must survive regardless of the
+            // batch size.
             &Options {
                 batch: 512,
                 ..options()
