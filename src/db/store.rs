@@ -2534,6 +2534,10 @@ impl Store {
     /// write chunks, so a huge database never holds a giant transaction;
     /// called once at startup when the index is stale).
     pub(crate) fn rebuild_event_meta(&self) -> Result<usize> {
+        // Like the sibling rebuilds: refuse below the free-space margin
+        // instead of committing into a full disk (SIGBUS). Callers degrade
+        // gracefully (scans fall back to the full JSON parse).
+        self.disk_full_error()?;
         let Some(meta) = self.event_meta else {
             return Ok(0);
         };
