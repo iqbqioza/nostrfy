@@ -646,7 +646,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod mock_server {
+pub(crate) mod mock_server {
     use super::*;
     use axum::body::Body;
     use axum::extract::{Path, RawQuery, State};
@@ -655,7 +655,7 @@ mod mock_server {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
-    type Store = Arc<Mutex<HashMap<String, Vec<u8>>>>;
+    pub(crate) type Store = Arc<Mutex<HashMap<String, Vec<u8>>>>;
 
     async fn put(
         Path((_bucket, key)): Path<(String, String)>,
@@ -773,7 +773,7 @@ mod mock_server {
         String::from_utf8_lossy(&out).into_owned()
     }
 
-    async fn build_mock() -> (String, Store) {
+    pub(crate) async fn build_mock() -> (String, Store) {
         let store: Store = Arc::new(Mutex::new(HashMap::new()));
         let app = axum::Router::new()
             .route(

@@ -85,18 +85,28 @@ impl TrustedProxy {
             ),
             None => {
                 let addr = value.parse::<IpAddr>().ok()?;
-                let prefix = if addr.is_ipv4() { 32 } else { 128 };
+                // Default the prefix from the normalized family: a dual-stack
+                // listener reports IPv4 peers as `::ffff:a.b.c.d`, and such a
+                // bare value names the IPv4 host (`/32`), not a `/128` that
+                // would overflow the V4 mask in `contains`.
+                let prefix = if normalize_ip(addr).is_ipv4() {
+                    32
+                } else {
+                    128
+                };
                 (addr, prefix)
             }
         };
+        // Validate against the normalized family: an IPv4-mapped address
+        // with a prefix above 32 (e.g. `::ffff:10.0.0.0/96`) can never match
+        // (the V4 mask shifts by `32 - prefix`), so reject it instead of
+        // storing an unusable range.
+        let addr = normalize_ip(addr);
         let bits = if addr.is_ipv4() { 32 } else { 128 };
         if prefix == 0 || prefix > bits {
             return None;
         }
-        Some(TrustedProxy {
-            addr: normalize_ip(addr),
-            prefix,
-        })
+        Some(TrustedProxy { addr, prefix })
     }
 
     /// Whether `ip` falls inside this proxy's range.
@@ -253,6 +263,24 @@ mod tests {
         assert!(TrustedProxy::parse("2001:db8::/129").is_none());
         assert!(TrustedProxy::parse("0.0.0.0/0").is_none());
         assert!(TrustedProxy::parse("::/0").is_none());
+    }
+
+    #[test]
+    fn trusted_proxy_v4_mapped_prefix_checked_after_normalization() {
+        // A bare IPv4-mapped address names the IPv4 host: it must parse as
+        // an exact `/32` and match the peer (previously it stored a `/128`
+        // against a V4 address, overflowing the mask in `contains`).
+        let mapped = TrustedProxy::parse("::ffff:127.0.0.1").expect("bare mapped must parse");
+        assert!(mapped.contains("127.0.0.1".parse().unwrap()));
+        assert!(mapped.contains("::ffff:127.0.0.1".parse().unwrap()));
+        assert!(!mapped.contains("127.0.0.2".parse().unwrap()));
+        // A mapped CIDR with a prefix above 32 is unrepresentable and must
+        // be rejected instead of stored as a broken range.
+        assert!(TrustedProxy::parse("::ffff:10.0.0.0/96").is_none());
+        // A mapped CIDR within the V4 width works as the IPv4 range.
+        let range = TrustedProxy::parse("::ffff:10.0.0.0/24").expect("mapped /24 must parse");
+        assert!(range.contains("10.0.0.5".parse().unwrap()));
+        assert!(!range.contains("10.0.1.5".parse().unwrap()));
     }
 
     #[test]
