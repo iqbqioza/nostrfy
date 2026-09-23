@@ -379,8 +379,9 @@ fn validate_auth_event(
 }
 
 /// Decodes the Blossom auth event from the `Authorization: Nostr <token>`
-/// header (BUD-11). Accepts both the spec's Base64url-without-padding and
-/// the padded standard variant for leniency.
+/// header (BUD-11). Accepts the spec's Base64url-without-padding, padded
+/// Base64url, and the padded standard variant for leniency: base64
+/// libraries commonly emit padding by default, in either alphabet.
 fn decode_auth_event(headers: &HeaderMap) -> Option<crate::event::Event> {
     let encoded = headers
         .get(axum::http::header::AUTHORIZATION)
@@ -388,6 +389,7 @@ fn decode_auth_event(headers: &HeaderMap) -> Option<crate::event::Event> {
         .and_then(crate::nips::nip98::strip_nostr_scheme)?;
     let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(encoded)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(encoded))
         .or_else(|_| base64::engine::general_purpose::STANDARD.decode(encoded))
         .ok()?;
     serde_json::from_slice(&raw).ok()
@@ -3013,6 +3015,54 @@ mod tests {
         assert_eq!(parse_range("bytes=0-4,6-8", 10).unwrap(), None);
         assert_eq!(parse_range("items=0-4", 10).unwrap(), None);
         assert_eq!(parse_range("", 10).unwrap(), None);
+    }
+
+    #[test]
+    fn auth_token_accepts_padded_base64url() {
+        // Base64 libraries commonly emit padding by default, in either
+        // alphabet: a padded base64url token must decode like the spec's
+        // unpadded form and the padded standard variant (previously it
+        // failed both engines and answered 401).
+        let secp = Secp256k1::new();
+        // Find a deterministic fixture whose padded base64url form carries
+        // both padding and url-safe characters: only then does this test
+        // discriminate the padded url-safe engine from the unpadded and
+        // standard fallbacks. Pure-ASCII event JSON almost never produces
+        // the 62/63 symbols, so the content carries multibyte characters
+        // (id/sig stay stale afterwards, which decoding does not check).
+        // Deterministic: all inputs are fixed, the first hit is pinned.
+        let mut fixture: Option<(Event, String)> = None;
+        for content in ["\u{7ff}", "\u{ffff}", "\u{20ac}", "\u{1f389}"] {
+            for repeats in 1..=16 {
+                let mut ev = auth_event_with_key(
+                    &secp,
+                    &[9u8; 32],
+                    1_700_000_000,
+                    "list",
+                    Some(1_700_000_600),
+                    None,
+                    None,
+                );
+                ev.content = content.repeat(repeats);
+                let raw = serde_json::to_vec(&ev).unwrap();
+                let token = base64::engine::general_purpose::URL_SAFE.encode(&raw);
+                if token.contains('=') && (token.contains('-') || token.contains('_')) {
+                    fixture = Some((ev, token));
+                    break;
+                }
+            }
+            if fixture.is_some() {
+                break;
+            }
+        }
+        let (ev, token) = fixture.expect("fixture must reach padded url-safe alphabet");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Nostr {token}").parse().unwrap(),
+        );
+        let decoded = decode_auth_event(&headers).expect("padded base64url must decode");
+        assert_eq!(decoded.pubkey, ev.pubkey);
     }
 
     #[test]
