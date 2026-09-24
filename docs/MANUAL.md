@@ -83,6 +83,12 @@ verifies its checksum:
 curl -fsSL https://raw.githubusercontent.com/iqbqioza/nostrfy/main/install.sh | sh
 ```
 
+Options: `VERSION=v0.1.2 ./install.sh` pins a release,
+`INSTALL_DIR=/usr/local/bin sudo ./install.sh` installs system-wide,
+`./install.sh --force` overwrites without asking. The script picks the
+first of `~/.local/bin`, `~/bin`, `~/.cargo/bin` already on `PATH`
+(falling back to `~/.local/bin`).
+
 #### FreeBSD
 
 nostrfy builds and runs on FreeBSD (13.x and 14.x, amd64). Install Rust
@@ -269,6 +275,23 @@ To generate a secret key, use the `nostrfy genkey` command (see [5. Command Refe
 | `blocked_ips` | IP addresses to refuse connections from |
 
 > **Note**: The pubkey allow/deny lists are **not** config keys — they live in the relay database and are managed with `nostrfy relay allow/deny` (see [Section 7](#7-nip-86-management-api) / the blossom-style CLI), or at runtime via command events (`/relay allow|deny`, `/blossom allow|deny`). A denied pubkey is always rejected when **publishing**, even with `restrict_relay = false`, and is **never served either**: subscriptions (REQ), COUNT and negentropy syncs are refused with `restricted:`, and live events stop being delivered to its connections — immediately, without disconnecting them. With `restrict_relay = true`, only the allow-listed pubkeys may post (NIP-11 `restricted_writes`), while reading stays open to everyone — anonymous readers and non-listed pubkeys can still subscribe, so the allowed pubkeys' posts remain publicly readable. Denied pubkeys are the only ones cut off from reading. The admin pubkey (`relay.pubkey`) and the relay's own pubkey (`relay.private_key`) are exempt from the lists, so the operator can always publish command events and read the replies.
+
+### Fixed anti-abuse bounds
+
+A few hard bounds are fixed (not configurable) to keep the relay
+responsive under abuse:
+
+- One filter carries at most **512** `ids`, `authors` or `kinds`
+  entries; `#...` tag values share a separate **512**-value budget per
+  filter. Larger filters are rejected (`CLOSED invalid: ...`).
+- `max_connections_per_sec_per_ip` tracks at most 10,000 source IPs;
+  while full, unseen IPs are refused (fail closed).
+- Event ids in `ids` filters may be prefixes, but only full 32-byte ids
+  and even-length prefixes match (odd-length/empty entries are ignored
+  for history and live delivery alike).
+- Over-long index keys (tag values, content words, `d` tags beyond
+  LMDB's key-size limit) are skipped at indexing time; the event is
+  still stored.
 
 ---
 
@@ -807,6 +830,27 @@ The `[access]` kind/IP lists are runtime-managed via NIP-86 (a config edit is ig
 
 ## 14. Large-Scale Deployments
 
+### Architecture (how it stays up)
+
+- **Single database writer thread**, merging puts into batches with one
+  fsync per batch. Replies go out only after commit, so `OK` means
+  durable (unless `database.disabled_fsync = true`, which trades the
+  guarantee for throughput).
+- **Dedicated reader threads** serve queries without the write lock, so
+  a stalled writer cannot take down readers. The REST API has its own
+  reader thread and concurrency limiter.
+- **Bounded queues everywhere** (database requests, outgoing messages,
+  live fan-out, negentropy store): overload fails fast instead of
+  piling up in memory.
+- The LMDB map opens at its configured ceiling and is never resized at
+  runtime (a sparse reservation: physical memory grows only with real
+  data). Writing to a full disk would raise SIGBUS, so writes are
+  refused below a free-space margin while reads keep serving.
+- Multi-range filters walk a merged newest-first iterator with a
+  per-scan work budget; NIP-67 ties never split across pages.
+- Task panics are contained and logged; connection accounting is
+  released on every exit path.
+
 The relay is designed to scale to hundreds of thousands of connections
 on a single host (the live delivery wakes only the subscribers that can
 match an event, and the per-connection memory is kept small). Pushing
@@ -834,6 +878,24 @@ kernel + user memory on top of the database. The WebSocket reader pool
 has two threads; a single heavy REQ no longer stalls every query.
 
 ### Throughput (events per second)
+
+Measured on the release build with a fresh database using the bundled
+load client `examples/bench.rs` (8-thread laptop: Intel Core i5-8265U,
+8 GB RAM):
+
+| Scenario | Result |
+| --- | --- |
+| Event ingest (1 connection, 10,000 events) | **~21,000 events/s** (0.48 s, all accepted) |
+| Parallel ingest (5 connections, 25,000 events) | **~22,000 events/s** (1.14 s) |
+| Live fan-out (50 subscribers, 200 publishes) | **10,000/10,000 deliveries** (100%) |
+| Stored query (20,000 events) | 20,000 events in **0.32 s** |
+| NIP-50 search (10,000 results) | 10,000 events in **0.26 s** |
+| Concurrent search (20 parallel scans, 35k store) | worst **1.7 s**, avg 0.94 s |
+
+To reproduce: `cargo build --release --examples`, start a relay and
+run the scenarios above — raise `limits.max_limit` for the
+query/search scenarios (the default 500 caps results), and keep
+subscriber counts under `limits.max_connections_per_ip` (default 64).
 
 Event ingestion is bound by two costs: the Schnorr signature check
 (about 30-50 µs per event) and the synchronous disk flush the LMDB

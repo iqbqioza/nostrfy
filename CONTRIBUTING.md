@@ -58,3 +58,19 @@ All four must pass without warnings or failures.
 Please include the relay version (`nostrfy --version`), the configuration
 (with secrets redacted), and the relevant log lines. Security issues should
 be reported privately rather than in a public issue.
+
+## Repository layout
+
+```
+src/
+├── main.rs, cli.rs, config.rs   entry point, CLI, nostrfy.toml
+├── event.rs, filter.rs, stats.rs, util.rs
+├── db/                          LMDB storage (writer/reader threads,
+│                                write path, query engine, removals)
+├── relay/                       event acceptance, NIP-29/43 state
+├── server/                      HTTP/WebSocket front end, REST API,
+│                                Blossom file server, LiveKit endpoint
+├── ws/                          connection handling, protocol handlers,
+│                                negentropy
+└── nips/                        per-NIP modules
+```
