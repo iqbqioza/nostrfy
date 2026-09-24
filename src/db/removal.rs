@@ -653,6 +653,9 @@ impl Store {
         self.disk_full_error()?;
         let mut wtxn = self.env.write_txn()?;
         self.banned.put(&mut wtxn, id, reason.as_bytes())?;
+        // NIP-86: a ban removes the event from the allow list, in the
+        // same transaction so the two markers can never disagree.
+        self.allowed.delete(&mut wtxn, id)?;
         let mut state_removed = false;
         let removed = match self.events.get(&wtxn, id)? {
             Some(raw) => {
@@ -684,6 +687,46 @@ impl Store {
         let removed = self.banned.delete(&mut wtxn, id)?;
         wtxn.commit()?;
         Ok(removed)
+    }
+
+    /// NIP-86 allowevent: records the event on the allow list and removes
+    /// it from the ban list in the same transaction (the spec's mutual
+    /// exclusion). Allowing re-enables future publication of the id; it
+    /// does not restore an already-removed event. Beyond the ban/allow
+    /// coupling the marker carries no enforcement — the relay defines no
+    /// allow-gated read path, and none is invented here.
+    pub(crate) fn apply_allow(&self, id: &[u8], reason: &str) -> Result<bool> {
+        self.disk_full_error()?;
+        let mut wtxn = self.env.write_txn()?;
+        self.allowed.put(&mut wtxn, id, reason.as_bytes())?;
+        let unbanned = self.banned.delete(&mut wtxn, id)?;
+        wtxn.commit()?;
+        Ok(unbanned)
+    }
+
+    /// NIP-86 unallowevent: removes the event from the allow list.
+    /// Returns whether a marker existed (a missing marker is a no-op
+    /// success at the RPC layer).
+    pub(crate) fn apply_unallow(&self, id: &[u8]) -> Result<bool> {
+        self.disk_full_error()?;
+        let mut wtxn = self.env.write_txn()?;
+        let removed = self.allowed.delete(&mut wtxn, id)?;
+        wtxn.commit()?;
+        Ok(removed)
+    }
+
+    /// NIP-86 listallowedevents: allowed event ids with reasons.
+    pub(crate) fn list_allowed(&self) -> Result<Vec<(String, String)>> {
+        let rtxn = self.env.read_txn()?;
+        let mut out = Vec::new();
+        for item in self.allowed.iter(&rtxn)? {
+            let (id, reason) = item?;
+            out.push((
+                hex::encode(id),
+                String::from_utf8_lossy(reason).into_owned(),
+            ));
+        }
+        Ok(out)
     }
 
     pub(crate) fn list_banned(&self) -> Result<Vec<(String, String)>> {

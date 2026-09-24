@@ -221,52 +221,61 @@ impl super::Relay {
         self.publish_relay_event(event).await
     }
 
-    pub async fn delete_role(&self, id: &str) -> bool {
+    pub async fn delete_role(&self, id: &str) -> RoleChange {
         if !self.config.read().await.nip_enabled(43) || self.key.is_none() {
-            return false;
+            return RoleChange::Failed;
         }
-        let removed = self
+        let outcome = self
             .mutate_roles(
                 super::BufferedRoleMutation::Delete { id: id.to_string() },
                 |roles| {
                     let removed = roles.delete(id);
-                    (removed, removed)
+                    // Deleting a missing role is a no-op success (like the
+                    // other removal methods), not an error.
+                    if removed {
+                        (RoleChange::Applied, true)
+                    } else {
+                        (RoleChange::Noop, false)
+                    }
                 },
             )
             .await;
-        if removed {
-            // Deferred persistence before publishing (see `create_role`):
-            // the tombstone path below must not lose the in-memory deletion
-            // on restart even if publishing fails.
-            self.schedule_roles_persist();
-            // Publish a tombstone `kind:33534` so the deletion survives the
-            // restart rebuild (the rebuild skips `["deleted"]` tombstones);
-            // then republish the membership list without the deleted role.
-            // A failed tombstone save reports false: without it the role
-            // would be resurrected by the rebuild after a restart (the
-            // operator can re-create and re-delete to retry).
-            let relay_pubkey = self.relay_pubkey().unwrap_or_default();
-            let event = {
-                let roles = self.roles.read().await;
-                roles.role_deletion_event(id, &relay_pubkey, self.stamp_floor(unix_now()))
-            };
-            let stored = self.publish_relay_event(event).await;
-            if stored {
-                // The membership republish must not be silently dropped:
-                // a failure would leave the old membership event stored,
-                // and the restart rebuild would resurrect assignments to
-                // the deleted role. The tombstone itself still guarantees
-                // the role stays deleted; the operator is told the
-                // membership refresh failed so it can be retried.
-                if !self.publish_membership(None).await {
-                    log::warn!(
-                        "delete_role {id}: the membership list could not be republished; assignments to the deleted role may resurface after a restart"
-                    );
-                }
+        if outcome != RoleChange::Applied {
+            return outcome;
+        }
+        // Deferred persistence before publishing (see `create_role`):
+        // the tombstone path below must not lose the in-memory deletion
+        // on restart even if publishing fails.
+        self.schedule_roles_persist();
+        // Publish a tombstone `kind:33534` so the deletion survives the
+        // restart rebuild (the rebuild skips `["deleted"]` tombstones);
+        // then republish the membership list without the deleted role.
+        // A failed tombstone save reports `Failed`: without it the role
+        // would be resurrected by the rebuild after a restart (the
+        // operator can re-create and re-delete to retry).
+        let relay_pubkey = self.relay_pubkey().unwrap_or_default();
+        let event = {
+            let roles = self.roles.read().await;
+            roles.role_deletion_event(id, &relay_pubkey, self.stamp_floor(unix_now()))
+        };
+        let stored = self.publish_relay_event(event).await;
+        if stored {
+            // The membership republish must not be silently dropped:
+            // a failure would leave the old membership event stored,
+            // and the restart rebuild would resurrect assignments to
+            // the deleted role. The tombstone itself still guarantees
+            // the role stays deleted; the operator is told the
+            // membership refresh failed so it can be retried.
+            if !self.publish_membership(None).await {
+                log::warn!(
+                    "delete_role {id}: the membership list could not be republished; assignments to the deleted role may resurface after a restart"
+                );
             }
-            stored
+        }
+        if stored {
+            RoleChange::Applied
         } else {
-            false
+            RoleChange::Failed
         }
     }
 
@@ -339,6 +348,97 @@ impl super::Relay {
             }
         }
         outcome
+    }
+
+    /// NIP-86 `createclaim`: stores an invite code. Invite codes have no
+    /// events behind them, so the debounced roles snapshot is their only
+    /// persistence (a crash before it lands loses the code — fail-closed,
+    /// and creation is idempotent, so the admin retries). Returns false
+    /// only when NIP-43 is disabled or the relay key is missing.
+    pub async fn create_claim(&self, claim: &str) -> bool {
+        if !self.config.read().await.nip_enabled(43) || self.key.is_none() {
+            return false;
+        }
+        let added = self
+            .mutate_roles(
+                super::BufferedRoleMutation::CreateClaim {
+                    claim: claim.to_string(),
+                },
+                |roles| {
+                    let added = roles.add_claim(claim);
+                    (added, added)
+                },
+            )
+            .await;
+        if added {
+            self.schedule_roles_persist();
+        }
+        true
+    }
+
+    /// NIP-86 `deleteclaim`: revokes an invite code. Revoking an absent
+    /// code is a no-op success. Returns false only when NIP-43 is disabled
+    /// or the relay key is missing.
+    pub async fn delete_claim(&self, claim: &str) -> bool {
+        if !self.config.read().await.nip_enabled(43) || self.key.is_none() {
+            return false;
+        }
+        let removed = self
+            .mutate_roles(
+                super::BufferedRoleMutation::DeleteClaim {
+                    claim: claim.to_string(),
+                },
+                |roles| {
+                    let removed = roles.remove_claim(claim);
+                    (removed, removed)
+                },
+            )
+            .await;
+        if removed {
+            self.schedule_roles_persist();
+        }
+        true
+    }
+
+    /// Admits a `kind:28934` join by invite code: records the membership,
+    /// schedules the snapshot persist, and republishes the member list
+    /// with an add-user event (NIP-43 SHOULD + MAY). Returns false only
+    /// when NIP-43 is disabled or the relay key is missing (the caller
+    /// reports a retryable error instead of a false welcome).
+    pub(crate) async fn admit_member(&self, pubkey: &str) -> bool {
+        if !self.config.read().await.nip_enabled(43) || self.key.is_none() {
+            return false;
+        }
+        let added = self
+            .mutate_roles(
+                super::BufferedRoleMutation::AdmitMember {
+                    pubkey: pubkey.to_string(),
+                },
+                |roles| {
+                    if roles.assignments.contains_key(pubkey) {
+                        (false, false)
+                    } else {
+                        roles.admit(pubkey);
+                        (true, true)
+                    }
+                },
+            )
+            .await;
+        if added {
+            self.schedule_roles_persist();
+            // A failed republish is logged, not fatal: the membership is
+            // recorded and the next change republishes the full list (same
+            // contract as the leave path).
+            if !self
+                .publish_membership(Some((true, pubkey.to_string())))
+                .await
+            {
+                log::warn!(
+                    "admit_member: the membership list could not be republished; {pubkey} may be missing from kind 13534 until the next change"
+                );
+            }
+        }
+        true
     }
 
     /// NIP-43 leave request: removes the user from the member list and

@@ -465,7 +465,28 @@ enum Msg {
         reply: oneshot::Sender<anyhow::Result<bool>>,
     },
     ListBanned {
-        reply: oneshot::Sender<Vec<(String, String)>>,
+        /// `Err` is a store/read failure — a failed lookup must surface
+        /// instead of an empty list (the operator would believe "no bans").
+        reply: oneshot::Sender<anyhow::Result<Vec<(String, String)>>>,
+    },
+    Allow {
+        id: Vec<u8>,
+        reason: String,
+        /// `Ok(unbanned)`: whether a ban entry was removed alongside the
+        /// allow marker (a missing ban is a no-op success, per NIP-86's
+        /// always-`true` result). `Err` is a store failure.
+        reply: oneshot::Sender<anyhow::Result<bool>>,
+    },
+    Unallow {
+        id: Vec<u8>,
+        /// `Ok(removed)`: whether an allow marker existed (a missing
+        /// marker is a no-op success). `Err` is a store failure.
+        reply: oneshot::Sender<anyhow::Result<bool>>,
+    },
+    ListAllowed {
+        /// `Err` is a store/read failure — like `ListBanned`, a failed
+        /// lookup must surface instead of an empty list.
+        reply: oneshot::Sender<anyhow::Result<Vec<(String, String)>>>,
     },
     /// Persists the access control lists (NIP-86 runtime bans/allowlists).
     SaveAccess {
@@ -2209,8 +2230,75 @@ impl DbClient {
         .ok_or_else(|| anyhow::anyhow!("database writer unavailable"))?
     }
 
-    pub async fn list_banned_events(&self) -> Vec<(String, String)> {
-        self.request_read(|reply| Msg::ListBanned { reply }).await
+    /// Records an event id on the allow list (NIP-86 allowevent) and
+    /// removes it from the ban list, atomically. `Ok` always reports
+    /// success at the RPC layer (a missing ban is a no-op); only a store
+    /// failure is an `Err`.
+    pub async fn allow_event(&self, id: [u8; 32], reason: &str) -> anyhow::Result<bool> {
+        self.request_write_checked(|reply| Msg::Allow {
+            id: id.to_vec(),
+            reason: reason.to_string(),
+            reply,
+        })
+        .await
+        .ok_or_else(|| anyhow::anyhow!("database writer unavailable"))?
+    }
+
+    /// Removes an event id from the allow list (NIP-86 unallowevent).
+    /// `Ok(false)` for a missing marker is a no-op success; only a store
+    /// failure is an `Err`.
+    pub async fn unallow_event(&self, id: [u8; 32]) -> anyhow::Result<bool> {
+        self.request_write_checked(|reply| Msg::Unallow {
+            id: id.to_vec(),
+            reply,
+        })
+        .await
+        .ok_or_else(|| anyhow::anyhow!("database writer unavailable"))?
+    }
+
+    /// Lists banned event ids with reasons. A failed lookup is an `Err`
+    /// (never an empty list): the operator must not believe "no bans"
+    /// while the database is unavailable.
+    pub async fn list_banned_events(&self) -> anyhow::Result<Vec<(String, String)>> {
+        let channel = self.read_channel();
+        let Some(rx) = self.send_request_read(|reply| Msg::ListBanned { reply }, channel) else {
+            return Err(anyhow::anyhow!("database reader unavailable"));
+        };
+        if self.timeout_secs == 0 {
+            return rx
+                .await
+                .map_err(|_| anyhow::anyhow!("database reader unavailable"))?;
+        }
+        match tokio::time::timeout(std::time::Duration::from_secs(self.timeout_secs), rx).await {
+            Ok(Ok(value)) => value,
+            _ => {
+                self.errors
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Err(anyhow::anyhow!("database read timed out"))
+            }
+        }
+    }
+
+    /// Lists allowed event ids with reasons. A failed lookup is an `Err`
+    /// (never an empty list), like [`Self::list_banned_events`].
+    pub async fn list_allowed_events(&self) -> anyhow::Result<Vec<(String, String)>> {
+        let channel = self.read_channel();
+        let Some(rx) = self.send_request_read(|reply| Msg::ListAllowed { reply }, channel) else {
+            return Err(anyhow::anyhow!("database reader unavailable"));
+        };
+        if self.timeout_secs == 0 {
+            return rx
+                .await
+                .map_err(|_| anyhow::anyhow!("database reader unavailable"))?;
+        }
+        match tokio::time::timeout(std::time::Duration::from_secs(self.timeout_secs), rx).await {
+            Ok(Ok(value)) => value,
+            _ => {
+                self.errors
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Err(anyhow::anyhow!("database read timed out"))
+            }
+        }
     }
 
     /// Persists the access control lists (NIP-86 runtime bans/allowlists).

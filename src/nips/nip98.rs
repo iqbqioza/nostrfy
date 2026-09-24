@@ -97,6 +97,7 @@ pub fn verify(
     Some(Verified {
         pubkey: event.pubkey,
         id: event.id,
+        created_at: event.created_at,
     })
 }
 
@@ -107,11 +108,14 @@ pub fn payload_sha256_hex(data: &[u8]) -> String {
     hex::encode(Sha256::digest(data))
 }
 
-/// A verified NIP-98 authorization: the author pubkey and the auth event id
-/// (the caller records the id in its replay guard).
+/// A verified NIP-98 authorization: the author pubkey, the auth event id
+/// (the caller records the id in its replay guard), and the event's
+/// `created_at` (the guard must remember the id for the whole interval
+/// the event still verifies).
 pub struct Verified {
     pub pubkey: String,
     pub id: String,
+    pub created_at: u64,
 }
 
 /// NIP-98 replay guard: "the `u` tag MUST be exactly the same as the
@@ -147,11 +151,16 @@ impl ReplayGuard {
     /// Minimum seconds between capacity warnings.
     const WARNING_INTERVAL: u64 = 60;
 
-    /// Records `id` (valid until `now + 60`); returns `false` when it was
-    /// already used (a replay) or when the guard is full. Expired entries
-    /// are pruned first; a full guard of still-live authorizations rejects
-    /// the new one instead of evicting a live entry.
-    pub fn accept(&self, id: &str, now: u64) -> bool {
+    /// Records `id` (valid until the event stops verifying); returns
+    /// `false` when it was already used (a replay) or when the guard is
+    /// full. Expired entries are pruned first; a full guard of still-live
+    /// authorizations rejects the new one instead of evicting a live entry.
+    /// `valid_until` must cover the whole NIP-98 validity interval of the
+    /// event: callers pass its `created_at` and the guard extends past the
+    /// inclusive 60-second boundary, so a replay at the last valid second
+    /// (or inside a future-dated event's extended window) is still refused.
+    pub fn accept(&self, id: &str, now: u64, created_at: u64) -> bool {
+        let valid_until = created_at.saturating_add(61);
         let mut seen = self.seen.lock().unwrap_or_else(|p| p.into_inner());
         seen.retain(|_, expiry| *expiry > now);
         if seen.contains_key(id) {
@@ -164,7 +173,7 @@ impl ReplayGuard {
             self.warn_capacity(now);
             return false;
         }
-        seen.insert(id.to_string(), now.saturating_add(60));
+        seen.insert(id.to_string(), valid_until);
         true
     }
 
@@ -571,41 +580,67 @@ mod tests {
     #[test]
     fn replay_guard_rejects_reuse_within_the_window() {
         let guard = ReplayGuard::default();
-        assert!(guard.accept("aa", 1_000));
-        assert!(!guard.accept("aa", 1_000), "the same id is a replay");
-        assert!(!guard.accept("aa", 1_059), "still within the window");
+        assert!(guard.accept("aa", 1_000, 1_000));
+        assert!(!guard.accept("aa", 1_000, 1_000), "the same id is a replay");
+        assert!(!guard.accept("aa", 1_059, 1_059), "still within the window");
         // After the 60-second window the entry expires.
-        assert!(guard.accept("aa", 1_061));
+        assert!(guard.accept("aa", 1_061, 1_061));
         // Distinct ids are independent.
-        assert!(guard.accept("bb", 1_061));
+        assert!(guard.accept("bb", 1_061, 1_061));
+    }
+
+    #[test]
+    fn replay_guard_covers_the_full_validity_window() {
+        // The guard is keyed to the event's validity interval, not the
+        // first-accept time: a replay at the last valid second — or inside
+        // a future-dated event's extended window — is still refused.
+        let guard = ReplayGuard::default();
+        assert!(guard.accept("aa", 1_000, 1_000));
+        assert!(
+            !guard.accept("aa", 1_060, 1_060),
+            "the inclusive boundary second is still guarded"
+        );
+        assert!(guard.accept("aa", 1_061, 1_061));
+        // Future-dated event (created_at ahead): valid until
+        // created_at + 60, guarded that long.
+        assert!(guard.accept("bb", 1_000, 1_060));
+        assert!(
+            !guard.accept("bb", 1_061, 1_061),
+            "a future-dated auth stays guarded past first-accept + 60"
+        );
+        assert!(
+            !guard.accept("bb", 1_120, 1_120),
+            "still within created_at + 60"
+        );
+        assert!(guard.accept("bb", 1_121, 1_121));
     }
 
     #[test]
     fn replay_guard_rejects_new_entries_when_full_instead_of_evicting() {
         let guard = ReplayGuard::default();
         for n in 0..ReplayGuard::MAX_ENTRIES {
-            assert!(guard.accept(&format!("id-{n}"), 1_000));
+            assert!(guard.accept(&format!("id-{n}"), 1_000, 1_000));
         }
         // The guard is full of live entries: the new authorization is
         // refused (fail closed) instead of evicting a live one...
         assert!(
-            !guard.accept("new", 1_001),
+            !guard.accept("new", 1_001, 1_001),
             "a full guard must reject the new authorization"
         );
         // ...and no live entry was dropped to make room: the oldest and the
         // newest authorizations are both still tracked as replays.
         assert!(
-            !guard.accept("id-0", 1_001),
+            !guard.accept("id-0", 1_001, 1_001),
             "the oldest live entry must not be evicted"
         );
         assert!(
-            !guard.accept("id-4095", 1_001),
+            !guard.accept("id-4095", 1_001, 1_001),
             "the newest entry remains protected from replay"
         );
         // Once the 60-second window passes, all entries expire and the guard
         // drains by itself.
         assert!(
-            guard.accept("new", 1_061),
+            guard.accept("new", 1_061, 1_061),
             "acceptance resumes after the live entries expire"
         );
     }

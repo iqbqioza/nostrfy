@@ -823,7 +823,7 @@ fn banned_events_are_removed_and_rejected() {
         // Re-publication is rejected.
         assert!(matches!(db.put(ev, now).await, PutOutcome::Invalid(_)));
         // Listed with the reason.
-        let banned = db.list_banned_events().await;
+        let banned = db.list_banned_events().await.unwrap();
         assert_eq!(banned, vec![(hex::encode(id), "spam".to_string())]);
         // Unbanning restores publication.
         assert!(db.unban_event(id).await.unwrap());

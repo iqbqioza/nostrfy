@@ -471,6 +471,7 @@ Set this whenever a reverse proxy (nginx, Caddy, a cloud load balancer, Cloudfla
 | `blocked_kinds` | array of integers | `[]` | Kinds to reject |
 | `allowed_kinds` | array of integers | `[]` | Kind allowlist — when non-empty, only these kinds are accepted |
 | `blocked_ips` | array of strings | `[]` | IP addresses refused at connection time |
+| `method_grants` | table pubkey → array of strings | `{}` | NIP-86 method grants for non-admin pubkeys (managed at runtime with `assignmethod`) |
 
 ### Key details
 
@@ -500,6 +501,8 @@ nostrfy restart                        # the daemon holds the list in memory
 ```
 
 Remove the address from `access.blocked_ips` in the config too when it is listed there.
+
+**`method_grants`** — NIP-86 method grants for non-admin pubkeys (pubkey → method names, e.g. a moderator allowed `banevent` and `listbannedevents`). Seeded from the config on the first run, then managed at runtime with NIP-86 `assignmethod`/`unassignmethod` (inspected with `listmethodassignees`); like the other access lists the runtime state wins afterwards. Only moderation and read methods are grantable (`supportedmethods` needs no grant) — permission, role, invite-claim and relay-identity management stay admin-only. A banned pubkey is refused even with grants.
 
 All CLI access mutations (`nostrfy relay allow/deny`, `nostrfy blossom allow/deny`, `nostrfy access unblockip`) serialize their read-modify-write with an advisory `flock` on `<database.path>/access.lock` and commit their changes in one LMDB transaction. The lock file is a marker only (its contents are never read) and can be left in place. For the cross-process guarantee — a daemon ban and a CLI mutation cannot overwrite each other — the daemon's NIP-86 access persistence must take the same lock around its own write (the CLI holds it for the whole read-modify-write).
 
@@ -728,6 +731,9 @@ restrict_relay = false
 blocked_kinds = []
 allowed_kinds = []
 blocked_ips = []
+
+[access.method_grants]
+# "<64-hex-pubkey>" = ["banevent", "listbannedevents"]
 
 [blossom]
 host = ""

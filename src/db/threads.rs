@@ -283,13 +283,24 @@ fn handle_read_msg(store: &Store, errors: &Arc<std::sync::atomic::AtomicU64>, ms
         }
         Msg::ListBanned { reply } => {
             let banned = match store.list_banned() {
-                Ok(banned) => banned,
+                Ok(banned) => Ok(banned),
                 Err(e) => {
                     db_error(errors, &e);
-                    Vec::new()
+                    Err(e)
                 }
             };
             let _ = reply.send(banned);
+            false
+        }
+        Msg::ListAllowed { reply } => {
+            let allowed = match store.list_allowed() {
+                Ok(allowed) => Ok(allowed),
+                Err(e) => {
+                    db_error(errors, &e);
+                    Err(e)
+                }
+            };
+            let _ = reply.send(allowed);
             false
         }
         Msg::AggregateSample { limit, now, reply } => {
@@ -1297,15 +1308,45 @@ pub(crate) fn spawn(
                                     };
                                     let _ = reply.send(out);
                                 }
-                                Msg::ListBanned { reply } => {
-                                    let banned = match store.list_banned() {
-                                        Ok(banned) => banned,
+                                Msg::Allow { id, reason, reply } => {
+                                    let out = match store.apply_allow(&id, &reason) {
+                                        Ok(out) => Ok(out),
                                         Err(e) => {
                                             db_error(&thread_errors, &e);
-                                            Vec::new()
+                                            Err(e)
+                                        }
+                                    };
+                                    let _ = reply.send(out);
+                                }
+                                Msg::Unallow { id, reply } => {
+                                    let out = match store.apply_unallow(&id) {
+                                        Ok(out) => Ok(out),
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            Err(e)
+                                        }
+                                    };
+                                    let _ = reply.send(out);
+                                }
+                                Msg::ListBanned { reply } => {
+                                    let banned = match store.list_banned() {
+                                        Ok(banned) => Ok(banned),
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            Err(e)
                                         }
                                     };
                                     let _ = reply.send(banned);
+                                }
+                                Msg::ListAllowed { reply } => {
+                                    let allowed = match store.list_allowed() {
+                                        Ok(allowed) => Ok(allowed),
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            Err(e)
+                                        }
+                                    };
+                                    let _ = reply.send(allowed);
                                 }
                                 Msg::SaveAccess { access, reply } => {
                                     let ok = match store.save_access(&access) {

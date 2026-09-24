@@ -143,6 +143,9 @@ pub(crate) const EXPIRY: &str = "expiry";
 pub(crate) const REPLACEABLE: &str = "replaceable";
 pub(crate) const VANISH: &str = "vanish";
 pub(crate) const BANNED: &str = "banned";
+/// NIP-86 event allowlist: event id -> reason. Mutually exclusive with
+/// the ban list (adding to one removes from the other, atomically).
+pub(crate) const ALLOWED: &str = "allowed";
 pub(crate) const FIRST_SEEN: &str = "first_seen";
 pub(crate) const ACCESS: &str = "access";
 /// sha256 → blob metadata (mime/size/uploaded/owners) plus the per-owner
@@ -563,6 +566,8 @@ pub(crate) struct Store {
     pub(crate) replaceable: Database<Bytes, Bytes>,
     pub(crate) vanish: Database<Bytes, Bytes>,
     pub(crate) banned: Database<Bytes, Bytes>,
+    /// NIP-86 event allowlist markers (see [`ALLOWED`]).
+    pub(crate) allowed: Database<Bytes, Bytes>,
     /// pubkey (32 bytes) -> unix timestamp of the first accepted event.
     pub(crate) first_seen: Database<Bytes, Bytes>,
     /// Serialized access control lists (NIP-86 runtime bans/allowlists), kept
@@ -710,8 +715,8 @@ impl Store {
         let map_size = map_max_size as usize;
         let env = unsafe {
             EnvOpenOptions::new()
-                // 21 named tables, plus the word index when search is on.
-                .max_dbs(cfg.max_dbs.max(22))
+                // 22 named tables, plus the word index when search is on.
+                .max_dbs(cfg.max_dbs.max(23))
                 // Every reader thread can hold a concurrent read transaction,
                 // the writer/API/startup paths take slots too, and some read
                 // paths nest a second transaction inside the first
@@ -763,6 +768,7 @@ impl Store {
         let replaceable = env.create_database::<Bytes, Bytes>(&mut wtxn, Some(REPLACEABLE))?;
         let vanish = env.create_database::<Bytes, Bytes>(&mut wtxn, Some(VANISH))?;
         let banned = env.create_database::<Bytes, Bytes>(&mut wtxn, Some(BANNED))?;
+        let allowed = env.create_database::<Bytes, Bytes>(&mut wtxn, Some(ALLOWED))?;
         let first_seen = env.create_database::<Bytes, Bytes>(&mut wtxn, Some(FIRST_SEEN))?;
         let access = env.create_database::<Bytes, Bytes>(&mut wtxn, Some(ACCESS))?;
         let blossom = env.create_database::<Bytes, Bytes>(&mut wtxn, Some(BLOSSOM))?;
@@ -831,6 +837,7 @@ impl Store {
             replaceable,
             vanish,
             banned,
+            allowed,
             first_seen,
             access,
             blossom,
@@ -955,6 +962,7 @@ impl Store {
             replaceable: self.replaceable,
             vanish: self.vanish,
             banned: self.banned,
+            allowed: self.allowed,
             first_seen: self.first_seen,
             access: self.access,
             blossom: self.blossom,

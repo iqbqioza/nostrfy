@@ -491,15 +491,24 @@ curl -X POST http://127.0.0.1:8080/ \
 | `unallowpubkey` | `["pubkey"]` | Remove from the allowlist |
 | `listallowedpubkeys` | `[]` | List the allowlist |
 | `allowkind` / `disallowkind` | `[kind]` | Allow / disallow a kind |
-| `listallowedkinds` | `[]` | List allowed kinds |
-| `changerelayname` / `changerelaydescription` / `changerelayicon` | `["new value"]` | Change the relay name / description / icon (**persisted to the config file**) |
-| `createrole` / `editrole` / `deleterole` | `[id, label, description, color, order]` | NIP-43 role management |
+| `listallowedkinds` / `listdisallowedkinds` | `[]` | List allowed / disallowed kinds |
+| `changerelayname` / `changerelaydescription` / `changerelayicon` | `["new value"]` | Change the relay name / description / icon (**persisted to the config file**; reports an error when the file cannot be written) |
+| `createrole` / `editrole` / `deleterole` | `[id, label, description, color, order]` | NIP-43 role management (wrong-typed fields are rejected; deleting a missing role succeeds) |
 | `assignrole` / `unassignrole` | `["pubkey", "role id"]` | Assign / unassign a role (a duplicate grant or missing revocation succeeds) |
+| `assignmethod` / `unassignmethod` | `["pubkey", "method"]` | Grant / revoke a NIP-86 method to a non-admin pubkey (result `[true, "message"]`; only moderation and read methods are grantable, `supportedmethods` needs no grant) |
+| `listmethodassignees` | `[]` | List method grants (`[{pubkey, methods}]`) |
 | `blockip` / `unblockip` | `["ip", "reason (optional)"]` | Block / unblock an IP (**blocking also drops existing connections**) |
 | `listblockedips` | `[]` | List blocked IPs |
-| `banevent` / `allowevent` | `["event id", "reason (optional)"]` | Ban / unban an event (banning an unknown id pre-bans it; unbanning a never-banned id succeeds) |
-| `listbannedevents` | `[]` | List banned events |
+| `banevent` | `["event id", "reason (optional)"]` | Ban an event (banning an unknown id pre-bans it; also removes it from the allow list) |
+| `allowevent` | `["event id", "reason (optional)"]` | Add an event to the allow list (also lifts the ban; allowing an unknown id pre-allows it) |
+| `unallowevent` / `unbanevent` | `["event id"]` | Remove an event from the allow / ban list (a missing entry succeeds) |
+| `listbannedevents` | `[]` | List banned events (a failed lookup surfaces an error, never an empty list) |
+| `listallowedevents` | `[]` | List allowed events |
 | `listeventsneedingmoderation` | `[]` | Events awaiting moderation (always empty on this relay) |
+| `listclaims` | `[]` | List NIP-43 invite codes |
+| `createclaim` / `deleteclaim` | `["claim"]` | Issue / revoke a NIP-43 invite code (a `kind:28934` carrying a listed code admits its author) |
+
+> **Delegated administration**: `rpc.admin_pubkey` (and the management token) stay the root login with every method. Other pubkeys authenticate with NIP-98 and may only run their `assignmethod`-granted methods (`supportedmethods` shows their own subset). Permission, role, invite-claim and relay-identity management stay admin-only, so a grantee can never escalate. A banned pubkey is refused even with grants.
 
 ---
 
@@ -521,7 +530,7 @@ curl -X POST http://127.0.0.1:8080/ \
 | 34 | git stuff (kinds 1617-1619, 1621, 1622, 1630-1633, 30617/30618 — **opt-in** via `relay.enabled_git`, off by default) |
 | 40 | Expiration timestamp |
 | 42 | Client authentication |
-| 43 | Relay access metadata (roles) — kinds 33534/13534/8000/8001 plus ephemeral 28934/28935/28936; the relay-signed metadata events (33534/13534/8000/8001) carry the NIP-70 `-` tag as the spec requires, so they are only served to authenticated clients (AUTH-gated, like NIP-78) |
+| 43 | Relay access metadata (roles) — kinds 33534/13534/8000/8001 plus ephemeral 28934/28935/28936; the relay-signed metadata events (33534/13534/8000/8001) carry the NIP-70 `-` tag as the spec requires, so they are only served to authenticated clients (AUTH-gated, like NIP-78). Invite codes are issued with NIP-86 `createclaim`/`deleteclaim` (listed by `listclaims`); a `kind:28934` carrying a listed `claim` tag admits its author to the member list |
 | 45 | Counting results (COUNT / HyperLogLog) |
 | 46 | Nostr Connect (ephemeral kind 24133, exempt from `reject_ephemeral`) |
 | 47 | Nostr Wallet Connect (ephemeral kinds 23194/23195, exempt from `reject_ephemeral`) |
@@ -1036,7 +1045,8 @@ clients can display the migrated groups and members.
   gating, ...): the merge report lists each one with the reason and the
   suggested replacement.
 - Blossom media and its owner mappings (strfry has no Blossom server).
-- Access lists (NIP-86 bans, relay pubkey lists, Blossom allowlist).
+- Access lists (NIP-86 bans, relay pubkey lists, Blossom allowlist, NIP-86 method grants).
+- NIP-43 invite codes (`createclaim`): they have no events behind them, so a migration cannot carry them — issue new codes afterwards.
 - NIP-62 vanish requests, unless `--apply-vanish` is given: strfry does not
   implement NIP-62, so the events those requests name were served by strfry
   and are part of the migrated data. With the flag (and NIP-62 enabled in

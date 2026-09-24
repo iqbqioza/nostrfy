@@ -556,6 +556,18 @@ enum BufferedRoleMutation {
     RemovePubkey {
         pubkey: String,
     },
+    /// NIP-86 `createclaim` / `deleteclaim` (invite codes have no events
+    /// behind them, so the snapshot is their only persistence).
+    CreateClaim {
+        claim: String,
+    },
+    DeleteClaim {
+        claim: String,
+    },
+    /// A `kind:28934` join admitted by invite code.
+    AdmitMember {
+        pubkey: String,
+    },
 }
 
 /// Which derived stores a removal of stored events invalidates: a NIP-29
@@ -604,6 +616,15 @@ fn replay_role_mutation(store: &mut RoleStore, mutation: &BufferedRoleMutation) 
         }
         BufferedRoleMutation::RemovePubkey { pubkey } => {
             store.remove_pubkey(pubkey);
+        }
+        BufferedRoleMutation::CreateClaim { claim } => {
+            store.add_claim(claim);
+        }
+        BufferedRoleMutation::DeleteClaim { claim } => {
+            store.remove_claim(claim);
+        }
+        BufferedRoleMutation::AdmitMember { pubkey } => {
+            store.admit(pubkey);
         }
     }
 }
@@ -2118,14 +2139,14 @@ impl Relay {
     /// methods) to the config file, preserving comments and unrelated
     /// lines. A failure only warns: the change stays applied in memory
     /// until the next config reload.
-    pub async fn persist_relay_field(&self, field: &str, value: &str) {
+    pub async fn persist_relay_field(&self, field: &str, value: &str) -> bool {
         let Some(path) = self.config_path.read().await.clone() else {
             log::warn!(
                 "cannot persist relay.{field}: the config file path is unknown \
                  (running without a config file?); the change applies until the \
                  next config reload"
             );
-            return;
+            return false;
         };
         match std::fs::read_to_string(&path) {
             Ok(text) => {
@@ -2142,7 +2163,7 @@ impl Relay {
                              until the next config reload",
                             path.display()
                         );
-                        return;
+                        return false;
                     }
                 };
                 if let Err(e) = crate::config::write_text_atomic(&path, &updated) {
@@ -2151,13 +2172,16 @@ impl Relay {
                          until the next config reload",
                         path.display()
                     );
+                    return false;
                 }
+                true
             }
             Err(e) => {
                 log::warn!(
                     "cannot read {} to persist relay.{field}: {e}",
                     path.display()
                 );
+                false
             }
         }
     }
@@ -2206,6 +2230,29 @@ impl Relay {
                 return PutOutcome::Invalid(reason);
             }
             crate::relay::validate::Precheck::Duplicate(msg) => {
+                self.stats.bump(&self.stats.events_duplicate, 1);
+                return PutOutcome::Duplicate(msg);
+            }
+            crate::relay::validate::Precheck::Admit(msg) => {
+                // NIP-43 join by invite code (ephemeral, never stored):
+                // record the membership like a vanish records its removal
+                // (the access gates above are intentionally bypassed for
+                // the admission itself: the code is the authorization).
+                // The event pubkey was signature-verified before the
+                // precheck, so it names the joiner.
+                drop(cfg);
+                drop(access);
+                if !self.admit_member(&event.pubkey).await {
+                    // NIP-43 is disabled or the relay key is missing: the
+                    // membership was not recorded, so a welcome would lie.
+                    self.stats.bump(&self.stats.events_rejected, 1);
+                    return PutOutcome::Invalid(
+                        "error: membership could not be recorded; retry".into(),
+                    );
+                }
+                // Acknowledged without storing (the welcome text rides the
+                // duplicate-style ack): counted like the member-rejoin
+                // verdict below.
                 self.stats.bump(&self.stats.events_duplicate, 1);
                 return PutOutcome::Duplicate(msg);
             }
@@ -2646,6 +2693,27 @@ impl Relay {
                 crate::relay::validate::Precheck::Duplicate(msg) => {
                     // Already stored: its id is a valid reference even
                     // though this reply is a duplicate.
+                    Self::insert_event_prefixes(&mut known_set, &id);
+                    self.stats.bump(&self.stats.events_duplicate, 1);
+                    results.push((id, PutOutcome::Duplicate(msg)));
+                    continue;
+                }
+                crate::relay::validate::Precheck::Admit(msg) => {
+                    // NIP-43 join by invite code: admit inline (the
+                    // membership mutation is idempotent, like the
+                    // single-event path above) and acknowledge without
+                    // storing the ephemeral request (welcome text rides
+                    // the duplicate-style ack).
+                    if !self.admit_member(&event.pubkey).await {
+                        self.stats.bump(&self.stats.events_rejected, 1);
+                        results.push((
+                            id,
+                            PutOutcome::Invalid(
+                                "error: membership could not be recorded; retry".into(),
+                            ),
+                        ));
+                        continue;
+                    }
                     Self::insert_event_prefixes(&mut known_set, &id);
                     self.stats.bump(&self.stats.events_duplicate, 1);
                     results.push((id, PutOutcome::Duplicate(msg)));
@@ -3976,7 +4044,7 @@ mod tests {
         let keyless = build_role_relay(None).await;
         assert!(!keyless.create_role("r1", "R", "", "", None).await);
         assert_eq!(keyless.assign_role(&member, "r1").await, RoleChange::Failed);
-        assert!(!keyless.delete_role("r1").await);
+        assert_eq!(keyless.delete_role("r1").await, RoleChange::Failed);
         assert!(
             !keyless
                 .publish_membership(Some((true, member.clone())))
@@ -4027,8 +4095,8 @@ mod tests {
 
         // delete a missing role fails; the real one succeeds and stores a
         // tombstone (kind 33534 with a `deleted` tag).
-        assert!(!relay.delete_role("nope").await);
-        assert!(relay.delete_role("r1").await);
+        assert_eq!(relay.delete_role("nope").await, RoleChange::Noop);
+        assert_eq!(relay.delete_role("r1").await, RoleChange::Applied);
         assert!(!relay.roles.read().await.roles.contains_key("r1"));
 
         // A leave request from a member removes and republishes; a
@@ -5218,7 +5286,10 @@ mod tests {
         let relay = build_relay().await;
         // No config path: the change warns and stays in memory.
         *relay.config_path.write().await = None;
-        relay.persist_relay_field("name", "newname").await;
+        assert!(
+            !relay.persist_relay_field("name", "newname").await,
+            "an unpersisted change must report failure"
+        );
         // A writable temp config: the field is updated on disk.
         let dir = std::env::temp_dir().join("nostrfy-persist-field-test");
         let _ = std::fs::remove_dir_all(&dir);
@@ -5226,7 +5297,7 @@ mod tests {
         let path = dir.join("nostrfy.toml");
         std::fs::write(&path, "[relay]\nname = \"old\"\ndescription = \"d\"\n").unwrap();
         *relay.config_path.write().await = Some(path.clone());
-        relay.persist_relay_field("name", "newname").await;
+        assert!(relay.persist_relay_field("name", "newname").await);
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(
             text.contains("newname"),
@@ -5234,7 +5305,10 @@ mod tests {
         );
         // An unreadable path warns and leaves the in-memory change applied.
         *relay.config_path.write().await = Some(dir.join("missing.toml"));
-        relay.persist_relay_field("description", "x").await;
+        assert!(
+            !relay.persist_relay_field("description", "x").await,
+            "an unwritable path must report failure"
+        );
         let _ = std::fs::remove_dir_all(&dir);
         relay.db.shutdown();
     }

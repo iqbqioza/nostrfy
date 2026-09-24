@@ -87,7 +87,9 @@ pub(crate) async fn livekit_token(
         });
     match authed {
         Some(verified)
-            if relay.nip98_replay.accept(&verified.id, unix_now())
+            if relay
+                .nip98_replay
+                .accept(&verified.id, unix_now(), verified.created_at)
                 && group_allows(&relay, &group, &verified.pubkey.to_ascii_lowercase()).await =>
         {
             // NIP-29: the JWT `sub` starts with the *lowercase* hex

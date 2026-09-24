@@ -1740,6 +1740,12 @@ pub struct AccessControl {
     /// may publish. When false (default), everyone except the denied
     /// pubkeys may publish.
     pub restrict_relay: bool,
+    /// NIP-86 method grants (NIP-86 PR #2439): pubkey (lowercase hex) →
+    /// method names the pubkey may call. Only consulted for non-admin
+    /// identities; the admin pubkey and the management token bypass it.
+    /// Persisted in LMDB with the rest of the access state; absent in old
+    /// snapshots (serde default) means no grants.
+    pub method_grants: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 /// The runtime blocked-IP list: the persisted `(ip, reason)` entries plus a
@@ -1884,6 +1890,14 @@ pub enum AccessOp {
     UnblockIp {
         ip: std::net::IpAddr,
     },
+    GrantMethod {
+        pubkey: String,
+        method: String,
+    },
+    UngrantMethod {
+        pubkey: String,
+        method: String,
+    },
 }
 
 /// Applies one [`AccessOp`] to an access state. Mirrors the NIP-86 and/// command-event mutation code exactly (including which list wins on a
@@ -1979,6 +1993,27 @@ pub fn apply_access_op(state: &mut AccessControl, op: &AccessOp) {
         AccessOp::UnblockIp { ip } => {
             state.blocked_ips.remove(*ip);
         }
+        AccessOp::GrantMethod { pubkey, method } => {
+            // Stored lowercase (like the pubkey lists); the grant check
+            // compares case-insensitively, so a mixed-case replay and the
+            // live mutation converge on the same entry.
+            let pubkey = pubkey.to_ascii_lowercase();
+            let methods = state.method_grants.entry(pubkey).or_default();
+            if !methods.iter().any(|m| m == method) {
+                methods.push(method.clone());
+            }
+        }
+        AccessOp::UngrantMethod { pubkey, method } => {
+            if let Some(methods) = state
+                .method_grants
+                .iter_mut()
+                .find(|(entry, _)| entry.eq_ignore_ascii_case(pubkey))
+                .map(|(_, methods)| methods)
+            {
+                methods.retain(|m| m != method);
+            }
+            state.method_grants.retain(|_, methods| !methods.is_empty());
+        }
     }
 }
 
@@ -2014,6 +2049,14 @@ pub fn access_seed_ops(seed: &AccessControl) -> Vec<AccessOp> {
             ops.push(AccessOp::BlockIp {
                 ip: crate::util::normalize_ip(ip),
                 reason: reason.clone(),
+            });
+        }
+    }
+    for (pubkey, methods) in &seed.method_grants {
+        for method in methods {
+            ops.push(AccessOp::GrantMethod {
+                pubkey: pubkey.clone(),
+                method: method.clone(),
             });
         }
     }
@@ -2074,6 +2117,16 @@ impl AccessControl {
             return false;
         }
         self.allowed_kinds.is_empty() || self.allowed_kinds.contains(&kind)
+    }
+
+    /// Whether `pubkey` was granted `method` through NIP-86
+    /// `assignmethod`. Compared case-insensitively: entries are stored
+    /// lowercase (like the pubkey lists), while wire pubkeys may be
+    /// uppercase hex.
+    pub fn grants_method(&self, pubkey: &str, method: &str) -> bool {
+        self.method_grants.iter().any(|(entry, methods)| {
+            entry.eq_ignore_ascii_case(pubkey) && methods.iter().any(|m| m == method)
+        })
     }
 
     /// Whether `peer` is on the blocked-IP list (normalized comparison).
@@ -2683,6 +2736,7 @@ fn known_config_keys() -> &'static [(&'static str, &'static [&'static str])] {
                 "allowed_kinds",
                 "blocked_ips",
                 "restrict_relay",
+                "method_grants",
             ],
         ),
         (
@@ -3743,6 +3797,7 @@ max_log_files = 2
             allowed_kinds: vec![],
             blocked_ips: vec![("203.0.113.9".into(), String::new())].into(),
             restrict_relay: false,
+            method_grants: Default::default(),
         };
         let json = serde_json::to_string(&legacy).unwrap();
         // Simulate the pre-reason persisted document.
@@ -4207,6 +4262,14 @@ max_log_files = 2
                 ip: "203.0.113.7".parse().unwrap(),
                 reason: String::new(),
             },
+            AccessOp::GrantMethod {
+                pubkey: "c".into(),
+                method: "banevent".into(),
+            },
+            AccessOp::UngrantMethod {
+                pubkey: "c".into(),
+                method: "allowevent".into(),
+            },
         ];
         for op in &ops {
             apply_access_op(&mut state, op);
@@ -4219,6 +4282,45 @@ max_log_files = 2
         assert_eq!(state.allowed_pubkeys, once.allowed_pubkeys);
         assert_eq!(state.blocked_kinds, once.blocked_kinds);
         assert_eq!(state.blocked_ips.entries(), once.blocked_ips.entries());
+        assert_eq!(state.method_grants, once.method_grants);
+    }
+
+    #[test]
+    fn method_grants_match_case_insensitively_and_deduplicate() {
+        // Entries are stored lowercase; the check is case-insensitive and
+        // replays converge (no duplicate method entries).
+        let mut state = AccessControl::default();
+        let pk = "aa".repeat(32);
+        apply_access_op(
+            &mut state,
+            &AccessOp::GrantMethod {
+                pubkey: pk.to_ascii_uppercase(),
+                method: "banevent".into(),
+            },
+        );
+        assert!(state.grants_method(&pk, "banevent"));
+        assert!(state.grants_method(&pk.to_ascii_uppercase(), "banevent"));
+        assert!(!state.grants_method(&pk, "allowevent"));
+        apply_access_op(
+            &mut state,
+            &AccessOp::GrantMethod {
+                pubkey: pk.clone(),
+                method: "banevent".into(),
+            },
+        );
+        assert_eq!(state.method_grants[&pk].len(), 1, "no duplicate grants");
+        apply_access_op(
+            &mut state,
+            &AccessOp::UngrantMethod {
+                pubkey: pk.to_ascii_uppercase(),
+                method: "banevent".into(),
+            },
+        );
+        assert!(!state.grants_method(&pk, "banevent"));
+        assert!(
+            !state.method_grants.contains_key(&pk),
+            "empty grant entries are pruned"
+        );
     }
 
     #[test]
