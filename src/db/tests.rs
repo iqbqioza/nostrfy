@@ -815,7 +815,7 @@ fn banned_events_are_removed_and_rejected() {
         let ev = event(1, "to be banned", now, vec![]);
         assert_eq!(db.put(ev.clone(), now).await, PutOutcome::Stored);
         let id = ev.id_bytes().unwrap();
-        assert_eq!(db.ban_event(id, "spam").await, (true, false));
+        assert_eq!(db.ban_event(id, "spam").await.unwrap(), (true, false));
         // Removed from queries.
         let f: Filter = serde_json::from_value(serde_json::json!({"kinds": [1]})).unwrap();
         let (res, _) = db.query(vec![f], 500, now).await;
@@ -826,7 +826,7 @@ fn banned_events_are_removed_and_rejected() {
         let banned = db.list_banned_events().await;
         assert_eq!(banned, vec![(hex::encode(id), "spam".to_string())]);
         // Unbanning restores publication.
-        assert!(db.unban_event(id).await);
+        assert!(db.unban_event(id).await.unwrap());
         let (res, _) = db.query(vec![Filter::default()], 500, now).await;
         assert!(res.is_empty(), "the event itself was removed");
     });
@@ -857,7 +857,9 @@ fn banning_state_event_advances_derived_stamp() {
         assert_eq!(db.put(grant.clone(), now).await, PutOutcome::Stored);
         let base = db.state_stamp().await;
         assert_eq!(
-            db.ban_event(plain.id_bytes().unwrap(), "spam").await,
+            db.ban_event(plain.id_bytes().unwrap(), "spam")
+                .await
+                .unwrap(),
             (true, false)
         );
         assert_eq!(
@@ -866,7 +868,9 @@ fn banning_state_event_advances_derived_stamp() {
             "ordinary bans must not touch the stamp"
         );
         assert_eq!(
-            db.ban_event(grant.id_bytes().unwrap(), "spam").await,
+            db.ban_event(grant.id_bytes().unwrap(), "spam")
+                .await
+                .unwrap(),
             (true, true)
         );
         assert!(

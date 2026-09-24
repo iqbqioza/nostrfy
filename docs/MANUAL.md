@@ -217,7 +217,7 @@ To generate a secret key, use the `nostrfy genkey` command (see [5. Command Refe
 | `max_subscriptions` | Max subscriptions per connection | `20` |
 | `max_limit` | Ceiling for the REQ `limit` | `500` |
 | `max_count` | Ceiling for COUNT aggregation | `2000` |
-| `max_sub_id_len` | Max subscription id length | `64` |
+| `max_sub_id_len` | Max subscription id length in **characters** (not bytes) | `64` |
 | `max_content_bytes` | Max event content length in **characters** (not bytes — non-ASCII text is fine) | `65536` |
 | `max_tags` | Max tags per event | `2000` |
 | `max_tag_value_bytes` | Max bytes per tag value | `1024` |
@@ -484,7 +484,7 @@ curl -X POST http://127.0.0.1:8080/ \
 | Method | Params | Description |
 | --- | --- | --- |
 | `supportedmethods` | `[]` | List of supported methods |
-| `banpubkey` | `["pubkey", "reason (optional)"]` | Ban a pubkey from posting |
+| `banpubkey` | `["pubkey", "reason (optional)"]` | Ban a pubkey from posting (also removes it from the allowlist) |
 | `unbanpubkey` | `["pubkey"]` | Unban a pubkey |
 | `listbannedpubkeys` | `[]` | List banned pubkeys and reasons |
 | `allowpubkey` | `["pubkey", "reason (optional)"]` | Add to the allowlist (also un-bans) |
@@ -497,7 +497,7 @@ curl -X POST http://127.0.0.1:8080/ \
 | `assignrole` / `unassignrole` | `["pubkey", "role id"]` | Assign / unassign a role |
 | `blockip` / `unblockip` | `["ip", "reason (optional)"]` | Block / unblock an IP (**blocking also drops existing connections**) |
 | `listblockedips` | `[]` | List blocked IPs |
-| `banevent` / `allowevent` | `["event id", "reason (optional)"]` | Ban / unban an event |
+| `banevent` / `allowevent` | `["event id", "reason (optional)"]` | Ban / unban an event (banning an unknown id pre-bans it; unbanning a never-banned id succeeds) |
 | `listbannedevents` | `[]` | List banned events |
 | `listeventsneedingmoderation` | `[]` | Events awaiting moderation (always empty on this relay) |
 
@@ -598,7 +598,7 @@ From these moderation events, the relay generates the following **relay-signed s
 | `private` | Only members can read group **messages**. It does **not** hide the relay-generated metadata (39000 name/description, 39001/39002): those stay readable to everyone, as they are not the private content (the messages are). Use `hidden` to also hide the metadata from non-members |
 | `restricted` | Only members can write |
 | `hidden` | Metadata is hidden from non-members |
-| `closed` | Join requests are not auto-approved (invite codes required) |
+| `closed` | Join requests without a valid invite code are rejected (ignored — there is no pending queue) |
 
 > **Invite codes accumulate and are reusable**: a `kind:9009` adds codes to the group (it does not replace the set), and a code is not consumed by a join. Up to 100 codes are kept per group. To revoke a leaked code, delete the `9009` event that created it with a NIP-09 deletion request (the group state rebuilds from the surviving events, dropping the deleted event's codes).
 | `livekit` | The group has a LiveKit audio/video room |
@@ -662,11 +662,11 @@ Both backends use the `bucket/{npub1xxx}/{file}` hierarchy: every upload is stor
 | Method | Path | Auth | Description |
 | --- | --- | --- | --- |
 | `GET` | `/` | — | Blossom server info |
-| `GET` / `HEAD` | `/<sha256>[.ext]` | — | Fetch / probe a blob (`.ext` is advisory); both support RFC 7233 byte ranges (206 / `accept-ranges: bytes`) and both 404 when the backing file/object is gone |
+| `GET` / `HEAD` | `/<sha256>[.ext]` | — | Fetch / probe a blob (`.ext` is advisory); both 404 when the backing file/object is gone. `GET` supports RFC 7233 byte ranges (206 / `accept-ranges: bytes`, `If-Range` honored); `HEAD` ignores `Range` (always 200 with the full length) and never carries a body, including on errors |
 | `PUT` | `/upload` | kind 24242 (`t=upload`, `x=<sha256>`, `expiration`) | Upload a blob; returns 201 + the descriptor |
-| `HEAD` | `/upload` | kind 24242 (`t=upload`, `x=<sha256>`, `expiration`) | BUD-06 pre-flight — would the upload be accepted? Uses `X-SHA-256` / `X-Content-Length` headers (400 malformed/missing, 411 missing length, 413 too large) |
+| `HEAD` | `/upload` | kind 24242 (`t=upload`, `x=<sha256>`, `expiration`) | BUD-06 pre-flight — would the upload be accepted? Uses `X-SHA-256` / `X-Content-Length` headers (400 malformed/missing, 411 missing length, 413 too large); refusals carry no body |
 | `PUT` | `/media` | kind 24242 (`t=media`, `x=<sha256>`, `expiration`) | BUD-05 media upload (stored verbatim — no optimization); returns 201 + the descriptor |
-| `HEAD` | `/media` | kind 24242 (`t=media`, `x=<sha256>`, `expiration`) | BUD-05 pre-flight — would the upload be accepted? Uses `X-SHA-256` / `X-Content-Length` headers (400 malformed/missing, 411 missing length, 413 too large) |
+| `HEAD` | `/media` | kind 24242 (`t=media`, `x=<sha256>`, `expiration`) | BUD-05 pre-flight — would the upload be accepted? Uses `X-SHA-256` / `X-Content-Length` headers (400 malformed/missing, 411 missing length, 413 too large); refusals carry no body |
 | `GET` | `/list/<pubkey>` | kind 24242 (`t=list`, `expiration`) | Blobs uploaded by the requesting pubkey (hex, must match the token's author), sorted by `uploaded` descending; supports `cursor` (the sha256 of the last entry of the previous page) and `limit` |
 | `DELETE` | `/<sha256>` | kind 24242 (`t=delete`, `x=<sha256>`, `expiration`) | Delete a blob (uploader only) |
 

@@ -332,7 +332,9 @@ impl super::Conn {
             self.reject_req(sub_id, "invalid: subscription id must not be empty");
             return;
         }
-        if sub_id.len() > max_sub_id_len {
+        // NIP-01 bounds the id in *chars* (a multibyte id may exceed the
+        // limit in bytes while staying within it in characters).
+        if sub_id.chars().count() > max_sub_id_len {
             self.reject_req(sub_id, "invalid: subscription id too long");
             return;
         }
@@ -919,7 +921,8 @@ impl super::Conn {
                 cfg.nip_enabled(50),
             )
         };
-        if sub_id.len() > max_sub_id_len {
+        // NIP-01 bounds the id in *chars*, like the REQ path above.
+        if sub_id.chars().count() > max_sub_id_len {
             self.reject_count(sub_id, "invalid: subscription id too long");
             return;
         }

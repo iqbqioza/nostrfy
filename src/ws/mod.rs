@@ -4643,6 +4643,55 @@ mod tests {
     }
 
     #[test]
+    fn sub_id_length_counts_characters_not_bytes() {
+        // NIP-01: `<subscription_id>` is an arbitrary string of max
+        // length 64 *chars*. A 64-char multibyte id is legal even though
+        // it is 128 bytes; a 65-char id is refused even in ASCII.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let wide = "é".repeat(64);
+            assert_eq!(wide.chars().count(), 64);
+            conn.handle_req(&[json!(wide.clone()), json!({"kinds": [1]})])
+                .await;
+            assert!(
+                !outgoing_json(&conn)
+                    .iter()
+                    .any(|m| m.to_string().contains("too long")),
+                "a 64-char REQ id must not be refused as too long"
+            );
+            conn.outgoing.clear();
+            conn.handle_count(&[json!(wide.clone()), json!({"kinds": [1]})])
+                .await;
+            assert!(
+                !outgoing_json(&conn)
+                    .iter()
+                    .any(|m| m.to_string().contains("too long")),
+                "a 64-char COUNT id must not be refused as too long"
+            );
+            conn.outgoing.clear();
+            conn.handle_neg_open(&[json!(wide.clone()), json!({}), json!("61000000")])
+                .await;
+            assert!(
+                !outgoing_json(&conn)
+                    .iter()
+                    .any(|m| m.to_string().contains("too long")),
+                "a 64-char NEG-OPEN id must not be refused as too long"
+            );
+            conn.outgoing.clear();
+            let over = "é".repeat(65);
+            conn.handle_req(&[json!(over.clone()), json!({"kinds": [1]})])
+                .await;
+            assert!(
+                outgoing_json(&conn)
+                    .iter()
+                    .any(|m| m.to_string().contains("too long")),
+                "a 65-char REQ id must still be refused"
+            );
+        });
+    }
+
+    #[test]
     fn neg_open_query_size_and_item_filters() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {

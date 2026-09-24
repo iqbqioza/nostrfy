@@ -450,14 +450,19 @@ enum Msg {
     Ban {
         id: Vec<u8>,
         reason: String,
-        /// `(removed, state_removed)`: whether the event was stored, and
-        /// whether a removed NIP-29/NIP-43 state event invalidated the
-        /// derived state (see [`Store::apply_ban`]).
-        reply: oneshot::Sender<(bool, bool)>,
+        /// `Ok((removed, state_removed))`: whether the event was stored,
+        /// and whether a removed NIP-29/NIP-43 state event invalidated
+        /// the derived state (see [`Store::apply_ban`]). `Err` is a store
+        /// failure — including a pre-ban of an unknown id, which still
+        /// lands the ban marker, unlike a failure.
+        reply: oneshot::Sender<anyhow::Result<(bool, bool)>>,
     },
     Unban {
         id: Vec<u8>,
-        reply: oneshot::Sender<bool>,
+        /// `Ok(removed)`: whether a ban entry existed (a missing entry
+        /// is a no-op success, per NIP-86's always-`true` result). `Err`
+        /// is a store failure.
+        reply: oneshot::Sender<anyhow::Result<bool>>,
     },
     ListBanned {
         reply: oneshot::Sender<Vec<(String, String)>>,
@@ -2179,22 +2184,29 @@ impl DbClient {
     /// prevents re-publication. Returns whether the event was stored and
     /// whether a removed NIP-29/NIP-43 state event invalidated the derived
     /// state (the caller must then rebuild it instead of trusting the
-    /// live groups/roles and the persisted snapshots).
-    pub async fn ban_event(&self, id: [u8; 32], reason: &str) -> (bool, bool) {
-        self.request_write(|reply| Msg::Ban {
+    /// live groups/roles and the persisted snapshots). Banning an unknown
+    /// id pre-bans it (`Ok((false, false))`); only a store failure is
+    /// an `Err` (NIP-86 reports `true` for every landed mutation).
+    pub async fn ban_event(&self, id: [u8; 32], reason: &str) -> anyhow::Result<(bool, bool)> {
+        self.request_write_checked(|reply| Msg::Ban {
             id: id.to_vec(),
             reason: reason.to_string(),
             reply,
         })
         .await
+        .ok_or_else(|| anyhow::anyhow!("database writer unavailable"))?
     }
 
-    pub async fn unban_event(&self, id: [u8; 32]) -> bool {
-        self.request_write(|reply| Msg::Unban {
+    /// Removes an event ban (NIP-86 allowevent): `Ok(false)` for a
+    /// never-banned id is a no-op success; only a store failure is an
+    /// `Err`.
+    pub async fn unban_event(&self, id: [u8; 32]) -> anyhow::Result<bool> {
+        self.request_write_checked(|reply| Msg::Unban {
             id: id.to_vec(),
             reply,
         })
         .await
+        .ok_or_else(|| anyhow::anyhow!("database writer unavailable"))?
     }
 
     pub async fn list_banned_events(&self) -> Vec<(String, String)> {

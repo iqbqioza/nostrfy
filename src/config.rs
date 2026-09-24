@@ -1903,6 +1903,13 @@ pub fn apply_access_op(state: &mut AccessControl, op: &AccessOp) {
             reason,
             insensitive,
         } => {
+            // NIP-86: a ban removes the pubkey from the allow list
+            // (mirrors `AllowPubkey` un-banning below, and `DenyKind`
+            // un-allowing): otherwise an unban would silently restore
+            // publishing rights on a `restrict_relay` relay.
+            state
+                .allowed_pubkeys
+                .retain(|(p, _)| !pubkey_eq(*insensitive, p, pubkey));
             if let Some(entry) = state
                 .blocked_pubkeys
                 .iter_mut()
@@ -4133,6 +4140,50 @@ max_log_files = 2
             "a CLI-removed entry must not come back"
         );
         assert!(merged.blocked_pubkeys.iter().any(|(p, _)| p == "y"));
+    }
+
+    #[test]
+    fn ban_pubkey_removes_pubkey_from_allow_list() {
+        // NIP-86 `banpubkey`: "Should automatically remove the pubkey
+        // from the allow list" — otherwise an unban would silently
+        // restore publishing rights on a `restrict_relay` relay.
+        let mut state = AccessControl {
+            restrict_relay: true,
+            ..Default::default()
+        };
+        apply_access_op(
+            &mut state,
+            &AccessOp::AllowPubkey {
+                pubkey: "a".into(),
+                reason: String::new(),
+                insensitive: true,
+            },
+        );
+        assert!(state.allows_pubkey("a"));
+        apply_access_op(
+            &mut state,
+            &AccessOp::BanPubkey {
+                pubkey: "a".into(),
+                reason: "spam".into(),
+                insensitive: true,
+            },
+        );
+        assert!(
+            !state.allowed_pubkeys.iter().any(|(p, _)| p == "a"),
+            "a ban must drop the allow-list entry"
+        );
+        assert!(!state.allows_pubkey("a"));
+        apply_access_op(
+            &mut state,
+            &AccessOp::UnbanPubkey {
+                pubkey: "a".into(),
+                insensitive: true,
+            },
+        );
+        assert!(
+            !state.allows_pubkey("a"),
+            "an unban must not restore allow-list membership the ban removed"
+        );
     }
 
     #[test]

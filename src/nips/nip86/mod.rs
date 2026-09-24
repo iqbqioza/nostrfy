@@ -690,14 +690,19 @@ pub async fn rpc_handler(
             let Ok(id): Result<[u8; 32], _> = id.try_into() else {
                 return rpc_err("invalid event id");
             };
-            // Like the neighboring mutations, a failed store must not be
-            // reported as success: the ban would silently disappear on the
-            // next restart.
-            let (banned, state_removed) = relay.db.ban_event(id, reason).await;
+            // NIP-86: the result is always `true` — a ban lands even
+            // for an unknown (future) id, pre-banning it. Only a store
+            // failure must not be reported as success (the ban would
+            // silently disappear on the next restart).
+            let outcome = relay.db.ban_event(id, reason).await;
             audit!(&relay, &identity, "banevent", params);
-            if !banned {
-                return rpc_err("error: cannot persist the event ban");
-            }
+            let (_, state_removed) = match outcome {
+                Ok(outcome) => outcome,
+                Err(e) => {
+                    log::error!("banevent store failure: {e}");
+                    return rpc_err("error: cannot persist the event ban");
+                }
+            };
             if state_removed {
                 // A banned NIP-29/NIP-43 state event invalidates the live
                 // derived state like any other removal of one (the database
@@ -718,9 +723,13 @@ pub async fn rpc_handler(
             let Ok(id): Result<[u8; 32], _> = id.try_into() else {
                 return rpc_err("invalid event id");
             };
-            let unbanned = relay.db.unban_event(id).await;
+            // NIP-86: the result is always `true` — unbanning a
+            // never-banned id is a no-op success. Only a store failure
+            // surfaces an error.
+            let outcome = relay.db.unban_event(id).await;
             audit!(&relay, &identity, "allowevent", params);
-            if !unbanned {
+            if let Err(e) = outcome {
+                log::error!("allowevent store failure: {e}");
                 return rpc_err("error: cannot persist the event unban");
             }
             rpc_ok(json!(true))
@@ -1212,10 +1221,11 @@ mod tests {
         );
         let _ = rpc_call(&relay, "unblockip", vec![json!("::9")]).await;
 
-        // banevent / allowevent / listbannedevents. The ban must name a
-        // stored event: the db's reply reports whether the event was
-        // actually removed, and an ignored failure would report success for
-        // a ban that did not land.
+        // banevent / allowevent / listbannedevents. NIP-86 reports
+        // `true` (always) for these mutations: banning an unknown id
+        // pre-bans it (future publications are refused), and unbanning
+        // a never-banned id is a no-op success. Only a genuine store
+        // failure surfaces an error.
         let secp = secp256k1::Secp256k1::new();
         let keypair = secp256k1::Keypair::from_seckey_slice(&secp, &[13u8; 32]).unwrap();
         let mut banned_event = crate::event::Event {
@@ -1250,6 +1260,24 @@ mod tests {
         let resp = rpc_call(&relay, "allowevent", vec![json!("zz")]).await;
         assert!(rpc_err_of(resp).await.contains("event id"));
         let resp = rpc_call(&relay, "allowevent", vec![json!(id.clone())]).await;
+        assert!(rpc_ok_of(resp).await);
+        // Pre-ban: an unknown (future) id is banned, not an error.
+        let unknown = "cd".repeat(32);
+        let resp = rpc_call(&relay, "banevent", vec![json!(unknown.clone())]).await;
+        assert!(rpc_ok_of(resp).await);
+        assert!(
+            relay
+                .db
+                .list_banned_events()
+                .await
+                .iter()
+                .any(|(banned, _)| banned == &unknown),
+            "a pre-banned id must be listed"
+        );
+        // Idempotent unban: a never-banned id (and a repeat) succeeds.
+        let resp = rpc_call(&relay, "allowevent", vec![json!(unknown.clone())]).await;
+        assert!(rpc_ok_of(resp).await);
+        let resp = rpc_call(&relay, "allowevent", vec![json!(unknown.clone())]).await;
         assert!(rpc_ok_of(resp).await);
         // A reply that reports the store as failed must surface an error,
         // not a `true` result (the next call runs against the dead writer).

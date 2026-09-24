@@ -1278,24 +1278,24 @@ pub(crate) fn spawn(
                                     let _ = reply.send(out);
                                 }
                                 Msg::Ban { id, reason, reply } => {
-                                    let banned = match store.apply_ban(&id, &reason) {
-                                        Ok(banned) => banned,
+                                    let out = match store.apply_ban(&id, &reason) {
+                                        Ok(out) => Ok(out),
                                         Err(e) => {
                                             db_error(&thread_errors, &e);
-                                            (false, false)
+                                            Err(e)
                                         }
                                     };
-                                    let _ = reply.send(banned);
+                                    let _ = reply.send(out);
                                 }
                                 Msg::Unban { id, reply } => {
-                                    let unbanned = match store.apply_unban(&id) {
-                                        Ok(unbanned) => unbanned,
+                                    let out = match store.apply_unban(&id) {
+                                        Ok(out) => Ok(out),
                                         Err(e) => {
                                             db_error(&thread_errors, &e);
-                                            false
+                                            Err(e)
                                         }
                                     };
-                                    let _ = reply.send(unbanned);
+                                    let _ = reply.send(out);
                                 }
                                 Msg::ListBanned { reply } => {
                                     let banned = match store.list_banned() {
