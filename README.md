@@ -7,6 +7,7 @@
 <p align="center">
   <a href="https://github.com/iqbqioza/nostrfy/actions/workflows/ci.yml"><img src="https://github.com/iqbqioza/nostrfy/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://github.com/iqbqioza/nostrfy/actions/workflows/release.yml"><img src="https://github.com/iqbqioza/nostrfy/actions/workflows/release.yml/badge.svg" alt="Release"></a>
+  <a href="https://github.com/sponsors/iqbqioza"><img src="https://img.shields.io/github/sponsors/iqbqioza" alt="GitHub Sponsors"></a>
 </p>
 
 <p align="center">
