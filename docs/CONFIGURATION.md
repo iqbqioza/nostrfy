@@ -58,7 +58,7 @@ key = true         # boolean
 | --- | --- |
 | `[relay]` | Identity, URLs and NIP toggles |
 | `[server]` | Network binding, API split, metrics |
-| `[rpc]` | NIP-86 management RPC (port, auth, body limit) |
+| `[rpc]` | NIP-86 management RPC (auth, body limit; served on the relay port — no separate management port) |
 | `[limits]` | All limits and overload protections |
 | `[database]` | LMDB storage, DB thread timeouts and queue caps, search index |
 | `[daemon]` | PID/log/stats files and rotation |

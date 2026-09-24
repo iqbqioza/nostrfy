@@ -405,18 +405,22 @@ fn ws_paths_for(mode: &str) -> &'static [&'static str] {
 }
 
 /// Normalizes a configured split hostname (api_host / blossom.host):
-/// lowercase, with IPv6 brackets stripped so it compares equal to the
-/// normalized request Host (`[::1]` -> `::1`).
+/// lowercase, with IPv6 brackets stripped and any trailing dot removed,
+/// so it compares equal to the normalized request Host (`[::1]` -> `::1`,
+/// `example.com.` -> `example.com`, the same DNS name).
 fn normalize_host(host: &str) -> String {
     host.trim()
         .trim_start_matches('[')
         .trim_end_matches(']')
+        .trim_end_matches('.')
         .to_ascii_lowercase()
 }
 
 /// The host part of an HTTP Host header value: strips an IPv6 literal's
 /// brackets (`[::1]:8080` -> `::1`) or splits a DNS/IPv4 host from its
 /// optional `:port` suffix (`relay.example.com:8080` -> `relay.example.com`).
+/// A single trailing dot (the DNS root) is removed so the result compares
+/// equal to the normalized configured host.
 fn host_header_host(header: &str) -> &str {
     let h = header.trim();
     if let Some(rest) = h.strip_prefix('[') {
@@ -424,7 +428,7 @@ fn host_header_host(header: &str) -> &str {
         rest.split(']').next().unwrap_or(rest)
     } else {
         // DNS name or IPv4 address: everything before the first ':'.
-        h.split(':').next().unwrap_or(h)
+        h.split(':').next().unwrap_or(h).trim_end_matches('.')
     }
 }
 
@@ -4551,6 +4555,8 @@ mod tests {
     fn host_header_host_extracts_host() {
         assert_eq!(host_header_host("api.example.com"), "api.example.com");
         assert_eq!(host_header_host("api.example.com:8080"), "api.example.com");
+        assert_eq!(host_header_host("api.example.com."), "api.example.com");
+        assert_eq!(host_header_host("api.example.com.:8080"), "api.example.com");
         assert_eq!(host_header_host("[::1]"), "::1");
         assert_eq!(host_header_host("[::1]:8080"), "::1");
         assert_eq!(host_header_host("192.0.2.1:80"), "192.0.2.1");

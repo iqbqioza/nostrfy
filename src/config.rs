@@ -1194,7 +1194,14 @@ impl Config {
                 .api_host
                 .trim()
                 .trim_matches(['[', ']'])
-                .eq_ignore_ascii_case(self.blossom.host.trim().trim_matches(['[', ']']))
+                .trim_end_matches('.')
+                .eq_ignore_ascii_case(
+                    self.blossom
+                        .host
+                        .trim()
+                        .trim_matches(['[', ']'])
+                        .trim_end_matches('.'),
+                )
         {
             return Err(config_err(
                 "server.api_host and blossom.host must be different hostnames",
@@ -3894,6 +3901,25 @@ max_log_files = 2
             );
             cfg.blossom.host = String::new();
         }
+    }
+
+    #[test]
+    fn validation_treats_trailing_dot_hosts_as_equal() {
+        // A trailing DNS dot names the same host: `api_host` and
+        // `blossom.host` differing only by it would split nothing, so
+        // they must be rejected as duplicates like identical spellings.
+        let mut cfg = Config::default();
+        cfg.server.api_host = "api.example.com".into();
+        cfg.blossom.host = "api.example.com.".into();
+        assert!(
+            cfg.validate().is_err(),
+            "dot-suffixed duplicates must be rejected"
+        );
+        cfg.blossom.host = "media.example.com.".into();
+        assert!(
+            cfg.validate().is_ok(),
+            "distinct hosts stay valid with or without the dot"
+        );
     }
 
     #[test]
