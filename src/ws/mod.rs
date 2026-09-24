@@ -813,8 +813,12 @@ impl Conn {
                 let ids: Vec<String> = self.pending_reqs.iter().map(|p| p.sub_id.clone()).collect();
                 self.pending_reqs.clear();
                 for id in ids {
-                    self.send_closed(&id, "restricted: you are not allowed to subscribe");
                     self.remove_req_subscription(&id);
+                    // Drop already-pumped frames of the released
+                    // incarnation too (like `close_all_subs`): without this
+                    // stale EVENTs would arrive ahead of the CLOSED below.
+                    self.purge_queued_events_for(&id);
+                    self.send_closed(&id, "restricted: you are not allowed to subscribe");
                 }
                 break;
             }
@@ -6252,6 +6256,54 @@ mod tests {
     }
 
     #[test]
+    fn pump_access_deny_purges_queued_frames() {
+        // Results queued before a deny must not reach the wire: the pump's
+        // access-deny branch releases the subscription and closes it, so
+        // already-pumped frames of that id have to go too (like
+        // `close_all_subs`), ahead of the terminal CLOSED.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let key = "aa".repeat(32);
+            conn.authed_pubkeys.push(key.clone());
+            conn.enqueue_pending_req(PendingReq {
+                sub_id: "s".into(),
+                events: Default::default(),
+                eose_hint: false,
+                truncated_or_more: false,
+                auth_hint: false,
+                sent_bytes: 0,
+                live: Default::default(),
+                live_bytes: 0,
+                eose_sent: false,
+                budget: None,
+                reserved: 0,
+            });
+            assert!(conn.send_tagged(
+                Message::Text("[\"EVENT\",\"s\",{}]".into()),
+                Some(sub_fingerprint("s")),
+            ));
+            conn.relay
+                .access
+                .write()
+                .await
+                .blocked_pubkeys
+                .push((key, String::new()));
+            conn.pump_pending_reqs();
+            let msgs = outgoing_json(&conn);
+            assert!(
+                msgs.iter().any(|m| m[0] == "CLOSED" && m[1] == "s"),
+                "the deny must close: {msgs:?}"
+            );
+            assert!(
+                !msgs.iter().any(|m| m[0] == "EVENT" && m[1] == "s"),
+                "no queued EVENTs may precede the terminal CLOSED: {msgs:?}"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
     fn purge_adjusts_all_outgoing_counters() {
         // The removed frames were counted when queued but never reach the
         // wire: the purge must forget them in every counter, not only
@@ -6772,6 +6824,89 @@ mod tests {
                     .is_empty(),
                 "a closed subscription must not receive live events"
             );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn refused_count_purges_queued_frames_of_the_same_id() {
+        // CLOSED is terminal: a refused COUNT sharing its id with an
+        // active REQ must drop the REQ incarnation's already-queued
+        // EVENTs instead of delivering them ahead of the CLOSED — and
+        // the CLOSED itself must survive (it carries the same id tag, so
+        // purging after the send would eat it).
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let now = unix_now();
+            for content in ["a", "b"] {
+                let e = signed_note(conn.relay.secp(), content, now, vec![]);
+                assert_eq!(
+                    conn.relay.db.put(e, now).await,
+                    crate::db::PutOutcome::Stored
+                );
+            }
+            conn.handle_req(&[json!("x"), json!({"kinds": [1]})]).await;
+            conn.pump_pending_reqs();
+            assert!(
+                outgoing_json(&conn)
+                    .iter()
+                    .any(|m| m[0] == "EVENT" && m[1] == "x"),
+                "response EVENTs must be queued before the refusal"
+            );
+            conn.relay.config.write().await.relay.disabled_nips.push(45);
+            conn.handle_count(&[json!("x"), json!({"kinds": [1]})])
+                .await;
+            let msgs = outgoing_json(&conn);
+            assert!(
+                msgs.iter().any(|m| m[0] == "CLOSED" && m[1] == "x"),
+                "the refusal must close: {msgs:?}"
+            );
+            assert!(
+                !msgs.iter().any(|m| m[0] == "EVENT" && m[1] == "x"),
+                "no stale EVENTs may precede the terminal CLOSED: {msgs:?}"
+            );
+            assert!(!conn.subs.contains_key("x"));
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn rejected_req_purges_queued_frames_of_the_same_id() {
+        // Like the COUNT path: a failed re-REQ must drop the previous
+        // incarnation's queued frames instead of delivering them ahead of
+        // its terminal CLOSED.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let now = unix_now();
+            for content in ["a", "b"] {
+                let e = signed_note(conn.relay.secp(), content, now, vec![]);
+                assert_eq!(
+                    conn.relay.db.put(e, now).await,
+                    crate::db::PutOutcome::Stored
+                );
+            }
+            conn.handle_req(&[json!("s"), json!({"kinds": [1]})]).await;
+            conn.pump_pending_reqs();
+            assert!(
+                outgoing_json(&conn)
+                    .iter()
+                    .any(|m| m[0] == "EVENT" && m[1] == "s"),
+                "response EVENTs must be queued before the refusal"
+            );
+            conn.handle_req(&[json!("s"), json!({"kinds": "nope"})])
+                .await;
+            let msgs = outgoing_json(&conn);
+            assert!(
+                msgs.iter().any(|m| m[0] == "CLOSED" && m[1] == "s"),
+                "the refusal must close: {msgs:?}"
+            );
+            assert!(
+                !msgs.iter().any(|m| m[0] == "EVENT" && m[1] == "s"),
+                "no stale EVENTs may precede the terminal CLOSED: {msgs:?}"
+            );
+            assert!(!conn.subs.contains_key("s"));
             conn.relay.db.shutdown();
         });
     }

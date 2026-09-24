@@ -677,9 +677,13 @@ impl super::Conn {
     /// Rejects a REQ with CLOSED, releasing any previous subscription held
     /// under the same id first. NIP-01 treats CLOSED as terminal: without the
     /// removal a failed re-REQ would leave a ghost subscription that keeps
-    /// receiving live events for a client-considered-closed id.
+    /// receiving live events for a client-considered-closed id. Queued
+    /// frames of the released incarnation are purged before the CLOSED is
+    /// queued (like `handle_close`), or stale EVENTs would arrive ahead of
+    /// the terminal message.
     fn reject_req(&mut self, sub_id: &str, reason: &str) {
         self.remove_req_subscription(sub_id);
+        self.purge_queued_events_for(sub_id);
         self.send_closed(sub_id, reason);
     }
 
@@ -872,10 +876,14 @@ impl super::Conn {
     /// CLOSED is terminal for the subscription id on the wire. A REQ
     /// subscription of the same id must therefore be released too, or the
     /// client would consider it closed while the relay kept delivering live
-    /// events for it. REQ namespace only (NIP-77 uses NEG-CLOSE).
+    /// events for it. REQ namespace only (NIP-77 uses NEG-CLOSE). Queued
+    /// frames go before the CLOSED (like `reject_req`): purging after the
+    /// send would eat the terminal message itself, since it carries the
+    /// same id tag.
     fn reject_count(&mut self, sub_id: &str, reason: &str) {
-        self.send_closed(sub_id, reason);
         self.remove_req_subscription(sub_id);
+        self.purge_queued_events_for(sub_id);
+        self.send_closed(sub_id, reason);
     }
 
     pub(crate) async fn handle_count(&mut self, rest: &[Value]) {
