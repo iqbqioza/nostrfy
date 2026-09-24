@@ -492,15 +492,15 @@ curl -X POST http://127.0.0.1:8080/ \
 | `listallowedpubkeys` | `[]` | List the allowlist |
 | `allowkind` / `disallowkind` | `[kind]` | Allow / disallow a kind |
 | `listallowedkinds` | `[]` | List allowed kinds |
-| `changerelayname` / `changerelaydescription` / `changerelayicon` | `["new value"]` | Change the relay name / description / icon (**persisted to the config file**) |
-| `createrole` / `editrole` / `deleterole` | `[id, label, description, color, order]` | NIP-43 role management |
+| `changerelayname` / `changerelaydescription` / `changerelayicon` | `["new value"]` | Change the relay name / description / icon (**persisted to the config file**; reports an error when the file cannot be written) |
+| `createrole` / `editrole` / `deleterole` | `[id, label, description, color, order]` | NIP-43 role management (wrong-typed fields are rejected; deleting a missing role succeeds) |
 | `assignrole` / `unassignrole` | `["pubkey", "role id"]` | Assign / unassign a role (a duplicate grant or missing revocation succeeds) |
 | `assignmethod` / `unassignmethod` | `["pubkey", "method"]` | Grant / revoke a NIP-86 method to a non-admin pubkey (result `[true, "message"]`; only moderation, read and discovery methods are grantable) |
 | `listmethodassignees` | `[]` | List method grants (`[{pubkey, methods}]`) |
 | `blockip` / `unblockip` | `["ip", "reason (optional)"]` | Block / unblock an IP (**blocking also drops existing connections**) |
 | `listblockedips` | `[]` | List blocked IPs |
 | `banevent` / `allowevent` | `["event id", "reason (optional)"]` | Ban / unban an event (banning an unknown id pre-bans it; unbanning a never-banned id succeeds) |
-| `listbannedevents` | `[]` | List banned events |
+| `listbannedevents` | `[]` | List banned events (a failed lookup surfaces an error, never an empty list) |
 | `listeventsneedingmoderation` | `[]` | Events awaiting moderation (always empty on this relay) |
 | `listclaims` | `[]` | List NIP-43 invite codes |
 | `createclaim` / `deleteclaim` | `["claim"]` | Issue / revoke a NIP-43 invite code (a `kind:28934` carrying a listed code admits its author) |

@@ -167,8 +167,15 @@ fn check_role_id(id: &str) -> anyhow::Result<()> {
 /// non-empty, within the store bound, and free of control characters
 /// (codes persist in the roles snapshot and are echoed in `listclaims`).
 fn check_claim(claim: &str) -> anyhow::Result<()> {
-    if claim.is_empty() {
+    // Mirror `check_role_id` hygiene: a whitespace-only code would be a
+    // useless invite that can never be typed or matched deliberately.
+    if claim.trim().is_empty() {
         return Err(anyhow!("claim must not be empty"));
+    }
+    if claim != claim.trim() {
+        return Err(anyhow!(
+            "claim must not have leading or trailing whitespace"
+        ));
     }
     if claim.chars().count() > crate::nips::nip43::RoleStore::MAX_CLAIM_LEN {
         return Err(anyhow!(
@@ -206,6 +213,31 @@ fn rpc_ok(result: Value) -> Response {
 
 fn rpc_err(message: &str) -> Response {
     (StatusCode::OK, Json(json!({ "error": message }))).into_response()
+}
+
+/// Reads an optional string param: absent or null means "not given"
+/// (empty default); any other non-string type is invalid — silently
+/// dropping a mistyped value would store data the operator did not send.
+fn opt_param_str<'a>(params: &'a [Value], index: usize, what: &str) -> Result<&'a str, String> {
+    match params.get(index) {
+        None | Some(Value::Null) => Ok(""),
+        Some(Value::String(s)) => Ok(s),
+        Some(_) => Err(format!("invalid params: {what} must be a string")),
+    }
+}
+
+/// Reads an optional integer param: absent or null means "not given";
+/// any other non-integer type (including a string holding digits) is
+/// invalid.
+fn opt_param_i64(params: &[Value], index: usize, what: &str) -> Result<Option<i64>, String> {
+    match params.get(index) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Number(n)) => n
+            .as_i64()
+            .ok_or_else(|| format!("invalid params: {what} must be an integer"))
+            .map(Some),
+        Some(_) => Err(format!("invalid params: {what} must be an integer")),
+    }
 }
 
 /// Records a management mutation in the relay's rate-limited audit
@@ -300,11 +332,12 @@ pub async fn rpc_handler(
             rpc_ok(json!(others))
         }
         "banpubkey" => {
-            let (Some(pubkey), reason) = (
-                params.first().and_then(Value::as_str),
-                params.get(1).and_then(Value::as_str).unwrap_or(""),
-            ) else {
+            let Some(pubkey) = params.first().and_then(Value::as_str) else {
                 return rpc_err("invalid params");
+            };
+            let reason = match opt_param_str(params, 1, "reason") {
+                Ok(reason) => reason,
+                Err(e) => return rpc_err(&e),
             };
             if !is_pubkey(pubkey) {
                 return rpc_err("invalid pubkey");
@@ -371,11 +404,12 @@ pub async fn rpc_handler(
             rpc_ok(json!(list))
         }
         "allowpubkey" => {
-            let (Some(pubkey), reason) = (
-                params.first().and_then(Value::as_str),
-                params.get(1).and_then(Value::as_str).unwrap_or(""),
-            ) else {
+            let Some(pubkey) = params.first().and_then(Value::as_str) else {
                 return rpc_err("invalid params");
+            };
+            let reason = match opt_param_str(params, 1, "reason") {
+                Ok(reason) => reason,
+                Err(e) => return rpc_err(&e),
             };
             if !is_pubkey(pubkey) {
                 return rpc_err("invalid pubkey");
@@ -542,10 +576,15 @@ pub async fn rpc_handler(
                 "changerelaydescription" => 10_000,
                 _ => 4_000, // icon URL
             };
+            // Only the description is free text: the name and the icon
+            // URL are single-line values, so embedded newlines/tabs are
+            // rejected there (they would land verbatim in the NIP-11
+            // document served to every client).
+            let newline_allowed = method == "changerelaydescription";
             if value.len() > max_len
                 || value
                     .chars()
-                    .any(|c| c.is_control() && c != '\n' && c != '\t')
+                    .any(|c| c.is_control() && !(newline_allowed && (c == '\n' || c == '\t')))
             {
                 return rpc_err("invalid params: value too long or contains control characters");
             }
@@ -573,7 +612,12 @@ pub async fn rpc_handler(
             // reload and a restart (without persistence the reload handler
             // would silently revert it). The lock is released first: the
             // (blocking) file write must not stall every config reader.
-            relay.persist_relay_field(field, value).await;
+            // A failed persist must not report success (like the access
+            // mutations below): the change would vanish on reload.
+            if !relay.persist_relay_field(field, value).await {
+                audit!(&relay, &identity, method, params);
+                return rpc_err("error: cannot persist the relay field");
+            }
             audit!(&relay, &identity, method, params);
             rpc_ok(json!(true))
         }
@@ -585,10 +629,22 @@ pub async fn rpc_handler(
             if let Err(e) = check_role_id(id) {
                 return rpc_err(&e.to_string());
             }
-            let label = params.get(1).and_then(Value::as_str).unwrap_or("");
-            let description = params.get(2).and_then(Value::as_str).unwrap_or("");
-            let color = params.get(3).and_then(Value::as_str).unwrap_or("");
-            let order = params.get(4).and_then(Value::as_i64);
+            let label = match opt_param_str(params, 1, "label") {
+                Ok(label) => label,
+                Err(e) => return rpc_err(&e),
+            };
+            let description = match opt_param_str(params, 2, "description") {
+                Ok(description) => description,
+                Err(e) => return rpc_err(&e),
+            };
+            let color = match opt_param_str(params, 3, "color") {
+                Ok(color) => color,
+                Err(e) => return rpc_err(&e),
+            };
+            let order = match opt_param_i64(params, 4, "order") {
+                Ok(order) => order,
+                Err(e) => return rpc_err(&e),
+            };
             if let Err(e) = check_role_fields(label, description, color) {
                 return rpc_err(&e.to_string());
             }
@@ -611,10 +667,22 @@ pub async fn rpc_handler(
             if let Err(e) = check_role_id(id) {
                 return rpc_err(&e.to_string());
             }
-            let label = params.get(1).and_then(Value::as_str).unwrap_or("");
-            let description = params.get(2).and_then(Value::as_str).unwrap_or("");
-            let color = params.get(3).and_then(Value::as_str).unwrap_or("");
-            let order = params.get(4).and_then(Value::as_i64);
+            let label = match opt_param_str(params, 1, "label") {
+                Ok(label) => label,
+                Err(e) => return rpc_err(&e),
+            };
+            let description = match opt_param_str(params, 2, "description") {
+                Ok(description) => description,
+                Err(e) => return rpc_err(&e),
+            };
+            let color = match opt_param_str(params, 3, "color") {
+                Ok(color) => color,
+                Err(e) => return rpc_err(&e),
+            };
+            let order = match opt_param_i64(params, 4, "order") {
+                Ok(order) => order,
+                Err(e) => return rpc_err(&e),
+            };
             if let Err(e) = check_role_fields(label, description, color) {
                 return rpc_err(&e.to_string());
             }
@@ -634,13 +702,22 @@ pub async fn rpc_handler(
             if let Err(e) = check_role_id(id) {
                 return rpc_err(&e.to_string());
             }
-            if relay.delete_role(id).await {
-                audit!(&relay, &identity, "deleterole", params);
-                rpc_ok(json!(true))
-            } else {
-                rpc_err(
+            // Deleting a missing role is a no-op success (like the other
+            // removal methods). Only a disabled NIP-43, a missing relay
+            // key, or a failed tombstone publish surfaces an error.
+            match relay.delete_role(id).await {
+                crate::relay::roles::RoleChange::Applied
+                | crate::relay::roles::RoleChange::Noop => {
+                    audit!(&relay, &identity, "deleterole", params);
+                    rpc_ok(json!(true))
+                }
+                crate::relay::roles::RoleChange::Unknown => {
+                    audit!(&relay, &identity, "deleterole", params);
+                    rpc_ok(json!(true))
+                }
+                crate::relay::roles::RoleChange::Failed => rpc_err(
                     "restricted: NIP-43 is disabled, the relay key is missing or the event could not be stored",
-                )
+                ),
             }
         }
         "assignrole" => {
@@ -805,11 +882,12 @@ pub async fn rpc_handler(
             rpc_ok(json!(list))
         }
         "blockip" => {
-            let (Some(ip), reason) = (
-                params.first().and_then(Value::as_str),
-                params.get(1).and_then(Value::as_str).unwrap_or(""),
-            ) else {
+            let Some(ip) = params.first().and_then(Value::as_str) else {
                 return rpc_err("invalid params");
+            };
+            let reason = match opt_param_str(params, 1, "reason") {
+                Ok(reason) => reason,
+                Err(e) => return rpc_err(&e),
             };
             let Ok(ip) = ip.parse::<std::net::IpAddr>() else {
                 return rpc_err("invalid ip address");
@@ -879,11 +957,12 @@ pub async fn rpc_handler(
             rpc_ok(json!(list))
         }
         "banevent" => {
-            let (Some(id), reason) = (
-                params.first().and_then(Value::as_str),
-                params.get(1).and_then(Value::as_str).unwrap_or(""),
-            ) else {
+            let Some(id) = params.first().and_then(Value::as_str) else {
                 return rpc_err("invalid params");
+            };
+            let reason = match opt_param_str(params, 1, "reason") {
+                Ok(reason) => reason,
+                Err(e) => return rpc_err(&e),
             };
             let Ok(id) = hex::decode(id) else {
                 return rpc_err("invalid event id");
@@ -918,6 +997,12 @@ pub async fn rpc_handler(
             let Some(id) = params.first().and_then(Value::as_str) else {
                 return rpc_err("invalid params");
             };
+            // The optional reason slot is validated like its siblings
+            // (a non-string there is a client bug), though unbanning
+            // carries no reason.
+            if opt_param_str(params, 1, "reason").is_err() {
+                return rpc_err("invalid params: reason must be a string");
+            }
             let Ok(id) = hex::decode(id) else {
                 return rpc_err("invalid event id");
             };
@@ -936,10 +1021,14 @@ pub async fn rpc_handler(
             rpc_ok(json!(true))
         }
         "listbannedevents" => {
-            let list: Vec<Value> = relay
-                .db
-                .list_banned_events()
-                .await
+            let list = match relay.db.list_banned_events().await {
+                Ok(list) => list,
+                Err(e) => {
+                    log::error!("listbannedevents read failure: {e}");
+                    return rpc_err("error: cannot list banned events");
+                }
+            };
+            let list: Vec<Value> = list
                 .into_iter()
                 .map(|(id, reason)| json!({ "id": id, "reason": reason }))
                 .collect();
@@ -1119,7 +1208,7 @@ async fn rpc_authenticated(
         )
         && relay
             .nip98_replay
-            .accept(&verified.id, crate::util::unix_now())
+            .accept(&verified.id, crate::util::unix_now(), verified.created_at)
     {
         return Some(Identity::Admin(verified.pubkey));
     }
@@ -1141,7 +1230,7 @@ async fn rpc_authenticated(
         )
         && relay
             .nip98_replay
-            .accept(&verified.id, crate::util::unix_now())
+            .accept(&verified.id, crate::util::unix_now(), verified.created_at)
         && !relay
             .access
             .read()
@@ -1429,12 +1518,14 @@ mod tests {
         let resp = rpc_call(&relay, "changerelayname", vec![json!("\u{0}")]).await;
         assert!(rpc_err_of(resp).await.contains("control"));
         let resp = rpc_call(&relay, "changerelayname", vec![json!("newname")]).await;
-        assert!(rpc_ok_of(resp).await);
+        // The file-less test relay cannot persist: the in-memory change
+        // applies but the RPC reports the failure (not `true`).
+        assert!(rpc_err_of(resp).await.contains("persist"));
         assert_eq!(relay.config.read().await.relay.name, "newname");
         let resp = rpc_call(&relay, "changerelaydescription", vec![json!("new desc")]).await;
-        assert!(rpc_ok_of(resp).await);
+        assert!(rpc_err_of(resp).await.contains("persist"));
         let resp = rpc_call(&relay, "changerelayicon", vec![json!("https://x/i.png")]).await;
-        assert!(rpc_ok_of(resp).await);
+        assert!(rpc_err_of(resp).await.contains("persist"));
 
         // Role methods through the RPC (the relay has no key: they fail
         // with the restricted error, which covers the else branches).
@@ -1642,6 +1733,7 @@ mod tests {
                 .db
                 .list_banned_events()
                 .await
+                .unwrap()
                 .iter()
                 .any(|(banned, _)| banned == &unknown),
             "a pre-banned id must be listed"
@@ -1658,6 +1750,10 @@ mod tests {
         assert!(rpc_err_of(resp).await.contains("persist"));
         let resp = rpc_call(&relay, "allowevent", vec![json!(id.clone())]).await;
         assert!(rpc_err_of(resp).await.contains("persist"));
+        // A failed ban lookup must surface an error, not an empty list
+        // (the operator would believe "no bans").
+        let resp = rpc_call(&relay, "listbannedevents", vec![]).await;
+        assert!(rpc_err_of(resp).await.contains("cannot list banned events"));
         // The audit trail still records the attempted mutations.
         let recent = relay.audit.recent();
         assert!(recent.iter().any(|entry| entry.starts_with("banevent")));
@@ -1944,10 +2040,26 @@ mod tests {
             body.windows(5).any(|w| w == b"error"),
             "a failed role save must be reported: {body:?}"
         );
-        // The same applies to delete: the tombstone could not be stored.
+        // The same applies to deleting an existing role: the tombstone
+        // could not be stored. (Deleting a *missing* role is a no-op
+        // success that needs no store access.)
+        let relay = build_admin_relay_with_key(Some(&"ab".repeat(32))).await;
+        let resp = rpc_call(&relay, "createrole", vec![json!("t")]).await;
+        assert!(rpc_ok_of(resp).await);
+        relay.db.shutdown();
+        let resp = rpc_call(&relay, "deleterole", vec![json!("t")]).await;
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        assert!(
+            body.windows(5).any(|w| w == b"error"),
+            "a failed tombstone save must be reported: {body:?}"
+        );
         let resp = rpc_call(&relay, "deleterole", vec![json!("ghost")]).await;
         let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
-        assert!(body.windows(5).any(|w| w == b"error"));
+        assert!(
+            body.windows(4).any(|w| w == b"true"),
+            "deleting a missing role needs no store: {body:?}"
+        );
+        relay.db.shutdown();
     }
 
     #[tokio::test]
@@ -2321,6 +2433,128 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn changerelay_reports_persist_failure() {
+        // The test relay has no config file to persist to: the in-memory
+        // change applies, but the RPC must report the failure instead of
+        // `true` (the change would vanish on reload).
+        let relay = build_admin_relay().await;
+        let resp = rpc_call(&relay, "changerelayname", vec![json!("x")]).await;
+        assert!(
+            rpc_err_of(resp).await.contains("persist"),
+            "an unpersisted relay change must surface an error"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn role_params_reject_wrong_types() {
+        // A mistyped field must fail instead of silently storing a role
+        // the operator did not describe (absent/null still means default).
+        let relay = build_admin_relay_with_key(Some(&"cd".repeat(32))).await;
+        let resp = rpc_call(
+            &relay,
+            "createrole",
+            vec![json!("r1"), json!(1), json!(""), json!("")],
+        )
+        .await;
+        assert!(
+            rpc_err_of(resp).await.contains("label must be a string"),
+            "a numeric label must be rejected"
+        );
+        let resp = rpc_call(
+            &relay,
+            "createrole",
+            vec![json!("r1"), json!(""), json!(""), json!(""), json!("1")],
+        )
+        .await;
+        assert!(
+            rpc_err_of(resp).await.contains("order must be an integer"),
+            "a string order must be rejected"
+        );
+        let resp = rpc_call(
+            &relay,
+            "createrole",
+            vec![
+                json!("r1"),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Null,
+            ],
+        )
+        .await;
+        assert!(rpc_ok_of(resp).await, "null fields mean defaults");
+        let resp = rpc_call(
+            &relay,
+            "editrole",
+            vec![json!("r1"), json!(true), json!(""), json!("")],
+        )
+        .await;
+        assert!(
+            rpc_err_of(resp).await.contains("label must be a string"),
+            "editrole validates types too"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn reason_params_reject_non_strings() {
+        // A non-string reason must fail instead of being silently dropped
+        // (absent/null still means no reason).
+        let relay = build_admin_relay().await;
+        for method in ["banpubkey", "allowpubkey"] {
+            let resp = rpc_call(&relay, method, vec![json!("aa".repeat(32)), json!(7)]).await;
+            assert!(
+                rpc_err_of(resp).await.contains("reason must be a string"),
+                "{method} must reject a numeric reason"
+            );
+            let resp = rpc_call(&relay, method, vec![json!("aa".repeat(32)), Value::Null]).await;
+            assert!(rpc_ok_of(resp).await, "{method} accepts a null reason");
+        }
+        let resp = rpc_call(&relay, "blockip", vec![json!("127.0.0.1"), json!(true)]).await;
+        assert!(rpc_err_of(resp).await.contains("reason must be a string"));
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn deleterole_missing_is_noop_success() {
+        // Deleting a missing role is a no-op success like the other
+        // removal methods (spec: result `true`).
+        let relay = build_admin_relay_with_key(Some(&"cd".repeat(32))).await;
+        let resp = rpc_call(&relay, "deleterole", vec![json!("ghost")]).await;
+        assert!(rpc_ok_of(resp).await);
+        let resp = rpc_call(&relay, "createrole", vec![json!("r1")]).await;
+        assert!(rpc_ok_of(resp).await);
+        let resp = rpc_call(&relay, "deleterole", vec![json!("r1")]).await;
+        assert!(rpc_ok_of(resp).await);
+        let resp = rpc_call(&relay, "deleterole", vec![json!("r1")]).await;
+        assert!(rpc_ok_of(resp).await, "repeat deletion stays a success");
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn changerelay_rejects_newlines_outside_description() {
+        // The name and icon URL are single-line values served in NIP-11;
+        // only the description keeps the newline/tab allowance.
+        let relay = build_admin_relay().await;
+        let resp = rpc_call(&relay, "changerelayname", vec![json!("a\nb")]).await;
+        assert!(rpc_err_of(resp).await.contains("control characters"));
+        let resp = rpc_call(&relay, "changerelayicon", vec![json!("https://x\ny")]).await;
+        assert!(rpc_err_of(resp).await.contains("control characters"));
+        // A newline description passes validation (persistence still
+        // fails on the file-less test relay, proving the refusal above
+        // came from validation, not persistence).
+        let resp = rpc_call(&relay, "changerelaydescription", vec![json!("a\nb")]).await;
+        assert!(rpc_err_of(resp).await.contains("persist"));
+        relay.db.shutdown();
+        // Whitespace-only invite codes are rejected like role ids.
+        let relay = build_admin_relay_with_key(Some(&"cd".repeat(32))).await;
+        let resp = rpc_call(&relay, "createclaim", vec![json!("   ")]).await;
+        assert!(rpc_err_of(resp).await.contains("empty"));
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
     async fn unauthorized_mutations_are_not_audited() {
         let relay = build_admin_relay().await;
         relay.audit.clear();
@@ -2358,14 +2592,22 @@ mod tests {
     async fn changerelayname_refreshes_the_nip11_cache() {
         // The NIP-11 document caches its static part against the relay's
         // config version; the management RPC must bump it like a SIGHUP
-        // reload, or the old value is served until the next restart.
+        // reload, or the old value is served until the next restart. A
+        // writable config file lets the change persist (and report `true`).
         let relay = build_admin_relay().await;
+        let dir = std::env::temp_dir().join("nostrfy-changerelay-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("nostrfy.toml");
+        std::fs::write(&path, "[relay]\nname = \"before\"\n").unwrap();
+        *relay.config_path.write().await = Some(path);
         let before = relay.relay_info_document().await;
         let resp = rpc_call(&relay, "changerelayname", vec![json!("after-change")]).await;
         assert!(rpc_ok_of(resp).await);
         let after = relay.relay_info_document().await;
         assert_eq!(after["name"], "after-change");
         assert_ne!(before["name"], after["name"]);
+        let _ = std::fs::remove_dir_all(&dir);
         relay.db.shutdown();
     }
 }

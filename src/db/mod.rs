@@ -465,7 +465,9 @@ enum Msg {
         reply: oneshot::Sender<anyhow::Result<bool>>,
     },
     ListBanned {
-        reply: oneshot::Sender<Vec<(String, String)>>,
+        /// `Err` is a store/read failure — a failed lookup must surface
+        /// instead of an empty list (the operator would believe "no bans").
+        reply: oneshot::Sender<anyhow::Result<Vec<(String, String)>>>,
     },
     /// Persists the access control lists (NIP-86 runtime bans/allowlists).
     SaveAccess {
@@ -2209,8 +2211,27 @@ impl DbClient {
         .ok_or_else(|| anyhow::anyhow!("database writer unavailable"))?
     }
 
-    pub async fn list_banned_events(&self) -> Vec<(String, String)> {
-        self.request_read(|reply| Msg::ListBanned { reply }).await
+    /// Lists banned event ids with reasons. A failed lookup is an `Err`
+    /// (never an empty list): the operator must not believe "no bans"
+    /// while the database is unavailable.
+    pub async fn list_banned_events(&self) -> anyhow::Result<Vec<(String, String)>> {
+        let channel = self.read_channel();
+        let Some(rx) = self.send_request_read(|reply| Msg::ListBanned { reply }, channel) else {
+            return Err(anyhow::anyhow!("database reader unavailable"));
+        };
+        if self.timeout_secs == 0 {
+            return rx
+                .await
+                .map_err(|_| anyhow::anyhow!("database reader unavailable"))?;
+        }
+        match tokio::time::timeout(std::time::Duration::from_secs(self.timeout_secs), rx).await {
+            Ok(Ok(value)) => value,
+            _ => {
+                self.errors
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Err(anyhow::anyhow!("database read timed out"))
+            }
+        }
     }
 
     /// Persists the access control lists (NIP-86 runtime bans/allowlists).

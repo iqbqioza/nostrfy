@@ -221,52 +221,61 @@ impl super::Relay {
         self.publish_relay_event(event).await
     }
 
-    pub async fn delete_role(&self, id: &str) -> bool {
+    pub async fn delete_role(&self, id: &str) -> RoleChange {
         if !self.config.read().await.nip_enabled(43) || self.key.is_none() {
-            return false;
+            return RoleChange::Failed;
         }
-        let removed = self
+        let outcome = self
             .mutate_roles(
                 super::BufferedRoleMutation::Delete { id: id.to_string() },
                 |roles| {
                     let removed = roles.delete(id);
-                    (removed, removed)
+                    // Deleting a missing role is a no-op success (like the
+                    // other removal methods), not an error.
+                    if removed {
+                        (RoleChange::Applied, true)
+                    } else {
+                        (RoleChange::Noop, false)
+                    }
                 },
             )
             .await;
-        if removed {
-            // Deferred persistence before publishing (see `create_role`):
-            // the tombstone path below must not lose the in-memory deletion
-            // on restart even if publishing fails.
-            self.schedule_roles_persist();
-            // Publish a tombstone `kind:33534` so the deletion survives the
-            // restart rebuild (the rebuild skips `["deleted"]` tombstones);
-            // then republish the membership list without the deleted role.
-            // A failed tombstone save reports false: without it the role
-            // would be resurrected by the rebuild after a restart (the
-            // operator can re-create and re-delete to retry).
-            let relay_pubkey = self.relay_pubkey().unwrap_or_default();
-            let event = {
-                let roles = self.roles.read().await;
-                roles.role_deletion_event(id, &relay_pubkey, self.stamp_floor(unix_now()))
-            };
-            let stored = self.publish_relay_event(event).await;
-            if stored {
-                // The membership republish must not be silently dropped:
-                // a failure would leave the old membership event stored,
-                // and the restart rebuild would resurrect assignments to
-                // the deleted role. The tombstone itself still guarantees
-                // the role stays deleted; the operator is told the
-                // membership refresh failed so it can be retried.
-                if !self.publish_membership(None).await {
-                    log::warn!(
-                        "delete_role {id}: the membership list could not be republished; assignments to the deleted role may resurface after a restart"
-                    );
-                }
+        if outcome != RoleChange::Applied {
+            return outcome;
+        }
+        // Deferred persistence before publishing (see `create_role`):
+        // the tombstone path below must not lose the in-memory deletion
+        // on restart even if publishing fails.
+        self.schedule_roles_persist();
+        // Publish a tombstone `kind:33534` so the deletion survives the
+        // restart rebuild (the rebuild skips `["deleted"]` tombstones);
+        // then republish the membership list without the deleted role.
+        // A failed tombstone save reports `Failed`: without it the role
+        // would be resurrected by the rebuild after a restart (the
+        // operator can re-create and re-delete to retry).
+        let relay_pubkey = self.relay_pubkey().unwrap_or_default();
+        let event = {
+            let roles = self.roles.read().await;
+            roles.role_deletion_event(id, &relay_pubkey, self.stamp_floor(unix_now()))
+        };
+        let stored = self.publish_relay_event(event).await;
+        if stored {
+            // The membership republish must not be silently dropped:
+            // a failure would leave the old membership event stored,
+            // and the restart rebuild would resurrect assignments to
+            // the deleted role. The tombstone itself still guarantees
+            // the role stays deleted; the operator is told the
+            // membership refresh failed so it can be retried.
+            if !self.publish_membership(None).await {
+                log::warn!(
+                    "delete_role {id}: the membership list could not be republished; assignments to the deleted role may resurface after a restart"
+                );
             }
-            stored
+        }
+        if stored {
+            RoleChange::Applied
         } else {
-            false
+            RoleChange::Failed
         }
     }
 
