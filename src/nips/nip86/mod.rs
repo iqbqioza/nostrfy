@@ -1405,11 +1405,12 @@ mod tests {
 
     /// Calls the RPC as a non-admin pubkey with a fresh NIP-98 signature
     /// (the grantee path: `u` = this endpoint, `method` = POST, payload =
-    /// the body hash). A per-call salt param keeps the body (and therefore
-    /// the auth event id) unique: the relay's 60-second replay guard would
-    /// otherwise reject two identical calls in the same second, and the
-    /// tested arms ignore trailing params. Returns the keypair's pubkey
-    /// with the response.
+    /// the body hash). A per-call salt in the auth event's `content` keeps
+    /// the event id unique: the relay's 60-second replay guard would
+    /// otherwise reject two identical calls in the same second. The salt
+    /// rides `content` (which this relay leniently ignores) rather than
+    /// the RPC body, so strict param validation sees pristine inputs.
+    /// Returns the keypair's pubkey with the response.
     async fn nip98_call(
         relay: &std::sync::Arc<Relay>,
         seckey: &[u8; 32],
@@ -1418,10 +1419,7 @@ mod tests {
     ) -> (String, Response) {
         use base64::Engine as _;
         static SALT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let mut params = params;
-        params.push(json!(
-            SALT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
+        let salt = SALT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let secp = secp256k1::Secp256k1::new();
         let keypair = secp256k1::Keypair::from_seckey_slice(&secp, seckey).unwrap();
         let pubkey = secp256k1::XOnlyPublicKey::from_keypair(&keypair)
@@ -1442,7 +1440,7 @@ mod tests {
                     crate::nips::nip98::payload_sha256_hex(body.as_bytes()),
                 ],
             ],
-            content: String::new(),
+            content: format!("test-call-{salt}"),
             sig: String::new(),
         };
         ev.id = crate::nips::nip01::compute_id(&ev);
@@ -2306,6 +2304,54 @@ mod tests {
         // The grantee runs the granted methods…
         let (_, resp) = nip98_call(&relay, &agent, "listbannedevents", vec![]).await;
         assert_eq!(resp.status(), StatusCode::OK);
+        // …including a granted mutation end to end: the ban lands and is
+        // audited under the grantee's pubkey.
+        let target = "cd".repeat(32);
+        let (_, resp) = nip98_call(&relay, &agent, "banevent", vec![json!(target.clone())]).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            relay
+                .db
+                .list_banned_events()
+                .await
+                .unwrap()
+                .iter()
+                .any(|(id, _)| id == &target),
+            "a grantee-called banevent must take effect"
+        );
+        assert!(
+            relay
+                .audit
+                .recent()
+                .iter()
+                .any(|e| e.starts_with("banevent") && e.contains(&agent_pk)),
+            "the mutation must be audited as the grantee: {:?}",
+            relay.audit.recent()
+        );
+        // …but nothing else: admin-only arms without their own guard
+        // rely on the gate alone, so probe each family.
+        for method in [
+            "createrole",
+            "deleterole",
+            "assignrole",
+            "createclaim",
+            "deleteclaim",
+            "listclaims",
+            "changerelayname",
+            "unassignmethod",
+        ] {
+            let (_, resp) = nip98_call(&relay, &agent, method, vec![]).await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::UNAUTHORIZED,
+                "a grantee must not reach {method}"
+            );
+        }
+        // Unknown methods: admins get the rpc error, grantees a 401.
+        let resp = rpc_call(&relay, "nosuchmethod", vec![]).await;
+        assert!(rpc_err_of(resp).await.contains("unsupported"));
+        let (_, resp) = nip98_call(&relay, &agent, "nosuchmethod", vec![]).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         // …but nothing else, including the permission methods themselves.
         let (_, resp) = nip98_call(&relay, &agent, "listbannedpubkeys", vec![]).await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
