@@ -185,9 +185,10 @@ fn add_cors_headers(headers: &mut HeaderMap) {
         axum::http::header::ACCESS_CONTROL_ALLOW_HEADERS,
         // X-SHA-256 is the optional preflight hash header of BUD-02;
         // X-Content-Length / X-Content-Type are the BUD-05/06 pre-flight
-        // headers (nostter sends X-Content-Length on PUT /media).
+        // headers (nostter sends X-Content-Length on PUT /media). BUD-01
+        // requires at minimum `Authorization, *` on the preflight.
         HeaderValue::from_static(
-            "Authorization, Content-Type, Accept, X-SHA-256, X-Content-Length, X-Content-Type",
+            "Authorization, Content-Type, Accept, X-SHA-256, X-Content-Length, X-Content-Type, *",
         ),
     );
     headers.insert(
@@ -3135,6 +3136,17 @@ mod tests {
                 .get("access-control-allow-origin")
                 .is_some(),
             "the preflight must carry the CORS headers"
+        );
+        // BUD-01: the preflight `Access-Control-Allow-Headers` is at
+        // minimum `Authorization, *`.
+        let allow_headers = response
+            .headers()
+            .get("access-control-allow-headers")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            allow_headers.contains("Authorization") && allow_headers.contains('*'),
+            "the preflight must allow Authorization and the wildcard: {allow_headers:?}"
         );
         // A regular request passes through and gets the CORS headers.
         let request = Request::builder()

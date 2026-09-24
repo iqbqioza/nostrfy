@@ -171,7 +171,8 @@ impl super::Conn {
             }
         };
         let max_sub_id_len = self.relay.config.read().await.limits.max_sub_id_len;
-        if sub_id.len() > max_sub_id_len {
+        // NIP-01 bounds the id in *chars*, like the REQ/COUNT paths.
+        if sub_id.chars().count() > max_sub_id_len {
             self.neg_err(&sub_id, "error: NEG-OPEN subscription id too long");
             return;
         }

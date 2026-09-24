@@ -570,13 +570,21 @@ pub async fn rpc_handler(
             if let Err(e) = check_role_id(role) {
                 return rpc_err(&e.to_string());
             }
-            if relay.assign_role(&pubkey, role).await {
-                audit!(&relay, &identity, "assignrole", params);
-                rpc_ok(json!(true))
-            } else {
-                rpc_err(
-                    "restricted: NIP-43 is disabled, the relay key is missing, the role does not exist or the event could not be stored",
-                )
+            // NIP-86: the result is always `true` — a duplicate grant is
+            // a no-op success. Only an unknown role, a disabled NIP-43, a
+            // missing relay key, or a failed persistence surfaces an error.
+            match relay.assign_role(&pubkey, role).await {
+                crate::relay::roles::RoleChange::Applied
+                | crate::relay::roles::RoleChange::Noop => {
+                    audit!(&relay, &identity, "assignrole", params);
+                    rpc_ok(json!(true))
+                }
+                crate::relay::roles::RoleChange::Unknown => {
+                    rpc_err("restricted: the role does not exist")
+                }
+                crate::relay::roles::RoleChange::Failed => rpc_err(
+                    "restricted: NIP-43 is disabled, the relay key is missing or the event could not be stored",
+                ),
             }
         }
         "unassignrole" => {
@@ -594,13 +602,24 @@ pub async fn rpc_handler(
             if let Err(e) = check_role_id(role) {
                 return rpc_err(&e.to_string());
             }
-            if relay.unassign_role(&pubkey, role).await {
-                audit!(&relay, &identity, "unassignrole", params);
-                rpc_ok(json!(true))
-            } else {
-                rpc_err(
-                    "restricted: NIP-43 is disabled, the relay key is missing or the assignment does not exist",
-                )
+            // NIP-86: the result is always `true` — revoking an absent
+            // grant is a no-op success. Only a disabled NIP-43, a missing
+            // relay key, or a failed persistence surfaces an error.
+            match relay.unassign_role(&pubkey, role).await {
+                crate::relay::roles::RoleChange::Applied
+                | crate::relay::roles::RoleChange::Noop => {
+                    audit!(&relay, &identity, "unassignrole", params);
+                    rpc_ok(json!(true))
+                }
+                // Unreachable for revocations (an unknown role revokes
+                // nothing, which is a `Noop`), kept for exhaustiveness.
+                crate::relay::roles::RoleChange::Unknown => {
+                    audit!(&relay, &identity, "unassignrole", params);
+                    rpc_ok(json!(true))
+                }
+                crate::relay::roles::RoleChange::Failed => rpc_err(
+                    "restricted: NIP-43 is disabled, the relay key is missing or the event could not be stored",
+                ),
             }
         }
         "blockip" => {
@@ -690,14 +709,19 @@ pub async fn rpc_handler(
             let Ok(id): Result<[u8; 32], _> = id.try_into() else {
                 return rpc_err("invalid event id");
             };
-            // Like the neighboring mutations, a failed store must not be
-            // reported as success: the ban would silently disappear on the
-            // next restart.
-            let (banned, state_removed) = relay.db.ban_event(id, reason).await;
+            // NIP-86: the result is always `true` — a ban lands even
+            // for an unknown (future) id, pre-banning it. Only a store
+            // failure must not be reported as success (the ban would
+            // silently disappear on the next restart).
+            let outcome = relay.db.ban_event(id, reason).await;
             audit!(&relay, &identity, "banevent", params);
-            if !banned {
-                return rpc_err("error: cannot persist the event ban");
-            }
+            let (_, state_removed) = match outcome {
+                Ok(outcome) => outcome,
+                Err(e) => {
+                    log::error!("banevent store failure: {e}");
+                    return rpc_err("error: cannot persist the event ban");
+                }
+            };
             if state_removed {
                 // A banned NIP-29/NIP-43 state event invalidates the live
                 // derived state like any other removal of one (the database
@@ -718,9 +742,13 @@ pub async fn rpc_handler(
             let Ok(id): Result<[u8; 32], _> = id.try_into() else {
                 return rpc_err("invalid event id");
             };
-            let unbanned = relay.db.unban_event(id).await;
+            // NIP-86: the result is always `true` — unbanning a
+            // never-banned id is a no-op success. Only a store failure
+            // surfaces an error.
+            let outcome = relay.db.unban_event(id).await;
             audit!(&relay, &identity, "allowevent", params);
-            if !unbanned {
+            if let Err(e) = outcome {
+                log::error!("allowevent store failure: {e}");
                 return rpc_err("error: cannot persist the event unban");
             }
             rpc_ok(json!(true))
@@ -1212,10 +1240,11 @@ mod tests {
         );
         let _ = rpc_call(&relay, "unblockip", vec![json!("::9")]).await;
 
-        // banevent / allowevent / listbannedevents. The ban must name a
-        // stored event: the db's reply reports whether the event was
-        // actually removed, and an ignored failure would report success for
-        // a ban that did not land.
+        // banevent / allowevent / listbannedevents. NIP-86 reports
+        // `true` (always) for these mutations: banning an unknown id
+        // pre-bans it (future publications are refused), and unbanning
+        // a never-banned id is a no-op success. Only a genuine store
+        // failure surfaces an error.
         let secp = secp256k1::Secp256k1::new();
         let keypair = secp256k1::Keypair::from_seckey_slice(&secp, &[13u8; 32]).unwrap();
         let mut banned_event = crate::event::Event {
@@ -1250,6 +1279,24 @@ mod tests {
         let resp = rpc_call(&relay, "allowevent", vec![json!("zz")]).await;
         assert!(rpc_err_of(resp).await.contains("event id"));
         let resp = rpc_call(&relay, "allowevent", vec![json!(id.clone())]).await;
+        assert!(rpc_ok_of(resp).await);
+        // Pre-ban: an unknown (future) id is banned, not an error.
+        let unknown = "cd".repeat(32);
+        let resp = rpc_call(&relay, "banevent", vec![json!(unknown.clone())]).await;
+        assert!(rpc_ok_of(resp).await);
+        assert!(
+            relay
+                .db
+                .list_banned_events()
+                .await
+                .iter()
+                .any(|(banned, _)| banned == &unknown),
+            "a pre-banned id must be listed"
+        );
+        // Idempotent unban: a never-banned id (and a repeat) succeeds.
+        let resp = rpc_call(&relay, "allowevent", vec![json!(unknown.clone())]).await;
+        assert!(rpc_ok_of(resp).await);
+        let resp = rpc_call(&relay, "allowevent", vec![json!(unknown.clone())]).await;
         assert!(rpc_ok_of(resp).await);
         // A reply that reports the store as failed must surface an error,
         // not a `true` result (the next call runs against the dead writer).
@@ -1596,6 +1643,73 @@ mod tests {
         let resp = rpc_call(&relay, "unassignrole", vec![json!(upper), json!("mod")]).await;
         assert!(rpc_ok_of(resp).await);
         assert!(!relay.roles.read().await.is_member_of(&lower));
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn role_grant_revoke_are_idempotent() {
+        // NIP-86: the `assignrole`/`unassignrole` result is always `true`
+        // — a duplicate grant and a missing revocation are no-op
+        // successes. Only an unknown grant target, a disabled NIP-43, a
+        // missing relay key, or a failed persistence surfaces an error.
+        let relay = build_admin_relay_with_key(Some(&"cd".repeat(32))).await;
+        let member = "aa".repeat(32);
+        let resp = rpc_call(&relay, "createrole", vec![json!("mod")]).await;
+        assert!(rpc_ok_of(resp).await);
+        let resp = rpc_call(
+            &relay,
+            "assignrole",
+            vec![json!(member.clone()), json!("mod")],
+        )
+        .await;
+        assert!(rpc_ok_of(resp).await);
+        let resp = rpc_call(
+            &relay,
+            "assignrole",
+            vec![json!(member.clone()), json!("mod")],
+        )
+        .await;
+        assert!(
+            rpc_ok_of(resp).await,
+            "a duplicate grant must still report true"
+        );
+        let resp = rpc_call(
+            &relay,
+            "assignrole",
+            vec![json!(member.clone()), json!("ghost")],
+        )
+        .await;
+        assert!(
+            rpc_err_of(resp).await.contains("does not exist"),
+            "a grant to an unknown role stays an error"
+        );
+        let resp = rpc_call(
+            &relay,
+            "unassignrole",
+            vec![json!("bb".repeat(32)), json!("mod")],
+        )
+        .await;
+        assert!(
+            rpc_ok_of(resp).await,
+            "revoking a missing grant must still report true"
+        );
+        let resp = rpc_call(
+            &relay,
+            "unassignrole",
+            vec![json!(member.clone()), json!("mod")],
+        )
+        .await;
+        assert!(rpc_ok_of(resp).await);
+        let resp = rpc_call(
+            &relay,
+            "unassignrole",
+            vec![json!(member.clone()), json!("mod")],
+        )
+        .await;
+        assert!(
+            rpc_ok_of(resp).await,
+            "a repeat revocation must still report true"
+        );
         relay.db.shutdown();
     }
 

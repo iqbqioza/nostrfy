@@ -453,16 +453,21 @@ async fn verify_auth(
     Some(pubkey)
 }
 
-fn error(status: StatusCode, reason: &str) -> Response {
-    // The reason also goes into the `x-reason` header, where control
-    // characters and non-ASCII bytes (possible in io/S3 error strings:
-    // filenames, XML, OS messages) would panic the response builder.
-    // Sanitize the header value; the body keeps the full text.
-    let header_reason: String = reason
+/// Sanitizes a reason string for the `x-reason` response header, where
+/// control characters and non-ASCII bytes (possible in io/S3 error
+/// strings: filenames, XML, OS messages) would panic the response
+/// builder.
+fn sanitize_reason(reason: &str) -> String {
+    reason
         .chars()
         .filter(|c| c.is_ascii_graphic() || *c == ' ')
         .take(200)
-        .collect();
+        .collect()
+}
+
+fn error(status: StatusCode, reason: &str) -> Response {
+    // The body keeps the full text; the header carries the sanitized form.
+    let header_reason = sanitize_reason(reason);
     let reason = reason.to_string();
     (
         status,
@@ -476,6 +481,33 @@ fn error(status: StatusCode, reason: &str) -> Response {
         reason,
     )
         .into_response()
+}
+
+/// A HEAD error: status + `x-reason` header with no body. HEAD
+/// responses must not carry a message body (RFC 9110 §9.3.2), and
+/// BUD-05/06 require clients to decide from the status code and headers
+/// alone — so unlike [`error`], there is no `text/plain` body here.
+fn head_error(status: StatusCode, reason: &str) -> Response {
+    (
+        status,
+        [(
+            axum::http::header::HeaderName::from_static("x-reason"),
+            sanitize_reason(reason),
+        )],
+    )
+        .into_response()
+}
+
+/// [`store_error`] for HEAD handlers: same statuses, no body.
+fn store_error_head(e: anyhow::Error) -> Response {
+    if e.downcast_ref::<storage::DbUnavailable>().is_some() {
+        return head_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "blob lookup unavailable, please retry",
+        );
+    }
+    log::error!("blossom storage error: {e}");
+    head_error(StatusCode::INTERNAL_SERVER_ERROR, "storage error")
 }
 
 /// Maps a BlobStore error to the HTTP response. A database lookup failure
@@ -493,6 +525,18 @@ fn store_error(e: anyhow::Error) -> Response {
     // response only carries a generic message.
     log::error!("blossom storage error: {e}");
     error(StatusCode::INTERNAL_SERVER_ERROR, "storage error")
+}
+
+/// RFC 7233 §3.2 `If-Range`: the Range is honored only when the
+/// validator matches the blob's ETag (`"<sha256>"`; the bare hash is
+/// accepted leniently). No `Last-Modified` is ever served, so an
+/// HTTP-date validator never matches and the full blob is served.
+fn if_range_matches(if_range: Option<&str>, sha: &str) -> bool {
+    let Some(value) = if_range else {
+        return true;
+    };
+    let value = value.trim();
+    value == format!("\"{sha}\"").as_str() || value == sha
 }
 
 /// Parses a single `Range: bytes=` request (RFC 7233) against `size`.
@@ -734,8 +778,17 @@ async fn get_blob(
         .get(axum::http::header::RANGE)
         .and_then(|v| v.to_str().ok())
         .map(|r| parse_range(r, size_usize));
+    // RFC 7233 §3.2: a Range guarded by a non-matching `If-Range`
+    // validator is ignored entirely (even a malformed range): the stale
+    // client gets the full blob with 200.
+    let range_honored = if_range_matches(
+        headers
+            .get(axum::http::header::IF_RANGE)
+            .and_then(|v| v.to_str().ok()),
+        &sha,
+    );
     let (start, end) = match range {
-        Some(Err(_)) => {
+        Some(Err(_)) if range_honored => {
             // Unsatisfiable or malformed range: 416 with the required
             // `Content-Range: bytes */<size>`.
             let mut response = error(
@@ -748,7 +801,7 @@ async fn get_blob(
             );
             return response;
         }
-        Some(Ok(Some((start, end)))) => (start, end),
+        Some(Ok(Some((start, end)))) if range_honored => (start, end),
         _ => (0, size_usize.saturating_sub(1)),
     };
     let len = if size == 0 {
@@ -786,7 +839,7 @@ async fn get_blob(
             // that the backend honored: a multi-range or non-bytes Range
             // header, or an ignored backend range, serves the full blob
             // with 200 (RFC 7233).
-            let ranged = matches!(range, Some(Ok(Some(_))));
+            let ranged = matches!(range, Some(Ok(Some(_)))) && range_honored;
             let mut response = if ranged && honored {
                 (StatusCode::PARTIAL_CONTENT, base_headers, body).into_response()
             } else {
@@ -828,77 +881,39 @@ async fn get_blob(
 
 /// `HEAD /<sha256>` — blob headers without the body, mirroring GET: the
 /// backing file/object must resolve (a mapping whose blob is gone is a
-/// 404, exactly like GET), and a single satisfiable Range yields 206 with
-/// `Content-Range` and a ranged `Content-Length`.
+/// 404, exactly like GET). RFC 7233 §3.1 requires ignoring a Range on
+/// HEAD, so the full length is always described with 200.
 async fn head_blob(
     State(relay): State<Arc<Relay>>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     AxPath(blob): AxPath<String>,
 ) -> Response {
     let Some(state) = state_of(&relay).await else {
-        return error(StatusCode::SERVICE_UNAVAILABLE, "blossom not initialized");
+        return head_error(StatusCode::SERVICE_UNAVAILABLE, "blossom not initialized");
     };
     let Some(sha) = split_blob(&blob) else {
-        return error(StatusCode::BAD_REQUEST, "invalid blob hash");
+        return head_error(StatusCode::BAD_REQUEST, "invalid blob hash");
     };
     let desc = match state.store.find(&sha).await {
         Ok(Some(desc)) => desc,
-        Ok(None) => return error(StatusCode::NOT_FOUND, "blob not found"),
-        Err(e) => return store_error(e),
+        Ok(None) => return head_error(StatusCode::NOT_FOUND, "blob not found"),
+        Err(e) => return store_error_head(e),
     };
     let size = desc.size;
-    let Ok(size_usize) = usize::try_from(size) else {
-        return error(StatusCode::NOT_FOUND, "blob not found");
-    };
-    let range = headers
-        .get(axum::http::header::RANGE)
-        .and_then(|v| v.to_str().ok())
-        .map(|r| parse_range(r, size_usize));
-    let (start, end) = match range {
-        Some(Err(_)) => {
-            let mut response = error(
-                StatusCode::RANGE_NOT_SATISFIABLE,
-                "requested byte range is not satisfiable",
-            );
-            response.headers_mut().insert(
-                axum::http::header::CONTENT_RANGE,
-                format!("bytes */{size}").parse().unwrap(),
-            );
-            return response;
-        }
-        Some(Ok(Some((start, end)))) => (start, end),
-        _ => (0, size_usize.saturating_sub(1)),
-    };
-    let len = if size == 0 {
-        0
-    } else {
-        (end - start + 1) as u64
-    };
     // Resolve the backing object exactly like GET: a mapping without a
-    // readable blob must 404, and the backend's range support decides
-    // whether a Range yields 206 or a full 200.
-    let honored = match state.store.open_stream_any(&sha, start as u64, len).await {
-        Ok(Some((stream, _owner))) => match stream {
-            storage::BlobStream::Local(_) => true,
-            storage::BlobStream::S3(resp) => resp.status() == reqwest::StatusCode::PARTIAL_CONTENT,
-        },
-        Ok(None) => return error(StatusCode::NOT_FOUND, "blob not found"),
-        Err(e) => return store_error(e),
-    };
-    let ranged = matches!(range, Some(Ok(Some(_))));
-    let status = if ranged && honored {
-        StatusCode::PARTIAL_CONTENT
-    } else {
-        StatusCode::OK
-    };
-    // An S3 backend that ignored the range serves the whole blob (like GET);
-    // Content-Length must describe what GET would actually send.
-    let served_len = if ranged && honored { len } else { size };
+    // readable blob must 404. The byte window is always the whole blob
+    // (a HEAD Range is ignored, and `If-Range` is meaningless without
+    // one), so there is no 206/416 path here.
+    match state.store.open_stream_any(&sha, 0, size).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return head_error(StatusCode::NOT_FOUND, "blob not found"),
+        Err(e) => return store_error_head(e),
+    }
     let mut response = (
-        status,
+        StatusCode::OK,
         [
             (axum::http::header::CONTENT_TYPE, desc.mime.clone()),
-            (axum::http::header::CONTENT_LENGTH, served_len.to_string()),
+            (axum::http::header::CONTENT_LENGTH, size.to_string()),
             (axum::http::header::ETAG, format!("\"{sha}\"")),
             (
                 axum::http::header::CACHE_CONTROL,
@@ -908,27 +923,6 @@ async fn head_blob(
         ],
     )
         .into_response();
-    if ranged
-        && honored
-        && let Some(Ok(Some((start, end)))) = range
-    {
-        response.headers_mut().insert(
-            axum::http::header::CONTENT_RANGE,
-            format!("bytes {start}-{end}/{size}").parse().unwrap(),
-        );
-    }
-    if ranged && honored {
-        // A 206 must not be cached as if it were the full blob (mirrors
-        // GET): drop the immutable cache header and mark the Range
-        // variance (the same URL can serve different bytes).
-        response
-            .headers_mut()
-            .remove(axum::http::header::CACHE_CONTROL);
-        response.headers_mut().insert(
-            axum::http::header::VARY,
-            axum::http::HeaderValue::from_static("Range"),
-        );
-    }
     harden_blob_response(&mut response, &desc.mime);
     response
 }
@@ -1410,17 +1404,19 @@ async fn head_media(State(relay): State<Arc<Relay>>, headers: HeaderMap) -> Resp
 /// `X-Content-Type` headers against the server policy and returns whether
 /// the corresponding PUT would be accepted.
 async fn head_preflight(relay: Arc<Relay>, headers: HeaderMap, verb: &str) -> Response {
+    // HEAD carries no body (see `head_error`): every refusal below is
+    // status + headers only.
     let Some(state) = state_of(&relay).await else {
-        return error(StatusCode::SERVICE_UNAVAILABLE, "blossom not initialized");
+        return head_error(StatusCode::SERVICE_UNAVAILABLE, "blossom not initialized");
     };
     // `X-SHA-256` is required: it is the only source of the blob hash
     // without a body.
     let Some(x_sha) = headers.get("x-sha-256").and_then(|v| v.to_str().ok()) else {
-        return error(StatusCode::BAD_REQUEST, "missing X-SHA-256 header");
+        return head_error(StatusCode::BAD_REQUEST, "missing X-SHA-256 header");
     };
     let x_sha = x_sha.trim().to_ascii_lowercase();
     if x_sha.len() != 64 || hex::decode(&x_sha).is_err() {
-        return error(StatusCode::BAD_REQUEST, "malformed X-SHA-256 header");
+        return head_error(StatusCode::BAD_REQUEST, "malformed X-SHA-256 header");
     }
     // `X-Content-Length` is required and bounded by the upload ceiling.
     let Some(len) = headers
@@ -1428,14 +1424,14 @@ async fn head_preflight(relay: Arc<Relay>, headers: HeaderMap, verb: &str) -> Re
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok())
     else {
-        return error(
+        return head_error(
             StatusCode::LENGTH_REQUIRED,
             "missing X-Content-Length header",
         );
     };
     let max_upload = state.max_upload_bytes as u64;
     if len > max_upload {
-        return error(
+        return head_error(
             StatusCode::PAYLOAD_TOO_LARGE,
             "the upload exceeds the configured size limit",
         );
@@ -1443,10 +1439,10 @@ async fn head_preflight(relay: Arc<Relay>, headers: HeaderMap, verb: &str) -> Re
     // BUD-11: upload/media tokens carry the matching verb and an `x` tag
     // matching the declared hash.
     let Some(pubkey) = verify_auth(&relay, &state, &headers, verb, Some(&x_sha)).await else {
-        return error(StatusCode::UNAUTHORIZED, "invalid or missing authorization");
+        return head_error(StatusCode::UNAUTHORIZED, "invalid or missing authorization");
     };
     if upload_allowed(&relay, &pubkey).await.is_err() {
-        return error(
+        return head_error(
             StatusCode::FORBIDDEN,
             "uploads are restricted to the configured allowlist",
         );
@@ -1462,7 +1458,7 @@ async fn head_preflight(relay: Arc<Relay>, headers: HeaderMap, verb: &str) -> Re
     // promises more than that case. The guard releases on drop (this is a
     // read-only check).
     if state.store.reserve_space(len.min(max_upload)).is_err() {
-        return error(StatusCode::INSUFFICIENT_STORAGE, "storage is full");
+        return head_error(StatusCode::INSUFFICIENT_STORAGE, "storage is full");
     }
     StatusCode::OK.into_response()
 }
@@ -1981,6 +1977,49 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(&body[..], &data[1000..2000]);
+        // RFC 7233 §3.2: a Range with a matching If-Range validator is
+        // honored; with a stale validator the Range is ignored (200 full).
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::RANGE,
+            "bytes=1000-1999".parse().unwrap(),
+        );
+        headers.insert(
+            axum::http::header::IF_RANGE,
+            format!("\"{sha}\"").parse().unwrap(),
+        );
+        let resp = get_blob(State(relay.clone()), headers, AxPath(sha.clone())).await;
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::RANGE,
+            "bytes=1000-1999".parse().unwrap(),
+        );
+        headers.insert(
+            axum::http::header::IF_RANGE,
+            format!("\"{}\"", "0".repeat(64)).parse().unwrap(),
+        );
+        let resp = get_blob(State(relay.clone()), headers, AxPath(sha.clone())).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(axum::http::header::CONTENT_RANGE),
+            None,
+            "a stale If-Range must ignore the Range, not serve 206"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], &data[..]);
+        // A stale If-Range ignores even an unsatisfiable Range (200, not
+        // 416: the Range field itself is ignored).
+        let mut headers = HeaderMap::new();
+        headers.insert(axum::http::header::RANGE, "bytes=50000-".parse().unwrap());
+        headers.insert(
+            axum::http::header::IF_RANGE,
+            format!("\"{}\"", "0".repeat(64)).parse().unwrap(),
+        );
+        let resp = get_blob(State(relay.clone()), headers, AxPath(sha.clone())).await;
+        assert_eq!(resp.status(), StatusCode::OK);
         // A multi-range header is ignored (RFC 7233): the full blob with 200,
         // not a 206 without Content-Range.
         let mut headers = HeaderMap::new();
@@ -2030,6 +2069,59 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn head_blob_ignores_range_and_carries_no_body() {
+        // RFC 7233 §3.1: a Range on HEAD is ignored (always 200 with the
+        // full length); RFC 9110 §9.3.2: HEAD responses carry no body.
+        let relay = build_blossom_relay(0).await;
+        let state = relay.blossom.read().await.clone().unwrap();
+        let data: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
+        let sha = sha256_hex(&data);
+        state
+            .store
+            .put(&"aa".repeat(32), &sha, &data, "application/octet-stream")
+            .await
+            .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(axum::http::header::RANGE, "bytes=0-10".parse().unwrap());
+        let resp = head_blob(State(relay.clone()), headers, AxPath(sha.clone())).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(axum::http::header::CONTENT_RANGE),
+            None,
+            "HEAD must ignore Range, not answer 206"
+        );
+        assert_eq!(resp.headers()[axum::http::header::CONTENT_LENGTH], "1000");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(body.is_empty(), "HEAD must not carry a body");
+        // Error paths are bodiless too (BUD-05/06: clients decide from
+        // the status code and headers alone).
+        let resp = head_blob(
+            State(relay.clone()),
+            HeaderMap::new(),
+            AxPath("ab".repeat(32)),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(body.is_empty(), "a HEAD 404 must not carry a body");
+        // Preflight errors are bodiless as well.
+        let resp = head_upload(State(relay.clone()), HeaderMap::new()).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            body.is_empty(),
+            "a HEAD preflight error must not carry a body"
+        );
         relay.db.shutdown();
     }
 
@@ -3209,25 +3301,28 @@ mod tests {
             .await
             .unwrap();
 
-        // A single satisfiable Range yields 206 + Content-Range, like GET.
+        // RFC 7233 §3.1: a Range on HEAD is ignored — always 200 with
+        // the full length (never a 206), keeping the immutable cache
+        // header and no Range variance marker.
         let mut headers = HeaderMap::new();
         headers.insert(axum::http::header::RANGE, "bytes=100-199".parse().unwrap());
         let resp = head_blob(State(relay.clone()), headers, AxPath(sha.clone())).await;
-        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
-        assert_eq!(resp.headers()[axum::http::header::CONTENT_LENGTH], "100");
+        assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
-            resp.headers()[axum::http::header::CONTENT_RANGE],
-            format!("bytes 100-199/{}", data.len())
+            resp.headers()[axum::http::header::CONTENT_LENGTH],
+            data.len().to_string()
         );
-        // A 206 must not be cached as if it were the full blob (mirrors
-        // GET): no immutable cache header, and a Range variance marker.
         assert!(
             resp.headers()
-                .get(axum::http::header::CACHE_CONTROL)
+                .get(axum::http::header::CONTENT_RANGE)
                 .is_none(),
-            "a HEAD 206 must not carry the full-blob immutable cache header"
+            "HEAD must ignore Range, not answer 206"
         );
-        assert_eq!(resp.headers()[axum::http::header::VARY], "Range");
+        assert_eq!(
+            resp.headers()[axum::http::header::CACHE_CONTROL],
+            "public, max-age=31536000, immutable"
+        );
+        assert!(resp.headers().get(axum::http::header::VARY).is_none());
         // A full HEAD keeps the immutable cache header and needs no Vary.
         let resp = head_blob(State(relay.clone()), HeaderMap::new(), AxPath(sha.clone())).await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -3236,14 +3331,16 @@ mod tests {
             "public, max-age=31536000, immutable"
         );
         assert!(resp.headers().get(axum::http::header::VARY).is_none());
-        // An unsatisfiable range is a 416 with `Content-Range: bytes */`.
+        // An unsatisfiable range is ignored the same way (200, not 416).
         let mut headers = HeaderMap::new();
         headers.insert(axum::http::header::RANGE, "bytes=999999-".parse().unwrap());
         let resp = head_blob(State(relay.clone()), headers, AxPath(sha.clone())).await;
-        assert_eq!(resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
-        assert_eq!(
-            resp.headers()[axum::http::header::CONTENT_RANGE],
-            format!("bytes */{}", data.len())
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_RANGE)
+                .is_none(),
+            "HEAD must ignore even an unsatisfiable Range"
         );
 
         // The backing file disappears while the LMDB mapping remains:

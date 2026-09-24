@@ -754,11 +754,14 @@ impl GroupStore {
         let mut out = Vec::new();
         match event.kind {
             JOIN => {
-                // Joined via a valid invite code on a closed group, or
+                // Admitted via a valid invite code on a closed group, or
                 // honored on an open group (not `closed`): the `code` tag
                 // is optional preauthorization and irrelevant to admission
-                // on open groups. A closed group without a valid code
-                // leaves the request pending for an admin to review.
+                // on open groups. A closed group without a valid code is
+                // ignored (NIP-29: `closed` means join requests are not
+                // honored; this relay keeps no pending-join queue — the
+                // live validation rejects such requests as final, so this
+                // arm is a no-op for them on every path).
                 let admitted = self.groups.get(gid).is_some_and(|g| {
                     if g.settings.closed {
                         event_code(event).is_some_and(|code| g.has_invite(code))
@@ -1013,7 +1016,15 @@ impl GroupStore {
                         parent_group.children.push(gid.to_string());
                         linked_to_new_parent = true;
                     }
-                    if let Some(group) = self.groups.get_mut(gid) {
+                    // Mirror the live validation (`parent group does not
+                    // exist`): a replay that deleted the parent earlier in
+                    // the same second (the rebuild rank runs 9008 before
+                    // 9002) must leave the child orphaned like the live
+                    // delete did, not dangle a pointer at the deleted id.
+                    let parent_exists = parent_after
+                        .as_deref()
+                        .is_none_or(|p| self.groups.contains_key(p));
+                    if parent_exists && let Some(group) = self.groups.get_mut(gid) {
                         group.parent = parent_after.clone();
                     }
                 }
@@ -1139,9 +1150,15 @@ impl GroupStore {
                 let mut adopted_parent = None;
                 // An empty id is rejected at intake and validation; the
                 // replay path below must not resurrect one either (it would
-                // create a phantom group outside the capacity budget).
+                // create a phantom group outside the capacity budget). A
+                // ghost id is rejected the same way: its create was lost
+                // while survivors may remain stored, so reviving it as a
+                // default-public group would expose them (validation
+                // rejects such creates; this guard keeps replays that
+                // bypass validation fail-closed).
                 if !gid.is_empty()
                     && !self.groups.contains_key(gid)
+                    && !self.ghost.contains(gid)
                     && (ignore_capacity || !self.at_capacity())
                 {
                     // A fresh create resurrects an explicitly deleted id:
@@ -1149,12 +1166,9 @@ impl GroupStore {
                     // deleted group's events were purged by the relay when
                     // the `9008` was applied, so re-creation starts from an
                     // empty history (no old private content can surface
-                    // under the new, default-public settings). A ghost is
-                    // deliberately NOT cleared: its create was lost while
-                    // survivors may remain stored, so reviving it as a
-                    // default-public group would expose them. Validation
-                    // rejects such creates; this arm stays fail-closed for
-                    // replays that bypass validation.
+                    // under the new, default-public settings). Ghost ids
+                    // never reach this arm (guarded above), so there is no
+                    // tombstone of theirs to clear here.
                     self.deleted.remove(gid);
                     let mut group = Group::default();
                     group

@@ -88,9 +88,14 @@ pub(crate) async fn livekit_token(
     match authed {
         Some(verified)
             if relay.nip98_replay.accept(&verified.id, unix_now())
-                && group_allows(&relay, &group, &verified.pubkey).await =>
+                && group_allows(&relay, &group, &verified.pubkey.to_ascii_lowercase()).await =>
         {
-            match issue_livekit_token(&cfg, &group, &verified.pubkey) {
+            // NIP-29: the JWT `sub` starts with the *lowercase* hex
+            // pubkey (plus a random suffix), and members are stored
+            // lowercase — but wire pubkeys may be uppercase hex, so
+            // normalize before minting (and the membership check above).
+            let pubkey = verified.pubkey.to_ascii_lowercase();
+            match issue_livekit_token(&cfg, &group, &pubkey) {
                 Ok(token) => {
                     let url = cfg.relay.livekit_url.clone();
                     (StatusCode::OK, Json(json!({ "token": token, "url": url })))
@@ -473,6 +478,75 @@ mod tests {
             status,
             StatusCode::UNAUTHORIZED,
             "a banned pubkey must not mint a LiveKit token"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn uppercase_auth_mints_lowercase_subject() {
+        // Wire pubkeys may be uppercase hex (hex-decode is
+        // case-insensitive and the Schnorr signature verifies over the
+        // verbatim string). NIP-29 requires the JWT `sub` to start with
+        // the *lowercase* hex pubkey, and members are stored lowercase —
+        // so the endpoint normalizes before the membership check and the
+        // mint.
+        use base64::Engine as _;
+        let relay = build_relay().await;
+        relay.groups.write().await.groups.insert(
+            "open".into(),
+            crate::nips::nip29::Group {
+                settings: crate::nips::nip29::GroupSettings {
+                    livekit: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let secp = relay.secp().clone();
+        let keypair = Keypair::from_seckey_slice(&secp, &[7u8; 32]).unwrap();
+        let mut ev = signed_token_auth(&relay, &secp, "open").await;
+        ev.pubkey = ev.pubkey.to_ascii_uppercase();
+        assert!(
+            ev.pubkey.chars().any(|c| c.is_ascii_uppercase()),
+            "the test needs hex letters to tell the cases apart"
+        );
+        ev.id = compute_id(&ev);
+        let id = ev.id_bytes().unwrap();
+        ev.sig = secp.sign_schnorr_no_aux_rand(&id, &keypair).to_string();
+        let (status, _, body) = token_status(&relay, "open", &ev).await;
+        assert_eq!(status, StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let token = json["token"].as_str().expect("a JWT must be minted");
+        let payload = token.split('.').nth(1).expect("a JWT has three parts");
+        let claims: serde_json::Value = serde_json::from_slice(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(payload)
+                .unwrap(),
+        )
+        .unwrap();
+        let sub = claims["sub"].as_str().expect("sub must be a string");
+        assert_eq!(
+            &sub[..64],
+            &ev.pubkey.to_ascii_lowercase(),
+            "the subject must start with the lowercase pubkey"
+        );
+        // A closed-group member signing uppercase is still recognized.
+        let mut g = crate::nips::nip29::Group::default();
+        g.settings.private = true;
+        g.settings.livekit = true;
+        g.members
+            .insert(ev.pubkey.to_ascii_lowercase(), Default::default());
+        relay.groups.write().await.groups.insert("closed".into(), g);
+        let mut ev2 = signed_token_auth(&relay, &secp, "closed").await;
+        ev2.pubkey = ev2.pubkey.to_ascii_uppercase();
+        ev2.id = compute_id(&ev2);
+        let id2 = ev2.id_bytes().unwrap();
+        ev2.sig = secp.sign_schnorr_no_aux_rand(&id2, &keypair).to_string();
+        let (status, _, _) = token_status(&relay, "closed", &ev2).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "an uppercase-signed member must mint on a closed group"
         );
         relay.db.shutdown();
     }

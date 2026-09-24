@@ -1361,6 +1361,84 @@ fn join_to_unknown_group_is_rejected() {
 }
 
 #[test]
+fn create_replay_for_ghost_id_stays_fail_closed() {
+    // The CREATE_GROUP arm promises fail-closed replays: a ghost id
+    // (its create was lost while survivors may remain stored) must not
+    // resurrect as a default-public group on paths that bypass
+    // validation (migration/import, `ignore_capacity` rebuild).
+    let mut store = GroupStore::default();
+    store.mark_ghost("g1");
+    let create = event(CREATE_GROUP, USER, Some("g1"), vec![]);
+    let out = store.apply(&create, "", 1, true, false);
+    assert!(
+        !store.groups.contains_key("g1"),
+        "a ghosted id must not be recreated by an unvalidated replay"
+    );
+    assert!(
+        out.is_empty(),
+        "no metadata may be emitted for a group that was never created"
+    );
+}
+
+#[test]
+fn replay_linking_to_deleted_parent_keeps_child_orphaned() {
+    // Live `validate_edit_metadata` rejects a 9002 whose parent does not
+    // exist, and a live 9008 orphans the children to `None`. The
+    // same-second rebuild rank runs the 9008 before the 9002, so the
+    // replay must converge on the live end state — not a dangling
+    // parent pointer plus a bare 39000 for the deleted id.
+    let mut store = GroupStore::default();
+    let now = 1_600_000_000;
+    store.apply(
+        &event(CREATE_GROUP, ADMIN, Some("p"), vec![]),
+        "relay",
+        now,
+        false,
+        false,
+    );
+    store.apply(
+        &event(CREATE_GROUP, ADMIN, Some("c"), vec![]),
+        "relay",
+        now,
+        false,
+        false,
+    );
+    let link = event(
+        9002,
+        ADMIN,
+        Some("c"),
+        vec![vec!["parent".into(), "p".into()]],
+    );
+    store.apply(&link, "relay", now, false, false);
+    assert_eq!(store.groups["c"].parent.as_deref(), Some("p"));
+    // Live delete orphans the child.
+    store.apply(
+        &event(DELETE_GROUP, ADMIN, Some("p"), vec![]),
+        "relay",
+        now,
+        false,
+        false,
+    );
+    assert_eq!(store.groups["c"].parent, None);
+    // Rank-inverted rebuild replay of the (once-valid) link: the parent
+    // is gone, so the assignment is dropped like the live validation
+    // rejects it (`ignore_capacity` mirrors the startup rebuild, which
+    // skips the runtime re-check above).
+    let out = store.apply(&link, "relay", now, true, true);
+    assert_eq!(
+        store.groups["c"].parent, None,
+        "a replayed link to a deleted parent must not dangle"
+    );
+    assert!(
+        !out.iter().any(|e| e.kind == GROUP_META
+            && e.tags
+                .iter()
+                .any(|t| t == &vec![D.to_string(), "p".to_string()])),
+        "no metadata may be resurrected for the deleted parent"
+    );
+}
+
+#[test]
 fn livekit_tag_and_single_parent() {
     // NIP-29: a `livekit` tag in the metadata edit is mirrored in the
     // 39000 event, and a 9002 carrying more than one `parent` tag is

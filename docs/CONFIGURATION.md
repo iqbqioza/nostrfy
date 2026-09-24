@@ -245,7 +245,7 @@ Set this whenever a reverse proxy (nginx, Caddy, a cloud load balancer, Cloudfla
 | `max_subscriptions` | integer | `20` | Max subscriptions per connection (REQ and NEG) |
 | `max_limit` | integer | `500` | Ceiling for the REQ `limit` |
 | `max_count` | integer | `2000` | Ceiling for COUNT results |
-| `max_sub_id_len` | integer | `64` | Max subscription id length |
+| `max_sub_id_len` | integer | `64` | Max subscription id length (characters) |
 | `max_sub_bytes` | integer | `1048576` | Total subscription filter bytes per connection |
 
 ### Events
@@ -320,7 +320,7 @@ Set this whenever a reverse proxy (nginx, Caddy, a cloud load balancer, Cloudfla
 
 **`max_count`** — The ceiling for COUNT results. When the count is cut at this value, the response carries `"approximate": true`.
 
-**`max_sub_id_len`** — The maximum length of a subscription id. Longer ids are refused.
+**`max_sub_id_len`** — The maximum length of a subscription id, counted in **characters** (not bytes), matching the NIP-01 definition. Longer ids are refused.
 
 **`max_sub_bytes`** — The total bytes of all subscription filters held by one connection. Prevents a connection from pinning many megabytes of filter data.
 

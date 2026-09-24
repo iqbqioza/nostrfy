@@ -370,11 +370,24 @@ impl FileLogger {
             .collect();
         existing.sort_unstable();
         // Descending so `.N` is moved before `.N-1` overwrites it. A
-        // generation above the current ceiling is left in place (the same
-        // as before) until a later shift overwrites it.
+        // generation above the current ceiling (left by a lowered
+        // `max_log_files`) is removed below instead of shifting.
         let mut failure: Option<String> = None;
         for i in existing.into_iter().rev() {
             if i >= self.max_files {
+                // A lowered ceiling orphans higher generations: remove
+                // them so the total stays within `max_files + 1` (a
+                // missing file lost a rename race — ignore it, but
+                // report other errors like any rotation failure).
+                let stale = backup_path(&self.path, i);
+                if let Err(e) = std::fs::remove_file(&stale)
+                    && e.kind() != std::io::ErrorKind::NotFound
+                {
+                    failure.get_or_insert(format!(
+                        "cannot remove over-ceiling log backup {}: {e}",
+                        stale.display()
+                    ));
+                }
                 continue;
             }
             let from = backup_path(&self.path, i);
@@ -655,6 +668,36 @@ mod tests {
         // Backups exist and are bounded.
         assert!(path.with_file_name("nostrfy.log.1").exists() || backup_path(&path, 1).exists());
         assert!(!backup_path(&path, 4).exists(), "only 3 backups are kept");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rotation_removes_backups_above_a_lowered_ceiling() {
+        // Lowering `max_log_files` must not orphan higher generations:
+        // rotation deletes them so the total stays within the ceiling.
+        // Driven directly (not through the process-global logger) so
+        // parallel tests cannot steal the records.
+        let dir = std::env::temp_dir().join("nostrfy-log-ceiling-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("nostrfy.log");
+        let logger = FileLogger::open(path.clone(), 8, 2).unwrap();
+        // A stale generation from when the ceiling was higher.
+        std::fs::write(backup_path(&path, 5), b"stale").unwrap();
+        for i in 0..6 {
+            logger.log(
+                &log::Record::builder()
+                    .args(format_args!("ceiling test line {i}"))
+                    .level(log::Level::Info)
+                    .build(),
+            );
+        }
+        logger.flush();
+        assert!(
+            !backup_path(&path, 5).exists(),
+            "an over-ceiling generation must be removed by rotation"
+        );
+        assert!(!backup_path(&path, 3).exists(), "only 2 backups are kept");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
