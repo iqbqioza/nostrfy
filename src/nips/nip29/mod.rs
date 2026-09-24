@@ -1206,6 +1206,16 @@ impl GroupStore {
                 }
             }
             DELETE_GROUP => {
+                // Tombstone only known ids: a delete for a completely
+                // unknown id (no group, ghost, or tombstone — reachable
+                // only via history replay, since validation rejects live
+                // 9008s for unknown groups) must not consume the capacity
+                // budget forever. Ghost ids keep their lifecycle (delete
+                // tombstone, purge, re-creatable); already-deleted ids
+                // re-insert idempotently.
+                let known = self.groups.contains_key(gid)
+                    || self.ghost.contains(gid)
+                    || self.deleted.contains(gid);
                 if let Some(group) = self.groups.remove(gid) {
                     self.total_members = self.total_members.saturating_sub(group.members.len());
                     // The throttle stamp belongs to the deleted incarnation:
@@ -1242,7 +1252,9 @@ impl GroupStore {
                         }
                     }
                 }
-                self.deleted.insert(gid.to_string());
+                if known {
+                    self.deleted.insert(gid.to_string());
+                }
             }
             9009 => {
                 if let Some(group) = self.groups.get_mut(gid) {

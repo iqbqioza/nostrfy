@@ -2445,6 +2445,62 @@ fn recreated_group_republishes_member_list() {
 }
 
 #[test]
+fn delete_unknown_group_leaves_no_tombstone() {
+    // A 9008 for a completely unknown id (reachable only via history
+    // replay — live validation rejects it) must not consume the capacity
+    // budget forever: only known ids earn a delete tombstone. Ghost ids
+    // keep their delete lifecycle, and re-deleting is idempotent.
+    let mut store = GroupStore::with_cap(2);
+    let now = 1_700_000_000;
+    store.apply(
+        &event(DELETE_GROUP, ADMIN, Some("nope"), vec![]),
+        "relay",
+        now,
+        false,
+        false,
+    );
+    assert!(
+        !store.deleted.contains("nope"),
+        "unknown ids must not take cap space"
+    );
+    assert!(store.group("nope").is_none());
+    // Known groups still tombstone, idempotently.
+    store.apply(
+        &event(CREATE_GROUP, ADMIN, Some("g1"), vec![]),
+        "relay",
+        now,
+        false,
+        false,
+    );
+    store.apply(
+        &event(DELETE_GROUP, ADMIN, Some("g1"), vec![]),
+        "relay",
+        now,
+        false,
+        false,
+    );
+    assert!(store.deleted.contains("g1"));
+    store.apply(
+        &event(DELETE_GROUP, ADMIN, Some("g1"), vec![]),
+        "relay",
+        now,
+        false,
+        false,
+    );
+    assert!(store.deleted.contains("g1"));
+    // Ghost ids still transition to deleted (their purge lifecycle).
+    store.mark_ghost("g2");
+    store.apply(
+        &event(DELETE_GROUP, ADMIN, Some("g2"), vec![]),
+        "relay",
+        now,
+        false,
+        false,
+    );
+    assert!(store.deleted.contains("g2"));
+}
+
+#[test]
 fn capacity_blocked_create_emits_nothing() {
     // A create refused by the group cap must not store or broadcast bare
     // metadata for a group that was never created (two concurrent creates
