@@ -7,15 +7,17 @@ This page is the complete reference for the `nostrfy.toml` configuration file: e
 1. [Basics](#1-basics)
 2. [Configuration Sections](#2-configuration-sections)
 3. [`[relay]` — relay identity](#3-relay--relay-identity)
-4. [`[server]` — server settings](#4-server--server-settings)
-5. [`[limits]` — limits and protections](#5-limits--limits-and-protections)
-6. [`[database]` — database settings](#6-database--database-settings)
-7. [`[daemon]` — daemon settings](#7-daemon--daemon-settings)
-8. [`[access]` — access control](#8-access--access-control)
-9. [Validation rules](#9-validation-rules)
-10. [Reloading at runtime (SIGHUP)](#10-reloading-at-runtime-sighup)
-11. [Full example](#11-full-example)
-12. [Common mistakes](#12-common-mistakes)
+4. [`[rpc]` — NIP-86 management RPC](#4-rpc--nip-86-management-rpc)
+5. [`[server]` — server settings](#5-server--server-settings)
+6. [`[limits]` — limits and protections](#6-limits--limits-and-protections)
+7. [`[database]` — database settings](#7-database--database-settings)
+8. [`[daemon]` — daemon settings](#8-daemon--daemon-settings)
+9. [`[access]` — access control](#9-access--access-control)
+10. [`[blossom]` — Blossom file server](#10-blossom--blossom-file-server-media-hosting)
+11. [Validation rules](#11-validation-rules)
+12. [Reloading at runtime (SIGHUP)](#12-reloading-at-runtime-sighup)
+13. [Full example](#13-full-example)
+14. [Common mistakes](#14-common-mistakes)
 
 ---
 
@@ -87,6 +89,9 @@ Every key is optional; a missing key uses the default shown below.
 | `reject_ephemeral` | boolean | `false` | When `true`, NIP-01 ephemeral events (kinds 20000-29999) are rejected (`blocked: ephemeral events not allowed`) |
 | `enabled_git` | boolean | `false` | When `true`, NIP-34 git events (kinds 1617-1633, 30617/30618) are accepted and NIP-34 is advertised. Default `false`: the kinds are rejected (`blocked: NIP-34 git events are disabled`) and NIP-34 is not advertised |
 | `max_events_per_min_per_pubkey` | integer | `0` | Publish rate limit per pubkey (events per minute; `0` = no limit) |
+| `require_pow` | integer | `0` | Required proof-of-work difficulty in leading zero bits (`0` = off; enforced regardless of NIP-13 advertisement) |
+| `new_pubkey_min_age_secs` | integer | `0` | Reject events from pubkeys first seen less than this many seconds ago (`0` = off) |
+| `max_groups` | integer | `1000` | Cap on the in-memory NIP-29 group store (active groups plus deleted-group markers); must be ≥ 1 |
 | `require_auth` | boolean | `false` | Require NIP-42 authentication for all REQ/EVENT/COUNT/NEG |
 | `send_auth_challenge` | boolean | `true` | Send the AUTH challenge on connect |
 | `enabled_nip78_auth` | boolean | `true` | Require NIP-42 AUTH before accepting kind 78/30078 events and serve them only to the authenticated owner |
@@ -167,6 +172,10 @@ The changes take effect immediately and are persisted (same lists as `nostrfy re
 
 ### Key details
 
+**`management_token`** — The bearer token that authenticates management calls (`Authorization: Bearer <token>`). Compared in constant time. Empty = token authentication is disabled.
+
+**`admin_pubkey`** — The administrator's public key for NIP-98 authentication: management calls must carry a valid NIP-98 auth event (kind 27235, with a `payload` tag, a `u` tag matching the relay URL exactly, signed by this key). Empty = NIP-98 authentication is disabled. Each auth event is single-use within its 60-second window.
+
 **`max_admin_body_bytes`** — The request body limit for the NIP-86 JSON-RPC handler mounted on the relay's public `POST /` routes (must be at least 1; `0` fails validation). NIP-86 requests are tiny method+params documents, so the 64 KiB default is generous while keeping the publicly reachable route from buffering large bodies. Management mutations are recorded in a rate-limited audit log (at most 600 entries per minute, then a single per-window summary line) with the authenticated identity.
 
 ## 5. `[server]` — server settings
@@ -192,11 +201,9 @@ The changes take effect immediately and are persisted (same lists as `nostrfy re
 
 **`ws_paths`** — Which paths serve the WebSocket endpoint and the NIP-11 document: `root` serves `/` only (the default; the legacy `/ws` and `/ws/` paths are removed); `inbox-outbox` serves only `/inbox` and `/outbox`; `all` serves the root and the inbox/outbox paths. The inbox/outbox paths give the relay distinct endpoints for the inbox/outbox routing model (e.g. `wss://relay.example.com/inbox` and `wss://relay.example.com/outbox`). In `inbox-outbox` mode the root path returns 404 on every host except a configured Blossom host, where it answers the Blossom server-info document. Fixed at startup — requires a `restart`.
 
-**`management_token`** — The bearer token that authenticates management calls (`Authorization: Bearer <token>`). Compared in constant time. Empty = token authentication is disabled.
-
-**`admin_pubkey`** — The administrator's public key for NIP-98 authentication: management calls must carry a valid NIP-98 auth event (kind 27235, with a `payload` tag, a `u` tag matching the relay URL exactly, signed by this key). Empty = NIP-98 authentication is disabled. Each auth event is single-use within its 60-second window.
-
 **`metrics_enabled`** — When `true`, serves Prometheus-formatted metrics at `/metrics` (no authentication). Fixed at startup — requires a `restart`.
+
+> **Note:** `management_token` / `admin_pubkey` sometimes appear under `[server]` in old guides — those spellings are legacy aliases of the `[rpc]` keys above.
 
 **`trusted_proxies`** — Reverse-proxy addresses (single IPs or CIDR ranges) whose `X-Forwarded-For` header is trusted. When the TCP peer matches an entry, the client address used for the per-IP connection caps (`max_connections_per_ip`, `max_connections_per_sec_per_ip`), NIP-86 `blockip` and the connection logs is the **last untrusted** entry of `X-Forwarded-For` (proxies append per hop, so the right-most entry that is not itself a trusted proxy is the address that reached the nearest hop); an absent or malformed header falls back to the peer. IPv6 clients are accounted under their `/64` prefix, so one host cannot rotate addresses inside its `/64` to dodge a cap. Empty (the default) trusts no proxy and ignores the header entirely.
 
@@ -250,8 +257,8 @@ Set this whenever a reverse proxy (nginx, Caddy, a cloud load balancer, Cloudfla
 | `max_tags` | integer | `2000` | Max tags per event |
 | `max_tag_value_bytes` | integer | `1024` | Max bytes per tag value |
 | `max_created_at_future_secs` | integer | `3600` | Tolerated future skew of `created_at` (seconds) |
-| `require_pow` | integer | `0` | Required proof-of-work difficulty in leading zero bits |
-| `max_indexed_words` | integer | `32` | Words of content indexed for NIP-50 search |
+| `require_pow` | integer | `0` | Required proof-of-work difficulty in leading zero bits (legacy alias of `relay.require_pow`) |
+| `max_indexed_words` | integer | `32` | Words of content indexed for NIP-50 search (legacy alias of `database.max_indexed_words`) |
 
 ### Database queue and overload protection
 
@@ -266,7 +273,7 @@ Set this whenever a reverse proxy (nginx, Caddy, a cloud load balancer, Cloudfla
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
-| `new_pubkey_min_age_secs` | integer | `0` | Reject events from pubkeys younger than this (seconds) |
+| `new_pubkey_min_age_secs` | integer | `0` | Reject events from pubkeys younger than this (seconds; legacy alias of `relay.new_pubkey_min_age_secs`) |
 | `group_late_publish_secs` | integer | `3600` | NIP-29: reject group events older than this (seconds) |
 
 ### REST API
@@ -365,6 +372,10 @@ Set this whenever a reverse proxy (nginx, Caddy, a cloud load balancer, Cloudfla
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
 | `path` | string | `"./data"` | Database directory (LMDB) |
+| `db_buffer_size` | integer | `2048` | Initial per-connection WebSocket buffer (bytes, grows on demand) |
+| `db_request_timeout_secs` | integer | `30` | Database request timeout (`0` = wait forever) |
+| `max_db_queue_msgs` | integer | `4096` | Max queued database messages before failing fast |
+| `max_db_queue_events` | integer | `262144` | Max queued database events before failing fast |
 | `max_dbs` | integer | `32` | LMDB max named databases (raised to 22 when lower) |
 | `max_readers` | integer | `128` | LMDB max concurrent readers (raised to `2 * reader_threads + 3` when lower) |
 | `map_size` | integer | `1073741824` (1 GB) | Floor for the memory map size (bytes) |
@@ -500,7 +511,7 @@ All CLI access mutations (`nostrfy relay allow/deny`, `nostrfy blossom allow/den
 
 ---
 
-## 8b. `[blossom]` — Blossom file server (media hosting)
+## 10. `[blossom]` — Blossom file server (media hosting)
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -555,7 +566,7 @@ Each `allow`/`deny` writes the database and reloads the running daemon (SIGHUP),
 
 ---
 
-## 10. Validation rules
+## 11. Validation rules
 
 `nostrfy check` (and startup) rejects invalid configurations with a clear message:
 
@@ -565,15 +576,21 @@ Each `allow`/`deny` writes the database and reloads the running daemon (SIGHUP),
 | `private_key` must be a valid secp256k1 secret key | `relay.private_key is not a valid secp256k1 secret key` |
 | `port` must be 1–65535 | `server.port must be between 1 and 65535` |
 | `api_host` / `blossom.host` must be bare hostnames | `server.api_host must be a bare hostname (no scheme, port or path), got "https://..."` |
+| `server.ws_paths` must be `root`, `inbox-outbox` or `all` | `server.ws_paths must be "root", "inbox-outbox" or "all", got ...` |
+| `server.inbox/outbox_write_policy` must be `any` or `relay` | `server.inbox_write_policy must be "any" or "relay", got ...` |
+| `relay.require_auth` / `relay.enabled_nip78_auth` need NIP-42 | `relay.require_auth requires NIP-42 to be enabled (...)` |
+| `database.reader_threads` must be 1-64 | `database.reader_threads must be between 1 and 64` |
+| `limits.socket_recv_buffer_kb` must be ≤ 4096 | `limits.socket_recv_buffer_kb must be at most 4096` |
+| `blossom.storage` must be `local`/`s3`; `max_upload_bytes` ≥ 1 and ≤ 4294967295; S3 needs endpoint/bucket/keys (+ region unless R2) and `https://` (loopback exempt) | `blossom.storage must be "local" or "s3" ...`, `blossom.max_upload_bytes must be at least 1`, `... must not exceed 4294967295`, `blossom.storage = "s3" requires ...`, `blossom.s3_region must not be empty ...`, `blossom.s3_endpoint must use https:// ...` |
 | `api_host` must differ from `blossom.host` | `server.api_host and blossom.host must be different hostnames` |
 | `trusted_proxies` entries must be IPs/CIDRs (no `/0`) | `server.trusted_proxies entries must be an IP address or CIDR range ..., got "0.0.0.0/0"` |
 | blocked IPs must parse | `access.blocked_ips contains an invalid IP address: "..."` |
 | `map_size` ≤ `max_map_size` | `database.map_size must not exceed database.max_map_size` |
-| Core limits must be ≥ 1 (incl. `relay.max_groups`) | `limits.max_connections must be at least 1 (got 0)` |
+| Core limits must be ≥ 1 (incl. `relay.max_groups`, `db_buffer_size`, `reader_threads`, `max_indexed_words`, `max_db_queue_msgs`/`max_db_queue_events`, `rpc.max_admin_body_bytes`; `max_out_queue_bytes` is exempt) | `limits.max_connections must be at least 1 (got 0)` |
 | `daemon.stats_interval_secs` must be ≥ 1 | `daemon.stats_interval_secs must be at least 1 (got 0)` |
 | `daemon.max_log_files` must be 1-1000 | `daemon.max_log_files must be between 1 and 1000` |
 | `max_neg_items`/`max_req_response_bytes` hard ceilings | `config.limits.max_neg_items = 20000000 exceeds the hard ceiling of 10000000; ...` |
-| Paths must not be empty | `database.path must not be empty` |
+| Paths must not be empty (`database.path`, `daemon.pid/log/stats_file`, `blossom.local_path` when enabled) | `database.path must not be empty` |
 
 Unknown keys or sections produce **warnings** (not errors), so typos are visible:
 
@@ -584,7 +601,7 @@ Unknown keys or sections produce **warnings** (not errors), so typos are visible
 
 ---
 
-## 10. Reloading at runtime (SIGHUP)
+## 12. Reloading at runtime (SIGHUP)
 
 Editing the file and sending `kill -HUP $(cat nostrfy.pid)` reloads it **without a restart**. The reload is **not all-or-nothing**: every setting that can be applied live is applied, even when the same file also changes a startup-only setting. Startup-only settings keep their running values; each changed one is warned about (`<key> changed in the reloaded config but the routes are fixed at startup; a restart is required to apply it`), and a changed `relay.private_key` is warned about and ignored because the signing key is fixed at startup. A file that **fails validation** is rejected as a whole (the error is logged and the old configuration stays in force) — except the database-owned allow/deny lists (NIP-86 access lists, relay pubkey lists, Blossom allowlist), which still refresh from the database on every reload attempt, in the fail-safe direction.
 
@@ -604,7 +621,7 @@ The log warns when one of the restart-required settings changed (`... a restart 
 
 ---
 
-## 11. Full example
+## 13. Full example
 
 ```toml
 [relay]
@@ -728,7 +745,7 @@ restrict_uploads = false
 
 ---
 
-## 12. Common mistakes
+## 14. Common mistakes
 
 | Mistake | Symptom | Fix |
 | --- | --- | --- |
