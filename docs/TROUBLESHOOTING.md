@@ -60,6 +60,8 @@ ss -tlnp | grep :8080
 
 **Fix**: Use `nostrfy restart`, or just use the running instance.
 
+> **Note**: `restart` stops the daemon through the pid file named in the *new* config. If you changed `daemon.pid_file`, stop the old instance first (`nostrfy stop` with the old config, or `kill` its pid) — otherwise the old daemon keeps running unknown to the new pid file.
+
 ### 1-4. `nostrfy stop` hangs / `did not stop in time`
 
 **Cause**: The daemon is stuck or not responding. Shutdown is graceful and bounded by the documented budget (`HTTP drain 5 s + background-task joins 5 s + WebSocket drain 7 s + database joins margin 10 s = 27 s`, plus a 5 s CLI margin), so a healthy daemon can take up to ~32 s to stop. `nostrfy stop` reports a timeout only when the process is still alive after that budget.
