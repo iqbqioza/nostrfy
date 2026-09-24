@@ -2501,6 +2501,28 @@ fn delete_unknown_group_leaves_no_tombstone() {
 }
 
 #[test]
+fn empty_group_id_is_rejected_everywhere() {
+    // An empty `h` tag names no group: validation rejects group actions
+    // carrying one, and the apply path never creates the phantom group
+    // (which would sit outside the capacity budget with relay-signed
+    // metadata).
+    let mut store = GroupStore::default();
+    let now = 1_700_000_000;
+    let create = event(CREATE_GROUP, ADMIN, Some(""), vec![]);
+    assert!(
+        store.validate_write(&create).is_err(),
+        "a create with an empty id must be rejected"
+    );
+    let out = store.apply(&create, "relay", now, true, false);
+    assert!(store.group("").is_none(), "no phantom group may be created");
+    assert!(out.is_empty(), "no metadata may be emitted for it: {out:?}");
+    // Ordinary events with an empty `h` are unaffected (treated like
+    // untagged ones).
+    let note = event(1, USER, Some(""), vec![]);
+    assert!(store.validate_write(&note).is_ok());
+}
+
+#[test]
 fn capacity_blocked_create_emits_nothing() {
     // A create refused by the group cap must not store or broadcast bare
     // metadata for a group that was never created (two concurrent creates
