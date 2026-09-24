@@ -69,7 +69,10 @@ const SUPPORTED_METHODS: &[&str] = &[
     "listblockedips",
     "banevent",
     "allowevent",
+    "unallowevent",
+    "unbanevent",
     "listbannedevents",
+    "listallowedevents",
     "listeventsneedingmoderation",
     "listclaims",
     "createclaim",
@@ -98,8 +101,12 @@ const GRANTABLE_METHODS: &[&str] = &[
     "listblockedips",
     "banevent",
     "allowevent",
+    "unallowevent",
+    "unbanevent",
     "listbannedevents",
+    "listallowedevents",
     "listeventsneedingmoderation",
+    "listdisallowedkinds",
 ];
 
 /// Maximum length of a NIP-43 role id accepted through the NIP-86 RPC:
@@ -564,6 +571,10 @@ pub async fn rpc_handler(
                 .collect();
             rpc_ok(json!(list))
         }
+        "listdisallowedkinds" => {
+            let list: Vec<u64> = relay.access.read().await.blocked_kinds.clone();
+            rpc_ok(json!(list))
+        }
         "changerelayname" | "changerelaydescription" | "changerelayicon" => {
             let Some(value) = params.first().and_then(Value::as_str) else {
                 return rpc_err("invalid params");
@@ -1000,9 +1011,54 @@ pub async fn rpc_handler(
             // The optional reason slot is validated like its siblings
             // (a non-string there is a client bug), though unbanning
             // carries no reason.
-            if opt_param_str(params, 1, "reason").is_err() {
-                return rpc_err("invalid params: reason must be a string");
+            let reason = match opt_param_str(params, 1, "reason") {
+                Ok(reason) => reason,
+                Err(e) => return rpc_err(&e),
+            };
+            let Ok(id) = hex::decode(id) else {
+                return rpc_err("invalid event id");
+            };
+            let Ok(id): Result<[u8; 32], _> = id.try_into() else {
+                return rpc_err("invalid event id");
+            };
+            // NIP-86: adding to the allow list removes the event from
+            // the ban list (mutually exclusive, atomically). The result
+            // is always `true` — allowing an unknown id pre-allows it,
+            // like banning pre-bans. Only a store failure surfaces an
+            // error.
+            let outcome = relay.db.allow_event(id, reason).await;
+            audit!(&relay, &identity, "allowevent", params);
+            if let Err(e) = outcome {
+                log::error!("allowevent store failure: {e}");
+                return rpc_err("error: cannot persist the event allow");
             }
+            rpc_ok(json!(true))
+        }
+        "unallowevent" => {
+            let Some(id) = params.first().and_then(Value::as_str) else {
+                return rpc_err("invalid params");
+            };
+            let Ok(id) = hex::decode(id) else {
+                return rpc_err("invalid event id");
+            };
+            let Ok(id): Result<[u8; 32], _> = id.try_into() else {
+                return rpc_err("invalid event id");
+            };
+            // NIP-86: the result is always `true` — removing a missing
+            // marker is a no-op success. Only a store failure surfaces
+            // an error.
+            let outcome = relay.db.unallow_event(id).await;
+            audit!(&relay, &identity, "unallowevent", params);
+            if let Err(e) = outcome {
+                log::error!("unallowevent store failure: {e}");
+                return rpc_err("error: cannot persist the event unallow");
+            }
+            rpc_ok(json!(true))
+        }
+        "unbanevent" => {
+            let Some(id) = params.first().and_then(Value::as_str) else {
+                return rpc_err("invalid params");
+            };
             let Ok(id) = hex::decode(id) else {
                 return rpc_err("invalid event id");
             };
@@ -1013,9 +1069,9 @@ pub async fn rpc_handler(
             // never-banned id is a no-op success. Only a store failure
             // surfaces an error.
             let outcome = relay.db.unban_event(id).await;
-            audit!(&relay, &identity, "allowevent", params);
+            audit!(&relay, &identity, "unbanevent", params);
             if let Err(e) = outcome {
-                log::error!("allowevent store failure: {e}");
+                log::error!("unbanevent store failure: {e}");
                 return rpc_err("error: cannot persist the event unban");
             }
             rpc_ok(json!(true))
@@ -1026,6 +1082,20 @@ pub async fn rpc_handler(
                 Err(e) => {
                     log::error!("listbannedevents read failure: {e}");
                     return rpc_err("error: cannot list banned events");
+                }
+            };
+            let list: Vec<Value> = list
+                .into_iter()
+                .map(|(id, reason)| json!({ "id": id, "reason": reason }))
+                .collect();
+            rpc_ok(json!(list))
+        }
+        "listallowedevents" => {
+            let list = match relay.db.list_allowed_events().await {
+                Ok(list) => list,
+                Err(e) => {
+                    log::error!("listallowedevents read failure: {e}");
+                    return rpc_err("error: cannot list allowed events");
                 }
             };
             let list: Vec<Value> = list
@@ -2551,6 +2621,81 @@ mod tests {
         let relay = build_admin_relay_with_key(Some(&"cd".repeat(32))).await;
         let resp = rpc_call(&relay, "createclaim", vec![json!("   ")]).await;
         assert!(rpc_err_of(resp).await.contains("empty"));
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn event_allowlist_roundtrip_and_coupling() {
+        // NIP-86 event allowlist: `allowevent` records a marker and lifts
+        // the ban, `banevent` drops the marker, `unallowevent` removes it,
+        // `unbanevent` only lifts the ban — all idempotent `true`.
+        let relay = build_admin_relay().await;
+        for method in ["allowevent", "unallowevent", "unbanevent"] {
+            let resp = rpc_call(&relay, method, vec![]).await;
+            assert!(
+                rpc_err_of(resp).await.contains("params"),
+                "{method} validates params"
+            );
+            let resp = rpc_call(&relay, method, vec![json!("zz")]).await;
+            assert!(
+                rpc_err_of(resp).await.contains("event id"),
+                "{method} validates ids"
+            );
+        }
+        let id = "ab".repeat(32);
+        // Unknown id: allow records the marker (pre-allow, like pre-ban).
+        let resp = rpc_call(&relay, "allowevent", vec![json!(id.clone()), json!("mine")]).await;
+        assert!(rpc_ok_of(resp).await);
+        let listed = rpc_result_of(rpc_call(&relay, "listallowedevents", vec![]).await).await;
+        assert_eq!(listed, json!([{ "id": id, "reason": "mine" }]));
+        // Banning drops the marker atomically.
+        let resp = rpc_call(&relay, "banevent", vec![json!(id.clone())]).await;
+        assert!(rpc_ok_of(resp).await);
+        assert!(
+            rpc_result_of(rpc_call(&relay, "listallowedevents", vec![]).await)
+                .await
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "a ban removes the allow marker"
+        );
+        // Allowing lifts the ban and re-records the marker.
+        let resp = rpc_call(&relay, "allowevent", vec![json!(id.clone())]).await;
+        assert!(rpc_ok_of(resp).await);
+        assert!(
+            rpc_result_of(rpc_call(&relay, "listbannedevents", vec![]).await)
+                .await
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "an allow lifts the ban"
+        );
+        assert_eq!(
+            rpc_result_of(rpc_call(&relay, "listallowedevents", vec![]).await).await[0]["id"],
+            json!(id)
+        );
+        // Unallow removes the marker (idempotent); unban on a clean id
+        // succeeds without touching the marker.
+        let resp = rpc_call(&relay, "unallowevent", vec![json!(id.clone())]).await;
+        assert!(rpc_ok_of(resp).await);
+        let resp = rpc_call(&relay, "unallowevent", vec![json!(id.clone())]).await;
+        assert!(rpc_ok_of(resp).await);
+        let resp = rpc_call(&relay, "unbanevent", vec![json!(id.clone())]).await;
+        assert!(rpc_ok_of(resp).await);
+        assert!(
+            rpc_result_of(rpc_call(&relay, "listallowedevents", vec![]).await)
+                .await
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        // Denied kinds are listed back.
+        let resp = rpc_call(&relay, "disallowkind", vec![json!(7)]).await;
+        assert!(rpc_ok_of(resp).await);
+        assert_eq!(
+            rpc_result_of(rpc_call(&relay, "listdisallowedkinds", vec![]).await).await,
+            json!([7])
+        );
         relay.db.shutdown();
     }
 

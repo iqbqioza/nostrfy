@@ -491,7 +491,7 @@ curl -X POST http://127.0.0.1:8080/ \
 | `unallowpubkey` | `["pubkey"]` | Remove from the allowlist |
 | `listallowedpubkeys` | `[]` | List the allowlist |
 | `allowkind` / `disallowkind` | `[kind]` | Allow / disallow a kind |
-| `listallowedkinds` | `[]` | List allowed kinds |
+| `listallowedkinds` / `listdisallowedkinds` | `[]` | List allowed / disallowed kinds |
 | `changerelayname` / `changerelaydescription` / `changerelayicon` | `["new value"]` | Change the relay name / description / icon (**persisted to the config file**; reports an error when the file cannot be written) |
 | `createrole` / `editrole` / `deleterole` | `[id, label, description, color, order]` | NIP-43 role management (wrong-typed fields are rejected; deleting a missing role succeeds) |
 | `assignrole` / `unassignrole` | `["pubkey", "role id"]` | Assign / unassign a role (a duplicate grant or missing revocation succeeds) |
@@ -499,8 +499,11 @@ curl -X POST http://127.0.0.1:8080/ \
 | `listmethodassignees` | `[]` | List method grants (`[{pubkey, methods}]`) |
 | `blockip` / `unblockip` | `["ip", "reason (optional)"]` | Block / unblock an IP (**blocking also drops existing connections**) |
 | `listblockedips` | `[]` | List blocked IPs |
-| `banevent` / `allowevent` | `["event id", "reason (optional)"]` | Ban / unban an event (banning an unknown id pre-bans it; unbanning a never-banned id succeeds) |
+| `banevent` | `["event id", "reason (optional)"]` | Ban an event (banning an unknown id pre-bans it; also removes it from the allow list) |
+| `allowevent` | `["event id", "reason (optional)"]` | Add an event to the allow list (also lifts the ban; allowing an unknown id pre-allows it) |
+| `unallowevent` / `unbanevent` | `["event id"]` | Remove an event from the allow / ban list (a missing entry succeeds) |
 | `listbannedevents` | `[]` | List banned events (a failed lookup surfaces an error, never an empty list) |
+| `listallowedevents` | `[]` | List allowed events |
 | `listeventsneedingmoderation` | `[]` | Events awaiting moderation (always empty on this relay) |
 | `listclaims` | `[]` | List NIP-43 invite codes |
 | `createclaim` / `deleteclaim` | `["claim"]` | Issue / revoke a NIP-43 invite code (a `kind:28934` carrying a listed code admits its author) |
