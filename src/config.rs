@@ -217,9 +217,9 @@ pub struct ServerConfig {
     pub trusted_proxies: Vec<String>,
 }
 
-/// NIP-86 management RPC settings: the separate management port, the
-/// bearer token / admin pubkey authentication, and the request body
-/// limit.
+/// NIP-86 management RPC settings: served on the relay port (there is no
+/// separate management port), the bearer token / admin pubkey
+/// authentication, and the request body limit.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RpcConfig {
@@ -2772,7 +2772,7 @@ mod tests {
         let docs = std::fs::read_to_string("docs/CONFIGURATION.md")
             .expect("docs/CONFIGURATION.md is readable from the crate root");
         let example = docs
-            .split_once("## 11. Full example")
+            .split_once("## 13. Full example")
             .and_then(|(_, rest)| rest.split_once("```toml\n"))
             .and_then(|(_, rest)| rest.split_once("\n```"))
             .map(|(block, _)| block)

@@ -12,7 +12,7 @@
 [relay]
 name = "nostrfy"
 description = "A minimal and stable Nostr relay"
-pubkey = ""                 # your public key (npub or hex), shown in NIP-11
+pubkey = ""                 # your public key (64 hex chars), shown in NIP-11
 contact = ""                # admin contact, shown in NIP-11
 icon = ""                   # relay icon URL, shown in NIP-11
 post_policy = ""            # a free-text posting-policy URL/text shown in NIP-11

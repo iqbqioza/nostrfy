@@ -21,7 +21,7 @@
 
 ## Install in one line
 
-No cloning, no compiling — downloads the pre-built binary for your platform, verifies its checksum, and installs it:
+No cloning, no compiling — downloads the pre-built binary for your platform, verifies its checksum when a checksum tool is available, and installs it:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/iqbqioza/nostrfy/main/install.sh | sh
@@ -29,14 +29,14 @@ curl -fsSL https://raw.githubusercontent.com/iqbqioza/nostrfy/main/install.sh | 
 
 ### Migrate from strfry?
 
-Bring your existing database with one command (dry-run first, then import):
+Bring your existing database with one command (see the
+[step-by-step migration guide](docs/MIGRATING-FROM-STRFRY.md) first —
+you will need your strfry database or export):
 
 ```sh
-nostrfy migrate-strfry --dry-run
-nostrfy migrate-strfry
+nostrfy migrate-strfry --strfry-db /path/to/strfry/db --dry-run
+nostrfy migrate-strfry --strfry-db /path/to/strfry/db
 ```
-
-See the [step-by-step migration guide](docs/MIGRATING-FROM-STRFRY.md).
 
 ## Run in one minute
 
@@ -46,7 +46,7 @@ nostrfy start         # start as a daemon (--foreground to stay in the shell)
 nostrfy stats         # check it is up
 ```
 
-Point your Nostr client at `ws://<host>:8080` (or `wss://<domain>` behind a TLS proxy). Copy a ready-made template from [`examples/`](examples/) for chat, DMs, groups, search, or tiny-VPS setups — then `nostrfy check` it.
+Point your Nostr client at `ws://<host>:8080` (or `wss://<domain>` behind a TLS proxy). The default bind is loopback-only — set `server.host` to reach it remotely. Copy a ready-made template from [`examples/`](examples/) for chat, DMs, groups, search, or tiny-VPS setups — copy it over `nostrfy.toml` (or pass `--config`) and `nostrfy check` it.
 
 Deploying to Fly.io, AWS, GCP, Azure, Digital Ocean, or any VPS? See the [deployment guides](docs/deploy/README.md).
 

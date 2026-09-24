@@ -43,8 +43,8 @@ max_connections = 500
 max_connections_per_ip = 8
 
 [rpc]
-# Management API (NIP-86) on its own port (must differ from
-# server.port) with a strong token; 0 disables the API entirely.
+# NIP-86 management credentials (the API shares the relay port — there is
+# no separate management port). Set a strong token to enable the API.
 management_token = "change-me-to-a-long-random-string"
 
 [server]
