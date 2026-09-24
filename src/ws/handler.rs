@@ -1146,10 +1146,15 @@ impl super::Conn {
     /// NIP-59 / NIP-17: gift wraps are signed by random keys, so they may
     /// only be served to their recipients, i.e. authenticated users whose
     /// pubkey appears in a `p` tag of the wrap (enforced with NIP-42 auth;
-    /// skipped when NIP-42 is disabled).
+    /// skipped when NIP-42 is disabled). NIP-59 §4 gives kind 21059 the
+    /// same structure as kind 1059, so the gate covers both (21059 is
+    /// live-only, which is where an exemption would leak).
     pub(crate) fn gift_wrap_visible(&self, event: &Event) -> bool {
         !self.giftwrap_restricted
-            || event.kind != crate::nips::nip62::GIFT_WRAP_KIND
+            || !matches!(
+                event.kind,
+                crate::nips::nip62::GIFT_WRAP_KIND | crate::nips::nip62::EPHEMERAL_GIFT_WRAP_KIND
+            )
             || event.tags.iter().any(|t| {
                 t.len() >= 2
                     && t[0] == "p"

@@ -20,7 +20,7 @@
 mod commands;
 mod index;
 pub(crate) use index::{FilterComponents, SubscriptionIndex};
-mod roles;
+pub(crate) mod roles;
 mod validate;
 
 use std::sync::Arc;
@@ -3765,6 +3765,7 @@ mod tests {
     use super::Relay;
     use super::StampClock;
     use super::enqueue_live_batch;
+    use super::roles::RoleChange;
     use super::signal_live_resync;
     use super::validate::contains_secret_key;
     use crate::nips::nip43::RoleStore;
@@ -3971,10 +3972,10 @@ mod tests {
         let relay = build_role_relay(Some(&key)).await;
         let member = "aa".repeat(32);
 
-        // Without NIP-43 / a relay key every operation reports false.
+        // Without NIP-43 / a relay key every operation reports failure.
         let keyless = build_role_relay(None).await;
         assert!(!keyless.create_role("r1", "R", "", "", None).await);
-        assert!(!keyless.assign_role(&member, "r1").await);
+        assert_eq!(keyless.assign_role(&member, "r1").await, RoleChange::Failed);
         assert!(!keyless.delete_role("r1").await);
         assert!(
             !keyless
@@ -4003,16 +4004,25 @@ mod tests {
                 .await
         );
 
-        // assign to an unknown role fails; to a known role succeeds and
-        // publishes the membership (kind 39002 for this relay... the
-        // membership event kind is derived from the relay's own key).
-        assert!(!relay.assign_role(&member, "nope").await);
-        assert!(relay.assign_role(&member, "r1").await);
+        // assign to an unknown role reports Unknown; to a known role
+        // applies and publishes the membership (kind 39002 for this
+        // relay... the membership event kind is derived from the relay's
+        // own key). A repeat grant is a no-op success.
+        assert_eq!(
+            relay.assign_role(&member, "nope").await,
+            RoleChange::Unknown
+        );
+        assert_eq!(relay.assign_role(&member, "r1").await, RoleChange::Applied);
+        assert_eq!(relay.assign_role(&member, "r1").await, RoleChange::Noop);
         assert!(relay.roles.read().await.is_member_of(&member));
 
-        // unassign a non-assignment fails; the real one succeeds.
-        assert!(!relay.unassign_role(&member, "nope").await);
-        assert!(relay.unassign_role(&member, "r1").await);
+        // unassign of a non-assignment is a no-op success; the real one
+        // applies.
+        assert_eq!(relay.unassign_role(&member, "nope").await, RoleChange::Noop);
+        assert_eq!(
+            relay.unassign_role(&member, "r1").await,
+            RoleChange::Applied
+        );
         assert!(!relay.roles.read().await.is_member_of(&member));
 
         // delete a missing role fails; the real one succeeds and stores a
@@ -4024,7 +4034,7 @@ mod tests {
         // A leave request from a member removes and republishes; a
         // non-member is a no-op.
         assert!(relay.create_role("r1", "Role 1", "desc", "red", None).await);
-        assert!(relay.assign_role(&member, "r1").await);
+        assert_eq!(relay.assign_role(&member, "r1").await, RoleChange::Applied);
         let mut leave = crate::event::Event {
             id: String::new(),
             pubkey: member.clone(),
@@ -4067,7 +4077,7 @@ mod tests {
         let relay = build_role_relay(Some(&key)).await;
         let member = "aa".repeat(32);
         assert!(relay.create_role("r1", "Role 1", "", "", None).await);
-        assert!(relay.assign_role(&member, "r1").await);
+        assert_eq!(relay.assign_role(&member, "r1").await, RoleChange::Applied);
         assert!(relay.roles.read().await.is_member_of(&member));
         // Simulate the revoked window without racing a real worker: the
         // store is empty and a rebuild is pending.
@@ -4142,7 +4152,7 @@ mod tests {
         let relay = build_role_relay(Some(&key)).await;
         let member = "bb".repeat(32);
         assert!(relay.create_role("r1", "Role 1", "", "", None).await);
-        assert!(relay.assign_role(&member, "r1").await);
+        assert_eq!(relay.assign_role(&member, "r1").await, RoleChange::Applied);
         let guard = relay.roles_rebuild.buffer.lock().await;
         let mut leave = crate::event::Event {
             id: String::new(),
@@ -4410,8 +4420,8 @@ mod tests {
         let b = "bb".repeat(32);
         assert!(relay.create_role("r1", "R1", "", "", None).await);
         assert!(relay.create_role("r2", "R2", "", "", None).await);
-        assert!(relay.assign_role(&a, "r1").await);
-        assert!(relay.assign_role(&b, "r2").await);
+        assert_eq!(relay.assign_role(&a, "r1").await, RoleChange::Applied);
+        assert_eq!(relay.assign_role(&b, "r2").await, RoleChange::Applied);
         assert!(relay.roles.read().await.is_member_of(&a));
         assert!(relay.roles.read().await.is_member_of(&b));
 
@@ -4744,7 +4754,10 @@ mod tests {
         assert!(relay.create_role("king", "King", "", "", None).await);
         // The scan is in flight: enter its buffering window.
         relay.roles_rebuild.buffer.lock().await.scanning = true;
-        assert!(relay.assign_role(&member, "king").await);
+        assert_eq!(
+            relay.assign_role(&member, "king").await,
+            RoleChange::Applied
+        );
         {
             let buffer = relay.roles_rebuild.buffer.lock().await;
             assert_eq!(
@@ -4801,7 +4814,10 @@ mod tests {
         );
         drop(gate);
         assert!(handle.await.unwrap(), "the fresh store must be swapped in");
-        assert!(relay.assign_role(&member, "king").await);
+        assert_eq!(
+            relay.assign_role(&member, "king").await,
+            RoleChange::Applied
+        );
         assert!(
             relay.roles.read().await.is_member_of(&member),
             "the post-swap mutation must apply to the swapped-in store"
@@ -4820,7 +4836,7 @@ mod tests {
         relay.config.write().await.relay.enabled_nips = vec![9, 29, 43];
         let member = "aa".repeat(32);
         assert!(relay.create_role("mod", "Mod", "", "", None).await);
-        assert!(relay.assign_role(&member, "mod").await);
+        assert_eq!(relay.assign_role(&member, "mod").await, RoleChange::Applied);
 
         let now = crate::util::unix_now();
         let secp = secp256k1::Secp256k1::new();
@@ -5001,7 +5017,10 @@ mod tests {
                     .push(BufferedRoleMutation::Delete { id: "x".into() });
             }
         }
-        assert!(relay.assign_role(&member, "king").await);
+        assert_eq!(
+            relay.assign_role(&member, "king").await,
+            RoleChange::Applied
+        );
         {
             let buffer = relay.roles_rebuild.buffer.lock().await;
             assert!(

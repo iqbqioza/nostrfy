@@ -1239,18 +1239,37 @@ impl Cli {
         let dir = exe
             .parent()
             .ok_or_else(|| anyhow!("cannot locate the binary's directory"))?;
+        // Serialize concurrent upgrades (an operator and a cron job, two
+        // shells): without this one run's startup sweep deletes the
+        // other's in-progress download, and the two backup/rename
+        // sequences clobber each other's rollback copy. The lock is held
+        // for the whole upgrade and releases on drop (or process death).
+        let _upgrade_lock = lock_upgrade(dir)?;
         // Best-effort cleanup of temp files left behind by a hard-killed
-        // previous upgrade (same pattern, any pid).
+        // previous upgrade (same pattern, any pid): only generations
+        // older than an hour — a fresh file may belong to a live run on
+        // platforms without a cross-process lock.
         if let Ok(entries) = std::fs::read_dir(dir) {
+            let now = std::time::SystemTime::now();
             for entry in entries.flatten() {
                 let name = entry.file_name();
                 let name = name.to_string_lossy();
                 if name.starts_with(".nostrfy-upgrade-") && name.ends_with("-tmp") {
-                    let _ = std::fs::remove_file(entry.path());
+                    let stale = entry
+                        .metadata()
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| now.duration_since(t).ok())
+                        .is_some_and(|age| age > Duration::from_secs(3600));
+                    if stale {
+                        let _ = std::fs::remove_file(entry.path());
+                    }
                 }
             }
         }
-        let tmp = dir.join(format!(".nostrfy-upgrade-{}-tmp", std::process::id()));
+        // A random suffix per run: the pid alone collides across pid
+        // namespaces (containers sharing a binary volume).
+        let tmp = upgrade_tmp_path(dir);
         let url = format!("https://github.com/{REPO}/releases/download/{tag}/{asset}");
         print_line(&format!("downloading {url} ..."));
         flush_stdout();
@@ -1437,6 +1456,7 @@ impl Cli {
             )));
         }
         let existing = Config::load(&self.config)?.relay.private_key.clone();
+        let original = std::fs::read_to_string(&self.config)?;
         let key = generate_secret_key_hex()?;
 
         if !existing.is_empty() {
@@ -1458,16 +1478,7 @@ impl Cli {
         // then restrict the config itself to 0600 — a shared or loosely
         // defaulted umask must not leave the private key readable by
         // other users on the host.
-        let text = std::fs::read_to_string(&self.config)?;
-        let updated = crate::config::rewrite_config_checked(
-            &text,
-            "relay",
-            "private_key",
-            &format!("\"{}\"", crate::config::toml_escape(&key)),
-        )?;
-        crate::config::write_text_atomic(&self.config, &updated)?;
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&self.config, std::fs::Permissions::from_mode(0o600))?;
+        self.write_private_key(&original, &key)?;
 
         // Print the relay's pubkey too: it is safe to share and useful for
         // advertising the relay's `self` identity (NIP-11).
@@ -1487,6 +1498,30 @@ impl Cli {
         if !pubkey.is_empty() {
             print_line(&format!("relay pubkey (NIP-11 \"self\"): {pubkey}"));
         }
+        Ok(())
+    }
+
+    /// Writes `key` as `relay.private_key`, guarding against a concurrent
+    /// writer: the file is re-read and the write aborts when it changed
+    /// since `original` was snapshotted (same discipline as the config
+    /// merge) instead of silently dropping the other edit.
+    fn write_private_key(&self, original: &str, key: &str) -> Result<()> {
+        let current = std::fs::read_to_string(&self.config)?;
+        if current != original {
+            return Err(config_err(format!(
+                "{} changed while the key was being prepared; re-run genkey",
+                self.config.display()
+            )));
+        }
+        let updated = crate::config::rewrite_config_checked(
+            &current,
+            "relay",
+            "private_key",
+            &format!("\"{}\"", crate::config::toml_escape(key)),
+        )?;
+        crate::config::write_text_atomic(&self.config, &updated)?;
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&self.config, std::fs::Permissions::from_mode(0o600))?;
         Ok(())
     }
 }
@@ -2150,7 +2185,20 @@ fn latest_release_version(repo: &str) -> Result<String> {
         .set("User-Agent", "nostrfy-upgrade")
         .call()
         .map_err(|e| anyhow!(format!("cannot query the latest release: {e}")))?;
-    let value: serde_json::Value = serde_json::from_reader(response.into_reader())
+    // Bounded like the checksum fetch: a hostile proxy must not be able
+    // to exhaust memory with a huge body before `tag_name` is read.
+    let body = Cli::read_limited_string(
+        response.into_reader(),
+        1024 * 1024,
+        "release response too large",
+    )?;
+    latest_tag_from_json(body.as_bytes())
+}
+
+/// Extracts the release tag (without the leading "v") from a GitHub
+/// `releases/latest` response body.
+fn latest_tag_from_json(body: &[u8]) -> Result<String> {
+    let value: serde_json::Value = serde_json::from_slice(body)
         .map_err(|e| anyhow!(format!("invalid release response: {e}")))?;
     value
         .get("tag_name")
@@ -2528,6 +2576,80 @@ fn lock_access_state(cfg: &Config) -> Result<AccessStateLock> {
     }
 }
 
+/// Held for the whole `upgrade` run; the lock releases on drop.
+/// Same stale-file discipline as [`AccessStateLock`]: Unix-only
+/// (`flock`); elsewhere concurrent upgrades are guarded only by the
+/// unique temp names from [`upgrade_tmp_path`].
+struct UpgradeLock {
+    #[cfg(unix)]
+    file: std::fs::File,
+}
+
+impl Drop for UpgradeLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            unsafe {
+                libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+            }
+        }
+    }
+}
+
+/// Serializes concurrent `upgrade` runs in one binary directory.
+fn lock_upgrade(dir: &std::path::Path) -> Result<UpgradeLock> {
+    let path = dir.join(".nostrfy-upgrade.lock");
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|e| anyhow!("cannot open the upgrade lock {}: {e}", path.display()))?;
+        // SAFETY: `file` holds a valid descriptor for the call.
+        let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        if ret != 0 {
+            return Err(anyhow!(
+                "cannot lock {}: {}",
+                path.display(),
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(UpgradeLock { file })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(UpgradeLock {})
+    }
+}
+
+/// A per-run temp path for the downloaded upgrade binary: pid plus a
+/// random suffix, so runs never share a file (the pid alone collides
+/// across pid namespaces sharing a binary volume).
+fn upgrade_tmp_path(dir: &std::path::Path) -> std::path::PathBuf {
+    let mut rand = [0u8; 8];
+    if getrandom::getrandom(&mut rand).is_err() {
+        rand = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| {
+                d.as_nanos().to_le_bytes()[..8]
+                    .try_into()
+                    .unwrap_or([0u8; 8])
+            })
+            .unwrap_or([0u8; 8]);
+    }
+    dir.join(format!(
+        ".nostrfy-upgrade-{}-{}-tmp",
+        std::process::id(),
+        hex::encode(rand)
+    ))
+}
+
 /// Loads the whole persisted access state in one read transaction. The
 /// one-time legacy migration runs first, exactly like the server startup and
 /// the old per-key helpers did.
@@ -2806,6 +2928,39 @@ mod tests {
     }
 
     #[test]
+    fn latest_tag_parses_canned_release_bodies() {
+        // The network half (`latest_release_version`) is bounded by
+        // `read_limited_string`; this covers the parsing half.
+        assert_eq!(
+            latest_tag_from_json(br#"{"tag_name":"v0.1.15"}"#).unwrap(),
+            "0.1.15"
+        );
+        assert_eq!(
+            latest_tag_from_json(br#"{"tag_name":"0.1.15"}"#).unwrap(),
+            "0.1.15"
+        );
+        assert!(latest_tag_from_json(br#"{}"#).is_err());
+        assert!(latest_tag_from_json(b"not json").is_err());
+    }
+
+    #[test]
+    fn upgrade_tmp_paths_are_unique_per_run() {
+        // Concurrent `upgrade` runs must never share a temp file (the
+        // pid alone collides across pid namespaces).
+        let dir = std::path::Path::new("/tmp");
+        let a = upgrade_tmp_path(dir);
+        let b = upgrade_tmp_path(dir);
+        assert_ne!(a, b, "two runs must not share a temp path");
+        for p in [&a, &b] {
+            let name = p.file_name().unwrap().to_string_lossy();
+            assert!(
+                name.starts_with(".nostrfy-upgrade-") && name.ends_with("-tmp"),
+                "the startup sweep must still recognize the temp files: {name}"
+            );
+        }
+    }
+
+    #[test]
     fn genkey_writes_private_key_with_0600_permissions() {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2841,6 +2996,45 @@ name = \"nostrfy\"\n",
             .map(|l| l.split('"').nth(1).unwrap_or(""))
             .unwrap_or("");
         assert_eq!(key_value.len(), 64, "a 64-hex key must have been written");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn private_key_write_aborts_on_concurrent_edit() {
+        // A concurrent config writer between the snapshot and the write
+        // must abort instead of silently dropping the other edit (same
+        // discipline as the config merge).
+        let dir = std::env::temp_dir().join("nostrfy-genkey-race-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("nostrfy.toml");
+        std::fs::write(&config_path, "[relay]\nname = \"nostrfy\"\n").unwrap();
+        let cli = Cli {
+            config: config_path.clone(),
+            command: Command::GenKey,
+            daemonized: false,
+        };
+        let original = std::fs::read_to_string(&config_path).unwrap();
+        cli.write_private_key(&original, KEY).unwrap();
+        assert!(
+            std::fs::read_to_string(&config_path).unwrap().contains(KEY),
+            "an unchanged file takes the new key"
+        );
+        // Another writer appends a line; a write based on the stale
+        // snapshot must refuse.
+        std::fs::write(&config_path, format!("{original}# concurrent edit\n")).unwrap();
+        let err = cli.write_private_key(&original, KEY).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("changed while the key was being prepared"),
+            "a concurrent edit must abort the write: {err}"
+        );
+        assert!(
+            std::fs::read_to_string(&config_path)
+                .unwrap()
+                .contains("# concurrent edit"),
+            "the concurrent edit must survive the aborted write"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

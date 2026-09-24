@@ -494,7 +494,7 @@ curl -X POST http://127.0.0.1:8080/ \
 | `listallowedkinds` | `[]` | List allowed kinds |
 | `changerelayname` / `changerelaydescription` / `changerelayicon` | `["new value"]` | Change the relay name / description / icon (**persisted to the config file**) |
 | `createrole` / `editrole` / `deleterole` | `[id, label, description, color, order]` | NIP-43 role management |
-| `assignrole` / `unassignrole` | `["pubkey", "role id"]` | Assign / unassign a role |
+| `assignrole` / `unassignrole` | `["pubkey", "role id"]` | Assign / unassign a role (a duplicate grant or missing revocation succeeds) |
 | `blockip` / `unblockip` | `["ip", "reason (optional)"]` | Block / unblock an IP (**blocking also drops existing connections**) |
 | `listblockedips` | `[]` | List blocked IPs |
 | `banevent` / `allowevent` | `["event id", "reason (optional)"]` | Ban / unban an event (banning an unknown id pre-bans it; unbanning a never-banned id succeeds) |
@@ -511,7 +511,7 @@ curl -X POST http://127.0.0.1:8080/ \
 | 9 | Event deletion |
 | 11 | Relay information document |
 | 13 | Proof of work |
-| 17 | Private DMs (kind 14 wrapped in kind 15; kind 1059 gift wraps served recipient-only, ephemeral kind 21059 wraps forwarded) |
+| 17 | Private DMs (kind 14 wrapped in kind 15; kind 1059 and ephemeral kind 21059 gift wraps served recipient-only when NIP-42 auth is on) |
 | 22 | Comments (kind 1111, threaded via the `#e` index) |
 | 26 | Delegated event signing |
 | 28 | Public chat (client-side: stored and served as plain events, not advertised — NIP-28 imposes no relay requirements) |

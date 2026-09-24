@@ -4692,6 +4692,51 @@ mod tests {
     }
 
     #[test]
+    fn ephemeral_gift_wrap_gated_like_stored_wrap() {
+        // NIP-59 §4: kind 21059 has the same structure as kind 1059, so
+        // the recipient-only gate covers both when restricted (21059 is
+        // live-only — never stored — which is exactly where the leak
+        // was: any subscriber with a matching filter received wraps meant for someone else).
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            conn.giftwrap_restricted = true;
+            let recipient = "cc".repeat(32);
+            let stranger = "dd".repeat(32);
+            let wrap = |kind: u64| crate::event::Event {
+                id: String::new(),
+                pubkey: "ee".repeat(32),
+                created_at: 1,
+                kind,
+                tags: vec![vec!["p".into(), recipient.clone()]],
+                content: "secret".into(),
+                sig: String::new(),
+            };
+            let stored = wrap(crate::nips::nip62::GIFT_WRAP_KIND);
+            let ephemeral = wrap(crate::nips::nip62::EPHEMERAL_GIFT_WRAP_KIND);
+            // Anonymous: neither served.
+            assert!(!conn.gift_wrap_visible(&stored));
+            assert!(
+                !conn.gift_wrap_visible(&ephemeral),
+                "a 21059 wrap must not leak to anonymous subscribers"
+            );
+            // Authed as a non-recipient: neither served.
+            conn.authed_pubkeys.push(stranger);
+            assert!(!conn.gift_wrap_visible(&stored));
+            assert!(!conn.gift_wrap_visible(&ephemeral));
+            // The recipient: both served.
+            conn.authed_pubkeys.push(recipient);
+            assert!(conn.gift_wrap_visible(&stored));
+            assert!(conn.gift_wrap_visible(&ephemeral));
+            // Unrestricted: served to everyone, like any ephemeral.
+            conn.giftwrap_restricted = false;
+            conn.authed_pubkeys.clear();
+            assert!(conn.gift_wrap_visible(&stored));
+            assert!(conn.gift_wrap_visible(&ephemeral));
+        });
+    }
+
+    #[test]
     fn neg_open_query_size_and_item_filters() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {

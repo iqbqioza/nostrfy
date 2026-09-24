@@ -570,13 +570,21 @@ pub async fn rpc_handler(
             if let Err(e) = check_role_id(role) {
                 return rpc_err(&e.to_string());
             }
-            if relay.assign_role(&pubkey, role).await {
-                audit!(&relay, &identity, "assignrole", params);
-                rpc_ok(json!(true))
-            } else {
-                rpc_err(
-                    "restricted: NIP-43 is disabled, the relay key is missing, the role does not exist or the event could not be stored",
-                )
+            // NIP-86: the result is always `true` — a duplicate grant is
+            // a no-op success. Only an unknown role, a disabled NIP-43, a
+            // missing relay key, or a failed persistence surfaces an error.
+            match relay.assign_role(&pubkey, role).await {
+                crate::relay::roles::RoleChange::Applied
+                | crate::relay::roles::RoleChange::Noop => {
+                    audit!(&relay, &identity, "assignrole", params);
+                    rpc_ok(json!(true))
+                }
+                crate::relay::roles::RoleChange::Unknown => {
+                    rpc_err("restricted: the role does not exist")
+                }
+                crate::relay::roles::RoleChange::Failed => rpc_err(
+                    "restricted: NIP-43 is disabled, the relay key is missing or the event could not be stored",
+                ),
             }
         }
         "unassignrole" => {
@@ -594,13 +602,24 @@ pub async fn rpc_handler(
             if let Err(e) = check_role_id(role) {
                 return rpc_err(&e.to_string());
             }
-            if relay.unassign_role(&pubkey, role).await {
-                audit!(&relay, &identity, "unassignrole", params);
-                rpc_ok(json!(true))
-            } else {
-                rpc_err(
-                    "restricted: NIP-43 is disabled, the relay key is missing or the assignment does not exist",
-                )
+            // NIP-86: the result is always `true` — revoking an absent
+            // grant is a no-op success. Only a disabled NIP-43, a missing
+            // relay key, or a failed persistence surfaces an error.
+            match relay.unassign_role(&pubkey, role).await {
+                crate::relay::roles::RoleChange::Applied
+                | crate::relay::roles::RoleChange::Noop => {
+                    audit!(&relay, &identity, "unassignrole", params);
+                    rpc_ok(json!(true))
+                }
+                // Unreachable for revocations (an unknown role revokes
+                // nothing, which is a `Noop`), kept for exhaustiveness.
+                crate::relay::roles::RoleChange::Unknown => {
+                    audit!(&relay, &identity, "unassignrole", params);
+                    rpc_ok(json!(true))
+                }
+                crate::relay::roles::RoleChange::Failed => rpc_err(
+                    "restricted: NIP-43 is disabled, the relay key is missing or the event could not be stored",
+                ),
             }
         }
         "blockip" => {
@@ -1624,6 +1643,73 @@ mod tests {
         let resp = rpc_call(&relay, "unassignrole", vec![json!(upper), json!("mod")]).await;
         assert!(rpc_ok_of(resp).await);
         assert!(!relay.roles.read().await.is_member_of(&lower));
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn role_grant_revoke_are_idempotent() {
+        // NIP-86: the `assignrole`/`unassignrole` result is always `true`
+        // — a duplicate grant and a missing revocation are no-op
+        // successes. Only an unknown grant target, a disabled NIP-43, a
+        // missing relay key, or a failed persistence surfaces an error.
+        let relay = build_admin_relay_with_key(Some(&"cd".repeat(32))).await;
+        let member = "aa".repeat(32);
+        let resp = rpc_call(&relay, "createrole", vec![json!("mod")]).await;
+        assert!(rpc_ok_of(resp).await);
+        let resp = rpc_call(
+            &relay,
+            "assignrole",
+            vec![json!(member.clone()), json!("mod")],
+        )
+        .await;
+        assert!(rpc_ok_of(resp).await);
+        let resp = rpc_call(
+            &relay,
+            "assignrole",
+            vec![json!(member.clone()), json!("mod")],
+        )
+        .await;
+        assert!(
+            rpc_ok_of(resp).await,
+            "a duplicate grant must still report true"
+        );
+        let resp = rpc_call(
+            &relay,
+            "assignrole",
+            vec![json!(member.clone()), json!("ghost")],
+        )
+        .await;
+        assert!(
+            rpc_err_of(resp).await.contains("does not exist"),
+            "a grant to an unknown role stays an error"
+        );
+        let resp = rpc_call(
+            &relay,
+            "unassignrole",
+            vec![json!("bb".repeat(32)), json!("mod")],
+        )
+        .await;
+        assert!(
+            rpc_ok_of(resp).await,
+            "revoking a missing grant must still report true"
+        );
+        let resp = rpc_call(
+            &relay,
+            "unassignrole",
+            vec![json!(member.clone()), json!("mod")],
+        )
+        .await;
+        assert!(rpc_ok_of(resp).await);
+        let resp = rpc_call(
+            &relay,
+            "unassignrole",
+            vec![json!(member.clone()), json!("mod")],
+        )
+        .await;
+        assert!(
+            rpc_ok_of(resp).await,
+            "a repeat revocation must still report true"
+        );
         relay.db.shutdown();
     }
 

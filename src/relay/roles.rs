@@ -11,6 +11,24 @@ use crate::nips::nip01;
 use crate::nips::nip43::RoleStore;
 use crate::util::unix_now;
 
+/// Outcome of an RPC-facing role grant/revoke. NIP-86 reports `true`
+/// for both a landed change and an idempotent no-op (a duplicate grant
+/// or a missing revocation); only an unknown grant target, a disabled
+/// subsystem, a missing relay key, or a failed persistence surfaces an
+/// error.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum RoleChange {
+    /// The store changed (and the membership was republished).
+    Applied,
+    /// Nothing to do (duplicate grant / missing revocation): success.
+    Noop,
+    /// A grant naming a role that does not exist: an error.
+    Unknown,
+    /// NIP-43 disabled, relay key missing, or the membership event
+    /// could not be stored: an error.
+    Failed,
+}
+
 impl super::Relay {
     /// Applies a role mutation to the live store, capturing it for replay
     /// when a rebuild is pending or in flight (see
@@ -252,54 +270,75 @@ impl super::Relay {
         }
     }
 
-    pub async fn assign_role(&self, pubkey: &str, role: &str) -> bool {
+    pub async fn assign_role(&self, pubkey: &str, role: &str) -> RoleChange {
         if !self.config.read().await.nip_enabled(43) || self.key.is_none() {
-            return false;
+            return RoleChange::Failed;
         }
-        let assigned = self
+        let outcome = self
             .mutate_roles(
                 super::BufferedRoleMutation::Assign {
                     pubkey: pubkey.to_string(),
                     role: role.to_string(),
                 },
                 |roles| {
-                    let assigned = roles.assign(pubkey, role);
-                    (assigned, assigned)
+                    if !roles.roles.contains_key(role) {
+                        (RoleChange::Unknown, false)
+                    } else if roles
+                        .assignments
+                        .get(pubkey)
+                        .is_some_and(|grants| grants.iter().any(|r| r == role))
+                    {
+                        (RoleChange::Noop, false)
+                    } else {
+                        roles.assign(pubkey, role);
+                        (RoleChange::Applied, true)
+                    }
                 },
             )
             .await;
-        if assigned {
+        if outcome == RoleChange::Applied {
             self.schedule_roles_persist();
-            self.publish_membership(Some((true, pubkey.to_string())))
+            if !self
+                .publish_membership(Some((true, pubkey.to_string())))
                 .await
-        } else {
-            false
+            {
+                return RoleChange::Failed;
+            }
         }
+        outcome
     }
 
-    pub async fn unassign_role(&self, pubkey: &str, role: &str) -> bool {
+    pub async fn unassign_role(&self, pubkey: &str, role: &str) -> RoleChange {
         if !self.config.read().await.nip_enabled(43) || self.key.is_none() {
-            return false;
+            return RoleChange::Failed;
         }
-        let changed = self
+        let outcome = self
             .mutate_roles(
                 super::BufferedRoleMutation::Unassign {
                     pubkey: pubkey.to_string(),
                     role: role.to_string(),
                 },
                 |roles| {
-                    let changed = roles.unassign(pubkey, role);
-                    (changed, changed)
+                    if roles.unassign(pubkey, role) {
+                        (RoleChange::Applied, true)
+                    } else {
+                        // Revoking an absent grant (or an unknown role) is
+                        // a no-op success, per NIP-86's always-`true`.
+                        (RoleChange::Noop, false)
+                    }
                 },
             )
             .await;
-        if changed {
+        if outcome == RoleChange::Applied {
             self.schedule_roles_persist();
-            self.publish_membership(Some((false, pubkey.to_string())))
+            if !self
+                .publish_membership(Some((false, pubkey.to_string())))
                 .await
-        } else {
-            false
+            {
+                return RoleChange::Failed;
+            }
         }
+        outcome
     }
 
     /// NIP-43 leave request: removes the user from the member list and
