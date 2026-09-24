@@ -53,6 +53,7 @@ const SUPPORTED_METHODS: &[&str] = &[
     "allowkind",
     "disallowkind",
     "listallowedkinds",
+    "listdisallowedkinds",
     "changerelayname",
     "changerelaydescription",
     "changerelayicon",
@@ -2696,6 +2697,25 @@ mod tests {
             rpc_result_of(rpc_call(&relay, "listdisallowedkinds", vec![]).await).await,
             json!([7])
         );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn supportedmethods_advertises_every_implemented_method() {
+        // Every implemented method (except itself) must be advertised:
+        // clients discover capabilities through this list.
+        let relay = build_admin_relay().await;
+        let list = rpc_result_of(rpc_call(&relay, "supportedmethods", vec![]).await).await;
+        let list = list.as_array().unwrap();
+        for method in SUPPORTED_METHODS {
+            if *method == "supportedmethods" {
+                continue;
+            }
+            assert!(
+                list.iter().any(|m| m == *method),
+                "{method} is implemented but not advertised"
+            );
+        }
         relay.db.shutdown();
     }
 
