@@ -1,7 +1,7 @@
 # nostrfy
 
 <p align="center">
-  <img src="docs/images/nostrfy-banner.png" alt="nostrfy — a minimal and stable Nostr relay server" width="100%">
+  <img src="https://nostrfy.org/og-image.png" alt="nostrfy — a minimal and stable Nostr relay server" width="100%">
 </p>
 
 <p align="center">
@@ -13,7 +13,7 @@
   <a href="https://nostrfy.org/">Official website</a>
 </p>
 
-**An all-in-one Nostr relay server in Rust. Blazing fast by Design. Lean by Nature. Powerful by Default.**
+**High-performance Nostr relay engine written in Rust. Fast, memory-efficient, and built for modern relays.**
 
 > [!TIP]
 > Live instance running at **wss://relay.nostrfy.org**.
