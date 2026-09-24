@@ -22,9 +22,10 @@ host = "127.0.0.1"          # only reachable through Caddy
 port = 8080
 
 [rpc]
-# Management API on a separate port, reachable only from localhost.
-# Port allocation on this box: 8080 = relay 1, 8081 = relay 2,
-# 8082 = relay 1 management, 8083 = relay 2 management.
+# NIP-86 management credentials. The API shares the relay port (there is
+# no separate management port); reachable only from localhost here because
+# the whole relay binds 127.0.0.1 below. Port allocation on this box:
+# 8080 = relay 1, 8081 = relay 2.
 management_token = ""       # set a strong token to enable NIP-86
 
 [database]

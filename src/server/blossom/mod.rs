@@ -1730,6 +1730,7 @@ pub(crate) fn host_is_blossom(blossom_host: &str, host_header: Option<&str>) -> 
             .trim()
             .trim_start_matches('[')
             .trim_end_matches(']')
+            .trim_end_matches('.')
             .to_ascii_lowercase()
     })
 }

@@ -32,7 +32,7 @@ Key features:
 
 - **Simple and stable**: written in Rust; a single binary does everything
 - **Fast storage and search**: LMDB database with a full-text search index
-- **Broad NIP support**: 36 NIPs implemented (plus the Blossom file server), including deletion, proof-of-work, delegation, groups, search, and a management API
+- **Broad NIP support**: 34 NIPs advertised (plus NIP-94 file metadata and the Blossom file server), including deletion, proof-of-work, delegation, groups, search, and a management API
 - **Easy to operate**: daemon mode, log rotation, hot configuration reload, statistics output, a REST API, and Prometheus metrics
 
 ---
@@ -83,7 +83,7 @@ verifies its checksum:
 curl -fsSL https://raw.githubusercontent.com/iqbqioza/nostrfy/main/install.sh | sh
 ```
 
-Options: `VERSION=v0.1.2 ./install.sh` pins a release,
+Options: `VERSION=v0.1.15 ./install.sh` pins a release,
 `INSTALL_DIR=/usr/local/bin sudo ./install.sh` installs system-wide,
 `./install.sh --force` overwrites without asking. The script picks the
 first of `~/.local/bin`, `~/bin`, `~/.cargo/bin` already on `PATH`
@@ -155,7 +155,7 @@ If anything is wrong, it tells you exactly what. It is strongly recommended to r
 | Option | Description | Default |
 | --- | --- | --- |
 | `name` | Relay name (shown to clients via NIP-11) | `nostrfy` |
-| `description` | Relay description | A fixed description |
+| `description` | Relay description | `A minimal and stable Nostr relay` |
 | `pubkey` | Administrator public key (64 hex chars) | empty |
 | `contact` | Administrator contact (URL or email) | empty |
 | `icon` | Relay icon image URL | empty |
@@ -369,10 +369,10 @@ All commands accept `--config <path>` (default: `nostrfy.toml`).
 | `nostrfy stop` | Stop the running daemon |
 | `nostrfy restart` | Stop and start again (re-reads the config) |
 | `nostrfy stats` | Show live statistics |
-| `nostrfy blossom allow <pubkey>` / `deny <pubkey>` / `list` | Manage the Blossom upload allowlist (persisted in LMDB; the running relay applies it on SIGHUP) |
-| `nostrfy relay allow <pubkey>` / `deny <pubkey>` / `list` | Manage the relay pubkey allow/deny lists (persisted in LMDB; a denied pubkey is always rejected when publishing and never served when reading; the running relay applies changes on SIGHUP) |
+| `nostrfy blossom allow <pubkey>` / `deny <pubkey>` / `list` | Manage the Blossom upload allowlist (persisted in LMDB; the running daemon is reloaded automatically) |
+| `nostrfy relay allow <pubkey>` / `deny <pubkey>` / `list` | Manage the relay pubkey allow/deny lists (persisted in LMDB; a denied pubkey is always rejected when publishing and never served when reading; the running daemon is reloaded automatically) |
 | `nostrfy access unblockip <ip>` | Remove an IP from the persisted NIP-86 blocked-IP list by editing the database directly — the self-lockout recovery when `blockip` also blocked the management connection. Restart the daemon to apply |
-| `nostrfy upgrade [version]` | Update the relay binary to the latest GitHub release, or to the given version. Downloads the asset for this platform (`nostrfy-linux-x86_64`, `-aarch64` or `-freebsd-x86_64`), verifies it runs (`--version` probe) and atomically replaces the binary — a crash mid-upgrade keeps the old binary. Never downgrades a newer local build unless a version is given explicitly; `--force` reinstalls the current version. A running daemon keeps the old binary until `nostrfy restart` |
+| `nostrfy upgrade [version]` | Update the relay binary to the latest GitHub release, or to the given version. Downloads the asset for this platform (`nostrfy-linux-x86_64`, `-aarch64` or `-freebsd-x86_64`), verifies its sha256 checksum, verifies it runs (`--version` probe) and atomically replaces the binary — a crash mid-upgrade keeps the old binary. Never downgrades a newer local build unless a version is given explicitly; `--force` reinstalls the current version. A running daemon keeps the old binary until `nostrfy restart` |
 
 ### Inbox/outbox subscription filters
 
@@ -501,9 +501,6 @@ curl -X POST http://127.0.0.1:8080/ \
 | `listbannedevents` | `[]` | List banned events |
 | `listeventsneedingmoderation` | `[]` | Events awaiting moderation (always empty on this relay) |
 
-### Legacy management port
-
-
 ---
 
 ## 8. Supported NIPs
@@ -514,17 +511,17 @@ curl -X POST http://127.0.0.1:8080/ \
 | 9 | Event deletion |
 | 11 | Relay information document |
 | 13 | Proof of work |
-| 17 | Private DMs (kind 14, wrapped in 15; ephemeral wraps 1059/21059 forwarded) |
+| 17 | Private DMs (kind 14 wrapped in kind 15; kind 1059 gift wraps served recipient-only, ephemeral kind 21059 wraps forwarded) |
 | 22 | Comments (kind 1111, threaded via the `#e` index) |
 | 26 | Delegated event signing |
-| 28 | Public chat |
+| 28 | Public chat (client-side: stored and served as plain events, not advertised — NIP-28 imposes no relay requirements) |
 | 29 | Relay-based groups |
 | 32 | Labeling (kind 1985, `#l`/`#L` indexed) |
 | 33 | Parameterized replaceable events |
-| 34 | git stuff (kinds 1617-1633, 30617/30618 — **opt-in** via `relay.enabled_git`, off by default) |
+| 34 | git stuff (kinds 1617-1619, 1621, 1622, 1630-1633, 30617/30618 — **opt-in** via `relay.enabled_git`, off by default) |
 | 40 | Expiration timestamp |
 | 42 | Client authentication |
-| 43 | Relay access metadata (roles) — the relay-signed metadata events (33534/13534/8000/8001) carry the NIP-70 `-` tag as the spec requires, so they are only served to authenticated clients (AUTH-gated, like NIP-78) |
+| 43 | Relay access metadata (roles) — kinds 33534/13534/8000/8001 plus ephemeral 28934/28935/28936; the relay-signed metadata events (33534/13534/8000/8001) carry the NIP-70 `-` tag as the spec requires, so they are only served to authenticated clients (AUTH-gated, like NIP-78) |
 | 45 | Counting results (COUNT / HyperLogLog) |
 | 46 | Nostr Connect (ephemeral kind 24133, exempt from `reject_ephemeral`) |
 | 47 | Nostr Wallet Connect (ephemeral kinds 23194/23195, exempt from `reject_ephemeral`) |
@@ -533,15 +530,15 @@ curl -X POST http://127.0.0.1:8080/ \
 | 59 | Gift wrap (recipient-only serving) |
 | 62 | Request to vanish — this relay keeps a **stricter, fail-closed bar** than the spec's `until_created` window: once a vanish request is honored the pubkey is recorded in a permanent set and **every** later event from it is rejected (including events created after the request), so a vanished key cannot resume publishing here; it is purged history plus a permanent publishing ban |
 | 65 | Relay list metadata (kind 10002, `#r` indexed) |
-| 66 | Relay discovery & liveness (self-publishes kind 30166 when `relay.private_key` is set, refreshed every 12 h) |
+| 66 | Relay discovery & liveness (kinds 30166/10166 stored and served; self-publishes kind 30166 when `relay.private_key` is set, refreshed every 12 h) |
 | 67 | EOSE completeness hint (incl. the `"auth"` hint with a challenge when AUTH-gated events were withheld) |
 | 70 | Protected events |
-| 77 | Negentropy syncing — note: when a `NEG-OPEN` replaces a currently open subscription and the new query fails, the existing subscription is **kept** (the spec's "first close the existing one" would destroy a working sync on a failed replacement); the replacement only happens once the new query succeeds |
+| 77 | Negentropy syncing (a failed replacement closes the id with `NEG-ERR` per NIP-77) |
 | 78 | Application-specific data (kind 30078, addressable; **AUTH-gated** — see `relay.enabled_nip78_auth`) |
 | 84 | Highlights (kind 9802) |
-| 85 | Trusted assertions (kinds 30382/30383/30384, addressable) |
+| 85 | Trusted assertions (kinds 30382/30383/30384/30385/10040, addressable) |
 | 86 | Relay management API |
-| 87 | Cashu and Fedimint announcements (kinds 38172/38173) |
+| 87 | Cashu and Fedimint announcements (kinds 38000/38172/38173) |
 | 88 | Polls (kinds 1068/1018) |
 | 94 | File metadata (kind 1063 — references an externally hosted file) |
 | 98 | HTTP auth |
@@ -557,7 +554,7 @@ The NIP-11 `supported_nips` list is not static: a NIP is dropped from it when ev
 - **`allowed_kinds`** — a NIP's kind is only accepted when listed; a NIP whose kinds are all unlisted is hidden.
 - **`reject_ephemeral`** — ephemeral kinds that are not in the NIP-mandated exempt list (`22242`, `27235`, `28934`/`28935`/`28936`, `24133`, `23194`/`23195`, `24242`, `21059`) are rejected, so NIPs relying on them are hidden.
 - **Prerequisites** — NIP-29, NIP-43 and NIP-66 rely on relay-signed events (group metadata, role/membership lists, the relay's own discovery event) and are hidden without `relay.private_key`; NIP-86 is hidden unless `rpc.management_token` or `rpc.admin_pubkey` is configured (otherwise every management call is refused).
-- NIPs without dedicated kinds (11, 13, 26, 33, 40, 45, 50, 67, 70, 77) are always advertised when enabled.
+- NIPs without dedicated kinds (1, 11, 13, 26, 33, 40, 45, 50, 67, 70, 77) are always advertised when enabled.
 
 Changes made at runtime — NIP-86 `allowkind`/`disallowkind`, or a `SIGHUP` reload of `reject_ephemeral` — are reflected in the next NIP-11 fetch. `enabled_nips`/`disabled_nips` still require a restart.
 
@@ -667,14 +664,14 @@ Both backends use the `bucket/{npub1xxx}/{file}` hierarchy: every upload is stor
 | `GET` | `/` | — | Blossom server info |
 | `GET` / `HEAD` | `/<sha256>[.ext]` | — | Fetch / probe a blob (`.ext` is advisory); both support RFC 7233 byte ranges (206 / `accept-ranges: bytes`) and both 404 when the backing file/object is gone |
 | `PUT` | `/upload` | kind 24242 (`t=upload`, `x=<sha256>`, `expiration`) | Upload a blob; returns 201 + the descriptor |
-| `HEAD` | `/upload` | kind 24242 (`t=upload`, `x=<sha256>`, `expiration`) | BUD-06 pre-flight — would the upload be accepted? Uses `X-SHA-256` / `X-Content-Length` / `X-Content-Type` headers (400 malformed / 411 missing length / 413 too large) |
+| `HEAD` | `/upload` | kind 24242 (`t=upload`, `x=<sha256>`, `expiration`) | BUD-06 pre-flight — would the upload be accepted? Uses `X-SHA-256` / `X-Content-Length` headers (400 malformed/missing, 411 missing length, 413 too large) |
 | `PUT` | `/media` | kind 24242 (`t=media`, `x=<sha256>`, `expiration`) | BUD-05 media upload (stored verbatim — no optimization); returns 201 + the descriptor |
-| `HEAD` | `/media` | kind 24242 (`t=media`, `x=<sha256>`, `expiration`) | BUD-05 pre-flight — would the upload be accepted? Uses `X-SHA-256` / `X-Content-Length` / `X-Content-Type` headers (400 malformed / 411 missing length / 413 too large) |
+| `HEAD` | `/media` | kind 24242 (`t=media`, `x=<sha256>`, `expiration`) | BUD-05 pre-flight — would the upload be accepted? Uses `X-SHA-256` / `X-Content-Length` headers (400 malformed/missing, 411 missing length, 413 too large) |
 | `GET` | `/list/<pubkey>` | kind 24242 (`t=list`, `expiration`) | Blobs uploaded by the requesting pubkey (hex, must match the token's author), sorted by `uploaded` descending; supports `cursor` (the sha256 of the last entry of the previous page) and `limit` |
 | `DELETE` | `/<sha256>` | kind 24242 (`t=delete`, `x=<sha256>`, `expiration`) | Delete a blob (uploader only) |
 
 - `PUT /upload` returns **201** when the blob was newly stored and **200** when it already exists (BUD-02).
-- Authorization tokens are accepted in the spec's **Base64url (no padding)** form and in the padded standard form (BUD-11).
+- Authorization tokens are accepted in the spec's **Base64url (no padding)** form, in padded Base64url, and in the padded standard form (BUD-11).
 - The optional `X-SHA-256` request header is verified against the actual bytes: a mismatch returns **409** (BUD-02).
 - User-uploaded bytes are served with `X-Content-Type-Options: nosniff`; active document types (HTML/SVG/XML/JavaScript) additionally get `Content-Disposition: attachment` and `Content-Security-Policy: default-src 'none'; sandbox`, so the media origin cannot be used for stored XSS. (An SVG used as an `<img>` subresource is unaffected.)
 - The CORS pre-flight accepts the BUD-05/06 headers (`X-SHA-256`, `X-Content-Type`, `X-Content-Length`), so browser clients like nostter can upload to `/media`.
@@ -820,7 +817,7 @@ After editing the config file, reload it without a restart:
 kill -HUP $(cat nostrfy.pid)
 ```
 
-The reload is **not all-or-nothing**: every live setting is applied even when the same edit also changes a startup-only one. Settings that take effect on reload: the relay name/description/pubkey/contact/icon/post-policy, `public_url`, the auth and policy knobs (`reject_ephemeral`, `enabled_git`, `enabled_nip78_auth`, `require_auth`, `send_auth_challenge`, `require_pow`, `new_pubkey_min_age_secs`, `max_events_per_min_per_pubkey`), most `[limits]` entries (the restart-only ones are listed below), the NIP-40 on/off state and the REST API concurrency ceiling, `rpc.management_token`/`admin_pubkey`, `blossom.restrict_uploads` and `access.restrict_relay`.
+The reload is **not all-or-nothing**: every live setting is applied even when the same edit also changes a startup-only one. Settings that take effect on reload: the relay name/description/pubkey/contact/icon/post-policy, `public_url`, the auth and policy knobs (`reject_ephemeral`, `enabled_git`, `enabled_nip78_auth`, `require_auth`, `send_auth_challenge`, `require_pow`, `new_pubkey_min_age_secs`, `max_events_per_min_per_pubkey`), most `[limits]` entries (the restart-only ones are listed below), the REST API concurrency and queue ceilings, `daemon.stats_file`, `rpc.management_token`/`admin_pubkey`, `blossom.restrict_uploads` and `access.restrict_relay`. NIP toggles (`enabled_nips`/`disabled_nips`, incl. NIP-40) require a restart.
 
 Settings that require a **restart**: each changed one is warned about (`... a restart is required to apply it`) and keeps its running value. They are `private_key` (warned about and ignored), `api_host`, `metrics_enabled`, LiveKit settings, `enabled_nips`/`disabled_nips`, `server.host`/`port`/`ws_paths`/`trusted_proxies`, `rpc.max_admin_body_bytes`, `database.path`/`purge_interval_secs`/`map_size`/`max_map_size`/`max_dbs`/`max_readers`/`search_index`/`meta_index`/`reader_threads`/`disabled_fsync`/`db_request_timeout_secs`/`max_db_queue_msgs`/`max_db_queue_events`/`max_db_queue_bytes`/`max_indexed_words`, `daemon.max_log_size_bytes`/`max_log_files`/`stats_interval_secs`/`log_file`/`pid_file`, `limits.live_buffer`/`live_batch_size`/`live_batch_interval_ms`/`socket_recv_buffer_kb`/`max_connections`/`max_connections_per_ip`/`http_read_timeout_secs`/`max_connections_per_sec_per_ip`, all `blossom.*` except `restrict_uploads` (which applies on reload), and `relay.max_groups`. See the CONFIGURATION.md SIGHUP table for the full matrix.
 

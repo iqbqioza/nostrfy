@@ -60,6 +60,8 @@ ss -tlnp | grep :8080
 
 **Fix**: Use `nostrfy restart`, or just use the running instance.
 
+> **Note**: `restart` stops the daemon through the pid file named in the *new* config. If you changed `daemon.pid_file`, stop the old instance first (`nostrfy stop` with the old config, or `kill` its pid) — otherwise the old daemon keeps running unknown to the new pid file.
+
 ### 1-4. `nostrfy stop` hangs / `did not stop in time`
 
 **Cause**: The daemon is stuck or not responding. Shutdown is graceful and bounded by the documented budget (`HTTP drain 5 s + background-task joins 5 s + WebSocket drain 7 s + database joins margin 10 s = 27 s`, plus a 5 s CLI margin), so a healthy daemon can take up to ~32 s to stop. `nostrfy stop` reports a timeout only when the process is still alive after that budget.
@@ -117,7 +119,7 @@ enabled_nips = [1, 50]   # lists are wrapped in [ ]
 | --- | --- |
 | `relay.public_url is empty and server.host is "0.0.0.0"...` | `public_url` is not set. **NIP-42 auth, NIP-62 vanish and NIP-98 admin auth will not work.** Set `wss://your-public-url` |
 | `relay.private_key is empty while NIP-29 is enabled...` | Groups need a secret key. Run `nostrfy genkey` |
-| `unknown config key [relay].software is ignored` | An unused legacy key (or a typo) in the config. Check the key name |
+| `unknown config key [relay].softwar is ignored` | A typo in a key name. Check the spelling (note: `software`/`version` are legacy keys that are silently accepted) |
 | `unknown config section [serve] is ignored` | A typo in a section name (e.g. `[serve]` instead of `[server]`). Fix it |
 | `relay.require_auth is true but relay.send_auth_challenge is false...` | This combination locks everyone out. Change one of the two |
 | `relay.require_pow = 64 ... practically unmineable` | The PoW requirement is so high nobody can post. Lower `require_pow` |
@@ -197,7 +199,7 @@ When using Cloudflare Tunnel:
 
 ### 2-8. A NIP is missing from the NIP-11 `supported_nips` list
 
-**Cause**: The advertised list is dynamic — a NIP is hidden when all the kinds it defines are rejected: they are all in `blocked_kinds`, none of them is in `allowed_kinds`, or they are ephemeral kinds rejected by `reject_ephemeral` (only the exempt kinds `22242`, `27235`, `28934`/`28935`/`28936`, `24133`, `23194`/`23195`, `24242`, `21059` are forwarded). NIP-29/43/66 additionally require `relay.private_key` (their relay-signed events cannot be produced without it) and NIP-86 requires `rpc.management_token` or `rpc.admin_pubkey`. Runtime access changes via NIP-86 (`allowkind`/`disallowkind`) apply immediately; NIPs without dedicated kinds (11, 13, 26, 33, 40, 45, 50, 67, 70, 77) are always advertised when enabled.
+**Cause**: The advertised list is dynamic — a NIP is hidden when all the kinds it defines are rejected: they are all in `blocked_kinds`, none of them is in `allowed_kinds`, or they are ephemeral kinds rejected by `reject_ephemeral` (only the exempt kinds `22242`, `27235`, `28934`/`28935`/`28936`, `24133`, `23194`/`23195`, `24242`, `21059` are forwarded). NIP-29/43/66 additionally require `relay.private_key` (their relay-signed events cannot be produced without it) and NIP-86 requires `rpc.management_token` or `rpc.admin_pubkey`. Runtime access changes via NIP-86 (`allowkind`/`disallowkind`) apply immediately; NIPs without dedicated kinds (1, 11, 13, 26, 33, 40, 45, 50, 67, 70, 77, 86) are always advertised when enabled.
 
 **Fix**: Check the active access lists — NIP-86 `listallowedkinds` shows the kind allowlist (use `disallowkind` to add a kind to the blocklist, `allowkind` to remove it), and `GET /` shows the effective `supported_nips` immediately. Remove the blocking kind or the `reject_ephemeral` setting, then `SIGHUP` or re-issue the NIP-86 call.
 

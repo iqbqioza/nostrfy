@@ -57,5 +57,7 @@
 #   wss://, not ws://.
 # * WebSocket connections drop after ~60 s: increase ws_idle_timeout_secs
 #   in [limits] (some clients send no keep-alive).
-# * The management API (NIP-86) is bound to 127.0.0.1 only — do NOT
-#   expose it through Caddy; it is not covered by the templates.
+# * The management API (NIP-86) shares the relay port (there is no separate
+#   port) — do NOT expose it through Caddy; it is not covered by the
+#   templates. Here it is reachable only from localhost because the relays
+#   bind 127.0.0.1.

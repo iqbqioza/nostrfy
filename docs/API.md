@@ -35,9 +35,9 @@ http://<host>:<port>/api/v1/{identifier}/{kind}
 
 `GET /api/v1/{npub1...}/kinds` — per-kind event counts for an author: `{"kinds": [{"kind": 1, "count": 120}], "approximate": bool}`, sorted by count descending.
 
-Author identifiers (`{npub1...}`) may also be given as a **64-hex pubkey** (case-insensitive) on every endpoint.
+Author identifiers (`{npub1...}`) may also be given as a **64-hex pubkey** (case-insensitive) or `nprofile1...` on every endpoint.
 
-`GET /api/v1/{npub1...}/{kind}/daily?year=2026&month=8` — per-day counts for one month (default: the current month; `month` must be 1-12). **Every day of the month is reported, zero-filled through the last day** — 8/31 comes back as 0 even when today is the 28th: `{"days": [{"day": "2026-08-01", "count": 0}], "total": N}`.
+`GET /api/v1/{npub1...}/{kind}/daily?year=2026&month=8` — per-day counts for one month (default: the current month; `month` must be 1-12). **Every day of the month is reported, zero-filled through the last day** — 8/31 comes back as 0 even when today is the 28th: `{"days": [{"day": "2026-08-01", "count": 0, "approximate": false}], "total": N, "approximate": false}`.
 
 `GET /api/v1/ids/{hex}` — a single event by its 64-hex id (prefixes rejected).
 
@@ -45,21 +45,23 @@ Author identifiers (`{npub1...}`) may also be given as a **64-hex pubkey** (case
 
 ### Stats, hourly, related, follows and relay kinds
 
-`GET /api/v1/{npub1...}/stats` — author statistics in one call: `{"total": N, "approximate": bool, "first_seen": unix, "last_seen": unix, "first_month": "2026-08", "last_month": "2026-08", "kinds": [{"kind": 1, "count": 120}]}`.
+`GET /api/v1/{npub1...}/stats` — author statistics in one call: `{"total": N, "approximate": bool, "first_seen": unix, "last_seen": unix, "first_month": "2026-08", "last_month": "2026-08", "kinds": [{"kind": 1, "count": 120}]}` (`first_seen`/`last_seen`/months are `null` when no visible events exist).
 
-`GET /api/v1/{npub1...}/{kind}/hourly?year=&month=&day=` — per-hour counts for one day (defaults: the current date; `day` validated against the month). All **24 hours are reported, zero-filled**: `{"hours": [{"hour": "2026-08-28T00", "count": 0}], "total": N}`.
+`GET /api/v1/{npub1...}/{kind}/hourly?year=&month=&day=` — per-hour counts for one day (defaults: the current date when year/month select the current month, else the 1st; `day` validated against the month). All **24 hours are reported, zero-filled**: `{"hours": [{"hour": "2026-08-28T00", "count": 0, "approximate": false}], "total": N, "approximate": false}`.
 
-`GET /api/v1/ids/{hex}/related` — events referencing the event: the union of `#e` (replies, threads) and `#q` (quotes) filters.
+`GET /api/v1/ids/{hex}/related` — events referencing the event: the union of `#e` (replies, threads) and `#q` (quotes) filters. The path id is lowercased before matching (uppercase works); an `e` query parameter is OR-ed into the `#e` side.
 
 `GET /api/v1/{npub1...}/follows` — the author's latest follow list (kind 3, NIP-02; replaceable, so the newest event is the current list).
 
-`GET /api/v1/relay/kinds?limit=` — the most common kinds stored on the relay, sorted by count descending (`{"kinds": [{"kind": 1, "count": 12345}], "approximate": bool}`). Counts are computed over a bounded sample of the newest events, filtered with the anonymous-connection visibility rules (protected, gift-wrap, owner-only and private-group events are excluded); `approximate: true` when the sample was cut short.
+`GET /api/v1/relay/kinds?limit=` — the most common kinds stored on the relay, sorted by count descending (`{"kinds": [{"kind": 1, "count": 12345}], "approximate": bool, "filtered": true}`). Counts are computed over a bounded sample of the newest events, filtered with the anonymous-connection visibility rules (protected, gift-wrap, owner-only and private-group events are excluded); `approximate: true` when the sample was cut short.
 
 ### Top authors and relay lists
 
-`GET /api/v1/relay/top-authors?limit=` — the most active authors on the relay, sorted by count descending (`{"authors": [{"pubkey": "<hex>", "count": 123}], "approximate": bool}`). Like `relay/kinds`, counts come from the bounded, visibility-filtered sample; `approximate: true` when it was cut short.
+`GET /api/v1/relay/top-authors?limit=` — the most active authors on the relay, sorted by count descending (`{"authors": [{"pubkey": "<hex>", "count": 123}], "approximate": bool, "filtered": true}`). Like `relay/kinds`, counts come from the bounded, visibility-filtered sample; `approximate: true` when it was cut short.
 
 `GET /api/v1/{npub1...}/relays` — the author's latest NIP-65 relay list (kind 10002, replaceable — the newest event is the current list; the `r` tags carry the relay URLs).
+
+> **Endpoint quirks:** the singleton endpoints (profile, `/ids/{hex}`, follows, relays) still accept `offset` — `?offset=1` skips the only event and returns `[]`. `authors`/`kinds` query parameters only filter the generic `/query` endpoint: on kind endpoints they are silently ignored (both are pre-filled), while on id endpoints they are AND-ed (so `/note1...?kinds=999` is empty). The `stats` kind breakdown is ordered by kind, unlike `/kinds` (count first). An author whose only events are future-dated gets `400` from `monthly` with no params (use an explicit range).
 
 ### Monthly counts
 
@@ -71,14 +73,15 @@ Author identifiers (`{npub1...}`) may also be given as a **64-hex pubkey** (case
     { "month": "2026-08", "count": 4, "approximate": false },
     { "month": "2026-09", "count": 0, "approximate": false }
   ],
-  "total": 4
+  "total": 4,
+  "approximate": false
 }
 ```
 
-- `since` / `until` bound the range (unix seconds); without them the **whole period** is covered, from the earliest stored event of that author and kind to now (an author with no events returns an empty list). When more than 1024 hidden events (protected, gift-wrap, owner-only or private-group content) precede the earliest visible one, the start cannot be determined by the bounded visibility probe and the request returns `400` — pass `since` explicitly.
+- `since` / `until` bound the range (unix seconds); without them the **whole period** is covered, from the earliest visible event of that author and kind to now (an author with no events returns an empty list). When more than 1024 hidden events (protected, gift-wrap, owner-only or private-group content) precede the earliest visible one, the start cannot be determined by the bounded visibility probe and the request returns `400` — pass `since` explicitly.
 - Every month in the range is reported, zero-filled, oldest first; the range is capped at **120 months** (exceeding it returns `400`, as does `until < since`).
 - `approximate: true` marks a month whose count hit the collection limit (`limits.max_count`), mirroring NIP-45.
-- The same visibility rules as the rest of the API apply (protected events, gift wraps and private/hidden group content are withheld).
+- The same visibility rules as the rest of the API apply (protected events, gift wraps, owner-only application data and private/hidden group content are withheld).
 
 ### `server.api_host` (host-based routing)
 
@@ -110,7 +113,7 @@ Without `api_host`, the API is served on every host, next to the WebSocket endpo
 
 ### 2.2 `GET /api/v1/{identifier}/{kind}`
 
-Only valid for `npub1...`. Returns events by the pubkey, filtered by `kind` (a decimal number).
+Valid for author identifiers (`npub1...`, 64-hex pubkeys and `nprofile1...`). Returns events by the pubkey, filtered by `kind` (a decimal number).
 
 ```
 GET /api/v1/npub1.../1        # notes
@@ -128,12 +131,15 @@ All parameters are optional and passed as URL query strings.
 
 | Parameter | Type | Description |
 | --- | --- | --- |
-| `limit` | integer | Max results (default `100` for npub queries; capped by `limits.max_api_limit`; `0` in the config means "no bound") |
-| `offset` | integer | Number of visible results to skip (pagination; capped by `limits.max_api_offset` — exceeding it returns `400`) |
+| `limit` | integer | Max results (default `100` for author/kind and generic queries — `20` for the `relay/kinds` and `top-authors` aggregates, `1` (fixed) for profile/note/single-event/follows/relays endpoints; capped by `limits.max_api_limit`; `0` in the config means "no bound") |
+| `offset` | integer | Number of visible results to skip (pagination; capped by `limits.max_api_offset` — exceeding it returns `400` on the endpoints that enforce it) |
 | `since` | integer | Only events with `created_at >= since` |
 | `until` | integer | Only events with `created_at <= until` |
 | `sort` | string | `asc` or `ascending` = oldest first; anything else (default) = newest first |
-| `search` | string | NIP-50 full-text search on content (whole-word matching; length capped by `limits.max_api_search_bytes` — exceeding it returns `400`) |
+| `search` | string | NIP-50 full-text search on content (whole-word matching; length capped by `limits.max_api_search_bytes` — exceeding it returns `400` on the endpoints that enforce it) |
+| `authors` | pubkey(s) | Single, comma-separated or repeated author filter (generic query only) |
+| `kinds` | integer(s) | Single, comma-separated or repeated kind filter (generic query only) |
+| `year` / `month` / `day` | integers | Date selectors for the `daily` / `hourly` endpoints |
 | `e` | string | Require an `e` tag with this value |
 | `p` | string | Require a `p` tag with this value |
 | `t` | string | Require a `t` tag with this value |
@@ -151,7 +157,7 @@ All parameters are optional and passed as URL query strings.
 
 ## 4. Response Format
 
-Successful responses return `200 OK` with the following JSON body:
+Successful event-list responses return `200 OK` with the following JSON body:
 
 ```json
 {
@@ -175,7 +181,9 @@ Successful responses return `200 OK` with the following JSON body:
 | --- | --- |
 | `events` | The events of this page (newest first by default) |
 | `count` | The number of events in this page |
-| `more` | `true` when further pages exist (use `offset` to fetch them) |
+| `more` | Best-effort `true` when further pages may exist (use `offset` to fetch them; a page cut short by hidden events can report `more` with an empty follow-up) |
+
+The aggregate endpoints return their own shapes (`{"count", "approximate"}`, `{"kinds", ...}`, `{"days"/"months"/"hours", "total", "approximate"}`, author `stats`, `authors` lists) as documented per endpoint above.
 
 ---
 
@@ -198,6 +206,7 @@ The API is unauthenticated, so it applies the same visibility rules as an **anon
 
 - **NIP-70 protected events** (carrying a `-` tag)
 - **NIP-59 gift wraps** (kind 1059)
+- **NIP-78 application-specific events** (kinds 78/30078, owner-only while `relay.enabled_nip78_auth` is set)
 - **NIP-29 private/hidden group content** (visible only to members)
 
 These events are excluded before pagination, so they do not consume `limit` slots or corrupt the `offset` sequence.
@@ -214,11 +223,18 @@ Errors return a JSON body with an `error` field:
 
 | Error example | When |
 | --- | --- |
-| `invalid identifier: ...` | The NIP-19 identifier cannot be decoded (400) |
-| `the endpoint requires an npub1 identifier or a 64-hex pubkey` | A kind path given with a note1/nevent1/naddr1 identifier, or an unrecognized path (400) |
-| `offset exceeds the maximum of 50000` | `offset` above `max_api_offset` (400) |
-| `search exceeds the maximum of 2048 bytes` | `search` longer than `max_api_search_bytes` (400) |
+| `invalid identifier: ...` | The NIP-19 identifier cannot be decoded (400). Malformed query values (`?limit=abc`, `?kinds=1,x`) and non-numeric `{kind}` paths fail earlier at URL parsing with a plain-text `400`, not this JSON body |
+| `the endpoint requires an npub1 identifier or a 64-hex pubkey` | A kind path given with a note1/nevent1/naddr1 identifier, or an unrecognized path (400; unknown paths and wrong `api_host` are `404`) |
+| `the id must be a 64-character hex string` | `/ids/{hex}` or `/related` with a malformed id (400) |
+| `since/until are not supported by this endpoint`, `"month must be between 1 and 12"`, `"year must be between 1970 and 2999"`, `"day must be between 1 and ..."` | Invalid date selectors on `daily`/`hourly` (400) |
+| `"until must not be earlier than since"`, `"the requested range exceeds 120 months"` | Invalid `monthly` range (400) |
+| `"error: too many hidden events to determine the range start; pass since"` | The `monthly` visibility probe was overwhelmed (400; note the doubled `error:` prefix is part of the message) |
+| `"authors and kinds are limited to 512 entries each"` | Too many `authors`/`kinds` values (400) |
+| `"offset + limit exceed the server fetch limit..."` | `offset + limit + 1` beyond `max_api_fetch` (400) |
+| `offset exceeds the maximum of ...` | `offset` above `max_api_offset` (400; `0` disables the check). Aggregate/stats/monthly endpoints ignore `offset` bounds |
+| `search exceeds the maximum of ... bytes` | `search` longer than `max_api_search_bytes` (400; `0` disables the check; still enforced when NIP-50 is disabled) |
 | `server is busy, try again shortly` | Too many concurrent API requests (`max_api_concurrent` reached) (503) |
+| `database is overloaded...` / `database timeout, please retry` | The database reader is saturated or timed out (503) |
 | `not found` | The path does not exist, or the Host header does not match `api_host` (404) |
 
 ---
@@ -228,10 +244,10 @@ Errors return a JSON body with an `error` field:
 | Code | Meaning |
 | --- | --- |
 | `200` | Success |
-| `400` | Invalid identifier or query parameter |
+| `400` | Invalid identifier or query parameter (malformed query value types like `?limit=abc` fail URL parsing with a plain-text `400`, not the JSON body above) |
 | `403` | WebSocket upgrade attempt to `/api/v1` |
 | `404` | Unknown path, or wrong Host for the API (`api_host` configured) |
-| `503` | API concurrency limit reached — retry shortly |
+| `503` | API concurrency limit reached, or the database reader saturated/timed out — retry shortly |
 
 ---
 
@@ -281,5 +297,5 @@ curl "http://127.0.0.1:8080/api/v1/npub180cvv07tjdrrgpa0j7j7tmnyl2yr6yr7l8j4s3ev
 
 ## Related
 
-- [Manual (MANUAL.md)](MANUAL.md) — configuration reference for the API limits (`max_api_concurrent`, `max_api_limit`, `max_api_offset`, `max_api_search_bytes`)
+- [Manual (MANUAL.md)](MANUAL.md) — configuration reference for the API limits (`max_api_concurrent`, `max_api_limit`, `max_api_offset`, `max_api_search_bytes`, `max_api_fetch`, `limits.max_count`)
 - [Troubleshooting (TROUBLESHOOTING.md)](TROUBLESHOOTING.md)

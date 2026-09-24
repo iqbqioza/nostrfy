@@ -217,9 +217,9 @@ pub struct ServerConfig {
     pub trusted_proxies: Vec<String>,
 }
 
-/// NIP-86 management RPC settings: the separate management port, the
-/// bearer token / admin pubkey authentication, and the request body
-/// limit.
+/// NIP-86 management RPC settings: served on the relay port (there is no
+/// separate management port), the bearer token / admin pubkey
+/// authentication, and the request body limit.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RpcConfig {
@@ -1194,7 +1194,14 @@ impl Config {
                 .api_host
                 .trim()
                 .trim_matches(['[', ']'])
-                .eq_ignore_ascii_case(self.blossom.host.trim().trim_matches(['[', ']']))
+                .trim_end_matches('.')
+                .eq_ignore_ascii_case(
+                    self.blossom
+                        .host
+                        .trim()
+                        .trim_matches(['[', ']'])
+                        .trim_end_matches('.'),
+                )
         {
             return Err(config_err(
                 "server.api_host and blossom.host must be different hostnames",
@@ -2772,7 +2779,7 @@ mod tests {
         let docs = std::fs::read_to_string("docs/CONFIGURATION.md")
             .expect("docs/CONFIGURATION.md is readable from the crate root");
         let example = docs
-            .split_once("## 11. Full example")
+            .split_once("## 13. Full example")
             .and_then(|(_, rest)| rest.split_once("```toml\n"))
             .and_then(|(_, rest)| rest.split_once("\n```"))
             .map(|(block, _)| block)
@@ -3894,6 +3901,25 @@ max_log_files = 2
             );
             cfg.blossom.host = String::new();
         }
+    }
+
+    #[test]
+    fn validation_treats_trailing_dot_hosts_as_equal() {
+        // A trailing DNS dot names the same host: `api_host` and
+        // `blossom.host` differing only by it would split nothing, so
+        // they must be rejected as duplicates like identical spellings.
+        let mut cfg = Config::default();
+        cfg.server.api_host = "api.example.com".into();
+        cfg.blossom.host = "api.example.com.".into();
+        assert!(
+            cfg.validate().is_err(),
+            "dot-suffixed duplicates must be rejected"
+        );
+        cfg.blossom.host = "media.example.com.".into();
+        assert!(
+            cfg.validate().is_ok(),
+            "distinct hosts stay valid with or without the dot"
+        );
     }
 
     #[test]
