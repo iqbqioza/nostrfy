@@ -3525,7 +3525,10 @@ mod tests {
             .await
             .unwrap();
         let body = String::from_utf8(body.to_vec()).unwrap();
-        assert!(body.contains("How to Open a Door"), "the joke guide is served");
+        assert!(
+            body.contains("How to Open a Door"),
+            "the joke guide is served"
+        );
         assert!(
             !body.to_ascii_lowercase().contains("nostr"),
             "the decoy must not name the protocol: {body:?}"
