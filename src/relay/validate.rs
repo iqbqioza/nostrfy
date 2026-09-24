@@ -182,8 +182,12 @@ impl super::Relay {
             }
             return Precheck::Reject("restricted: this relay does not issue invite codes".into());
         }
-        // NIP-29: group action events MUST carry an `h` tag.
-        if cfg.nip_enabled(29) && nip29::is_group_action(event) && nip29::group_id(event).is_none()
+        // NIP-29: group action events MUST carry an `h` tag naming a
+        // non-empty group id (an empty id would create a phantom group
+        // that consumes the capacity budget).
+        if cfg.nip_enabled(29)
+            && nip29::is_group_action(event)
+            && nip29::group_id(event).is_none_or(|gid| gid.is_empty())
         {
             return Precheck::Reject("invalid: group events must carry an h tag".into());
         }
@@ -1735,6 +1739,15 @@ mod tests {
             );
             let out = relay
                 .precheck(&cfg, &access, &join, now, &[], None, None)
+                .await;
+            assert!(matches!(out, super::Precheck::Reject(m) if m.contains("h tag")));
+
+            // An empty h tag names no group: rejected like a missing one,
+            // or it would create a phantom group outside the capacity
+            // budget.
+            let empty = h(crate::nips::nip29::JOIN, vec![vec!["h".into(), "".into()]]);
+            let out = relay
+                .precheck(&cfg, &access, &empty, now, &[], None, None)
                 .await;
             assert!(matches!(out, super::Precheck::Reject(m) if m.contains("h tag")));
 

@@ -500,11 +500,12 @@ impl GroupStore {
         {
             bail!("invalid: group events must carry only one h tag");
         }
-        let Some(gid) = group_id(event) else {
-            // NIP-29 group actions MUST carry an `h` tag (mirrors the intake
-            // precheck): without it the event names no group to validate
-            // against, so accepting it here would let a direct caller bypass
-            // the requirement. Ordinary events without `h` are unaffected.
+        let Some(gid) = group_id(event).filter(|gid| !gid.is_empty()) else {
+            // NIP-29 group actions MUST carry a non-empty `h` tag (mirrors
+            // the intake precheck): without it the event names no group to
+            // validate against, so accepting it here would let a direct
+            // caller bypass the requirement. Ordinary events without `h`
+            // are unaffected.
             if is_group_action(event) {
                 bail!("invalid: group events must carry an h tag");
             }
@@ -1136,7 +1137,13 @@ impl GroupStore {
             }
             CREATE_GROUP => {
                 let mut adopted_parent = None;
-                if !self.groups.contains_key(gid) && (ignore_capacity || !self.at_capacity()) {
+                // An empty id is rejected at intake and validation; the
+                // replay path below must not resurrect one either (it would
+                // create a phantom group outside the capacity budget).
+                if !gid.is_empty()
+                    && !self.groups.contains_key(gid)
+                    && (ignore_capacity || !self.at_capacity())
+                {
                     // A fresh create resurrects an explicitly deleted id:
                     // clear the delete tombstone so the id is reusable. The
                     // deleted group's events were purged by the relay when
