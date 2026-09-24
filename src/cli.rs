@@ -1158,6 +1158,27 @@ impl Cli {
         Ok(())
     }
 
+    /// Reads a small text response with a hard byte cap: a hostile server
+    /// must not be able to exhaust memory before the content is validated.
+    /// Returns the text, or an error naming `too_large` when the body
+    /// exceeds `cap`.
+    fn read_limited_string(
+        reader: impl std::io::Read,
+        cap: u64,
+        too_large: &str,
+    ) -> Result<String> {
+        use std::io::Read;
+        let mut body = Vec::new();
+        reader
+            .take(cap + 1)
+            .read_to_end(&mut body)
+            .map_err(|e| anyhow!(format!("cannot read response: {e}")))?;
+        if body.len() as u64 > cap {
+            return Err(anyhow!(too_large.to_string()));
+        }
+        String::from_utf8(body).map_err(|e| anyhow!(format!("response is not valid UTF-8: {e}")))
+    }
+
     /// `nostrfy upgrade`: replaces the relay binary with a GitHub release
     /// asset (the version given on the command line, or the latest release).
     /// The download is written to a temp file next to the current
@@ -1172,6 +1193,9 @@ impl Cli {
     fn upgrade(&self, version: Option<&str>, force: bool) -> Result<()> {
         const REPO: &str = "iqbqioza/nostrfy";
         const MAX_ASSET_BYTES: u64 = 256 * 1024 * 1024;
+        // A checksum file is two short fields; cap it like the binary so
+        // a hostile mirror cannot exhaust memory before validation.
+        const MAX_CHECKSUM_BYTES: u64 = 64 * 1024;
 
         let current = env!("CARGO_PKG_VERSION");
         let Some(asset) = upgrade_asset_name(std::env::consts::OS, std::env::consts::ARCH) else {
@@ -1281,9 +1305,14 @@ impl Cli {
                 .get(&format!("{url}.sha256"))
                 .set("User-Agent", "nostrfy-upgrade")
                 .call()
-                .map_err(|e| anyhow!(format!("cannot fetch the checksum: {e}")))?
-                .into_string()
-                .map_err(|e| anyhow!(format!("invalid checksum response: {e}")))?;
+                .map_err(|e| anyhow!(format!("cannot fetch the checksum: {e}")))?;
+            // Bounded like the binary body above: a hostile mirror must
+            // not be able to exhaust memory before the digest check.
+            let checksum = Self::read_limited_string(
+                checksum.into_reader(),
+                MAX_CHECKSUM_BYTES,
+                "checksum response too large",
+            )?;
             let expected = checksum
                 .split_whitespace()
                 .next()
@@ -2753,6 +2782,27 @@ mod tests {
         assert!(!version_gt("0.1.2", "0.1.3"));
         // Unparsable versions never trigger a downgrade.
         assert!(!version_gt("dev", "0.1.3"));
+    }
+
+    #[test]
+    fn limited_string_read_rejects_oversize_bodies() {
+        // A hostile mirror must not be able to exhaust memory through an
+        // unbounded checksum-sized response: bodies past the cap fail
+        // instead of buffering without limit.
+        let small = b"abcd1234  nostrfy\n".to_vec();
+        assert_eq!(
+            Cli::read_limited_string(small.as_slice(), 64, "too large").unwrap(),
+            "abcd1234  nostrfy\n"
+        );
+        let big = vec![b'x'; 65];
+        assert!(
+            Cli::read_limited_string(big.as_slice(), 64, "too large").is_err(),
+            "a body past the cap must fail"
+        );
+        assert!(
+            Cli::read_limited_string(vec![0xffu8].as_slice(), 64, "too large").is_err(),
+            "non-UTF-8 bodies must fail"
+        );
     }
 
     #[test]
