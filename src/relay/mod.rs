@@ -556,6 +556,18 @@ enum BufferedRoleMutation {
     RemovePubkey {
         pubkey: String,
     },
+    /// NIP-86 `createclaim` / `deleteclaim` (invite codes have no events
+    /// behind them, so the snapshot is their only persistence).
+    CreateClaim {
+        claim: String,
+    },
+    DeleteClaim {
+        claim: String,
+    },
+    /// A `kind:28934` join admitted by invite code.
+    AdmitMember {
+        pubkey: String,
+    },
 }
 
 /// Which derived stores a removal of stored events invalidates: a NIP-29
@@ -604,6 +616,15 @@ fn replay_role_mutation(store: &mut RoleStore, mutation: &BufferedRoleMutation) 
         }
         BufferedRoleMutation::RemovePubkey { pubkey } => {
             store.remove_pubkey(pubkey);
+        }
+        BufferedRoleMutation::CreateClaim { claim } => {
+            store.add_claim(claim);
+        }
+        BufferedRoleMutation::DeleteClaim { claim } => {
+            store.remove_claim(claim);
+        }
+        BufferedRoleMutation::AdmitMember { pubkey } => {
+            store.admit(pubkey);
         }
     }
 }
@@ -2209,6 +2230,29 @@ impl Relay {
                 self.stats.bump(&self.stats.events_duplicate, 1);
                 return PutOutcome::Duplicate(msg);
             }
+            crate::relay::validate::Precheck::Admit(msg) => {
+                // NIP-43 join by invite code (ephemeral, never stored):
+                // record the membership like a vanish records its removal
+                // (the access gates above are intentionally bypassed for
+                // the admission itself: the code is the authorization).
+                // The event pubkey was signature-verified before the
+                // precheck, so it names the joiner.
+                drop(cfg);
+                drop(access);
+                if !self.admit_member(&event.pubkey).await {
+                    // NIP-43 is disabled or the relay key is missing: the
+                    // membership was not recorded, so a welcome would lie.
+                    self.stats.bump(&self.stats.events_rejected, 1);
+                    return PutOutcome::Invalid(
+                        "error: membership could not be recorded; retry".into(),
+                    );
+                }
+                // Acknowledged without storing (the welcome text rides the
+                // duplicate-style ack): counted like the member-rejoin
+                // verdict below.
+                self.stats.bump(&self.stats.events_duplicate, 1);
+                return PutOutcome::Duplicate(msg);
+            }
             crate::relay::validate::Precheck::Vanish => {
                 // NIP-62: delete everything by this pubkey and never
                 // accept anything from it again. The access/rate/first-seen
@@ -2646,6 +2690,27 @@ impl Relay {
                 crate::relay::validate::Precheck::Duplicate(msg) => {
                     // Already stored: its id is a valid reference even
                     // though this reply is a duplicate.
+                    Self::insert_event_prefixes(&mut known_set, &id);
+                    self.stats.bump(&self.stats.events_duplicate, 1);
+                    results.push((id, PutOutcome::Duplicate(msg)));
+                    continue;
+                }
+                crate::relay::validate::Precheck::Admit(msg) => {
+                    // NIP-43 join by invite code: admit inline (the
+                    // membership mutation is idempotent, like the
+                    // single-event path above) and acknowledge without
+                    // storing the ephemeral request (welcome text rides
+                    // the duplicate-style ack).
+                    if !self.admit_member(&event.pubkey).await {
+                        self.stats.bump(&self.stats.events_rejected, 1);
+                        results.push((
+                            id,
+                            PutOutcome::Invalid(
+                                "error: membership could not be recorded; retry".into(),
+                            ),
+                        ));
+                        continue;
+                    }
                     Self::insert_event_prefixes(&mut known_set, &id);
                     self.stats.bump(&self.stats.events_duplicate, 1);
                     results.push((id, PutOutcome::Duplicate(msg)));

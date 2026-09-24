@@ -59,6 +59,12 @@ pub struct RoleStore {
     pub roles: HashMap<String, Role>,
     /// pubkey -> role ids.
     pub assignments: HashMap<String, Vec<String>>,
+    /// NIP-86 `createclaim` invite codes (NIP-43 PR #2408): a `kind:28934`
+    /// join request carrying a listed code admits its author. Codes have
+    /// no events behind them, so unlike roles/assignments they live only
+    /// in the snapshot — a disaster rebuild from events drops them
+    /// (fail-closed: joins are rejected until an admin recreates a code).
+    pub claims: std::collections::BTreeSet<String>,
 }
 
 /// The persistable NIP-43 role state (see the `ROLE` table).
@@ -66,6 +72,10 @@ pub struct RoleStore {
 pub(crate) struct RolesSnapshot {
     pub roles: HashMap<String, Role>,
     pub assignments: HashMap<String, Vec<String>>,
+    /// Invite codes (see [`RoleStore::claims`]). Absent in older
+    /// snapshots (serde default) means no codes.
+    #[serde(default)]
+    pub claims: std::collections::BTreeSet<String>,
     /// The database's state generation the snapshot was taken at (see
     /// `DbClient::state_stamp`): a restore must reject a snapshot stamped
     /// before the current generation, because it predates a removal of a
@@ -85,9 +95,12 @@ pub(crate) struct RolesSnapshot {
 impl RoleStore {
     /// Whether `pubkey` holds at least one role assignment.
     pub fn is_member_of(&self, pubkey: &str) -> bool {
-        self.assignments
-            .get(pubkey)
-            .is_some_and(|roles| !roles.is_empty())
+        // Membership is presence on the member list: a claim-admitted
+        // joiner carries no roles yet still appears in `kind:13534` and
+        // must get the `duplicate:` verdict on rejoin (every other entry
+        // is kept role-non-empty by the assign/unassign/delete cleanup,
+        // so this matches the old check on all existing states).
+        self.assignments.contains_key(pubkey)
     }
 
     /// Persisted snapshot of the role state (see the `ROLE` table).
@@ -95,6 +108,7 @@ impl RoleStore {
         RolesSnapshot {
             roles: self.roles.clone(),
             assignments: self.assignments.clone(),
+            claims: self.claims.clone(),
             // Filled by the persist path, which reads the database's
             // generation (`DbClient::state_stamp` and `DbClient::state_seq`).
             stamp: 0,
@@ -106,6 +120,7 @@ impl RoleStore {
     pub(crate) fn restore(&mut self, snap: RolesSnapshot) {
         self.roles = snap.roles;
         self.assignments = snap.assignments;
+        self.claims = snap.claims;
     }
 
     /// Whether a snapshot stamped `snapshot_stamp` still reflects the
@@ -206,6 +221,34 @@ impl RoleStore {
     /// when the pubkey was listed.
     pub fn remove_pubkey(&mut self, pubkey: &str) -> bool {
         self.assignments.remove(pubkey).is_some()
+    }
+
+    /// Maximum invite-code length accepted by NIP-86 `createclaim`: codes
+    /// persist in the roles snapshot, so an unbounded string must not
+    /// enter the store.
+    pub const MAX_CLAIM_LEN: usize = 128;
+
+    /// Stores an invite code. Returns false when it already existed
+    /// (idempotent success at the RPC layer).
+    pub fn add_claim(&mut self, claim: &str) -> bool {
+        self.claims.insert(claim.to_string())
+    }
+
+    /// Revokes an invite code. Returns false when no such code existed
+    /// (idempotent success at the RPC layer).
+    pub fn remove_claim(&mut self, claim: &str) -> bool {
+        self.claims.remove(claim)
+    }
+
+    /// Whether `claim` is a listed invite code.
+    pub fn has_claim(&self, claim: &str) -> bool {
+        self.claims.contains(claim)
+    }
+
+    /// Admits a claim-holder to the member list: an entry with no roles
+    /// yet (listed in `kind:13534`, counted by [`Self::is_member_of`]).
+    pub fn admit(&mut self, pubkey: &str) {
+        self.assignments.entry(pubkey.to_string()).or_default();
     }
 
     // ----- relay-generated events -----
@@ -493,6 +536,36 @@ mod tests {
             "empty assignments are dropped"
         );
         assert!(store.delete("king"));
+    }
+
+    #[test]
+    fn invite_claims_roundtrip_through_snapshot() {
+        // Invite codes live in the snapshot (they have no events behind
+        // them): add/remove/list plus snapshot/restore, and legacy
+        // snapshots without the field still load.
+        let mut store = RoleStore::default();
+        assert!(store.add_claim("welcome-1"));
+        assert!(!store.add_claim("welcome-1"), "re-adding reports no change");
+        assert!(store.has_claim("welcome-1"));
+        assert!(!store.has_claim("bogus"));
+        store.admit("abc");
+        assert!(
+            store.is_member_of("abc"),
+            "a claim-admitted joiner is a member"
+        );
+        let snap = store.snapshot();
+        let json = serde_json::to_string(&snap).unwrap();
+        let restored: RolesSnapshot = serde_json::from_str(&json).unwrap();
+        let mut fresh = RoleStore::default();
+        fresh.restore(restored);
+        assert!(fresh.has_claim("welcome-1"));
+        assert!(fresh.is_member_of("abc"));
+        assert!(fresh.remove_claim("welcome-1"));
+        assert!(
+            !fresh.remove_claim("welcome-1"),
+            "re-removal reports no change"
+        );
+        assert!(!fresh.has_claim("welcome-1"));
     }
 
     #[test]

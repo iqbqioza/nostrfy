@@ -20,6 +20,9 @@ pub(crate) enum Precheck {
     /// The event is acknowledged as a duplicate (OK true, not stored):
     /// NIP-43's example for a member's repeated join claim.
     Duplicate(String),
+    /// A NIP-43 join admitted by invite code (OK true with the welcome
+    /// message, not stored): the relay records the membership.
+    Admit(String),
     /// NIP-62: the event is a valid request to vanish. The relay records
     /// the pubkey permanently: every later event from it is rejected, even
     /// ones created after the request's `until_created` (see the vanish
@@ -166,13 +169,16 @@ impl super::Relay {
         if !access.allows_kind(event.kind) {
             return Precheck::Reject("blocked: kind not allowed".into());
         }
-        // NIP-43: join requests carry an invite code, which this relay
-        // never issues; every claim therefore fails (NIP-43 mandates an
-        // OK reply). A member who already belongs to the relay gets the
-        // spec's `duplicate:` verdict instead of a blanket refusal.
+        // NIP-43: join requests carry an invite code (NIP-43 PR #2408:
+        // codes are issued with NIP-86 `createclaim`). A member who
+        // already belongs to the relay gets the spec's `duplicate:`
+        // verdict; a listed code admits (the claim itself is never
+        // stored — kind 28934 is ephemeral); anything else is refused
+        // with the spec's `restricted:` wording. NIP-43 mandates an OK
+        // reply on every path.
         if cfg.nip_enabled(43) && event.kind == nip43::JOIN {
-            let is_member = self.roles.read().await.is_member_of(&event.pubkey);
-            if is_member {
+            let roles = self.roles.read().await;
+            if roles.is_member_of(&event.pubkey) {
                 // NIP-43: the spec's example replies OK `true` with the
                 // `duplicate:` prefix for a member's repeated claim (the
                 // claim itself is never stored — kind 28934 is ephemeral).
@@ -180,7 +186,15 @@ impl super::Relay {
                     "duplicate: you are already a member of this relay".into(),
                 );
             }
-            return Precheck::Reject("restricted: this relay does not issue invite codes".into());
+            let code = event
+                .tags
+                .iter()
+                .find(|t| t.len() >= 2 && t[0] == "claim")
+                .map(|t| t[1].as_str());
+            if code.is_some_and(|code| roles.has_claim(code)) {
+                return Precheck::Admit("info: welcome to this relay!".into());
+            }
+            return Precheck::Reject("restricted: that is an invalid invite code.".into());
         }
         // NIP-29: group action events MUST carry an `h` tag naming a
         // non-empty group id (an empty id would create a phantom group
@@ -1493,11 +1507,13 @@ mod tests {
                 ),
                 "a member's repeated claim must be OK true with the duplicate: prefix: {outcome:?}"
             );
-            // A non-member's claim is refused (this relay issues no invites).
+            // A non-member's claim without a listed code is refused with
+            // the spec's wording (invite codes are issued with NIP-86
+            // `createclaim`).
             let stranger = signed_with_seed(10u8, crate::nips::nip43::JOIN, vec![]);
             let outcome = relay.accept_event(stranger, &[], None).await;
             assert!(
-                matches!(&outcome, crate::db::PutOutcome::Invalid(reason) if reason.contains("invite codes")),
+                matches!(&outcome, crate::db::PutOutcome::Invalid(reason) if reason.contains("invalid invite code")),
                 "a non-member claim is refused: {outcome:?}"
             );
             relay.db.shutdown();

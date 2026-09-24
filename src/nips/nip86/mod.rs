@@ -61,6 +61,38 @@ const SUPPORTED_METHODS: &[&str] = &[
     "deleterole",
     "assignrole",
     "unassignrole",
+    "assignmethod",
+    "unassignmethod",
+    "listmethodassignees",
+    "blockip",
+    "unblockip",
+    "listblockedips",
+    "banevent",
+    "allowevent",
+    "listbannedevents",
+    "listeventsneedingmoderation",
+    "listclaims",
+    "createclaim",
+    "deleteclaim",
+];
+
+/// Methods a non-admin pubkey may be granted through NIP-86 PR #2439
+/// `assignmethod`: the moderation verbs plus the read-only lists.
+/// `supportedmethods` is implicitly available to every authenticated
+/// caller (it shows their own subset), so it is not a grant target.
+/// Everything else — permission management itself, role and
+/// invite-claim management, and the relay identity — stays admin-only,
+/// so a grantee can never escalate.
+const GRANTABLE_METHODS: &[&str] = &[
+    "banpubkey",
+    "unbanpubkey",
+    "listbannedpubkeys",
+    "allowpubkey",
+    "unallowpubkey",
+    "listallowedpubkeys",
+    "allowkind",
+    "disallowkind",
+    "listallowedkinds",
     "blockip",
     "unblockip",
     "listblockedips",
@@ -131,6 +163,43 @@ fn check_role_id(id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Validates a NIP-43 invite code for `createclaim` / `deleteclaim`:
+/// non-empty, within the store bound, and free of control characters
+/// (codes persist in the roles snapshot and are echoed in `listclaims`).
+fn check_claim(claim: &str) -> anyhow::Result<()> {
+    if claim.is_empty() {
+        return Err(anyhow!("claim must not be empty"));
+    }
+    if claim.chars().count() > crate::nips::nip43::RoleStore::MAX_CLAIM_LEN {
+        return Err(anyhow!(
+            "claim exceeds the maximum of {} characters",
+            crate::nips::nip43::RoleStore::MAX_CLAIM_LEN
+        ));
+    }
+    if claim.chars().any(|c| c.is_control()) {
+        return Err(anyhow!("claim must not contain control characters"));
+    }
+    Ok(())
+}
+
+/// Refuses a grantee at an admin-only method. The per-method gate above
+/// already refused grantees (grants can never name these methods), so
+/// this is defense in depth against a future `GRANTABLE_METHODS`
+/// expansion mistake.
+fn require_admin(identity: &Identity) -> Option<Response> {
+    if identity.is_admin() {
+        None
+    } else {
+        Some(
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "unauthorized" })),
+            )
+                .into_response(),
+        )
+    }
+}
+
 fn rpc_ok(result: Value) -> Response {
     (StatusCode::OK, Json(json!({ "result": result }))).into_response()
 }
@@ -197,13 +266,36 @@ pub async fn rpc_handler(
     let params = request.get("params").and_then(Value::as_array).cloned();
     let params = params.as_deref().unwrap_or(&[]);
 
+    // Non-admin identities are gated per method (NIP-86 PR #2439): only
+    // `assignmethod`-granted methods run, plus `supportedmethods` (every
+    // authenticated caller may discover their own subset). Admins bypass
+    // every check — `admin_pubkey` (and the management token) stay the
+    // root login.
+    if !identity.is_admin()
+        && method != "supportedmethods"
+        && !relay
+            .access
+            .read()
+            .await
+            .grants_method(identity.name(), method)
+    {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "unauthorized" })),
+        )
+            .into_response();
+    }
+
     match method {
-        // NIP-86: the result lists "all the OTHER supported methods".
+        // NIP-86: the result lists "all the OTHER supported methods" —
+        // customized to the caller's grants for grantees.
         "supportedmethods" => {
+            let access = relay.access.read().await;
             let others: Vec<&str> = SUPPORTED_METHODS
                 .iter()
                 .copied()
                 .filter(|m| *m != "supportedmethods")
+                .filter(|m| identity.is_admin() || access.grants_method(identity.name(), m))
                 .collect();
             rpc_ok(json!(others))
         }
@@ -622,6 +714,96 @@ pub async fn rpc_handler(
                 ),
             }
         }
+        "assignmethod" => {
+            if let Some(denied) = require_admin(&identity) {
+                return denied;
+            }
+            let (Some(pubkey), Some(method)) = (
+                params.first().and_then(Value::as_str),
+                params.get(1).and_then(Value::as_str),
+            ) else {
+                return rpc_err("invalid params");
+            };
+            if !is_pubkey(pubkey) {
+                return rpc_err("invalid pubkey");
+            }
+            // Normalize like the other pubkey arms: the grant check is
+            // case-insensitive, but the stored form stays canonical.
+            let pubkey = pubkey.to_ascii_lowercase();
+            if !GRANTABLE_METHODS.contains(&method) {
+                return rpc_err(
+                    "invalid method: only moderation, read and discovery methods can be granted",
+                );
+            }
+            {
+                let op = crate::config::AccessOp::GrantMethod {
+                    pubkey: pubkey.clone(),
+                    method: method.to_string(),
+                };
+                let mut access = relay.access.write().await;
+                crate::config::apply_access_op(&mut access, &op);
+                relay.push_access_ops(vec![op]);
+            }
+            // Same contract as the neighboring mutations: the in-memory
+            // grant is live even when persistence fails, so it is still
+            // audited; the RPC reports the persistence error.
+            let persisted = relay.persist_access().await;
+            audit!(&relay, &identity, "assignmethod", params);
+            if !persisted {
+                return rpc_err("error: cannot persist the access control state");
+            }
+            rpc_ok(json!([true, format!("granted {method} to {pubkey}")]))
+        }
+        "unassignmethod" => {
+            if let Some(denied) = require_admin(&identity) {
+                return denied;
+            }
+            let (Some(pubkey), Some(method)) = (
+                params.first().and_then(Value::as_str),
+                params.get(1).and_then(Value::as_str),
+            ) else {
+                return rpc_err("invalid params");
+            };
+            if !is_pubkey(pubkey) {
+                return rpc_err("invalid pubkey");
+            }
+            let pubkey = pubkey.to_ascii_lowercase();
+            // Revoking an absent grant is a no-op success (like the other
+            // removal methods); an ungrantable name is still rejected so
+            // typos surface instead of silently succeeding.
+            if !GRANTABLE_METHODS.contains(&method) {
+                return rpc_err(
+                    "invalid method: only moderation, read and discovery methods can be granted",
+                );
+            }
+            {
+                let op = crate::config::AccessOp::UngrantMethod {
+                    pubkey: pubkey.clone(),
+                    method: method.to_string(),
+                };
+                let mut access = relay.access.write().await;
+                crate::config::apply_access_op(&mut access, &op);
+                relay.push_access_ops(vec![op]);
+            }
+            let persisted = relay.persist_access().await;
+            audit!(&relay, &identity, "unassignmethod", params);
+            if !persisted {
+                return rpc_err("error: cannot persist the access control state");
+            }
+            rpc_ok(json!([true, format!("revoked {method} from {pubkey}")]))
+        }
+        "listmethodassignees" => {
+            if let Some(denied) = require_admin(&identity) {
+                return denied;
+            }
+            let access = relay.access.read().await;
+            let list: Vec<Value> = access
+                .method_grants
+                .iter()
+                .map(|(pubkey, methods)| json!({ "pubkey": pubkey, "methods": methods }))
+                .collect();
+            rpc_ok(json!(list))
+        }
         "blockip" => {
             let (Some(ip), reason) = (
                 params.first().and_then(Value::as_str),
@@ -767,6 +949,50 @@ pub async fn rpc_handler(
             // This relay has no moderation queue: no events await review.
             rpc_ok(json!([]))
         }
+        "listclaims" => {
+            if let Some(denied) = require_admin(&identity) {
+                return denied;
+            }
+            // Invite codes admit members: listing them is admin-only.
+            let roles = relay.roles.read().await;
+            let list: Vec<&str> = roles.claims.iter().map(String::as_str).collect();
+            rpc_ok(json!(list))
+        }
+        "createclaim" => {
+            if let Some(denied) = require_admin(&identity) {
+                return denied;
+            }
+            let Some(claim) = params.first().and_then(Value::as_str) else {
+                return rpc_err("invalid params");
+            };
+            if let Err(e) = check_claim(claim) {
+                return rpc_err(&e.to_string());
+            }
+            if relay.create_claim(claim).await {
+                audit!(&relay, &identity, "createclaim", params);
+                rpc_ok(json!(true))
+            } else {
+                rpc_err("restricted: NIP-43 is disabled or the relay key is missing")
+            }
+        }
+        "deleteclaim" => {
+            if let Some(denied) = require_admin(&identity) {
+                return denied;
+            }
+            let Some(claim) = params.first().and_then(Value::as_str) else {
+                return rpc_err("invalid params");
+            };
+            if let Err(e) = check_claim(claim) {
+                return rpc_err(&e.to_string());
+            }
+            // Revoking an absent code is a no-op success.
+            if relay.delete_claim(claim).await {
+                audit!(&relay, &identity, "deleteclaim", params);
+                rpc_ok(json!(true))
+            } else {
+                rpc_err("restricted: NIP-43 is disabled or the relay key is missing")
+            }
+        }
         _ => rpc_err("unsupported method"),
     }
 }
@@ -820,11 +1046,43 @@ fn ct_eq(a: &str, b: &str) -> bool {
     diff == 0
 }
 
+/// Who called the NIP-86 RPC: a full administrator (the management
+/// token or the configured admin pubkey, bypassing every per-method
+/// check) or a pubkey holding `assignmethod` grants (gated per call).
+/// `admin_pubkey` stays the root login; other users are controlled
+/// within their granted method scope.
+enum Identity {
+    Admin(String),
+    Grantee(String),
+}
+
+impl Identity {
+    fn name(&self) -> &str {
+        match self {
+            Identity::Admin(name) | Identity::Grantee(name) => name,
+        }
+    }
+
+    fn is_admin(&self) -> bool {
+        matches!(self, Identity::Admin(_))
+    }
+}
+
+impl std::fmt::Display for Identity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
 /// NIP-86 authentication: either the bearer `management_token` or a NIP-98
 /// event by `admin_pubkey` whose `payload` tag is present and whose `u` tag
 /// matches this relay's URL, including the request path and query
 /// (NIP-98: "the `u` tag MUST be exactly the same as the absolute request
 /// URL"; the scheme is normalized so TLS-terminating proxies keep working).
+/// Otherwise any valid NIP-98 identity is admitted as a grantee: the
+/// signature, `u`, `method`, `payload` and replay checks are identical —
+/// only the pubkey restriction is lifted — and the per-method gate below
+/// decides. A banned pubkey is refused on every authenticated service.
 /// Returns the identity for the audit trail: the NIP-98 pubkey or
 /// `"management-token"`.
 async fn rpc_authenticated(
@@ -832,7 +1090,7 @@ async fn rpc_authenticated(
     headers: &HeaderMap,
     uri: &axum::http::Uri,
     body: &str,
-) -> Option<String> {
+) -> Option<Identity> {
     let cfg = relay.config.read().await;
     if !cfg.rpc.management_token.is_empty()
         && let Some(token) = headers
@@ -841,19 +1099,21 @@ async fn rpc_authenticated(
             .and_then(strip_bearer_scheme)
         && ct_eq(token, &cfg.rpc.management_token)
     {
-        return Some("management-token".into());
+        return Some(Identity::Admin("management-token".into()));
     }
+    let payload = nip98::payload_sha256_hex(body.as_bytes());
+    // Full administrator: the configured admin pubkey.
     if !cfg.rpc.admin_pubkey.is_empty()
-        && let Some(auth) = headers
+        && let Some(encoded) = headers
             .get(header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
             .and_then(nip98::strip_nostr_scheme)
         && let Some(verified) = nip98::verify(
-            auth,
+            encoded,
             Some(&cfg.rpc.admin_pubkey),
             relay.secp(),
             true,
-            Some(&nip98::payload_sha256_hex(body.as_bytes())),
+            Some(&payload),
             "POST",
             |url| nip98::matches_request_url(url, &cfg.relay_identity(), uri.path(), uri.query()),
         )
@@ -861,7 +1121,36 @@ async fn rpc_authenticated(
             .nip98_replay
             .accept(&verified.id, crate::util::unix_now())
     {
-        return Some(verified.pubkey);
+        return Some(Identity::Admin(verified.pubkey));
+    }
+    // Grantee: any other valid NIP-98 identity (the admin attempt above
+    // short-circuits before consuming the replay on a pubkey mismatch, so
+    // a fresh event still verifies here). A banned pubkey is refused.
+    if let Some(encoded) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(nip98::strip_nostr_scheme)
+        && let Some(verified) = nip98::verify(
+            encoded,
+            None,
+            relay.secp(),
+            true,
+            Some(&payload),
+            "POST",
+            |url| nip98::matches_request_url(url, &cfg.relay_identity(), uri.path(), uri.query()),
+        )
+        && relay
+            .nip98_replay
+            .accept(&verified.id, crate::util::unix_now())
+        && !relay
+            .access
+            .read()
+            .await
+            .blocked_pubkeys
+            .iter()
+            .any(|(banned, _)| banned.eq_ignore_ascii_case(&verified.pubkey))
+    {
+        return Some(Identity::Grantee(verified.pubkey));
     }
     None
 }
@@ -952,6 +1241,70 @@ mod tests {
         assert_eq!(strip_bearer_scheme("Nostr tok"), None);
         assert_eq!(strip_bearer_scheme("Bearer"), None);
         assert_eq!(strip_bearer_scheme(""), None);
+    }
+
+    /// Calls the RPC as a non-admin pubkey with a fresh NIP-98 signature
+    /// (the grantee path: `u` = this endpoint, `method` = POST, payload =
+    /// the body hash). A per-call salt param keeps the body (and therefore
+    /// the auth event id) unique: the relay's 60-second replay guard would
+    /// otherwise reject two identical calls in the same second, and the
+    /// tested arms ignore trailing params. Returns the keypair's pubkey
+    /// with the response.
+    async fn nip98_call(
+        relay: &std::sync::Arc<Relay>,
+        seckey: &[u8; 32],
+        method: &str,
+        params: Vec<Value>,
+    ) -> (String, Response) {
+        use base64::Engine as _;
+        static SALT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let mut params = params;
+        params.push(json!(
+            SALT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let secp = secp256k1::Secp256k1::new();
+        let keypair = secp256k1::Keypair::from_seckey_slice(&secp, seckey).unwrap();
+        let pubkey = secp256k1::XOnlyPublicKey::from_keypair(&keypair)
+            .0
+            .to_string();
+        let body = serde_json::to_string(&json!({ "method": method, "params": params })).unwrap();
+        let origin = relay.config.read().await.relay_identity().http_origin();
+        let mut ev = crate::event::Event {
+            id: String::new(),
+            pubkey: pubkey.clone(),
+            created_at: crate::util::unix_now(),
+            kind: crate::nips::nip98::AUTH_KIND,
+            tags: vec![
+                vec!["u".into(), format!("{origin}/")],
+                vec!["method".into(), "POST".into()],
+                vec![
+                    "payload".into(),
+                    crate::nips::nip98::payload_sha256_hex(body.as_bytes()),
+                ],
+            ],
+            content: String::new(),
+            sig: String::new(),
+        };
+        ev.id = crate::nips::nip01::compute_id(&ev);
+        let id = ev.id_bytes().unwrap();
+        ev.sig = secp.sign_schnorr_no_aux_rand(&id, &keypair).to_string();
+        let encoded =
+            base64::engine::general_purpose::STANDARD.encode(serde_json::to_string(&ev).unwrap());
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            format!("Nostr {encoded}").parse().unwrap(),
+        );
+        headers.insert(header::CONTENT_TYPE, RPC_CONTENT_TYPE.parse().unwrap());
+        let resp = rpc_handler(
+            State(relay.clone()),
+            axum::extract::ConnectInfo("127.0.0.1:1234".parse().unwrap()),
+            axum::http::Uri::from_static("/"),
+            headers,
+            body,
+        )
+        .await;
+        (pubkey, resp)
     }
 
     #[tokio::test]
@@ -1709,6 +2062,260 @@ mod tests {
         assert!(
             rpc_ok_of(resp).await,
             "a repeat revocation must still report true"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn method_grants_scope_non_admin_callers() {
+        // NIP-86 PR #2439: `admin_pubkey` stays the root login; other
+        // pubkeys only run their granted methods. `assignmethod` validates
+        // its target, grants are idempotent, ungranted calls 401, and
+        // `supportedmethods` shows the grantee only their subset.
+        let relay = build_admin_relay().await;
+        let agent = [11u8; 32];
+        let (agent_pk, resp) = nip98_call(&relay, &agent, "listbannedevents", vec![]).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "an ungranted pubkey calls nothing"
+        );
+        // Only grantable methods can be granted.
+        let resp = rpc_call(
+            &relay,
+            "assignmethod",
+            vec![json!(agent_pk), json!("createrole")],
+        )
+        .await;
+        assert!(rpc_err_of(resp).await.contains("invalid method"));
+        let resp = rpc_call(
+            &relay,
+            "assignmethod",
+            vec![json!(agent_pk), json!("no-such-method")],
+        )
+        .await;
+        assert!(rpc_err_of(resp).await.contains("invalid method"));
+        let resp = rpc_call(&relay, "assignmethod", vec![json!("zz"), json!("banevent")]).await;
+        assert!(rpc_err_of(resp).await.contains("pubkey"));
+        // Grant + idempotent re-grant: the PR's `[true, message]` shape.
+        let resp = rpc_call(
+            &relay,
+            "assignmethod",
+            vec![json!(agent_pk.clone()), json!("banevent")],
+        )
+        .await;
+        let granted = rpc_result_of(resp).await;
+        assert_eq!(granted[0], true);
+        let resp = rpc_call(
+            &relay,
+            "assignmethod",
+            vec![json!(agent_pk.clone()), json!("banevent")],
+        )
+        .await;
+        assert_eq!(rpc_result_of(resp).await[0], true);
+        let resp = rpc_call(
+            &relay,
+            "assignmethod",
+            vec![json!(agent_pk.clone()), json!("listbannedevents")],
+        )
+        .await;
+        assert_eq!(rpc_result_of(resp).await[0], true);
+        // The grantee runs the granted methods…
+        let (_, resp) = nip98_call(&relay, &agent, "listbannedevents", vec![]).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        // …but nothing else, including the permission methods themselves.
+        let (_, resp) = nip98_call(&relay, &agent, "listbannedpubkeys", vec![]).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let (_, resp) = nip98_call(
+            &relay,
+            &agent,
+            "assignmethod",
+            vec![json!(agent_pk), json!("banevent")],
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "a grantee must never escalate"
+        );
+        // Discovery shows the subset only.
+        let (_, resp) = nip98_call(&relay, &agent, "supportedmethods", vec![]).await;
+        let list = rpc_result_of(resp).await;
+        let list = list.as_array().unwrap();
+        assert!(list.iter().any(|m| m == "banevent"));
+        assert!(!list.iter().any(|m| m == "assignmethod"));
+        assert!(!list.iter().any(|m| m == "supportedmethods"));
+        // Admins still see everything.
+        let admin_list = rpc_result_of(rpc_call(&relay, "supportedmethods", vec![]).await).await;
+        assert!(
+            admin_list
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m == "assignmethod")
+        );
+        // listmethodassignees reports the grant (admin-only).
+        let reported = rpc_result_of(rpc_call(&relay, "listmethodassignees", vec![]).await).await;
+        assert_eq!(reported[0]["pubkey"], agent_pk);
+        assert_eq!(
+            reported[0]["methods"],
+            json!(["banevent", "listbannedevents"])
+        );
+        let (_, resp) = nip98_call(&relay, &agent, "listmethodassignees", vec![]).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        // Revoke: the grants disappear, calls 401 again (idempotent).
+        let resp = rpc_call(
+            &relay,
+            "unassignmethod",
+            vec![json!(agent_pk.clone()), json!("banevent")],
+        )
+        .await;
+        assert_eq!(rpc_result_of(resp).await[0], true);
+        let resp = rpc_call(
+            &relay,
+            "unassignmethod",
+            vec![json!(agent_pk.clone()), json!("banevent")],
+        )
+        .await;
+        assert_eq!(rpc_result_of(resp).await[0], true);
+        let resp = rpc_call(
+            &relay,
+            "unassignmethod",
+            vec![json!(agent_pk.clone()), json!("listbannedevents")],
+        )
+        .await;
+        assert_eq!(rpc_result_of(resp).await[0], true);
+        let (_, resp) = nip98_call(&relay, &agent, "listbannedevents", vec![]).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            rpc_result_of(rpc_call(&relay, "listmethodassignees", vec![]).await)
+                .await
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn banned_grantee_is_refused() {
+        // A banned pubkey is refused on every authenticated service: a
+        // grant does not override a ban.
+        let relay = build_admin_relay().await;
+        let agent = [12u8; 32];
+        let (agent_pk, _) = nip98_call(&relay, &agent, "supportedmethods", vec![]).await;
+        let resp = rpc_call(
+            &relay,
+            "assignmethod",
+            vec![json!(agent_pk.clone()), json!("listbannedevents")],
+        )
+        .await;
+        assert_eq!(rpc_result_of(resp).await[0], true);
+        let _ = rpc_call(&relay, "banpubkey", vec![json!(agent_pk.clone())]).await;
+        let (_, resp) = nip98_call(&relay, &agent, "listbannedevents", vec![]).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "a banned grantee must be refused"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn invite_claims_roundtrip_and_admit() {
+        // NIP-86 PR #2408 + NIP-43: `createclaim` issues codes,
+        // `listclaims` shows them (admin-only), `deleteclaim` revokes,
+        // and a `kind:28934` carrying a listed code admits its author.
+        let relay = build_admin_relay_with_key(Some(&"cd".repeat(32))).await;
+        // Validation first.
+        let resp = rpc_call(&relay, "createclaim", vec![]).await;
+        assert!(rpc_err_of(resp).await.contains("params"));
+        let resp = rpc_call(&relay, "createclaim", vec![json!("")]).await;
+        assert!(rpc_err_of(resp).await.contains("empty"));
+        // Issue + idempotent re-issue.
+        let resp = rpc_call(&relay, "createclaim", vec![json!("welcome-1")]).await;
+        assert!(rpc_ok_of(resp).await);
+        let resp = rpc_call(&relay, "createclaim", vec![json!("welcome-1")]).await;
+        assert!(rpc_ok_of(resp).await);
+        let listed = rpc_result_of(rpc_call(&relay, "listclaims", vec![]).await).await;
+        assert_eq!(listed, json!(["welcome-1"]));
+        // A join with the code is admitted (OK true, welcome).
+        let secp = secp256k1::Secp256k1::new();
+        let keypair = secp256k1::Keypair::from_seckey_slice(&secp, &[21u8; 32]).unwrap();
+        let pubkey = secp256k1::XOnlyPublicKey::from_keypair(&keypair)
+            .0
+            .to_string();
+        let join = || crate::event::Event {
+            id: String::new(),
+            pubkey: pubkey.clone(),
+            created_at: crate::util::unix_now(),
+            kind: crate::nips::nip43::JOIN,
+            tags: vec![vec!["-".into()], vec!["claim".into(), "welcome-1".into()]],
+            content: String::new(),
+            sig: String::new(),
+        };
+        let mut ev = join();
+        ev.id = crate::nips::nip01::compute_id(&ev);
+        let id = ev.id_bytes().unwrap();
+        ev.sig = secp.sign_schnorr_no_aux_rand(&id, &keypair).to_string();
+        assert!(
+            matches!(
+                relay.accept_event(ev, std::slice::from_ref(&pubkey), None).await,
+                crate::db::PutOutcome::Duplicate(msg) if msg.starts_with("info:")
+            ),
+            "a valid claim admits the joiner with a welcome"
+        );
+        assert!(
+            relay.roles.read().await.is_member_of(&pubkey),
+            "the joiner is recorded on the member list"
+        );
+        // Rejoin with the same code: the spec's `duplicate:` verdict.
+        let mut ev = join();
+        ev.id = crate::nips::nip01::compute_id(&ev);
+        let id = ev.id_bytes().unwrap();
+        ev.sig = secp.sign_schnorr_no_aux_rand(&id, &keypair).to_string();
+        assert!(
+            matches!(
+                relay.accept_event(ev, std::slice::from_ref(&pubkey), None).await,
+                crate::db::PutOutcome::Duplicate(msg) if msg.starts_with("duplicate:")
+            ),
+            "a member rejoining gets the duplicate verdict"
+        );
+        // A bogus code is refused with the spec's wording.
+        let other = secp256k1::Keypair::from_seckey_slice(&secp, &[22u8; 32]).unwrap();
+        let other_pk = secp256k1::XOnlyPublicKey::from_keypair(&other)
+            .0
+            .to_string();
+        let mut ev = crate::event::Event {
+            id: String::new(),
+            pubkey: other_pk.clone(),
+            created_at: crate::util::unix_now(),
+            kind: crate::nips::nip43::JOIN,
+            tags: vec![vec!["-".into()], vec!["claim".into(), "bogus".into()]],
+            content: String::new(),
+            sig: String::new(),
+        };
+        ev.id = crate::nips::nip01::compute_id(&ev);
+        let id = ev.id_bytes().unwrap();
+        ev.sig = secp.sign_schnorr_no_aux_rand(&id, &other).to_string();
+        assert!(
+            matches!(
+                relay.accept_event(ev, std::slice::from_ref(&other_pk), None).await,
+                crate::db::PutOutcome::Invalid(msg) if msg.starts_with("restricted:")
+            ),
+            "an unknown code is refused"
+        );
+        // Revoke + idempotent re-revoke; joins fail again.
+        let resp = rpc_call(&relay, "deleteclaim", vec![json!("welcome-1")]).await;
+        assert!(rpc_ok_of(resp).await);
+        let resp = rpc_call(&relay, "deleteclaim", vec![json!("welcome-1")]).await;
+        assert!(rpc_ok_of(resp).await);
+        assert!(
+            rpc_result_of(rpc_call(&relay, "listclaims", vec![]).await)
+                .await
+                .as_array()
+                .unwrap()
+                .is_empty()
         );
         relay.db.shutdown();
     }

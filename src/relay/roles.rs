@@ -341,6 +341,97 @@ impl super::Relay {
         outcome
     }
 
+    /// NIP-86 `createclaim`: stores an invite code. Invite codes have no
+    /// events behind them, so the debounced roles snapshot is their only
+    /// persistence (a crash before it lands loses the code — fail-closed,
+    /// and creation is idempotent, so the admin retries). Returns false
+    /// only when NIP-43 is disabled or the relay key is missing.
+    pub async fn create_claim(&self, claim: &str) -> bool {
+        if !self.config.read().await.nip_enabled(43) || self.key.is_none() {
+            return false;
+        }
+        let added = self
+            .mutate_roles(
+                super::BufferedRoleMutation::CreateClaim {
+                    claim: claim.to_string(),
+                },
+                |roles| {
+                    let added = roles.add_claim(claim);
+                    (added, added)
+                },
+            )
+            .await;
+        if added {
+            self.schedule_roles_persist();
+        }
+        true
+    }
+
+    /// NIP-86 `deleteclaim`: revokes an invite code. Revoking an absent
+    /// code is a no-op success. Returns false only when NIP-43 is disabled
+    /// or the relay key is missing.
+    pub async fn delete_claim(&self, claim: &str) -> bool {
+        if !self.config.read().await.nip_enabled(43) || self.key.is_none() {
+            return false;
+        }
+        let removed = self
+            .mutate_roles(
+                super::BufferedRoleMutation::DeleteClaim {
+                    claim: claim.to_string(),
+                },
+                |roles| {
+                    let removed = roles.remove_claim(claim);
+                    (removed, removed)
+                },
+            )
+            .await;
+        if removed {
+            self.schedule_roles_persist();
+        }
+        true
+    }
+
+    /// Admits a `kind:28934` join by invite code: records the membership,
+    /// schedules the snapshot persist, and republishes the member list
+    /// with an add-user event (NIP-43 SHOULD + MAY). Returns false only
+    /// when NIP-43 is disabled or the relay key is missing (the caller
+    /// reports a retryable error instead of a false welcome).
+    pub(crate) async fn admit_member(&self, pubkey: &str) -> bool {
+        if !self.config.read().await.nip_enabled(43) || self.key.is_none() {
+            return false;
+        }
+        let added = self
+            .mutate_roles(
+                super::BufferedRoleMutation::AdmitMember {
+                    pubkey: pubkey.to_string(),
+                },
+                |roles| {
+                    if roles.assignments.contains_key(pubkey) {
+                        (false, false)
+                    } else {
+                        roles.admit(pubkey);
+                        (true, true)
+                    }
+                },
+            )
+            .await;
+        if added {
+            self.schedule_roles_persist();
+            // A failed republish is logged, not fatal: the membership is
+            // recorded and the next change republishes the full list (same
+            // contract as the leave path).
+            if !self
+                .publish_membership(Some((true, pubkey.to_string())))
+                .await
+            {
+                log::warn!(
+                    "admit_member: the membership list could not be republished; {pubkey} may be missing from kind 13534 until the next change"
+                );
+            }
+        }
+        true
+    }
+
     /// NIP-43 leave request: removes the user from the member list and
     /// republishes it with a remove-user event.
     pub(crate) async fn apply_leave_request(&self, event: &Event) {
