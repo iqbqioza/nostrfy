@@ -4857,6 +4857,19 @@ fn event_meta_rebuilds_from_stored_events() {
 }
 
 #[test]
+fn rebuild_event_meta_refuses_full_disk() {
+    // Like its sibling rebuilds, the metadata backfill must fail with a
+    // clean error below the free-space margin instead of committing into
+    // a full disk (which raises SIGBUS and kills the process).
+    let expiry = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let store = crate::db::store::Store::open(&config(), expiry, 128).unwrap();
+    store
+        .disk_full_override
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(store.rebuild_event_meta().is_err());
+}
+
+#[test]
 fn gift_wrap_index_backfills_legacy_wraps() {
     let expiry = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let store = crate::db::store::Store::open(&config(), expiry, 128).unwrap();

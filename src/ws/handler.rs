@@ -1089,8 +1089,13 @@ impl super::Conn {
             // lists, so the lists cannot apply to them: they always read.
             return true;
         }
-        self.authed_pubkeys.iter().any(|pk| {
-            !access
+        // Deny when ANY authenticated key is blocked (fail closed): the
+        // per-event visibility checks union over every authenticated key,
+        // so allowing on any-clean-key would serve the banned key's
+        // private content (its gift wraps, owned application data and
+        // group memberships) to a holder pairing it with a fresh key.
+        !self.authed_pubkeys.iter().any(|pk| {
+            access
                 .blocked_pubkeys
                 .iter()
                 .any(|(p, _)| p.eq_ignore_ascii_case(pk))
