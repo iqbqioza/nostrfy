@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="How to Open a Door: a short, practical guide for anyone standing in front of one. Updated daily with timeless door wisdom.">
+<meta name="keywords" content="door, how to open a door, doors, guide, daily guide">
+<meta property="og:type" content="website">
+<meta property="og:title" content="How to Open a Door - Daily Door Guide">
+<meta property="og:description" content="A short, practical guide for anyone standing in front of a door.">
+<meta name="twitter:card" content="summary">
+<title>How to Open a Door - Daily Door Guide</title>
+<script type="application/ld+json">
+{"@context": "https://schema.org", "@type": "HowTo", "name": "How to Open a Door",
+ "description": "A short guide for anyone standing in front of a door.",
+ "step": [
+  {"@type": "HowToStep", "text": "Open the Door opener's toolkit below."},
+  {"@type": "HowToStep", "text": "Press the Copy button."},
+  {"@type": "HowToStep", "text": "Paste it into a certain application of yours."},
+  {"@type": "HowToStep", "text": "Congratulations. The door is now open."}
+ ]}
+</script>
+<style>
+body { font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans", sans-serif; color: #333; margin: 0; padding: 12px 16px; max-width: 600px; line-height: 1.6; }
+h1 { font-size: 1.4em; }
+li { margin: 0.5em 0; }
+img { max-width: 100%; height: auto; }
+input, button { font-family: inherit; font-size: 1rem; padding: 0.5em 0.75em; }
+input { width: 100%; max-width: 420px; box-sizing: border-box; margin-bottom: 0.5em; }
+summary {
+  display: inline-block;
+  cursor: pointer;
+  font-weight: bold;
+  text-decoration: underline;
+  text-decoration-color: #E1306C;
+  text-underline-offset: 3px;
+  background: linear-gradient(45deg, #405DE6, #5851DB, #833AB4, #C13584, #E1306C, #FD1D1D, #FCB045);
+  background-size: 300% 300%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  -webkit-text-fill-color: transparent;
+  animation: gradient-shift 6s ease infinite;
+}
+@keyframes gradient-shift {
+  0% { background-position: 0% 50%; }
+  50% { background-position: 100% 50%; }
+  100% { background-position: 0% 50%; }
+}
+@media (max-width: 480px) {
+  body { padding: 8px 12px; }
+  h1 { font-size: 1.2em; }
+}
+</style>
+</head>
+<body>
+<p><img id="robot" alt="robot" width="120" height="120"></p>
+<h1>How to Open a Door</h1>
+<p>A short guide for anyone standing in front of one.</p>
+<ol>
+<li>Open the "Door opener's toolkit" below.</li>
+<li>Press the Copy button.</li>
+<li>Paste it into a certain application of yours.</li>
+<li>Congratulations. The door is now open.</li>
+</ol>
+<details>
+<summary>Door opener's toolkit</summary>
+<p>
+<input id="relay-url" readonly size="40">
+<button id="copy-url" type="button">Copy</button>
+</p>
+</details>
+<h2>About this guide</h2>
+<p>Door opening is a timeless skill. People have opened doors for thousands of years, and this guide collects the essential technique in one place so that no one is ever stuck in front of one again.</p>
+<h2>Frequently asked questions</h2>
+<h3>Push or pull?</h3>
+<p>Yes.</p>
+<h3>What if the door has no handle?</h3>
+<p>Congratulations, you have found a wall. There is no step for that.</p>
+<h3>What about sliding doors?</h3>
+<p>Slide it. If it does not slide, see the wall answer above.</p>
+<h3>Do I really have to close it?</h3>
+<p>Only if you enjoy heating the outdoors.</p>
+<script>
+document.getElementById("robot").src =
+  "https://robohash.org/" + encodeURIComponent(location.hostname) + ".png?size=200x200";
+(function () {
+  // Assembled at runtime so the address never appears in this page.
+  var secure = location.protocol === "https:";
+  var scheme = String.fromCharCode.apply(null, secure ? [119, 115, 115] : [119, 115]);
+  var url = scheme + "://" + location.host + "/";
+  var field = document.getElementById("relay-url");
+  field.value = url;
+  document.getElementById("copy-url").addEventListener("click", function () {
+    function done() {
+      field.select();
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(url).then(done, function () { field.select(); });
+    } else {
+      field.select();
+      try { document.execCommand("copy"); } catch (e) { /* manual copy */ }
+    }
+  });
+})();
+</script>
+<hr>
+<p><small>Robot images via <a href="https://robohash.org/">Robohash</a>, used under the Creative Commons Attribution (CC BY) license.<br>
+The text of this page is licensed under Creative Commons Attribution (CC BY).<br>
+Last updated: <span id="updated">today</span></small></p>
+<script>
+document.getElementById("updated").textContent =
+  new Date().toISOString().slice(0, 10);
+</script>
+</body>
+</html>
