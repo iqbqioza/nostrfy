@@ -178,9 +178,14 @@ impl RoleStore {
             return false;
         }
         let roles = self.assignments.entry(pubkey.to_string()).or_default();
-        if !roles.iter().any(|r| r == role) {
-            roles.push(role.to_string());
+        // Unlike `unassign` (which reports whether anything changed), the
+        // old code always reported success: a duplicate assignment
+        // needlessly scheduled snapshots and republished the membership
+        // list with a fresh timestamp for identical state.
+        if roles.iter().any(|r| r == role) {
+            return false;
         }
+        roles.push(role.to_string());
         true
     }
 
@@ -477,6 +482,11 @@ mod tests {
         assert!(store.roles.contains_key("king"));
         assert!(store.assign("abc", "king"));
         assert!(!store.assign("abc", "ghost"), "unknown role rejected");
+        assert!(
+            !store.assign("abc", "king"),
+            "a duplicate assignment changes nothing and must report so, \
+             or callers republish identical membership state"
+        );
         assert!(store.unassign("abc", "king"));
         assert!(
             store.assignments.is_empty(),
