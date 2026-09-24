@@ -495,7 +495,7 @@ curl -X POST http://127.0.0.1:8080/ \
 | `changerelayname` / `changerelaydescription` / `changerelayicon` | `["new value"]` | Change the relay name / description / icon (**persisted to the config file**; reports an error when the file cannot be written) |
 | `createrole` / `editrole` / `deleterole` | `[id, label, description, color, order]` | NIP-43 role management (wrong-typed fields are rejected; deleting a missing role succeeds) |
 | `assignrole` / `unassignrole` | `["pubkey", "role id"]` | Assign / unassign a role (a duplicate grant or missing revocation succeeds) |
-| `assignmethod` / `unassignmethod` | `["pubkey", "method"]` | Grant / revoke a NIP-86 method to a non-admin pubkey (result `[true, "message"]`; only moderation, read and discovery methods are grantable) |
+| `assignmethod` / `unassignmethod` | `["pubkey", "method"]` | Grant / revoke a NIP-86 method to a non-admin pubkey (result `[true, "message"]`; only moderation and read methods are grantable, `supportedmethods` needs no grant) |
 | `listmethodassignees` | `[]` | List method grants (`[{pubkey, methods}]`) |
 | `blockip` / `unblockip` | `["ip", "reason (optional)"]` | Block / unblock an IP (**blocking also drops existing connections**) |
 | `listblockedips` | `[]` | List blocked IPs |

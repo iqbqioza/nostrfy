@@ -821,7 +821,7 @@ pub async fn rpc_handler(
             let pubkey = pubkey.to_ascii_lowercase();
             if !GRANTABLE_METHODS.contains(&method) {
                 return rpc_err(
-                    "invalid method: only moderation, read and discovery methods can be granted",
+                    "invalid method: only moderation and read methods can be granted (supportedmethods needs no grant)",
                 );
             }
             {
@@ -862,7 +862,7 @@ pub async fn rpc_handler(
             // typos surface instead of silently succeeding.
             if !GRANTABLE_METHODS.contains(&method) {
                 return rpc_err(
-                    "invalid method: only moderation, read and discovery methods can be granted",
+                    "invalid method: only moderation and read methods can be granted (supportedmethods needs no grant)",
                 );
             }
             {
