@@ -26,6 +26,17 @@ No cloning, no compiling — downloads the pre-built binary for your platform, v
 curl -fsSL https://raw.githubusercontent.com/iqbqioza/nostrfy/main/install.sh | sh
 ```
 
+### Migrate from strfry?
+
+Bring your existing database with one command (dry-run first, then import):
+
+```sh
+nostrfy migrate-strfry --dry-run
+nostrfy migrate-strfry
+```
+
+See the [step-by-step migration guide](docs/MIGRATING-FROM-STRFRY.md).
+
 ## Run in one minute
 
 ```sh
