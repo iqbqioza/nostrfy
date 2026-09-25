@@ -1163,14 +1163,29 @@ async fn blossom_root_info(
 /// The NIP-11 relay information document, served with `application/nostr+json`
 /// when the client asked for it.
 async fn nip11_doc(relay: Arc<Relay>, wants_nostr_json: bool) -> Response {
+    if !wants_nostr_json {
+        // No Nostr media type requested: answer with the built-in decoy
+        // page instead of the relay document, so a plain probe (browser,
+        // curl, scanner) sees an ordinary placeholder site and learns
+        // nothing about this relay. The NIP-11 document is served only
+        // with `Accept: application/nostr+json`, and WebSocket
+        // handshakes are unaffected (decided before this branch).
+        return (
+            StatusCode::OK,
+            [(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("text/html; charset=utf-8"),
+            )],
+            include_str!("decoy.html"),
+        )
+            .into_response();
+    }
     let body = Json(relay.relay_info_document().await);
     let mut response = body.into_response();
-    if wants_nostr_json {
-        response.headers_mut().insert(
-            axum::http::header::CONTENT_TYPE,
-            axum::http::HeaderValue::from_static("application/nostr+json"),
-        );
-    }
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/nostr+json"),
+    );
     response
 }
 
@@ -3483,6 +3498,84 @@ mod tests {
             .unwrap();
         let response = ws_handler(State(relay.clone()), request).await;
         assert_eq!(response.status(), StatusCode::OK);
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn plain_get_serves_decoy_not_nip11() {
+        // Without `Accept: application/nostr+json` a plain GET must see
+        // an ordinary placeholder site and learn nothing about the relay;
+        // the NIP-11 document is served only on the Nostr media type.
+        let relay = blossom_relay().await;
+        let plain = || {
+            Request::builder()
+                .method(Method::GET)
+                .uri("/")
+                .header(axum::http::header::HOST, "relay.example.com")
+                .body(Body::empty())
+                .unwrap()
+        };
+        let response = ws_handler(State(relay.clone()), plain()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[axum::http::header::CONTENT_TYPE],
+            "text/html; charset=utf-8"
+        );
+        let body = axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            body.contains("How to Open a Door"),
+            "the joke guide is served"
+        );
+        assert!(
+            !body.to_ascii_lowercase().contains("nostr"),
+            "the decoy must not name the protocol: {body:?}"
+        );
+        assert!(
+            !body.contains("wss://") && !body.contains("ws://"),
+            "the relay address must only be assembled at runtime: {body:?}"
+        );
+        assert!(
+            !body.contains("nostrfy") && !body.contains("github"),
+            "the decoy must not name the software: {body:?}"
+        );
+        // A browser-style Accept still gets the decoy.
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/")
+            .header(axum::http::header::HOST, "relay.example.com")
+            .header(axum::http::header::ACCEPT, "text/html")
+            .body(Body::empty())
+            .unwrap();
+        let response = ws_handler(State(relay.clone()), request).await;
+        let body = axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8(body.to_vec())
+                .unwrap()
+                .contains("How to Open a Door")
+        );
+        // The Nostr media type still gets the relay document.
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/")
+            .header(axum::http::header::HOST, "relay.example.com")
+            .header(axum::http::header::ACCEPT, "application/nostr+json")
+            .body(Body::empty())
+            .unwrap();
+        let response = ws_handler(State(relay.clone()), request).await;
+        assert_eq!(
+            response.headers()[axum::http::header::CONTENT_TYPE],
+            "application/nostr+json"
+        );
+        let body = axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["supported_nips"].is_array());
         relay.db.shutdown();
     }
 
