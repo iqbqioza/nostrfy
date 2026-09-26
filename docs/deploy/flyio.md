@@ -4,7 +4,7 @@ This guide deploys nostrfy to [Fly.io](https://fly.io) in a few minutes. The rep
 
 | File | Purpose |
 | --- | --- |
-| `Dockerfile` | Container image — **downloads the pre-built release binary** from the GitHub release assets (x86_64 / aarch64, chosen by the build architecture) and verifies its sha256 checksum. No compilation happens on Fly |
+| `Dockerfile` | Container image — installs the pre-built release binary with `install.sh` (auto-detects x86_64/aarch64, verifies the sha256 checksum); `NOSTRFY_VERSION` build-arg pins a release |
 | `fly.toml` | Fly app configuration: HTTP service on port 8080, health checks, the `/data` volume mount, always-on machines |
 | `deploy/nostrfy.container.toml` | The relay configuration baked into the image at `/etc/nostrfy/nostrfy.toml` |
 
@@ -75,8 +75,8 @@ curl https://<your-app-name>.fly.dev/
 
 ## Scaling and updates
 
-- **Update the relay**: edit `deploy/nostrfy.container.toml` and `fly deploy` again — the image always downloads the **latest** GitHub release binary, so an update is a simple redeploy
-- **Pin a version**: `docker build --build-arg NOSTRFY_VERSION=v0.1.3 ...` or change the `ARG` in the Dockerfile
+- **Update the relay**: edit `deploy/nostrfy.container.toml` and `fly deploy` again — the image installs the **latest** GitHub release binary, so an update is a simple redeploy
+- **Pin a version**: `docker build --build-arg NOSTRFY_VERSION=v0.1.3 ...`
 - **Scale**: the relay is a single machine by default. `fly machines clone <id>` creates a second machine; both share the volume (Fly volumes support multiple machines in the same region)
 - **Metrics**: Fly collects the `/metrics` endpoint (see `[metrics]` in `fly.toml`) and shows it in the Fly dashboard under Metrics
 

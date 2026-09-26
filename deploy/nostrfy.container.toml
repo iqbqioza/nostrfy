@@ -1,5 +1,4 @@
-# nostrfy configuration for container deployments (Fly.io, App Platform, ECS,
-# Cloud Run, Container Apps) — baked into the image at /etc/nostrfy/nostrfy.toml.
+# nostrfy configuration for container deployments — baked into the image at /etc/nostrfy/nostrfy.toml.
 #
 # Edit this file BEFORE building the image (or mount your own config at
 # /etc/nostrfy/nostrfy.toml) to set:
@@ -9,14 +8,14 @@
 # All values below are the built-in defaults; adjust as needed.
 
 [relay]
-name = "nostrfy on Fly.io"
-description = "A nostrfy relay running on Fly.io"
+name = "nostrfy"
+description = "A nostrfy relay running in a container"
 pubkey = ""
 contact = ""
 icon = ""
 post_policy = ""
 private_key = ""
-public_url = "wss://YOUR-APP-NAME.fly.dev"
+public_url = "wss://relay.example.com"
 livekit_url = ""
 livekit_api_key = ""
 livekit_api_secret = ""

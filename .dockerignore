@@ -1,4 +1,6 @@
-# Only the Fly config template is needed in the build context: the binary
-# is downloaded from GitHub releases, not compiled here.
+# Only the files the generic image needs in its build context: the relay
+# config template and the entrypoint (the binary is downloaded from
+# GitHub releases, not compiled here).
 *
 !deploy/nostrfy.container.toml
+!docker-entrypoint.sh
