@@ -83,7 +83,7 @@ verifies its checksum:
 curl -fsSL https://raw.githubusercontent.com/iqbqioza/nostrfy/main/install.sh | sh
 ```
 
-Options: `VERSION=v0.1.15 ./install.sh` pins a release,
+Options: `VERSION=v0.1.16 ./install.sh` pins a release,
 `INSTALL_DIR=/usr/local/bin sudo ./install.sh` installs system-wide,
 `./install.sh --force` overwrites without asking. The script picks the
 first of `~/.local/bin`, `~/bin`, `~/.cargo/bin` already on `PATH`
