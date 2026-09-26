@@ -1,0 +1,23 @@
+# Minimal local run: builds the image from source and starts the relay on
+# http://localhost:8080 (plain WS; terminate TLS in front for wss://).
+#
+#   docker compose up -d --build
+#   curl http://localhost:8080/health
+#
+# Data persists in the `nostrfy-data` volume. To use your own config,
+# uncomment the config mount below (the file must exist first).
+
+services:
+  nostrfy:
+    build: .
+    image: nostrfy:local
+    container_name: nostrfy
+    ports:
+      - "8080:8080"
+    volumes:
+      - nostrfy-data:/data
+      # - ./nostrfy.toml:/etc/nostrfy/nostrfy.toml:ro
+    restart: unless-stopped
+
+volumes:
+  nostrfy-data:

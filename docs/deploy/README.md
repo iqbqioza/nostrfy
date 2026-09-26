@@ -53,4 +53,4 @@ private_key = ""                          # run `nostrfy genkey` and paste the k
 ## Choosing between VM and containers
 
 - **VM (systemd)**: simplest, cheapest, full control. Recommended for most relay deployments.
-- **Container**: use the repository `Dockerfile` (downloads the release binary at build time) on Fly.io, Digital Ocean App Platform, AWS ECS, GCP Cloud Run or Azure Container Apps. Persistent storage is required for the LMDB data (`/data`).
+- **Container**: use the repository `Dockerfile` (installs the release binary via `install.sh`) on Fly.io, Digital Ocean App Platform, AWS ECS, GCP Cloud Run or Azure Container Apps — or `docker compose up -d --build` locally. Persistent storage is required for the LMDB data (`/data`).
