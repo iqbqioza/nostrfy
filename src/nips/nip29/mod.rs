@@ -1072,6 +1072,16 @@ impl GroupStore {
                         None => (None, None, Vec::new(), Vec::new()),
                     }
                 };
+                // A 9002 for a group that does not exist must do nothing:
+                // live validation rejects it (`unknown group`), so applying
+                // its child-adoption half would steal children from their
+                // real parents, dangle their parent pointers at the missing
+                // id, and resurrect a bare 39000 for it. This mirrors the
+                // parent-side guard below, which drops a link to a deleted
+                // parent instead of dangling.
+                if !self.groups.contains_key(gid) {
+                    return Vec::new();
+                }
                 // Keep the adoption hint current: a declared child id makes
                 // a later CREATE_GROUP scan for the (deterministically
                 // smallest) adopting parent. The hint is bounded (see

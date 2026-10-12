@@ -1782,6 +1782,72 @@ fn replay_linking_to_deleted_parent_keeps_child_orphaned() {
 }
 
 #[test]
+fn replay_child_adoption_for_missing_group_is_ignored() {
+    // Live `validate_write` rejects a 9002 for an unknown group, so the
+    // rebuild replay (which runs unconditionally) must ignore its
+    // child-adoption half too: it must not steal the child from its real
+    // parent, dangle its parent pointer at the missing id, or resurrect a
+    // bare 39000 for that id.
+    let mut store = GroupStore::default();
+    let now = 1_600_000_000;
+    store.apply(
+        &event(CREATE_GROUP, ADMIN, Some("realparent"), vec![]),
+        "relay",
+        now,
+        false,
+        false,
+    );
+    store.apply(
+        &event(CREATE_GROUP, ADMIN, Some("x"), vec![]),
+        "relay",
+        now,
+        false,
+        false,
+    );
+    let link = event(
+        9002,
+        ADMIN,
+        Some("x"),
+        vec![vec!["parent".into(), "realparent".into()]],
+    );
+    store.apply(&link, "relay", now, false, false);
+    assert_eq!(store.groups["x"].parent.as_deref(), Some("realparent"));
+    assert_eq!(store.groups["realparent"].children, vec!["x".to_string()]);
+    let phantom = event(
+        9002,
+        ADMIN,
+        Some("ghost"),
+        vec![vec!["child".into(), "x".into()]],
+    );
+    assert!(
+        store.validate_write(&phantom).is_err(),
+        "live validation must reject a 9002 for an unknown group"
+    );
+    let out = store.apply(&phantom, "relay", now, true, true);
+    assert_eq!(
+        store.groups["x"].parent.as_deref(),
+        Some("realparent"),
+        "a replayed adoption from a missing group must not steal the child"
+    );
+    assert_eq!(
+        store.groups["realparent"].children,
+        vec!["x".to_string()],
+        "the real parent must keep its child"
+    );
+    assert!(
+        !store.groups.contains_key("ghost"),
+        "the missing group must not be created"
+    );
+    assert!(
+        !out.iter().any(|e| e.kind == GROUP_META
+            && e.tags
+                .iter()
+                .any(|t| t == &vec![D.to_string(), "ghost".to_string()])),
+        "no metadata may be resurrected for the missing group"
+    );
+}
+
+#[test]
 fn livekit_tag_and_single_parent() {
     // NIP-29: a `livekit` tag in the metadata edit is mirrored in the
     // 39000 event, and a 9002 carrying more than one `parent` tag is
