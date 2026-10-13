@@ -5432,6 +5432,68 @@ mod tests {
     }
 
     #[test]
+    fn asymmetric_filter_limits_drop_the_boundary_tie() {
+        // The tie-drop guard must fire when *any* filter's quota fills the
+        // page, not only when the largest limit does: with asymmetric
+        // limits the small filter fills first, and an incomplete page made
+        // entirely of the boundary second would otherwise be delivered
+        // verbatim, so an inclusive client (`until = T`) re-reads the same
+        // block forever while older events stay unreachable.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let now = unix_now();
+            for content in ["new-0", "new-1", "new-2"] {
+                let e = signed_note(conn.relay.secp(), content, now, vec![]);
+                conn.relay.db.put(e, now).await;
+            }
+            for content in ["old-0", "old-1", "old-2"] {
+                let e = signed_note(conn.relay.secp(), content, now - 1, vec![]);
+                conn.relay.db.put(e, now).await;
+            }
+            conn.handle_req(&[
+                json!("sub"),
+                json!({"kinds": [1], "limit": 1, "until": now}),
+                json!({"kinds": [7], "limit": 500}),
+            ])
+            .await;
+            conn.pump_pending_reqs();
+            let msgs = outgoing_json(&conn);
+            let contents: Vec<&str> = msgs
+                .iter()
+                .filter(|m| m[0] == "EVENT")
+                .map(|m| m[2]["content"].as_str().unwrap())
+                .collect();
+            assert!(
+                !contents.iter().any(|c| c.starts_with("new-")),
+                "the boundary tie must be dropped even though only the small quota filled: {contents:?}"
+            );
+            assert!(
+                msgs.iter()
+                    .any(|m| m[0] == "EOSE" && m[1] == "sub" && m[2] == json!(["more"])),
+                "the dropped second must keep the more hint: {msgs:?}"
+            );
+            // The client advances past the dropped second and completes.
+            conn.outgoing.clear();
+            conn.out_bytes = 0;
+            conn.handle_req(&[
+                json!("sub"),
+                json!({"kinds": [1], "limit": 1, "until": now - 1}),
+                json!({"kinds": [7], "limit": 500}),
+            ])
+            .await;
+            conn.pump_pending_reqs();
+            let msgs = outgoing_json(&conn);
+            assert!(
+                msgs.iter()
+                    .any(|m| m[0] == "EVENT" && m[2]["content"].as_str().unwrap().starts_with("old-")),
+                "the next page must serve the older events: {msgs:?}"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
     fn same_second_tie_flood_paginates_to_finish() {
         // A same-second flood larger than the scan's tie cap used to
         // return the same tie block on every page, so an inclusive client

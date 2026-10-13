@@ -565,7 +565,12 @@ impl super::Conn {
         // keeps the `more` hint; the extreme flood (the scan returned only
         // tie events) yields an empty `more` page, and the client proceeds
         // from `T - 1` on the next request.
-        let page_capacity = limits.iter().copied().max().unwrap_or(0);
+        // A page is full as soon as *any* filter exhausts its quota, so
+        // the capacity is the smallest limit: with asymmetric limits the
+        // small filter fills first, and comparing against the largest
+        // would deliver an incomplete all-tie page verbatim, livelocking
+        // an inclusive client while older events stay unreachable.
+        let page_capacity = limits.iter().copied().min().unwrap_or(0);
         let mut tie_truncated = false;
         while (more || truncated) && kept.len() >= page_capacity && !kept.is_empty() {
             let boundary = kept[0].created_at;
