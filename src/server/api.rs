@@ -293,11 +293,12 @@ fn excluded_tags(params: &ApiParams) -> Vec<&'static str> {
     out
 }
 
-/// Whether a stored event is visible to this unauthenticated REST API,
-/// mirroring an anonymous WebSocket connection: NIP-70 protected events,
-/// NIP-59 gift wraps, NIP-29 private/hidden group content and (when the
-/// NIP-78 AUTH gate is active) NIP-78 application-specific events are
-/// withheld.
+/// Whether a stored event is visible to this unauthenticated REST API.
+/// It applies the same per-event visibility rules as an anonymous
+/// WebSocket connection: NIP-70 protected events, NIP-59 gift wraps,
+/// NIP-29 private/hidden group content and (when the NIP-78 AUTH gate is
+/// active) NIP-78 application-specific events are withheld. Unlike the
+/// WebSocket paths, `relay.require_auth` does not gate this API.
 fn api_visible(
     event: &Event,
     groups: Option<&nip29::GroupStore>,
@@ -1819,8 +1820,9 @@ async fn query_and_respond(
         }
     }
 
-    // The REST API is unauthenticated, so it must apply the same
-    // visibility rules as an anonymous WebSocket connection: NIP-70
+    // The REST API is unauthenticated, so it applies the same per-event
+    // visibility rules as an anonymous WebSocket connection (see
+    // `api_visible`; `relay.require_auth` does not gate this API): NIP-70
     // protected events, NIP-59 gift wraps and NIP-29 private/hidden group
     // content are withheld. Only the group read lock is taken when a batch
     // actually contains group events (the common case has none).

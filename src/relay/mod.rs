@@ -3213,7 +3213,8 @@ impl Relay {
         }
         // Drain and record in the same pass: the writer shed the deletion
         // moments ago and may still be full, in which case the requests stay
-        // held and the next event retries the flush.
+        // held until another failed removal retries the flush (there is no
+        // periodic flush and no other caller).
         let drained: Vec<crate::db::store::PendingDeletion> = {
             let mut held = self
                 .pending_removals
@@ -3803,10 +3804,11 @@ impl Relay {
         if nip29_enabled && group_state_removed {
             // A moderation/join/leave (or role-state) event was removed: the
             // derived state must be rebuilt from the surviving history. The
-            // db reports one combined flag, so both stores are marked stale
-            // (a relay-signed role event can only be removed when the
-            // operator's own key vanished, but the fail-closed revocation is
-            // cheap compared to resurrecting a grant). The marks run while
+            // db reports one combined flag that cannot tell a role event
+            // from an ordinary group-state event, so both stores are marked
+            // stale (the revocation also fires for group events any author
+            // can produce; the fail-closed revocation is cheap compared to
+            // resurrecting a grant). The marks run while
             // the in-flight claims are held: `mark_group_state_stale` sets
             // `pending` and its persist clears the snapshot through that
             // branch, so no concurrent save can certify pre-removal state in
@@ -3844,11 +3846,11 @@ impl Relay {
         // Relay-generated events are stamped with the strictly monotonic
         // clock (not plain `now`): two events applied in the same second
         // must still be distinguishable, or the NIP-01 id tie-break could
-        // let a stale, later-committed version win. The floor is clamped
-        // to `now`: a group event may carry a future created_at (allowed
-        // up to max_created_at_future_secs), and stamping the metadata in
-        // the future would make it invisible to `until: now` scans and,
-        // after a restart, unreplaceable until the wall clock catches up.
+        // let a stale, later-committed version win. Passing `now` only
+        // raises the floor; the clock never moves backwards, so sustained
+        // group activity stamps metadata ahead of the wall clock, which
+        // hides it from `until: now` scans (and delays replacement until
+        // wall time catches up after a restart).
         let stamp = self.stamp_floor(now);
         let mut buffer = self.groups_rebuild.buffer.lock().await;
         if buffer.scanning {

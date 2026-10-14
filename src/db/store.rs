@@ -405,16 +405,18 @@ pub(crate) fn apply_put_batch(
                 Ok(out) => {
                     // Record the first-seen timestamp in the same commit:
                     // the pubkey's account-age clock starts only when the
-                    // event actually stored (a rejected first event must
-                    // not pre-warm it).
+                    // event is accepted (a rejected first event must not
+                    // pre-warm it). An `Ephemeral` outcome is accepted
+                    // without being stored, but still records the clock.
                     if matches!(
                         out,
                         PutOutcome::Stored | PutOutcome::Replaced | PutOutcome::Ephemeral
                     ) && let Some((pubkey, ts)) = first_seen.get(i).copied().flatten()
                         && let Err(e) = store.touch_first_seen(&mut txn, &pubkey, ts)
                     {
-                        // Non-fatal: the event is stored either way, and a
-                        // missing first-seen only weakens the age gate.
+                        // Non-fatal: the event is stored either way. A
+                        // missing row reads as a brand-new pubkey on the
+                        // next event, re-arming the age gate.
                         db_error(thread_errors, &e);
                     }
                     outcomes.push(out);

@@ -62,8 +62,9 @@ pub struct RoleStore {
     /// NIP-86 `createclaim` invite codes (NIP-43 PR #2408): a `kind:28934`
     /// join request carrying a listed code admits its author. Codes have
     /// no events behind them, so unlike roles/assignments they live only
-    /// in the snapshot — a disaster rebuild from events drops them
-    /// (fail-closed: joins are rejected until an admin recreates a code).
+    /// in the snapshot — every rebuild from events drops them, including
+    /// the routine role-store revocation a vanish triggers (fail-closed:
+    /// joins are rejected until an admin recreates a code).
     pub claims: std::collections::BTreeSet<String>,
 }
 

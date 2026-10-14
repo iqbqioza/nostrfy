@@ -31,10 +31,12 @@
 //! first relay start after the migration replays the stored events, exactly
 //! like a fresh database.
 //!
-//! A failed write or side effect aborts with an error; re-running the same
-//! export is safe (duplicates are skipped, and side effects are re-applied
-//! so a crash between a store and its side effect cannot leave a tombstone
-//! missing).
+//! A failed side effect (or a lost database writer) aborts with an error.
+//! Database write faults are reported per event as rejections and do not
+//! abort the run, so a run that reports "complete" can have skipped
+//! events. Re-running the same export is safe (duplicates are skipped,
+//! and side effects are re-applied so a crash between a store and its
+//! side effect cannot leave a tombstone missing).
 
 use std::io::BufRead;
 use std::sync::Arc;
@@ -1064,9 +1066,10 @@ async fn apply_nip09(db: &DbClient, event: &Event, stats: &mut Stats) -> Result<
     let targets = nip09::deletion_targets(event);
     let addresses = nip09::deletion_addresses(event);
     if targets.is_empty() && addresses.is_empty() {
-        // A request with nothing to delete: the live write path rejects it
-        // and strfry applies nothing, so the event stays stored but has no
-        // side effects (it must not purge the author's gift wraps).
+        // Nothing resolvable to delete: intentionally no side effects here
+        // (in particular no gift-wrap purge). The live path differs: it
+        // purges the author's gift wraps for any accepted kind:5 request,
+        // even when its tags name nothing resolvable.
         return Ok(());
     }
     let (removed, _state_removed) = db

@@ -1,11 +1,12 @@
 # nostrfy.toml — private (invite-only / authenticated) relay
 #
-# For a closed community: only authenticated clients (NIP-42) may
-# publish, and `restrict_relay = true` narrows publishing to the allow
-# list. Reading stays open to everyone (NIP-11 `restricted_writes`
-# semantics), so the members' posts remain publicly readable — add
-# `require_auth` if you want publishing restricted to authenticated
-# clients as well.
+# For a closed community: `require_auth = true` (below) makes every
+# WebSocket session complete NIP-42 AUTH before it may publish or
+# subscribe, and `restrict_relay = true` narrows publishing to the allow
+# list. Note the unauthenticated REST API (/api/v1) is NOT gated by
+# `require_auth`: it keeps serving the events its per-event visibility
+# rules allow, so a relay that must not be readable anonymously should
+# not rely on `require_auth` alone.
 
 [relay]
 name = "nostrfy private"
@@ -27,8 +28,9 @@ enabled_command_events = false
 enabled_nips = [1, 9, 11, 40, 42, 45, 46, 59, 65, 70, 78, 84]
 
 [access]
-# Only allow-listed pubkeys may POST (reading stays open to everyone;
-# denied pubkeys are the only ones refused reads). The allow/deny lists
+# Only allow-listed pubkeys may POST. The allow list does not restrict
+# reads (only denied pubkeys are refused reads), but `require_auth` above
+# already requires AUTH before any subscribe. The allow/deny lists
 # are NOT config keys: they live in the relay database and are managed
 # with `nostrfy relay allow <pubkey>` / `nostrfy relay deny <pubkey>`
 # (the admin and the relay's own pubkey are always exempt).

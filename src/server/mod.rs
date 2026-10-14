@@ -559,8 +559,9 @@ async fn restore_group_state(relay: &Relay, groups_enabled: bool) -> Result<()> 
 async fn rebuild_group_state(relay: &Relay, groups_enabled: bool) -> Result<()> {
     if !groups_enabled {
         // The replay migration only runs when the NIP is enabled (see the
-        // caller). The store stays empty, the fail-closed state when no
-        // snapshot is available; a start with NIP-29 re-enabled rebuilds.
+        // caller). The store stays empty — which reads as "every group id
+        // is public", not fail-closed — and a start with NIP-29
+        // re-enabled rebuilds it.
         warn!(
             "NIP-29 group state was not restored and NIP-29 is disabled; the group store \
              starts empty until the NIP is re-enabled and the relay restarts"
@@ -1625,11 +1626,12 @@ async fn purge_loop(relay: Arc<Relay>, mut shutdown: watch::Receiver<bool>) {
                 // the worst case, but this lets a clean shutdown complete
                 // promptly instead of aborting the task).
                 //
-                // `first_seen` rows are reaped once a pubkey is older than
-                // the new-pubkey gate: it can never reject that pubkey again,
-                // so the row only grows the table (0 = gate disabled = no
-                // reap, the database's documented convention). Read per tick
-                // so a config reload applies.
+                // `first_seen` rows older than the new-pubkey gate are
+                // reaped (0 = gate disabled = no reap, the database's
+                // documented convention): the row is only consulted while
+                // it is younger than the gate, and a later accepted event
+                // writes a fresh row, so the gate can reject that pubkey
+                // again. Read per tick so a config reload applies.
                 let (now, first_seen_min_age) = {
                     let cfg = relay.config.read().await;
                     (unix_now(), cfg.relay.new_pubkey_min_age_secs)

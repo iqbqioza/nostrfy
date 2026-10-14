@@ -1044,8 +1044,9 @@ impl GroupStore {
                 // into a cycle, drop a child another edit just adopted, or
                 // reparent through an admin whose role was revoked in
                 // between (the same TOCTOU the 9000/9001 arms close for the
-                // last-admin invariant). A rebuild replays already-validated
-                // history, so the re-check is runtime-only.
+                // last-admin invariant). A rebuild applies the stored events
+                // without this re-check, so an effect dropped here is not
+                // final: the next rebuild re-applies the event.
                 if !ignore_capacity && let Some(group) = self.groups.get(gid) {
                     let relay_signed =
                         !relay_pubkey.is_empty() && event.pubkey.eq_ignore_ascii_case(relay_pubkey);

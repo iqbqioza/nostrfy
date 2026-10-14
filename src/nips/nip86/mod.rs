@@ -144,9 +144,8 @@ fn check_role_fields(label: &str, description: &str, color: &str) -> anyhow::Res
 
 /// Validates a NIP-43 role id: non-empty (after trimming), within the byte
 /// length bound, and free of control characters (it lands in a stored relay
-/// event's `d` tag and the in-memory role map). Character count is used for
-/// the length bound like the other role fields so multibyte ids cannot
-/// bypass the intent.
+/// event's `d` tag and the in-memory role map). The bound is in bytes so
+/// multibyte ids cannot bypass it via a character count.
 fn check_role_id(id: &str) -> anyhow::Result<()> {
     if id.trim().is_empty() {
         return Err(anyhow!("role id must not be empty"));

@@ -195,11 +195,13 @@ impl Cli {
                 // bind between check and start); `prepare` re-checks the
                 // port right before forking.
                 ensure_port_available(&cfg)?;
-                // Probe the database directory without failing on a live
-                // instance: `check` must keep working while the relay runs.
-                // A lockable directory proves it is usable; a lock held by
-                // another instance is the expected running case, not an
-                // error. Any other failure (unwritable path, bad mount) is.
+                // Probe the database directory, tolerating a lock held by a
+                // live instance (the expected running case, not an error):
+                // a lockable directory proves it is usable; any other
+                // failure (unwritable path, bad mount) is fatal. Note the
+                // port probe above still rejects the config while the relay
+                // is running on the same port, so `check` cannot be used
+                // against a live instance.
                 match crate::db::lock_database_dir(&cfg.database.path) {
                     Ok(guard) => drop(guard),
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}

@@ -559,12 +559,11 @@ impl super::Conn {
         // every kept event shares one `created_at`, the scan ended at (or
         // inside) that tie block and a client advancing inclusively
         // (`until = T`) would receive the same block forever. The whole
-        // boundary second is dropped — a page never delivers a partial tie
-        // — and the older events the scan over-fetched are attributed
-        // instead, so the client's cursor advances past `T`. The omission
-        // keeps the `more` hint; the extreme flood (the scan returned only
-        // tie events) yields an empty `more` page, and the client proceeds
-        // from `T - 1` on the next request.
+        // boundary second is dropped — a page never delivers a partial tie.
+        // The attribution above already discarded every event it did not
+        // place, so there is nothing left to attribute in its place: the
+        // guard always yields an empty page that keeps the `more` hint,
+        // and the client proceeds from `T - 1` on the next request.
         // A page is full as soon as *any* filter exhausts its quota, so
         // the capacity is the smallest limit: with asymmetric limits the
         // small filter fills first, and comparing against the largest
@@ -1348,8 +1347,9 @@ impl super::Conn {
 /// created_at tie), exactly like the scan's per-filter boundary
 /// continuation. Returns the kept events and whether any event was
 /// dropped (the caller turns that into the `more` completeness hint).
-/// Drains `events`, so the caller can re-run the attribution after
-/// dropping a boundary second.
+/// Drains `events` and discards every event it does not place, so a
+/// caller cannot re-attribute them after dropping a boundary second; the
+/// returned `truncated` flag is the only trace of the discarded events.
 fn attribute_visible_page(
     events: &mut Vec<Event>,
     filters: &[Filter],

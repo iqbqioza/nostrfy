@@ -250,9 +250,11 @@ impl super::Relay {
         // Publish a tombstone `kind:33534` so the deletion survives the
         // restart rebuild (the rebuild skips `["deleted"]` tombstones);
         // then republish the membership list without the deleted role.
-        // A failed tombstone save reports `Failed`: without it the role
-        // would be resurrected by the rebuild after a restart (the
-        // operator can re-create and re-delete to retry).
+        // A failed tombstone save reports `Failed`: without the tombstone
+        // the rebuild after a restart resurrects the role. A plain retry
+        // does not publish it (the in-memory role is already gone, so the
+        // deletion reads back as `Noop`) — re-create the role and delete
+        // it again to write the tombstone.
         let relay_pubkey = self.relay_pubkey().unwrap_or_default();
         let event = {
             let roles = self.roles.read().await;

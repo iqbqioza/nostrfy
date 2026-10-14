@@ -202,7 +202,7 @@ Pagination is computed over the **visible** sequence (see [Visibility Rules](#6-
 
 ## 6. Visibility Rules
 
-The API is unauthenticated, so it applies the same visibility rules as an **anonymous** WebSocket connection. The following events are withheld:
+The API is unauthenticated and applies the same per-event visibility rules as an **anonymous** WebSocket connection — with one exception: `relay.require_auth` gates WebSocket REQ/COUNT/NEG but does **not** gate this API, so an auth-required relay remains readable here. The following events are withheld:
 
 - **NIP-70 protected events** (carrying a `-` tag)
 - **NIP-59 gift wraps** (kind 1059)
