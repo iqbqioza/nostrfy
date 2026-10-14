@@ -995,13 +995,19 @@ pub async fn rpc_handler(
                     return rpc_err("error: cannot persist the event ban");
                 }
             };
-            if state_removed {
+            if !state_removed.is_empty() {
                 // A banned NIP-29/NIP-43 state event invalidates the live
                 // derived state like any other removal of one (the database
                 // already advanced its stamp, so a restart rebuilds instead
-                // of resurrecting the banned grant).
-                relay.mark_group_state_stale().await;
-                relay.mark_roles_stale().await;
+                // of resurrecting the banned grant). Only the families
+                // that lost an event are revoked: a banned group event
+                // must not drop the NIP-43 invite codes via a role rebuild.
+                if state_removed.group {
+                    relay.mark_group_state_stale().await;
+                }
+                if state_removed.role {
+                    relay.mark_roles_stale().await;
+                }
             }
             rpc_ok(json!(true))
         }

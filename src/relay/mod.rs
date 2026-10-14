@@ -3097,7 +3097,7 @@ impl Relay {
                     });
                 }
             }
-            if state_removed {
+            if !state_removed.is_empty() {
                 // The live state still holds state derived from a removed
                 // event: mark the touched store(s) stale and let the
                 // coalesced background workers rebuild. A NIP-29-only
@@ -3378,20 +3378,14 @@ impl Relay {
         /// `a`-tag address carries its kind directly, so it can classify the
         /// family but never the group the event belongs to.
         fn classify(kind: u64) -> (bool, bool) {
-            (
-                (nip29::MOD_MIN..=nip29::MOD_MAX).contains(&kind)
-                    || kind == nip29::JOIN
-                    || kind == nip29::LEAVE,
-                matches!(
-                    kind,
-                    nip43::ROLE_DEFINITION
-                        | nip43::MEMBERSHIP_LIST
-                        | nip43::ADD_USER
-                        | nip43::REMOVE_USER
-                        | nip43::JOIN
-                        | nip43::LEAVE
-                ),
-            )
+            // One definition of the families for the whole relay: the
+            // database classifies removed events with the same helper, so
+            // the pre-check and the removal walk cannot drift apart.
+            match crate::db::store::state_kind_family(kind) {
+                Some(crate::db::store::StateFamily::Group) => (true, false),
+                Some(crate::db::store::StateFamily::Role) => (false, true),
+                None => (false, false),
+            }
         }
         let mut touch = StateTouch::default();
         for address in nip09::deletion_addresses(event) {
@@ -3637,12 +3631,19 @@ impl Relay {
     /// API so a future asynchronous recovery can be awaited without the
     /// server changing its startup order.
     pub async fn recovery_done(&self) {
-        if self.db.resumed_deletion_state_removed() {
+        let state_removed = self.db.resumed_deletion_state_removed();
+        if state_removed.group {
             log::warn!(
-                "startup recovery removed a derived-state event; rebuilding the NIP-29/NIP-43 \
+                "startup recovery removed a NIP-29 group-state event; rebuilding the group \
                  state from the surviving events"
             );
             self.mark_group_state_stale().await;
+        }
+        if state_removed.role {
+            log::warn!(
+                "startup recovery removed a NIP-43 role-state event; rebuilding the role \
+                 state from the surviving events"
+            );
             self.mark_roles_stale().await;
         }
     }
@@ -3753,7 +3754,7 @@ impl Relay {
         // generation against pre-removal state.
         let groups_in_flight = nip29_enabled.then(|| self.groups_rebuild.derived.begin());
         let roles_in_flight = nip43_enabled.then(|| self.roles_rebuild.derived.begin());
-        let (removed, group_state_removed) =
+        let (removed, state_removed) =
             match self.db.apply_vanish_checked(pubkey, until_created).await {
                 Some(outcome) => outcome,
                 None => {
@@ -3768,7 +3769,7 @@ impl Relay {
                 }
             };
         self.stats.bump(&self.stats.events_deleted, removed as u64);
-        if nip29_enabled && !group_state_removed {
+        if nip29_enabled && !state_removed.group {
             // A replayed vanish, one that removed nothing, or one that only
             // deleted ordinary posts: the live state only needs the vanished
             // pubkey dropped from its memberships, and only a real change is
@@ -3800,25 +3801,30 @@ impl Relay {
                 )
                 .await;
         }
-        if nip29_enabled && group_state_removed {
-            // A moderation/join/leave (or role-state) event was removed: the
-            // derived state must be rebuilt from the surviving history. The
-            // db reports one combined flag, so both stores are marked stale
-            // (a relay-signed role event can only be removed when the
-            // operator's own key vanished, but the fail-closed revocation is
-            // cheap compared to resurrecting a grant). The marks run while
-            // the in-flight claims are held: `mark_group_state_stale` sets
-            // `pending` and its persist clears the snapshot through that
-            // branch, so no concurrent save can certify pre-removal state in
-            // the window. The rebuilds are full-history scans and vanishes
-            // are exempt from the publish rate limit, so any fresh keypair
-            // could otherwise stall every group write; the coalesced
+        if state_removed.group {
+            // A moderation/join/leave event was removed: the group state
+            // must be rebuilt from the surviving history. The mark runs
+            // while the in-flight claims are held: `mark_group_state_stale`
+            // sets `pending` and its persist clears the snapshot through
+            // that branch, so no concurrent save can certify pre-removal
+            // state in the window. The rebuilds are full-history scans and
+            // vanishes are exempt from the publish rate limit, so any fresh
+            // keypair could otherwise stall every group write; the coalesced
             // background workers keep it amortized.
             self.mark_group_state_stale().await;
+        }
+        if state_removed.role {
+            // A NIP-43 role-state event was removed: only the relay's own
+            // key can author those, so the role store must be revoked and
+            // rebuilt from the surviving events (the rebuild drops the
+            // NIP-86 invite codes, which have no events behind them). A
+            // group-state-only vanish must never reach here: revoking the
+            // role store for an anonymous group event would drop every
+            // invite code.
             self.mark_roles_stale().await;
         }
         drop(groups_in_flight);
-        if nip29_enabled && !group_state_removed && changed_member && !self.persist_groups().await {
+        if nip29_enabled && !state_removed.group && changed_member && !self.persist_groups().await {
             log::error!(
                 "could not persist the group state after a vanish; it will be \
                  rebuilt on the next restart"
@@ -3971,7 +3977,7 @@ impl Relay {
                         });
                     }
                 }
-                if state_removed {
+                if !state_removed.is_empty() {
                     // Removing a moderation/join/leave event invalidates
                     // the in-memory state derived from it (a deleted 9000
                     // grant must revoke the membership): mark the touched
@@ -5682,12 +5688,10 @@ mod tests {
         relay.db.shutdown();
     }
 
-    #[tokio::test]
-    async fn recovery_done_marks_the_state_stale_after_a_resumed_deletion() {
-        // The db writer resumes an interrupted NIP-09 deletion during
-        // `open`; when it removed a derived-state event, the startup
-        // barrier must mark the group/role stores stale so the startup
-        // restore/rebuild cannot certify pre-removal state.
+    /// Builds a relay whose startup resume finishes a pending NIP-09
+    /// deletion of one stored derived-state event of `kind` (what a crash
+    /// mid-walk leaves behind).
+    async fn build_resumed_deletion_relay(kind: u64) -> Relay {
         use crate::db::store::{Store, encode_pending_deletion, pending_deletion_key};
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -5703,14 +5707,13 @@ mod tests {
         let store = Store::open(&cfg.database, std::sync::Arc::clone(&expiry), 128)
             .expect("the scratch store opens");
         let now = crate::util::unix_now();
-        // A stored NIP-29 state event and the pending deletion that targets
-        // it (what a crash mid-walk leaves behind).
+        // The stored state event and the pending deletion that targets it.
         let author = "aa".repeat(32);
         let mut edit = crate::event::Event {
             id: String::new(),
             pubkey: author.clone(),
             created_at: now.saturating_sub(10),
-            kind: 9002,
+            kind,
             tags: vec![vec!["h".into(), "g1".into()]],
             content: String::new(),
             sig: String::new(),
@@ -5750,7 +5753,7 @@ mod tests {
         )
         .expect("the db client opens");
         let config = std::sync::Arc::new(tokio::sync::RwLock::new(cfg));
-        let relay = Relay::new(
+        Relay::new(
             config,
             db,
             crate::stats::Stats::new(),
@@ -5761,9 +5764,20 @@ mod tests {
                 batch_size: 64,
             },
         )
-        .await;
+        .await
+    }
+
+    #[tokio::test]
+    async fn recovery_done_marks_the_group_store_after_a_resumed_group_removal() {
+        // The db writer resumes an interrupted NIP-09 deletion during
+        // `open`; when it removed a NIP-29 group-state event, the startup
+        // barrier must mark the group store stale so the startup
+        // restore/rebuild cannot certify pre-removal state — and it must
+        // not revoke the role store (its rebuild drops the NIP-86 invite
+        // codes).
+        let relay = build_resumed_deletion_relay(9002).await;
         assert!(
-            relay.db.resumed_deletion_state_removed(),
+            !relay.db.resumed_deletion_state_removed().is_empty(),
             "the startup resume must expose the removed state event"
         );
         assert!(
@@ -5783,14 +5797,42 @@ mod tests {
                 .groups_rebuild
                 .pending
                 .load(std::sync::atomic::Ordering::SeqCst),
-            "a resumed state removal must keep the group snapshot dropped"
+            "a resumed group-state removal must keep the group snapshot dropped"
         );
+        assert!(
+            !relay
+                .roles_rebuild
+                .dirty
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "a resumed group-state removal must not revoke the role grants"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn recovery_done_marks_the_role_store_after_a_resumed_role_removal() {
+        // Same barrier for a relay-signed NIP-43 role-state event: the
+        // role store is revoked (fail-closed), the group store is left
+        // alone.
+        let relay = build_resumed_deletion_relay(crate::nips::nip43::MEMBERSHIP_LIST).await;
+        let state_removed = relay.db.resumed_deletion_state_removed();
+        assert!(state_removed.role, "the role family must be reported");
+        assert!(!state_removed.group, "no group event was removed");
+        relay.signal_drain();
+        relay.recovery_done().await;
         assert!(
             relay
                 .roles_rebuild
                 .dirty
                 .load(std::sync::atomic::Ordering::SeqCst),
-            "a resumed state removal must revoke the live role grants"
+            "a resumed role-state removal must revoke the live grants"
+        );
+        assert!(
+            !relay
+                .groups_rebuild
+                .pending
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "a role-only removal must not drop the group snapshot"
         );
         relay.db.shutdown();
     }
@@ -7733,6 +7775,86 @@ mod tests {
             assert!(
                 snapshot.groups.is_empty() && snapshot.ghost.len() >= gids.len(),
                 "the rebuilt snapshot must carry the ghosts, not the groups"
+            );
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn an_anonymous_group_vanish_keeps_the_invite_claims() {
+        // A-1: a group-state event any key can author (a 9007 create) must
+        // not revoke the NIP-43 role store when its author vanishes. The
+        // role rebuild replaces the store from events and drops the
+        // NIP-86 invite codes, which have no events behind them, so a
+        // group-family removal must leave the role store alone (only a
+        // relay-signed role-state removal may revoke it).
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            use crate::db::PutOutcome;
+
+            let relay = build_relay_with_key(false, &"11".repeat(32)).await;
+            assert!(relay.create_claim("keep-me").await);
+            assert!(relay.roles.read().await.claims.contains("keep-me"));
+
+            let now = crate::util::unix_now();
+            let secp = secp256k1::Secp256k1::new();
+            let keypair = secp256k1::Keypair::from_seckey_slice(&secp, &[7u8; 32]).unwrap();
+            let sign = |kind: u64, tags: Vec<Vec<String>>| {
+                let mut e = crate::event::Event {
+                    id: String::new(),
+                    pubkey: secp256k1::XOnlyPublicKey::from_keypair(&keypair)
+                        .0
+                        .to_string(),
+                    created_at: now,
+                    kind,
+                    tags,
+                    content: String::new(),
+                    sig: String::new(),
+                };
+                e.id = crate::nips::nip01::compute_id(&e);
+                let id = e.id_bytes().unwrap();
+                e.sig = secp.sign_schnorr_no_aux_rand(&id, &keypair).to_string();
+                e
+            };
+            let create = sign(
+                crate::nips::nip29::CREATE_GROUP,
+                vec![vec!["h".into(), "anon-group".into()]],
+            );
+            let results = relay.accept_events_batch(vec![create.clone()], &[]).await;
+            assert!(
+                matches!(&results[0].1, PutOutcome::Stored),
+                "the anonymous create must store: {results:?}"
+            );
+            assert!(relay.groups.read().await.groups.contains_key("anon-group"));
+            let vanish = sign(
+                crate::nips::nip62::VANISH_KIND,
+                vec![vec!["relay".into(), "ws://127.0.0.1:8080".into()]],
+            );
+            let results = relay.accept_events_batch(vec![vanish], &[]).await;
+            assert!(
+                matches!(&results[0].1, PutOutcome::Stored),
+                "the vanish must be accepted: {results:?}"
+            );
+            // The vanish really removed the author's group-state event ...
+            let f: crate::filter::Filter =
+                serde_json::from_value(serde_json::json!({"ids": [create.id]})).unwrap();
+            let (res, _) = relay.db.query(vec![f], 10, now).await;
+            assert!(
+                res.is_empty(),
+                "the vanish must remove the author's own group create"
+            );
+            // ... but it must not revoke the role store (which would drop
+            // every invite code on the next rebuild).
+            assert!(
+                relay.roles.read().await.claims.contains("keep-me"),
+                "a group-state vanish must not drop the NIP-86 invite codes"
+            );
+            assert!(
+                !relay
+                    .roles_rebuild
+                    .dirty
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                "the role store must not be revoked for a group-state removal"
             );
             relay.db.shutdown();
         });

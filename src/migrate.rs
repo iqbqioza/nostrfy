@@ -1148,7 +1148,7 @@ async fn apply_group_deletion(
         );
     }
     stats.group_deletions += 1;
-    Ok(state_removed)
+    Ok(!state_removed.is_empty())
 }
 
 /// NIP-29 `kind:9008`: purge the group's stored events and verify the purge

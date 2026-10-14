@@ -1,6 +1,7 @@
 //! Integration tests for the database layer, exercised through the
 //! public [`DbClient`] API.
 
+use super::store::StateRemoved;
 use super::*;
 use crate::config::DatabaseConfig;
 use crate::event::Event;
@@ -342,7 +343,7 @@ fn expired_events_are_filtered() {
             )
             .await;
         assert!(res.is_empty());
-        assert_eq!(db.purge_expired(now, 0).await, (1, false));
+        assert_eq!(db.purge_expired(now, 0).await, (1, StateRemoved::default()));
 
         // Query filtering must use the earliest value when multiple
         // expiration tags are present, matching storage and purge semantics.
@@ -362,15 +363,15 @@ fn expired_events_are_filtered() {
             )
             .await;
         assert!(res.is_empty());
-        assert_eq!(db.purge_expired(now, 0).await, (1, false));
+        assert_eq!(db.purge_expired(now, 0).await, (1, StateRemoved::default()));
     });
 }
 
 #[test]
-fn purge_expired_reports_group_state_removals() {
+fn purge_expired_reports_state_families() {
     // NIP-40: removing an expired NIP-29/NIP-43 state event must tell the
-    // caller to rebuild the derived state; an ordinary expired post must
-    // not.
+    // caller which derived stores to rebuild; an ordinary expired post must
+    // not. Here both families expire in one pass.
     let db = DbClient::open(
         &config(),
         true,
@@ -405,7 +406,13 @@ fn purge_expired_reports_group_state_removals() {
         db.set_expiry_enabled(true);
         assert_eq!(
             db.purge_expired(now, 0).await,
-            (3, true),
+            (
+                3,
+                StateRemoved {
+                    group: true,
+                    role: true
+                }
+            ),
             "a removed NIP-29/NIP-43 state event must request a rebuild"
         );
     });
@@ -960,7 +967,10 @@ fn banned_events_are_removed_and_rejected() {
         let ev = event(1, "to be banned", now, vec![]);
         assert_eq!(db.put(ev.clone(), now).await, PutOutcome::Stored);
         let id = ev.id_bytes().unwrap();
-        assert_eq!(db.ban_event(id, "spam").await.unwrap(), (true, false));
+        assert_eq!(
+            db.ban_event(id, "spam").await.unwrap(),
+            (true, StateRemoved::default())
+        );
         // Removed from queries.
         let f: Filter = serde_json::from_value(serde_json::json!({"kinds": [1]})).unwrap();
         let (res, _) = db.query(vec![f], 500, now).await;
@@ -1005,7 +1015,7 @@ fn banning_state_event_advances_derived_stamp() {
             db.ban_event(plain.id_bytes().unwrap(), "spam")
                 .await
                 .unwrap(),
-            (true, false)
+            (true, StateRemoved::default())
         );
         assert_eq!(
             db.state_stamp().await,
@@ -1016,7 +1026,7 @@ fn banning_state_event_advances_derived_stamp() {
             db.ban_event(grant.id_bytes().unwrap(), "spam")
                 .await
                 .unwrap(),
-            (true, true)
+            (true, StateRemoved::GROUP)
         );
         assert!(
             db.state_stamp().await > base,
@@ -3389,7 +3399,7 @@ fn events_stored_while_nip40_was_disabled_are_purged_on_reenable() {
         db.set_expiry_enabled(true);
         assert_eq!(
             db.purge_expired(now, 0).await,
-            (1, false),
+            (1, StateRemoved::default()),
             "the event stored while disabled must be purged"
         );
         let f: Filter = serde_json::from_value(serde_json::json!({"ids": [ev.id]})).unwrap();
@@ -4502,7 +4512,10 @@ fn purged_replaceable_can_be_re_published() {
         assert_eq!(db.put(v1.clone(), now).await, PutOutcome::Stored);
         assert_eq!(db.put(v2.clone(), now).await, PutOutcome::Replaced);
         // Later, the purge removes v2 and must clear the slot.
-        assert_eq!(db.purge_expired(now + 10, 0).await, (1, false));
+        assert_eq!(
+            db.purge_expired(now + 10, 0).await,
+            (1, StateRemoved::default())
+        );
         assert_eq!(
             db.put(v1.clone(), now).await,
             PutOutcome::Stored,
@@ -5453,13 +5466,13 @@ fn corrupt_short_keys_do_not_panic_the_removal_walks() {
         );
         assert_eq!(
             db.apply_vanish_checked([0u8; 32], now).await,
-            Some((1, false)),
+            Some((1, StateRemoved::default())),
             "the valid event is still vanished"
         );
         db.set_expiry_enabled(true);
         assert_eq!(
             db.purge_expired(now, 0).await,
-            (1, false),
+            (1, StateRemoved::default()),
             "the valid expired event is still purged"
         );
     });
@@ -5686,10 +5699,14 @@ fn vanish_pubkeys_each_reports_database_failure() {
 }
 
 #[test]
-fn vanish_reports_whether_group_state_was_removed() {
-    // NIP-62: only a removed NIP-29 state event (moderation/join/leave)
-    // requires the derived group state to be rebuilt; deleting ordinary
-    // posts must not trigger the full-history scan.
+fn vanish_reports_state_families() {
+    // NIP-62: the walk classifies the removed events per derived-state
+    // family (NIP-29 group state vs NIP-43 role state). The relay revokes
+    // and rebuilds exactly the reported families, because a role rebuild
+    // replaces the store from events and drops the NIP-86 invite codes
+    // (they have no events behind them). Ordinary posts must not trigger
+    // either rebuild, and a group-only removal must not report the role
+    // family.
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
         let db = DbClient::open(
@@ -5703,7 +5720,7 @@ fn vanish_reports_whether_group_state_was_removed() {
         )
         .unwrap();
         let now = unix_now();
-        // Two distinct authors: a vanished key cannot publish again.
+        // Distinct authors: a vanished key cannot publish again.
         let authored = |kind: u64, pk: &str, created: u64| {
             let mut e = event(kind, "x", created, vec![]);
             e.pubkey = pk.to_string();
@@ -5712,14 +5729,15 @@ fn vanish_reports_whether_group_state_was_removed() {
         };
         let pk_note = "aa".repeat(32);
         let pk_mod = "bb".repeat(32);
+        let pk_role = "cc".repeat(32);
         assert_eq!(
             db.put(authored(1, &pk_note, now), now).await,
             PutOutcome::Stored
         );
         assert_eq!(
             db.apply_vanish_checked([0xaa; 32], now).await,
-            Some((1, false)),
-            "an ordinary post must not require a group state rebuild"
+            Some((1, StateRemoved::default())),
+            "an ordinary post must not require a state rebuild"
         );
         assert_eq!(
             db.put(authored(9000, &pk_mod, now + 1), now + 1).await,
@@ -5727,8 +5745,21 @@ fn vanish_reports_whether_group_state_was_removed() {
         );
         assert_eq!(
             db.apply_vanish_checked([0xbb; 32], now + 1).await,
-            Some((1, true)),
-            "a removed moderation event must require a rebuild"
+            Some((1, StateRemoved::GROUP)),
+            "a removed moderation event must rebuild the group store only"
+        );
+        assert_eq!(
+            db.put(
+                authored(crate::nips::nip43::MEMBERSHIP_LIST, &pk_role, now + 2),
+                now + 2
+            )
+            .await,
+            PutOutcome::Stored
+        );
+        assert_eq!(
+            db.apply_vanish_checked([0xcc; 32], now + 2).await,
+            Some((1, StateRemoved::ROLE)),
+            "a removed role-state event must rebuild the role store only"
         );
         db.shutdown();
     });
@@ -6142,7 +6173,7 @@ fn interrupted_vanish_is_resumed_at_startup() {
         // ...and a re-delivered request is a no-op covered by the marker.
         assert_eq!(
             db.apply_vanish_checked(pk_bytes, now).await,
-            Some((0, false))
+            Some((0, StateRemoved::default()))
         );
     });
     db.shutdown();
@@ -6259,11 +6290,11 @@ fn pending_vanish_is_resumed_at_startup() {
         // The replay short-circuit works after the resume.
         assert_eq!(
             db.apply_vanish_checked(a_bytes, u64::MAX).await,
-            Some((0, false))
+            Some((0, StateRemoved::default()))
         );
         assert_eq!(
             db.apply_vanish_checked(b_bytes, u64::MAX).await,
-            Some((0, false))
+            Some((0, StateRemoved::default()))
         );
     });
     db.shutdown();
@@ -6321,7 +6352,7 @@ fn state_stamp_advances_with_group_state_removals() {
         );
         assert_eq!(
             db.apply_vanish_checked([0xaa; 32], now).await,
-            Some((1, false))
+            Some((1, StateRemoved::default()))
         );
         assert_eq!(
             db.state_stamp().await,
@@ -6336,7 +6367,7 @@ fn state_stamp_advances_with_group_state_removals() {
         );
         assert_eq!(
             db.apply_vanish_checked([0xbb; 32], now).await,
-            Some((1, true))
+            Some((1, StateRemoved::GROUP))
         );
         assert_eq!(db.state_stamp().await, Some(1));
 
@@ -6346,7 +6377,7 @@ fn state_stamp_advances_with_group_state_removals() {
         expiring.tags = vec![vec!["expiration".into(), (now - 50).to_string()]];
         assert_eq!(db.put(expiring, now).await, PutOutcome::Stored);
         db.set_expiry_enabled(true);
-        assert_eq!(db.purge_expired(now, 0).await, (1, true));
+        assert_eq!(db.purge_expired(now, 0).await, (1, StateRemoved::GROUP));
         assert_eq!(db.state_stamp().await, Some(2));
 
         // A group purge bumps the stamp at completion.
@@ -6791,7 +6822,7 @@ fn pending_deletion_is_reported_and_resumed_at_startup() {
             "an interrupted deletion must not report a clean count"
         );
         assert!(
-            state_removed,
+            state_removed.group,
             "the removed moderation event must be reported even though a later chunk failed"
         );
         // The pending record carries the whole request.
@@ -7182,7 +7213,7 @@ fn interrupted_deletion_resume_removes_remaining_state() {
             PutOutcome::Stored
         );
         assert!(
-            db.resumed_deletion_state_removed(),
+            !db.resumed_deletion_state_removed().is_empty(),
             "the resume removed the moderation event and must surface it"
         );
         assert!(
@@ -7235,7 +7266,7 @@ fn shutdown_cancellation_aborts_removals_and_leaves_pending() {
             .apply_deletion_checked(vec![post.id.clone()], vec![], Some(pk.clone()), now, false)
             .await;
         assert!(removed.is_none(), "a cancelled deletion is a failure");
-        assert!(!state);
+        assert!(state.is_empty());
         assert_eq!(
             db.pending_deletions()
                 .await
@@ -7270,7 +7301,7 @@ fn shutdown_cancellation_aborts_removals_and_leaves_pending() {
         );
         assert_eq!(
             db.purge_expired(now, 0).await,
-            (0, false),
+            (0, StateRemoved::default()),
             "a cancelled expiry walk stops at the chunk boundary without removing"
         );
 
@@ -7295,7 +7326,7 @@ fn shutdown_cancellation_aborts_removals_and_leaves_pending() {
         );
         assert_eq!(
             db.purge_expired(now, 0).await,
-            (1, false),
+            (1, StateRemoved::default()),
             "the retry after the cancellation clears the expiry backlog"
         );
     });
@@ -7472,7 +7503,10 @@ fn purge_expired_reaps_old_first_seen_entries() {
             .await;
         assert_eq!(db.table_counts().await.expect("counts").first_seen, 2);
 
-        assert_eq!(db.purge_expired(now, 500).await, (0, false));
+        assert_eq!(
+            db.purge_expired(now, 500).await,
+            (0, StateRemoved::default())
+        );
         assert_eq!(
             db.table_counts().await.expect("counts").first_seen,
             1,
@@ -7491,7 +7525,10 @@ fn purge_expired_reaps_old_first_seen_entries() {
 
         // A zero margin disables the reap (the caller passed no gate).
         db.touch_first_seen_batch(vec![(old, now + 1)]).await;
-        assert_eq!(db.purge_expired(now + 1, 0).await, (0, false));
+        assert_eq!(
+            db.purge_expired(now + 1, 0).await,
+            (0, StateRemoved::default())
+        );
         assert_eq!(db.table_counts().await.expect("counts").first_seen, 2);
     });
     db.shutdown();
@@ -7514,7 +7551,10 @@ fn vanish_pubkeys_raw_page_round_trips() {
         let now = unix_now();
         let keys = [[1u8; 32], [2u8; 32], [3u8; 32]];
         for key in keys {
-            assert_eq!(db.apply_vanish_checked(key, now).await, Some((0, false)));
+            assert_eq!(
+                db.apply_vanish_checked(key, now).await,
+                Some((0, StateRemoved::default()))
+            );
         }
         let first = db
             .vanish_pubkeys_raw_page(None, 2)
@@ -8497,7 +8537,7 @@ fn disk_full_removals_fail_closed_before_any_side_effect() {
             .apply_deletion_checked(vec![post.id.clone()], vec![], Some(pk.clone()), now, false)
             .await;
         assert_eq!(removed, None, "a full-disk deletion must report failure");
-        assert!(!state);
+        assert!(state.is_empty());
         assert!(
             db.pending_deletions().await.expect("pending").is_empty(),
             "a refusal before the walk must not write a delete record"
@@ -8527,7 +8567,7 @@ fn disk_full_removals_fail_closed_before_any_side_effect() {
         );
         assert_eq!(db.take_errors(), 1);
 
-        assert_eq!(db.purge_expired(now, 0).await, (0, false));
+        assert_eq!(db.purge_expired(now, 0).await, (0, StateRemoved::default()));
         assert_eq!(db.take_errors(), 1);
 
         assert_eq!(
@@ -8557,12 +8597,12 @@ fn disk_full_removals_fail_closed_before_any_side_effect() {
         );
         assert_eq!(
             db.apply_vanish_checked([0xab; 32], now).await,
-            Some((0, false)),
+            Some((0, StateRemoved::default())),
             "the post was already deleted, only the marker is written"
         );
         assert_eq!(db.group_purge(gid.to_string(), now).await, Some(1));
         db.set_expiry_enabled(true);
-        assert_eq!(db.purge_expired(now, 0).await, (1, false));
+        assert_eq!(db.purge_expired(now, 0).await, (1, StateRemoved::default()));
         assert_eq!(
             db.delete_gift_wraps_to_checked(recipient_bytes, u64::MAX)
                 .await,
@@ -8611,7 +8651,7 @@ fn nip09_first_chunk_failure_stays_pending_until_startup_resume() {
             removed.is_none(),
             "an interrupted deletion must report failure instead of zero"
         );
-        assert!(!state, "nothing was removed yet");
+        assert!(state.is_empty(), "nothing was removed yet");
         assert_eq!(
             db.table_counts().await.expect("counts").delete_pending,
             1,
@@ -8646,7 +8686,7 @@ fn nip09_first_chunk_failure_stays_pending_until_startup_resume() {
             PutOutcome::Stored
         );
         assert!(
-            db.resumed_deletion_state_removed(),
+            !db.resumed_deletion_state_removed().is_empty(),
             "the resume removed the moderation event and must surface it"
         );
         assert!(
@@ -8691,7 +8731,7 @@ fn nip09_middle_chunk_failure_resumes_at_startup() {
             removed.is_none(),
             "the failed middle chunk must report failure"
         );
-        assert!(!state, "the state event was not reached yet");
+        assert!(state.is_empty(), "the state event was not reached yet");
         assert_eq!(db.table_counts().await.expect("counts").delete_pending, 1);
         assert_eq!(
             db.query(vec![author_filter()], 10, now).await.0.len(),
@@ -8719,7 +8759,7 @@ fn nip09_middle_chunk_failure_resumes_at_startup() {
             PutOutcome::Stored
         );
         assert!(
-            db.resumed_deletion_state_removed(),
+            !db.resumed_deletion_state_removed().is_empty(),
             "the resume must remove the remaining moderation event"
         );
         assert!(
@@ -8918,7 +8958,7 @@ fn vanish_first_chunk_failure_stays_pending_until_startup_resume() {
         );
         assert_eq!(
             db.apply_vanish_checked(pk_bytes, now).await,
-            Some((0, false))
+            Some((0, StateRemoved::default()))
         );
     });
     db.shutdown();
@@ -9203,7 +9243,7 @@ fn purge_expired_first_and_middle_chunk_failures_leave_a_resumable_backlog() {
         faults
             .chunk_after
             .store(1, std::sync::atomic::Ordering::SeqCst);
-        assert_eq!(db.purge_expired(now, 0).await, (0, false));
+        assert_eq!(db.purge_expired(now, 0).await, (0, StateRemoved::default()));
         assert_eq!(db.take_errors(), 1);
         // The scan hides expired events while NIP-40 is on, so read them
         // with the feature off to observe the stored (unpurged) backlog.
@@ -9214,7 +9254,7 @@ fn purge_expired_first_and_middle_chunk_failures_leave_a_resumable_backlog() {
             "a pass that never reached a chunk removes nothing"
         );
         db.set_expiry_enabled(true);
-        assert_eq!(db.purge_expired(now, 0).await, (2, false));
+        assert_eq!(db.purge_expired(now, 0).await, (2, StateRemoved::default()));
         assert!(db.query(vec![kind_filter()], 10, now).await.0.is_empty());
 
         // Middle-chunk failure: 4098 expired events, the moderation state
@@ -9236,7 +9276,7 @@ fn purge_expired_first_and_middle_chunk_failures_leave_a_resumable_backlog() {
             .store(2, std::sync::atomic::Ordering::SeqCst);
         assert_eq!(
             db.purge_expired(now, 0).await,
-            (4096, true),
+            (4096, StateRemoved::GROUP),
             "the first chunk committed (with its state event) before the failure"
         );
         assert_eq!(db.state_stamp().await, Some(1));
@@ -9250,7 +9290,7 @@ fn purge_expired_first_and_middle_chunk_failures_leave_a_resumable_backlog() {
         db.set_expiry_enabled(true);
         assert_eq!(
             db.purge_expired(now, 0).await,
-            (2, false),
+            (2, StateRemoved::default()),
             "the state event was removed by the first pass"
         );
         assert!(

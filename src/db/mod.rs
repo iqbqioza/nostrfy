@@ -392,12 +392,13 @@ enum Msg {
         /// NIP-59: also purge the requester's gift wraps (live NIP-09
         /// only; migration/moderation own their bounded purge).
         purge_wraps: bool,
-        /// `(removed, group_state_removed)`: the count is `None` when the
+        /// `(removed, state_removed)`: the count is `None` when the
         /// removal walk failed (the checked callers must not treat a
-        /// skipped deletion as success), while the flag is still set when
-        /// an earlier chunk removed a NIP-29/NIP-43 state event — a failed
-        /// later chunk must not hide that the derived state went stale.
-        reply: oneshot::Sender<(Option<usize>, bool)>,
+        /// skipped deletion as success), while the families are still
+        /// reported when an earlier chunk removed a NIP-29/NIP-43 state
+        /// event — a failed later chunk must not hide that the derived
+        /// state went stale.
+        reply: oneshot::Sender<(Option<usize>, store::StateRemoved)>,
     },
     /// Records a [`PendingDeletion`] in the `delete_pending` table without
     /// running the walk. The writer queue sheds a deletion under overload
@@ -429,11 +430,12 @@ enum Msg {
         /// NIP-62: events up to this created_at (the request's `.created_at`)
         /// are deleted.
         until_created: u64,
-        /// `Some((removed events, whether a NIP-29/NIP-43 state event was
-        /// among them))`, or `None` when the walk failed (no marker is
+        /// `Some((removed events, which derived-state families lost an
+        /// event))`, or `None` when the walk failed (no marker is
         /// written, so the checked caller does not report success): only a
-        /// removed state event requires the derived state to be rebuilt.
-        reply: oneshot::Sender<Option<(usize, bool)>>,
+        /// removed state event requires the derived state to be rebuilt,
+        /// and only for the families it actually belonged to.
+        reply: oneshot::Sender<Option<(usize, store::StateRemoved)>>,
     },
     /// NIP-59: delete gift wraps addressed to a pubkey (on NIP-09 deletion).
     GiftWrapPurge {
@@ -470,11 +472,11 @@ enum Msg {
         id: Vec<u8>,
         reason: String,
         /// `Ok((removed, state_removed))`: whether the event was stored,
-        /// and whether a removed NIP-29/NIP-43 state event invalidated
-        /// the derived state (see [`Store::apply_ban`]). `Err` is a store
+        /// and which derived-state families a removed NIP-29/NIP-43 state
+        /// event belonged to (see [`Store::apply_ban`]). `Err` is a store
         /// failure — including a pre-ban of an unknown id, which still
         /// lands the ban marker, unlike a failure.
-        reply: oneshot::Sender<anyhow::Result<(bool, bool)>>,
+        reply: oneshot::Sender<anyhow::Result<(bool, store::StateRemoved)>>,
     },
     Unban {
         id: Vec<u8>,
@@ -630,16 +632,16 @@ enum Msg {
     BlossomMarkMigration {
         reply: oneshot::Sender<()>,
     },
-    /// NIP-40 expiration purge: `(removed events, whether a NIP-29/NIP-43
-    /// state event was among them)`. The second field lets the caller
-    /// rebuild the derived state only when it actually changed, and stays
-    /// set when a later chunk fails after removing state events.
+    /// NIP-40 expiration purge: `(removed events, which derived-state
+    /// families lost an event)`. The second field lets the caller rebuild
+    /// exactly the stores that changed, and stays set when a later chunk
+    /// fails after removing state events.
     /// `first_seen_min_age` is the age (seconds) past which `first_seen`
     /// rows are reaped (0 disables the reap).
     PurgeExpired {
         now: u64,
         first_seen_min_age: u64,
-        reply: oneshot::Sender<(usize, bool)>,
+        reply: oneshot::Sender<(usize, store::StateRemoved)>,
     },
     /// Started-but-unfinished NIP-29 group purges as `(gid, purge_now)`
     /// (see `Store::pending_purges`). `None` when the table could not be
@@ -732,7 +734,7 @@ pub struct DbClient {
     /// Set by the writer's startup resume when an interrupted NIP-09
     /// deletion removed a NIP-29/NIP-43 state event, so the startup path
     /// can mark the derived state stale.
-    resumed_deletion_state_removed: Arc<std::sync::atomic::AtomicBool>,
+    resumed_deletion_state_removed: Arc<std::sync::atomic::AtomicU8>,
     /// Seconds a request may wait for the database thread before timing out
     /// (0 = wait forever). Keeps the relay responsive even when the storage
     /// is stuck: timed-out requests fail with a clear error instead of
@@ -1080,14 +1082,16 @@ impl DbClient {
         self.cancel.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Whether the writer's startup resume of an interrupted NIP-09
-    /// deletion removed a NIP-29/NIP-43 state event. The relay checks
-    /// this once at startup to mark its derived group/role state stale
-    /// (the persistent [`Self::state_stamp`] is bumped as well, so the
-    /// snapshot currency check also fails closed).
-    pub fn resumed_deletion_state_removed(&self) -> bool {
-        self.resumed_deletion_state_removed
-            .load(std::sync::atomic::Ordering::Relaxed)
+    /// Which derived-state families the writer's startup resume of an
+    /// interrupted NIP-09 deletion removed (NIP-29 group state / NIP-43
+    /// role state). The relay checks this once at startup to mark exactly
+    /// those stores stale (the persistent [`Self::state_stamp`] is bumped
+    /// as well, so the snapshot currency check also fails closed).
+    pub fn resumed_deletion_state_removed(&self) -> store::StateRemoved {
+        store::StateRemoved::from_bits(
+            self.resumed_deletion_state_removed
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
     }
 
     /// Adjusts the API reader queue cap live (SIGHUP reload). Values below
@@ -1954,10 +1958,11 @@ impl DbClient {
 
     /// Like [`Self::apply_deletion`], reporting a fail-fast/lost writer or
     /// a failed removal walk as `None` in the first element so the caller
-    /// does not treat a skipped deletion as success. The second element is
-    /// the `group_state_removed` flag: it is still reported when the walk
-    /// failed, because a removed NIP-29/NIP-43 state event invalidates the
-    /// derived state even if a later chunk aborted.
+    /// does not treat a skipped deletion as success. The second element
+    /// names the derived-state families that lost an event: it is still
+    /// reported when the walk failed, because a removed NIP-29/NIP-43
+    /// state event invalidates the derived state even if a later chunk
+    /// aborted.
     pub async fn apply_deletion_checked(
         &self,
         targets: Vec<String>,
@@ -1965,7 +1970,7 @@ impl DbClient {
         request_pubkey: Option<String>,
         request_created: u64,
         purge_wraps: bool,
-    ) -> (Option<usize>, bool) {
+    ) -> (Option<usize>, store::StateRemoved) {
         self.request_write(|reply| Msg::Delete {
             targets,
             addresses,
@@ -1992,12 +1997,12 @@ impl DbClient {
 
     /// Like [`Self::apply_group_deletion`], reporting a fail-fast/lost
     /// writer or a failed removal walk as `None` in the first element (see
-    /// [`Self::apply_deletion_checked`] for the group-state flag).
+    /// [`Self::apply_deletion_checked`] for the derived-state families).
     pub async fn apply_group_deletion_checked(
         &self,
         targets: Vec<String>,
         group: String,
-    ) -> (Option<usize>, bool) {
+    ) -> (Option<usize>, store::StateRemoved) {
         self.request_write(|reply| Msg::Delete {
             targets,
             addresses: Vec::new(),
@@ -2099,14 +2104,14 @@ impl DbClient {
     /// Like [`Self::apply_vanish`], reporting a fail-fast/lost writer or a
     /// failed removal walk as `None` (in which case no vanish marker was
     /// written, so the re-delivered request must finish the removal). The
-    /// second element of the tuple is true when the removed history
-    /// contained a NIP-29/NIP-43 state event, so the derived state must be
-    /// rebuilt (a plain post deletion does not change it).
+    /// second element of the tuple names the derived-state families the
+    /// removed history contained, so exactly those stores are rebuilt (a
+    /// plain post deletion changes neither).
     pub async fn apply_vanish_checked(
         &self,
         pubkey: [u8; 32],
         until_created: u64,
-    ) -> Option<(usize, bool)> {
+    ) -> Option<(usize, store::StateRemoved)> {
         self.request_write(|reply| Msg::Vanish {
             pubkey: pubkey.to_vec(),
             until_created,
@@ -2254,12 +2259,17 @@ impl DbClient {
 
     /// Bans an event id (NIP-86 banevent): removes it from storage and
     /// prevents re-publication. Returns whether the event was stored and
-    /// whether a removed NIP-29/NIP-43 state event invalidated the derived
-    /// state (the caller must then rebuild it instead of trusting the
-    /// live groups/roles and the persisted snapshots). Banning an unknown
-    /// id pre-bans it (`Ok((false, false))`); only a store failure is
+    /// which derived-state families a removed NIP-29/NIP-43 state event
+    /// belonged to (the caller must then rebuild exactly those stores
+    /// instead of trusting the live groups/roles and the persisted
+    /// snapshots). Banning an unknown id pre-bans it
+    /// (`Ok((false, StateRemoved::default()))`); only a store failure is
     /// an `Err` (NIP-86 reports `true` for every landed mutation).
-    pub async fn ban_event(&self, id: [u8; 32], reason: &str) -> anyhow::Result<(bool, bool)> {
+    pub async fn ban_event(
+        &self,
+        id: [u8; 32],
+        reason: &str,
+    ) -> anyhow::Result<(bool, store::StateRemoved)> {
         self.request_write_checked(|reply| Msg::Ban {
             id: id.to_vec(),
             reason: reason.to_string(),
@@ -2658,13 +2668,17 @@ impl DbClient {
             .await;
     }
 
-    /// NIP-40 expiration purge: `(removed events, whether a NIP-29/NIP-43
-    /// state event was among them)`. The caller rebuilds the derived state
-    /// only when the second field is true; on a failed later chunk the
-    /// partial counts are still reported. `first_seen_min_age` is the age
-    /// (seconds) past which `first_seen` rows are reaped (0 disables the
-    /// reap), so the table cannot grow forever.
-    pub async fn purge_expired(&self, now: u64, first_seen_min_age: u64) -> (usize, bool) {
+    /// NIP-40 expiration purge: `(removed events, which derived-state
+    /// families lost an event)`. The caller rebuilds only the stores whose
+    /// families are reported; on a failed later chunk the partial counts
+    /// are still reported. `first_seen_min_age` is the age (seconds) past
+    /// which `first_seen` rows are reaped (0 disables the reap), so the
+    /// table cannot grow forever.
+    pub async fn purge_expired(
+        &self,
+        now: u64,
+        first_seen_min_age: u64,
+    ) -> (usize, store::StateRemoved) {
         self.request_write(|reply| Msg::PurgeExpired {
             now,
             first_seen_min_age,

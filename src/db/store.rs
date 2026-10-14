@@ -248,12 +248,62 @@ pub(crate) fn state_kind_family(kind: u64) -> Option<StateFamily> {
     }
 }
 
-/// Whether a `kind` event feeds any derived state (NIP-29 group state or
-/// NIP-43 role state). Used by the removal paths, which bump the shared
-/// [`STATE_STAMP_KEY`] because a stamp change must invalidate both snapshot
-/// families.
-pub(crate) fn is_group_state_kind(kind: u64) -> bool {
-    state_kind_family(kind).is_some()
+/// Which derived-state families lost at least one stored event to a
+/// removal walk (NIP-29 group state, NIP-43 role state). The removal paths
+/// bump the shared [`STATE_STAMP_KEY`] when either family is affected, but
+/// a caller must revoke and rebuild only the families actually touched: a
+/// role rebuild replaces the store from events and drops the NIP-86 invite
+/// codes, which have no events behind them, so a group-state removal must
+/// not revoke the role store.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct StateRemoved {
+    pub group: bool,
+    pub role: bool,
+}
+
+impl StateRemoved {
+    /// Folds one removed event's kind into the set.
+    pub(crate) fn observe(&mut self, kind: u64) {
+        match state_kind_family(kind) {
+            Some(StateFamily::Group) => self.group = true,
+            Some(StateFamily::Role) => self.role = true,
+            None => {}
+        }
+    }
+
+    pub(crate) fn merge(&mut self, other: Self) {
+        self.group |= other.group;
+        self.role |= other.role;
+    }
+
+    pub(crate) fn is_empty(self) -> bool {
+        !self.group && !self.role
+    }
+
+    /// Group family only (NIP-29); a named value for tests.
+    #[cfg(test)]
+    pub(crate) const GROUP: Self = Self {
+        group: true,
+        role: false,
+    };
+    /// Role family only (NIP-43); a named value for tests.
+    #[cfg(test)]
+    pub(crate) const ROLE: Self = Self {
+        group: false,
+        role: true,
+    };
+
+    /// Bit encoding for the atomic shared with the startup recovery.
+    pub(crate) fn to_bits(self) -> u8 {
+        u8::from(self.group) | (u8::from(self.role) << 1)
+    }
+
+    pub(crate) fn from_bits(bits: u8) -> Self {
+        Self {
+            group: bits & 1 != 0,
+            role: bits & 2 != 0,
+        }
+    }
 }
 pub(crate) const CREATED_LEN: usize = 8;
 pub(crate) const ID_LEN: usize = 32;

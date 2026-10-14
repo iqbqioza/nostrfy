@@ -1636,19 +1636,22 @@ async fn purge_loop(relay: Arc<Relay>, mut shutdown: watch::Receiver<bool>) {
                 };
                 let purge = relay.db.purge_expired(now, first_seen_min_age);
                 tokio::select! {
-                    (removed, state_changed) = purge => {
+                    (removed, state_removed) = purge => {
                         if removed > 0 {
                             info!("purged {removed} expired events");
                         }
-                        if state_changed {
-                            // The purge removed group/role state events
-                            // (NIP-40 expiration): the derived state must
-                            // not keep authorizing members whose grant
-                            // expired. Both rebuilds are coalesced and run
-                            // in the background; the role store is revoked
-                            // immediately so expired grants stop
-                            // authorizing even before its scan completes.
+                        if state_removed.group {
+                            // An expired NIP-29 group-state event: the
+                            // derived state must not keep authorizing
+                            // members whose grant expired. The rebuild is
+                            // coalesced and runs in the background.
                             relay.mark_group_state_stale().await;
+                        }
+                        if state_removed.role {
+                            // An expired NIP-43 role-state event: revoke
+                            // the role store immediately so expired grants
+                            // stop authorizing even before its scan
+                            // completes.
                             relay.mark_roles_stale().await;
                         }
                     }
