@@ -7,11 +7,11 @@ use super::db_error;
 #[cfg(test)]
 use super::store::take_chunk_fault;
 use super::store::{
-    CREATED_LEN, GIFT_WRAP_INDEX, ID_LEN, Store, TAG_INDEX_VALUE_MAX, created_key,
+    CREATED_LEN, GIFT_WRAP_INDEX, ID_LEN, StateRemoved, Store, TAG_INDEX_VALUE_MAX, created_key,
     decode_pending_purge, decode_purged_group_marker, delegated_by, deleted_address_key,
     dtag_key_safe, encode_pending_deletion, encode_pending_purge, encode_purged_group_marker,
-    is_group_state_kind, pending_deletion_key, pubkey_key, purged_group_key, replaceable_key,
-    replaceable_key_range_end, tag_key,
+    pending_deletion_key, pubkey_key, purged_group_key, replaceable_key, replaceable_key_range_end,
+    tag_key,
 };
 use crate::error::Result;
 use crate::event::Event;
@@ -32,14 +32,15 @@ const REMOVAL_CHUNK: usize = 4096;
 const SCOPED_TOMBSTONE_MAX: usize = 4;
 
 /// The partial outcome of a chunked removal walk: what was removed before
-/// the walk ended, whether the removed events feed the derived NIP-29 /
-/// NIP-43 state, and the failure that stopped it (if any). The counters
-/// stay meaningful when `error` is `Some`: a later chunk that failed must
-/// not hide the state events an earlier chunk already removed (the derived
-/// state still needs the rebuild), nor the events it already removed.
+/// the walk ended, which derived-state families the removed events feed
+/// (NIP-29 group state / NIP-43 role state), and the failure that stopped
+/// it (if any). The counters stay meaningful when `error` is `Some`: a
+/// later chunk that failed must not hide the state events an earlier chunk
+/// already removed (the derived state still needs the rebuild), nor the
+/// events it already removed.
 pub(crate) struct RemovalReport {
     pub removed: usize,
-    pub group_state_removed: bool,
+    pub state_removed: StateRemoved,
     pub error: Option<anyhow::Error>,
 }
 
@@ -270,7 +271,7 @@ impl Store {
         purge_wraps: bool,
     ) -> RemovalReport {
         let mut removed = 0usize;
-        let mut group_state_removed = false;
+        let mut state_removed = StateRemoved::default();
         let error = self
             .apply_deletion_walk(
                 targets,
@@ -280,12 +281,12 @@ impl Store {
                 group,
                 purge_wraps,
                 &mut removed,
-                &mut group_state_removed,
+                &mut state_removed,
             )
             .err();
         RemovalReport {
             removed,
-            group_state_removed,
+            state_removed,
             error,
         }
     }
@@ -305,7 +306,7 @@ impl Store {
         group: Option<&str>,
         purge_wraps: bool,
         removed: &mut usize,
-        group_state_removed: &mut bool,
+        state_removed: &mut StateRemoved,
     ) -> Result<()> {
         // Disk-full guard: a removal still writes (the deleted marker),
         // so the same SIGBUS protection as the put path applies.
@@ -352,7 +353,7 @@ impl Store {
                 return Err(anyhow::anyhow!("test-only removal chunk failure"));
             }
             let mut wtxn = self.env.write_txn()?;
-            let mut chunk_state_removed = false;
+            let mut chunk_state_removed = StateRemoved::default();
             for target in chunk {
                 let Ok(id) = hex::decode(target) else {
                     continue;
@@ -408,19 +409,19 @@ impl Store {
                 }
                 self.deleted.put(&mut wtxn, &id, b"")?;
                 // The derived NIP-29/NIP-43 state is built from these kinds
-                // (see `is_group_state_kind`): the stamp must advance in the
+                // (`state_kind_family`): the stamp must advance in the
                 // same removal transaction, or a crash after this commit
                 // could restore a snapshot that still authorizes the
                 // deleted grant.
-                chunk_state_removed |= is_group_state_kind(event.kind);
+                chunk_state_removed.observe(event.kind);
                 self.remove_event(&mut wtxn, &id)?;
                 *removed += 1;
             }
-            if chunk_state_removed {
+            if !chunk_state_removed.is_empty() {
                 self.bump_state_stamp(&mut wtxn)?;
             }
             wtxn.commit()?;
-            *group_state_removed |= chunk_state_removed;
+            state_removed.merge(chunk_state_removed);
             // Test-only: fail after the chunk committed, so the resume
             // path runs over a genuinely partial walk.
             #[cfg(test)]
@@ -533,7 +534,7 @@ impl Store {
                 self.removal_scanned
                     .fetch_add(entries.len() as u64, std::sync::atomic::Ordering::SeqCst);
                 last_key = Some(entries.last().unwrap().0.clone());
-                let mut chunk_state_removed = false;
+                let mut chunk_state_removed = StateRemoved::default();
                 for (key, value) in entries {
                     // key = kind(8) + pubkey(32) + dlen(4) + d
                     if key.len() < CREATED_LEN + ID_LEN + 4 {
@@ -592,15 +593,15 @@ impl Store {
                     // whether the derived state must be invalidated. Bumped
                     // in the same transaction as the removal (see the
                     // `e`-tag path).
-                    chunk_state_removed |= is_group_state_kind(address.kind);
+                    chunk_state_removed.observe(address.kind);
                     self.remove_event(&mut wtxn, id)?;
                     *removed += 1;
                 }
-                if chunk_state_removed {
+                if !chunk_state_removed.is_empty() {
                     self.bump_state_stamp(&mut wtxn)?;
                 }
                 wtxn.commit()?;
-                *group_state_removed |= chunk_state_removed;
+                state_removed.merge(chunk_state_removed);
                 // See the `e`-tag walk: fail after a committed chunk so the
                 // resume runs over a partial removal.
                 #[cfg(test)]
@@ -689,28 +690,25 @@ impl Store {
     /// in the same transaction (otherwise a restart restores the banned
     /// grant from a still-current snapshot), and reports it so the caller
     /// rebuilds the live derived state.
-    pub(crate) fn apply_ban(&self, id: &[u8], reason: &str) -> Result<(bool, bool)> {
+    pub(crate) fn apply_ban(&self, id: &[u8], reason: &str) -> Result<(bool, StateRemoved)> {
         self.disk_full_error()?;
         let mut wtxn = self.env.write_txn()?;
         self.banned.put(&mut wtxn, id, reason.as_bytes())?;
         // NIP-86: a ban removes the event from the allow list, in the
         // same transaction so the two markers can never disagree.
         self.allowed.delete(&mut wtxn, id)?;
-        let mut state_removed = false;
+        let mut state_removed = StateRemoved::default();
         let removed = match self.events.get(&wtxn, id)? {
             Some(raw) => {
                 // Classify before removing: only a stored NIP-29/NIP-43
                 // state event invalidates the derived state (an event that
                 // fails to parse is still removed, but, like the e-tag
                 // path, cannot be classified as state).
-                if serde_json::from_slice::<Event>(raw)
-                    .map(|event| is_group_state_kind(event.kind))
-                    .unwrap_or(false)
-                {
-                    state_removed = true;
+                if let Ok(event) = serde_json::from_slice::<Event>(raw) {
+                    state_removed.observe(event.kind);
                 }
                 self.remove_event(&mut wtxn, id)?;
-                if state_removed {
+                if !state_removed.is_empty() {
                     self.bump_state_stamp(&mut wtxn)?;
                 }
                 true
@@ -1156,7 +1154,11 @@ impl Store {
     /// snapshots on every delivery). Only the *completed* marker
     /// short-circuits: an in-progress record means the walk was interrupted
     /// and must be retried.
-    pub(crate) fn apply_vanish(&self, pubkey: &[u8], until_created: u64) -> Result<(usize, bool)> {
+    pub(crate) fn apply_vanish(
+        &self,
+        pubkey: &[u8],
+        until_created: u64,
+    ) -> Result<(usize, StateRemoved)> {
         self.disk_full_error()?;
         // Replay check: a completed marker covering this request means every
         // event up to its cut was already removed, so there is nothing to do.
@@ -1169,7 +1171,7 @@ impl Store {
                 .vanished_until(&rtxn, pubkey)?
                 .is_some_and(|covered| covered >= until_created)
             {
-                return Ok((0, false));
+                return Ok((0, StateRemoved::default()));
             }
         }
         // Persist the in-progress record *before* the first removal chunk:
@@ -1222,16 +1224,16 @@ impl Store {
     pub(crate) fn resume_pending_deletions(
         &self,
         errors: &Arc<std::sync::atomic::AtomicU64>,
-    ) -> (usize, bool) {
+    ) -> (usize, StateRemoved) {
         let pending = match self.pending_deletions_and_keys() {
             Ok(pending) => pending,
             Err(e) => {
                 db_error(errors, &e);
-                return (0, false);
+                return (0, StateRemoved::default());
             }
         };
         let mut completed = 0usize;
-        let mut group_state_removed = false;
+        let mut state_removed = StateRemoved::default();
         for (record_key, request) in pending {
             if self.cancelled() {
                 break;
@@ -1256,7 +1258,7 @@ impl Store {
                 request.group.as_deref(),
                 request.purge_wraps,
             );
-            group_state_removed |= report.group_state_removed;
+            state_removed.merge(report.state_removed);
             match report.error {
                 Some(e) => db_error(errors, &e),
                 None => {
@@ -1270,7 +1272,7 @@ impl Store {
                 }
             }
         }
-        (completed, group_state_removed)
+        (completed, state_removed)
     }
 
     /// Every started-but-unfinished vanish as `(pubkey, until_created)`,
@@ -1332,16 +1334,18 @@ impl Store {
     /// derived-state stamp is bumped inside each chunk's transaction that
     /// removed a NIP-29/NIP-43 state event, so a crash later in the walk
     /// cannot lose the fact that the derived state changed.
-    fn finish_vanish(&self, pubkey: &[u8], until_created: u64) -> Result<(usize, bool)> {
+    fn finish_vanish(&self, pubkey: &[u8], until_created: u64) -> Result<(usize, StateRemoved)> {
         // The resume path enters here directly: refuse to write to a full
         // disk like every other write path (SIGBUS protection).
         self.disk_full_error()?;
         let mut removed = 0usize;
-        // Whether a NIP-29/NIP-43 state event (moderation/join/leave/role
-        // mutation) was removed: only then does the derived state need a
-        // rebuild. Deleting a member's ordinary posts must not trigger a
+        // Which derived-state families the removed events feed (NIP-29
+        // moderation/join/leave vs NIP-43 role state): the two stores are
+        // marked stale and rebuilt separately, because a role rebuild drops
+        // the NIP-86 invite codes (they have no events behind them).
+        // Deleting a member's ordinary posts must not trigger a
         // full-history scan.
-        let mut group_state_removed = false;
+        let mut state_removed = StateRemoved::default();
         let start = pubkey_key(pubkey, 0, &[0u8; ID_LEN]);
         // NIP-62: the request deletes the pubkey's history *until its
         // `.created_at`* — events published (timestamped) after the request
@@ -1394,7 +1398,7 @@ impl Store {
             }
             last_key = Some(entries.last().unwrap().0.clone());
             let pubkey_hex = hex::encode(pubkey);
-            let mut chunk_state_removed = false;
+            let mut chunk_state_removed = StateRemoved::default();
             for (key, id) in entries {
                 let Some(raw) = self.events.get(&wtxn, &id)? else {
                     continue;
@@ -1416,15 +1420,15 @@ impl Store {
                     }
                     continue;
                 }
-                chunk_state_removed |= is_group_state_kind(event.kind);
+                chunk_state_removed.observe(event.kind);
                 self.remove_event(&mut wtxn, &id)?;
                 removed += 1;
             }
-            if chunk_state_removed {
+            if !chunk_state_removed.is_empty() {
                 // The stamp and the state-event removals commit atomically.
                 self.bump_state_stamp(&mut wtxn)?;
             }
-            group_state_removed |= chunk_state_removed;
+            state_removed.merge(chunk_state_removed);
             wtxn.commit()?;
         }
 
@@ -1453,7 +1457,7 @@ impl Store {
         self.vanish_pending.delete(&mut wtxn, pubkey)?;
         wtxn.commit()?;
 
-        Ok((removed, group_state_removed))
+        Ok((removed, state_removed))
     }
 
     /// NIP-59: relays SHOULD delete `kind:1059` gift wraps addressed to a
@@ -1477,19 +1481,18 @@ impl Store {
     /// The returned report carries the partial counters on a failed chunk
     /// (the backlog is unbounded, so a MapFull mid-pass must not hide the
     /// state events an earlier chunk already removed), and its
-    /// `group_state_removed` flag reports whether a NIP-29/NIP-43 state
-    /// event was among the removals so the caller rebuilds the derived
-    /// state.
+    /// `state_removed` families report which derived stores changed so the
+    /// caller rebuilds exactly those.
     pub(crate) fn purge_expired(&self, now: u64, first_seen_min_age: u64) -> RemovalReport {
         let mut removed = 0usize;
-        let mut group_state_removed = false;
+        let mut state_removed = StateRemoved::default();
         let error = self
-            .purge_expired_walk(now, &mut removed, &mut group_state_removed)
+            .purge_expired_walk(now, &mut removed, &mut state_removed)
             .and_then(|()| self.reap_first_seen(now, first_seen_min_age))
             .err();
         RemovalReport {
             removed,
-            group_state_removed,
+            state_removed,
             error,
         }
     }
@@ -1501,7 +1504,7 @@ impl Store {
         &self,
         now: u64,
         removed: &mut usize,
-        group_state_removed: &mut bool,
+        state_removed: &mut StateRemoved,
     ) -> Result<()> {
         self.disk_full_error()?;
         // NIP-40 disabled: nothing is expired. Stale entries written while
@@ -1550,11 +1553,11 @@ impl Store {
                 break;
             }
             last_key = Some(entries.last().unwrap().0.clone());
-            let mut chunk_state_removed = false;
+            let mut chunk_state_removed = StateRemoved::default();
             for (key, id) in entries {
                 if let Some(raw) = self.events.get(&wtxn, &id)? {
                     if let Ok(event) = serde_json::from_slice::<Event>(raw) {
-                        chunk_state_removed |= is_group_state_kind(event.kind);
+                        chunk_state_removed.observe(event.kind);
                     }
                     self.remove_event(&mut wtxn, &id)?;
                     *removed += 1;
@@ -1565,14 +1568,14 @@ impl Store {
                     self.expiry.delete(&mut wtxn, &key)?;
                 }
             }
-            if chunk_state_removed {
+            if !chunk_state_removed.is_empty() {
                 // The stamp and the state-event removals commit atomically
                 // (a separate bump transaction would let a crash lose the
                 // fact that the derived state changed).
                 self.bump_state_stamp(&mut wtxn)?;
             }
             wtxn.commit()?;
-            *group_state_removed |= chunk_state_removed;
+            state_removed.merge(chunk_state_removed);
         }
         Ok(())
     }

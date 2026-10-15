@@ -136,10 +136,12 @@ pub(crate) struct DbThreads {
     pub(crate) overloads: Arc<std::sync::atomic::AtomicU64>,
     pub(crate) expiry: Arc<std::sync::atomic::AtomicBool>,
     /// Set once at startup when the resumed NIP-09 deletions removed a
-    /// NIP-29/NIP-43 state event: the relay must mark its derived state
-    /// stale (the persistent state stamp was bumped too, but the direct
-    /// fact lets the startup path act without comparing snapshots).
-    pub(crate) resumed_deletion_state_removed: Arc<std::sync::atomic::AtomicBool>,
+    /// NIP-29/NIP-43 state event: the relay must mark exactly the
+    /// derived-state families that lost an event stale (the persistent
+    /// state stamp was bumped too, but the direct fact lets the startup
+    /// path act without comparing snapshots). Encoded with
+    /// [`super::store::StateRemoved::to_bits`].
+    pub(crate) resumed_deletion_state_removed: Arc<std::sync::atomic::AtomicU8>,
     /// Receives one message when the writer finished its startup recovery
     /// (interrupted vanish/deletion resumes and the outcome flag). The
     /// [`super::DbClient`] constructor waits on it, so the recovery is
@@ -602,7 +604,7 @@ pub(crate) fn spawn(
     let api_pending_bytes_thread = Arc::clone(&api_pending_bytes);
     // Set by the writer's startup resume of interrupted NIP-09 deletions
     // (see `DbThreads::resumed_deletion_state_removed`).
-    let resumed_deletion_state_removed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let resumed_deletion_state_removed = Arc::new(std::sync::atomic::AtomicU8::new(0));
     let thread_resumed_deletion_state_removed = Arc::clone(&resumed_deletion_state_removed);
     // The writer signals once its startup recovery finished; the client
     // constructor waits here (see `DbThreads::recovery_rx`).
@@ -754,8 +756,10 @@ pub(crate) fn spawn(
         if resumed_deletions > 0 {
             log::info!("resumed {resumed_deletions} interrupted deletion request(s)");
         }
-        thread_resumed_deletion_state_removed
-            .store(deletion_state_removed, std::sync::atomic::Ordering::SeqCst);
+        thread_resumed_deletion_state_removed.store(
+            deletion_state_removed.to_bits(),
+            std::sync::atomic::Ordering::SeqCst,
+        );
         // Recovery is complete and its outcome is visible: release the
         // `DbClient::open` barrier. A send failure only means the client
         // was never built (the receiver is dropped), which is harmless.
@@ -1206,10 +1210,8 @@ pub(crate) fn spawn(
                                     if let Some(e) = &report.error {
                                         db_error(&thread_errors, e);
                                     }
-                                    let _ = reply.send((
-                                        report.checked_removed(),
-                                        report.group_state_removed,
-                                    ));
+                                    let _ = reply
+                                        .send((report.checked_removed(), report.state_removed));
                                 }
                                 Msg::RecordPendingDeletion { request, reply } => {
                                     match store.record_pending_deletion(&request) {
@@ -1524,8 +1526,7 @@ pub(crate) fn spawn(
                                     if let Some(e) = &report.error {
                                         db_error(&thread_errors, e);
                                     }
-                                    let _ =
-                                        reply.send((report.removed, report.group_state_removed));
+                                    let _ = reply.send((report.removed, report.state_removed));
                                 }
                                 Msg::PendingPurges { reply } => {
                                     let pending = match store.pending_purges() {
