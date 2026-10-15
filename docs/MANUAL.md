@@ -172,7 +172,7 @@ If anything is wrong, it tells you exactly what. It is strongly recommended to r
 | `new_pubkey_min_age_secs` | Reject posts from accounts younger than this (spam defense, 0 = off) | `0` |
 | `max_events_per_min_per_pubkey` | Max events a pubkey may publish per minute (0 = unlimited) | `0` |
 | `max_groups` | NIP-29 in-memory group store cap (active + deleted markers; must be ≥ 1, `0` is rejected) | `1000` |
-| `require_auth` | Require NIP-42 auth for everything (subscriptions and publishing) | `false` |
+| `require_auth` | Require NIP-42 auth for everything (subscriptions and publishing; REST API reads require NIP-98) | `false` |
 | `send_auth_challenge` | Send an AUTH challenge on connect | `true` |
 | `enabled_nip78_auth` | Require NIP-42 AUTH before accepting kind 78/30078 events and serve them only to the authenticated owner | `true` |
 | `enabled_command_events` | Execute kind:1 operator commands (authored by the admin pubkey `relay.pubkey`) that edit the relay/blossom allow lists, answered with kind:1111 events | `false` |

@@ -8,8 +8,11 @@ use std::sync::Arc;
 
 use anyhow::anyhow;
 use axum::Json;
-use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::extract::{Path, Query, Request, State};
+use axum::http::header;
+use axum::http::{Method, StatusCode};
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -17,7 +20,7 @@ use crate::config::Config;
 use crate::event::Event;
 use crate::filter::Filter;
 use crate::nips::nip19::{self, Nip19Entity};
-use crate::nips::{nip29, nip62, nip70, nip78};
+use crate::nips::{nip29, nip62, nip70, nip78, nip98};
 use crate::relay::Relay;
 use crate::util::unix_now;
 
@@ -228,6 +231,108 @@ fn error_response(status: StatusCode, message: &str) -> (StatusCode, Json<Value>
     (status, Json(json!({ "error": message })))
 }
 
+/// The 401 for a refused REST API read on a `require_auth` relay.
+fn api_auth_required() -> Response {
+    error_response(
+        StatusCode::UNAUTHORIZED,
+        "auth-required: this relay requires NIP-98 authorization",
+    )
+    .into_response()
+}
+
+/// NIP-98 `u` matching for the REST API: the exact request URL under the
+/// relay's own origin ([`nip98::matches_request_url`]), or — when the API is
+/// isolated on `server.api_host` — under that hostname only (the client
+/// signs the URL it actually requested). The scheme follows the relay
+/// origin (`https` for a TLS-terminating public URL, `http` otherwise);
+/// `api_host` is a bare hostname, so the proxy's default port is implicit.
+fn api_url_matches(cfg: &Config, url: &str, path: &str, query: Option<&str>) -> bool {
+    let host = cfg.server.api_host.trim();
+    if host.is_empty() {
+        return nip98::matches_request_url(url, &cfg.relay_identity(), path, query);
+    }
+    let origin = cfg.relay_identity().http_origin();
+    let scheme = origin.split_once("://").map(|(s, _)| s).unwrap_or("http");
+    let mut expected = format!("{scheme}://{host}{path}");
+    if let Some(query) = query {
+        expected.push('?');
+        expected.push_str(query);
+    }
+    url == expected
+}
+
+/// Enforces `relay.require_auth` on the REST API, mirroring the WebSocket
+/// read gate (anonymous REQ/COUNT/NEG are refused): a NIP-98
+/// `Authorization: Nostr <base64 kind:27235>` must sign this exact URL
+/// (path and query, see [`nip98::matches_request_url`]), carry the request
+/// method and fall inside the 60-second freshness window; the signature
+/// and one-request replay checks are the shared NIP-98 ones. A banned
+/// pubkey is refused like a NIP-86 grantee. The API mounts only
+/// `GET`/`HEAD` handlers, so other methods are refused here rather than
+/// authorized without the NIP-98 body-hash check. Without `require_auth`
+/// the API stays anonymous (the per-event rules in [`api_visible`] still
+/// apply).
+pub async fn api_auth_middleware(relay: Arc<Relay>, request: Request, next: Next) -> Response {
+    let verified = {
+        let cfg = relay.config.read().await;
+        if !cfg.relay.require_auth {
+            drop(cfg);
+            return next.run(request).await;
+        }
+        if request.method() != Method::GET && request.method() != Method::HEAD {
+            drop(cfg);
+            return api_auth_required();
+        }
+        // `nest("/api/v1", ...)` rewrites the URI the nested router (and
+        // its middleware) sees to the stripped path, so the NIP-98 `u`
+        // comparison must use the original request URI (NIP-98: the tag is
+        // the exact absolute request URL, path and query included).
+        let uri = request
+            .extensions()
+            .get::<axum::extract::OriginalUri>()
+            .map(|original| original.0.clone())
+            .unwrap_or_else(|| request.uri().clone());
+        request
+            .headers()
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(nip98::strip_nostr_scheme)
+            .and_then(|encoded| {
+                nip98::verify(
+                    encoded,
+                    None,
+                    relay.secp(),
+                    false,
+                    None,
+                    request.method().as_str(),
+                    |url| api_url_matches(&cfg, url, uri.path(), uri.query()),
+                )
+            })
+    };
+    let Some(verified) = verified else {
+        return api_auth_required();
+    };
+    if !relay
+        .nip98_replay
+        .accept(&verified.id, unix_now(), verified.created_at)
+    {
+        return api_auth_required();
+    }
+    // A banned pubkey must not read an auth-required relay, exactly like a
+    // NIP-86 grantee.
+    if relay
+        .access
+        .read()
+        .await
+        .blocked_pubkeys
+        .iter()
+        .any(|(banned, _)| banned.eq_ignore_ascii_case(&verified.pubkey))
+    {
+        return api_auth_required();
+    }
+    next.run(request).await
+}
+
 /// Answers a rejected API query parameter.
 fn param_rejection(e: anyhow::Error) -> (StatusCode, Json<Value>) {
     error_response(StatusCode::BAD_REQUEST, &e.to_string())
@@ -293,12 +398,14 @@ fn excluded_tags(params: &ApiParams) -> Vec<&'static str> {
     out
 }
 
-/// Whether a stored event is visible to this unauthenticated REST API.
-/// It applies the same per-event visibility rules as an anonymous
-/// WebSocket connection: NIP-70 protected events, NIP-59 gift wraps,
-/// NIP-29 private/hidden group content and (when the NIP-78 AUTH gate is
-/// active) NIP-78 application-specific events are withheld. Unlike the
-/// WebSocket paths, `relay.require_auth` does not gate this API.
+/// Whether a stored event is visible to the REST API. It applies the same
+/// per-event visibility rules as an anonymous WebSocket connection:
+/// NIP-70 protected events, NIP-59 gift wraps, NIP-29 private/hidden group
+/// content and (when the NIP-78 AUTH gate is active) NIP-78
+/// application-specific events are withheld. `relay.require_auth` is
+/// enforced separately by [`api_auth_middleware`]; this predicate stays
+/// the anonymous-visibility one, so an authorized caller sees the same
+/// event set as before (the API exposes no identity-scoped reads).
 fn api_visible(
     event: &Event,
     groups: Option<&nip29::GroupStore>,
@@ -1820,9 +1927,9 @@ async fn query_and_respond(
         }
     }
 
-    // The REST API is unauthenticated, so it applies the same per-event
-    // visibility rules as an anonymous WebSocket connection (see
-    // `api_visible`; `relay.require_auth` does not gate this API): NIP-70
+    // The REST API applies the same per-event visibility rules as an
+    // anonymous WebSocket connection (see `api_visible`; the
+    // `require_auth` gate runs earlier in `api_auth_middleware`): NIP-70
     // protected events, NIP-59 gift wraps and NIP-29 private/hidden group
     // content are withheld. Only the group read lock is taken when a batch
     // actually contains group events (the common case has none).

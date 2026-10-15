@@ -2,11 +2,10 @@
 #
 # For a closed community: `require_auth = true` (below) makes every
 # WebSocket session complete NIP-42 AUTH before it may publish or
-# subscribe, and `restrict_relay = true` narrows publishing to the allow
-# list. Note the unauthenticated REST API (/api/v1) is NOT gated by
-# `require_auth`: it keeps serving the events its per-event visibility
-# rules allow, so a relay that must not be readable anonymously should
-# not rely on `require_auth` alone.
+# subscribe, and every REST API (/api/v1) request carry a NIP-98
+# authorization. `restrict_relay = true` narrows publishing to the allow
+# list. (An authorized API caller still sees only the anonymous-visibility
+# event set: the API has no identity-scoped reads.)
 
 [relay]
 name = "nostrfy private"

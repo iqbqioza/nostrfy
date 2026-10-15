@@ -202,7 +202,7 @@ Pagination is computed over the **visible** sequence (see [Visibility Rules](#6-
 
 ## 6. Visibility Rules
 
-The API is unauthenticated and applies the same per-event visibility rules as an **anonymous** WebSocket connection — with one exception: `relay.require_auth` gates WebSocket REQ/COUNT/NEG but does **not** gate this API, so an auth-required relay remains readable here. The following events are withheld:
+The API applies the same per-event visibility rules as an **anonymous** WebSocket connection, and `relay.require_auth` gates it like one: every request must then carry a NIP-98 `Authorization: Nostr <base64 kind:27235 event>` whose `u` tag is the exact request URL (path and query; with `server.api_host` set, that host's URL) and whose `method` tag is `GET`; the event must be fresh (60 seconds) and each authorization is accepted once. Anonymous requests are refused with `401 {"error":"auth-required: this relay requires NIP-98 authorization"}`. An authorized caller still sees the anonymous-visibility event set — the API has no identity-scoped reads. The following events are withheld:
 
 - **NIP-70 protected events** (carrying a `-` tag)
 - **NIP-59 gift wraps** (kind 1059)

@@ -92,7 +92,7 @@ Every key is optional; a missing key uses the default shown below.
 | `require_pow` | integer | `0` | Required proof-of-work difficulty in leading zero bits (`0` = off; enforced regardless of NIP-13 advertisement) |
 | `new_pubkey_min_age_secs` | integer | `0` | Reject events from pubkeys first seen less than this many seconds ago (`0` = off) |
 | `max_groups` | integer | `1000` | Cap on the in-memory NIP-29 group store (active groups plus deleted-group markers); must be ≥ 1 |
-| `require_auth` | boolean | `false` | Require NIP-42 authentication for all REQ/EVENT/COUNT/NEG |
+| `require_auth` | boolean | `false` | Require NIP-42 authentication for all REQ/EVENT/COUNT/NEG (REST API reads require NIP-98) |
 | `send_auth_challenge` | boolean | `true` | Send the AUTH challenge on connect |
 | `enabled_nip78_auth` | boolean | `true` | Require NIP-42 AUTH before accepting kind 78/30078 events and serve them only to the authenticated owner |
 | `enabled_command_events` | boolean | `false` | Execute kind:1 operator commands authored by the admin pubkey `relay.pubkey` (see below) |
@@ -137,7 +137,7 @@ Every key is optional; a missing key uses the default shown below.
 
 **`max_groups`** — The cap on the in-memory NIP-29 group store. The store keeps the active groups plus a marker per deleted group (the marker is permanent so a deleted group cannot be resurrected), so without a cap an attacker could churn group ids and grow the memory without limit. The cap counts both, and group creation beyond it is rejected with `restricted: group limit reached` (both on the live write path and during the startup rebuild). Must be at least 1: `0` (formerly "unlimited") is rejected because unlimited group-id churn is a memory-exhaustion vector. Read at startup — changing it requires a `restart`.
 
-**`require_auth`** — When `true`, the relay refuses REQ/EVENT/COUNT/NEG messages with `auth-required:` unless the connection has completed NIP-42 AUTH. Useful for a private relay. Applied per connection.
+**`require_auth`** — When `true`, the relay refuses REQ/EVENT/COUNT/NEG messages with `auth-required:` unless the connection has completed NIP-42 AUTH. Useful for a private relay. Applied per connection. The REST API (`/api/v1`) is gated as well: every request must carry a NIP-98 `Authorization: Nostr <base64 kind:27235 event>` whose `u` tag is the exact request URL (path and query; with `api_host` set, that host's URL) and whose `method` tag matches; anonymous requests get `401 {"error":"auth-required: ..."}`. An authorized caller still sees only the anonymous-visibility event set (the API has no identity-scoped reads).
 
 **`send_auth_challenge`** — When `true`, every new connection receives a NIP-42 auth-request challenge. `require_auth = true` with `send_auth_challenge = false` locks everyone out — the relay warns about the combination at startup.
 

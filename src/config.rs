@@ -150,7 +150,8 @@ pub struct RelayConfig {
     /// let group-id churn grow memory without limit).
     pub max_groups: usize,
     /// When true, connections must complete a NIP-42 AUTH exchange before
-    /// they may publish or subscribe.
+    /// they may publish or subscribe, and REST API reads require a NIP-98
+    /// authorization.
     pub require_auth: bool,
     /// Send a NIP-42 auth-request challenge when a connection arrives
     /// without authentication.

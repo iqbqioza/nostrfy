@@ -283,7 +283,17 @@ async fn build_router(
         .route("/{identifier}/{kind}/monthly", get(api_monthly_handler))
         .route("/{identifier}/{kind}/daily", get(api_daily_handler))
         .route("/{identifier}/{kind}/hourly", get(api_hourly_handler))
-        .layer(axum::middleware::from_fn(reject_ws_upgrade));
+        .layer(axum::middleware::from_fn(reject_ws_upgrade))
+        // `relay.require_auth` gates reads on every surface: the WebSocket
+        // REQ/COUNT/NEG paths refuse anonymous connections, and this layer
+        // requires a NIP-98 authorization for the REST API when it is set.
+        .layer(axum::middleware::from_fn({
+            let relay = Arc::clone(relay);
+            move |request, next| {
+                let relay = Arc::clone(&relay);
+                async move { api::api_auth_middleware(relay, request, next).await }
+            }
+        }));
     // `server.ws_paths` selects which paths serve the WebSocket/NIP-11/NIP-86
     // endpoint: the default root paths, the inbox/outbox paths only, or all
     // of them. The inbox and outbox paths give the relay distinct endpoints
@@ -3431,6 +3441,186 @@ mod tests {
             3,
             "blocked-IP 403s must be counted"
         );
+        relay.db.shutdown();
+    }
+
+    /// Signs a NIP-98 `GET` authorization for `origin + path`.
+    async fn nip98_get_header_for(origin: &str, path: &str, salt: u64) -> String {
+        use base64::Engine as _;
+        let secp = secp256k1::Secp256k1::new();
+        let keypair = secp256k1::Keypair::from_seckey_slice(&secp, &[9u8; 32]).unwrap();
+        let pubkey = secp256k1::XOnlyPublicKey::from_keypair(&keypair)
+            .0
+            .to_string();
+        let mut ev = Event {
+            id: String::new(),
+            pubkey,
+            created_at: unix_now(),
+            kind: crate::nips::nip98::AUTH_KIND,
+            tags: vec![
+                vec!["u".into(), format!("{origin}{path}")],
+                vec!["method".into(), "GET".into()],
+            ],
+            // A per-call salt keeps the event id unique: the shared replay
+            // guard would otherwise reject two identical calls in the same
+            // second.
+            content: format!("api-auth-{salt}"),
+            sig: String::new(),
+        };
+        ev.id = crate::nips::nip01::compute_id(&ev);
+        let id = ev.id_bytes().unwrap();
+        ev.sig = secp.sign_schnorr_no_aux_rand(&id, &keypair).to_string();
+        format!(
+            "Nostr {}",
+            base64::engine::general_purpose::STANDARD.encode(serde_json::to_string(&ev).unwrap())
+        )
+    }
+
+    /// Signs a NIP-98 `GET` authorization for `path` on `relay` (the `u`
+    /// tag is the relay's HTTP origin plus the exact path and query).
+    async fn nip98_get_header(relay: &Arc<Relay>, path: &str, salt: u64) -> String {
+        let origin = relay.config.read().await.relay_identity().http_origin();
+        nip98_get_header_for(&origin, path, salt).await
+    }
+
+    fn api_request(uri: &str, auth: Option<&str>) -> Request {
+        let mut builder = Request::builder().method(Method::GET).uri(uri);
+        if let Some(auth) = auth {
+            builder = builder.header(axum::http::header::AUTHORIZATION, auth);
+        }
+        let mut request = builder.body(Body::empty()).unwrap();
+        request
+            .extensions_mut()
+            .insert(axum::extract::connect_info::ConnectInfo::<
+                std::net::SocketAddr,
+            >("127.0.0.1:1234".parse().unwrap()));
+        request
+    }
+
+    #[tokio::test]
+    async fn require_auth_gates_the_rest_api_with_nip98() {
+        // A-2: `require_auth` must gate the REST API like it gates the
+        // WebSocket read paths. Anonymous requests are refused with 401,
+        // and a NIP-98 authorization whose `u` tag is the exact request URL
+        // (path and query) is accepted exactly once.
+        let relay = blossom_relay().await;
+        relay.config.write().await.relay.require_auth = true;
+        let app = build_router(&relay, None).await;
+
+        // Anonymous read: 401 with the auth-required hint.
+        let response = app
+            .clone()
+            .oneshot(api_request("/api/v1/count?kinds=1", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            error["error"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("auth-required"),
+            "{error}"
+        );
+
+        // A valid authorization passes (the `u` tag includes the query).
+        let auth = nip98_get_header(&relay, "/api/v1/count?kinds=1", 1).await;
+        let response = app
+            .clone()
+            .oneshot(api_request("/api/v1/count?kinds=1", Some(&auth)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // The same authorization is a replay: refused.
+        let response = app
+            .clone()
+            .oneshot(api_request("/api/v1/count?kinds=1", Some(&auth)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // An authorization for another path does not authorize this one.
+        let other = nip98_get_header(&relay, "/api/v1/query", 2).await;
+        let response = app
+            .clone()
+            .oneshot(api_request("/api/v1/count?kinds=1", Some(&other)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // NIP-98 requires the exact absolute URL: a different query string
+        // is a different URL.
+        let exact = nip98_get_header(&relay, "/api/v1/count?kinds=1", 3).await;
+        let response = app
+            .clone()
+            .oneshot(api_request("/api/v1/count?kinds=2", Some(&exact)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // Without `require_auth` the API stays anonymous.
+        relay.config.write().await.relay.require_auth = false;
+        let response = app
+            .clone()
+            .oneshot(api_request("/api/v1/count?kinds=1", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn require_auth_accepts_the_api_host_origin() {
+        // With `api_host` the API is reachable only on that hostname, so
+        // the NIP-98 `u` tag is the api_host URL (https, since the public
+        // URL is TLS-terminated), not the relay origin.
+        let relay = blossom_relay().await;
+        {
+            let mut cfg = relay.config.write().await;
+            cfg.relay.require_auth = true;
+            cfg.relay.public_url = "wss://relay.example.com".into();
+            cfg.server.api_host = "api.example.com".into();
+        }
+        let app = build_router(&relay, None).await;
+        let with_host = |mut request: Request| {
+            request.headers_mut().insert(
+                axum::http::header::HOST,
+                HeaderValue::from_static("api.example.com"),
+            );
+            request
+        };
+        // Anonymous on the API host: 401.
+        let response = app
+            .clone()
+            .oneshot(with_host(api_request("/api/v1/count?kinds=1", None)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        // A `u` under the api_host origin (https) is accepted.
+        let auth =
+            nip98_get_header_for("https://api.example.com", "/api/v1/count?kinds=1", 11).await;
+        let response = app
+            .clone()
+            .oneshot(with_host(api_request("/api/v1/count?kinds=1", Some(&auth))))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        // The relay origin does not authorize an api_host request: the
+        // client must sign the URL it actually requested.
+        let relay_origin_auth = nip98_get_header(&relay, "/api/v1/count?kinds=1", 12).await;
+        let response = app
+            .clone()
+            .oneshot(with_host(api_request(
+                "/api/v1/count?kinds=1",
+                Some(&relay_origin_auth),
+            )))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         relay.db.shutdown();
     }
 
