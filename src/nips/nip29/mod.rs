@@ -10,7 +10,7 @@ pub(crate) mod tests;
 
 use events::{
     apply_settings, build_admins_event, build_members_event, build_meta_event, build_pins_event,
-    build_put_user, build_remove_user,
+    build_put_user, build_remove_user, build_remove_users,
 };
 
 /// Moderation policy implemented here: any user with at least one role (from
@@ -1002,6 +1002,7 @@ impl GroupStore {
             }
             9001 => {
                 let mut removed = 0usize;
+                let mut removed_members: Vec<String> = Vec::new();
                 if let Some(group) = self.groups.get_mut(gid) {
                     // The last-admin invariant is validated under a read
                     // lock before the store; re-check it here under the
@@ -1027,6 +1028,7 @@ impl GroupStore {
                     for pk in removing {
                         if group.members.remove(pk).is_some() {
                             removed += 1;
+                            removed_members.push(pk.to_string());
                         }
                     }
                 }
@@ -1034,6 +1036,18 @@ impl GroupStore {
                     self.total_members = self.total_members.saturating_sub(removed);
                 }
                 if emit {
+                    // Record the removal as a relay-signed `9001` mirror
+                    // (like the JOIN and LEAVE arms). The relay stamp is
+                    // monotonic and later than everything applied before
+                    // it, so a replay cannot resurrect the members: without
+                    // the mirror, a removal whose own `created_at` predates
+                    // a member's join (clock skew inside the accepted
+                    // late-publish window) sorts before that join and the
+                    // join (plus its put-user mirror) re-adds them on the
+                    // next restart.
+                    if !removed_members.is_empty() {
+                        out.push(build_remove_users(gid, &removed_members, relay_pubkey, now));
+                    }
                     out.extend(self.membership_events(gid, relay_pubkey, now));
                 }
             }

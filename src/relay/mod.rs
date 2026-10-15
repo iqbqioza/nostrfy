@@ -7862,6 +7862,95 @@ mod tests {
     }
 
     #[test]
+    fn a_backdated_removal_survives_the_rebuild() {
+        // A-3: an admin removes a member with a `created_at` that predates
+        // the member's join (clock skew inside the accepted late-publish
+        // window). Live, arrival order removes the member; the replay sorts
+        // by `created_at`, so without the relay-signed removal mirror the
+        // join (and the join's put-user mirror) would re-add them on the
+        // next restart.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            use crate::db::PutOutcome;
+            use crate::nips::nip29::{CREATE_GROUP, JOIN, REMOVE_USER};
+
+            let relay = build_relay_with_key(false, &"11".repeat(32)).await;
+            let now = crate::util::unix_now();
+            let secp = secp256k1::Secp256k1::new();
+            let keypair =
+                |seed: u8| secp256k1::Keypair::from_seckey_slice(&secp, &[seed; 32]).unwrap();
+            let admin = keypair(21);
+            let member = keypair(22);
+            let member_pk = secp256k1::XOnlyPublicKey::from_keypair(&member)
+                .0
+                .to_string();
+            let sign =
+                |kp: &secp256k1::Keypair, kind: u64, tags: Vec<Vec<String>>, created: u64| {
+                    let mut e = crate::event::Event {
+                        id: String::new(),
+                        pubkey: secp256k1::XOnlyPublicKey::from_keypair(kp).0.to_string(),
+                        created_at: created,
+                        kind,
+                        tags,
+                        content: String::new(),
+                        sig: String::new(),
+                    };
+                    e.id = crate::nips::nip01::compute_id(&e);
+                    let id = e.id_bytes().unwrap();
+                    e.sig = secp.sign_schnorr_no_aux_rand(&id, kp).to_string();
+                    e
+                };
+            let create = sign(
+                &admin,
+                CREATE_GROUP,
+                vec![vec!["h".into(), "g1".into()]],
+                now - 5,
+            );
+            let join = sign(&member, JOIN, vec![vec!["h".into(), "g1".into()]], now);
+            // Backdated one second: inside the late-publish window, and
+            // ordered before the join on a replay.
+            let remove = sign(
+                &admin,
+                REMOVE_USER,
+                vec![
+                    vec!["h".into(), "g1".into()],
+                    vec!["p".into(), member_pk.clone()],
+                ],
+                now - 1,
+            );
+            for ev in [create, join, remove] {
+                let results = relay.accept_events_batch(vec![ev], &[]).await;
+                assert!(
+                    matches!(&results[0].1, PutOutcome::Stored),
+                    "every event must store: {results:?}"
+                );
+            }
+            assert!(
+                !relay
+                    .groups
+                    .read()
+                    .await
+                    .group("g1")
+                    .expect("the group exists")
+                    .is_member(&member_pk),
+                "the live apply must remove the member"
+            );
+            // What a restart does: replay the stored events (including the
+            // relay-signed removal mirror) from scratch.
+            let mut rebuilt = crate::nips::nip29::GroupStore::default();
+            assert!(rebuilt.rebuild(&relay.db, relay.relay_pubkey_ref()).await);
+            assert!(
+                !rebuilt
+                    .group("g1")
+                    .expect("the group exists after the rebuild")
+                    .is_member(&member_pk),
+                "the backdated removal must not be undone by the rebuild"
+            );
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
     fn concurrent_group_persists_keep_every_group() {
         // Snapshot capture and write are serialized: without the lock a
         // mutation that captured an older snapshot could queue its write

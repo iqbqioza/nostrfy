@@ -184,6 +184,24 @@ pub(crate) fn build_remove_user(gid: &str, member: &str, relay_pubkey: &str, now
     event
 }
 
+/// `kind:9001` removing several members in one event: the mirror of an
+/// admin removal that dropped more than one `p` tag. One event per apply
+/// (not one per member): the generated-event dedup keeps the last build
+/// per `(kind, d)` slot, and these mirrors carry no `d` tag.
+pub(crate) fn build_remove_users(
+    gid: &str,
+    members: &[String],
+    relay_pubkey: &str,
+    now: u64,
+) -> Event {
+    let mut event = base_event(9001, gid, relay_pubkey, now);
+    event.tags[0] = vec![H.to_string(), gid.to_string()];
+    for member in members {
+        event.tags.push(vec![P.to_string(), member.clone()]);
+    }
+    event
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
