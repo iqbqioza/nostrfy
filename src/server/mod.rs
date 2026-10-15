@@ -1655,9 +1655,17 @@ async fn purge_loop(relay: Arc<Relay>, mut shutdown: watch::Receiver<bool>) {
                         if state_removed.group {
                             // An expired NIP-29 group-state event: the
                             // derived state must not keep authorizing
-                            // members whose grant expired. The rebuild is
-                            // coalesced and runs in the background.
-                            relay.mark_group_state_stale().await;
+                            // members whose grant expired. The mark is
+                            // scoped to the groups the expired events
+                            // belonged to; an unresolved scope falls back
+                            // to the whole store. The rebuild is coalesced
+                            // and runs in the background.
+                            match state_removed.group_ids.as_deref() {
+                                Some(ids) if !ids.is_empty() => {
+                                    relay.mark_group_state_stale_for(ids).await;
+                                }
+                                _ => relay.mark_group_state_stale().await,
+                            }
                         }
                         if state_removed.role {
                             // An expired NIP-43 role-state event: revoke

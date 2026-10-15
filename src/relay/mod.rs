@@ -271,7 +271,9 @@ const GROUPS_REBUILD_MIN_INTERVAL_SECS: u64 = 2;
 /// service to every other group, so the resolution cost has to be bounded too:
 /// reaching the cap already means the caller stored and named this many group
 /// state events, and the resulting rebuild is one shared, coalesced scan.
-const GROUP_STALE_SCOPE_CAP: usize = 1_024;
+/// Shared with the removal walks' scope resolution
+/// ([`crate::db::store::STATE_REMOVED_SCOPE_CAP`]).
+const GROUP_STALE_SCOPE_CAP: usize = crate::db::store::STATE_REMOVED_SCOPE_CAP;
 
 /// Bound on the group events buffered while a rebuild scan runs. The scan
 /// does not hold `groups.write()`, so events arriving meanwhile are applied
@@ -3503,8 +3505,11 @@ impl Relay {
     /// Fails closed for only the group ids the removal actually touched.
     /// An unauthenticated caller that removes group state in a group it
     /// administers must not deny every group on the relay, so the NIP-09
-    /// and 9005 paths resolve the addressed groups and pass them here; the
-    /// unresolved paths (vanish, the startup resume, a failed lookup) keep
+    /// and 9005 paths resolve the addressed groups and pass them here, and
+    /// the removal walks resolve the groups they removed for the vanish,
+    /// expiry and ban paths. Only a removal whose scope could not be
+    /// resolved (a failed lookup, an `a`-tag address, more groups than the
+    /// cap, or the startup resume, whose atomic cannot carry the set) keeps
     /// the global scope.
     pub(crate) async fn mark_group_state_stale_for(&self, group_ids: &[String]) {
         self.mark_group_state_stale_scope(GroupStaleScope::Groups(group_ids))
@@ -3804,15 +3809,22 @@ impl Relay {
         }
         if state_removed.group {
             // A moderation/join/leave event was removed: the group state
-            // must be rebuilt from the surviving history. The mark runs
-            // while the in-flight claims are held: `mark_group_state_stale`
-            // sets `pending` and its persist clears the snapshot through
-            // that branch, so no concurrent save can certify pre-removal
-            // state in the window. The rebuilds are full-history scans and
-            // vanishes are exempt from the publish rate limit, so any fresh
-            // keypair could otherwise stall every group write; the coalesced
-            // background workers keep it amortized.
-            self.mark_group_state_stale().await;
+            // must be rebuilt from the surviving history. The mark is
+            // scoped to the groups the removed events belonged to (the walk
+            // resolves them); only an unresolved or over-cap removal fails
+            // the whole store closed. A global mark would let any fresh
+            // keypair freeze every group write by repeating a vanish
+            // (vanishes are exempt from the publish rate limit). The mark
+            // runs while the in-flight claims are held:
+            // `mark_group_state_stale*` sets `pending` and its persist
+            // clears the snapshot through that branch, so no concurrent
+            // save can certify pre-removal state in the window. The
+            // rebuilds are full-history scans and the coalesced background
+            // workers keep them amortized.
+            match state_removed.group_ids.as_deref() {
+                Some(ids) if !ids.is_empty() => self.mark_group_state_stale_for(ids).await,
+                _ => self.mark_group_state_stale().await,
+            }
         }
         if state_removed.role {
             // A NIP-43 role-state event was removed: only the relay's own
@@ -7946,6 +7958,75 @@ mod tests {
                     .is_member(&member_pk),
                 "the backdated removal must not be undone by the rebuild"
             );
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn a_vanish_only_gates_the_groups_it_touched() {
+        // Any keypair can vanish, so the post-removal fail-closed mark must
+        // be scoped: a global mark would let an anonymous caller freeze
+        // every group write (and read) by repeating a vanish. Only the
+        // groups whose state events were removed may fail closed while the
+        // store rebuilds.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            use crate::db::PutOutcome;
+            use crate::nips::nip29::CREATE_GROUP;
+
+            let relay = build_relay_with_key(false, &"11".repeat(32)).await;
+            let now = crate::util::unix_now();
+            let secp = secp256k1::Secp256k1::new();
+            let keypair =
+                |seed: u8| secp256k1::Keypair::from_seckey_slice(&secp, &[seed; 32]).unwrap();
+            let anon = keypair(31);
+            let other = keypair(32);
+            let sign = |kp: &secp256k1::Keypair, kind: u64, tags: Vec<Vec<String>>| {
+                let mut e = crate::event::Event {
+                    id: String::new(),
+                    pubkey: secp256k1::XOnlyPublicKey::from_keypair(kp).0.to_string(),
+                    created_at: now,
+                    kind,
+                    tags,
+                    content: String::new(),
+                    sig: String::new(),
+                };
+                e.id = crate::nips::nip01::compute_id(&e);
+                let id = e.id_bytes().unwrap();
+                e.sig = secp.sign_schnorr_no_aux_rand(&id, kp).to_string();
+                e
+            };
+            // The attacker's two groups plus an unrelated one.
+            for (kp, gid) in [(&anon, "g1"), (&anon, "g2"), (&other, "g3")] {
+                let ev = sign(kp, CREATE_GROUP, vec![vec!["h".into(), gid.into()]]);
+                let results = relay.accept_events_batch(vec![ev], &[]).await;
+                assert!(
+                    matches!(&results[0].1, PutOutcome::Stored),
+                    "{gid} must store: {results:?}"
+                );
+            }
+            // Drain first so the rebuild worker cannot clear the marks
+            // before the assertions (the same determinism trick as the
+            // other rebuild tests).
+            relay.signal_drain();
+            let vanish = sign(
+                &anon,
+                crate::nips::nip62::VANISH_KIND,
+                vec![vec!["relay".into(), "ws://127.0.0.1:8080".into()]],
+            );
+            let results = relay.accept_events_batch(vec![vanish], &[]).await;
+            assert!(
+                matches!(&results[0].1, PutOutcome::Stored),
+                "the vanish must be accepted: {results:?}"
+            );
+            let groups = relay.groups.read().await;
+            assert!(groups.group_is_stale("g1"), "g1 lost its create");
+            assert!(groups.group_is_stale("g2"), "g2 lost its create");
+            assert!(
+                !groups.group_is_stale("g3"),
+                "an untouched group must stay live while the store rebuilds"
+            );
+            drop(groups);
             relay.db.shutdown();
         });
     }

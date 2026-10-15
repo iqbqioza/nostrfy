@@ -412,8 +412,9 @@ impl Store {
                 // (`state_kind_family`): the stamp must advance in the
                 // same removal transaction, or a crash after this commit
                 // could restore a snapshot that still authorizes the
-                // deleted grant.
-                chunk_state_removed.observe(event.kind);
+                // deleted grant. The event's group scopes the stale mark
+                // (`None` keeps the whole store in scope).
+                chunk_state_removed.observe(event.kind, crate::nips::nip29::group_id_any(&event));
                 self.remove_event(&mut wtxn, &id)?;
                 *removed += 1;
             }
@@ -592,8 +593,10 @@ impl Store {
                     // (the walk only filters pubkey/d), so its kind decides
                     // whether the derived state must be invalidated. Bumped
                     // in the same transaction as the removal (see the
-                    // `e`-tag path).
-                    chunk_state_removed.observe(address.kind);
+                    // `e`-tag path). An address names a kind, not an event,
+                    // so the group cannot be resolved: `None` keeps the
+                    // whole store in scope.
+                    chunk_state_removed.observe(address.kind, None);
                     self.remove_event(&mut wtxn, id)?;
                     *removed += 1;
                 }
@@ -705,7 +708,8 @@ impl Store {
                 // fails to parse is still removed, but, like the e-tag
                 // path, cannot be classified as state).
                 if let Ok(event) = serde_json::from_slice::<Event>(raw) {
-                    state_removed.observe(event.kind);
+                    let gid = crate::nips::nip29::group_id_any(&event);
+                    state_removed.observe(event.kind, gid);
                 }
                 self.remove_event(&mut wtxn, id)?;
                 if !state_removed.is_empty() {
@@ -1420,7 +1424,7 @@ impl Store {
                     }
                     continue;
                 }
-                chunk_state_removed.observe(event.kind);
+                chunk_state_removed.observe(event.kind, crate::nips::nip29::group_id_any(&event));
                 self.remove_event(&mut wtxn, &id)?;
                 removed += 1;
             }
@@ -1557,7 +1561,8 @@ impl Store {
             for (key, id) in entries {
                 if let Some(raw) = self.events.get(&wtxn, &id)? {
                     if let Ok(event) = serde_json::from_slice::<Event>(raw) {
-                        chunk_state_removed.observe(event.kind);
+                        chunk_state_removed
+                            .observe(event.kind, crate::nips::nip29::group_id_any(&event));
                     }
                     self.remove_event(&mut wtxn, &id)?;
                     *removed += 1;

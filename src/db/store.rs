@@ -249,52 +249,94 @@ pub(crate) fn state_kind_family(kind: u64) -> Option<StateFamily> {
 }
 
 /// Which derived-state families lost at least one stored event to a
-/// removal walk (NIP-29 group state, NIP-43 role state). The removal paths
-/// bump the shared [`STATE_STAMP_KEY`] when either family is affected, but
-/// a caller must revoke and rebuild only the families actually touched: a
-/// role rebuild replaces the store from events and drops the NIP-86 invite
-/// codes, which have no events behind them, so a group-state removal must
-/// not revoke the role store.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// removal walk (NIP-29 group state, NIP-43 role state), and — for the
+/// group family — the groups the removed events belonged to when the walk
+/// could resolve them. The removal paths bump the shared [`STATE_STAMP_KEY`]
+/// when either family is affected, but a caller must revoke and rebuild only
+/// what was touched: a role rebuild replaces the store from events and drops
+/// the NIP-86 invite codes, and a group-state removal in one group must not
+/// fail every other group closed (any keypair can trigger a vanish).
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct StateRemoved {
     pub group: bool,
     pub role: bool,
+    /// The distinct groups whose group-state events were removed, when the
+    /// walk resolved them all within [`STATE_REMOVED_SCOPE_CAP`]; `None`
+    /// keeps the whole-store scope (an event whose group could not be read,
+    /// or more distinct groups than the cap). Only meaningful while `group`
+    /// is true; empty means no group-state event was removed.
+    pub group_ids: Option<Vec<String>>,
+}
+
+/// Bounds how many distinct groups a removal walk resolves before falling
+/// back to the whole-store scope (see [`StateRemoved::group_ids`]).
+pub(crate) const STATE_REMOVED_SCOPE_CAP: usize = 1_024;
+
+impl Default for StateRemoved {
+    fn default() -> Self {
+        Self {
+            group: false,
+            role: false,
+            group_ids: Some(Vec::new()),
+        }
+    }
 }
 
 impl StateRemoved {
-    /// Folds one removed event's kind into the set.
-    pub(crate) fn observe(&mut self, kind: u64) {
+    /// Folds one removed event's kind (and, for the group family, its group
+    /// id) into the set. A group-state event whose group cannot be read
+    /// fails closed: the whole store stays in scope.
+    pub(crate) fn observe(&mut self, kind: u64, gid: Option<&str>) {
         match state_kind_family(kind) {
-            Some(StateFamily::Group) => self.group = true,
+            Some(StateFamily::Group) => {
+                self.group = true;
+                self.scope_group(gid);
+            }
             Some(StateFamily::Role) => self.role = true,
             None => {}
         }
     }
 
+    fn scope_group(&mut self, gid: Option<&str>) {
+        let Some(gid) = gid else {
+            // Unresolved: the whole store stays in scope.
+            self.group_ids = None;
+            return;
+        };
+        let Some(ids) = self.group_ids.as_mut() else {
+            return;
+        };
+        if ids.iter().any(|id| id == gid) {
+            return;
+        }
+        if ids.len() >= STATE_REMOVED_SCOPE_CAP {
+            self.group_ids = None;
+            return;
+        }
+        ids.push(gid.to_string());
+    }
+
     pub(crate) fn merge(&mut self, other: Self) {
         self.group |= other.group;
         self.role |= other.role;
+        match other.group_ids {
+            None => self.group_ids = None,
+            Some(other_ids) => {
+                for gid in &other_ids {
+                    self.scope_group(Some(gid));
+                }
+            }
+        }
     }
 
-    pub(crate) fn is_empty(self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         !self.group && !self.role
     }
 
-    /// Group family only (NIP-29); a named value for tests.
-    #[cfg(test)]
-    pub(crate) const GROUP: Self = Self {
-        group: true,
-        role: false,
-    };
-    /// Role family only (NIP-43); a named value for tests.
-    #[cfg(test)]
-    pub(crate) const ROLE: Self = Self {
-        group: false,
-        role: true,
-    };
-
-    /// Bit encoding for the atomic shared with the startup recovery.
-    pub(crate) fn to_bits(self) -> u8 {
+    /// Bit encoding for the atomic shared with the startup recovery: the
+    /// resolved groups cannot ride the atomic, so the recovery keeps the
+    /// whole-store scope (`group_ids: None`).
+    pub(crate) fn to_bits(&self) -> u8 {
         u8::from(self.group) | (u8::from(self.role) << 1)
     }
 
@@ -302,6 +344,7 @@ impl StateRemoved {
         Self {
             group: bits & 1 != 0,
             role: bits & 2 != 0,
+            group_ids: None,
         }
     }
 }

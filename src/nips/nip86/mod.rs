@@ -1002,7 +1002,15 @@ pub async fn rpc_handler(
                 // that lost an event are revoked: a banned group event
                 // must not drop the NIP-43 invite codes via a role rebuild.
                 if state_removed.group {
-                    relay.mark_group_state_stale().await;
+                    // Scope the mark to the banned event's group when the
+                    // walk resolved it; an unresolved scope keeps the
+                    // whole store closed.
+                    match state_removed.group_ids.as_deref() {
+                        Some(ids) if !ids.is_empty() => {
+                            relay.mark_group_state_stale_for(ids).await;
+                        }
+                        _ => relay.mark_group_state_stale().await,
+                    }
                 }
                 if state_removed.role {
                     relay.mark_roles_stale().await;

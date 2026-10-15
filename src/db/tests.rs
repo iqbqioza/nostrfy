@@ -1,7 +1,7 @@
 //! Integration tests for the database layer, exercised through the
 //! public [`DbClient`] API.
 
-use super::store::StateRemoved;
+use super::store::{STATE_REMOVED_SCOPE_CAP, StateRemoved};
 use super::*;
 use crate::config::DatabaseConfig;
 use crate::event::Event;
@@ -410,7 +410,8 @@ fn purge_expired_reports_state_families() {
                 3,
                 StateRemoved {
                     group: true,
-                    role: true
+                    role: true,
+                    group_ids: Some(vec!["group-exp".to_string()]),
                 }
             ),
             "a removed NIP-29/NIP-43 state event must request a rebuild"
@@ -1022,12 +1023,16 @@ fn banning_state_event_advances_derived_stamp() {
             base,
             "ordinary bans must not touch the stamp"
         );
-        assert_eq!(
-            db.ban_event(grant.id_bytes().unwrap(), "spam")
-                .await
-                .unwrap(),
-            (true, StateRemoved::GROUP)
+        let (banned, state) = db
+            .ban_event(grant.id_bytes().unwrap(), "spam")
+            .await
+            .unwrap();
+        assert!(banned);
+        assert!(
+            state.group && !state.role,
+            "the ban must report the group family only"
         );
+        assert_eq!(state.group_ids, Some(vec!["g1".to_string()]));
         assert!(
             db.state_stamp().await > base,
             "state bans must advance the stamp"
@@ -5743,10 +5748,15 @@ fn vanish_reports_state_families() {
             db.put(authored(9000, &pk_mod, now + 1), now + 1).await,
             PutOutcome::Stored
         );
-        assert_eq!(
-            db.apply_vanish_checked([0xbb; 32], now + 1).await,
-            Some((1, StateRemoved::GROUP)),
+        let (removed, state) = db.apply_vanish_checked([0xbb; 32], now + 1).await.unwrap();
+        assert_eq!(removed, 1);
+        assert!(
+            state.group && !state.role,
             "a removed moderation event must rebuild the group store only"
+        );
+        assert_eq!(
+            state.group_ids, None,
+            "an event without an h tag keeps the whole store in scope"
         );
         assert_eq!(
             db.put(
@@ -5756,11 +5766,121 @@ fn vanish_reports_state_families() {
             .await,
             PutOutcome::Stored
         );
-        assert_eq!(
-            db.apply_vanish_checked([0xcc; 32], now + 2).await,
-            Some((1, StateRemoved::ROLE)),
+        let (removed, state) = db.apply_vanish_checked([0xcc; 32], now + 2).await.unwrap();
+        assert_eq!(removed, 1);
+        assert!(
+            state.role && !state.group,
             "a removed role-state event must rebuild the role store only"
         );
+        db.shutdown();
+    });
+}
+
+#[test]
+fn state_removed_scopes_groups_and_falls_back() {
+    // The scope decides which groups fail closed while the store rebuilds:
+    // resolved groups, an unresolved one (whole store), the cap, and the
+    // family split must all hold.
+    let mut state = StateRemoved::default();
+    state.observe(9000, Some("g1"));
+    state.observe(9000, Some("g2"));
+    state.observe(9000, Some("g1"));
+    assert!(state.group && !state.role);
+    assert_eq!(
+        state.group_ids,
+        Some(vec!["g1".to_string(), "g2".to_string()])
+    );
+
+    // An event whose group cannot be read fails closed.
+    state.observe(9000, None);
+    assert_eq!(state.group_ids, None);
+
+    // More distinct groups than the cap fail closed too.
+    let mut wide = StateRemoved::default();
+    for i in 0..STATE_REMOVED_SCOPE_CAP {
+        wide.observe(9000, Some(&format!("g{i}")));
+    }
+    assert_eq!(
+        wide.group_ids.as_ref().map(Vec::len),
+        Some(STATE_REMOVED_SCOPE_CAP)
+    );
+    wide.observe(9000, Some("one-too-many"));
+    assert_eq!(wide.group_ids, None);
+
+    // A role event never touches the group scope; merging keeps the
+    // stricter (unscoped) side.
+    let mut role = StateRemoved::default();
+    role.observe(crate::nips::nip43::MEMBERSHIP_LIST, Some("g1"));
+    assert!(role.role && !role.group);
+    assert_eq!(role.group_ids, Some(Vec::new()));
+    let mut merged = StateRemoved::default();
+    merged.observe(9000, Some("g1"));
+    merged.merge(role);
+    assert!(merged.group && merged.role);
+    assert_eq!(merged.group_ids, Some(vec!["g1".to_string()]));
+    let mut unscoped = StateRemoved::default();
+    unscoped.observe(9000, None);
+    merged.merge(unscoped);
+    assert_eq!(
+        merged.group_ids, None,
+        "an unscoped side keeps the whole store in scope"
+    );
+}
+
+#[test]
+fn vanish_reports_the_touched_groups() {
+    // NIP-62: the removed group-state events name the groups that must
+    // fail closed; an event without an `h` tag keeps the whole store in
+    // scope (fail closed).
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let db = DbClient::open(
+            &config(),
+            true,
+            Arc::new(Default::default()),
+            30,
+            128,
+            4096,
+            262144,
+        )
+        .unwrap();
+        let now = unix_now();
+        let authored = |kind: u64, pk: &str, gid: Option<&str>, created: u64| {
+            let mut e = event(kind, "x", created, vec![]);
+            e.pubkey = pk.to_string();
+            if let Some(gid) = gid {
+                e.tags = vec![vec!["h".into(), gid.into()]];
+            }
+            e.id = nip01::compute_id(&e);
+            e
+        };
+        // Two groups' moderation events: the scope resolves both.
+        let pk_ok = "aa".repeat(32);
+        for (gid, created) in [(Some("g1"), now), (Some("g2"), now + 1)] {
+            assert_eq!(
+                db.put(authored(9000, &pk_ok, gid, created), created).await,
+                PutOutcome::Stored
+            );
+        }
+        let (removed, state) = db.apply_vanish_checked([0xaa; 32], now + 1).await.unwrap();
+        assert_eq!(removed, 2);
+        assert!(state.group && !state.role);
+        assert_eq!(
+            state.group_ids,
+            Some(vec!["g1".to_string(), "g2".to_string()])
+        );
+
+        // A malformed history (a state kind without an `h` tag) keeps the
+        // whole store in scope.
+        let pk_bad = "bb".repeat(32);
+        assert_eq!(
+            db.put(authored(9001, &pk_bad, None, now + 2), now + 2)
+                .await,
+            PutOutcome::Stored
+        );
+        let (removed, state) = db.apply_vanish_checked([0xbb; 32], now + 2).await.unwrap();
+        assert_eq!(removed, 1);
+        assert_eq!(state.group_ids, None);
         db.shutdown();
     });
 }
@@ -6365,9 +6485,12 @@ fn state_stamp_advances_with_group_state_removals() {
             db.put(authored(9000, &"bb".repeat(32), now), now).await,
             PutOutcome::Stored
         );
+        let (removed, state) = db.apply_vanish_checked([0xbb; 32], now).await.unwrap();
+        assert_eq!(removed, 1);
+        assert!(state.group && !state.role);
         assert_eq!(
-            db.apply_vanish_checked([0xbb; 32], now).await,
-            Some((1, StateRemoved::GROUP))
+            state.group_ids, None,
+            "an event without an h tag keeps the whole store in scope"
         );
         assert_eq!(db.state_stamp().await, Some(1));
 
@@ -6377,7 +6500,13 @@ fn state_stamp_advances_with_group_state_removals() {
         expiring.tags = vec![vec!["expiration".into(), (now - 50).to_string()]];
         assert_eq!(db.put(expiring, now).await, PutOutcome::Stored);
         db.set_expiry_enabled(true);
-        assert_eq!(db.purge_expired(now, 0).await, (1, StateRemoved::GROUP));
+        let (removed, state) = db.purge_expired(now, 0).await;
+        assert_eq!(removed, 1);
+        assert!(state.group && !state.role);
+        assert_eq!(
+            state.group_ids, None,
+            "an event without an h tag keeps the whole store in scope"
+        );
         assert_eq!(db.state_stamp().await, Some(2));
 
         // A group purge bumps the stamp at completion.
@@ -9274,10 +9403,15 @@ fn purge_expired_first_and_middle_chunk_failures_leave_a_resumable_backlog() {
         faults
             .chunk_after
             .store(2, std::sync::atomic::Ordering::SeqCst);
+        let (removed, state) = db.purge_expired(now, 0).await;
         assert_eq!(
-            db.purge_expired(now, 0).await,
-            (4096, StateRemoved::GROUP),
+            removed, 4096,
             "the first chunk committed (with its state event) before the failure"
+        );
+        assert!(state.group && !state.role);
+        assert_eq!(
+            state.group_ids, None,
+            "an event without an h tag keeps the whole store in scope"
         );
         assert_eq!(db.state_stamp().await, Some(1));
         assert_eq!(db.take_errors(), 1);
