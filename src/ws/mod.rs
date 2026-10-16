@@ -5400,6 +5400,111 @@ mod tests {
     }
 
     #[test]
+    fn limit_one_page_serves_the_reserve_instead_of_coming_back_empty() {
+        // A `limit: 1` page whose newest second is a full tie block used to
+        // come back empty: the scan collected only that block, so the tie
+        // drop had nothing older to serve. The scan's reserve (the events
+        // below the boundary second) must be delivered instead, and the
+        // client's inclusive cursor must still advance block by block.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let now = unix_now();
+            for second in [now, now - 1, now - 2] {
+                for i in 0..2 {
+                    let e =
+                        signed_note(conn.relay.secp(), &format!("{second}-{i}"), second, vec![]);
+                    conn.relay.db.put(e, now).await;
+                }
+            }
+            conn.handle_req(&[json!("sub"), json!({"kinds": [1], "limit": 1})])
+                .await;
+            conn.pump_pending_reqs();
+            let msgs = outgoing_json(&conn);
+            let times: Vec<u64> = msgs
+                .iter()
+                .filter(|m| m[0] == "EVENT")
+                .filter_map(|m| m[2]["created_at"].as_u64())
+                .collect();
+            assert!(
+                !times.is_empty(),
+                "a limit:1 page must not come back empty while matches exist: {msgs:?}"
+            );
+            assert!(
+                times.iter().all(|t| *t < now),
+                "the dropped boundary block must not be delivered: {times:?}"
+            );
+            assert!(
+                msgs.iter()
+                    .any(|m| m[0] == "EOSE" && m[1] == "sub" && m[2] == json!(["more"])),
+                "the dropped second must keep the more hint: {msgs:?}"
+            );
+            // The inclusive client (`until = oldest seen`) gets the block
+            // below the dropped one whole, so it keeps making progress.
+            conn.outgoing.clear();
+            conn.out_bytes = 0;
+            conn.handle_req(&[
+                json!("sub"),
+                json!({"kinds": [1], "limit": 1, "until": now - 1}),
+            ])
+            .await;
+            conn.pump_pending_reqs();
+            let msgs = outgoing_json(&conn);
+            let times: Vec<u64> = msgs
+                .iter()
+                .filter(|m| m[0] == "EVENT")
+                .filter_map(|m| m[2]["created_at"].as_u64())
+                .collect();
+            assert!(
+                !times.is_empty() && times.iter().all(|t| *t < now - 1),
+                "the next page must serve the block below the dropped one: {times:?}"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn tie_flood_above_the_collection_cap_still_serves_the_reserve() {
+        // A boundary tie block larger than the scan's tie cap is skipped
+        // without ending the walk: the reserve below it must still be
+        // collected, so the drop serves the older events instead of an
+        // empty page — and the oversized block itself is never delivered
+        // partially.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let now = unix_now();
+            for i in 0..50 {
+                let e = signed_note(conn.relay.secp(), &format!("flood-{i}"), now, vec![]);
+                conn.relay.db.put(e, now).await;
+            }
+            for i in 0..2 {
+                let e = signed_note(conn.relay.secp(), &format!("old-{i}"), now - 1, vec![]);
+                conn.relay.db.put(e, now).await;
+            }
+            conn.handle_req(&[json!("sub"), json!({"kinds": [1], "limit": 1})])
+                .await;
+            conn.pump_pending_reqs();
+            let msgs = outgoing_json(&conn);
+            let contents: Vec<&str> = msgs
+                .iter()
+                .filter(|m| m[0] == "EVENT")
+                .map(|m| m[2]["content"].as_str().unwrap())
+                .collect();
+            assert!(
+                contents.len() == 2 && contents.iter().all(|c| c.starts_with("old-")),
+                "the reserve below the oversized tie must be served: {contents:?}"
+            );
+            assert!(
+                msgs.iter()
+                    .any(|m| m[0] == "EOSE" && m[1] == "sub" && m[2] == json!(["more"])),
+                "the skipped tie block must keep the more hint: {msgs:?}"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
     fn req_boundary_tie_beyond_the_page_is_dropped_whole() {
         // NIP-01/NIP-67 boundary rule: events sharing the boundary
         // `created_at` travel together — never a partial tie. When the tie
@@ -5429,6 +5534,11 @@ mod tests {
             assert!(
                 !contents.contains(&"v1") && !contents.contains(&"v2"),
                 "an oversized boundary tie must not be delivered partially: {contents:?}"
+            );
+            assert!(
+                contents.contains(&"v3"),
+                "the reserve below the dropped tie must be served instead of an empty page: \
+                 {contents:?}"
             );
             assert!(
                 msgs.iter()

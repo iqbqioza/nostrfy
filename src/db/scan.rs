@@ -153,6 +153,12 @@ trait ScanCollector {
     fn begin_filter(&mut self, index: usize) {
         let _ = index;
     }
+    /// Whether the collection skipped matching events (a boundary tie block
+    /// beyond the tie cap): the result is incomplete and the caller must
+    /// report `more` even though the walk reached the end of its ranges.
+    fn skipped(&self) -> bool {
+        false
+    }
     /// Pushes a matched event; returns `false` when the per-filter limit is
     /// reached and the event is strictly older than the boundary timestamp,
     /// so the scan stops. Events at the boundary timestamp are still
@@ -200,16 +206,41 @@ struct EventCollector {
     /// created_at of the event that filled a per-filter limit; events at
     /// the same timestamp keep being collected (see [`ScanCollector::push`]).
     boundary: Option<u64>,
+    /// created_at of the event that filled a per-filter *reserve* quota:
+    /// events at that timestamp keep being collected like the primary
+    /// boundary's tie (see [`ScanCollector::push`]).
+    reserve_boundary: Option<u64>,
     /// Hard stop including the same-created_at tie continuation: a per-filter
     /// boundary may exceed its limit to keep a tie in one page, but never
     /// beyond twice the collection cap. Without this a flood of events
     /// sharing one timestamp (up to the candidate budget) would be
-    /// materialized for a `limit: 1` query.
+    /// materialized for a `limit: 1` query. The overflow is skipped, not
+    /// walked away from: the reserve below the boundary second must stay
+    /// reachable.
     tie_cap: usize,
+    /// Hard stop for the re-attribution reserve: the reserve quota plus its
+    /// own boundary tie block, bounded like [`Self::tie_cap`].
+    reserve_cap: usize,
+    /// Whether the reserve is collected at all. Only the WebSocket REQ path
+    /// (the `hidden_slack > 0` callers) drops a boundary tie block and
+    /// re-attributes what is below it; every other caller (the REST API,
+    /// tests, internal scans) must keep the pre-reserve results.
+    collect_reserve: bool,
     /// Accepted events per filter, indexed by the filter's position in the
     /// REQ. NIP-01 applies `limit` to each filter independently, so a
     /// filter's quota must not be consumed by an earlier filter's matches.
     counts: Vec<usize>,
+    /// Accepted *reserve* events per filter (strictly older than
+    /// [`Self::boundary`]). The connection drops the boundary second of a
+    /// full single-second page so an inclusive client (`until = T`)
+    /// advances, and re-attributes these events in its place: without the
+    /// reserve a `limit: 1` page whose newest second is a full tie block
+    /// would come back empty even though matching events exist below it.
+    reserves: Vec<usize>,
+    /// A boundary tie block exceeded [`Self::tie_cap`] and its overflow was
+    /// skipped (not collected, not walked away from): the result is
+    /// incomplete and must report `more`.
+    skipped: bool,
     /// Estimated heap bytes of the collected events (see
     /// [`COLLECT_BYTE_CAP`]).
     bytes: usize,
@@ -218,14 +249,19 @@ struct EventCollector {
 }
 
 impl EventCollector {
-    fn new(cap: usize, boundary_ok: bool, filters: usize) -> Self {
+    fn new(cap: usize, boundary_ok: bool, filters: usize, collect_reserve: bool) -> Self {
         EventCollector {
             events: Vec::new(),
             cap,
             boundary_ok,
             boundary: None,
+            reserve_boundary: None,
             tie_cap: cap.saturating_mul(2),
+            reserve_cap: cap.saturating_mul(2),
+            collect_reserve,
             counts: vec![0; filters],
+            reserves: vec![0; filters],
+            skipped: false,
             bytes: 0,
             filter: 0,
         }
@@ -271,15 +307,26 @@ impl ScanCollector for EventCollector {
             // quotas alone let a multi-filter COUNT sum past the cap).
             return self.events.len() >= self.cap;
         }
-        // The tie continuation may exceed `cap`, but only up to `tie_cap`.
-        self.events.len() >= self.tie_cap
+        // The tie continuation and the reserve may exceed `cap`, but only
+        // up to their own bounds (the reserve's quota plus its boundary tie
+        // block, when the caller collects the reserve at all).
+        let total_cap = if self.collect_reserve {
+            self.tie_cap.saturating_add(self.reserve_cap)
+        } else {
+            self.tie_cap
+        };
+        self.events.len() >= total_cap
     }
     fn cap(&self) -> usize {
         self.cap
     }
+    fn skipped(&self) -> bool {
+        self.skipped
+    }
     fn begin_filter(&mut self, index: usize) {
         self.filter = index;
         self.boundary = None;
+        self.reserve_boundary = None;
     }
     fn push(&mut self, event: Event, _id: [u8; 32], limit: usize) -> bool {
         let count = self.counts[self.filter];
@@ -288,7 +335,41 @@ impl ScanCollector for EventCollector {
                 return false;
             }
             match self.boundary {
-                Some(b) if b == event.created_at => {}
+                Some(b) if b == event.created_at => {
+                    // The boundary second's tie block: collected whole so a
+                    // page never splits a tie, but never beyond `tie_cap`.
+                    // The overflow is skipped without ending the walk: the
+                    // reserve below the boundary second must stay
+                    // reachable (the connection re-attributes it when the
+                    // block is dropped).
+                    if self.events.len() >= self.tie_cap {
+                        self.skipped = true;
+                        return true;
+                    }
+                }
+                Some(b) if event.created_at < b => {
+                    // The reserve: older events the connection
+                    // re-attributes after dropping the boundary second.
+                    // Bounded by the same quota as the primary page, plus
+                    // its own boundary tie block (the same no-partial-tie
+                    // rule: a re-attributed page must not start inside a
+                    // split tie either). Callers that do not drop a
+                    // boundary block (no WebSocket REQ handler) keep the
+                    // pre-reserve behavior: the walk stops here.
+                    if !self.collect_reserve {
+                        return false;
+                    }
+                    let reserve = self.reserves[self.filter];
+                    if reserve >= limit {
+                        match self.reserve_boundary {
+                            Some(rb) if rb == event.created_at => {}
+                            _ => return false,
+                        }
+                    } else if reserve + 1 == limit {
+                        self.reserve_boundary = Some(event.created_at);
+                    }
+                    self.reserves[self.filter] += 1;
+                }
                 _ => return false,
             }
         } else if count + 1 == limit {
@@ -720,7 +801,11 @@ impl Store {
                 )
             }
         };
-        let mut out = EventCollector::new(collect_cap, !count_mode, filters.len());
+        // Only the WebSocket REQ path (the `hidden_slack > 0` callers)
+        // re-attributes the events below a dropped boundary tie block, so
+        // only it needs the reserve collected.
+        let mut out =
+            EventCollector::new(collect_cap, !count_mode, filters.len(), hidden_slack > 0);
         let more = self.scan_collect(
             filters,
             now,
@@ -938,6 +1023,12 @@ impl Store {
             if out.full() {
                 break;
             }
+        }
+        // A boundary tie block beyond the collector's tie cap was skipped:
+        // the result is incomplete even though the walk reached the end of
+        // its ranges.
+        if out.skipped() {
+            more = true;
         }
         if !count_mode {
             if sort_search && !all_terms.is_empty() {
@@ -1811,6 +1902,67 @@ mod tests {
         c.sort_relevance(&[], &[]);
         c.truncate_to(3);
         assert_eq!(c.items.len(), 3);
+    }
+
+    #[test]
+    fn event_collector_collects_the_reserve_below_a_tie_block() {
+        use super::{EventCollector, ScanCollector};
+        // The connection drops a full boundary tie block and re-attributes
+        // the events below it (the reserve): the collector must keep the
+        // whole block (the no-partial-tie rule) *and* the reserve, bounded
+        // by the same quota plus the reserve's own tie block.
+        let mut c = EventCollector::new(2, true, 1, true);
+        c.begin_filter(0);
+        for i in 0..3u8 {
+            assert!(c.push(ev("tie", 1000), [i; 32], 2));
+        }
+        for i in 3..5u8 {
+            assert!(c.push(ev("old", 999), [i; 32], 2));
+        }
+        let times: Vec<u64> = c.events.iter().map(|e| e.created_at).collect();
+        assert_eq!(
+            times,
+            vec![1000, 1000, 1000, 999, 999],
+            "the boundary tie block and the reserve below it must both be collected"
+        );
+        // The reserve's own boundary second is completed too (the same
+        // no-partial-tie rule: a re-attributed page must not start inside
+        // a split tie).
+        assert!(c.push(ev("old", 999), [5; 32], 2));
+        assert_eq!(c.events.len(), 6);
+        // Older than the reserve boundary: the walk stops.
+        assert!(!c.push(ev("older", 998), [6; 32], 2));
+        assert_eq!(c.events.len(), 6);
+        // A caller that never drops a boundary block (no WebSocket REQ
+        // handler) keeps the pre-reserve behavior: the walk stops below the
+        // quota instead of collecting the reserve.
+        let mut c = EventCollector::new(2, true, 1, false);
+        c.begin_filter(0);
+        for i in 0..3u8 {
+            assert!(c.push(ev("tie", 1000), [i; 32], 2));
+        }
+        assert!(!c.push(ev("old", 999), [7; 32], 2));
+        assert_eq!(c.events.len(), 3);
+        // The reserve is bounded like the primary: a flood below the
+        // boundary second stops at its own tie cap, not at the candidate
+        // budget.
+        let mut c = EventCollector::new(2, true, 1, true);
+        c.begin_filter(0);
+        let mut pushed = 0;
+        for i in 0..16u8 {
+            let created = if i < 2 { 1000 } else { 999 };
+            if c.full() {
+                break;
+            }
+            if c.push(ev("x", created), [i; 32], 2) {
+                pushed += 1;
+            }
+        }
+        assert!(c.full(), "the total collection cap must stop the scan");
+        assert_eq!(
+            pushed, 8,
+            "two primary events plus their tie cap, and the reserve with its own"
+        );
     }
 
     #[test]

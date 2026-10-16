@@ -561,29 +561,46 @@ impl super::Conn {
         // inside) that tie block and a client advancing inclusively
         // (`until = T`) would receive the same block forever. The whole
         // boundary second is dropped — a page never delivers a partial tie
-        // — and the older events the scan over-fetched are attributed in
-        // its place, so the client's cursor advances past `T`. The
-        // omission keeps the `more` hint; when the scan returned only tie
-        // events there is nothing to attribute, the page is empty, and the
-        // client proceeds from `T - 1` on the next request.
+        // — and the older events the scan over-fetched (the reserve) are
+        // attributed in its place, so the client's cursor advances past
+        // `T`. The omission keeps the `more` hint.
         // A page is full as soon as *any* filter exhausts its quota, so
         // the capacity is the smallest limit: with asymmetric limits the
         // small filter fills first, and comparing against the largest
         // would deliver an incomplete all-tie page verbatim, livelocking
         // an inclusive client while older events stay unreachable.
+        //
+        // At most one block is dropped: the request's newest one. The scan
+        // collects a reserve below the boundary second exactly for this,
+        // and dropping the re-attributed blocks too would skip seconds the
+        // client has never seen — and, for a `limit: 1` page, leave the
+        // response empty while matching events exist. One drop is enough
+        // for progress: the client's cursor is the oldest event received,
+        // and its next request drops that block and serves the one after.
         let page_capacity = limits.iter().copied().min().unwrap_or(0);
         let mut tie_truncated = false;
-        while (more || truncated) && kept.len() >= page_capacity && !kept.is_empty() {
-            let boundary = kept[0].created_at;
-            if kept.iter().any(|event| event.created_at != boundary) {
-                break;
-            }
+        if (more || truncated)
+            && kept.len() >= page_capacity
+            && !kept.is_empty()
+            && kept
+                .iter()
+                .all(|event| event.created_at == kept[0].created_at)
+        {
             // Drop the boundary second (all of `kept`) and give the
             // over-fetched older events a fresh attribution.
             let (next, next_unplaced) = attribute_visible_page(&mut unplaced, &stored, &limits);
-            kept = next;
-            unplaced = next_unplaced;
-            truncated = !unplaced.is_empty();
+            if next.is_empty() {
+                // The scan collected only the boundary second: its tie
+                // block hit the collection bound (a flood sharing one
+                // timestamp). There is no reserve to serve, and a partial
+                // tie must not be delivered: the block is dropped and the
+                // client proceeds from `T - 1` on the next request.
+                kept.clear();
+            } else {
+                kept = next;
+                unplaced = next_unplaced;
+                truncated = !unplaced.is_empty();
+            }
             tie_truncated = true;
         }
         to_send = kept;
