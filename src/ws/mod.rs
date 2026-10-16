@@ -5494,6 +5494,81 @@ mod tests {
     }
 
     #[test]
+    fn tie_drop_delivers_the_over_fetched_older_events() {
+        // The tie-drop guard must not throw away the older events the scan
+        // already fetched: after dropping the boundary second they are
+        // attributed in its place, so the page makes progress instead of
+        // coming back empty (the pre-fix behavior dropped both).
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let now = unix_now();
+            for i in 0..12 {
+                let e = signed_note(conn.relay.secp(), &format!("new-{i}"), now, vec![]);
+                conn.relay.db.put(e, now).await;
+            }
+            for i in 0..8 {
+                let e = signed_note(conn.relay.secp(), &format!("old-{i}"), now - 1, vec![]);
+                conn.relay.db.put(e, now).await;
+            }
+            // The scan over-fetches up to `limit * 2` (12 + 8 = 20), so the
+            // older second is already materialized when the tie drops.
+            conn.handle_req(&[json!("sub"), json!({"kinds": [1], "limit": 10})])
+                .await;
+            conn.pump_pending_reqs();
+            let msgs = outgoing_json(&conn);
+            let contents: Vec<&str> = msgs
+                .iter()
+                .filter(|m| m[0] == "EVENT")
+                .map(|m| m[2]["content"].as_str().unwrap())
+                .collect();
+            assert_eq!(
+                contents.len(),
+                8,
+                "the over-fetched older events must be delivered: {contents:?}"
+            );
+            assert!(
+                contents.iter().all(|c| c.starts_with("old-")),
+                "the boundary tie itself must not be delivered: {contents:?}"
+            );
+            assert!(
+                msgs.iter()
+                    .any(|m| m[0] == "EOSE" && m[1] == "sub" && m[2] == json!(["more"])),
+                "the dropped second must keep the more hint: {msgs:?}"
+            );
+            // An inclusive cursor (`until = T - 1`) re-serves the older
+            // second whole and completes: the delivered page was a prefix
+            // of that block, and re-fetching it is idempotent for the
+            // client.
+            conn.outgoing.clear();
+            conn.out_bytes = 0;
+            conn.handle_req(&[
+                json!("sub"),
+                json!({"kinds": [1], "limit": 10, "until": now - 1}),
+            ])
+            .await;
+            conn.pump_pending_reqs();
+            let msgs = outgoing_json(&conn);
+            let contents: Vec<&str> = msgs
+                .iter()
+                .filter(|m| m[0] == "EVENT")
+                .map(|m| m[2]["content"].as_str().unwrap())
+                .collect();
+            assert_eq!(
+                contents.len(),
+                8,
+                "the older block is served whole: {contents:?}"
+            );
+            assert!(
+                msgs.iter()
+                    .any(|m| m[0] == "EOSE" && m[1] == "sub" && m[2] == json!(["finish"])),
+                "the follow-up page must complete: {msgs:?}"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
     fn same_second_tie_flood_paginates_to_finish() {
         // A same-second flood larger than the scan's tie cap used to
         // return the same tie block on every page, so an inclusive client

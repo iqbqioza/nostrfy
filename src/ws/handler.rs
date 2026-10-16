@@ -554,16 +554,18 @@ impl super::Conn {
         // report `more`. That is conservative on purpose: it prompts the
         // client to authenticate (see the `auth` hint) instead of wrongly
         // claiming completeness.
-        let (mut kept, mut truncated) = attribute_visible_page(&mut to_send, &stored, &limits);
+        let (mut kept, mut unplaced) = attribute_visible_page(&mut to_send, &stored, &limits);
+        let mut truncated = !unplaced.is_empty();
         // Same-second pagination guard: when the page is incomplete and
         // every kept event shares one `created_at`, the scan ended at (or
         // inside) that tie block and a client advancing inclusively
         // (`until = T`) would receive the same block forever. The whole
-        // boundary second is dropped — a page never delivers a partial tie.
-        // The attribution above already discarded every event it did not
-        // place, so there is nothing left to attribute in its place: the
-        // guard always yields an empty page that keeps the `more` hint,
-        // and the client proceeds from `T - 1` on the next request.
+        // boundary second is dropped — a page never delivers a partial tie
+        // — and the older events the scan over-fetched are attributed in
+        // its place, so the client's cursor advances past `T`. The
+        // omission keeps the `more` hint; when the scan returned only tie
+        // events there is nothing to attribute, the page is empty, and the
+        // client proceeds from `T - 1` on the next request.
         // A page is full as soon as *any* filter exhausts its quota, so
         // the capacity is the smallest limit: with asymmetric limits the
         // small filter fills first, and comparing against the largest
@@ -576,10 +578,12 @@ impl super::Conn {
             if kept.iter().any(|event| event.created_at != boundary) {
                 break;
             }
-            to_send.retain(|event| event.created_at != boundary);
-            let (next, next_truncated) = attribute_visible_page(&mut to_send, &stored, &limits);
+            // Drop the boundary second (all of `kept`) and give the
+            // over-fetched older events a fresh attribution.
+            let (next, next_unplaced) = attribute_visible_page(&mut unplaced, &stored, &limits);
             kept = next;
-            truncated = next_truncated;
+            unplaced = next_unplaced;
+            truncated = !unplaced.is_empty();
             tie_truncated = true;
         }
         to_send = kept;
@@ -1345,20 +1349,19 @@ impl super::Conn {
 /// boundary timestamp of a filter whose quota is already exhausted still
 /// belong to that filter's page (NIP-01/NIP-67: a page never splits a
 /// created_at tie), exactly like the scan's per-filter boundary
-/// continuation. Returns the kept events and whether any event was
-/// dropped (the caller turns that into the `more` completeness hint).
-/// Drains `events` and discards every event it does not place, so a
-/// caller cannot re-attribute them after dropping a boundary second; the
-/// returned `truncated` flag is the only trace of the discarded events.
+/// continuation. Returns the kept events and the unplaced ones: a
+/// non-empty unplaced set is the caller's `more` completeness hint, and
+/// the events themselves are re-attributed after the caller drops a
+/// boundary second. Drains `events` (order preserved).
 fn attribute_visible_page(
     events: &mut Vec<Event>,
     filters: &[Filter],
     limits: &[usize],
-) -> (Vec<Event>, bool) {
+) -> (Vec<Event>, Vec<Event>) {
     let mut remaining = limits.to_vec();
     let mut boundaries: Vec<Option<u64>> = vec![None; remaining.len()];
     let mut kept = Vec::with_capacity(events.len());
-    let mut truncated = false;
+    let mut unplaced = Vec::new();
     for event in events.drain(..) {
         let mut placed = false;
         for (i, filter) in filters.iter().enumerate() {
@@ -1382,10 +1385,10 @@ fn attribute_visible_page(
         if placed {
             kept.push(event);
         } else {
-            truncated = true;
+            unplaced.push(event);
         }
     }
-    (kept, truncated)
+    (kept, unplaced)
 }
 
 /// The JSON serialization size of a value without allocating the string:
