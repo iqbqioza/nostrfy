@@ -376,6 +376,9 @@ pub struct DatabaseConfig {
     pub meta_index: bool,
     /// Initial per-connection WebSocket read/write buffer size in bytes
     /// (the buffers grow on demand; the name predates the current use).
+    /// Must stay strictly below [`Config::ws_max_write_buffer_bytes`]: the
+    /// WebSocket stack asserts that ordering on every upgrade, so
+    /// `validate` rejects a value at or above the bound.
     pub db_buffer_size: usize,
     /// Seconds a database request may wait before timing out (0 = wait
     /// forever). A timeout keeps the relay responsive even when the storage
@@ -1099,6 +1102,25 @@ impl Config {
     /// the first problem found, so `nostrfy check` and startup fail fast
     /// instead of misbehaving at runtime with a typo'd key or an impossible
     /// database layout.
+    /// The outgoing-buffer bound for a WebSocket connection: the largest
+    /// relay-generated message the stack must be able to write. A NIP-77
+    /// `NEG-MSG` response carries every id of a queried range as hex (up to
+    /// `limits.max_neg_items` ids) plus the JSON envelope; per-id worst case
+    /// is 32 bytes as 64 hex chars, with the range headers amortized over
+    /// the emitted ranges. The WebSocket stack asserts
+    /// `max_write_buffer_size > write_buffer_size` on every upgrade, so
+    /// `database.db_buffer_size` must stay strictly below this bound
+    /// (`validate` rejects it otherwise); the server uses this value for
+    /// `max_write_buffer_size`.
+    pub fn ws_max_write_buffer_bytes(&self) -> usize {
+        self.limits.max_ws_message_bytes.max(
+            self.limits
+                .max_neg_items
+                .saturating_mul(80)
+                .saturating_add(64 * 1024),
+        )
+    }
+
     pub fn validate(&self) -> Result<()> {
         // Hex key format checks.
         let hex32 = |value: &str, what: &str| -> Result<()> {
@@ -1392,6 +1414,20 @@ impl Config {
             if value == 0 {
                 return Err(config_err(format!("{name} must be at least 1 (got 0)")));
             }
+        }
+        // The WebSocket stack asserts `max_write_buffer_size >
+        // write_buffer_size` on every upgrade, so a `db_buffer_size` at or
+        // above the bound derived from the message/negentropy limits would
+        // panic every WebSocket upgrade (the process survives; every
+        // connection dies).
+        let ws_write_bound = self.ws_max_write_buffer_bytes();
+        if self.database.db_buffer_size >= ws_write_bound {
+            return Err(config_err(format!(
+                "database.db_buffer_size = {} must be smaller than the WebSocket write-buffer \
+                 bound ({ws_write_bound}); lower database.db_buffer_size or raise \
+                 limits.max_ws_message_bytes / limits.max_neg_items",
+                self.database.db_buffer_size
+            )));
         }
 
         // NIP-42 AUTH relay-tag, NIP-62 vanish and NIP-86 NIP-98 admin auth
@@ -3976,6 +4012,38 @@ max_log_files = 2
         assert!(
             cfg.validate().is_err(),
             "map_size must not exceed map_max_size"
+        );
+    }
+
+    #[test]
+    fn validation_rejects_a_db_buffer_size_at_the_ws_write_bound() {
+        // The WebSocket stack asserts `max_write_buffer_size >
+        // write_buffer_size` on every upgrade: a `db_buffer_size` at or
+        // above the derived bound must be rejected at load time instead of
+        // panicking every upgrade.
+        let mut cfg = Config::default();
+        let bound = cfg.ws_max_write_buffer_bytes();
+        assert!(
+            cfg.validate().is_ok(),
+            "the default buffer is far below the bound"
+        );
+        cfg.database.db_buffer_size = bound - 1;
+        assert!(cfg.validate().is_ok(), "one byte below the bound is usable");
+        cfg.database.db_buffer_size = bound;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("database.db_buffer_size"),
+            "the error must name the field: {err}"
+        );
+        // The bound follows the message/negentropy limits: with a smaller
+        // `max_neg_items` it drops to `max_ws_message_bytes`.
+        let mut small = Config::default();
+        small.limits.max_ws_message_bytes = 1 << 20;
+        small.limits.max_neg_items = 1_000;
+        small.database.db_buffer_size = small.ws_max_write_buffer_bytes();
+        assert!(
+            small.validate().is_err(),
+            "the bound must track the configured limits"
         );
     }
 

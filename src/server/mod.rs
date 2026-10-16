@@ -1321,13 +1321,10 @@ async fn ws_handler(State(relay): State<Arc<Relay>>, request: Request) -> Respon
             // demand); bounded so that hundreds of thousands of idle
             // connections do not pin megabytes each.
             let buffer_size = cfg.database.db_buffer_size;
-            // The outgoing buffer must fit the largest relay-generated
-            // message: a NIP-77 NEG-MSG response carries every id of a
-            // queried range as hex (up to neg_max_items ids), plus the JSON
-            // envelope. Per-id worst case: 32 bytes as 64 hex chars, with
-            // range headers amortized over the emitted ranges.
-            let neg_max = cfg.limits.max_neg_items;
-            let max_write = max_msg.max(neg_max.saturating_mul(80).saturating_add(64 * 1024));
+            // The outgoing-buffer bound (see `ws_max_write_buffer_bytes`);
+            // `validate` enforces `buffer_size < max_write` because the
+            // WebSocket stack asserts the strict ordering on every upgrade.
+            let max_write = cfg.ws_max_write_buffer_bytes();
             drop(cfg);
             upgrade
                 .read_buffer_size(buffer_size)
