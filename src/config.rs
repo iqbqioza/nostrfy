@@ -1098,6 +1098,11 @@ impl Config {
         !self.relay.disabled_nips.contains(&num)
     }
 
+    /// Hard ceiling for `limits.live_buffer`: far below tokio's semaphore
+    /// permit ceiling (`usize::MAX >> 3`, where the bounded channel would
+    /// panic at startup) and already far past any real live-fan-out burst.
+    const LIVE_BUFFER_CEILING: usize = 10_000_000;
+
     /// Validates the configuration values. Returns a clear error message for
     /// the first problem found, so `nostrfy check` and startup fail fast
     /// instead of misbehaving at runtime with a typo'd key or an impossible
@@ -1429,6 +1434,20 @@ impl Config {
                 self.database.db_buffer_size
             )));
         }
+        // A live buffer this large is certainly a typo (bytes for events,
+        // etc.): the bounded channel would hold that many queued events,
+        // and above tokio's semaphore permit ceiling (`usize::MAX >> 3`)
+        // its constructor panics at startup, so `check` must reject the
+        // value before the relay does.
+        if self.limits.live_buffer > Self::LIVE_BUFFER_CEILING {
+            return Err(config_err(format!(
+                "limits.live_buffer = {} exceeds the hard ceiling of {}; lower it (the live \
+                 queue would hold that many events, and a larger value panics the channel at \
+                 startup)",
+                self.limits.live_buffer,
+                Self::LIVE_BUFFER_CEILING
+            )));
+        }
 
         // NIP-42 AUTH relay-tag, NIP-62 vanish and NIP-86 NIP-98 admin auth
         // all compare client URLs against `relay_identity()`. With an empty
@@ -1521,6 +1540,9 @@ impl Config {
             ),
             ("limits.max_sub_bytes", l.max_sub_bytes, 64 << 20),
             ("limits.max_limit", l.max_limit, 100_000),
+            // A million queued live events is already far past any real
+            // fan-out burst (the hard ceiling above is 10 million).
+            ("limits.live_buffer", l.live_buffer, 1_000_000),
             // NIP-77 holds the whole sync window in memory; a very large
             // cap makes one NEG-OPEN an out-of-memory trigger.
             ("limits.max_neg_items", l.max_neg_items, 1_000_000),
@@ -4045,6 +4067,22 @@ max_log_files = 2
             small.validate().is_err(),
             "the bound must track the configured limits"
         );
+    }
+
+    #[test]
+    fn validation_rejects_an_unusable_live_buffer() {
+        // Above the hard ceiling the bounded live channel panics at startup
+        // (tokio's semaphore permit assert): `check` must reject the value
+        // first.
+        let mut cfg = Config::default();
+        assert!(cfg.validate().is_ok());
+        cfg.limits.live_buffer = i64::MAX as usize;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("limits.live_buffer"), "{err}");
+        cfg.limits.live_buffer = Config::LIVE_BUFFER_CEILING;
+        assert!(cfg.validate().is_ok(), "the ceiling itself is usable");
+        cfg.limits.live_buffer = Config::LIVE_BUFFER_CEILING + 1;
+        assert!(cfg.validate().is_err());
     }
 
     #[test]

@@ -340,7 +340,7 @@ Set this whenever a reverse proxy (nginx, Caddy, a cloud load balancer, Cloudfla
 
 **`max_neg_items`** — The maximum number of records a single NIP-77 negentropy sync may process. Larger syncs are refused with a `NEG-ERR`. The whole sync window is held in memory: values above 1,000,000 are warned about and anything above 10,000,000 is rejected as a clear mistake (a unit typo can turn one NEG-OPEN into an out-of-memory trigger).
 
-**`live_buffer`** — The size of the fan-out queue between the relay and the broadcaster. On overflow, events are dropped for live delivery (they stay available via subscriptions).
+**`live_buffer`** — The size of the fan-out queue between the relay and the broadcaster. On overflow, events are dropped for live delivery (they stay available via subscriptions). A value above 10,000,000 is rejected at `check`/startup (the bounded channel would panic above tokio's semaphore permit ceiling); a value above 1,000,000 is warned about as extraordinarily large.
 
 **`new_pubkey_min_age_secs`** — Spam defense: the relay records when a pubkey's first event was accepted, and events from pubkeys younger than this window are rejected with `restricted: your account is too new`. A rejected first event does **not** start the clock. `0` = disabled.
 
