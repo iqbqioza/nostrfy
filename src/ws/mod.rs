@@ -383,7 +383,10 @@ impl Drop for PendingReq {
 /// Upper bound on queued REQ responses per connection: beyond this the
 /// oldest pending response is cut off (its EOSE is sent immediately) so a
 /// client flooding REQs while reading slowly cannot pile up unbounded
-/// scan results.
+/// scan results. The queue is pumped into the capped outgoing queue
+/// before the bound applies (see [`Conn::enqueue_pending_req`]), so only
+/// responses the socket cannot take are cut off — a burst of REQs whose
+/// responses fit the outgoing queue is delivered in full.
 const MAX_PENDING_REQS: usize = 4;
 
 /// One queued outgoing frame. EVENT frames carry a fingerprint of their
@@ -724,15 +727,24 @@ impl Conn {
     }
 
     /// Queues a REQ response for the pump. Responses are processed in
-    /// order; when more than [`MAX_PENDING_REQS`] are queued (a client
-    /// flooding REQs while reading slowly), the oldest is cut off — its
-    /// EOSE is sent immediately so the client sees a completed
-    /// subscription instead of a hanging one.
+    /// order. Everything the outgoing queue can still take is pumped out
+    /// before the cap is applied: [`MAX_PENDING_REQS`] bounds responses
+    /// that cannot be *delivered* (a client flooding REQs while reading
+    /// slowly), not a client that sends several REQs in one read batch —
+    /// without that pump, the fifth REQ of such a batch silently lost the
+    /// first response's stored events even though the client was reading
+    /// normally. Only a response that is still queued with the outgoing
+    /// cap reached is cut off — its EOSE is sent immediately so the
+    /// client sees a completed subscription instead of a hanging one.
     pub(crate) fn enqueue_pending_req(&mut self, pending: PendingReq) {
         // A REQ replaces the subscription of the same id (NIP-01): drop
         // any still-pumping response for it so stale events are never
         // delivered for the replaced subscription.
         self.pending_reqs.retain(|p| p.sub_id != pending.sub_id);
+        // Deliver what fits before considering a cut-off: the cap must
+        // only bite when the socket is the bottleneck, never merely
+        // because the responses were queued in the same read batch.
+        self.pump_pending_reqs();
         if self.pending_reqs.len() >= MAX_PENDING_REQS
             && let Some(mut dropped) = self.pending_reqs.pop_front()
         {
@@ -2154,6 +2166,22 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// Fills the outgoing queue past its byte cap so the pending-REQ pump
+    /// cannot move any event out of `pending_reqs`. The pending cap only
+    /// cuts off responses the socket cannot take, so the cut-off tests
+    /// must congest the queue first.
+    fn congest_outgoing(conn: &mut Conn) {
+        conn.outgoing.clear();
+        conn.out_bytes = 0;
+        conn.send(Message::Text(
+            format!("[\"NOTICE\",\"{}\"]", "x".repeat(conn.out_queue_cap())).into(),
+        ));
+        assert!(
+            conn.out_bytes > conn.out_queue_cap(),
+            "the congestion fixture must exceed the outgoing cap"
+        );
     }
 
     #[test]
@@ -6178,13 +6206,71 @@ mod tests {
     }
 
     #[test]
-    fn pending_reqs_are_bounded_and_the_oldest_is_cut_off() {
-        // More than MAX_PENDING_REQS queued REQ responses (a client
-        // flooding REQs while reading slowly): the oldest is cut off with
-        // its EOSE sent immediately, so the subscription never hangs.
+    fn a_burst_of_reqs_is_delivered_without_cut_off() {
+        // A client that sends more REQs than MAX_PENDING_REQS in one read
+        // batch (the connection loop pumps only after the batch) must
+        // still receive every response in full: the pending cap bounds
+        // responses the socket cannot take, not a burst whose responses
+        // fit the outgoing queue.
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let mut conn = build_conn().await;
+            let now = unix_now();
+            let event = signed_note(conn.relay.secp(), "burst", now, vec![]);
+            conn.relay.db.put(event.clone(), now).await;
+            let subs = MAX_PENDING_REQS + 3;
+            for i in 0..subs {
+                conn.handle_req(&[json!(format!("s{i}")), json!({"kinds": [1]})])
+                    .await;
+            }
+            // Drain what the pump produces, un-congesting between passes:
+            // the outgoing queue would otherwise defer the rest.
+            let mut all = Vec::new();
+            loop {
+                conn.pump_pending_reqs();
+                for m in outgoing_json(&conn) {
+                    all.push(m.clone());
+                }
+                conn.outgoing.clear();
+                conn.out_bytes = 0;
+                if conn.pending_reqs.is_empty() {
+                    break;
+                }
+            }
+            for i in 0..subs {
+                let sub = format!("s{i}");
+                assert!(
+                    all.iter()
+                        .any(|m| m[0] == "EVENT" && m[1] == sub && m[2]["id"] == json!(event.id)),
+                    "the response of {sub} must deliver its event"
+                );
+                assert!(
+                    all.iter().any(|m| m[0] == "EOSE" && m[1] == sub),
+                    "the response of {sub} must finish with its EOSE"
+                );
+                assert!(
+                    !all.iter().any(|m| m[0] == "EOSE"
+                        && m[1] == sub
+                        && m.get(2) == Some(&json!(["more"]))),
+                    "no response of the burst may be cut off"
+                );
+            }
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn pending_reqs_are_bounded_and_the_oldest_is_cut_off() {
+        // More than MAX_PENDING_REQS queued REQ responses that cannot be
+        // delivered (the outgoing queue is at its cap: a client flooding
+        // REQs while reading slowly): the oldest is cut off with its EOSE
+        // sent immediately, so the subscription never hangs. A burst the
+        // outgoing queue can take is delivered instead (see
+        // `a_burst_of_reqs_is_delivered_without_cut_off`).
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            congest_outgoing(&mut conn);
             let now = unix_now();
             for i in 0..5 {
                 conn.subs
@@ -6256,11 +6342,12 @@ mod tests {
     fn pending_req_cutoff_does_not_resend_eose() {
         // A pending response whose EOSE was already sent (its buffered live
         // events still queued) must not receive a second EOSE when the
-        // pending queue overflows, and a CLOSEd subscription must not
-        // receive an EOSE at all.
+        // pending queue overflows under congestion, and a CLOSEd
+        // subscription must not receive an EOSE at all.
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let mut conn = build_conn().await;
+            congest_outgoing(&mut conn);
             conn.subs
                 .insert("s0".into(), (Vec::new(), 0, "\"s0\"".into()));
             let mut live = std::collections::VecDeque::new();
@@ -6307,6 +6394,7 @@ mod tests {
             conn.pending_reqs.clear();
             conn.outgoing.clear();
             conn.out_bytes = 0;
+            congest_outgoing(&mut conn);
             conn.enqueue_pending_req(PendingReq {
                 sub_id: "gone".into(),
                 events: Default::default(),
@@ -6348,12 +6436,13 @@ mod tests {
     #[test]
     fn pending_req_cutoff_closes_a_subscription_with_pre_eose_live_events() {
         // Live events buffered before the EOSE cannot be delivered once the
-        // response is cut off: without a CLOSED the subscription would look
-        // healthy while silently missing them (ephemeral events are not
-        // recoverable by a re-REQ).
+        // response is cut off under congestion: without a CLOSED the
+        // subscription would look healthy while silently missing them
+        // (ephemeral events are not recoverable by a re-REQ).
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let mut conn = build_conn().await;
+            congest_outgoing(&mut conn);
             conn.subs
                 .insert("s0".into(), (Vec::new(), 0, "\"s0\"".into()));
             let mut live = std::collections::VecDeque::new();
