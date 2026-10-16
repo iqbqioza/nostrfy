@@ -599,16 +599,27 @@ async fn rebuild_group_state(relay: &Relay, groups_enabled: bool) -> Result<()> 
 }
 
 /// The startup NIP-29 sequence, run before the relay accepts traffic:
-/// restore or rebuild the group state, then complete (or confirm) every
+/// restore or rebuild the group state, complete (or confirm) every
 /// interrupted `kind:9008` purge so a ghosted group is either fully purged
-/// or stays fail-closed, and publish the remaining pending count on the
-/// metrics. A failed rebuild is fatal (see [`rebuild_group_state`]).
+/// or stays fail-closed, heal the metadata a previous relay key left
+/// behind, and publish the remaining pending count on the metrics. A
+/// failed rebuild is fatal (see [`rebuild_group_state`]).
 async fn startup_group_state(relay: &Relay, groups_enabled: bool) -> Result<()> {
     restore_group_state(relay, groups_enabled).await?;
     // Crash recovery for kind:9008 group purges: a purge accepted but not
     // finished (the process crashed mid-walk) is re-run here, before the
     // relay serves. Idempotent and a no-op when nothing is pending.
     relay.resume_pending_purges().await;
+    // A relay key rotation leaves the previous key's relay-signed metadata
+    // (39000-39005) stored: addressable replacement is per author, so the
+    // current key can never replace it, and clients that verify the relay
+    // signature against NIP-11 `self` reject it. Heal it here — after the
+    // store holds the restored/rebuilt state and any pending purge has
+    // completed, so the republished metadata reflects the state the relay
+    // is about to serve.
+    if groups_enabled {
+        relay.heal_rotated_group_metadata().await;
+    }
     // Surface the resume outcome on the metrics: after the resume the
     // pending table should be empty, and a non-zero gauge means a recorded
     // purge could not be completed (the group stays fail-closed until the
@@ -2604,17 +2615,24 @@ mod tests {
     async fn blossom_relay_with_key(key: &str) -> Arc<Relay> {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir()
+            .join("nostrfy-server-test")
+            .join(format!("{:x}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        blossom_relay_with_key_at(key, path).await
+    }
+
+    /// Like [`blossom_relay_with_key`], over a given database path: a
+    /// restart test reopens the same database with another relay key.
+    async fn blossom_relay_with_key_at(key: &str, path: std::path::PathBuf) -> Arc<Relay> {
         let mut cfg = crate::config::Config::default();
         cfg.relay.name = "example relay".into();
         cfg.blossom.host = "media.example.com".into();
         cfg.blossom.storage = "local".into();
         cfg.database.map_size = 16 * 1024 * 1024;
         cfg.database.max_map_size = 64 * 1024 * 1024;
-        cfg.database.path = std::env::temp_dir()
-            .join("nostrfy-server-test")
-            .join(format!("{:x}-{id}", std::process::id()));
+        cfg.database.path = path;
         cfg.blossom.local_path = cfg.database.path.join("blobs");
-        let _ = std::fs::remove_dir_all(&cfg.database.path);
         let db = crate::db::DbClient::open(
             &cfg.database,
             true,
@@ -2661,6 +2679,124 @@ mod tests {
         };
         event.id = crate::nips::nip01::compute_id(&event);
         event
+    }
+
+    #[tokio::test]
+    async fn group_metadata_of_a_rotated_relay_key_is_healed() {
+        // A relay key rotation leaves the previous key's relay-signed
+        // metadata (39000-39005) stored: NIP-29 metadata is addressable,
+        // replacement is per author, so a plain restart restores the
+        // key-independent state and never republishes anything. The startup
+        // must publish the restored state's metadata under the new key and
+        // remove the former key's events, without rebuilding the state (a
+        // rebuild would replay the former key's moderation events as plain
+        // client events and could drop master-authorized effects).
+        let path = std::env::temp_dir()
+            .join("nostrfy-server-test")
+            .join(format!("rotate-{:x}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        let now = crate::util::unix_now();
+        let admin = "aa".repeat(32);
+        let member = "bb".repeat(32);
+        let seed = || {
+            [
+                stored_event(9007, &admin, vec![vec!["h".into(), "g1".into()]], now - 30),
+                stored_event(
+                    9002,
+                    &admin,
+                    vec![
+                        vec!["h".into(), "g1".into()],
+                        vec!["name".into(), "Group One".into()],
+                    ],
+                    now - 20,
+                ),
+                stored_event(
+                    9000,
+                    &admin,
+                    vec![
+                        vec!["h".into(), "g1".into()],
+                        vec!["p".into(), member.clone()],
+                    ],
+                    now - 10,
+                ),
+            ]
+        };
+        let meta_filter = || -> crate::filter::Filter {
+            serde_json::from_value(serde_json::json!({"kinds": [39000, 39001, 39002, 39005]}))
+                .unwrap()
+        };
+
+        // First life: key A rebuilds the state and publishes its metadata.
+        let relay_a = blossom_relay_with_key_at(&"02".repeat(32), path.clone()).await;
+        for event in seed() {
+            assert!(matches!(
+                relay_a.db.put(event, now).await,
+                crate::db::PutOutcome::Stored
+            ));
+        }
+        startup_group_state(&relay_a, true)
+            .await
+            .expect("the first startup must succeed");
+        let key_a = relay_a.relay_pubkey().expect("key A must be configured");
+        let (before, _) = relay_a.db.query(vec![meta_filter()], 10, now).await;
+        assert_eq!(before.len(), 4, "key A must have published its metadata");
+        assert!(before.iter().all(|event| event.pubkey == key_a));
+        relay_a.db.shutdown();
+        drop(relay_a);
+
+        // Second life: the same database with key B. The snapshot is
+        // current, so the state restores and only the heal republishes.
+        let relay_b = blossom_relay_with_key_at(&"03".repeat(32), path).await;
+        let key_b = relay_b.relay_pubkey().expect("key B must be configured");
+        assert_ne!(key_a, key_b);
+        startup_group_state(&relay_b, true)
+            .await
+            .expect("the healed startup must succeed");
+        let (healed, _) = relay_b.db.query(vec![meta_filter()], 10, now).await;
+        assert_eq!(
+            healed.len(),
+            4,
+            "the former key's metadata must be removed, not duplicated"
+        );
+        assert!(
+            healed.iter().all(|event| event.pubkey == key_b),
+            "every metadata event must be signed by the current key"
+        );
+        let meta = healed
+            .iter()
+            .find(|event| event.kind == 39000)
+            .expect("the group metadata must be republished");
+        assert!(
+            meta.tags
+                .iter()
+                .any(|t| t.len() == 2 && t[0] == "name" && t[1] == "Group One"),
+            "the republished metadata must carry the restored state: {:?}",
+            meta.tags
+        );
+        let members = healed
+            .iter()
+            .find(|event| event.kind == 39002)
+            .expect("the member list must be republished");
+        assert!(
+            members.tags.iter().any(|t| t.len() >= 2 && t[1] == member),
+            "the member must survive the heal: {:?}",
+            members.tags
+        );
+
+        // A second heal must be a no-op: nothing foreign is left to find.
+        relay_b.heal_rotated_group_metadata().await;
+        let (again, _) = relay_b.db.query(vec![meta_filter()], 10, now).await;
+        assert_eq!(again.len(), 4);
+        assert_eq!(
+            again
+                .iter()
+                .find(|event| event.kind == 39000)
+                .expect("the metadata must exist")
+                .created_at,
+            meta.created_at,
+            "the heal must not republish when the stored metadata is current"
+        );
+        relay_b.db.shutdown();
     }
 
     #[tokio::test]

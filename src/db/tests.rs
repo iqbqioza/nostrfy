@@ -4367,6 +4367,111 @@ fn meta_index_disabled_skips_rebuild_and_keeps_scans_working() {
 }
 
 #[test]
+fn foreign_group_metadata_scan_and_removal() {
+    // A relay key rotation leaves the previous key's relay-signed metadata
+    // (39000-39005) stored: NIP-29 metadata is addressable, replacement is
+    // per author, so the current key can never replace it. The startup heal
+    // scans for those events and removes them. The scan must find exactly
+    // the foreign metadata kinds, and the removal must clear their indexes
+    // without touching derived state or ordinary events.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let current = "cc".repeat(32);
+        let former = "aa".repeat(32);
+        let imported = "bb".repeat(32);
+        let authored = |kind: u64, pubkey: &str, created: u64, tags: Vec<Vec<String>>| {
+            let mut ev = event(kind, "", created, tags);
+            ev.pubkey = pubkey.to_string();
+            ev.id = nip01::compute_id(&ev);
+            ev
+        };
+        let gid = |id: &str| vec![vec!["d".to_string(), id.to_string()]];
+        let former_meta = authored(39000, &former, now - 40, gid("g1"));
+        let former_members = authored(39002, &former, now - 39, gid("g1"));
+        let imported_meta = authored(39001, &imported, now - 38, gid("g2"));
+        let current_meta = authored(39000, &current, now - 37, gid("g1"));
+        // An ordinary event of the former key must never be classified as
+        // relay metadata (the scan is bounded to the metadata kinds).
+        let ordinary = authored(1, &former, now - 36, vec![]);
+        for ev in [
+            &former_meta,
+            &former_members,
+            &imported_meta,
+            &current_meta,
+            &ordinary,
+        ] {
+            assert_eq!(db.put(ev.clone(), now).await, PutOutcome::Stored);
+        }
+
+        let ids = db
+            .foreign_group_metadata_ids(&current)
+            .await
+            .expect("the scan must succeed");
+        let mut got: Vec<String> = ids.iter().map(hex::encode).collect();
+        got.sort();
+        let mut want = vec![
+            former_meta.id.clone(),
+            former_members.id.clone(),
+            imported_meta.id.clone(),
+        ];
+        want.sort();
+        assert_eq!(
+            got, want,
+            "the scan must find every foreign metadata event and nothing else"
+        );
+
+        let stamp_before = db.state_stamp().await;
+        assert_eq!(
+            db.remove_events_by_id(&ids).await,
+            Some(3),
+            "all three foreign events must be present"
+        );
+        assert_eq!(
+            db.remove_events_by_id(&ids).await,
+            Some(0),
+            "a repeated removal must be a no-op"
+        );
+        assert_eq!(
+            db.state_stamp().await,
+            stamp_before,
+            "metadata kinds are not derived state; no rebuild may be triggered"
+        );
+
+        // Only the current key's metadata survives, and the ordinary event
+        // of the former key is untouched.
+        let f: Filter =
+            serde_json::from_value(serde_json::json!({"kinds": [39000, 39001, 39002]})).unwrap();
+        let (res, _) = db.query(vec![f], 500, now).await;
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].id, current_meta.id);
+        let f: Filter = serde_json::from_value(serde_json::json!({"kinds": [1]})).unwrap();
+        let (res, _) = db.query(vec![f], 500, now).await;
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].id, ordinary.id);
+
+        // The next startup finds nothing to heal.
+        assert!(
+            db.foreign_group_metadata_ids(&current)
+                .await
+                .expect("the scan must succeed")
+                .is_empty()
+        );
+        db.shutdown();
+    });
+}
+
+#[test]
 fn query_directed_ascending() {
     let db = DbClient::open(
         &config(),

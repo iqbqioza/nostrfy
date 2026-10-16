@@ -569,6 +569,21 @@ enum Msg {
     ClearGroupsSnapshot {
         reply: oneshot::Sender<bool>,
     },
+    /// Ids of stored relay-generated NIP-29 metadata events (39000-39005)
+    /// that are not signed by the given relay pubkey (see
+    /// `Store::foreign_group_metadata_ids`). `None` reports a failed read:
+    /// the caller must not mistake it for "none found" and skip the heal.
+    ForeignGroupMetadata {
+        relay_pubkey: String,
+        reply: oneshot::Sender<Option<Vec<[u8; crate::db::store::ID_LEN]>>>,
+    },
+    /// Removes the stored events named by `ids` (see
+    /// `Store::remove_events_by_id`). The reply is the removed count, or
+    /// `None` when the write failed (the caller keeps its retry path).
+    RemoveEvents {
+        ids: Vec<[u8; crate::db::store::ID_LEN]>,
+        reply: oneshot::Sender<Option<usize>>,
+    },
     /// Persists the NIP-43 role state snapshot (write-through on every
     /// role mutation). The reply reports whether the commit succeeded.
     SaveRoles {
@@ -802,6 +817,8 @@ fn msg_bytes(msg: &Msg) -> usize {
         // gigabytes while `max_db_queue_bytes` ignored them entirely.
         Msg::SaveGroups { snapshot, .. } => groups_snapshot_bytes(snapshot),
         Msg::SaveRoles { snapshot, .. } => roles_snapshot_bytes(snapshot),
+        Msg::ForeignGroupMetadata { relay_pubkey, .. } => relay_pubkey.len(),
+        Msg::RemoveEvents { ids, .. } => ids.len() * crate::db::store::ID_LEN,
         Msg::Delete {
             targets,
             addresses,
@@ -2483,6 +2500,35 @@ impl DbClient {
     pub async fn clear_groups_snapshot(&self) -> bool {
         self.request_write(|reply| Msg::ClearGroupsSnapshot { reply })
             .await
+    }
+
+    /// Ids of stored NIP-29 metadata events (39000-39005) not signed by
+    /// `relay_pubkey` (see `Store::foreign_group_metadata_ids`). `None`
+    /// reports a failed read: the startup heal then skips instead of
+    /// mistaking the failure for "nothing to clean".
+    pub async fn foreign_group_metadata_ids(
+        &self,
+        relay_pubkey: &str,
+    ) -> Option<Vec<[u8; crate::db::store::ID_LEN]>> {
+        self.request_read_blocking(|reply| Msg::ForeignGroupMetadata {
+            relay_pubkey: relay_pubkey.to_string(),
+            reply,
+        })
+        .await
+    }
+
+    /// Removes the stored events named by `ids` (see
+    /// `Store::remove_events_by_id`). `None` reports a failed write: the
+    /// events stay and the next startup retries the cleanup.
+    pub async fn remove_events_by_id(
+        &self,
+        ids: &[[u8; crate::db::store::ID_LEN]],
+    ) -> Option<usize> {
+        self.request_write(|reply| Msg::RemoveEvents {
+            ids: ids.to_vec(),
+            reply,
+        })
+        .await
     }
 
     /// Persists the NIP-43 role state snapshot (same commit-success

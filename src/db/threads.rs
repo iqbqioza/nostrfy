@@ -369,6 +369,23 @@ fn handle_read_msg(store: &Store, errors: &Arc<std::sync::atomic::AtomicU64>, ms
             let _ = reply.send(outcome);
             false
         }
+        Msg::ForeignGroupMetadata {
+            relay_pubkey,
+            reply,
+        } => {
+            // A failed scan is reported as `None`: the startup heal must
+            // not mistake it for "the stored metadata is the current
+            // key's" and leave a former key's events in place.
+            let ids = match store.foreign_group_metadata_ids(&relay_pubkey) {
+                Ok(ids) => Some(ids),
+                Err(e) => {
+                    db_error(errors, &e);
+                    None
+                }
+            };
+            let _ = reply.send(ids);
+            false
+        }
         Msg::LoadRoles { reply } => {
             // Same missing/failed distinction as `LoadGroups`: an empty
             // role store would keep authorizing deleted grants.
@@ -1099,6 +1116,23 @@ pub(crate) fn spawn(
                                     };
                                     let _ = reply.send(outcome);
                                 }
+                                Msg::ForeignGroupMetadata {
+                                    relay_pubkey,
+                                    reply,
+                                } => {
+                                    // Same failure reporting as the reader
+                                    // arm: `None` must not read as "the
+                                    // stored metadata is the current key's".
+                                    let ids = match store.foreign_group_metadata_ids(&relay_pubkey)
+                                    {
+                                        Ok(ids) => Some(ids),
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            None
+                                        }
+                                    };
+                                    let _ = reply.send(ids);
+                                }
                                 Msg::LoadRoles { reply } => {
                                     let outcome = match store.load_roles() {
                                         Ok(Some(snap)) => LoadRolesOutcome::Loaded(snap),
@@ -1460,6 +1494,19 @@ pub(crate) fn spawn(
                                         }
                                     };
                                     let _ = reply.send(ok);
+                                }
+                                Msg::RemoveEvents { ids, reply } => {
+                                    // A failed removal is reported as `None`:
+                                    // the events stay and the next startup
+                                    // retries the metadata cleanup.
+                                    let removed = match store.remove_events_by_id(&ids) {
+                                        Ok(removed) => Some(removed),
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            None
+                                        }
+                                    };
+                                    let _ = reply.send(removed);
                                 }
                                 Msg::BlossomAddOwner {
                                     sha256,

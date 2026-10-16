@@ -3272,22 +3272,30 @@ impl Relay {
     }
 
     /// Publishes the relay-signed metadata events (39000/39001/39002/39005)
-    /// for every live group. Called after a rebuild from stored events: a
+    /// for every live group. Called after a rebuild from stored events (a
     /// database whose group state was rebuilt — a migration from another
     /// relay, or a dropped snapshot — has no (or stale) stored metadata,
-    /// and NIP-29 clients need it to display the groups. Requires the relay
-    /// key (without it the relay cannot sign metadata and NIP-29 is hidden
-    /// in NIP-11 anyway). A failed store only logs: the in-memory state is
-    /// already correct, and the next moderation event republishes.
-    pub(crate) async fn publish_group_metadata(&self) {
+    /// and NIP-29 clients need it to display the groups) and by the relay
+    /// key rotation heal ([`Self::heal_rotated_group_metadata`]). Requires
+    /// the relay key (without it the relay cannot sign metadata and NIP-29
+    /// is hidden in NIP-11 anyway). A failed store only logs: the
+    /// in-memory state is already correct, and the next moderation event
+    /// republishes.
+    ///
+    /// Returns whether every expected event was stored. A partial store
+    /// must not let a caller drop other copies of the metadata: the heal
+    /// keeps a former key's events until this one has stored the current
+    /// key's (see [`Self::heal_rotated_group_metadata`]).
+    pub(crate) async fn publish_group_metadata(&self) -> bool {
         let Some(relay_pubkey) = self.relay_pubkey() else {
-            return;
+            return false;
         };
         let now = self.stamp_floor(unix_now());
         let events = {
             let mut groups = self.groups.write().await;
             groups.all_metadata_events(&relay_pubkey, now)
         };
+        let expected = events.len();
         let mut stored = 0usize;
         for mut event in events {
             if self.store_relay_event(&mut event).await.is_ok() {
@@ -3295,7 +3303,70 @@ impl Relay {
             }
         }
         if stored > 0 {
-            log::info!("republished {stored} NIP-29 group metadata event(s) after the rebuild");
+            log::info!("republished {stored} NIP-29 group metadata event(s)");
+        }
+        stored == expected
+    }
+
+    /// Heals the NIP-29 group metadata left by a previous relay key.
+    ///
+    /// NIP-29 metadata (39000-39005) is relay-signed and addressable:
+    /// replacement is per author, so a relay key rotation leaves the
+    /// previous key's events stored and the current key can neither
+    /// replace nor delete them. Clients that verify the relay signature
+    /// against the NIP-11 `self` pubkey then reject that metadata (groups
+    /// look missing, duplicated or broken), and a plain restart never
+    /// heals it: the group state does not depend on the key, so the
+    /// snapshot restores and no rebuild republishes anything.
+    ///
+    /// When the stored metadata is not the current key's, this publishes
+    /// the restored state's metadata and then removes the foreign events.
+    /// The publication runs first on purpose: if the removal landed alone,
+    /// the groups would be left with no metadata and the next start would
+    /// have nothing to detect (the scan looks for foreign events), while
+    /// this order is self-healing — the foreign events stay until every
+    /// current event is stored.
+    ///
+    /// The group state itself is deliberately not rebuilt: it does not
+    /// depend on the relay key, and replaying the previous key's
+    /// moderation events as plain client events could drop
+    /// master-authorized effects (a removal the relay key issued on a
+    /// group where it is not an admin would resurrect the removed member).
+    /// Publishing the restored state keeps it exactly.
+    pub(crate) async fn heal_rotated_group_metadata(&self) {
+        let Some(relay_pubkey) = self.relay_pubkey() else {
+            return;
+        };
+        let Some(foreign) = self.db.foreign_group_metadata_ids(&relay_pubkey).await else {
+            log::error!(
+                "cannot read the stored NIP-29 metadata authors; leaving the stored \
+                 metadata untouched (the next startup retries)"
+            );
+            return;
+        };
+        if foreign.is_empty() {
+            return;
+        }
+        log::warn!(
+            "{} stored NIP-29 group metadata event(s) are not signed by the current relay \
+             key; republishing the current state's metadata and removing them",
+            foreign.len()
+        );
+        if !self.publish_group_metadata().await {
+            log::error!(
+                "could not republish every NIP-29 group metadata event; keeping the \
+                 former relay key's metadata so the next startup retries the cleanup"
+            );
+            return;
+        }
+        match self.db.remove_events_by_id(&foreign).await {
+            Some(removed) => {
+                log::info!("removed {removed} NIP-29 group metadata event(s) of a former relay key")
+            }
+            None => log::error!(
+                "cannot remove the former relay key's NIP-29 group metadata; the next \
+                 startup retries"
+            ),
         }
     }
 
