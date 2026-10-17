@@ -232,20 +232,34 @@ impl StampClock {
         }
     }
 
-    /// Returns a timestamp strictly greater than every previously issued
-    /// stamp and at least `floor`, while values remain. The increment is
-    /// capped at `u64::MAX - 1` so it never overflows. Once that cap is
-    /// reached (unreachable in practice at one stamp per second) the clock
-    /// saturates and keeps returning the cap: strict monotonicity is
-    /// impossible beyond the last usable timestamp, but the clock never
-    /// regresses and never returns `u64::MAX`.
+    /// Maximum seconds a stamp may run ahead of `floor` (the wall clock at
+    /// every call site). The increment exists to order relay events applied
+    /// in the same second; without a bound, anonymous group churn
+    /// (join/leave pairs, one stamp per generated event) pushed the relay's
+    /// own metadata and role events unboundedly into the future, where
+    /// `until: now` scans miss them and a later `9008` purge cut adopts the
+    /// drift. At the cap the clock keeps returning the cap — same-second
+    /// stamps tie and the NIP-01 id tie-break applies, exactly like two
+    /// client events in one second — instead of moving further ahead.
+    pub(crate) const MAX_AHEAD_SECS: u64 = 60;
+
+    /// Returns a timestamp at least `floor` and greater than every
+    /// previously issued stamp, while values remain, bounded to
+    /// [`Self::MAX_AHEAD_SECS`] past `floor`. Two exceptions keep the clock
+    /// from regressing instead of holding strict monotonicity: at the
+    /// `u64::MAX - 1` ceiling the clock saturates and keeps returning it
+    /// (unreachable in practice), and a stamp bootstrapped above the cap (a
+    /// relay that drifted under an older version) stays capped below it
+    /// until the wall clock catches up. `u64::MAX` is never returned.
     pub(crate) fn stamp(&self, floor: u64) -> u64 {
+        let cap = floor.saturating_add(Self::MAX_AHEAD_SECS).min(u64::MAX - 1);
         let mut cur = self.last.load(Ordering::Relaxed);
         loop {
             let next = cur
                 .max(floor.saturating_sub(1))
                 .min(u64::MAX - 2)
-                .saturating_add(1);
+                .saturating_add(1)
+                .min(cap);
             match self
                 .last
                 .compare_exchange_weak(cur, next, Ordering::Relaxed, Ordering::Relaxed)
@@ -1806,8 +1820,9 @@ impl Relay {
     }
 
     /// A strictly monotonic timestamp for relay-generated events (see
-    /// [`StampClock`]): at least `floor`, and greater than every stamp
-    /// issued before.
+    /// [`StampClock`]): at least `floor`, greater than every stamp issued
+    /// before, and no more than [`StampClock::MAX_AHEAD_SECS`] past it (see
+    /// [`StampClock::stamp`]).
     pub(crate) fn stamp_floor(&self, floor: u64) -> u64 {
         self.stamps.stamp(floor)
     }
@@ -7053,15 +7068,55 @@ mod tests {
 
     #[test]
     fn stamp_clock_is_strictly_monotonic() {
+        let base = 1_700_000_000;
         let clock = StampClock::new_with_last(0);
-        let a = clock.stamp(100);
-        let b = clock.stamp(50);
-        let c = clock.stamp(1000);
-        let d = clock.stamp(0);
-        assert!(a >= 100);
+        let a = clock.stamp(base);
+        let b = clock.stamp(base - 5);
+        let c = clock.stamp(base + 10);
+        let d = clock.stamp(base + 10);
+        assert!(a >= base);
         assert!(b > a, "a lower floor must not lower the stamp");
-        assert!(c > b && c >= 1000);
-        assert!(d > c, "a zero floor must not lower the stamp");
+        assert!(c > b && c >= base + 10);
+        assert!(
+            d > c,
+            "a second stamp in the same second must still be ordered"
+        );
+    }
+
+    #[test]
+    fn stamp_clock_caps_the_drift_ahead_of_the_floor() {
+        // A-5: the increment exists to order relay events applied in the
+        // same second, but anonymous join/leave churn must not push the
+        // relay's own metadata unboundedly into the future: a stamp stays
+        // within MAX_AHEAD_SECS of the floor (the wall clock at every call
+        // site). At the cap the clock keeps returning the cap — same-second
+        // stamps tie and the NIP-01 id tie-break applies — instead of
+        // moving further ahead.
+        let base = 1_700_000_000;
+        let clock = StampClock::new_with_last(0);
+        let mut last = 0;
+        for _ in 0..(StampClock::MAX_AHEAD_SECS * 3) {
+            let s = clock.stamp(base);
+            assert!(s >= last, "the clock never regresses");
+            assert!(
+                s <= base + StampClock::MAX_AHEAD_SECS,
+                "the stamp must stay within the cap: {s}"
+            );
+            last = s;
+        }
+        assert_eq!(
+            last,
+            base + StampClock::MAX_AHEAD_SECS,
+            "a burst longer than the cap pins the stamp at the cap"
+        );
+        // A later second raises the cap with the wall clock: ordering
+        // resumes.
+        assert_eq!(clock.stamp(base + 1), base + 1 + StampClock::MAX_AHEAD_SECS);
+        // A stamp bootstrapped above the cap (a relay that drifted under an
+        // older version) stays capped below it until the wall clock catches
+        // up, instead of drifting further.
+        let drifted = StampClock::new_with_last(base + 10_000);
+        assert_eq!(drifted.stamp(base), base + StampClock::MAX_AHEAD_SECS);
     }
 
     #[test]
