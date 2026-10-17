@@ -976,7 +976,8 @@ pub(crate) fn validate_merged(text: &str) -> Result<(), String> {
     // warnings `validate` emits would repeat once per proposal; the
     // returned error is unaffected.
     crate::logging::suppressed(|| {
-        let cfg: Config = toml::from_str(text).map_err(|e| e.to_string())?;
+        let cfg: Config =
+            toml::from_str(text).map_err(|e| crate::config::toml_error_message(&e, text))?;
         cfg.validate().map_err(|e| e.to_string())
     })
 }

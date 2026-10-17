@@ -861,12 +861,44 @@ fn apply_legacy_aliases(raw: &str, cfg: &mut Config) -> Vec<String> {
     warnings
 }
 
+/// Formats a TOML parse error without echoing the offending source line.
+///
+/// The `toml` crate's `Display` appends the raw line and a caret, and a
+/// broken secret line (`relay.private_key`, `rpc.management_token`,
+/// `relay.livekit_api_secret`, the S3 keys, ...) must never be copied into
+/// stderr or the relay's log: the config file is kept `0600`, but the daemon
+/// log is world-readable and a SIGHUP reload failure is logged there. The
+/// message and the line/column are kept so the file can still be fixed.
+pub(crate) fn toml_error_message(error: &toml::de::Error, raw: &str) -> String {
+    let message = error.message();
+    let Some(span) = error.span() else {
+        return message.to_string();
+    };
+    let start = span.start.min(raw.len());
+    let Some(prefix) = raw.get(..start) else {
+        // The span points inside a multibyte character: the location cannot
+        // be derived, but the message alone is still actionable.
+        return message.to_string();
+    };
+    let line = prefix.bytes().filter(|b| *b == b'\n').count() + 1;
+    let column = prefix.rfind('\n').map_or_else(
+        || prefix.chars().count(),
+        |i| prefix[i + 1..].chars().count(),
+    ) + 1;
+    format!("{message} (at line {line}, column {column})")
+}
+
 impl Config {
     pub fn load(path: &Path) -> Result<Config> {
         let raw = std::fs::read_to_string(path)
             .map_err(|e| config_err(format!("cannot read {}: {e}", path.display())))?;
-        let mut cfg: Config = toml::from_str(&raw)
-            .map_err(|e| config_err(format!("invalid {}: {e}", path.display())))?;
+        let mut cfg: Config = toml::from_str(&raw).map_err(|e| {
+            config_err(format!(
+                "invalid {}: {}",
+                path.display(),
+                toml_error_message(&e, &raw)
+            ))
+        })?;
         // Deprecated keys from older config layouts are applied to their new
         // locations (with a warning per key). This must run right after the
         // parse so a migrated config behaves as written instead of silently
@@ -2584,7 +2616,10 @@ pub(crate) fn rewrite_config_checked(
 ) -> anyhow::Result<String> {
     let rewritten = set_config_field_in_text(text, section, key, value);
     toml::from_str::<Config>(&rewritten).map_err(|e| {
-        anyhow::anyhow!("the rewritten config would be invalid ({e}); refusing to write it")
+        anyhow::anyhow!(
+            "the rewritten config would be invalid ({}); refusing to write it",
+            toml_error_message(&e, &rewritten)
+        )
     })?;
     Ok(rewritten)
 }
@@ -3598,6 +3633,56 @@ max_log_files = 2
             "a secret-free write must not narrow an ordinary 0644 config"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_errors_do_not_echo_the_offending_line() {
+        // The TOML error is printed on stderr by `check`/`start` and logged
+        // by the SIGHUP reload path, and the daemon log is world-readable:
+        // a broken secret line must not be copied into it. The location is
+        // kept so the file can still be fixed.
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir()
+            .join("nostrfy-config-secret-error-test")
+            .join(format!("{:x}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("nostrfy.toml");
+
+        // A missing closing quote: the toml crate's Display would append the
+        // raw line (`private_key = "SUPERSECRET...`) and a caret.
+        std::fs::write(
+            &path,
+            "[relay]\nname = \"ok\"\nprivate_key = \"SUPERSECRETKEY0123456789\n",
+        )
+        .unwrap();
+        let error = Config::load(&path).expect_err("the broken config must be rejected");
+        let message = format!("{error}");
+        assert!(
+            !message.contains("SUPERSECRETKEY0123456789"),
+            "the error must not echo the secret line: {message}"
+        );
+        assert!(
+            message.contains("line 3"),
+            "the error must keep the location so the file can be fixed: {message}"
+        );
+
+        // A valid secret line stays valid: the redaction must not reject a
+        // well-formed config.
+        std::fs::write(
+            &path,
+            format!(
+                "[relay]\nname = \"ok\"\nprivate_key = \"{}\"\n",
+                "01".repeat(32)
+            ),
+        )
+        .unwrap();
+        assert!(
+            Config::load(&path).is_ok(),
+            "a well-formed config must still load"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
