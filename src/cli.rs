@@ -189,27 +189,38 @@ impl Cli {
                 let cfg = self.load_config()?;
                 cfg.validate()?;
                 // A config that validates can still fail at serve time
-                // (an occupied port, an unusable database directory): probe
-                // both now so `check` does not bless a config `start`
-                // would reject. The probes are best-effort (a rival can
+                // (an occupied port, an unusable database directory), so
+                // probe both now. The probes are best-effort (a rival can
                 // bind between check and start); `prepare` re-checks the
                 // port right before forking.
-                ensure_port_available(&cfg)?;
-                // Probe the database directory, tolerating a lock held by a
-                // live instance (the expected running case, not an error):
-                // a lockable directory proves it is usable; any other
-                // failure (unwritable path, bad mount) is fatal. Note the
-                // port probe above still rejects the config while the relay
-                // is running on the same port, so `check` cannot be used
-                // against a live instance.
-                match crate::db::lock_database_dir(&cfg.database.path) {
-                    Ok(guard) => drop(guard),
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                //
+                // The database probe runs first and creates nothing: a
+                // validation command must not have side effects (probing a
+                // mistyped path used to create the whole directory tree and
+                // a lock file). A lock held by a live instance is the
+                // expected running case, not an error.
+                let live_instance = match crate::db::probe_database_dir(&cfg.database.path) {
+                    Ok(()) => false,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => true,
                     Err(e) => {
                         return Err(config_err(format!(
                             "database directory {} is not usable: {e}",
                             cfg.database.path.display()
                         )));
+                    }
+                };
+                // A live instance holding the database lock explains an
+                // occupied port: `check` must keep working while the relay
+                // runs, so that case is a warning. A port taken without a
+                // live instance on this database is an error.
+                if let Err(e) = ensure_port_available(&cfg) {
+                    if live_instance {
+                        log::warn!(
+                            "{e} (a live instance holds the database lock; if it serves \
+                             this config the port is expected to be taken)"
+                        );
+                    } else {
+                        return Err(e);
                     }
                 }
                 print_line(&format!("configuration OK: {}", cfg.relay.name));

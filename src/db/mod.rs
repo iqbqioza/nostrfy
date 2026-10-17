@@ -243,6 +243,88 @@ pub(crate) fn lock_database_dir(db_path: &std::path::Path) -> std::io::Result<Db
     }
 }
 
+/// Probes the database directory for `check` without creating anything: a
+/// validation command must not have side effects (creating the tree for a
+/// mistyped path left directories and a lock file behind). The nearest
+/// existing ancestor must be a writable directory, so `start` can create
+/// the rest; an existing `nostrfy.lock` is probed with the same
+/// non-blocking lock (a live instance holding it is the expected running
+/// case — the caller decides what that means), and a missing one is left
+/// missing.
+pub(crate) fn probe_database_dir(db_path: &std::path::Path) -> std::io::Result<()> {
+    let mut probe = db_path.to_path_buf();
+    loop {
+        match std::fs::metadata(&probe) {
+            Ok(meta) => {
+                if !meta.is_dir() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::NotADirectory,
+                        format!("{} is not a directory", probe.display()),
+                    ));
+                }
+                if !dir_writable(&probe) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        format!("{} is not writable", probe.display()),
+                    ));
+                }
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let Some(parent) = probe.parent() else {
+                    return Err(e);
+                };
+                probe = parent.to_path_buf();
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    let lock = db_path.join("nostrfy.lock");
+    if !lock.exists() {
+        // No lock file: no instance ever ran here (the start path creates
+        // it), so there is nothing to probe.
+        return Ok(());
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lock)?;
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: `file` holds a valid descriptor for the call. The guard
+        // is dropped with `file`, releasing the lock.
+        let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if ret != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = file;
+    }
+    Ok(())
+}
+
+/// Whether the process may write inside `dir`: an `access(2)` probe catches
+/// a read-only mount or a foreign owner, which is exactly what `check` must
+/// report before `start` fails at database open.
+fn dir_writable(dir: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let mut buf = dir.as_os_str().as_bytes().to_vec();
+        buf.push(0);
+        // SAFETY: `buf` is a NUL-terminated path string.
+        unsafe { libc::access(buf.as_ptr() as *const libc::c_char, libc::W_OK) == 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        true
+    }
+}
+
 /// Takes the cross-process advisory lock guarding the persisted access
 /// state. Unix-only (`flock`); on other platforms the operation is not
 /// serialized across processes (the same LMDB transaction still applies).

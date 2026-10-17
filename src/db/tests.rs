@@ -181,6 +181,58 @@ fn database_dir_lock_is_exclusive() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn database_dir_probe_creates_nothing_and_reports_the_state() {
+    // A-8: `check` probes the database directory without side effects (a
+    // validation command used to create a mistyped path's whole tree plus
+    // a lock file). The probe only reports: a missing directory is fine
+    // when its nearest existing ancestor is writable, a live lock is
+    // reported as `WouldBlock` (the caller decides what that means), and a
+    // component that is not a directory is an error.
+    use std::os::unix::fs::PermissionsExt;
+    let cfg = config();
+    let base = cfg.path;
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    // Missing path under a writable parent: OK, and nothing is created.
+    let missing = base.join("wrong").join("deep").join("db");
+    crate::db::probe_database_dir(&missing)
+        .expect("a missing path under a writable parent is fine");
+    assert!(
+        !base.join("wrong").exists(),
+        "the probe must create nothing"
+    );
+    // A live lock is reported; a stale lock file probes clean.
+    let locked = base.join("locked");
+    std::fs::create_dir_all(&locked).unwrap();
+    let held = crate::db::lock_database_dir(&locked).expect("the first holder takes the lock");
+    let err = crate::db::probe_database_dir(&locked).expect_err("a held lock must be reported");
+    assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+    drop(held);
+    crate::db::probe_database_dir(&locked).expect("a stale lock file is fine");
+    // A component that is not a directory is an error.
+    let file = base.join("plain");
+    std::fs::write(&file, b"x").unwrap();
+    let err = crate::db::probe_database_dir(&file.join("db"))
+        .expect_err("a non-directory component must be an error");
+    assert_eq!(err.kind(), std::io::ErrorKind::NotADirectory);
+    // An unwritable ancestor is an error: `start` could not create the
+    // directory there.
+    let read_only = base.join("readonly");
+    std::fs::create_dir_all(&read_only).unwrap();
+    let mut perms = std::fs::metadata(&read_only).unwrap().permissions();
+    perms.set_mode(0o555);
+    std::fs::set_permissions(&read_only, perms).unwrap();
+    let err = crate::db::probe_database_dir(&read_only.join("db"))
+        .expect_err("an unwritable parent must be an error");
+    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    let mut perms = std::fs::metadata(&read_only).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&read_only, perms).unwrap();
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 #[test]
 fn count_at_the_exact_cap_is_not_approximate() {
     // A walk that exhausts exactly at the request cap is complete: only a
