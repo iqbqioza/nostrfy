@@ -7501,6 +7501,88 @@ mod tests {
         });
     }
 
+    #[tokio::test]
+    async fn an_oversized_id_is_not_echoed_in_replies() {
+        // B-2: replies echo the client's event id (OK) and subscription id
+        // (CLOSED). A malformed or rejected frame can carry either as large
+        // as the whole message, and the app-side queue sits ahead of
+        // tungstenite's buffer bound, so echoing one verbatim pins that many
+        // bytes per queued frame. Only id-shaped values are echoed; anything
+        // else gets the empty id (the same correlation a frame without an id
+        // already gets).
+        let mut conn = build_conn().await;
+        let huge = "a".repeat(1024 * 1024);
+        // A malformed EVENT with an oversized id: the OK must not echo it.
+        conn.handle_text(&format!(r#"["EVENT",{{"id":"{huge}"}}]"#))
+            .await;
+        let msgs = outgoing_json(&conn);
+        let ok = msgs
+            .iter()
+            .find(|m| m[0] == "OK")
+            .expect("a malformed EVENT must get an OK");
+        assert_eq!(ok[1], "", "an oversized event id must not be echoed");
+        assert!(
+            msgs.iter().all(|m| m.to_string().len() < 4096),
+            "no reply may pin the client's message size"
+        );
+        // A parsed EVENT with an oversized id is rejected by validation, and
+        // its OK must not echo the id either.
+        conn.outgoing.clear();
+        conn.out_bytes = 0;
+        let full = format!(
+            r#"["EVENT",{{"id":"{huge}","pubkey":"{}","created_at":{},"kind":1,"tags":[],"content":"x","sig":"{}"}}]"#,
+            "00".repeat(32),
+            unix_now(),
+            "0".repeat(128)
+        );
+        conn.handle_text(&full).await;
+        // The event is queued for the batched acceptance path: flush it so
+        // its OK (with the sanitized id) is queued.
+        conn.flush_pending_events().await;
+        let msgs = outgoing_json(&conn);
+        let ok = msgs
+            .iter()
+            .find(|m| m[0] == "OK")
+            .expect("a rejected EVENT must get an OK");
+        assert_eq!(
+            ok[1], "",
+            "a rejected event's oversized id must not be echoed"
+        );
+        // A REQ with an oversized subscription id: the length check runs
+        // before the filter checks, and the CLOSED must not echo the id.
+        conn.outgoing.clear();
+        conn.out_bytes = 0;
+        conn.handle_text(&format!(r#"["REQ","{huge}"]"#)).await;
+        let msgs = outgoing_json(&conn);
+        let closed = msgs
+            .iter()
+            .find(|m| m[0] == "CLOSED")
+            .expect("an over-long subscription id must get a CLOSED");
+        assert_eq!(
+            closed[1], "",
+            "an oversized subscription id must not be echoed"
+        );
+        assert!(
+            closed[2].as_str().unwrap_or("").contains("too long"),
+            "the CLOSED must name the length limit: {closed:?}"
+        );
+        // COUNT takes the same path.
+        conn.outgoing.clear();
+        conn.out_bytes = 0;
+        conn.handle_text(&format!(r#"["COUNT","{huge}"]"#)).await;
+        let msgs = outgoing_json(&conn);
+        let closed = msgs
+            .iter()
+            .find(|m| m[0] == "CLOSED")
+            .expect("an over-long COUNT id must get a CLOSED");
+        assert_eq!(closed[1], "", "COUNT must not echo the oversized id either");
+        assert!(
+            msgs.iter().all(|m| m.to_string().len() < 4096),
+            "no reply may pin the client's message size"
+        );
+        conn.relay.db.shutdown();
+    }
+
     #[test]
     fn uppercase_auth_pubkey_is_rejected() {
         // NIP-01: hex fields are lowercase. An uppercase AUTH pubkey would

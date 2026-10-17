@@ -42,6 +42,22 @@ fn event_frame_lower_bound(event: &Event, sub_id_len: usize) -> u64 {
         .saturating_add(sub_id_len) as u64
 }
 
+/// The NIP-01 event id shape a reply may echo: exactly 64 hex characters.
+/// A malformed or rejected event can carry an `id` as large as the whole
+/// message (`max_ws_message_bytes`), and echoing it verbatim would pin that
+/// many bytes in the queued reply frame (B-2): the app-side queue is ahead
+/// of tungstenite's buffer bound, so the frame count alone would allow
+/// `OUT_QUEUE_LIMIT * 2` such frames per connection. Only an id-shaped
+/// value can be the client's correlation, so anything else is echoed as the
+/// empty string — the same correlation a frame without an id already gets.
+fn echo_event_id(id: &str) -> &str {
+    if id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        id
+    } else {
+        ""
+    }
+}
+
 impl super::Conn {
     /// The verb of a JSON array message, extracted with a lightweight scan
     /// (no full parse): `["EVENT", ...]` → `"EVENT"`. Returns `None` when
@@ -139,7 +155,7 @@ impl super::Conn {
         // restricted endpoints — see `write_policy_reason`.
         if let Some(reason) = self.write_policy_reason(&event) {
             self.relay.stats.bump(&self.relay.stats.events_rejected, 1);
-            self.send_ok(&event.id, false, &reason);
+            self.send_ok(echo_event_id(&event.id), false, &reason);
             return;
         }
         self.pending_bytes = self.pending_bytes.saturating_add(size);
@@ -243,10 +259,14 @@ impl super::Conn {
             Ok(event) => event,
             Err(_) => {
                 // NIP-01: every EVENT gets an OK. Correlate with the id
-                // when the malformed object still carries one; otherwise
-                // the empty id is the only correlation the frame allows.
+                // when the malformed object still carries an id-shaped one;
+                // otherwise the empty id is the only correlation the frame
+                // allows (B-2: an oversized id must not be echoed back).
                 self.send_ok(
-                    value.get("id").and_then(Value::as_str).unwrap_or(""),
+                    value
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .map_or("", echo_event_id),
                     false,
                     "invalid: malformed event",
                 );
@@ -268,9 +288,13 @@ impl super::Conn {
             .accept_events_batch(events, &self.authed_pubkeys)
             .await;
         for (id, outcome) in outcomes {
+            // B-2: only an id-shaped echo can be the client's correlation,
+            // and a rejected event may carry an oversized `id` that must
+            // not be pinned into the reply frame.
+            let id = echo_event_id(&id);
             match outcome {
                 crate::db::PutOutcome::Stored | crate::db::PutOutcome::Replaced => {
-                    self.send_ok(&id, true, "");
+                    self.send_ok(id, true, "");
                 }
                 crate::db::PutOutcome::Ephemeral => {
                     // NIP-01: ephemeral kinds are delivered live but never
@@ -278,25 +302,25 @@ impl super::Conn {
                     // current subscribers), so the OK is `true` with the
                     // empty message the spec allows; `mute:` means "ignored"
                     // and would contradict the acceptance.
-                    self.send_ok(&id, true, "");
+                    self.send_ok(id, true, "");
                 }
                 crate::db::PutOutcome::Duplicate(msg) => {
-                    self.send_ok(&id, true, &msg);
+                    self.send_ok(id, true, &msg);
                 }
                 crate::db::PutOutcome::Invalid(reason) => {
-                    self.send_ok(&id, false, &reason);
+                    self.send_ok(id, false, &reason);
                 }
                 crate::db::PutOutcome::Failed(reason) => {
                     // A database write fault revoked the batch: the event was
                     // not stored. The reason already reads as an error, so
                     // the client knows a retry is meaningful.
-                    self.send_ok(&id, false, &reason);
+                    self.send_ok(id, false, &reason);
                 }
                 crate::db::PutOutcome::Expired => {
-                    self.send_ok(&id, false, "invalid: event has expired");
+                    self.send_ok(id, false, "invalid: event has expired");
                 }
                 crate::db::PutOutcome::PreviouslyDeleted => {
-                    self.send_ok(&id, false, "blocked: event has been deleted");
+                    self.send_ok(id, false, "blocked: event has been deleted");
                 }
             }
         }
@@ -314,13 +338,6 @@ impl super::Conn {
                 return;
             }
         };
-        if rest.len() < 2 {
-            // NIP-01: a REQ with a subscription id can be refused with a
-            // terminal CLOSED (the client gets a correlated reply); only
-            // without an id is there nothing to echo, so a NOTICE is used.
-            self.reject_req(sub_id, "invalid: REQ requires at least one filter");
-            return;
-        }
 
         let cfg = self.relay.config.read().await;
         let (max_sub_id_len, max_filters, max_subscriptions, max_limit) = (
@@ -339,9 +356,22 @@ impl super::Conn {
             return;
         }
         // NIP-01 bounds the id in *chars* (a multibyte id may exceed the
-        // limit in bytes while staying within it in characters).
+        // limit in bytes while staying within it in characters). The
+        // over-long id is not echoed back (B-2): it can be as large as the
+        // whole message, and a CLOSED frame carrying it would pin that many
+        // bytes in the queue; the empty id is the correlation the client
+        // gets (its request is refused as invalid either way).
         if sub_id.chars().count() > max_sub_id_len {
-            self.reject_req(sub_id, "invalid: subscription id too long");
+            self.reject_req("", "invalid: subscription id too long");
+            return;
+        }
+        if rest.len() < 2 {
+            // NIP-01: a REQ with a subscription id can be refused with a
+            // terminal CLOSED (the client gets a correlated reply); only
+            // without an id is there nothing to echo, so a NOTICE is used.
+            // The id is already bounded at this point, so echoing it cannot
+            // pin the frame at the client's message size (B-2).
+            self.reject_req(sub_id, "invalid: REQ requires at least one filter");
             return;
         }
 
@@ -842,11 +872,15 @@ impl super::Conn {
             Ok(event) => event,
             Err(_) => {
                 // Correlate with the id when the malformed event still
-                // carries one; otherwise the empty id is the only
-                // correlation the frame allows.
+                // carries an id-shaped one; otherwise the empty id is the
+                // only correlation the frame allows (B-2: an oversized id
+                // must not be echoed back).
                 self.send_control(json!([
                     "OK",
-                    value.get("id").and_then(Value::as_str).unwrap_or(""),
+                    value
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .map_or("", echo_event_id),
                     false,
                     "invalid: malformed AUTH event"
                 ]));
@@ -856,7 +890,7 @@ impl super::Conn {
         if !self.relay.config.read().await.nip_enabled(42) {
             // NIP-42: client AUTH messages MUST be answered with OK, even
             // when the relay does not support authentication.
-            self.send_control(nip42::ok(&event.id, false));
+            self.send_control(nip42::ok(echo_event_id(&event.id), false));
             return;
         }
         // NIP-01: event hex fields are lowercase. An uppercase pubkey would
@@ -865,10 +899,10 @@ impl super::Conn {
         // NIP-78), so reject it up front instead of authenticating a key the
         // relay cannot actually use.
         if event.pubkey != event.pubkey.to_ascii_lowercase() {
-            self.send_control(nip42::ok(&event.id, false));
+            self.send_control(nip42::ok(echo_event_id(&event.id), false));
             return;
         }
-        let id = event.id.clone();
+        let id = echo_event_id(&event.id).to_string();
         let accepted = {
             let cfg = self.relay.config.read().await;
             nip42::verify(
@@ -928,13 +962,6 @@ impl super::Conn {
             self.send_notice("error: subscription id must be a string");
             return;
         };
-        if rest.len() < 2 {
-            // NIP-45: a COUNT with a subscription id is refused with the
-            // same CLOSED a filters-less REQ uses (the client can
-            // correlate); only without an id is a NOTICE the best reply.
-            self.reject_count(sub_id, "invalid: COUNT requires at least one filter");
-            return;
-        }
         if sub_id.is_empty() {
             self.reject_count(sub_id, "invalid: subscription id must not be empty");
             return;
@@ -952,9 +979,21 @@ impl super::Conn {
                 cfg.nip_enabled(50),
             )
         };
-        // NIP-01 bounds the id in *chars*, like the REQ path above.
+        // NIP-01 bounds the id in *chars*, like the REQ path above. The
+        // over-long id is not echoed back (B-2): it can be as large as the
+        // whole message, and a CLOSED frame carrying it would pin that many
+        // bytes in the queue; the empty id is the correlation the client
+        // gets.
         if sub_id.chars().count() > max_sub_id_len {
-            self.reject_count(sub_id, "invalid: subscription id too long");
+            self.reject_count("", "invalid: subscription id too long");
+            return;
+        }
+        if rest.len() < 2 {
+            // NIP-45: a COUNT with a subscription id is refused with the
+            // same CLOSED a filters-less REQ uses (the client can
+            // correlate); only without an id is a NOTICE the best reply.
+            // The id is already bounded at this point (B-2).
+            self.reject_count(sub_id, "invalid: COUNT requires at least one filter");
             return;
         }
         // NIP-45: refusals must be answered with a CLOSED message.
