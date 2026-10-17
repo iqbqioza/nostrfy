@@ -195,6 +195,11 @@ struct Model {
     slots: BTreeMap<Slot, String>,
     /// NIP-09 id tombstones: a re-published id must stay deleted.
     deleted_ids: BTreeSet<String>,
+    /// NIP-09 author-scoped re-publication blocks for deletion targets that
+    /// were *not* stored: the live walk records the same marker the
+    /// migration does, so only the deleter's own re-publication of the id is
+    /// refused (B-9). `(id, deleter pubkey)`.
+    absent_blocks: BTreeSet<(String, String)>,
     /// NIP-09 address tombstones: `(kind, pubkey, d) -> created_at cut`.
     address_tombstones: BTreeMap<Slot, u64>,
     /// NIP-62 vanished pubkeys -> the furthest `until_created` honored. Any
@@ -266,7 +271,11 @@ impl Model {
         if self.vanished.contains_key(&event.pubkey) {
             return Expected::Invalid;
         }
-        if self.deleted_ids.contains(&event.id) {
+        if self.deleted_ids.contains(&event.id)
+            || self
+                .absent_blocks
+                .contains(&(event.id.clone(), event.pubkey.to_lowercase()))
+        {
             return Expected::PreviouslyDeleted;
         }
         if self.purged_blocks(event) {
@@ -338,6 +347,11 @@ impl Model {
         let mut removed = 0;
         for id in targets {
             let Some(event) = self.stored.get(id) else {
+                // Not stored (never held, deleted, replaced or expired): the
+                // live walk records an author-scoped re-publication block, so
+                // only the requester's own re-publication is refused.
+                self.absent_blocks
+                    .insert((id.clone(), requester.to_lowercase()));
                 continue;
             };
             if event.kind == nip09::DELETION_KIND {

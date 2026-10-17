@@ -97,23 +97,34 @@ fn removal_chunk(
     Ok(entries)
 }
 
+/// Whether a scoped [`DELETED`] marker lists `pubkey` as one of its
+/// deleters. An unconditional (empty) or corrupt marker is not scoped and
+/// never matches: it already blocks the id outright.
+fn scoped_marker_covers(marker: &[u8], pubkey: &[u8]) -> bool {
+    !marker.is_empty()
+        && marker.len().is_multiple_of(ID_LEN)
+        && marker.chunks(ID_LEN).any(|chunk| chunk == pubkey)
+}
+
 impl Store {
-    /// Migration-only: records NIP-09 re-publication blocks for deletion
-    /// targets that are *absent* from the database, scoped to the deletion's
-    /// author. A strfry export contains no trace of an event its author
-    /// deleted (strfry removes it physically), so replaying the deletion
-    /// request cannot write the ordinary per-id tombstone — the walk only
-    /// marks targets it can see. Without this the deleted event could be
-    /// re-published after the migration. Present targets are left to the
-    /// deletion walk (which checks ownership and writes the unconditional
-    /// tombstone), and ids that already carry an unconditional tombstone
-    /// are untouched.
+    /// Records NIP-09 re-publication blocks for deletion targets that are
+    /// *absent* from the database, scoped to the deletion's author. The
+    /// migration uses this to replay a strfry export: strfry removes deleted
+    /// events physically, so the export has no trace of a target its author
+    /// deleted and replaying the deletion request cannot write the ordinary
+    /// per-id tombstone. The live deletion walk records the same marker for
+    /// absent targets (see `apply_deletion_walk`), so a live database and a
+    /// migrated one agree. Present targets are left to the walk (which
+    /// checks ownership and writes the unconditional tombstone), and ids
+    /// that already carry an unconditional tombstone are untouched.
     ///
     /// The value is one or more 32-byte deleter pubkeys (at most
     /// [`SCOPED_TOMBSTONE_MAX`]), so only those authors' re-publication is
     /// blocked — the event id commits to its author, and this mirrors
-    /// strfry's `(id, pubkey)` deletion record. Returns how many markers
-    /// were written or extended.
+    /// strfry's `(id, pubkey)` deletion record. Returns how many absent
+    /// targets carry a re-publication block after the pass (the live
+    /// deletion walk records the same marker while replaying the request,
+    /// so this pass is then usually a no-op).
     pub(crate) fn record_absent_deletion_targets(
         &self,
         pubkey: &[u8],
@@ -136,48 +147,65 @@ impl Store {
                 // Present: the deletion walk decides by ownership.
                 continue;
             }
-            match self.deleted.get(&wtxn, &id)? {
-                Some(existing) => {
-                    // An unconditional (empty) or corrupt marker is left as
-                    // is; a scoped marker gains this deleter unless it is
-                    // already covered or the cap is reached (the earliest
-                    // deleters win).
-                    if existing.is_empty() || existing.len() % ID_LEN != 0 {
-                        continue;
-                    }
-                    if existing.chunks(ID_LEN).any(|chunk| chunk == pubkey) {
-                        continue;
-                    }
-                    if existing.len() >= ID_LEN * SCOPED_TOMBSTONE_MAX {
-                        // More deleters than the scoped list holds. Dropping
-                        // this one would fail open when it is the author's
-                        // own deletion (the target is absent from the source
-                        // precisely because strfry deleted it on the
-                        // author's request), so fall back to an
-                        // unconditional tombstone: the event id was deleted
-                        // by many keys, and NIP-09 makes the deletion
-                        // permanent for that id.
-                        log::warn!(
-                            "deletion target {target} has more than {SCOPED_TOMBSTONE_MAX} \
-                             deleters; recording an unconditional re-publication block"
-                        );
-                        self.deleted.put(&mut wtxn, &id, &[])?;
-                        recorded += 1;
-                        continue;
-                    }
-                    let mut merged = existing.to_vec();
-                    merged.extend_from_slice(pubkey);
-                    self.deleted.put(&mut wtxn, &id, &merged)?;
-                    recorded += 1;
-                }
-                None => {
-                    self.deleted.put(&mut wtxn, &id, pubkey)?;
-                    recorded += 1;
-                }
-            }
+            // Record the marker — the live deletion walk recorded the same
+            // one while replaying the request, so this is usually a no-op —
+            // and count the target: either way the block is in place.
+            self.extend_absent_deletion_marker(&mut wtxn, &id, pubkey)?;
+            recorded += 1;
         }
         wtxn.commit()?;
         Ok(recorded)
+    }
+
+    /// Extends the [`DELETED`] marker of an *absent* deletion target with
+    /// one deleter pubkey, creating the marker when none exists: the
+    /// author-scoped re-publication block shared by the live deletion walk
+    /// and [`Self::record_absent_deletion_targets`]. An unconditional
+    /// (empty) or corrupt marker already blocks the id and is left as is; a
+    /// scoped marker gains the deleter unless it is already covered, and a
+    /// full scoped list falls back to an unconditional tombstone (the
+    /// earliest deleters win).
+    fn extend_absent_deletion_marker(
+        &self,
+        wtxn: &mut heed::RwTxn,
+        id: &[u8],
+        pubkey: &[u8],
+    ) -> Result<()> {
+        match self.deleted.get(wtxn, id)? {
+            Some(existing) => {
+                if existing.is_empty() || !existing.len().is_multiple_of(ID_LEN) {
+                    // An unconditional or corrupt marker already blocks the
+                    // id: nothing to add.
+                    return Ok(());
+                }
+                if scoped_marker_covers(existing, pubkey) {
+                    return Ok(());
+                }
+                if existing.len() >= ID_LEN * SCOPED_TOMBSTONE_MAX {
+                    // More deleters than the scoped list holds. Dropping this
+                    // one would fail open when it is the author's own deletion
+                    // (the target is absent precisely because it was deleted on
+                    // the author's request), so fall back to an unconditional
+                    // tombstone: the event id was deleted by many keys, and
+                    // NIP-09 makes the deletion permanent for that id.
+                    log::warn!(
+                        "deletion target {} has more than {SCOPED_TOMBSTONE_MAX} \
+                         deleters; recording an unconditional re-publication block",
+                        hex::encode(id)
+                    );
+                    self.deleted.put(wtxn, id, &[])?;
+                    return Ok(());
+                }
+                let mut merged = existing.to_vec();
+                merged.extend_from_slice(pubkey);
+                self.deleted.put(wtxn, id, &merged)?;
+                Ok(())
+            }
+            None => {
+                self.deleted.put(wtxn, id, pubkey)?;
+                Ok(())
+            }
+        }
     }
 
     /// NIP-59: deletes every stored `kind:1059` event addressed to `pubkey`.
@@ -362,6 +390,26 @@ impl Store {
                     continue;
                 }
                 let Some(raw) = self.events.get(&wtxn, &id)? else {
+                    // The target is not held: ownership cannot be checked, so
+                    // no unconditional tombstone may be written. Record the
+                    // author-scoped re-publication block instead — the same
+                    // marker the migration writes — so the deleted event is
+                    // still refused when it reaches this relay later (B-9:
+                    // live and migrated databases must agree). The event id
+                    // commits to its author, so the block is exact and a
+                    // malicious deleter cannot suppress another author's
+                    // event; a delegated deletion scopes to the delegator,
+                    // exactly like the migration. Group-scoped moderation
+                    // (9005) is excluded: its targets belong to other authors,
+                    // so an admin-scoped marker would be inert, and an admin
+                    // must not block a member's future event by id.
+                    if group.is_none()
+                        && let Some(pubkey) = request_pubkey
+                        && let Ok(pubkey) = hex::decode(pubkey)
+                        && pubkey.len() == ID_LEN
+                    {
+                        self.extend_absent_deletion_marker(&mut wtxn, &id, &pubkey)?;
+                    }
                     continue;
                 };
                 let Ok(event) = serde_json::from_slice::<Event>(raw) else {

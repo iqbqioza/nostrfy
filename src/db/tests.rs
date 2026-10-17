@@ -878,6 +878,100 @@ fn deletion_by_e_tag_ignores_the_request_timestamp() {
 }
 
 #[test]
+fn a_live_deletion_blocks_re_publishing_an_absent_target() {
+    // B-9 end to end: a NIP-09 request whose `e` target is not held (it
+    // reaches the relay only later, e.g. re-broadcast by another relay) used
+    // to be skipped entirely, so the target was served once it arrived —
+    // the migration recorded an author-scoped re-publication block for
+    // exactly this case, so live and migrated databases disagreed. The live
+    // walk now records the same marker.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let pk = "0000000000000000000000000000000000000000000000000000000000000000";
+        let late = event(1, "late", now, vec![]);
+        assert_eq!(
+            db.apply_deletion(vec![late.id.clone()], vec![], Some(pk.into()), now)
+                .await,
+            0,
+            "the target is not held, so nothing is removed"
+        );
+        assert_eq!(
+            db.put(late, now).await,
+            PutOutcome::PreviouslyDeleted,
+            "the deleted event must not be re-publishable"
+        );
+        // The block is scoped to the deleted id: the same author's fresh
+        // event is unaffected.
+        let fresh = event(1, "fresh", now, vec![]);
+        assert_eq!(db.put(fresh, now).await, PutOutcome::Stored);
+    });
+    db.shutdown();
+}
+
+#[test]
+fn an_absent_target_gets_the_deleter_scoped_marker_but_moderation_does_not() {
+    // The marker the live walk records must be scoped to the deletion's
+    // author (the event id commits to its author, so the block is exact and
+    // a malicious deleter cannot suppress another author's event — the same
+    // scoping the migration records). Group-scoped moderation (9005) must
+    // record nothing for an absent target: its targets belong to other
+    // authors, so an admin-scoped marker would be inert, and an admin must
+    // not block a member's future event by id.
+    use crate::db::store::Store;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    let store = Store::open(&config(), Arc::new(AtomicBool::new(true)), 512).unwrap();
+    let now = 1_000_000u64;
+    let author = "aa".repeat(32);
+    let admin = "bb".repeat(32);
+    let absent = authored_event(1, &author, "late", now, vec![]);
+    let absent_id = hex::decode(&absent.id).unwrap();
+    let report = store.apply_deletion_group(
+        std::slice::from_ref(&absent.id),
+        &[],
+        Some(&author),
+        now,
+        None,
+        false,
+    );
+    assert_eq!(report.removed, 0, "the target is not held");
+    let rtxn = store.env.read_txn().unwrap();
+    assert_eq!(
+        store.deleted.get(&rtxn, &absent_id).unwrap(),
+        Some(hex::decode(&author).unwrap().as_slice()),
+        "the absent target must carry the deleter-scoped marker"
+    );
+    drop(rtxn);
+    let other = authored_event(1, &author, "other", now, vec![]);
+    let other_id = hex::decode(&other.id).unwrap();
+    let report = store.apply_deletion_group(
+        std::slice::from_ref(&other.id),
+        &[],
+        Some(&admin),
+        now,
+        Some("some-group"),
+        false,
+    );
+    assert_eq!(report.removed, 0);
+    let rtxn = store.env.read_txn().unwrap();
+    assert!(
+        store.deleted.get(&rtxn, &other_id).unwrap().is_none(),
+        "a group-scoped moderation walk must not record an absent-target block"
+    );
+}
+
+#[test]
 fn is_replaceable() {
     assert!(super::store::is_replaceable(&event(10000, "", 1, vec![])));
     assert!(super::store::is_replaceable(&event(30023, "", 1, vec![])));
