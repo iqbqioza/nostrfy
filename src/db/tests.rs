@@ -1427,7 +1427,7 @@ fn failed_commit_revokes_every_put_in_the_batch() {
     let outcomes = crate::db::store::apply_put_batch(&store, &errors, None, &puts, &first_seen);
     assert_eq!(outcomes.len(), puts.len());
     assert!(
-        outcomes.iter().all(|o| matches!(o, PutOutcome::Invalid(_))),
+        outcomes.iter().all(|o| matches!(o, PutOutcome::Failed(_))),
         "every put in the failed batch must be revoked: {outcomes:?}"
     );
     let rtxn = store.env.read_txn().unwrap();
@@ -6276,7 +6276,7 @@ fn writer_thread_recovers_from_a_handler_panic() {
         let e = event(1, "panic candidate", now, vec![]);
         let out = db.put(e.clone(), now).await;
         assert!(
-            matches!(out, PutOutcome::Invalid(_)),
+            matches!(out, PutOutcome::Failed(_)),
             "the panicking handler's put must be revoked, got {out:?}"
         );
         assert_eq!(
@@ -8736,7 +8736,7 @@ fn commit_failure_write_paths_report_failure_without_partial_state() {
         let rejected = event(1, "rejected", now, vec![]);
         let outcomes = db.put_batch(vec![(rejected.clone(), now)]).await;
         assert!(
-            outcomes.iter().all(|o| matches!(o, PutOutcome::Invalid(_))),
+            outcomes.iter().all(|o| matches!(o, PutOutcome::Failed(_))),
             "a failed commit must revoke every put in the batch: {outcomes:?}"
         );
         assert!(
@@ -8932,7 +8932,7 @@ fn disk_full_write_paths_report_failure_without_partial_state() {
         let outcomes = db.put_batch(vec![(rejected.clone(), now)]).await;
         assert!(
             outcomes.iter().all(
-                |o| matches!(o, PutOutcome::Invalid(reason) if reason.contains("disk is full"))
+                |o| matches!(o, PutOutcome::Failed(reason) if reason.contains("disk is full"))
             ),
             "a put on a full disk must be refused: {outcomes:?}"
         );

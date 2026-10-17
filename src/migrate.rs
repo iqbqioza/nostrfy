@@ -31,12 +31,12 @@
 //! first relay start after the migration replays the stored events, exactly
 //! like a fresh database.
 //!
-//! A failed side effect (or a lost database writer) aborts with an error.
-//! Database write faults are reported per event as rejections and do not
-//! abort the run, so a run that reports "complete" can have skipped
-//! events. Re-running the same export is safe (duplicates are skipped,
-//! and side effects are re-applied so a crash between a store and its
-//! side effect cannot leave a tombstone missing).
+//! A failed side effect (or a lost database writer) aborts with an error,
+//! and so does a database write fault: a fault revokes the whole batch
+//! (`PutOutcome::Failed`), so the run must not report "complete" for a run
+//! that skipped events. Re-running the same export is safe (duplicates are
+//! skipped, and side effects are re-applied so a crash between a store and
+//! its side effect cannot leave a tombstone missing).
 
 use std::io::BufRead;
 use std::sync::Arc;
@@ -170,6 +170,9 @@ impl Stats {
             PutOutcome::Ephemeral => self.ephemeral += 1,
             PutOutcome::PreviouslyDeleted => self.previously_deleted += 1,
             PutOutcome::Invalid(_) => self.invalid += 1,
+            // The caller aborts on a database write fault before counting
+            // it (a fault is not a rejection); kept for exhaustiveness.
+            PutOutcome::Failed(_) => self.invalid += 1,
         }
     }
 }
@@ -483,6 +486,13 @@ async fn flush(
         );
     }
     for ((event, _), outcome) in events.iter().zip(outcomes.iter()) {
+        // A database write fault revoked the whole batch: the run did not
+        // complete, so it must not report a completed migration with
+        // skipped events (the module contract promises an abort on write
+        // faults). Re-running the same export is safe.
+        if let PutOutcome::Failed(reason) = outcome {
+            bail!("database write fault ({reason}); the migration did not complete (re-run it)");
+        }
         stats.record(outcome);
         let accepted = matches!(
             outcome,
@@ -1233,7 +1243,7 @@ mod tests {
     use crate::db::PutOutcome;
     use secp256k1::Keypair;
 
-    fn test_db(name: &str) -> DbClient {
+    fn test_db_config(name: &str) -> DatabaseConfig {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let cfg = DatabaseConfig {
@@ -1248,6 +1258,11 @@ mod tests {
             ..Default::default()
         };
         let _ = std::fs::remove_dir_all(&cfg.path);
+        cfg
+    }
+
+    fn test_db(name: &str) -> DbClient {
+        let cfg = test_db_config(name);
         DbClient::open(
             &cfg,
             true,
@@ -2472,6 +2487,47 @@ mod tests {
             visible(&db, serde_json::json!({"kinds": [9007]})).len(),
             1,
             "the re-create event itself survives"
+        );
+        db.shutdown();
+    }
+
+    #[test]
+    fn a_database_write_fault_aborts_the_migration() {
+        // B-8: a commit fault (disk full / map full) revokes the batch as
+        // `PutOutcome::Failed`; the migration must abort instead of counting
+        // it as a rejection and reporting a completed run — a "complete"
+        // run that silently skipped events is what the module contract
+        // forbids, and the process exit code must not say otherwise.
+        let cfg = test_db_config("fault");
+        let expiry = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let store = crate::db::store::Store::open(&cfg, Arc::clone(&expiry), 512).unwrap();
+        store
+            .fail_next_commit
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let db = DbClient::open_with_store(
+            &cfg,
+            store,
+            expiry,
+            Arc::new(Default::default()),
+            0,
+            512,
+            4096,
+        )
+        .unwrap();
+        let now = unix_now();
+        let event = signed(1, 1, now - 1, vec![], "fault");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let err = rt
+            .block_on(run(
+                Some(&db),
+                std::io::Cursor::new(jsonl(&[event])),
+                &options(),
+                |_| {},
+            ))
+            .expect_err("a write fault must abort the migration");
+        assert!(
+            err.to_string().contains("database write fault"),
+            "the abort must name the write fault: {err}"
         );
         db.shutdown();
     }

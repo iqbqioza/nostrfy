@@ -954,8 +954,8 @@ pub(crate) fn spawn(
                                     Ok(txn) => batch.pending = Some(txn),
                                     Err(e) => {
                                         db_error(&thread_errors, &e.into());
-                                        let _ = reply
-                                            .send(PutOutcome::Invalid("database error".into()));
+                                        let _ =
+                                            reply.send(PutOutcome::Failed("database error".into()));
                                         continue;
                                     }
                                 }
@@ -1753,11 +1753,11 @@ pub(crate) fn spawn(
                     // so their OK would be a lie. Drain the OLD batch before
                     // resetting it (a fresh batch has nothing to drain).
                     for s in batch.senders.drain(..) {
-                        let _ = s.send(PutOutcome::Invalid("database error".into()));
+                        let _ = s.send(PutOutcome::Failed("database error".into()));
                     }
                     for (events, _, reply) in batch.pending_batches.drain(..) {
                         let _ = reply.send(vec![
-                            PutOutcome::Invalid("database error".into());
+                            PutOutcome::Failed("database error".into());
                             events.len()
                         ]);
                     }

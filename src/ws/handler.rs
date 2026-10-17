@@ -286,6 +286,12 @@ impl super::Conn {
                 crate::db::PutOutcome::Invalid(reason) => {
                     self.send_ok(&id, false, &reason);
                 }
+                crate::db::PutOutcome::Failed(reason) => {
+                    // A database write fault revoked the batch: the event was
+                    // not stored. The reason already reads as an error, so
+                    // the client knows a retry is meaningful.
+                    self.send_ok(&id, false, &reason);
+                }
                 crate::db::PutOutcome::Expired => {
                     self.send_ok(&id, false, "invalid: event has expired");
                 }

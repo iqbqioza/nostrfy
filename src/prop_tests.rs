@@ -108,6 +108,9 @@ fn expected(outcome: &PutOutcome) -> Expected {
         PutOutcome::PreviouslyDeleted => Expected::PreviouslyDeleted,
         PutOutcome::Ephemeral => Expected::Ephemeral,
         PutOutcome::Invalid(_) => Expected::Invalid,
+        PutOutcome::Failed(reason) => {
+            panic!("unexpected database write fault in the property test: {reason}")
+        }
     }
 }
 

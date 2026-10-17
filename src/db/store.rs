@@ -485,7 +485,7 @@ pub(crate) fn apply_put_batch(
     if let Err(e) = store.disk_full_error() {
         db_error(thread_errors, &e);
         log::error!("disk is full: refusing to commit {} events", puts.len());
-        return vec![PutOutcome::Invalid("error: disk is full".into()); puts.len()];
+        return vec![PutOutcome::Failed("error: disk is full".into()); puts.len()];
     }
     loop {
         // LMDB allows a single writer: reuse the pending transaction if one
@@ -496,7 +496,7 @@ pub(crate) fn apply_put_batch(
                 Ok(t) => t,
                 Err(e) => {
                     db_error(thread_errors, &e.into());
-                    return vec![PutOutcome::Invalid("database error".into()); puts.len()];
+                    return vec![PutOutcome::Failed("database error".into()); puts.len()];
                 }
             },
         };
@@ -535,7 +535,7 @@ pub(crate) fn apply_put_batch(
             // The transaction is unusable: abort it and revoke every reply
             // queued for it, because the applied puts were rolled back with
             // it and their OK would be a lie.
-            return vec![PutOutcome::Invalid("database error".into()); puts.len()];
+            return vec![PutOutcome::Failed("database error".into()); puts.len()];
         }
         // Test-only fault injection: treat the next commit as a full map so
         // the rollback path below is exercised without filling a real
@@ -563,13 +563,13 @@ pub(crate) fn apply_put_batch(
                     // failure as well: `grow_map` only logs, and the
                     // relay's health metrics must see a full map.
                     thread_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    return vec![PutOutcome::Invalid("database error".into()); puts.len()];
+                    return vec![PutOutcome::Failed("database error".into()); puts.len()];
                 }
                 // Retry the whole batch in the larger map.
             }
             Err(e) => {
                 db_error(thread_errors, &e.into());
-                return vec![PutOutcome::Invalid("database error".into()); puts.len()];
+                return vec![PutOutcome::Failed("database error".into()); puts.len()];
             }
         }
     }

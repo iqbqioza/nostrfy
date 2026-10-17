@@ -137,6 +137,12 @@ pub enum PutOutcome {
     /// `OK true` (accepted, empty message).
     Ephemeral,
     Invalid(String),
+    /// A database write fault revoked the whole batch (a full disk, a full
+    /// map, a poisoned transaction): the write did not happen, so the
+    /// event's fate is unknown and the caller must not count it as a
+    /// rejection. The relay reports it as an error; the migration aborts
+    /// instead of reporting a completed run with skipped events.
+    Failed(String),
 }
 
 impl Default for PutOutcome {
