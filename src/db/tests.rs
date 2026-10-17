@@ -218,18 +218,22 @@ fn database_dir_probe_creates_nothing_and_reports_the_state() {
         .expect_err("a non-directory component must be an error");
     assert_eq!(err.kind(), std::io::ErrorKind::NotADirectory);
     // An unwritable ancestor is an error: `start` could not create the
-    // directory there.
-    let read_only = base.join("readonly");
-    std::fs::create_dir_all(&read_only).unwrap();
-    let mut perms = std::fs::metadata(&read_only).unwrap().permissions();
-    perms.set_mode(0o555);
-    std::fs::set_permissions(&read_only, perms).unwrap();
-    let err = crate::db::probe_database_dir(&read_only.join("db"))
-        .expect_err("an unwritable parent must be an error");
-    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
-    let mut perms = std::fs::metadata(&read_only).unwrap().permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(&read_only, perms).unwrap();
+    // directory there. Root bypasses the permission check (the FreeBSD CI
+    // runs the suite as root), so the case only means anything for an
+    // unprivileged user.
+    if unsafe { libc::geteuid() } != 0 {
+        let read_only = base.join("readonly");
+        std::fs::create_dir_all(&read_only).unwrap();
+        let mut perms = std::fs::metadata(&read_only).unwrap().permissions();
+        perms.set_mode(0o555);
+        std::fs::set_permissions(&read_only, perms).unwrap();
+        let err = crate::db::probe_database_dir(&read_only.join("db"))
+            .expect_err("an unwritable parent must be an error");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        let mut perms = std::fs::metadata(&read_only).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&read_only, perms).unwrap();
+    }
     let _ = std::fs::remove_dir_all(&base);
 }
 
