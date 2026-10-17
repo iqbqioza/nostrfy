@@ -461,14 +461,37 @@ impl GroupStore {
             && self.total_members.saturating_add(fresh) > self.max_total_members
     }
 
-    /// Whether another group may be created. The deleted and ghost markers
-    /// count toward the budget: they are kept forever (a deleted group must
-    /// not be resurrectable), so an unbounded number of distinct deletions
-    /// (or rebuild-discovered ghosts) must not grow the store without limit
-    /// either.
+    /// Whether another *live* group may be created. The deleted tombstones
+    /// are reclaimable (see [`Self::reclaim_tombstones`]), so they do not
+    /// block a create; the ghost markers are not — their history may
+    /// survive — so they still count.
     fn at_capacity(&self) -> bool {
-        self.max_groups > 0
-            && self.groups.len() + self.deleted.len() + self.ghost.len() >= self.max_groups
+        self.max_groups > 0 && self.groups.len() + self.ghost.len() >= self.max_groups
+    }
+
+    /// Makes room for `room` new entries within `max_groups`, dropping
+    /// tombstones as needed. The in-memory delete markers are a fast path
+    /// only: the database's purge marker and the purged events remain
+    /// authoritative, and a tombstone's only unique effect is the friendlier
+    /// rejection of a non-create write to an id that is unknown anyway — so
+    /// an arbitrary tombstone is the right thing to drop. Without this, an
+    /// anonymous create+delete churn over `max_groups` distinct ids
+    /// exhausted the budget with tombstones and permanently rejected every
+    /// later create (only a `max_groups` change recovered). Ghosts are never
+    /// dropped: their surviving history must stay withheld.
+    fn reclaim_tombstones(&mut self, room: usize) {
+        if self.max_groups == 0 {
+            return;
+        }
+        let budget = self.max_groups.saturating_sub(room);
+        while self.groups.len() + self.deleted.len() + self.ghost.len() > budget {
+            let Some(victim) = self.deleted.iter().next().cloned() else {
+                // Live groups and ghosts alone exceed the budget: the
+                // create/ghost insert is refused by `at_capacity` instead.
+                break;
+            };
+            self.deleted.remove(&victim);
+        }
     }
 
     /// The bound on the declared-children adoption hint: a small multiple
@@ -1281,6 +1304,11 @@ impl GroupStore {
                     && !self.ghost.contains(gid)
                     && (ignore_capacity || !self.at_capacity())
                 {
+                    // The budget counts the tombstones too (they bound the
+                    // store's memory): reclaim room for this group first, so
+                    // a create+delete churn cannot fill the budget with
+                    // tombstones and lock every later create out.
+                    self.reclaim_tombstones(1);
                     // A fresh create resurrects an explicitly deleted id:
                     // clear the delete tombstone so the id is reusable. The
                     // deleted group's events were purged by the relay when
@@ -1412,6 +1440,7 @@ impl GroupStore {
                     }
                 }
                 if known {
+                    self.reclaim_tombstones(1);
                     self.deleted.insert(gid.to_string());
                 }
             }
@@ -2008,6 +2037,7 @@ impl GroupStore {
     /// history readable) and reads stay withheld. Only a confirmed purge
     /// clears it again (see `unghost`).
     pub(crate) fn mark_ghost(&mut self, gid: &str) {
+        self.reclaim_tombstones(1);
         self.ghost.insert(gid.to_string());
     }
 

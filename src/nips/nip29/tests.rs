@@ -424,7 +424,12 @@ fn group_cap_rejects_creates_over_the_limit() {
 }
 
 #[test]
-fn group_cap_counts_deleted_groups() {
+fn group_cap_reclaims_deleted_tombstones_instead_of_locking_out() {
+    // B-7: the budget counts the tombstones too (they bound the store's
+    // memory), but they are reclaimable: a create+delete churn over
+    // `max_groups` distinct ids must not permanently reject every later
+    // create. A tombstone is dropped as needed and the store stays within
+    // the cap.
     let mut store = GroupStore::with_cap(2);
     let g1 = event(CREATE_GROUP, ADMIN, Some("g1"), vec![]);
     let g2 = event(CREATE_GROUP, ADMIN, Some("g2"), vec![]);
@@ -433,19 +438,51 @@ fn group_cap_counts_deleted_groups() {
     store.apply(&g1, "", 1, false, false);
     store.apply(&g2, "", 1, false, false);
     store.apply(&del1, "", 2, false, false);
-    // g1 is gone but its marker still counts: a new create is rejected.
+    // Re-creating the deleted g1 is admitted even though the tombstone
+    // occupies budget: the marker is reclaimed (g1's own here).
+    let recreate = event(CREATE_GROUP, ADMIN, Some("g1"), vec![]);
+    assert!(store.validate_write(&recreate).is_ok());
+    store.apply(&recreate, "", 3, false, false);
+    assert!(
+        store.group("g1").is_some(),
+        "the re-create must be admitted"
+    );
+    assert!(
+        store.groups.len() + store.deleted.len() + store.ghost.len() <= 2,
+        "the store must stay within the cap"
+    );
+    // The *live* cap still holds: with g1 and g2 live, a new id is refused.
     assert_eq!(
         store.validate_write(&g3).unwrap_err().to_string(),
-        "restricted: group limit reached",
-        "deleted groups must count toward the budget"
-    );
-    // Re-creating the DELETED g1 is refused on capacity grounds here (the
-    // budget is full); with spare capacity a fresh create resurrects it
-    // (see `deleted_group_id_can_be_recreated`).
-    assert_eq!(
-        store.validate_write(&g1).unwrap_err().to_string(),
         "restricted: group limit reached"
     );
+}
+
+#[test]
+fn tombstone_churn_does_not_lock_out_creates() {
+    // The lockout this guards: `max_groups` distinct create+delete cycles
+    // used to leave the budget full of tombstones, so every later create
+    // was rejected until the operator raised `max_groups`. The churn must
+    // keep working and the store must stay within the cap.
+    let cap = 3;
+    let mut store = GroupStore::with_cap(cap);
+    for i in 0..(cap * 4) {
+        let gid = format!("churn-{i}");
+        let create = event(CREATE_GROUP, ADMIN, Some(gid.as_str()), vec![]);
+        assert!(
+            store.validate_write(&create).is_ok(),
+            "create {i} must be admitted"
+        );
+        store.apply(&create, "", i as u64, false, false);
+        assert!(store.group(&gid).is_some(), "create {i} must apply");
+        let delete = event(DELETE_GROUP, ADMIN, Some(gid.as_str()), vec![]);
+        assert!(store.validate_write(&delete).is_ok());
+        store.apply(&delete, "", i as u64, false, false);
+        assert!(
+            store.groups.len() + store.deleted.len() + store.ghost.len() <= cap,
+            "the store must stay within the cap after cycle {i}"
+        );
+    }
 }
 
 #[test]
