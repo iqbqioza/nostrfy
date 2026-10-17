@@ -452,9 +452,9 @@ Set this whenever a reverse proxy (nginx, Caddy, a cloud load balancer, Cloudfla
 
 **`pid_file`** — Where the daemon writes its process id. `stop`/`restart` use it to signal the daemon. A stale entry (dead process, or a pid reused by a different program) is detected and ignored.
 
-**`log_file`** — Where the daemon writes its log. Rotated when it grows past `max_log_size_bytes`.
+**`log_file`** — Where the daemon writes its log. Rotated when it grows past `max_log_size_bytes`. Created owner-only (`0600`): the log carries client IPs and pubkeys. An existing world-readable file is tightened on open by clearing its world bits, so a deliberate `0640` group-readable setup keeps working.
 
-**`stats_file`** — Where live statistics are written (atomically, via temp-file + rename) every `stats_interval_secs` seconds. Read by `nostrfy stats`; a public subset of the same data is served at `/relay/stats`. Every snapshot carries a `written_at` Unix timestamp: `nostrfy stats` refuses to print a snapshot older than 3× `stats_interval_secs` (or whose daemon is no longer running) and exits nonzero instead of presenting stale counters as live.
+**`stats_file`** — Where live statistics are written (atomically, via temp-file + rename) every `stats_interval_secs` seconds. The snapshot is created owner-only (`0600`): it carries the storage-capacity gauges and failure counters that the public `/relay/stats` subset withholds. Read by `nostrfy stats`; a public subset of the same data is served at `/relay/stats`. Every snapshot carries a `written_at` Unix timestamp: `nostrfy stats` refuses to print a snapshot older than 3× `stats_interval_secs` (or whose daemon is no longer running) and exits nonzero instead of presenting stale counters as live.
 
 `/relay/stats` needs no token and the server answers with a wildcard `Access-Control-Allow-Origin`, so any web page can read it cross-origin; it therefore withholds the host's free disk space (`db_free_bytes`, `db_disk_full`), the failure counters (`db_errors`, `accept_errors`, `rebuild_failures`, `log_errors`) and the per-reason connection-refusal breakdown (`connection_refusals`), which together are a storage-capacity and timing oracle for an anonymous prober. Those keys are in the stats file (so `nostrfy stats` prints them) and in `/metrics`.
 

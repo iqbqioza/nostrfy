@@ -1553,7 +1553,10 @@ async fn stats_writer(relay: Arc<Relay>, mut shutdown: watch::Receiver<bool>) {
 /// Writes `data` to `path` atomically (temp file + rename) so a crash in
 /// the middle of a write never leaves a truncated stats file behind. The
 /// temp name is unique per write: a fixed `.tmp` name let two writers
-/// truncate each other's temp.
+/// truncate each other's temp. The snapshot is created owner-only
+/// (`0600`): it carries the storage-capacity gauges and failure counters
+/// that the public `/relay/stats` subset withholds, so it must not be
+/// world-readable.
 fn write_atomic(path: &Path, data: &[u8]) {
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1562,7 +1565,17 @@ fn write_atomic(path: &Path, data: &[u8]) {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let tmp = path.with_extension(format!("{}.{nanos}.{seq}.tmp", std::process::id()));
-    let result = std::fs::write(&tmp, data).and_then(|()| std::fs::rename(&tmp, path));
+    let result = {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)
+            .and_then(|mut file| file.write_all(data))
+            .and_then(|()| std::fs::rename(&tmp, path))
+    };
     if let Err(e) = result {
         error!("cannot write {}: {e}", path.display());
         let _ = std::fs::remove_file(&tmp);
@@ -2679,6 +2692,22 @@ mod tests {
         };
         event.id = crate::nips::nip01::compute_id(&event);
         event
+    }
+
+    #[test]
+    fn stats_snapshot_is_written_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("nostrfy-stats-mode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("nostrfy.stats.json");
+        write_atomic(&path, b"{}");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "the stats snapshot must not be world-readable (it carries the withheld gauges)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

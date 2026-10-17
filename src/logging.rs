@@ -297,9 +297,44 @@ struct FileState {
     rotate_attempt_size: u64,
 }
 
+/// Clears the world bits of a log file when it is world-accessible,
+/// keeping a deliberate group-readable (`0640`) mode. Shared by the open
+/// path (an existing log from an older version) and the rotation (the
+/// backups a legacy 0644 log left behind).
+fn tighten_log_file(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return;
+    };
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode & 0o007 != 0 {
+        let mut permissions = metadata.permissions();
+        permissions.set_mode(mode & !0o007);
+        let _ = std::fs::set_permissions(path, permissions);
+    }
+}
+
+/// Opens the log file, creating it owner-only (`0600`).
+///
+/// The log carries client IPs, pubkeys and operational detail, so it must
+/// not be world-readable: a plain `OpenOptions` created it with the umask
+/// default (typically `0644`). An existing world-accessible file is
+/// tightened by clearing its world bits, so a deliberately group-readable
+/// mode (`0640`) keeps working.
+fn open_log_file(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(path)?;
+    tighten_log_file(path);
+    Ok(file)
+}
+
 impl FileLogger {
     fn open(path: PathBuf, max_size: u64, max_files: u32) -> anyhow::Result<FileLogger> {
-        let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let file = open_log_file(&path)?;
         let size = file.metadata().map(|m| m.len()).unwrap_or(0);
         Ok(FileLogger {
             path,
@@ -328,11 +363,7 @@ impl FileLogger {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         let line = format!("[{} ERROR nostrfy::logging] {message}\n", utc_format(now));
-        if let Ok(mut file) = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-        {
+        if let Ok(mut file) = open_log_file(&self.path) {
             let _ = file.write_all(line.as_bytes());
             let _ = file.flush();
         }
@@ -395,6 +426,10 @@ impl FileLogger {
             if let Err(e) = std::fs::rename(&from, &to) {
                 let message = format!("cannot rotate log backup {}: {e}", from.display());
                 failure.get_or_insert(message);
+            } else {
+                // A backup left world-readable by an older version is
+                // tightened here; the current log is tightened on open.
+                tighten_log_file(&to);
             }
         }
         // The current file becomes `.1` and a fresh one is opened. A failed
@@ -402,7 +437,10 @@ impl FileLogger {
         // and the failure would otherwise be silently lost).
         let first = backup_path(&self.path, 1);
         let rotated = match std::fs::rename(&self.path, &first) {
-            Ok(()) => true,
+            Ok(()) => {
+                tighten_log_file(&first);
+                true
+            }
             Err(e) => {
                 failure.get_or_insert_with(|| {
                     format!(
@@ -414,11 +452,7 @@ impl FileLogger {
                 false
             }
         };
-        match OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-        {
+        match open_log_file(&self.path) {
             Ok(file) => {
                 state.file = file;
                 // Only a successful rotation may reset the size counter: a
@@ -575,6 +609,59 @@ mod tests {
         LOGGER.log(&record);
         LOGGER.flush();
         assert!(LOGGER.enabled(record.metadata()));
+    }
+
+    #[test]
+    fn log_file_is_created_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir()
+            .join("nostrfy-log-mode-test")
+            .join(format!("{:x}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("relay.log");
+        let mode =
+            |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+
+        // A fresh log must not be world-readable (the umask default was
+        // 0644 and the log carries client IPs and pubkeys).
+        let _ = FileLogger::open(path.clone(), 1 << 20, 4).unwrap();
+        assert_eq!(mode(&path), 0o600, "a fresh log must be owner-only");
+
+        // An existing world-readable log is tightened, keeping the group
+        // bits so a deliberate 0640 setup keeps working.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let _ = FileLogger::open(path.clone(), 1 << 20, 4).unwrap();
+        assert_eq!(mode(&path), 0o640, "a world-readable log must be tightened");
+
+        // A group-readable mode stays as the operator set it.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let _ = FileLogger::open(path.clone(), 1 << 20, 4).unwrap();
+        assert_eq!(mode(&path), 0o640, "a group-readable log must be kept");
+
+        // A rotation tightens the backups a world-readable legacy log left
+        // behind and creates the fresh log owner-only (the logger rotates
+        // after a write once the size is over the limit).
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let legacy = dir.join("relay.log.1");
+        std::fs::write(&legacy, "old\n").unwrap();
+        std::fs::set_permissions(&legacy, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let logger = FileLogger::open(path.clone(), 8, 2).unwrap();
+        let record = log::Record::builder()
+            .args(format_args!("rotate me"))
+            .level(log::Level::Info)
+            .build();
+        log::Log::log(&logger, &record);
+        assert_eq!(
+            mode(&dir.join("relay.log.2")),
+            0o640,
+            "a legacy world-readable backup must be tightened on rotation"
+        );
+        assert_eq!(mode(&path), 0o600, "the fresh log must be owner-only");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
