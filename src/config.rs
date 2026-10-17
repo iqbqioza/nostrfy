@@ -338,7 +338,9 @@ pub struct LimitsConfig {
     /// Byte budget for a single REQ response (the stored events delivered
     /// for one subscription). Responses larger than this are cut off with
     /// a `CLOSED ... response too large` reply so a slow reader cannot
-    /// pin unbounded memory; 0 disables the budget.
+    /// pin unbounded memory; 0 disables the budget. The REST API query
+    /// endpoints enforce the same budget per page (the page is cut with
+    /// `more` still set, so the client continues from the returned count).
     pub max_req_response_bytes: u64,
 }
 

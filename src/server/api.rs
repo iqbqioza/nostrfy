@@ -1863,9 +1863,13 @@ async fn query_and_respond(
     // Bound total work: at most 4 rounds, each at most 4x the visible target
     // and never more than the configured offset cap + limit (defaults keep
     // this small; `0` means unbounded so fall back to 8x with a hard 10k).
-    let (cfg_offset, cfg_fetch) = {
+    let (cfg_offset, cfg_fetch, cfg_response_bytes) = {
         let cfg = relay.config.read().await;
-        (cfg.limits.max_api_offset, cfg.limits.max_api_fetch)
+        (
+            cfg.limits.max_api_offset,
+            cfg.limits.max_api_fetch,
+            cfg.limits.max_req_response_bytes,
+        )
     };
     let hard_cap = if cfg_offset > 0 {
         cfg_offset.saturating_add(max_limit).saturating_add(1)
@@ -1952,12 +1956,35 @@ async fn query_and_respond(
     // hint says the pre-filter scan was cut short (best-effort, so a page
     // that is under-filled because of hidden rows still advertises more).
     let has_more = visible.len() > skip.saturating_add(max_limit) || db_more;
-    let event_values: Vec<Value> = visible
-        .into_iter()
-        .skip(skip)
-        .take(max_limit)
-        .filter_map(|e| serde_json::to_value(e).ok())
-        .collect();
+    // Enforce the response byte budget (`limits.max_req_response_bytes`, the
+    // same knob the WebSocket path enforces per REQ response; 0 disables
+    // it). The event count alone does not bound the response: a full page of
+    // large events serializes to hundreds of MiB, and `max_api_concurrent`
+    // such responses at once is an OOM. The page is cut at the budget with
+    // `more` still set, so the client continues from the returned `count`
+    // instead of losing the tail. The first event is always admitted (its
+    // size is already bounded by the intake caps), so a page is never empty
+    // while matches exist.
+    let mut event_values: Vec<Value> = Vec::new();
+    let mut used_bytes: u64 = 0;
+    let mut budget_cut = false;
+    for e in visible.into_iter().skip(skip).take(max_limit) {
+        let Ok(value) = serde_json::to_value(&e) else {
+            continue;
+        };
+        // JSON escaping can expand a value (a control character becomes
+        // `\uXXXX`), so measure the serialized form, not the raw fields.
+        let size = serde_json::to_string(&value).map_or(0, |s| s.len() as u64);
+        if cfg_response_bytes > 0
+            && !event_values.is_empty()
+            && used_bytes.saturating_add(size) > cfg_response_bytes
+        {
+            budget_cut = true;
+            break;
+        }
+        used_bytes = used_bytes.saturating_add(size);
+        event_values.push(value);
+    }
 
     let count = event_values.len();
 
@@ -1966,7 +1993,7 @@ async fn query_and_respond(
         Json(json!(ApiResponse {
             events: event_values,
             count,
-            more: has_more,
+            more: has_more || budget_cut,
         })),
     )
 }
@@ -2429,6 +2456,82 @@ mod tests {
             // A window within the cap is served.
             let (code, _) = query_and_respond(&relay, filters, 50, Some(0), false, &[]).await;
             assert_eq!(code, StatusCode::OK);
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn a_large_query_page_is_cut_at_the_response_byte_budget() {
+        // B-3: the event count alone does not bound a REST response: a full
+        // page of large events serializes to hundreds of MiB, and
+        // `max_api_concurrent` such responses at once is an OOM. The page is
+        // cut at `limits.max_req_response_bytes` (the same knob the WS path
+        // enforces) with `more` still set, so the client continues from the
+        // returned `count`.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_relay().await;
+            {
+                let mut cfg = relay.config.write().await;
+                // A small budget: a few fat notes already exceed it.
+                cfg.limits.max_req_response_bytes = 512;
+            }
+            let now = unix_now();
+            let fat = "x".repeat(300);
+            for i in 0..5 {
+                let e = signed_note(relay.secp(), &fat, now - i, vec![]);
+                assert_eq!(
+                    relay.db.put(e, now).await,
+                    crate::db::PutOutcome::Stored,
+                    "the note must store"
+                );
+            }
+            let filters: Vec<Filter> =
+                serde_json::from_value(serde_json::json!([{"kinds": [1]}])).unwrap();
+            let (code, Json(resp)) =
+                query_and_respond(&relay, filters, 10, Some(0), false, &[]).await;
+            assert_eq!(code, StatusCode::OK);
+            let events = resp["events"].as_array().unwrap();
+            assert!(
+                events.len() < 5,
+                "the page must be cut at the byte budget: {} events",
+                events.len()
+            );
+            assert!(
+                !events.is_empty(),
+                "at least one event is always returned while matches exist"
+            );
+            assert_eq!(resp["count"], events.len());
+            assert_eq!(
+                resp["more"], true,
+                "a cut page must advertise more so the client continues from count"
+            );
+            // The response stays near the budget (the first event is always
+            // admitted, so one event's worth of slack is expected).
+            let size = serde_json::to_string(&resp).unwrap().len();
+            assert!(
+                size <= 512 + 512,
+                "the response must stay near the budget: {size} bytes"
+            );
+            // With the budget disabled (0) the whole page is served.
+            {
+                let mut cfg = relay.config.write().await;
+                cfg.limits.max_req_response_bytes = 0;
+            }
+            let (_, Json(resp)) = query_and_respond(
+                &relay,
+                serde_json::from_value(serde_json::json!([{"kinds": [1]}])).unwrap(),
+                10,
+                Some(0),
+                false,
+                &[],
+            )
+            .await;
+            assert_eq!(
+                resp["events"].as_array().unwrap().len(),
+                5,
+                "0 disables the byte budget"
+            );
             relay.db.shutdown();
         });
     }
