@@ -312,10 +312,12 @@ pub async fn api_auth_middleware(relay: Arc<Relay>, request: Request, next: Next
     let Some(verified) = verified else {
         return api_auth_required();
     };
-    if !relay
-        .nip98_replay
-        .accept(&verified.id, unix_now(), verified.created_at)
-    {
+    if !relay.nip98_replay.accept(
+        &verified.id,
+        unix_now(),
+        verified.created_at,
+        &verified.pubkey,
+    ) {
         return api_auth_required();
     }
     // A banned pubkey must not read an auth-required relay, exactly like a

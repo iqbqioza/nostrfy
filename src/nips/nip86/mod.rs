@@ -1290,9 +1290,12 @@ async fn rpc_authenticated(
             "POST",
             |url| nip98::matches_request_url(url, &cfg.relay_identity(), uri.path(), uri.query()),
         )
-        && relay
-            .nip98_replay
-            .accept(&verified.id, crate::util::unix_now(), verified.created_at)
+        && relay.nip98_replay.accept(
+            &verified.id,
+            crate::util::unix_now(),
+            verified.created_at,
+            &verified.pubkey,
+        )
     {
         return Some(Identity::Admin(verified.pubkey));
     }
@@ -1312,9 +1315,12 @@ async fn rpc_authenticated(
             "POST",
             |url| nip98::matches_request_url(url, &cfg.relay_identity(), uri.path(), uri.query()),
         )
-        && relay
-            .nip98_replay
-            .accept(&verified.id, crate::util::unix_now(), verified.created_at)
+        && relay.nip98_replay.accept(
+            &verified.id,
+            crate::util::unix_now(),
+            verified.created_at,
+            &verified.pubkey,
+        )
         && !relay
             .access
             .read()

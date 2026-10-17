@@ -122,18 +122,29 @@ pub struct Verified {
 /// absolute request URL" only authorizes one request, so a captured
 /// `Authorization` header must not be reusable. Entries expire with the
 /// 60-second auth window; a hard cap bounds memory even under an
-/// authenticated event flood. Expired entries are pruned on every call,
-/// and at capacity a new authorization is rejected (fail closed) instead
-/// of evicting a live entry — evicting one would let a captured
-/// authorization be replayed once the entry was dropped. The guard drains
-/// by itself within a minute of the flood ending. This is process-local
-/// replay protection; restarting clears the guard.
+/// authenticated event flood. Expired entries are pruned on every call.
+/// At capacity the guard evicts the oldest live entry of the most prolific
+/// author instead of refusing the new authorization: a fail-closed cap let
+/// anyone with a signing key flood 4096 authorizations and lock every other
+/// identity — the admin's management NIP-98 included — out for the rest of
+/// the window. The flood's own entries are the eviction pool (an attacker
+/// can sign a fresh event at will, so replay protection for the flood
+/// itself is worth nothing), which keeps a quiet identity's live
+/// authorizations tracked and its captured ones unreplayable. This is
+/// process-local replay protection; restarting clears the guard.
 pub struct ReplayGuard {
-    seen: std::sync::Mutex<std::collections::HashMap<String, u64>>,
+    seen: std::sync::Mutex<std::collections::HashMap<String, Entry>>,
     /// Unix time of the last capacity warning: `accept` runs for every
     /// authenticated request, so a flood that fills the guard must not log
-    /// one line per rejected authorization.
+    /// one line per evicted authorization.
     last_capacity_warning: std::sync::atomic::AtomicU64,
+}
+
+/// One live authorization: when it stops verifying, and who presented it.
+/// The author drives the fair eviction at capacity (see [`ReplayGuard`]).
+struct Entry {
+    expiry: u64,
+    pubkey: String,
 }
 
 impl Default for ReplayGuard {
@@ -152,29 +163,83 @@ impl ReplayGuard {
     const WARNING_INTERVAL: u64 = 60;
 
     /// Records `id` (valid until the event stops verifying); returns
-    /// `false` when it was already used (a replay) or when the guard is
-    /// full. Expired entries are pruned first; a full guard of still-live
-    /// authorizations rejects the new one instead of evicting a live entry.
-    /// `valid_until` must cover the whole NIP-98 validity interval of the
-    /// event: callers pass its `created_at` and the guard extends past the
-    /// inclusive 60-second boundary, so a replay at the last valid second
-    /// (or inside a future-dated event's extended window) is still refused.
-    pub fn accept(&self, id: &str, now: u64, created_at: u64) -> bool {
+    /// `false` when it was already used (a replay). Expired entries are
+    /// pruned first. At capacity the oldest live entry of the most prolific
+    /// author is evicted to admit the new authorization (see
+    /// [`ReplayGuard`]), so one identity's flood cannot lock another out.
+    /// `pubkey` is the authorization's author (normalized to lowercase: hex
+    /// case variants of one key must not buy extra footprint from the
+    /// fairness policy). `valid_until` must cover the whole NIP-98 validity
+    /// interval of the event: callers pass its `created_at` and the guard
+    /// extends past the inclusive 60-second boundary, so a replay at the
+    /// last valid second (or inside a future-dated event's extended window)
+    /// is still refused.
+    pub fn accept(&self, id: &str, now: u64, created_at: u64, pubkey: &str) -> bool {
         let valid_until = created_at.saturating_add(61);
-        let mut seen = self.seen.lock().unwrap_or_else(|p| p.into_inner());
-        seen.retain(|_, expiry| *expiry > now);
-        if seen.contains_key(id) {
-            return false;
-        }
-        if seen.len() >= Self::MAX_ENTRIES {
-            // Drop the lock before logging: the warning must not stall the
-            // other requests waiting on the guard.
-            drop(seen);
+        let pubkey = pubkey.to_ascii_lowercase();
+        let mut warn = false;
+        let accepted = {
+            let mut seen = self.seen.lock().unwrap_or_else(|p| p.into_inner());
+            seen.retain(|_, entry| entry.expiry > now);
+            if seen.contains_key(id) {
+                false
+            } else {
+                if seen.len() >= Self::MAX_ENTRIES {
+                    Self::evict_most_prolific(&mut seen, &pubkey);
+                    warn = true;
+                }
+                seen.insert(
+                    id.to_string(),
+                    Entry {
+                        expiry: valid_until,
+                        pubkey,
+                    },
+                );
+                true
+            }
+        };
+        if warn {
             self.warn_capacity(now);
-            return false;
         }
-        seen.insert(id.to_string(), valid_until);
-        true
+        accepted
+    }
+
+    /// Removes the oldest live entry of the most prolific author. Ties on
+    /// the count prefer an author other than `requester`, so a request
+    /// never evicts its own author's earlier authorizations while another
+    /// author can be evicted instead (a single-key flood has no other
+    /// author at its count and evicts its own). Among the tied authors the
+    /// entry closest to natural expiry is removed, which bounds the replay
+    /// exposure an eviction can create. Called only with a map at capacity,
+    /// so there is always an entry to evict.
+    fn evict_most_prolific(seen: &mut std::collections::HashMap<String, Entry>, requester: &str) {
+        // (entry count, earliest expiry) per author.
+        let mut stats: std::collections::HashMap<&str, (usize, u64)> =
+            std::collections::HashMap::new();
+        for entry in seen.values() {
+            let stat = stats.entry(entry.pubkey.as_str()).or_insert((0, u64::MAX));
+            stat.0 += 1;
+            stat.1 = stat.1.min(entry.expiry);
+        }
+        let victim = stats
+            .iter()
+            .max_by_key(|(pubkey, (count, earliest))| {
+                // Highest count first; at equal counts a non-requester, then
+                // the author whose oldest entry expires first.
+                (*count, **pubkey != requester, std::cmp::Reverse(*earliest))
+            })
+            .map(|(pubkey, _)| pubkey.to_string());
+        let Some(victim) = victim else {
+            return;
+        };
+        if let Some(id) = seen
+            .iter()
+            .filter(|(_, entry)| entry.pubkey == victim)
+            .min_by_key(|(_, entry)| entry.expiry)
+            .map(|(id, _)| id.clone())
+        {
+            seen.remove(&id);
+        }
     }
 
     /// Rate-limited capacity warning (a bool would log once ever; time
@@ -191,8 +256,8 @@ impl ReplayGuard {
             .is_ok()
         {
             log::warn!(
-                "NIP-98 replay guard is full ({} live authorizations): refusing new \
-                 authorizations until entries expire",
+                "NIP-98 replay guard is at capacity ({} live authorizations): evicting \
+                 the oldest authorization of the most prolific author",
                 Self::MAX_ENTRIES
             );
         }
@@ -580,13 +645,19 @@ mod tests {
     #[test]
     fn replay_guard_rejects_reuse_within_the_window() {
         let guard = ReplayGuard::default();
-        assert!(guard.accept("aa", 1_000, 1_000));
-        assert!(!guard.accept("aa", 1_000, 1_000), "the same id is a replay");
-        assert!(!guard.accept("aa", 1_059, 1_059), "still within the window");
+        assert!(guard.accept("aa", 1_000, 1_000, "pk-a"));
+        assert!(
+            !guard.accept("aa", 1_000, 1_000, "pk-a"),
+            "the same id is a replay"
+        );
+        assert!(
+            !guard.accept("aa", 1_059, 1_059, "pk-a"),
+            "still within the window"
+        );
         // After the 60-second window the entry expires.
-        assert!(guard.accept("aa", 1_061, 1_061));
+        assert!(guard.accept("aa", 1_061, 1_061, "pk-a"));
         // Distinct ids are independent.
-        assert!(guard.accept("bb", 1_061, 1_061));
+        assert!(guard.accept("bb", 1_061, 1_061, "pk-b"));
     }
 
     #[test]
@@ -595,53 +666,92 @@ mod tests {
         // first-accept time: a replay at the last valid second — or inside
         // a future-dated event's extended window — is still refused.
         let guard = ReplayGuard::default();
-        assert!(guard.accept("aa", 1_000, 1_000));
+        assert!(guard.accept("aa", 1_000, 1_000, "pk-a"));
         assert!(
-            !guard.accept("aa", 1_060, 1_060),
+            !guard.accept("aa", 1_060, 1_060, "pk-a"),
             "the inclusive boundary second is still guarded"
         );
-        assert!(guard.accept("aa", 1_061, 1_061));
+        assert!(guard.accept("aa", 1_061, 1_061, "pk-a"));
         // Future-dated event (created_at ahead): valid until
         // created_at + 60, guarded that long.
-        assert!(guard.accept("bb", 1_000, 1_060));
+        assert!(guard.accept("bb", 1_000, 1_060, "pk-b"));
         assert!(
-            !guard.accept("bb", 1_061, 1_061),
+            !guard.accept("bb", 1_061, 1_061, "pk-b"),
             "a future-dated auth stays guarded past first-accept + 60"
         );
         assert!(
-            !guard.accept("bb", 1_120, 1_120),
+            !guard.accept("bb", 1_120, 1_120, "pk-b"),
             "still within created_at + 60"
         );
-        assert!(guard.accept("bb", 1_121, 1_121));
+        assert!(guard.accept("bb", 1_121, 1_121, "pk-b"));
     }
 
     #[test]
-    fn replay_guard_rejects_new_entries_when_full_instead_of_evicting() {
+    fn replay_guard_evicts_the_most_prolific_author_at_capacity() {
+        // A single-key flood must not lock other identities out (the
+        // fail-closed cap let it): at capacity the flood's own oldest entry
+        // is evicted, so the quiet identity is admitted and stays tracked,
+        // and what is lost is the flood's own replay protection — worth
+        // nothing, since the flood can re-sign at will.
+        let guard = ReplayGuard::default();
+        // flood-0 carries the earliest expiry, so it is deterministically
+        // the flood entry closest to natural expiry (the eviction's
+        // tie-break among one author's entries).
+        assert!(guard.accept("flood-0", 1_000, 1_000, "pk-flood"));
+        for n in 1..ReplayGuard::MAX_ENTRIES {
+            assert!(guard.accept(&format!("flood-{n}"), 1_000, 1_000 + n as u64, "pk-flood"));
+        }
+        // The guard is full of the flooder's live entries: the quiet
+        // identity is still admitted (the flood's oldest entry is evicted).
+        assert!(
+            guard.accept("quiet", 1_001, 1_001, "pk-quiet"),
+            "a flood must not lock another identity out"
+        );
+        // Its authorization is tracked: a replay is refused.
+        assert!(
+            !guard.accept("quiet", 1_001, 1_001, "pk-quiet"),
+            "the quiet authorization must stay protected from replay"
+        );
+        // The evicted entry is the flood's own oldest: replaying it is
+        // admitted again (the flood could just re-sign, so this costs
+        // nothing).
+        assert!(
+            guard.accept("flood-0", 1_001, 1_001, "pk-flood"),
+            "the flood's evicted entry is admitted again"
+        );
+        // The quiet identity's entry survived the flood's next eviction
+        // (the most prolific author is the flood, not the quiet identity).
+        assert!(
+            !guard.accept("quiet", 1_001, 1_001, "pk-quiet"),
+            "the quiet entry must survive flood evictions"
+        );
+        // Once every entry expires the guard drains back to empty.
+        assert!(
+            guard.accept("new", 5_157, 5_157, "pk-new"),
+            "acceptance resumes after the live entries expire"
+        );
+    }
+
+    #[test]
+    fn replay_guard_at_capacity_keeps_a_quiet_identity_tracked() {
+        // The guard full of one-entry authors (an attacker with 4096 keys):
+        // a quiet identity's new authorization evicts another author's
+        // entry, and the quiet identity's own earlier entries are not the
+        // victim (the tie prefers a non-requester).
         let guard = ReplayGuard::default();
         for n in 0..ReplayGuard::MAX_ENTRIES {
-            assert!(guard.accept(&format!("id-{n}"), 1_000, 1_000));
+            assert!(guard.accept(&format!("id-{n}"), 1_000, 1_000, &format!("pk-{n}")));
         }
-        // The guard is full of live entries: the new authorization is
-        // refused (fail closed) instead of evicting a live one...
+        // The quiet identity already holds one authorization from before
+        // the flood; it must survive its own new authorization's eviction.
+        assert!(guard.accept("quiet-old", 1_001, 1_001, "pk-quiet"));
         assert!(
-            !guard.accept("new", 1_001, 1_001),
-            "a full guard must reject the new authorization"
-        );
-        // ...and no live entry was dropped to make room: the oldest and the
-        // newest authorizations are both still tracked as replays.
-        assert!(
-            !guard.accept("id-0", 1_001, 1_001),
-            "the oldest live entry must not be evicted"
+            guard.accept("quiet-new", 1_002, 1_002, "pk-quiet"),
+            "the quiet identity must be admitted at capacity"
         );
         assert!(
-            !guard.accept("id-4095", 1_001, 1_001),
-            "the newest entry remains protected from replay"
-        );
-        // Once the 60-second window passes, all entries expire and the guard
-        // drains by itself.
-        assert!(
-            guard.accept("new", 1_061, 1_061),
-            "acceptance resumes after the live entries expire"
+            !guard.accept("quiet-old", 1_002, 1_002, "pk-quiet"),
+            "the quiet identity's earlier authorization must stay tracked"
         );
     }
 }
