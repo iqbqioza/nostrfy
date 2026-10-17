@@ -943,6 +943,11 @@ impl Config {
 
     /// Resolves every relative path against the config file directory so that
     /// paths stay valid after the daemon changes its working directory.
+    ///
+    /// An empty path stays empty: anchoring it to the config directory would
+    /// make [`Self::validate`]'s "must not be empty" checks unreachable and
+    /// silently open the database (or write the pid/log/stats files) next to
+    /// the config instead of failing loudly.
     pub fn absolutize_paths(&mut self, config_path: &Path) {
         let base = match config_path.parent() {
             Some(parent) if !parent.as_os_str().is_empty() => {
@@ -950,7 +955,13 @@ impl Config {
             }
             _ => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         };
-        let abs = |p: PathBuf| -> PathBuf { if p.is_absolute() { p } else { base.join(p) } };
+        let abs = |p: PathBuf| -> PathBuf {
+            if p.is_absolute() || p.as_os_str().is_empty() {
+                p
+            } else {
+                base.join(p)
+            }
+        };
         self.database.path = abs(self.database.path.clone());
         self.daemon.pid_file = abs(self.daemon.pid_file.clone());
         self.daemon.log_file = abs(self.daemon.log_file.clone());
@@ -3544,6 +3555,43 @@ max_log_files = 2
             "relative blossom path resolves against the config directory"
         );
         assert_eq!(cfg.database.path, dir.join("data"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_empty_path_survives_absolutization_and_is_rejected() {
+        // Anchoring an empty path to the config directory used to make the
+        // "must not be empty" validation unreachable: `database.path = ""`
+        // silently opened the LMDB environment next to the config file.
+        let mut cfg = Config::default();
+        cfg.database.path = PathBuf::new();
+        let dir = std::env::temp_dir().join("nostrfy-empty-path-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let cfg_path = dir.join("nostrfy.toml");
+        cfg.absolutize_paths(&cfg_path);
+        assert!(
+            cfg.database.path.as_os_str().is_empty(),
+            "an empty path must stay empty, not become the config directory"
+        );
+        let error = cfg
+            .validate()
+            .expect_err("an empty database.path must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("database.path must not be empty"),
+            "the error must name the field: {error}"
+        );
+        // The daemon paths are validated the same way.
+        cfg.database.path = dir.join("data");
+        cfg.daemon.log_file = PathBuf::new();
+        let error = cfg
+            .validate()
+            .expect_err("an empty log_file must be rejected");
+        assert!(
+            error.to_string().contains("daemon.pid_file"),
+            "the error must name the daemon paths: {error}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
