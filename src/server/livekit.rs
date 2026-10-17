@@ -127,6 +127,14 @@ async fn group_allows(relay: &Relay, group: &str, pubkey: &str) -> bool {
         return false;
     }
     let groups = relay.groups.read().await;
+    // The store is derived from state a removal invalidated and the rebuild
+    // has not recomputed: membership and settings are no longer certain, so
+    // no token is minted (the WS and API read paths fail closed the same
+    // way, see `GroupStore::group_is_stale`). Without this a removed member
+    // could mint a room token from the stale store.
+    if groups.group_is_stale(group) {
+        return false;
+    }
     match groups.group(group) {
         // Unknown groups are not hosted here: the relay cannot judge
         // membership (the id may be a private group on another relay),
@@ -423,6 +431,44 @@ mod tests {
         assert!(json["token"].as_str().is_some_and(|t| !t.is_empty()));
         relay.db.shutdown();
     }
+    #[tokio::test]
+    async fn stale_group_mints_no_token() {
+        // B-6: a group-state removal invalidates the derived membership
+        // until the rebuild recomputes it — minting from the stale store
+        // would hand a removed member a room token. The WS and API read
+        // paths fail closed the same way.
+        let relay = build_relay().await;
+        let keypair = Keypair::from_seckey_slice(relay.secp(), &[7u8; 32]).unwrap();
+        let pubkey = XOnlyPublicKey::from_keypair(&keypair).0.to_string();
+        let mut g = crate::nips::nip29::Group::default();
+        g.settings.private = true;
+        g.settings.livekit = true;
+        g.members.insert(pubkey.clone(), Default::default());
+        relay.groups.write().await.groups.insert("closed".into(), g);
+        assert!(
+            group_allows(&relay, "closed", &pubkey).await,
+            "control: a live store mints for the member"
+        );
+        // The group's state is invalidated (a removed state event): the
+        // same member is refused until the rebuild completes.
+        relay
+            .groups
+            .write()
+            .await
+            .mark_groups_stale(["closed".to_string()]);
+        assert!(
+            !group_allows(&relay, "closed", &pubkey).await,
+            "a stale group must not mint a token"
+        );
+        // The global fallback gates every group too.
+        relay.groups.write().await.mark_stale();
+        assert!(
+            !group_allows(&relay, "closed", &pubkey).await,
+            "the global stale flag gates minting too"
+        );
+        relay.db.shutdown();
+    }
+
     #[tokio::test]
     async fn non_allowlisted_member_cannot_mint_on_restricted_relay() {
         // The relay allowlist gates minting like publishing: on a
