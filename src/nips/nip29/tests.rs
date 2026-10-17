@@ -2191,6 +2191,128 @@ fn parent_side_adopt_requires_child_admin() {
 }
 
 #[test]
+fn a_parent_side_relisting_cannot_graft_an_unconsented_placeholder_child() {
+    // The declaring parent's children list is not the child's consent: an id
+    // pre-claimed as a placeholder (the child did not exist yet) stays
+    // un-adopted when a stranger creates it, and the parent's later 9002
+    // that re-lists the id must not graft it either — otherwise the parent
+    // admin publishes a `parent` tag the child's creator never chose.
+    let mut store = GroupStore::with_cap(10);
+    store.apply(
+        &event(CREATE_GROUP, ADMIN, Some("g1"), vec![]),
+        "relay",
+        1,
+        false,
+        false,
+    );
+    // ADMIN pre-claims "victim" as a placeholder child of g1. An id with no
+    // group yet is still listable: the placeholder flow stays intact.
+    let declare = event(
+        9002,
+        ADMIN,
+        Some("g1"),
+        vec![vec!["child".into(), "victim".into()]],
+    );
+    assert!(store.validate_write(&declare).is_ok());
+    store.apply(&declare, "relay", 1, false, false);
+    // A stranger creates the pre-claimed id: it is created as a root (the
+    // create-time consent rule), and the parent's re-listing is rejected.
+    store.apply(
+        &event(CREATE_GROUP, OTHER, Some("victim"), vec![]),
+        "relay",
+        2,
+        false,
+        false,
+    );
+    assert_eq!(
+        store.group("victim").unwrap().parent,
+        None,
+        "a stranger's create must not be adopted by a placeholder parent"
+    );
+    let relist = event(
+        9002,
+        ADMIN,
+        Some("g1"),
+        vec![vec!["child".into(), "victim".into()]],
+    );
+    assert!(
+        store.validate_write(&relist).is_err(),
+        "re-listing a placeholder-resolved child must require its admin"
+    );
+    // Consent unlocks it: once ADMIN also administers the child, the same
+    // edit validates and the parent-side link applies.
+    let grant = event(
+        9000,
+        OTHER,
+        Some("victim"),
+        vec![vec![P.into(), ADMIN.into(), "mod".into()]],
+    );
+    assert!(store.validate_write(&grant).is_ok());
+    store.apply(&grant, "relay", 2, false, false);
+    assert!(store.validate_write(&relist).is_ok());
+    store.apply(&relist, "relay", 3, false, false);
+    assert_eq!(store.group("victim").unwrap().parent.as_deref(), Some("g1"));
+}
+
+#[test]
+fn a_linked_child_can_be_reordered_by_the_parents_admin() {
+    // The parent-side shortcut stays for children that consented: once the
+    // child's own 9002 named g1 as its parent, g1's admin may re-list it
+    // without also administering the child (NIP-29: "the list can be
+    // rearranged by the parent's admin"). A detached child loses that
+    // shortcut.
+    let mut store = GroupStore::with_cap(10);
+    for gid in ["g1", "g2"] {
+        store.apply(
+            &event(CREATE_GROUP, ADMIN, Some(gid), vec![]),
+            "relay",
+            1,
+            false,
+            false,
+        );
+    }
+    // ADMIN administers both groups: the child's own 9002 links it under g1.
+    let link = event(
+        9002,
+        ADMIN,
+        Some("g2"),
+        vec![vec!["parent".into(), "g1".into()]],
+    );
+    assert!(store.validate_write(&link).is_ok());
+    store.apply(&link, "relay", 1, false, false);
+    assert_eq!(store.group("g2").unwrap().parent.as_deref(), Some("g1"));
+    // ADMIN2 administers g1 only: re-listing the linked child is allowed.
+    let grant = event(
+        9000,
+        ADMIN,
+        Some("g1"),
+        vec![vec![P.into(), ADMIN2.into(), "mod".into()]],
+    );
+    assert!(store.validate_write(&grant).is_ok());
+    store.apply(&grant, "relay", 2, false, false);
+    let reorder = event(
+        9002,
+        ADMIN2,
+        Some("g1"),
+        vec![vec!["child".into(), "g2".into()]],
+    );
+    assert!(
+        store.validate_write(&reorder).is_ok(),
+        "reordering an already-linked child stays parent-only"
+    );
+    // The child detaches itself (ADMIN administers it): the link is gone,
+    // so the same parent-side listing needs the child-admin check again.
+    let detach = event(9002, ADMIN, Some("g2"), vec![]);
+    assert!(store.validate_write(&detach).is_ok());
+    store.apply(&detach, "relay", 3, false, false);
+    assert_eq!(store.group("g2").unwrap().parent, None);
+    assert!(
+        store.validate_write(&reorder).is_err(),
+        "a detached child must not be re-adopted without its admin"
+    );
+}
+
+#[test]
 fn one_edit_cannot_close_a_subgroup_cycle_through_its_own_new_edges() {
     // NIP-29: "Relays MUST reject a kind:9002 whose parent value would
     // create a cycle, including self-reference." One 9002 creates two edges

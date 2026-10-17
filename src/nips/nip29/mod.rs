@@ -2234,12 +2234,24 @@ fn validate_edit_metadata(
     // for its scope). Reordering already-linked children stays parent-only.
     // Unknown ids (no group yet) are still listable as placeholders.
     for child in tag_values(event, "child") {
-        if _group.children.iter().any(|c| c == child) {
+        // "Already linked" means the *child's own* stored parent names this
+        // group: only then did the child's side consent to the link, and a
+        // reorder needs no further authority. An id that is merely present
+        // in this group's stored children list may be a placeholder
+        // declared before the child existed (see `declare_child`): its
+        // creator never consented, so the child-admin check below still
+        // applies. Otherwise the declaring parent could graft a group it
+        // does not administer by re-listing the placeholder after the
+        // child's creation.
+        let linked = store
+            .groups
+            .get(child)
+            .is_some_and(|g| g.parent.as_deref() == Some(gid));
+        if linked {
             continue;
         }
         if !relay_signed
             && let Some(child_group) = store.groups.get(child)
-            && child_group.parent.as_deref() != Some(gid)
             && !child_group.is_admin(event.pubkey.as_str())
         {
             bail!("restricted: you are not an admin of the child group");
