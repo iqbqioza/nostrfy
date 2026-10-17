@@ -225,14 +225,34 @@ impl super::Relay {
         if !self.config.read().await.nip_enabled(43) || self.key.is_none() {
             return RoleChange::Failed;
         }
+        // A rebuild marked before (or during) this call revokes the live
+        // store: the deletion cannot be confirmed from the empty store, and
+        // reporting `Noop` would lose it — the rebuild resurrects the role
+        // from its surviving events (B-5). Force-buffer the deletion for
+        // replay, and skip the full membership republish below (it cannot be
+        // built from the revoked store).
+        let mut rebuild_pending = self.roles_rebuild.dirty.load(Ordering::SeqCst)
+            || self.roles_rebuild.running.load(Ordering::SeqCst);
         let outcome = self
             .mutate_roles(
                 super::BufferedRoleMutation::Delete { id: id.to_string() },
                 |roles| {
                     let removed = roles.delete(id);
+                    // Re-read inside the mutation (under the write lock), not
+                    // just from the pre-lock snapshot above: a rebuild marked
+                    // in between would otherwise be missed, and a deletion
+                    // landing on the already-revoked empty store would report
+                    // "no such role" and never be buffered. Marking stores
+                    // `dirty` before revoking under the same write lock, so
+                    // observing the revoked store here implies observing the
+                    // mark.
+                    let pending = self.roles_rebuild.dirty.load(Ordering::SeqCst)
+                        || self.roles_rebuild.running.load(Ordering::SeqCst);
                     // Deleting a missing role is a no-op success (like the
-                    // other removal methods), not an error.
-                    if removed {
+                    // other removal methods), not an error; with a rebuild
+                    // pending the deletion is buffered instead — the role may
+                    // exist in the events the rebuild will replay.
+                    if removed || pending {
                         (RoleChange::Applied, true)
                     } else {
                         (RoleChange::Noop, false)
@@ -240,6 +260,12 @@ impl super::Relay {
                 },
             )
             .await;
+        // Re-read: the rebuild may have started between the snapshot above
+        // and the mutation, in which case the deletion was buffered and the
+        // full membership list still cannot be built from the revoked store.
+        rebuild_pending = rebuild_pending
+            || self.roles_rebuild.dirty.load(Ordering::SeqCst)
+            || self.roles_rebuild.running.load(Ordering::SeqCst);
         if outcome != RoleChange::Applied {
             return outcome;
         }
@@ -262,13 +288,20 @@ impl super::Relay {
         };
         let stored = self.publish_relay_event(event).await;
         if stored {
-            // The membership republish must not be silently dropped:
-            // a failure would leave the old membership event stored,
-            // and the restart rebuild would resurrect assignments to
-            // the deleted role. The tombstone itself still guarantees
-            // the role stays deleted; the operator is told the
-            // membership refresh failed so it can be retried.
-            if !self.publish_membership(None).await {
+            if rebuild_pending {
+                // The live store is revoked: publishing its (empty) member
+                // list would store a wrong list that the rebuild would then
+                // replay as the newest one. The tombstone alone announces the
+                // deletion; the buffered replay drops the assignments to the
+                // deleted role and the next membership change republishes
+                // the full list.
+            } else if !self.publish_membership(None).await {
+                // The membership republish must not be silently dropped:
+                // a failure would leave the old membership event stored,
+                // and the restart rebuild would resurrect assignments to
+                // the deleted role. The tombstone itself still guarantees
+                // the role stays deleted; the operator is told the
+                // membership refresh failed so it can be retried.
                 log::warn!(
                     "delete_role {id}: the membership list could not be republished; assignments to the deleted role may resurface after a restart"
                 );
@@ -323,6 +356,13 @@ impl super::Relay {
         if !self.config.read().await.nip_enabled(43) || self.key.is_none() {
             return RoleChange::Failed;
         }
+        // See `delete_role`: a revocation landing on the revoked empty store
+        // cannot be confirmed, but must still be buffered or the rebuild
+        // resurrects the assignment from the surviving membership events
+        // (B-5), and the full member list must not be published from the
+        // revoked store.
+        let mut rebuild_pending = self.roles_rebuild.dirty.load(Ordering::SeqCst)
+            || self.roles_rebuild.running.load(Ordering::SeqCst);
         let outcome = self
             .mutate_roles(
                 super::BufferedRoleMutation::Unassign {
@@ -330,23 +370,46 @@ impl super::Relay {
                     role: role.to_string(),
                 },
                 |roles| {
-                    if roles.unassign(pubkey, role) {
+                    let revoked = roles.unassign(pubkey, role);
+                    // Re-read inside the mutation (under the write lock): see
+                    // `delete_role` for why the pre-lock snapshot is not
+                    // enough.
+                    let pending = self.roles_rebuild.dirty.load(Ordering::SeqCst)
+                        || self.roles_rebuild.running.load(Ordering::SeqCst);
+                    // Revoking an absent grant (or an unknown role) is a
+                    // no-op success, per NIP-86's always-`true`; with a
+                    // rebuild pending the revocation is buffered instead.
+                    if revoked || pending {
                         (RoleChange::Applied, true)
                     } else {
-                        // Revoking an absent grant (or an unknown role) is
-                        // a no-op success, per NIP-86's always-`true`.
                         (RoleChange::Noop, false)
                     }
                 },
             )
             .await;
+        // Re-read: the rebuild may have started between the snapshot above
+        // and the mutation (see `apply_leave_request`).
+        rebuild_pending = rebuild_pending
+            || self.roles_rebuild.dirty.load(Ordering::SeqCst)
+            || self.roles_rebuild.running.load(Ordering::SeqCst);
         if outcome == RoleChange::Applied {
-            self.schedule_roles_persist();
-            if !self
-                .publish_membership(Some((false, pubkey.to_string())))
-                .await
-            {
-                return RoleChange::Failed;
+            if rebuild_pending {
+                // The live store is revoked: the full member list cannot be
+                // published from it (a wrong, empty list would be stored and
+                // the rebuild would replay it as the newest). Announce the
+                // revocation with a remove-user event alone; the buffered
+                // replay keeps the grant out of the rebuilt list.
+                if !self.publish_remove_user(pubkey).await {
+                    return RoleChange::Failed;
+                }
+            } else {
+                self.schedule_roles_persist();
+                if !self
+                    .publish_membership(Some((false, pubkey.to_string())))
+                    .await
+                {
+                    return RoleChange::Failed;
+                }
             }
         }
         outcome
@@ -392,7 +455,17 @@ impl super::Relay {
                 },
                 |roles| {
                     let removed = roles.remove_claim(claim);
-                    (removed, removed)
+                    // Re-read inside the mutation (see `delete_role`): a
+                    // deleteclaim during a rebuild must be buffered too, or a
+                    // createclaim buffered earlier for the same code would
+                    // re-add it when the replay runs (B-5).
+                    let pending = self.roles_rebuild.dirty.load(Ordering::SeqCst)
+                        || self.roles_rebuild.running.load(Ordering::SeqCst);
+                    if removed || pending {
+                        (true, true)
+                    } else {
+                        (false, false)
+                    }
                 },
             )
             .await;

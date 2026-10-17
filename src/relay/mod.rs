@@ -6019,6 +6019,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn role_removals_during_a_rebuild_are_buffered_and_replay() {
+        // B-5: a revocation or role deletion landing on the revoked empty
+        // store used to report `Noop`, so it was never captured for replay —
+        // the rebuild then resurrected the role and its assignments from the
+        // surviving events, while the RPC had answered `true`. Both removals
+        // are force-buffered now and replay onto the fresh store.
+        let key = "01".repeat(32);
+        let relay = build_role_relay(Some(&key)).await;
+        assert!(relay.create_role("mod", "Mod", "", "", None).await);
+        let member = "aa".repeat(32);
+        assert_eq!(relay.assign_role(&member, "mod").await, RoleChange::Applied);
+        // Revoke the live store without letting the rebuild worker run, so
+        // the window stays open for the mutations below.
+        relay.signal_drain();
+        relay.mark_roles_stale().await;
+        assert!(
+            relay.roles.read().await.roles.is_empty(),
+            "the marking path revokes the live store"
+        );
+        // The removals are accepted (not `Noop`) and captured for replay.
+        assert_eq!(
+            relay.unassign_role(&member, "mod").await,
+            RoleChange::Applied,
+            "a revocation on the revoked store must report Applied"
+        );
+        assert_eq!(
+            relay.delete_role("mod").await,
+            RoleChange::Applied,
+            "a role deletion on the revoked store must report Applied"
+        );
+        // The replay onto the store the rebuild produces (the role and the
+        // assignment restored from the surviving events) applies both
+        // removals, so they are not resurrected.
+        let mut fresh = crate::nips::nip43::RoleStore::default();
+        fresh.create("mod", "Mod", "", "", None);
+        fresh.assign(&member, "mod");
+        assert!(fresh.is_member_of(&member));
+        {
+            let buffer = relay.roles_rebuild.buffer.lock().await;
+            assert_eq!(
+                buffer.mutations.len(),
+                2,
+                "both removals must be captured for replay"
+            );
+            for mutation in &buffer.mutations {
+                super::replay_role_mutation(&mut fresh, mutation);
+            }
+        }
+        assert!(
+            !fresh.roles.contains_key("mod"),
+            "the buffered deletion must replay onto the fresh store"
+        );
+        assert!(
+            !fresh.is_member_of(&member),
+            "the buffered revocation must replay onto the fresh store"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
     async fn drain_prevents_new_role_rebuilds() {
         // Shutdown must not start a role rebuild scan whose result cannot be
         // persisted: the live store stays fail-closed (empty) and dirty, and
