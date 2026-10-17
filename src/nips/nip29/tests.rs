@@ -88,10 +88,10 @@ fn apply_covers_parent_child_roles_pins_and_delete() {
     // re-parented.
     store.apply(&adopt, "relay", now, true, false);
     assert_eq!(store.group("g3").unwrap().parent.as_deref(), Some("g1"));
-    // g1 drops g3 from its children (g2 stays listed): the back-pointer is
-    // cleared, and the unknown g4 stays a placeholder declaration. A
-    // dropping edit is not valid at runtime (NIP-29 requires every existing
-    // child), so this exercises the replay path (`ignore_capacity`).
+    // g1 drops g3 from its children (g2 stays listed): NIP-29 requires
+    // every existing child, so the edit is invalid at runtime — and the
+    // replay drops it the same way (B-1: a restart must not apply an edit
+    // the live path refuses), leaving g3 attached.
     let drop_child = event(
         9002,
         ADMIN,
@@ -101,8 +101,12 @@ fn apply_covers_parent_child_roles_pins_and_delete() {
             vec!["child".into(), "g4".into()],
         ],
     );
-    store.apply(&drop_child, "relay", now, true, true);
-    assert_eq!(store.group("g3").unwrap().parent, None);
+    let out = store.apply(&drop_child, "relay", now, true, true);
+    assert!(
+        out.is_empty(),
+        "the invalid edit must be dropped on the replay"
+    );
+    assert_eq!(store.group("g3").unwrap().parent.as_deref(), Some("g1"));
     // The old parent's metadata is republished when the parent changes.
     let reparent = event(
         9002,
@@ -209,7 +213,8 @@ fn apply_covers_parent_child_roles_pins_and_delete() {
     let leave = event(LEAVE, OTHER, Some("g1"), vec![]);
     store.apply(&leave, "relay", now, true, false);
     assert!(!store.group("g1").unwrap().is_member(OTHER));
-    // DELETE_GROUP removes the group and frees its children.
+    // DELETE_GROUP removes the group; the dropped edit above never
+    // re-parented g3, so its link to g1 stands.
     store.apply(
         &event(DELETE_GROUP, ADMIN, Some("g2"), vec![]),
         "relay",
@@ -218,7 +223,11 @@ fn apply_covers_parent_child_roles_pins_and_delete() {
         false,
     );
     assert!(store.group("g2").is_none());
-    assert_eq!(store.group("g3").unwrap().parent, None);
+    assert_eq!(
+        store.group("g3").unwrap().parent.as_deref(),
+        Some("g1"),
+        "the dropped edit never re-parented g3 away from g1"
+    );
     // privacy_gated: private groups are gated; unknown groups are not.
     store.apply(
         &event(
@@ -239,9 +248,9 @@ fn apply_covers_parent_child_roles_pins_and_delete() {
             Some("g1"),
             vec![
                 vec!["private".into()],
-                // Keep the placeholder child alive in the replacing list
+                // Keep the existing child alive in the replacing list
                 // (a metadata edit must carry every existing child).
-                vec!["child".into(), "g4".into()],
+                vec!["child".into(), "g3".into()],
             ],
         ),
         "relay",
@@ -1745,7 +1754,7 @@ fn create_replay_for_ghost_id_stays_fail_closed() {
     // The CREATE_GROUP arm promises fail-closed replays: a ghost id
     // (its create was lost while survivors may remain stored) must not
     // resurrect as a default-public group on paths that bypass
-    // validation (migration/import, `ignore_capacity` rebuild).
+    // validation (migration/import, `history_replay` rebuild).
     let mut store = GroupStore::default();
     store.mark_ghost("g1");
     let create = event(CREATE_GROUP, USER, Some("g1"), vec![]);
@@ -1829,8 +1838,7 @@ fn replay_linking_to_deleted_parent_keeps_child_orphaned() {
     assert_eq!(store.groups["c"].parent, None);
     // Rank-inverted rebuild replay of the (once-valid) link: the parent
     // is gone, so the assignment is dropped like the live validation
-    // rejects it (`ignore_capacity` mirrors the startup rebuild, which
-    // skips the runtime re-check above).
+    // rejects it (`history_replay` mirrors the startup rebuild).
     let out = store.apply(&link, "relay", now, true, true);
     assert_eq!(
         store.groups["c"].parent, None,
@@ -2915,8 +2923,9 @@ fn global_member_budget_is_enforced_and_freed_on_leave() {
     assert!(store.validate_write(&join3).is_ok());
     store.apply(&join3, "", 4, false, false);
     assert_eq!(store.total_members, 3);
-    // History replay (the rebuild) ignores the budget instead of dropping
-    // stored members, but still counts them.
+    // History replay (the rebuild) honors the budget too (B-1): the grant
+    // is dropped exactly like the live path drops it, so a restart cannot
+    // push the store past the budget the live state obeys.
     let replay = event(
         9000,
         ADMIN,
@@ -2924,8 +2933,135 @@ fn global_member_budget_is_enforced_and_freed_on_leave() {
         vec![vec![P.into(), "ff".repeat(32), "mod".into()]],
     );
     store.apply(&replay, "", 5, true, true);
-    assert_eq!(store.total_members, 4);
-    assert!(store.group("g1").unwrap().is_member(&"ff".repeat(32)));
+    assert_eq!(store.total_members, 3);
+    assert!(!store.group("g1").unwrap().is_member(&"ff".repeat(32)));
+    // The JOIN path honors the budget on the replay too (B-1).
+    let join4 = event(JOIN, &"ab".repeat(32), Some("g1"), vec![]);
+    store.apply(&join4, "", 6, true, true);
+    assert_eq!(store.total_members, 3);
+    assert!(!store.group("g1").unwrap().is_member(&"ab".repeat(32)));
+}
+
+#[test]
+fn replay_cannot_resurrect_a_cycle_the_live_path_dropped() {
+    // B-1: two concurrent 9002 edits can each pass the read-side validation
+    // and then interleave into a cycle; the apply's re-check drops the
+    // second while the event itself still stores. A rebuild must drop it
+    // again instead of re-applying it and leaving the tree cyclic.
+    let mut store = GroupStore::default();
+    let now = 1_600_000_000;
+    for gid in ["g1", "g2"] {
+        store.apply(
+            &event(CREATE_GROUP, ADMIN, Some(gid), vec![]),
+            "relay",
+            now,
+            false,
+            false,
+        );
+    }
+    let link_a = event(
+        9002,
+        ADMIN,
+        Some("g1"),
+        vec![vec!["parent".into(), "g2".into()]],
+    );
+    store.apply(&link_a, "relay", now, true, false);
+    assert_eq!(store.group("g1").unwrap().parent.as_deref(), Some("g2"));
+    let link_b = event(
+        9002,
+        ADMIN,
+        Some("g2"),
+        vec![vec!["parent".into(), "g1".into()]],
+    );
+    let out = store.apply(&link_b, "relay", now, true, false);
+    assert!(out.is_empty(), "the cycle-forming edit is dropped live");
+    assert_eq!(store.group("g2").unwrap().parent, None);
+    // Rebuild replay on a fresh store: both edits replay in rank order and
+    // the cycle-forming one is dropped again.
+    let mut replay = GroupStore::default();
+    for gid in ["g1", "g2"] {
+        replay.apply(
+            &event(CREATE_GROUP, ADMIN, Some(gid), vec![]),
+            "relay",
+            now,
+            false,
+            true,
+        );
+    }
+    replay.apply(&link_a, "relay", now, false, true);
+    let out = replay.apply(&link_b, "relay", now, false, true);
+    assert!(
+        out.is_empty(),
+        "the rebuild must not resurrect the cycle-forming edit"
+    );
+    assert_eq!(replay.group("g2").unwrap().parent, None);
+    assert_eq!(replay.group("g1").unwrap().parent.as_deref(), Some("g2"));
+}
+
+#[test]
+fn replay_cannot_resurrect_a_last_admin_demotion() {
+    // B-1: two concurrent 9000 demotions can each pass the read-side
+    // validation and then interleave; the apply's re-check drops the second,
+    // leaving one admin. The event still stores, so the rebuild must drop it
+    // again instead of leaving the group admin-less.
+    let mut store = GroupStore::default();
+    let now = 1_600_000_000;
+    store.apply(
+        &event(CREATE_GROUP, ADMIN, Some("g1"), vec![]),
+        "relay",
+        now,
+        false,
+        false,
+    );
+    store.apply(
+        &event(
+            9000,
+            ADMIN,
+            Some("g1"),
+            vec![vec![P.into(), ADMIN2.into(), "admin".into()]],
+        ),
+        "relay",
+        now,
+        false,
+        false,
+    );
+    let demote_a = event(9000, ADMIN, Some("g1"), vec![vec![P.into(), ADMIN.into()]]);
+    store.apply(&demote_a, "relay", now, true, false);
+    let demote_b = event(9000, ADMIN, Some("g1"), vec![vec![P.into(), ADMIN2.into()]]);
+    let out = store.apply(&demote_b, "relay", now, true, false);
+    assert!(out.is_empty(), "the last-admin demotion is dropped live");
+    assert!(store.group("g1").unwrap().is_admin(ADMIN2));
+    // Rebuild replay on a fresh store: the demotion is dropped again.
+    let mut replay = GroupStore::default();
+    replay.apply(
+        &event(CREATE_GROUP, ADMIN, Some("g1"), vec![]),
+        "relay",
+        now,
+        false,
+        true,
+    );
+    replay.apply(
+        &event(
+            9000,
+            ADMIN,
+            Some("g1"),
+            vec![vec![P.into(), ADMIN2.into(), "admin".into()]],
+        ),
+        "relay",
+        now,
+        false,
+        true,
+    );
+    replay.apply(&demote_a, "relay", now, false, true);
+    let out = replay.apply(&demote_b, "relay", now, false, true);
+    assert!(
+        out.is_empty(),
+        "the rebuild must not leave the group admin-less"
+    );
+    assert!(
+        replay.group("g1").unwrap().is_admin(ADMIN2),
+        "an admin must remain after the replay"
+    );
 }
 
 #[test]

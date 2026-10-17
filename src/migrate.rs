@@ -535,11 +535,10 @@ fn replay_moderation(
     // accepts a create (a group action without an `h` tag is refused, like
     // the live write path). The state-dependent invariants (last-admin,
     // metadata validation, caps, duplicate joins) are deliberately NOT
-    // checked here: they are order-sensitive, and the rank-ordered replay
-    // cannot know the live arrival order, so applying the rebuild's state
-    // machine (`ignore_capacity`) is the least destructive choice. The
-    // rebuild replays every stored event, so whatever this gate accepts is
-    // what the first restart derives.
+    // checked here: this gate only decides which events are authorized,
+    // and the apply state machine enforces them in the same rank order the
+    // startup rebuild uses (`history_replay`), so the migration's seeded
+    // state and the first restart's rebuild agree.
     if crate::nips::nip29::is_group_action(event) && crate::nips::nip29::group_id(event).is_none() {
         return false;
     }

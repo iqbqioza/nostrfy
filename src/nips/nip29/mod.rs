@@ -853,18 +853,23 @@ impl GroupStore {
 
     /// Applies a stored event to the group state and returns the unsigned
     /// relay-generated events to publish (empty when `emit` is false, e.g.
-    /// during startup rebuild). `ignore_capacity` lets the startup rebuild
-    /// restore every group that was actually stored: a group dropped by the
+    /// during startup rebuild). `history_replay` marks a replay of stored
+    /// history (the startup rebuild, the migration): stored groups are
+    /// restored even past the group capacity — a group dropped by the
     /// capacity limit must not become "unknown" (its private content would
-    /// turn world-readable), and the limit still applies to new creations
-    /// at runtime.
+    /// turn world-readable), and the limit still applies to new creations at
+    /// runtime — while the state-dependent runtime checks (the member
+    /// budgets, the last-admin invariant, the metadata graph re-check) run
+    /// on every path: an effect the live path dropped under a race is not
+    /// resurrected by the next rebuild, so a rebuilt state cannot contain a
+    /// cycle or an admin-less group that live would have refused.
     pub fn apply(
         &mut self,
         event: &Event,
         relay_pubkey: &str,
         now: u64,
         emit: bool,
-        ignore_capacity: bool,
+        history_replay: bool,
     ) -> Vec<Event> {
         let Some(gid) = group_id(event) else {
             return Vec::new();
@@ -895,11 +900,11 @@ impl GroupStore {
                         // (granted only via `kind:9000`) decide privileges.
                         // Bounded like validation (history replay bypasses
                         // the check above, so re-check here). The global
-                        // member budget is bypassed on history replay
-                        // (`ignore_capacity`): dropping a stored membership
-                        // would change what the restart rebuilds.
-                        let over_global = !ignore_capacity
-                            && self.max_total_members > 0
+                        // member budget applies on every path: a live drop
+                        // under the race must not be resurrected by the next
+                        // rebuild (B-1), and the rebuilt state must satisfy
+                        // the same budget the live state does.
+                        let over_global = self.max_total_members > 0
                             && self.total_members >= self.max_total_members
                             && !group.is_member(&member);
                         if !over_global
@@ -940,61 +945,59 @@ impl GroupStore {
                     // Re-check the last-admin invariant under the write
                     // lock, like the 9001 arm below: two concurrent 9000
                     // demotions can both pass the read-side validation and
-                    // otherwise leave the group admin-less.
-                    if !ignore_capacity {
-                        // Runtime only: a rebuild replays stored history in
-                        // a deterministic order that can differ from the
-                        // arrival order (same second, id order), and
-                        // dropping a demotion that was valid when accepted
-                        // would resurrect the admin after a restart.
-                        let mut overrides: HashMap<&str, bool> = HashMap::new();
-                        for tag in event.tags.iter().filter(|t| t.len() >= 2 && t[0] == P) {
-                            let has_roles = tag[2..].iter().any(|r| !r.is_empty());
-                            overrides.insert(tag[1].as_str(), has_roles);
+                    // otherwise leave the group admin-less. The re-check runs
+                    // on every path: a rebuild replays stored history in a
+                    // deterministic order that can differ from the arrival
+                    // order (same second, id order), and replaying the event
+                    // without the re-check would re-apply a demotion the live
+                    // race dropped, leaving the group admin-less (B-1).
+                    let mut overrides: HashMap<&str, bool> = HashMap::new();
+                    for tag in event.tags.iter().filter(|t| t.len() >= 2 && t[0] == P) {
+                        let has_roles = tag[2..].iter().any(|r| !r.is_empty());
+                        overrides.insert(tag[1].as_str(), has_roles);
+                    }
+                    // The retention check must only count grants the
+                    // apply loop below will actually insert: a fresh
+                    // grant skipped at the group or global member cap
+                    // would otherwise "retain" an admin that does not
+                    // exist, and the demotion of the real last admin
+                    // would leave the group admin-less. Simulate the
+                    // loop's capacity decisions in tag order.
+                    let mut group_room = MAX_MEMBERS.saturating_sub(group.members.len());
+                    let mut global_room = if self.max_total_members > 0 {
+                        self.max_total_members.saturating_sub(self.total_members)
+                    } else {
+                        usize::MAX
+                    };
+                    let mut inserted: HashSet<&str> = HashSet::new();
+                    for tag in event.tags.iter().filter(|t| t.len() >= 2 && t[0] == P) {
+                        let pk = tag[1].as_str();
+                        if group.is_member(pk) || inserted.contains(pk) {
+                            continue;
                         }
-                        // The retention check must only count grants the
-                        // apply loop below will actually insert: a fresh
-                        // grant skipped at the group or global member cap
-                        // would otherwise "retain" an admin that does not
-                        // exist, and the demotion of the real last admin
-                        // would leave the group admin-less. Simulate the
-                        // loop's capacity decisions in tag order.
-                        let mut group_room = MAX_MEMBERS.saturating_sub(group.members.len());
-                        let mut global_room = if self.max_total_members > 0 {
-                            self.max_total_members.saturating_sub(self.total_members)
-                        } else {
-                            usize::MAX
-                        };
-                        let mut inserted: HashSet<&str> = HashSet::new();
-                        for tag in event.tags.iter().filter(|t| t.len() >= 2 && t[0] == P) {
-                            let pk = tag[1].as_str();
-                            if group.is_member(pk) || inserted.contains(pk) {
-                                continue;
-                            }
-                            if group_room > 0 && global_room > 0 {
-                                inserted.insert(pk);
-                                group_room -= 1;
-                                global_room -= 1;
-                            }
+                        if group_room > 0 && global_room > 0 {
+                            inserted.insert(pk);
+                            group_room -= 1;
+                            global_room -= 1;
                         }
-                        let retains_admin = group.members.iter().any(|(pk, roles)| {
-                            overrides
-                                .get(pk.as_str())
-                                .copied()
-                                .unwrap_or(!roles.is_empty())
-                        }) || inserted
-                            .iter()
-                            .any(|pk| overrides.get(*pk).copied().unwrap_or(false));
-                        // Like validation: an already admin-less group has
-                        // no last admin to protect (only the relay key can
-                        // reach here with such an event).
-                        let group_has_admin = group.members.values().any(|roles| !roles.is_empty());
-                        if group_has_admin && !retains_admin {
-                            // Drop the demotion: the event itself still
-                            // stores, but the group keeps its last admin
-                            // (the relay key can manage the group anyway).
-                            return Vec::new();
-                        }
+                    }
+                    let retains_admin = group.members.iter().any(|(pk, roles)| {
+                        overrides
+                            .get(pk.as_str())
+                            .copied()
+                            .unwrap_or(!roles.is_empty())
+                    }) || inserted
+                        .iter()
+                        .any(|pk| overrides.get(*pk).copied().unwrap_or(false));
+                    // Like validation: an already admin-less group has
+                    // no last admin to protect (only the relay key can
+                    // reach here with such an event).
+                    let group_has_admin = group.members.values().any(|roles| !roles.is_empty());
+                    if group_has_admin && !retains_admin {
+                        // Drop the demotion: the event itself still
+                        // stores, but the group keeps its last admin
+                        // (the relay key can manage the group anyway).
+                        return Vec::new();
                     }
                     // NIP-29: roles are carried as the elements after the
                     // pubkey in each `p` tag (["p", <pubkey>, <role>...]).
@@ -1003,8 +1006,8 @@ impl GroupStore {
                     // without roles leaves the user a plain member.
                     for tag in event.tags.iter().filter(|t| t.len() >= 2 && t[0] == P) {
                         // Bounded like validation (see above). The global
-                        // budget re-check is runtime-only (history replay
-                        // must not drop stored members).
+                        // budget applies on every path: the live drop must
+                        // not be resurrected by the next rebuild (B-1).
                         if group.members.len() >= MAX_MEMBERS && !group.is_member(&tag[1]) {
                             continue;
                         }
@@ -1013,8 +1016,7 @@ impl GroupStore {
                         // bare `>=` check would admit N fresh members past
                         // a nearly-full budget (concurrent fill between
                         // validation and apply makes the stale read real).
-                        let over_global = !ignore_capacity
-                            && self.max_total_members > 0
+                        let over_global = self.max_total_members > 0
                             && self.total_members.saturating_add(added) >= self.max_total_members
                             && !group.is_member(&tag[1]);
                         if over_global {
@@ -1058,12 +1060,12 @@ impl GroupStore {
                     // Like validation and the 9000 arm: an already
                     // admin-less group has no last admin to protect.
                     let group_has_admin = group.members.values().any(|roles| !roles.is_empty());
-                    if !ignore_capacity && group_has_admin && !retains_admin {
-                        // Drop the removal at runtime: the event itself
-                        // still stores, but the group keeps its last admin
-                        // (the relay key can manage the group regardless).
-                        // A rebuild must replay what was stored instead
-                        // (see the 9000 arm).
+                    if group_has_admin && !retains_admin {
+                        // Drop the removal: the event itself still stores,
+                        // but the group keeps its last admin (the relay key
+                        // can manage the group regardless). The re-check runs
+                        // on the replay too, so a restart cannot resurrect
+                        // the removal (B-1).
                         return Vec::new();
                     }
                     for pk in removing {
@@ -1099,10 +1101,10 @@ impl GroupStore {
                 // into a cycle, drop a child another edit just adopted, or
                 // reparent through an admin whose role was revoked in
                 // between (the same TOCTOU the 9000/9001 arms close for the
-                // last-admin invariant). A rebuild applies the stored events
-                // without this re-check, so an effect dropped here is not
-                // final: the next rebuild re-applies the event.
-                if !ignore_capacity && let Some(group) = self.groups.get(gid) {
+                // last-admin invariant). The re-check runs on the replay
+                // too, so an effect dropped here is final: a rebuild cannot
+                // introduce a cycle (B-1).
+                if let Some(group) = self.groups.get(gid) {
                     let relay_signed =
                         !relay_pubkey.is_empty() && event.pubkey.eq_ignore_ascii_case(relay_pubkey);
                     if validate_edit_metadata(self, gid, group, event, relay_signed).is_err() {
@@ -1302,7 +1304,7 @@ impl GroupStore {
                 if !gid.is_empty()
                     && !self.groups.contains_key(gid)
                     && !self.ghost.contains(gid)
-                    && (ignore_capacity || !self.at_capacity())
+                    && (history_replay || !self.at_capacity())
                 {
                     // The budget counts the tombstones too (they bound the
                     // store's memory): reclaim room for this group first, so
