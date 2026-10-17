@@ -2328,6 +2328,84 @@ fn purge_marker_blocks_same_second_and_future_dated_replays() {
 }
 
 #[test]
+fn a_recreated_groups_metadata_is_not_blocked_by_a_future_cut() {
+    // B-11: a future-dated purged event raises the cut past the re-create,
+    // and the relay's own regenerated metadata (39000-39005, stamped at or
+    // after the purge) was compared against that cut — a re-created group
+    // then served no settings, roster or member list until the cut passed.
+    // The metadata now compares against the purge time, like the create
+    // exception; h-tagged content keeps the cut (a re-publication of the
+    // purged history must stay blocked).
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let meta = |content: &str, created: u64| {
+            event(
+                39000,
+                content,
+                created,
+                vec![vec!["d".into(), "group-b11".into()]],
+            )
+        };
+        let tagged = |content: &str, created: u64| {
+            event(
+                1,
+                content,
+                created,
+                vec![vec!["h".into(), "group-b11".into()]],
+            )
+        };
+        let old_meta = meta("old settings", now - 5);
+        let future = tagged("future dated", now + 1_000);
+        for e in [&old_meta, &future] {
+            assert_eq!(db.put(e.clone(), now).await, PutOutcome::Stored);
+        }
+        assert_eq!(db.group_purge("group-b11".into(), now).await, Some(2));
+
+        // The future-dated removed event still raises the cut: an h-tagged
+        // replay and a post inside the cut stay blocked (the design the
+        // re-publication block exists for).
+        assert_eq!(
+            db.put(future.clone(), now).await,
+            PutOutcome::PreviouslyDeleted
+        );
+        assert_eq!(
+            db.put(tagged("inside the cut", now + 500), now + 500).await,
+            PutOutcome::PreviouslyDeleted
+        );
+        // The purged metadata stays blocked on re-broadcast.
+        assert_eq!(
+            db.put(old_meta.clone(), now).await,
+            PutOutcome::PreviouslyDeleted
+        );
+        // The relay's regenerated metadata (stamped at/after the purge) is
+        // accepted, so the re-created group gets its 39000-39005.
+        let fresh_meta = meta("new settings", now + 1);
+        assert_eq!(db.put(fresh_meta, now + 1).await, PutOutcome::Stored);
+        let f: Filter =
+            serde_json::from_value(serde_json::json!({"kinds": [39000], "#d": ["group-b11"]}))
+                .unwrap();
+        let (res, _) = db.query(vec![f], 500, now + 1).await;
+        assert_eq!(
+            res.len(),
+            1,
+            "the re-created group's metadata must be stored"
+        );
+    });
+    db.shutdown();
+}
+
+#[test]
 fn group_purge_marker_merges_and_keeps_one_record() {
     // The marker value is `(purge time, cut)`: one fixed record per group,
     // merged on re-purge by keeping the furthest purge time and cut, and

@@ -2574,10 +2574,13 @@ impl Store {
     /// [`PURGED_GROUPS`]), and so is a relay-generated metadata event
     /// (39000-39005, which carries the group id in `d` instead of `h`).
     /// Other `d`-tagged events are ordinary addressable traffic and are
-    /// never blocked here. The `kind:9007` re-create is the exception: it
-    /// is compared against the purge time alone, so a legitimate re-create
-    /// at (or after) the purge passes even when future-dated purged content
-    /// pushed the cut past it.
+    /// never blocked here. Two exceptions compare against the purge time
+    /// alone, so a legitimate re-creation passes even when future-dated
+    /// purged content pushed the cut past it: the `kind:9007` re-create
+    /// (a different event than the purged create) and the relay-generated
+    /// metadata (the relay regenerates it at/after the purge; the cut would
+    /// otherwise leave a re-created group without settings or rosters until
+    /// the cut passed).
     fn purged_groups_blocks(&self, wtxn: &heed::RwTxn, event: &Event) -> Result<bool> {
         // The metadata kinds are checked by their `d` tag below; every
         // other event needs an `h` tag to name a group at all.
@@ -2608,6 +2611,15 @@ impl Store {
                 // a legitimate re-create is a different event.
                 event.created_at < purge_now
                     || purged_create.is_some_and(|id| Some(id) == event.id_bytes())
+            } else if is_meta {
+                // The relay regenerates its metadata (39000-39005, the only
+                // author the relay accepts for them) at/after the purge, so
+                // the purge-time bound is the right comparison: the cut
+                // would block the re-created group's metadata for as long as
+                // a future-dated purged event pushed it ahead, leaving the
+                // group without settings, roster or member list. Old
+                // metadata stays blocked, mirroring the create exception.
+                event.created_at < purge_now
             } else {
                 event.created_at <= cut
             };
