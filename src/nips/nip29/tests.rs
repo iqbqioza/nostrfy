@@ -1724,6 +1724,33 @@ fn create_replay_for_ghost_id_stays_fail_closed() {
 }
 
 #[test]
+fn an_unrestored_store_denies_unknown_group_content() {
+    // NIP-29 disabled with no usable snapshot: the store stays empty, and
+    // an empty store that reads unknown ids as public exposes the content
+    // of every group it lost (fail-open). The startup marks it unrestored,
+    // so unknown ids read as private until a snapshot restore (or a
+    // rebuild) makes the state authoritative again.
+    let mut store = GroupStore::default();
+    assert!(
+        store.visible_gid("g1", false, None),
+        "unknown ids are open while the store is authoritative"
+    );
+    store.mark_unrestored();
+    assert!(
+        !store.visible_gid("g1", false, None),
+        "an unrestored store must fail closed for unknown ids"
+    );
+    assert!(
+        !store.visible_to(&event(9, USER, Some("g1"), vec![]), None),
+        "group content must not be served from an unrestored store"
+    );
+    // A restored snapshot is authoritative: unknown ids are genuinely
+    // unknown again.
+    store.restore(GroupsSnapshot::default());
+    assert!(store.visible_gid("g1", false, None));
+}
+
+#[test]
 fn replay_linking_to_deleted_parent_keeps_child_orphaned() {
     // Live `validate_edit_metadata` rejects a 9002 whose parent does not
     // exist, and a live 9008 orphans the children to `None`. The

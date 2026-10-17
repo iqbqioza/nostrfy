@@ -511,9 +511,11 @@ fn host_route_allowed(api_host: &str, blossom_host: &str, host: &str, path: &str
 /// surviving events. A NIP-43 role event no longer invalidates the group
 /// snapshot (the per-family sequence). A legacy snapshot (stamp and seq 0)
 /// is accepted while both counters are still 0. The rebuild path only runs
-/// when the NIP is enabled; with NIP-29 disabled the store stays empty
-/// exactly as when no snapshot exists (the next start with the NIP
-/// re-enabled rebuilds).
+/// when the NIP is enabled; with NIP-29 disabled the store stays empty and
+/// is marked unrestored (unknown ids read as private instead of public), so
+/// a database whose private groups are missing from the empty store cannot
+/// leak their content. The next start with the NIP re-enabled rebuilds the
+/// store from the surviving events.
 async fn restore_group_state(relay: &Relay, groups_enabled: bool) -> Result<()> {
     let snapshot = match relay.db.load_groups().await {
         crate::db::LoadGroupsOutcome::Loaded(snapshot) => snapshot,
@@ -571,10 +573,14 @@ async fn rebuild_group_state(relay: &Relay, groups_enabled: bool) -> Result<()> 
         // The replay migration only runs when the NIP is enabled (see the
         // caller). The store stays empty — which reads as "every group id
         // is public", not fail-closed — and a start with NIP-29
-        // re-enabled rebuilds it.
+        // re-enabled rebuilds it. Until then the empty store must fail
+        // closed: unknown ids read as private, so a legacy database whose
+        // private groups are not in the store cannot leak their content.
+        relay.groups.write().await.mark_unrestored();
         warn!(
             "NIP-29 group state was not restored and NIP-29 is disabled; the group store \
-             starts empty until the NIP is re-enabled and the relay restarts"
+             starts empty and withholds every group event until the NIP is re-enabled and \
+             the relay restarts"
         );
         return Ok(());
     }
@@ -2826,6 +2832,38 @@ mod tests {
             "the heal must not republish when the stored metadata is current"
         );
         relay_b.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn startup_with_nip29_disabled_and_no_snapshot_fails_closed() {
+        // A legacy database (no snapshot) started with NIP-29 disabled: the
+        // store stays empty, and unknown group ids must read as private
+        // instead of public — the empty store does not know which ids were
+        // private, so treating them as open would expose their content.
+        let key = "01".repeat(32);
+        let relay = blossom_relay_with_key(&key).await;
+        startup_group_state(&relay, false)
+            .await
+            .expect("the startup must succeed");
+        assert!(
+            !relay.groups.read().await.visible_gid("g1", false, None),
+            "the unrestored store must fail closed for unknown group ids"
+        );
+        relay.db.shutdown();
+
+        // With NIP-29 enabled the same startup rebuilds from the surviving
+        // events, which makes the state authoritative again: a successful
+        // full rebuild clears the unrestored marker.
+        let relay = blossom_relay_with_key(&key).await;
+        relay.groups.write().await.mark_unrestored();
+        startup_group_state(&relay, true)
+            .await
+            .expect("the rebuild must succeed");
+        assert!(
+            relay.groups.read().await.visible_gid("g1", false, None),
+            "a rebuilt store is authoritative: unknown ids are open"
+        );
+        relay.db.shutdown();
     }
 
     #[tokio::test]

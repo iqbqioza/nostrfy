@@ -302,6 +302,13 @@ pub struct GroupStore {
     /// closed only the groups it actually touched instead of every group on
     /// the relay.
     pub(crate) stale_groups: HashSet<String>,
+    /// The persisted state could not be restored or rebuilt (NIP-29 is
+    /// disabled and no usable snapshot exists): every group id is unknown,
+    /// so an unknown id must read as *private* instead of public — treating
+    /// an empty store's ids as open would expose the content of the groups
+    /// it lost (fail-open). Set by [`Self::mark_unrestored`] at startup;
+    /// cleared by a successful snapshot restore or full rebuild.
+    unrestored: bool,
 }
 
 /// The persistable NIP-29 group state: everything [`GroupStore`] holds
@@ -395,6 +402,9 @@ impl GroupStore {
         self.groups = snap.groups;
         self.deleted = snap.deleted;
         self.ghost = snap.ghost;
+        // The snapshot is authoritative: unknown ids are genuinely unknown
+        // again (see the `unrestored` field).
+        self.unrestored = false;
         self.recompute_derived();
     }
 
@@ -533,6 +543,14 @@ impl GroupStore {
 
     pub fn mark_stale(&mut self) {
         self.stale = true;
+    }
+
+    /// Marks the store as not restored (see [`Self::unrestored`]): unknown
+    /// group ids must read as private, not public. Called by the startup
+    /// when NIP-29 is disabled and no usable snapshot exists, so the empty
+    /// store cannot expose the content of the groups it lost.
+    pub(crate) fn mark_unrestored(&mut self) {
+        self.unrestored = true;
     }
 
     /// Fails closed for the named groups only (see [`Self::stale_groups`]).
@@ -1478,9 +1496,6 @@ impl GroupStore {
             .is_some_and(|g| (g.settings.private && !is_meta) || (g.settings.hidden && is_meta))
     }
 
-    /// Whether the content of a group may be served to `authed`. `is_meta`
-    /// distinguishes relay-generated metadata events (kinds 39000-39005),
-    /// which `hidden` groups additionally withhold from non-members.
     /// Group ids that must stay hidden across a rebuild: the live groups
     /// (which the vanish may have removed), the existing ghosts and the
     /// delete tombstones. A rebuild must carry them so a second vanish
@@ -1565,6 +1580,9 @@ impl GroupStore {
         }
     }
 
+    /// Whether the content of a group may be served to `authed`. `is_meta`
+    /// distinguishes relay-generated metadata events (kinds 39000-39005),
+    /// which `hidden` groups additionally withhold from non-members.
     pub fn visible_gid(&self, gid: &str, is_meta: bool, authed: Option<&str>) -> bool {
         // While the store is known stale (a group-state event was removed
         // and the rebuild has not re-derived the answer), every group
@@ -1588,7 +1606,11 @@ impl GroupStore {
             return false;
         }
         let Some(group) = self.groups.get(gid) else {
-            return true;
+            // An unrestored store (NIP-29 disabled with no usable snapshot)
+            // knows no group at all: an unknown id must read as private, not
+            // public, or the empty store would expose the content of every
+            // group it lost (fail-open).
+            return !self.unrestored;
         };
         let member = authed.is_some_and(|pk| group.is_member(pk));
         // NIP-29: `private` restricts the group MESSAGES to members; the
@@ -1682,8 +1704,17 @@ impl GroupStore {
     /// materialized and sorted every stored group event before applying
     /// anything).
     pub async fn rebuild(&mut self, db: &DbClient, relay_pubkey: Option<&str>) -> bool {
-        self.rebuild_inner(db, relay_pubkey, None, Vec::new(), Vec::new())
-            .await
+        let rebuilt = self
+            .rebuild_inner(db, relay_pubkey, None, Vec::new(), Vec::new())
+            .await;
+        if rebuilt {
+            // A completed full replay walked every stored group event:
+            // unknown ids are genuinely unknown again (see the `unrestored`
+            // field). The vanish variant does not clear the flag: it only
+            // rebuilds the ids that were already known.
+            self.unrestored = false;
+        }
+        rebuilt
     }
 
     /// Rebuilds after a vanish, seeding the hidden markers from the
