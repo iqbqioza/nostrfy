@@ -1476,23 +1476,26 @@ impl Store {
     }
 
     /// Removes every stored event whose NIP-40 expiration has arrived, then
-    /// reaps `first_seen` entries older than `first_seen_min_age` seconds
-    /// (0 disables the reap): reaping bounds the table, at the cost of
-    /// re-arming the new-pubkey gate for a returning idle pubkey (its next
-    /// event passes once as "new" and re-establishes the clock, so an event
-    /// immediately after may be gated for `min_age` seconds).
+    /// reaps `first_seen` entries whose last activity is older than
+    /// `first_seen_retention` seconds (0 disables the reap): reaping bounds
+    /// the table, at the cost of re-arming the new-pubkey gate for a
+    /// returning *idle* pubkey (its next event passes once as "new" and
+    /// re-establishes the clock, so an event immediately after may be gated
+    /// for `min_age` seconds). Entries refreshed by an accepted event inside
+    /// the retention are never reaped, so an account that still posts keeps
+    /// its original clock and is not re-gated.
     ///
     /// The returned report carries the partial counters on a failed chunk
     /// (the backlog is unbounded, so a MapFull mid-pass must not hide the
     /// state events an earlier chunk already removed), and its
     /// `state_removed` families report which derived stores changed so the
     /// caller rebuilds exactly those.
-    pub(crate) fn purge_expired(&self, now: u64, first_seen_min_age: u64) -> RemovalReport {
+    pub(crate) fn purge_expired(&self, now: u64, first_seen_retention: u64) -> RemovalReport {
         let mut removed = 0usize;
         let mut state_removed = StateRemoved::default();
         let error = self
             .purge_expired_walk(now, &mut removed, &mut state_removed)
-            .and_then(|()| self.reap_first_seen(now, first_seen_min_age))
+            .and_then(|()| self.reap_first_seen(now, first_seen_retention))
             .err();
         RemovalReport {
             removed,
@@ -1586,15 +1589,23 @@ impl Store {
     }
 
     /// Reaps `first_seen` entries whose timestamp is older than `min_age`
-    /// seconds (see [`Self::purge_expired`]). `0` disables the reap. The
-    /// walk is chunked so a table with millions of accounts never pins one
+    /// Reaps `first_seen` entries whose *last activity* is older than
+    /// `retention` seconds (see [`Self::purge_expired`]). `0` disables the
+    /// reap. The reaper keys on the last-seen time, not the first-seen
+    /// clock: reaping an entry makes its pubkey read as brand new on the
+    /// next event, which re-arms the age gate, so an account that still
+    /// posts must never be reaped — only one idle past the retention is.
+    /// Legacy first-seen-only entries are upgraded in place with
+    /// `last_seen = now` instead of being reaped, so an upgrade does not
+    /// re-gate accounts that were active under the old layout. The walk is
+    /// chunked so a table with millions of accounts never pins one
     /// write transaction, and a shutdown cancellation stops at the chunk
     /// boundary (the next periodic purge finishes the reap).
-    fn reap_first_seen(&self, now: u64, min_age: u64) -> Result<()> {
-        if min_age == 0 {
+    fn reap_first_seen(&self, now: u64, retention: u64) -> Result<()> {
+        if retention == 0 {
             return Ok(());
         }
-        let cutoff = now.saturating_sub(min_age);
+        let cutoff = now.saturating_sub(retention);
         let mut last: Option<Vec<u8>> = None;
         loop {
             if self.cancelled() {
@@ -1606,6 +1617,7 @@ impl Store {
                 None => std::ops::Bound::Unbounded,
             };
             let mut doomed: Vec<Vec<u8>> = Vec::new();
+            let mut upgrades: Vec<(Vec<u8>, [u8; 16])> = Vec::new();
             let mut scanned = 0usize;
             let mut last_scanned: Option<Vec<u8>> = None;
             for item in self
@@ -1615,18 +1627,30 @@ impl Store {
                 let (key, raw) = item?;
                 scanned += 1;
                 last_scanned = Some(key.to_vec());
-                // A corrupt short entry has no usable timestamp: treat it as
-                // ancient (it can never satisfy the gate) and reap it.
-                let ts = raw
-                    .get(..8)
-                    .map(|bytes| u64::from_be_bytes(bytes.try_into().expect("checked length")))
-                    .unwrap_or(0);
-                if ts < cutoff {
+                if raw.len() >= 16 {
+                    let last_seen =
+                        u64::from_be_bytes(raw[8..16].try_into().expect("checked length"));
+                    if last_seen < cutoff {
+                        doomed.push(key.to_vec());
+                    }
+                } else if raw.len() >= 8 {
+                    // Legacy first-seen-only entry: upgrade in place with the
+                    // activity stamped as now (see the function doc).
+                    let mut buf = [0u8; 16];
+                    buf[..8].copy_from_slice(&raw[..8]);
+                    buf[8..].copy_from_slice(&now.to_be_bytes());
+                    upgrades.push((key.to_vec(), buf));
+                } else if 0 < cutoff {
+                    // A corrupt short entry has no usable timestamp: treat it
+                    // as ancient (it can never satisfy the gate) and reap it.
                     doomed.push(key.to_vec());
                 }
                 if scanned == REMOVAL_CHUNK {
                     break;
                 }
+            }
+            for (key, buf) in &upgrades {
+                self.first_seen.put(&mut wtxn, key, buf)?;
             }
             for key in &doomed {
                 self.first_seen.delete(&mut wtxn, key)?;

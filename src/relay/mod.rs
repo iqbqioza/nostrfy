@@ -2452,7 +2452,7 @@ impl Relay {
         // lookup is read-only here — the first-seen timestamp is only
         // persisted once an event actually stores, so a rejected first event
         // (expired/duplicate/invalid) cannot pre-warm the account-age clock.
-        let mut persist_first_seen = false;
+        let mut record_first_seen = false;
         if cfg.relay.new_pubkey_min_age_secs > 0
             && let Some(pubkey) = event.pubkey_bytes()
         {
@@ -2462,7 +2462,11 @@ impl Relay {
                 self.stats.bump(&self.stats.events_rejected, 1);
                 return PutOutcome::Invalid("error: database unavailable".into());
             };
-            persist_first_seen = created;
+            // Every accepted event records activity (not just the first
+            // one): the reaper keys on the last-seen half, so an account
+            // that still posts keeps its entry — and its original
+            // first-seen clock — and is never re-gated.
+            record_first_seen = true;
             if !created && now.saturating_sub(first_seen) < cfg.relay.new_pubkey_min_age_secs {
                 self.stats.bump(&self.stats.events_rejected, 1);
                 return PutOutcome::Invalid("restricted: your account is too new".into());
@@ -2473,10 +2477,10 @@ impl Relay {
             self.stats.bump(&self.stats.events_rejected, 1);
             return PutOutcome::Invalid("rate-limited: too many events".into());
         }
-        // The first-seen reservation rides along with the put: applied in
-        // the same write transaction (one commit/fsync) only when the event
+        // The first-seen record rides along with the put: applied in the
+        // same write transaction (one commit/fsync) only when the event
         // actually stores.
-        let first_seen = if persist_first_seen {
+        let first_seen = if record_first_seen {
             event.pubkey_bytes().map(|pubkey| (pubkey, now))
         } else {
             None
@@ -2935,7 +2939,6 @@ impl Relay {
         // account). Performed in one database round trip for the batch. The
         // lookup is read-only; first-seen is only persisted for events that
         // actually store, so a failed first event cannot pre-warm the clock.
-        let mut new_pubkeys: Vec<bool> = Vec::new();
         if min_age > 0 && !puts.is_empty() {
             let pubkeys: Vec<[u8; 32]> = puts
                 .iter()
@@ -2957,7 +2960,6 @@ impl Relay {
             } else {
                 let mut kept = Vec::with_capacity(puts.len());
                 let mut kept_slots = Vec::with_capacity(put_slots.len());
-                let mut kept_new = Vec::with_capacity(puts.len());
                 for ((event, slot), (created, first_seen)) in
                     puts.into_iter().zip(put_slots).zip(first_seens)
                 {
@@ -2968,31 +2970,22 @@ impl Relay {
                             PutOutcome::Invalid("restricted: your account is too new".into()),
                         );
                     } else {
-                        kept_new.push(created);
                         kept.push(event);
                         kept_slots.push(slot);
                     }
                 }
                 puts = kept;
                 put_slots = kept_slots;
-                new_pubkeys = kept_new;
             }
         }
 
         if rate_limit > 0 && !puts.is_empty() {
             let mut kept = Vec::with_capacity(puts.len());
             let mut kept_slots = Vec::with_capacity(put_slots.len());
-            let mut kept_new = Vec::with_capacity(new_pubkeys.len());
-            let new_flags = if new_pubkeys.is_empty() {
-                vec![false; puts.len()]
-            } else {
-                new_pubkeys
-            };
-            for ((event, slot), is_new) in puts.into_iter().zip(put_slots).zip(new_flags) {
+            for (event, slot) in puts.into_iter().zip(put_slots) {
                 if self.publish_rate_allowed(&cfg, &event.pubkey, now) {
                     kept.push(event);
                     kept_slots.push(slot);
-                    kept_new.push(is_new);
                 } else {
                     self.stats.bump(&self.stats.events_rejected, 1);
                     results[slot] = (
@@ -3003,28 +2996,24 @@ impl Relay {
             }
             puts = kept;
             put_slots = kept_slots;
-            new_pubkeys = kept_new;
         }
         let receiver = if puts.is_empty() {
             None
         } else {
-            // First-seen reservations ride the batch put transaction (one
+            // First-seen records ride the batch put transaction (one
             // commit/fsync for event+clock), replacing the previously
             // separate `touch_first_seen_batch` write that could vanish on
-            // a writer failure and then disable the account-age gate.
-            let first_seen: Vec<Option<([u8; 32], u64)>> = if new_pubkeys.len() == puts.len() {
+            // a writer failure and then disable the account-age gate. Every
+            // accepted event records activity, not just a pubkey's first
+            // one: the reaper keys on the last-seen half, so an account
+            // that still posts keeps its entry — and its original
+            // first-seen clock — and is never re-gated.
+            let first_seen: Vec<Option<([u8; 32], u64)>> = if min_age > 0 {
                 puts.iter()
-                    .zip(new_pubkeys.iter())
-                    .map(|(event, &is_new)| {
-                        if is_new {
-                            event.pubkey_bytes().map(|pk| (pk, now))
-                        } else {
-                            None
-                        }
-                    })
+                    .map(|event| event.pubkey_bytes().map(|pk| (pk, now)))
                     .collect()
             } else {
-                // No age gate active: nothing to reserve.
+                // No age gate active: nothing to record.
                 vec![None; puts.len()]
             };
             self.db.put_batch_deferred(
@@ -6306,6 +6295,45 @@ mod tests {
         assert!(
             matches!(outcome, crate::db::PutOutcome::Stored),
             "the first event of an unknown pubkey is accepted"
+        );
+        // A mature account's accepted event refreshes its last-seen time: a
+        // reap keyed on the clock alone would forget the account and re-gate
+        // its next event (A-4). A purge whose retention only covers the
+        // refresh must keep the entry, with the original clock intact.
+        let mature_keypair = secp256k1::Keypair::from_seckey_slice(&secp, &[9u8; 32]).unwrap();
+        let mature_pubkey = secp256k1::XOnlyPublicKey::from_keypair(&mature_keypair)
+            .0
+            .to_string();
+        let mature_bytes: [u8; 32] = hex::decode(&mature_pubkey).unwrap().try_into().unwrap();
+        let seeded_at = crate::util::unix_now() - 100;
+        relay
+            .db
+            .touch_first_seen_batch(vec![(mature_bytes, seeded_at)])
+            .await;
+        let mut ev3 = crate::event::Event {
+            id: String::new(),
+            pubkey: mature_pubkey,
+            created_at: crate::util::unix_now(),
+            kind: 1,
+            tags: vec![],
+            content: "mature".into(),
+            sig: String::new(),
+        };
+        ev3.id = crate::nips::nip01::compute_id(&ev3);
+        let id = ev3.id_bytes().unwrap();
+        ev3.sig = secp
+            .sign_schnorr_no_aux_rand(&id, &mature_keypair)
+            .to_string();
+        let outcome = relay.accept_event(ev3, &[], None).await;
+        assert!(
+            matches!(outcome, crate::db::PutOutcome::Stored),
+            "a mature account may publish: {outcome:?}"
+        );
+        let _ = relay.db.purge_expired(crate::util::unix_now() + 1, 5).await;
+        assert_eq!(
+            relay.db.first_seen_batch(vec![mature_bytes]).await[0],
+            (false, seeded_at),
+            "the accepted event must refresh the entry, not restart or drop it"
         );
         let _ = ev;
         relay.db.shutdown();

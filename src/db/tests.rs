@@ -3332,7 +3332,8 @@ fn first_seen_trust_period() {
         assert_eq!(first, now);
         // The recorded first-seen time never changes, so the trust
         // period does not restart once the window has elapsed: the
-        // entry is kept permanently (one 40-byte row per unique pubkey).
+        // clock is kept for as long as the account stays active (the
+        // reaper only drops entries idle past its retention).
         let (created, first) = db.touch_first_seen_batch(vec![(pubkey, now + 9999)]).await[0];
         assert!(!created);
         assert_eq!(first, now, "first-seen stays at the original arrival");
@@ -7844,6 +7845,145 @@ fn purge_expired_reaps_old_first_seen_entries() {
         assert_eq!(db.table_counts().await.expect("counts").first_seen, 2);
     });
     db.shutdown();
+}
+
+#[test]
+fn first_seen_activity_keeps_an_active_account_known() {
+    // A-4 regression, store level: the reaper keys on the last-seen half of
+    // the entry, so an account refreshed by an accepted event survives even
+    // when its first-seen clock is long past the retention. Keying on the
+    // clock dropped the entry as soon as the account matured; the next
+    // event then read as a brand-new pubkey, wrote a fresh clock and
+    // re-armed the age gate for `min_age` seconds — the periodic rejection
+    // of an active account this fix removes.
+    use crate::db::store::Store;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    let store = Store::open(&config(), Arc::new(AtomicBool::new(true)), 512).unwrap();
+    let pk = [9u8; 32];
+    let now = 1_000_000u64;
+    let min_age = 5u64;
+    let retention = min_age + 3600;
+    let mut wtxn = store.env.write_txn().unwrap();
+    // The first accepted event establishes the clock.
+    assert_eq!(
+        store.touch_first_seen(&mut wtxn, &pk, now).unwrap(),
+        (true, now)
+    );
+    // A later accepted event refreshes the activity, not the clock.
+    assert_eq!(
+        store
+            .touch_first_seen(&mut wtxn, &pk, now + min_age)
+            .unwrap(),
+        (false, now)
+    );
+    wtxn.commit().unwrap();
+    // The clock is far past the retention but the activity is inside it: the
+    // entry survives and the gate still sees the original clock.
+    assert_eq!(
+        store.purge_expired(now + min_age + 60, retention).removed,
+        0
+    );
+    let rtxn = store.env.read_txn().unwrap();
+    assert_eq!(
+        store.first_seen_status(&rtxn, &pk).unwrap(),
+        (false, now),
+        "an active account keeps its original clock"
+    );
+    assert!(
+        store.first_seen.get(&rtxn, &pk).unwrap().is_some(),
+        "an active entry must survive the reap"
+    );
+    drop(rtxn);
+    // Idle past the retention (measured from the last activity), the entry
+    // is reaped and the pubkey reads as new again.
+    assert_eq!(
+        store
+            .purge_expired(now + min_age + retention + 1, retention)
+            .removed,
+        0
+    );
+    let rtxn = store.env.read_txn().unwrap();
+    assert_eq!(store.first_seen_status(&rtxn, &pk).unwrap(), (true, 0));
+    assert!(store.first_seen.get(&rtxn, &pk).unwrap().is_none());
+    drop(rtxn);
+}
+
+#[test]
+fn a_legacy_first_seen_row_is_upgraded_instead_of_reaped() {
+    // Rows written before the last-seen half existed carry the clock alone.
+    // Reaping them on the clock would re-gate every established account on
+    // the first run after the upgrade, so both the reaper and the next
+    // accepted event upgrade them in place with `last_seen = now` and keep
+    // the clock untouched.
+    use crate::db::store::Store;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    let store = Store::open(&config(), Arc::new(AtomicBool::new(true)), 512).unwrap();
+    let now = 2_000_000u64;
+    let retention = 100u64;
+    // A legacy row whose clock is ancient: the first reap upgrades it
+    // instead of deleting it.
+    let reaped_pk = [3u8; 32];
+    let mut wtxn = store.env.write_txn().unwrap();
+    store
+        .first_seen
+        .put(&mut wtxn, &reaped_pk, &(now - 10_000).to_be_bytes())
+        .unwrap();
+    wtxn.commit().unwrap();
+    assert_eq!(store.purge_expired(now, retention).removed, 0);
+    let rtxn = store.env.read_txn().unwrap();
+    let raw = store
+        .first_seen
+        .get(&rtxn, &reaped_pk)
+        .unwrap()
+        .expect("the legacy row must survive the reap");
+    assert_eq!(raw.len(), 16, "the row is upgraded in place");
+    assert_eq!(
+        u64::from_be_bytes(raw[..8].try_into().unwrap()),
+        now - 10_000,
+        "the first-seen clock is untouched"
+    );
+    assert_eq!(
+        u64::from_be_bytes(raw[8..16].try_into().unwrap()),
+        now,
+        "the upgrade stamps the activity"
+    );
+    assert_eq!(
+        store.first_seen_status(&rtxn, &reaped_pk).unwrap(),
+        (false, now - 10_000)
+    );
+    drop(rtxn);
+    // The upgraded row is now subject to the retention: idle past it (from
+    // the upgrade), it is reaped like any other.
+    assert_eq!(
+        store.purge_expired(now + retention + 1, retention).removed,
+        0
+    );
+    let rtxn = store.env.read_txn().unwrap();
+    assert!(store.first_seen.get(&rtxn, &reaped_pk).unwrap().is_none());
+    drop(rtxn);
+    // The next accepted event upgrades a legacy row the same way.
+    let touched_pk = [4u8; 32];
+    let mut wtxn = store.env.write_txn().unwrap();
+    store
+        .first_seen
+        .put(&mut wtxn, &touched_pk, &(now - 5_000).to_be_bytes())
+        .unwrap();
+    assert_eq!(
+        store.touch_first_seen(&mut wtxn, &touched_pk, now).unwrap(),
+        (false, now - 5_000)
+    );
+    wtxn.commit().unwrap();
+    let rtxn = store.env.read_txn().unwrap();
+    let raw = store.first_seen.get(&rtxn, &touched_pk).unwrap().unwrap();
+    assert_eq!(raw.len(), 16);
+    assert_eq!(
+        u64::from_be_bytes(raw[..8].try_into().unwrap()),
+        now - 5_000
+    );
+    assert_eq!(u64::from_be_bytes(raw[8..16].try_into().unwrap()), now);
+    drop(rtxn);
 }
 
 #[test]

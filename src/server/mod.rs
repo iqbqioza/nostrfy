@@ -1644,6 +1644,14 @@ async fn nip66_publisher(relay: Arc<Relay>, mut shutdown: watch::Receiver<bool>)
     }
 }
 
+/// Idle time (seconds) past which the `first_seen` reaper drops an entry
+/// (added to the new-pubkey gate window): a pubkey that has posted within
+/// the retention keeps its entry, so its first-seen clock never restarts and
+/// the age gate never re-arms for it. Only an account idle longer is
+/// forgotten, and then its next event passes once as "new" (the gate's
+/// documented returning-idle-account behavior).
+const FIRST_SEEN_IDLE_RETENTION_SECS: u64 = 3600;
+
 async fn purge_loop(relay: Arc<Relay>, mut shutdown: watch::Receiver<bool>) {
     let secs = relay
         .config
@@ -1663,17 +1671,27 @@ async fn purge_loop(relay: Arc<Relay>, mut shutdown: watch::Receiver<bool>) {
                 // the worst case, but this lets a clean shutdown complete
                 // promptly instead of aborting the task).
                 //
-                // `first_seen` rows older than the new-pubkey gate are
-                // reaped (0 = gate disabled = no reap, the database's
-                // documented convention): the row is only consulted while
-                // it is younger than the gate, and a later accepted event
-                // writes a fresh row, so the gate can reject that pubkey
-                // again. Read per tick so a config reload applies.
-                let (now, first_seen_min_age) = {
+                // `first_seen` rows are reaped once their last activity is
+                // older than the retention (0 = gate disabled = no reap, the
+                // database's documented convention). Keying on the
+                // last-seen half keeps an account that still posts known, so
+                // the reap can no longer re-gate it; a reaped entry reads as
+                // a brand-new pubkey on its next event, which is the
+                // documented behavior for an idle account returning. Read
+                // per tick so a config reload applies.
+                let (now, first_seen_retention) = {
                     let cfg = relay.config.read().await;
-                    (unix_now(), cfg.relay.new_pubkey_min_age_secs)
+                    let min_age = cfg.relay.new_pubkey_min_age_secs;
+                    (
+                        unix_now(),
+                        if min_age == 0 {
+                            0
+                        } else {
+                            min_age.saturating_add(FIRST_SEEN_IDLE_RETENTION_SECS)
+                        },
+                    )
                 };
-                let purge = relay.db.purge_expired(now, first_seen_min_age);
+                let purge = relay.db.purge_expired(now, first_seen_retention);
                 tokio::select! {
                     (removed, state_removed) = purge => {
                         if removed > 0 {

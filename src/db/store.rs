@@ -150,6 +150,15 @@ pub(crate) const BANNED: &str = "banned";
 /// NIP-86 event allowlist: event id -> reason. Mutually exclusive with
 /// the ban list (adding to one removes from the other, atomically).
 pub(crate) const ALLOWED: &str = "allowed";
+/// New-pubkey age-gate bookkeeping: `pubkey -> first_seen (BE u64) ||
+/// last_seen (BE u64)`. `first_seen` is the arrival time of the pubkey's
+/// first accepted event and never moves (the gate compares against it);
+/// `last_seen` is refreshed on every accepted event so the reaper drops an
+/// entry only after the account has been idle past the retention — a reaped
+/// entry is treated as a brand-new pubkey on its next event, which re-arms
+/// the gate. Legacy 8-byte values carry `first_seen` alone and are read as
+/// `last_seen == first_seen` (upgraded in place by the reaper or by the next
+/// accepted event).
 pub(crate) const FIRST_SEEN: &str = "first_seen";
 pub(crate) const ACCESS: &str = "access";
 /// sha256 → blob metadata (mime/size/uploaded/owners) plus the per-owner
@@ -3291,9 +3300,13 @@ impl Store {
         }
         Ok(capped)
     }
-    /// Records `now` as the first-seen time of `pubkey` when the pubkey is
-    /// unknown, and returns `(created, first_seen)`: `created` is true when
-    /// the entry was just written (the pubkey's first accepted event).
+    /// Records activity for `pubkey` at `now`: a new pubkey's entry is
+    /// created with `now` as both its first-seen and last-seen time; an
+    /// existing entry keeps its first-seen time (the account-age clock never
+    /// restarts) and has its last-seen time refreshed, so the reaper can
+    /// tell an active account from an idle one. Returns
+    /// `(created, first_seen)`: `created` is true when the entry was just
+    /// written (the pubkey's first accepted event).
     pub(crate) fn touch_first_seen(
         &self,
         wtxn: &mut heed::RwTxn,
@@ -3301,12 +3314,32 @@ impl Store {
         now: u64,
     ) -> Result<(bool, u64)> {
         match self.first_seen.get(wtxn, pubkey)? {
+            Some(raw) if raw.len() >= 16 => {
+                let first = u64::from_be_bytes(raw[..8].try_into().unwrap());
+                let last = u64::from_be_bytes(raw[8..16].try_into().unwrap());
+                if last != now {
+                    let mut buf = [0u8; 16];
+                    buf[..8].copy_from_slice(&raw[..8]);
+                    buf[8..].copy_from_slice(&now.to_be_bytes());
+                    self.first_seen.put(wtxn, pubkey, &buf)?;
+                }
+                Ok((false, first))
+            }
             Some(raw) if raw.len() >= 8 => {
-                let ts = u64::from_be_bytes(raw[..8].try_into().unwrap());
-                Ok((false, ts))
+                // A legacy first-seen-only entry: upgrade it in place,
+                // keeping the clock and stamping the activity.
+                let first = u64::from_be_bytes(raw[..8].try_into().unwrap());
+                let mut buf = [0u8; 16];
+                buf[..8].copy_from_slice(&raw[..8]);
+                buf[8..].copy_from_slice(&now.to_be_bytes());
+                self.first_seen.put(wtxn, pubkey, &buf)?;
+                Ok((false, first))
             }
             _ => {
-                self.first_seen.put(wtxn, pubkey, &now.to_be_bytes())?;
+                let mut buf = [0u8; 16];
+                buf[..8].copy_from_slice(&now.to_be_bytes());
+                buf[8..].copy_from_slice(&now.to_be_bytes());
+                self.first_seen.put(wtxn, pubkey, &buf)?;
                 Ok((true, now))
             }
         }
@@ -3314,7 +3347,9 @@ impl Store {
 
     /// Read-only first-seen lookup: returns `(created, first_seen)` without
     /// recording anything. `created` is `true` when the pubkey has never been
-    /// seen (so its first stored event may establish the account).
+    /// seen (so its first stored event may establish the account). Only the
+    /// first-seen half of the value is read: the gate keys on the clock
+    /// alone, while the last-seen half drives the reaper.
     pub(crate) fn first_seen_status(
         &self,
         rtxn: &heed::RoTxn,

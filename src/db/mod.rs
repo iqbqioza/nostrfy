@@ -651,11 +651,11 @@ enum Msg {
     /// families lost an event)`. The second field lets the caller rebuild
     /// exactly the stores that changed, and stays set when a later chunk
     /// fails after removing state events.
-    /// `first_seen_min_age` is the age (seconds) past which `first_seen`
-    /// rows are reaped (0 disables the reap).
+    /// `first_seen_retention` is the idle age (seconds) past which
+    /// `first_seen` rows are reaped (0 disables the reap).
     PurgeExpired {
         now: u64,
-        first_seen_min_age: u64,
+        first_seen_retention: u64,
         reply: oneshot::Sender<(usize, store::StateRemoved)>,
     },
     /// Started-but-unfinished NIP-29 group purges as `(gid, purge_now)`
@@ -1677,12 +1677,13 @@ impl DbClient {
         out
     }
 
-    /// Records the first-seen time of each pubkey when unknown; returns
-    /// `(created, first_seen)` per entry, aligned with the input.
-    /// Records the first-seen timestamp of new accounts. A write: it is
-    /// routed without a response timeout like every other write, so a
-    /// stalled writer cannot silently drop the record (which would
-    /// disable the account-age gate while the writer is busy).
+    /// Records activity at each entry's timestamp: a new pubkey's first-seen
+    /// time, and a refresh of the last-seen time for a known one (the
+    /// first-seen clock never moves); returns `(created, first_seen)` per
+    /// entry, aligned with the input. A write: it is routed without a
+    /// response timeout like every other write, so a stalled writer cannot
+    /// silently drop the record (which would disable the account-age gate
+    /// while the writer is busy).
     pub async fn touch_first_seen_batch(&self, entries: Vec<([u8; 32], u64)>) -> Vec<(bool, u64)> {
         self.request_write(|reply| Msg::TouchFirstSeen { entries, reply })
             .await
@@ -2717,17 +2718,17 @@ impl DbClient {
     /// NIP-40 expiration purge: `(removed events, which derived-state
     /// families lost an event)`. The caller rebuilds only the stores whose
     /// families are reported; on a failed later chunk the partial counts
-    /// are still reported. `first_seen_min_age` is the age (seconds) past
-    /// which `first_seen` rows are reaped (0 disables the reap), so the
+    /// are still reported. `first_seen_retention` is the idle age (seconds)
+    /// past which `first_seen` rows are reaped (0 disables the reap), so the
     /// table cannot grow forever.
     pub async fn purge_expired(
         &self,
         now: u64,
-        first_seen_min_age: u64,
+        first_seen_retention: u64,
     ) -> (usize, store::StateRemoved) {
         self.request_write(|reply| Msg::PurgeExpired {
             now,
-            first_seen_min_age,
+            first_seen_retention,
             reply,
         })
         .await

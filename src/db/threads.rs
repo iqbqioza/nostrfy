@@ -1562,14 +1562,14 @@ pub(crate) fn spawn(
                                 }
                                 Msg::PurgeExpired {
                                     now,
-                                    first_seen_min_age,
+                                    first_seen_retention,
                                     reply,
                                 } => {
                                     // A purge self-heals on the next run, but
                                     // a failed later chunk must still report
                                     // the partial removals and the derived-
                                     // state change an earlier chunk applied.
-                                    let report = store.purge_expired(now, first_seen_min_age);
+                                    let report = store.purge_expired(now, first_seen_retention);
                                     if let Some(e) = &report.error {
                                         db_error(&thread_errors, e);
                                     }
