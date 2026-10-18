@@ -1327,6 +1327,53 @@ fn gift_wraps_to_are_deleted() {
 }
 
 #[test]
+fn a_deleted_gift_wrap_stays_blocked_on_republish() {
+    // NIP-09: the recipient's deletion of their DMs must survive a
+    // re-broadcast. A wrap's author is a random key, so an author-scoped
+    // marker is inert; the recipient-scoped marker (the same the migration
+    // records) must refuse the same wrap id when it arrives again.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let recipient = "b83130de0d1386592fe7b9f407f5f1ae8f1db91d772e484b3d81df0fa2e88f24";
+        let wrapper = "bb".repeat(32);
+        let wrap = |content: &str, p: &str| {
+            let mut e = event(1059, content, now, vec![vec!["p".into(), p.to_string()]]);
+            e.pubkey = wrapper.clone();
+            e.id = nip01::compute_id(&e);
+            e
+        };
+        let mine = wrap("mine", recipient);
+        assert_eq!(db.put(mine.clone(), now).await, PutOutcome::Stored);
+        let removed = db
+            .delete_gift_wraps_to(hex::decode(recipient).unwrap().try_into().unwrap())
+            .await;
+        assert_eq!(removed, 1, "the wrap addressed to the recipient is removed");
+        // The sender's copy arriving again must be refused: its random
+        // author cannot match a marker, so only the recipient scope can.
+        assert_eq!(
+            db.put(mine.clone(), now).await,
+            PutOutcome::PreviouslyDeleted,
+            "a deleted wrap must stay blocked on re-broadcast"
+        );
+        // The block is recipient-scoped: a wrap to someone else is stored.
+        let other = wrap("other", &"cc".repeat(32));
+        assert_eq!(db.put(other, now).await, PutOutcome::Stored);
+    });
+    db.shutdown();
+}
+
+#[test]
 fn gift_wraps_with_uppercase_p_are_deleted() {
     // The `by_tag` index stores values verbatim: an uppercase `p` value
     // lives under a different key range, so both cases must be walked.

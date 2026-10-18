@@ -157,14 +157,16 @@ impl Store {
         Ok(recorded)
     }
 
-    /// Extends the [`DELETED`] marker of an *absent* deletion target with
-    /// one deleter pubkey, creating the marker when none exists: the
-    /// author-scoped re-publication block shared by the live deletion walk
-    /// and [`Self::record_absent_deletion_targets`]. An unconditional
-    /// (empty) or corrupt marker already blocks the id and is left as is; a
-    /// scoped marker gains the deleter unless it is already covered, and a
-    /// full scoped list falls back to an unconditional tombstone (the
-    /// earliest deleters win).
+    /// Extends the [`DELETED`] marker of a deletion target with one deleter
+    /// pubkey, creating the marker when none exists: the scoped
+    /// re-publication block shared by the live deletion walk,
+    /// [`Self::record_absent_deletion_targets`] and
+    /// [`Self::remove_gift_wraps_for`] (a wrap's marker scopes to the
+    /// recipient, which `deletion_marker_blocks` matches by `p` tag). An
+    /// unconditional (empty) or corrupt marker already blocks the id and is
+    /// left as is; a scoped marker gains the deleter unless it is already
+    /// covered, and a full scoped list falls back to an unconditional
+    /// tombstone (the earliest deleters win).
     fn extend_absent_deletion_marker(
         &self,
         wtxn: &mut heed::RwTxn,
@@ -273,6 +275,16 @@ impl Store {
                 }
                 // The index is only written for kind:1059 events, so the
                 // entry cannot point at any other kind.
+                //
+                // Record the recipient-scoped re-publication block before
+                // removing: a wrap's author is a random key, so the
+                // author-scoped marker the `e`-tag walk writes would never
+                // match it (`deletion_marker_blocks` matches gift wraps by
+                // their `p`-tag recipients). Without it a re-broadcast of
+                // the same wrap is stored again and undoes the recipient's
+                // deletion; the migration records the same marker, so live
+                // and migrated databases agree.
+                self.extend_absent_deletion_marker(&mut wtxn, &id, pubkey)?;
                 self.remove_event(&mut wtxn, &id)?;
                 *removed += 1;
             }
