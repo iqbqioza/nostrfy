@@ -262,7 +262,7 @@ To generate a secret key, use the `nostrfy genkey` command (see [5. Command Refe
 | Option | Description | Default |
 | --- | --- | --- |
 | `pid_file` | PID file path (written in daemon **and** foreground mode, so `stats`/`stop`/`restart` find the instance; removed on exit) | `./nostrfy.pid` |
-| `log_file` | Log file path (used in daemon mode; foreground mode logs to stderr, i.e. journald under systemd) | `./nostrfy.log` |
+| `log_file` | Log file path (used in daemon mode; foreground mode logs to stderr) | `./nostrfy.log` |
 | `stats_file` | Statistics file path | `./nostrfy.stats.json` |
 | `stats_interval_secs` | Statistics write interval (must be ≥ 1) | `5` |
 | `max_log_size_bytes` | Log rotation size (0 = no rotation) | 50 MB |
@@ -313,7 +313,7 @@ responsive under abuse:
 ./target/release/nostrfy --config nostrfy.toml start --foreground
 ```
 
-> **Foreground lifecycle**: foreground mode (including the recommended systemd unit) writes the same `daemon.pid_file`, so `nostrfy stats` and `nostrfy stop` find the instance and the pid file is removed on exit. Under systemd prefer `systemctl stop nostrfy` / `systemctl restart nostrfy`: the unit's `Restart=always` would immediately restart a process that `nostrfy stop`/`restart` terminated, and foreground logs go to stderr (journald: `journalctl -u nostrfy -f`), not to `daemon.log_file`.
+> **Foreground lifecycle**: foreground mode writes the same `daemon.pid_file`, so `nostrfy stats` and `nostrfy stop` find the instance and the pid file is removed on exit. The systemd unit runs daemon mode; prefer `systemctl stop nostrfy` / `systemctl restart nostrfy` because the unit's `Restart=always` would immediately restart a process that `nostrfy stop`/`restart` terminated. Daemon logs go to `daemon.log_file`.
 
 ### Stop
 

@@ -58,7 +58,7 @@ sudo systemctl status nostrfy
 Logs:
 
 ```sh
-journalctl -u nostrfy -f
+sudo tail -f /var/lib/nostrfy/nostrfy.log
 ```
 
 ## 4. Open the port and verify

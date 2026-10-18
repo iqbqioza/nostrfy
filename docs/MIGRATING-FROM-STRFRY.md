@@ -231,7 +231,7 @@ from the imported events and republishes the relay-signed metadata
 On a large database this can take a moment; watch the log:
 
 ```sh
-journalctl -u nostrfy -f
+tail -f /var/lib/nostrfy/nostrfy.log
 ```
 
 Then verify (replace the URLs and pubkeys):

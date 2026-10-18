@@ -7,7 +7,8 @@ This page collects the errors you are most likely to meet while running nostrfy,
 1. `nostrfy check` validates your config (9 out of 10 errors are config mistakes)
 2. Check the log — the cause of the error is almost always there:
    - daemon mode: `tail -f nostrfy.log`
-   - foreground mode / systemd: the terminal, or `journalctl -u nostrfy -f` (the file logger is installed in daemon mode; foreground logs go to stderr)
+   - systemd (daemon mode): `tail -f /var/lib/nostrfy/nostrfy.log`
+   - foreground mode: the terminal (logs go to stderr)
 3. `nostrfy restart` restarts the relay cleanly; under systemd use `systemctl restart nostrfy` (the unit's `Restart=always` would immediately restart a process stopped by `nostrfy stop`/`restart`)
 
 ---
@@ -486,7 +487,7 @@ The `/metrics` endpoint (Prometheus text format; `metrics_enabled = true`) and t
 
 **Fix**: Run `nostrfy start` (or `restart`), wait at least one `stats_interval_secs`, and try again. If the relay is running but the snapshot stays stale, check the log for stats-writer errors (e.g. an unwritable `daemon.stats_file`).
 
-> **Foreground/systemd**: foreground mode writes the same `daemon.pid_file` as the daemon (removed on exit), so `stats`/`stop` find it. Prefer `systemctl stop/restart nostrfy` under systemd, and read the log from journald (the file logger is installed in daemon mode only).
+> **Foreground lifecycle**: foreground mode writes the same `daemon.pid_file` as the daemon (removed on exit), so `stats`/`stop` find it. The systemd unit runs daemon mode; prefer `systemctl stop/restart nostrfy` under systemd. Daemon logs go to `daemon.log_file`.
 
 ### 6-2. The log grows without bound
 
@@ -506,7 +507,7 @@ The `/metrics` endpoint (Prometheus text format; `metrics_enabled = true`) and t
 
 **Fix**:
 
-1. Check the end of the log: `tail -50 nostrfy.log` (daemon mode) or `journalctl -u nostrfy -n 50` (systemd)
+1. Check the end of the log: `tail -50 nostrfy.log` (daemon mode; `/var/lib/nostrfy/nostrfy.log` under systemd)
 2. Check if the machine rebooted: `uptime` (a very short uptime means a reboot)
 3. Check memory: `free -h`
 4. Start the relay again: `nostrfy start` (or `systemctl start nostrfy`)
@@ -521,7 +522,7 @@ A systemd service running as root can bind port 80. If you set `User=` to a regu
 
 ## 7. Still Not Solved?
 
-1. **Check the log**: `tail -100 nostrfy.log`, or `journalctl -u nostrfy -n 100` under systemd — it usually names the direct cause
+1. **Check the log**: `tail -100 nostrfy.log` (or `/var/lib/nostrfy/nostrfy.log` under systemd) — it usually names the direct cause
 2. **Re-validate the config**: `nostrfy check` — shows warnings and errors
 3. **Gather reproduction details**: what were you doing, which client, what exact error
 4. **Ask in the project repository**: https://github.com/iqbqioza/nostrfy (when filing an issue, include the reproduction steps and the log)

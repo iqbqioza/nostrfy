@@ -105,9 +105,7 @@ max_db_queue_events = 262144
 max_db_queue_bytes = 268435456
 
 [daemon]
-# The systemd unit runs foreground mode, which still writes pid_file (removed
-# on exit) and stats_file, so `nostrfy stats`/`stop` work; log_file is only
-# used in daemon mode (systemd captures stderr in the journal).
+# Keep pid_file in sync with the systemd unit's PIDFile setting.
 pid_file = "/var/lib/nostrfy/nostrfy.pid"
 log_file = "/var/lib/nostrfy/nostrfy.log"
 stats_file = "/var/lib/nostrfy/nostrfy.stats.json"

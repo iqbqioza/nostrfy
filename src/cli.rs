@@ -292,8 +292,7 @@ impl Cli {
                 }
                 let cfg = self.load_config()?;
                 cfg.validate()?;
-                // Foreground mode (including the recommended systemd unit)
-                // writes the pid file too, so the CLI lifecycle commands
+                // Foreground mode writes the pid file too, so the CLI lifecycle commands
                 // (`stats`, `stop`, `restart`) can find the instance. The
                 // daemon child already owns the file written by `daemonize`;
                 // the guard removes the foreground file on exit and refuses
@@ -1548,10 +1547,9 @@ impl Cli {
     }
 }
 
-/// The foreground process's pid file: `start --foreground` (including the
-/// recommended systemd unit) writes it so `nostrfy stats`/`stop`/`restart`
-/// can observe the instance, and removes it when the process exits. A live
-/// daemon's pid file is never overwritten.
+/// The foreground process's pid file: `start --foreground` writes it so
+/// `nostrfy stats`/`stop`/`restart` can observe the instance, and removes it
+/// when the process exits. A live daemon's pid file is never overwritten.
 #[derive(Debug)]
 struct PidFileGuard {
     path: PathBuf,

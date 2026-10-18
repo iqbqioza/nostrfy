@@ -8,8 +8,9 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=simple
-ExecStart=/usr/local/bin/nostrfy --config /etc/nostrfy/nostrfy.toml start --foreground
+Type=forking
+PIDFile=/var/lib/nostrfy/nostrfy.pid
+ExecStart=/usr/local/bin/nostrfy --config /etc/nostrfy/nostrfy.toml start
 Restart=always
 RestartSec=5
 # Every connection (and every live WebSocket) holds a file descriptor, and
