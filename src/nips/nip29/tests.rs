@@ -1060,7 +1060,10 @@ fn a_declared_placeholder_child_gets_no_metadata_emit() {
     );
     let is_g2_meta = |out: &[Event]| {
         out.iter().any(|e| {
-            e.kind == GROUP_META && e.tags.iter().any(|t| t == &vec![D.to_string(), "g2".into()])
+            e.kind == GROUP_META
+                && e.tags
+                    .iter()
+                    .any(|t| t == &vec![D.to_string(), "g2".into()])
         })
     };
     let declare = event(
