@@ -5,7 +5,7 @@
 mod api;
 pub(crate) mod blossom;
 mod landing;
-mod livekit;
+pub(crate) mod livekit;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -44,7 +44,7 @@ use api::{
     api_related_handler, api_relay_kinds_handler, api_relays_handler, api_stats_handler,
     api_top_authors_handler,
 };
-use livekit::{livekit_supported, livekit_token};
+use livekit::{livekit_supported, livekit_token, livekit_token_webhook_group, livekit_webhook};
 
 /// Minimum interval between rate-limited WARNs for connection refusals: the
 /// refusal paths run per connection, so an unthrottled warning would flood
@@ -361,7 +361,11 @@ async fn build_router(
     {
         app = app
             .route("/.well-known/nip29/livekit", get(livekit_supported))
-            .route("/.well-known/nip29/livekit/{group}", get(livekit_token));
+            .route("/.well-known/nip29/livekit/{group}", get(livekit_token))
+            .route(
+                "/.well-known/nip29/livekit/webhook",
+                get(livekit_token_webhook_group).post(livekit_webhook),
+            );
     }
     // The Blossom routes are reachable only on the Blossom host (the host
     // split middleware gates them; the root `/` route stays with the relay
@@ -841,6 +845,13 @@ pub async fn run_server(
             "purge_loop",
             Box::pin(purge_loop(relay.clone(), shutdown_rx.clone()))
                 as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+        ),
+        (
+            "livekit_participants",
+            Box::pin(livekit_participants_loop(
+                relay.clone(),
+                shutdown_rx.clone(),
+            )) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
         ),
         (
             "nip66_publisher",
@@ -1666,6 +1677,29 @@ async fn nip66_publisher(relay: Arc<Relay>, mut shutdown: watch::Receiver<bool>)
 /// documented returning-idle-account behavior).
 const FIRST_SEEN_IDLE_RETENTION_SECS: u64 = 3600;
 
+/// Refreshes the NIP-29 `kind:39004` participant lists by polling the
+/// LiveKit Room Service API (see
+/// [`Relay::poll_livekit_participants`]).
+async fn livekit_participants_loop(relay: Arc<Relay>, mut shutdown: watch::Receiver<bool>) {
+    let secs = relay
+        .config
+        .read()
+        .await
+        .relay
+        .livekit_participants_interval_secs
+        .max(1);
+    let mut ticker = interval(Duration::from_secs(secs));
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    // The first tick fires immediately: the initial list is published on
+    // start instead of after one interval.
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => relay.poll_livekit_participants().await,
+            _ = shutdown.changed() => break,
+        }
+    }
+}
+
 async fn purge_loop(relay: Arc<Relay>, mut shutdown: watch::Receiver<bool>) {
     let secs = relay
         .config
@@ -2369,6 +2403,11 @@ async fn apply_reloaded_config(
         (
             "relay.livekit_api_secret",
             old.relay.livekit_api_secret != new_config.relay.livekit_api_secret,
+        ),
+        (
+            "relay.livekit_participants_interval_secs",
+            old.relay.livekit_participants_interval_secs
+                != new_config.relay.livekit_participants_interval_secs,
         ),
         (
             "relay.enabled_nips",

@@ -164,6 +164,7 @@ If anything is wrong, it tells you exactly what. It is strongly recommended to r
 | `public_url` | The relay's public URL (e.g. `wss://relay.example.com`). **Set this for NIP-42 auth and friends to work correctly** | empty |
 | `livekit_url` | LiveKit server URL (for audio/video rooms) | empty |
 | `livekit_api_key` / `livekit_api_secret` | LiveKit API key and secret | empty |
+| `livekit_participants_interval_secs` | Seconds between LiveKit participant-list refreshes (the `39004` event) | `15` |
 | `enabled_nips` | Explicit allowlist of NIP numbers (empty = all enabled) | empty |
 | `disabled_nips` | List of NIP numbers to disable | empty |
 | `reject_ephemeral` | When `true`, reject NIP-01 ephemeral events (kinds 20000–29999), except the NIP-mandated kinds (`22242`, `27235`, `28934`/`28935`/`28936`, `24133`, `23194`/`23195`, `24242`, `21059`) | `false` |
@@ -629,6 +630,7 @@ With a LiveKit server configured, groups can have audio/video chat rooms.
 1. Set `relay.livekit_url`, `relay.livekit_api_key`, and `relay.livekit_api_secret`
 2. Add the `livekit` tag to the group's metadata (via an admin's 9002 edit)
 3. Clients fetch a JWT from `/.well-known/nip29/livekit/<group-id>` with NIP-98 auth (a pubkey banned with NIP-86 `banpubkey` is refused)
+4. The relay publishes a `kind:39004` participant list per livekit group, refreshed every `relay.livekit_participants_interval_secs` (default 15) and immediately when LiveKit sends webhooks to `/.well-known/nip29/livekit/webhook` — point the LiveKit server's `webhook.urls` at it and let `webhook.api_key` match `relay.livekit_api_key` (the relay verifies the signed payload; missed events are reconciled by the poll). Leaving the group's LiveKit mode clears the list
 
 ```bash
 # Support check (204 means enabled)

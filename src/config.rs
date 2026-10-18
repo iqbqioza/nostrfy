@@ -125,6 +125,11 @@ pub struct RelayConfig {
     pub livekit_url: String,
     pub livekit_api_key: String,
     pub livekit_api_secret: String,
+    /// How often (seconds) the relay refreshes the NIP-29 `kind:39004`
+    /// participant lists from the LiveKit Room Service API. Webhooks
+    /// (`/.well-known/nip29/livekit/webhook`) refresh immediately; the
+    /// poll reconciles.
+    pub livekit_participants_interval_secs: u64,
     /// Explicit allowlist of NIP numbers; empty means "all except disabled".
     pub enabled_nips: Vec<u16>,
     pub disabled_nips: Vec<u16>,
@@ -439,6 +444,7 @@ impl Default for RelayConfig {
             livekit_url: String::new(),
             livekit_api_key: String::new(),
             livekit_api_secret: String::new(),
+            livekit_participants_interval_secs: 15,
             enabled_nips: Vec::new(),
             disabled_nips: Vec::new(),
             reject_ephemeral: false,
@@ -1549,6 +1555,14 @@ impl Config {
             ));
         }
 
+        // A zero interval would panic the tokio ticker (`interval` panics
+        // on zero): reject it like the other interval settings instead of
+        // clamping, so the configured value is the actual cadence.
+        if self.relay.livekit_participants_interval_secs == 0 {
+            return Err(config_err(
+                "relay.livekit_participants_interval_secs must be at least 1 (got 0)",
+            ));
+        }
         // LiveKit configuration must be complete when enabled (fail-closed
         // at runtime: capability is unadvertised and minting 404s — but a
         // typo'd URL would silently disable AV, so warn loudly here).
@@ -2736,6 +2750,7 @@ fn known_config_keys() -> &'static [(&'static str, &'static [&'static str])] {
                 "livekit_url",
                 "livekit_api_key",
                 "livekit_api_secret",
+                "livekit_participants_interval_secs",
                 "enabled_nips",
                 "disabled_nips",
                 "reject_ephemeral",

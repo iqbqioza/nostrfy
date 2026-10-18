@@ -84,6 +84,7 @@ Every key is optional; a missing key uses the default shown below.
 | `livekit_url` | string | `""` | LiveKit server URL for NIP-29 audio/video rooms |
 | `livekit_api_key` | string | `""` | LiveKit API key |
 | `livekit_api_secret` | string | `""` | LiveKit API secret (used to sign JWTs) |
+| `livekit_participants_interval_secs` | integer | `15` | Seconds between LiveKit participant-list refreshes (the NIP-29 `39004` event) |
 | `enabled_nips` | array of integers | `[]` | Explicit NIP allowlist |
 | `disabled_nips` | array of integers | `[]` | NIPs to disable (ignored when `enabled_nips` is non-empty) |
 | `reject_ephemeral` | boolean | `false` | When `true`, NIP-01 ephemeral events (kinds 20000-29999) are rejected (`blocked: ephemeral events not allowed`) |
@@ -120,6 +121,8 @@ Every key is optional; a missing key uses the default shown below.
 **`livekit_api_key`** — The LiveKit API key; appears as the `iss` claim of issued JWTs.
 
 **`livekit_api_secret`** — The LiveKit API secret; the HMAC key for the JWT signature. An empty secret produces tokens LiveKit rejects (the relay warns about this combination).
+
+**`livekit_participants_interval_secs`** — How often (seconds) the relay refreshes the NIP-29 `kind:39004` participant lists by calling the LiveKit Room Service API (`ListParticipants`) with the configured credentials. LiveKit webhooks sent to `/.well-known/nip29/livekit/webhook` refresh a group's list immediately; the poll reconciles missed events. Must be at least 1. Fixed at startup — requires a `restart`.
 
 **`enabled_nips`** — An explicit allowlist of NIP numbers. When non-empty, **only** these NIPs are advertised (NIP-11) and their relay-side behavior is active; `disabled_nips` is ignored. Requires a `restart` to change.
 
@@ -622,7 +625,7 @@ Editing the file and sending `kill -HUP $(cat nostrfy.pid)` reloads it **without
 
 | Applies on SIGHUP | Requires `nostrfy restart` |
 | --- | --- |
-| Relay identity and policies: `relay.name`, `description`, `pubkey`, `contact`, `icon`, `post_policy`, `public_url`, `reject_ephemeral`, `enabled_git`, `enabled_nip78_auth`, `require_auth`, `send_auth_challenge`, `require_pow`, `new_pubkey_min_age_secs`, `max_events_per_min_per_pubkey` | `relay.private_key` (warned about and ignored), `relay.livekit_url`/`livekit_api_key`/`livekit_api_secret`, `relay.enabled_nips`/`disabled_nips`, `relay.max_groups` |
+| Relay identity and policies: `relay.name`, `description`, `pubkey`, `contact`, `icon`, `post_policy`, `public_url`, `reject_ephemeral`, `enabled_git`, `enabled_nip78_auth`, `require_auth`, `send_auth_challenge`, `require_pow`, `new_pubkey_min_age_secs`, `max_events_per_min_per_pubkey` | `relay.private_key` (warned about and ignored), `relay.livekit_url`/`livekit_api_key`/`livekit_api_secret`/`livekit_participants_interval_secs`, `relay.enabled_nips`/`disabled_nips`, `relay.max_groups` |
 | `rpc.management_token`, `rpc.admin_pubkey`, `blossom.restrict_uploads`, `access.restrict_relay` | `rpc.max_admin_body_bytes` |
 | `server.inbox_write_policy`, `server.outbox_write_policy` (existing connections pick them up on the next config refresh), `server.landing_page_file` (read per request), `relay.enabled_command_events` (read per event), `daemon.stats_file` (read on every stats tick), `database.db_buffer_size` (new connections only) | `server.host`, `server.port`, `server.ws_paths`, `server.api_host`, `server.metrics_enabled`, `server.trusted_proxies`, `server.assets_dir` (they shape the listener, routes and per-connection accounting built at startup) |
 | Most of `[limits]`: `max_ws_message_bytes`, `max_filters`, `max_subscriptions`, `max_limit`, `max_count`, `max_sub_id_len`, `max_content_bytes`, `max_tags`, `max_tag_value_bytes`, `max_created_at_future_secs`, `max_neg_items`, `max_sub_bytes`, `group_late_publish_secs`, the API bounds (`max_api_concurrent`, `max_api_queue_msgs`, `max_api_limit`, `max_api_offset`, `max_api_fetch`, `max_api_search_bytes`), `max_out_queue_bytes`, `max_req_response_bytes`, `ws_idle_timeout_secs` (existing connections keep their deadline; the new value applies to connections made after the reload) | `limits.live_buffer`, `limits.live_batch_size`, `limits.live_batch_interval_ms`, `limits.socket_recv_buffer_kb`, `limits.max_connections`, `limits.max_connections_per_ip`, `limits.http_read_timeout_secs`, `limits.max_connections_per_sec_per_ip` (they shape the accept loop built at startup), `server.trusted_proxies` (it shapes the per-connection accounting) |
@@ -651,6 +654,7 @@ public_url = "wss://relay.example.com"
 livekit_url = ""
 livekit_api_key = ""
 livekit_api_secret = ""
+livekit_participants_interval_secs = 15
 enabled_nips = []
 disabled_nips = []
 reject_ephemeral = false

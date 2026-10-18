@@ -173,6 +173,10 @@ pub struct Relay {
     /// `key`). The access-control checks exempt it, so the operator can
     /// always publish command events and read on restricted relays.
     pub(crate) relay_pubkey: Option<String>,
+    /// Last LiveKit participant list published per group (see
+    /// [`Self::poll_livekit_participants`]): the `kind:39004` event is only
+    /// re-published when the list changes.
+    livekit_participants: tokio::sync::Mutex<std::collections::HashMap<String, Vec<String>>>,
     /// Shared signature-verification context. It is an `Arc` because the
     /// accept path hands it to `spawn_blocking` verification tasks; the
     /// precomputed tables are far too large to rebuild per batch, and
@@ -1824,6 +1828,7 @@ impl Relay {
             nip98_replay: Default::default(),
             command_events: std::sync::Mutex::new(std::collections::HashSet::new()),
             nip11_cache: std::sync::Mutex::new(None),
+            livekit_participants: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -3521,6 +3526,131 @@ impl Relay {
         }
     }
 
+    /// Refreshes the NIP-29 `kind:39004` participant lists from the LiveKit
+    /// Room Service API. LiveKit pushes no state to this relay, so the list
+    /// is polled: one request per livekit-enabled group, and the event is
+    /// published only when the list changed (an idle room costs one request
+    /// per interval and no events). A failed fetch skips the group instead
+    /// of publishing an empty (wrong) list.
+    /// The LiveKit API configuration for participant refreshes, or `None`
+    /// when the integration is disabled or incomplete (fail-closed, like
+    /// the capability endpoint).
+    async fn livekit_api_config(&self) -> Option<(String, String, String)> {
+        let cfg = self.config.read().await;
+        if !cfg.nip_enabled(29) {
+            return None;
+        }
+        let url = cfg.relay.livekit_url.trim().to_string();
+        let api_key = cfg.relay.livekit_api_key.clone();
+        let api_secret = cfg.relay.livekit_api_secret.clone();
+        (!url.is_empty() && !api_key.is_empty() && !api_secret.is_empty())
+            .then_some((url, api_key, api_secret))
+    }
+
+    /// The ids of the groups with a LiveKit room, sorted.
+    async fn livekit_group_ids(&self) -> Vec<String> {
+        let groups = self.groups.read().await;
+        let mut gids: Vec<String> = groups
+            .groups
+            .iter()
+            .filter(|(_, group)| group.settings.livekit)
+            .map(|(gid, _)| gid.clone())
+            .collect();
+        gids.sort();
+        gids
+    }
+
+    /// Whether the group exists and has a LiveKit room (the webhook gate: a
+    /// signed event for any other room is ignored).
+    pub(crate) async fn is_livekit_group(&self, gid: &str) -> bool {
+        self.groups
+            .read()
+            .await
+            .groups
+            .get(gid)
+            .is_some_and(|group| group.settings.livekit)
+    }
+
+    /// Refreshes the NIP-29 `kind:39004` participant list of one group from
+    /// the LiveKit Room Service API, publishing the event when the list
+    /// changed. Shared by the periodic poll and the webhook trigger (webhook
+    /// delivery is at-most-once, so the poll keeps reconciling). A failed
+    /// fetch publishes nothing instead of an empty (wrong) list.
+    pub(crate) async fn refresh_livekit_participants(&self, gid: &str) {
+        let Some(relay_pubkey) = self.relay_pubkey() else {
+            return;
+        };
+        let Some((url, api_key, api_secret)) = self.livekit_api_config().await else {
+            return;
+        };
+        let participants = match crate::server::livekit::fetch_livekit_participants(
+            &url,
+            &api_key,
+            &api_secret,
+            gid,
+        )
+        .await
+        {
+            Ok(participants) => participants,
+            Err(e) => {
+                log::warn!("livekit participants for {gid}: {e}");
+                return;
+            }
+        };
+        // The group may have been deleted (or left LiveKit) while the fetch
+        // was in flight: publishing would resurrect metadata for a group
+        // that no longer wants it (a poll or webhook can race a 9008/9002).
+        if !self.is_livekit_group(gid).await {
+            return;
+        }
+        let changed = {
+            let mut last = self.livekit_participants.lock().await;
+            if last.get(gid) == Some(&participants) {
+                false
+            } else {
+                last.insert(gid.to_string(), participants.clone());
+                true
+            }
+        };
+        if !changed {
+            return;
+        }
+        let now = self.stamp_floor(unix_now());
+        let mut event = crate::nips::nip29::events::build_participants_event(
+            gid,
+            &participants,
+            &relay_pubkey,
+            now,
+        );
+        if self.store_relay_event(&mut event).await.is_err() {
+            log::warn!("could not publish the livekit participants list for {gid}");
+        }
+    }
+
+    /// Refreshes the NIP-29 `kind:39004` participant lists from the LiveKit
+    /// Room Service API. LiveKit pushes no state to this relay, so the list
+    /// is polled: one request per livekit-enabled group, and the event is
+    /// published only when the list changed (an idle room costs one request
+    /// per interval and no events). A failed fetch skips the group instead
+    /// of publishing an empty (wrong) list.
+    pub(crate) async fn poll_livekit_participants(&self) {
+        if self.livekit_api_config().await.is_none() {
+            return;
+        }
+        let gids = self.livekit_group_ids().await;
+        // Drop cached lists for groups that left LiveKit (or were deleted):
+        // their stored 39004 was cleared or purged, and a re-enable must
+        // republish even when the live list is unchanged.
+        let live: std::collections::HashSet<&str> = gids.iter().map(String::as_str).collect();
+        self.livekit_participants
+            .lock()
+            .await
+            .retain(|gid, _| live.contains(gid.as_str()));
+        for gid in gids {
+            self.refresh_livekit_participants(&gid).await;
+        }
+    }
+
     /// Persists the live NIP-43 role state (same lifecycle as
     /// [`Self::persist_groups`]). The lock keeps a stale snapshot from
     /// overwriting a newer one: two concurrent mutations could otherwise
@@ -4300,6 +4430,18 @@ impl Relay {
         generated.reverse();
 
         for mut ev in generated {
+            if ev.kind == crate::nips::nip29::GROUP_PARTICIPANTS {
+                // The store rewrote the participant list (the group left
+                // LiveKit): drop the cached poll result so a re-enable
+                // republishes even when the live list is unchanged.
+                let gid = ev
+                    .tags
+                    .iter()
+                    .find(|t| t.len() >= 2 && t[0] == "d")
+                    .map(|t| t[1].clone())
+                    .unwrap_or_default();
+                self.livekit_participants.lock().await.remove(&gid);
+            }
             let result = self.store_relay_event(&mut ev).await;
             if result.is_err() {
                 // The in-memory group state moved on, but the stored

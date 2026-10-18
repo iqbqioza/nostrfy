@@ -3065,6 +3065,164 @@ fn replay_cannot_resurrect_a_last_admin_demotion() {
 }
 
 #[test]
+fn roles_event_lists_the_roles_in_use() {
+    // NIP-29's `39003` informs clients about the roles in use. This relay
+    // keeps no separate role registry (any non-empty label is an admin
+    // role), so the list is derived from the roles actually assigned to
+    // members, sorted for a deterministic event id.
+    let mut store = GroupStore::default();
+    let now = 1_600_000_000;
+    store.apply(
+        &event(CREATE_GROUP, ADMIN, Some("g1"), vec![]),
+        "relay",
+        now,
+        false,
+        false,
+    );
+    // A role change emits the 39003 with the new role.
+    let out = store.apply(
+        &event(
+            9000,
+            ADMIN,
+            Some("g1"),
+            vec![vec![P.into(), USER.into(), "mod".into()]],
+        ),
+        "relay",
+        now,
+        true,
+        false,
+    );
+    let roles = out
+        .iter()
+        .find(|e| e.kind == GROUP_ROLES)
+        .expect("a role change must emit the 39003");
+    assert_eq!(
+        roles
+            .tags
+            .iter()
+            .filter(|t| t[0] == "role")
+            .map(|t| t[1].as_str())
+            .collect::<Vec<_>>(),
+        vec!["admin", "mod"],
+        "the creator's admin role and the assigned role must be listed"
+    );
+    // Two members sharing a role list it once.
+    let out = store.apply(
+        &event(
+            9000,
+            ADMIN,
+            Some("g1"),
+            vec![vec![P.into(), OTHER.into(), "mod".into()]],
+        ),
+        "relay",
+        now,
+        true,
+        false,
+    );
+    let roles = out.iter().find(|e| e.kind == GROUP_ROLES).unwrap();
+    assert_eq!(
+        roles
+            .tags
+            .iter()
+            .filter(|t| t[0] == "role" && t[1] == "mod")
+            .count(),
+        1,
+        "a role shared by two members must be listed once"
+    );
+    // Removing the members drops their role from the list.
+    let out = store.apply(
+        &event(
+            9001,
+            ADMIN,
+            Some("g1"),
+            vec![vec![P.into(), USER.into()], vec![P.into(), OTHER.into()]],
+        ),
+        "relay",
+        now,
+        true,
+        false,
+    );
+    let roles = out.iter().find(|e| e.kind == GROUP_ROLES).unwrap();
+    assert_eq!(
+        roles
+            .tags
+            .iter()
+            .filter(|t| t[0] == "role")
+            .map(|t| t[1].as_str())
+            .collect::<Vec<_>>(),
+        vec!["admin"],
+        "only the creator's admin role is left: {:?}",
+        roles.tags
+    );
+}
+
+#[test]
+fn leaving_livekit_clears_the_participants_event() {
+    // A group that leaves LiveKit must publish an empty 39004: the poll
+    // skips non-livekit groups, so the stored list would otherwise keep
+    // listing participants of a room that no longer exists. Enabling it
+    // emits nothing (the poll owns the list).
+    let mut store = GroupStore::default();
+    let now = 1_600_000_000;
+    store.apply(
+        &event(CREATE_GROUP, ADMIN, Some("g1"), vec![]),
+        "relay",
+        now,
+        false,
+        false,
+    );
+    let out = store.apply(
+        &event(9002, ADMIN, Some("g1"), vec![vec!["livekit".into()]]),
+        "relay",
+        now,
+        true,
+        false,
+    );
+    assert!(
+        out.iter().all(|e| e.kind != GROUP_PARTICIPANTS),
+        "enabling livekit must not emit a participants event"
+    );
+    let out = store.apply(
+        &event(
+            9002,
+            ADMIN,
+            Some("g1"),
+            vec![vec!["name".into(), "g1".into()]],
+        ),
+        "relay",
+        now,
+        true,
+        false,
+    );
+    let cleared = out
+        .iter()
+        .find(|e| e.kind == GROUP_PARTICIPANTS)
+        .expect("leaving livekit must emit an empty 39004");
+    assert!(
+        cleared.tags.iter().all(|t| t[0] != "participant"),
+        "the cleared list must carry no participant tags: {:?}",
+        cleared.tags
+    );
+    // A settings edit that keeps livekit enabled leaves the list alone.
+    let out = store.apply(
+        &event(
+            9002,
+            ADMIN,
+            Some("g1"),
+            vec![vec!["livekit".into()], vec!["name".into(), "g1".into()]],
+        ),
+        "relay",
+        now,
+        true,
+        false,
+    );
+    assert!(
+        out.iter().all(|e| e.kind != GROUP_PARTICIPANTS),
+        "a livekit-preserving edit must not clear the list"
+    );
+}
+
+#[test]
 fn declared_children_hint_is_bounded() {
     // The adoption hint is a monotonic set; without a bound, repeated 9002
     // edits with fresh placeholder child ids would grow it without limit

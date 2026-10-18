@@ -1,10 +1,14 @@
 //! Relay-generated NIP-29 events: metadata (39000), admins (39001),
-//! members (39002), pins (39005) and the put-user/remove-user moderation
-//! events emitted by the group state machine.
+//! members (39002), roles (39003), participants (39004), pins (39005) and
+//! the put-user/remove-user moderation events emitted by the group state
+//! machine.
 
 use crate::event::Event;
 
-use super::{D, GROUP_ADMINS, GROUP_MEMBERS, GROUP_META, GROUP_PINS, Group, GroupSettings, H, P};
+use super::{
+    D, GROUP_ADMINS, GROUP_MEMBERS, GROUP_META, GROUP_PARTICIPANTS, GROUP_PINS, GROUP_ROLES, Group,
+    GroupSettings, H, P,
+};
 pub(crate) fn apply_settings(group: &mut Group, event: &Event) {
     let mut settings = GroupSettings::default();
     for tag in &event.tags {
@@ -158,6 +162,49 @@ pub(crate) fn build_pins_event(
         for (tag, value) in &group.pins {
             event.tags.push(vec![tag.clone(), value.clone()]);
         }
+    }
+    event
+}
+
+pub(crate) fn build_roles_event(
+    gid: &str,
+    group: Option<&Group>,
+    relay_pubkey: &str,
+    now: u64,
+) -> Event {
+    let mut event = base_event(GROUP_ROLES, gid, relay_pubkey, now);
+    if let Some(group) = group {
+        // NIP-29's `39003` informs clients about the roles in use. This
+        // relay keeps no separate role registry (any non-empty role label
+        // is an admin role, per the free-form NIP-29 model), so the list
+        // is derived from the roles actually assigned to members. Sorted
+        // so the relay-generated event is deterministic across restarts
+        // (a HashSet iteration order would change the event id).
+        let mut roles: Vec<&str> = group
+            .members
+            .values()
+            .flat_map(|roles| roles.iter().map(String::as_str))
+            .collect();
+        roles.sort_unstable();
+        roles.dedup();
+        for role in roles {
+            event.tags.push(vec!["role".to_string(), role.to_string()]);
+        }
+    }
+    event
+}
+
+pub(crate) fn build_participants_event(
+    gid: &str,
+    participants: &[String],
+    relay_pubkey: &str,
+    now: u64,
+) -> Event {
+    let mut event = base_event(GROUP_PARTICIPANTS, gid, relay_pubkey, now);
+    for pubkey in participants {
+        event
+            .tags
+            .push(vec!["participant".to_string(), pubkey.clone()]);
     }
     event
 }

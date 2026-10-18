@@ -182,6 +182,270 @@ fn jwt_hs256(secret: &str, claims: &serde_json::Value) -> Result<String> {
     let mac = crate::util::hmac_sha256(secret.as_bytes(), signing_input.as_bytes());
     Ok(format!("{signing_input}.{}", b64url(&mac)))
 }
+
+/// Shared HTTP client for the LiveKit Room Service API: the connection pool
+/// survives between polls (a fresh client per poll would re-handshake TLS).
+fn livekit_http_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(reqwest::Client::new)
+}
+
+/// Issues a LiveKit server API token scoped to one room (the `roomAdmin`
+/// grant the Room Service API requires for `ListParticipants`).
+fn issue_livekit_admin_token(api_key: &str, api_secret: &str, room: &str) -> Result<String> {
+    let now = unix_now();
+    let claims = json!({
+        "iss": api_key,
+        "sub": api_key,
+        "iat": now,
+        "nbf": now,
+        "exp": now + 600,
+        "video": {
+            "room": room,
+            "roomAdmin": true
+        }
+    });
+    jwt_hs256(api_secret, &claims)
+}
+
+/// The hex pubkeys of the participants in a LiveKit `ListParticipants`
+/// response. The relay's minted identities start with the lowercase hex
+/// pubkey (NIP-29 requires the initial 64 characters to be the pubkey), so
+/// each identity maps back to its participant; identities that do not carry
+/// a valid pubkey (foreign tokens, or a multibyte prefix) are skipped.
+/// Sorted and deduplicated for a deterministic event id.
+pub(crate) fn participant_pubkeys(participants: &[serde_json::Value]) -> Vec<String> {
+    let mut out: Vec<String> = participants
+        .iter()
+        .filter_map(|p| p.get("identity").and_then(|i| i.as_str()))
+        .filter_map(|identity| {
+            let pubkey = identity.get(..64)?;
+            pubkey
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit())
+                .then(|| pubkey.to_ascii_lowercase())
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Maps a Room Service response to the participant pubkeys. A `404` is the
+/// Twirp `not_found` code LiveKit returns for a room that no longer exists:
+/// a deleted room has nobody live, so it maps to an empty list (returning
+/// an error would keep a stale list from before the room died, because
+/// every later poll would skip the group the same way).
+fn participants_from_response(status: u16, body: &str) -> Result<Vec<String>> {
+    if status == 404 {
+        return Ok(Vec::new());
+    }
+    if !(200..300).contains(&status) {
+        return Err(anyhow!("livekit ListParticipants failed: HTTP {status}"));
+    }
+    let body: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| anyhow!("livekit response was not JSON: {e}"))?;
+    let participants = body
+        .get("participants")
+        .and_then(|p| p.as_array())
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    Ok(participant_pubkeys(participants))
+}
+
+/// Fetches the live participants of one LiveKit room through the Room
+/// Service API (Twirp/JSON). Errors are reported so the caller can skip the
+/// group instead of publishing an empty (wrong) list.
+pub(crate) async fn fetch_livekit_participants(
+    url: &str,
+    api_key: &str,
+    api_secret: &str,
+    room: &str,
+) -> Result<Vec<String>> {
+    let url = format!(
+        "{}/twirp/livekit.RoomService/ListParticipants",
+        url.trim_end_matches('/')
+    );
+    let token = issue_livekit_admin_token(api_key, api_secret, room)?;
+    let response = livekit_http_client()
+        .post(&url)
+        .bearer_auth(token)
+        .header("Content-Type", "application/json")
+        .body(serde_json::to_string(&json!({ "room": room }))?)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|e| anyhow!("livekit request failed: {e}"))?;
+    let status = response.status().as_u16();
+    let body = response
+        .text()
+        .await
+        .map_err(|e| anyhow!("livekit response could not be read: {e}"))?;
+    participants_from_response(status, &body)
+}
+
+/// `GET /.well-known/nip29/livekit/webhook` — the token endpoint for a
+/// group literally named "webhook". NIP-29 allows a group id to be any
+/// string, and the webhook receiver below shares this path as a static
+/// route (which would otherwise shadow the `{group}` route for that id),
+/// so the route's `get` half dispatches here.
+pub(crate) async fn livekit_token_webhook_group(
+    state: State<Arc<Relay>>,
+    headers: HeaderMap,
+    uri: axum::http::Uri,
+) -> impl IntoResponse {
+    livekit_token(state, headers, uri, AxPath("webhook".to_string())).await
+}
+
+/// `POST /.well-known/nip29/livekit/webhook` — the LiveKit webhook receiver.
+///
+/// LiveKit signs the raw request body with the API secret: the
+/// `Authorization` header carries an HS256 JWT whose `sha256` claim is the
+/// base64 SHA-256 of the body (the scheme the LiveKit server SDKs verify).
+/// On a participant or room event for a livekit-enabled group the relay
+/// refreshes that group's `kind:39004` list immediately instead of waiting
+/// for the next poll; anything else is acknowledged and ignored.
+pub(crate) async fn livekit_webhook(
+    State(relay): State<Arc<Relay>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let (api_key, api_secret) = {
+        let cfg = relay.config.read().await;
+        (
+            cfg.relay.livekit_api_key.clone(),
+            cfg.relay.livekit_api_secret.clone(),
+        )
+    };
+    if api_key.is_empty() || api_secret.is_empty() {
+        return StatusCode::NOT_FOUND;
+    }
+    let auth = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if !verify_webhook_auth(auth, &api_key, &api_secret, &body) {
+        return StatusCode::UNAUTHORIZED;
+    }
+    let event: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(event) => event,
+        Err(_) => return StatusCode::BAD_REQUEST,
+    };
+    let kind = event
+        .get("event")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let room = event
+        .get("room")
+        .and_then(|room| room.get("name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let relevant = matches!(
+        kind,
+        "participant_joined"
+            | "participant_left"
+            | "participant_connection_aborted"
+            | "room_started"
+            | "room_finished"
+    );
+    if !relevant || room.is_empty() {
+        return StatusCode::NO_CONTENT;
+    }
+    let gid = room.to_string();
+    if !relay.is_livekit_group(&gid).await {
+        return StatusCode::NO_CONTENT;
+    }
+    // The ListParticipants fetch can take seconds: acknowledge LiveKit
+    // first and refresh in the background (a lost refresh is reconciled by
+    // the periodic poll).
+    let relay = relay.clone();
+    tokio::spawn(async move {
+        relay.refresh_livekit_participants(&gid).await;
+    });
+    StatusCode::NO_CONTENT
+}
+
+/// Verifies a LiveKit webhook `Authorization` token: an HS256 JWT signed
+/// with the API secret whose `iss` is the API key, whose `exp` has not
+/// passed, and whose `sha256` matches the base64 SHA-256 of the raw body
+/// (the three checks the LiveKit server SDKs perform). `alg: none` and any
+/// other algorithm are rejected.
+pub(crate) fn verify_webhook_auth(
+    token: &str,
+    api_key: &str,
+    api_secret: &str,
+    body: &[u8],
+) -> bool {
+    let mut segments = token.split('.');
+    let (Some(header_seg), Some(payload_seg), Some(signature_seg)) =
+        (segments.next(), segments.next(), segments.next())
+    else {
+        return false;
+    };
+    if segments.next().is_some() {
+        return false;
+    }
+    let Some(header) = b64url_decode(header_seg) else {
+        return false;
+    };
+    let Ok(header) = serde_json::from_slice::<serde_json::Value>(&header) else {
+        return false;
+    };
+    if header.get("alg").and_then(|v| v.as_str()) != Some("HS256") {
+        return false;
+    }
+    let Some(payload) = b64url_decode(payload_seg) else {
+        return false;
+    };
+    let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&payload) else {
+        return false;
+    };
+    if payload.get("iss").and_then(|v| v.as_str()) != Some(api_key) {
+        return false;
+    }
+    let expired = payload
+        .get("exp")
+        .and_then(|v| v.as_u64())
+        .is_none_or(|exp| exp <= unix_now());
+    if expired {
+        return false;
+    }
+    let expected_hash = {
+        use base64::Engine as _;
+        use sha2::Digest as _;
+        base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(body))
+    };
+    if payload.get("sha256").and_then(|v| v.as_str()) != Some(expected_hash.as_str()) {
+        return false;
+    }
+    let signing_input = format!("{header_seg}.{payload_seg}");
+    let expected = crate::util::hmac_sha256(api_secret.as_bytes(), signing_input.as_bytes());
+    let Some(signature) = b64url_decode(signature_seg) else {
+        return false;
+    };
+    constant_time_eq(&signature, &expected)
+}
+
+fn b64url_decode(data: &str) -> Option<Vec<u8>> {
+    use base64::Engine as _;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(data)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(data))
+        .ok()
+}
+
+/// Constant-time byte comparison for MACs (the length check is not secret).
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -369,6 +633,43 @@ mod tests {
             "the response must carry a minted JWT"
         );
         assert_eq!(json["url"], "wss://livekit.example.com");
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn webhook_group_id_mints_like_any_group() {
+        // A group id may be any string (NIP-29): the static webhook route
+        // shares the path with `{group}`, so its `get` half must still
+        // serve the token endpoint for the id "webhook" instead of
+        // shadowing it.
+        let relay = build_relay().await;
+        let settings = crate::nips::nip29::GroupSettings {
+            livekit: true,
+            ..Default::default()
+        };
+        relay.groups.write().await.groups.insert(
+            "webhook".into(),
+            crate::nips::nip29::Group {
+                settings,
+                ..Default::default()
+            },
+        );
+        let secp = relay.secp().clone();
+        let ev = signed_token_auth(&relay, &secp, "webhook").await;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Nostr {}", encode(&ev)).parse().unwrap(),
+        );
+        let uri: axum::http::Uri = "/.well-known/nip29/livekit/webhook".parse().unwrap();
+        let resp = livekit_token_webhook_group(State(relay.clone()), headers, uri)
+            .await
+            .into_response();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "the id \"webhook\" must reach the token endpoint"
+        );
         relay.db.shutdown();
     }
 
@@ -619,6 +920,101 @@ mod tests {
         .into_response();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         relay.db.shutdown();
+    }
+
+    #[test]
+    fn participants_from_response_treats_a_deleted_room_as_empty() {
+        let alice = "aa".repeat(32);
+        // A 404 is Twirp's `not_found`: the room no longer exists, so
+        // nobody is live (an error would keep a stale list forever).
+        assert_eq!(
+            participants_from_response(404, r#"{"code":"not_found","msg":"room not found"}"#)
+                .unwrap(),
+            Vec::<String>::new()
+        );
+        // A live room's list is parsed; an empty room yields no pubkeys.
+        let body =
+            json!({ "participants": [{ "identity": format!("{alice}deadbeef") }] }).to_string();
+        assert_eq!(participants_from_response(200, &body).unwrap(), vec![alice]);
+        assert_eq!(
+            participants_from_response(200, r#"{"participants":[]}"#).unwrap(),
+            Vec::<String>::new()
+        );
+        // Other failures stay errors: they must not clear the list.
+        assert!(participants_from_response(500, "boom").is_err());
+        assert!(participants_from_response(200, "not json").is_err());
+    }
+
+    #[test]
+    fn participant_pubkeys_parse_identities() {
+        // NIP-29: the initial 64 characters of the identity are the
+        // lowercase hex pubkey. Foreign identities (invalid hex, short, or
+        // multibyte) are skipped, and the result is sorted/deduplicated for
+        // a deterministic 39004 event id.
+        let alice = "aa".repeat(32);
+        let bob = "bb".repeat(32);
+        let participants = vec![
+            json!({ "identity": format!("{alice}deadbeef") }),
+            json!({ "identity": bob.to_uppercase() }),
+            json!({ "identity": "zz".repeat(32) }),
+            json!({ "identity": "abc" }),
+            json!({ "identity": format!("{alice}00000000") }),
+            json!({ "identity": "あ".repeat(40) }),
+            json!({}),
+            json!({ "identity": 42 }),
+        ];
+        assert_eq!(
+            participant_pubkeys(&participants),
+            vec![alice, bob],
+            "only valid identities survive, sorted and deduplicated"
+        );
+    }
+
+    /// Builds a webhook token the way LiveKit does (HS256 with a `sha256`
+    /// claim over the raw body).
+    fn webhook_token(api_key: &str, secret: &str, body: &[u8], exp: u64) -> String {
+        use base64::Engine;
+        use sha2::Digest;
+        let claims = json!({
+            "iss": api_key,
+            "exp": exp,
+            "sha256": base64::engine::general_purpose::STANDARD
+                .encode(sha2::Sha256::digest(body)),
+        });
+        jwt_hs256(secret, &claims).unwrap()
+    }
+
+    #[test]
+    fn webhook_auth_verifies_signature_issuer_expiry_and_body() {
+        let body = br#"{"event":"participant_joined","room":{"name":"g1"}}"#;
+        let token = webhook_token("key", "secret", body, unix_now() + 60);
+        assert!(verify_webhook_auth(&token, "key", "secret", body));
+        // A tampered body fails the sha256 check, and a wrong secret,
+        // issuer, or expiry fails.
+        assert!(!verify_webhook_auth(
+            &token,
+            "key",
+            "secret",
+            br#"{"event":"participant_left"}"#
+        ));
+        assert!(!verify_webhook_auth(&token, "key", "other", body));
+        assert!(!verify_webhook_auth(&token, "other", "secret", body));
+        let expired = webhook_token("key", "secret", body, unix_now() - 1);
+        assert!(!verify_webhook_auth(&expired, "key", "secret", body));
+        // `alg: none` is rejected even though the body hash would match,
+        // and malformed tokens never pass.
+        use base64::Engine;
+        let none = format!(
+            "{}.{}.{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"alg":"none"}"#),
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(br#"{"iss":"key","exp":9999999999}"#),
+            "",
+        );
+        assert!(!verify_webhook_auth(&none, "key", "secret", body));
+        assert!(!verify_webhook_auth("", "key", "secret", body));
+        assert!(!verify_webhook_auth("a.b", "key", "secret", body));
+        assert!(!verify_webhook_auth("a.b.c.d", "key", "secret", body));
     }
 
     #[test]

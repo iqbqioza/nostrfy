@@ -9,8 +9,9 @@ pub(crate) mod events;
 pub(crate) mod tests;
 
 use events::{
-    apply_settings, build_admins_event, build_members_event, build_meta_event, build_pins_event,
-    build_put_user, build_remove_user, build_remove_users,
+    apply_settings, build_admins_event, build_members_event, build_meta_event,
+    build_participants_event, build_pins_event, build_put_user, build_remove_user,
+    build_remove_users, build_roles_event,
 };
 
 /// Moderation policy implemented here: any user with at least one role (from
@@ -1111,9 +1112,10 @@ impl GroupStore {
                         return Vec::new();
                     }
                 }
-                let (parent_before, parent_after, children_before, children_after) = {
+                let (parent_before, parent_after, children_before, children_after, livekit_before) = {
                     match self.groups.get_mut(gid) {
                         Some(group) => {
+                            let livekit_before = group.settings.livekit;
                             apply_settings(group, event);
                             let children_before = group.children.clone();
                             // Deduplicate while preserving order: a repeated
@@ -1125,9 +1127,15 @@ impl GroupStore {
                                 .collect();
                             let before = group.parent.clone();
                             let after = tag_value(event, "parent").map(str::to_string);
-                            (before, after, children_before, group.children.clone())
+                            (
+                                before,
+                                after,
+                                children_before,
+                                group.children.clone(),
+                                livekit_before,
+                            )
                         }
-                        None => (None, None, Vec::new(), Vec::new()),
+                        None => (None, None, Vec::new(), Vec::new(), false),
                     }
                 };
                 // A 9002 for a group that does not exist must do nothing:
@@ -1252,6 +1260,14 @@ impl GroupStore {
                         relay_pubkey,
                         now,
                     ));
+                    // Leaving LiveKit: the stored 39004 would keep listing
+                    // participants of a room that no longer exists. Publish
+                    // an empty list (the spec allows zero `participant`
+                    // tags) so subscribers see the room close; the poll
+                    // skips non-livekit groups, so this is the only clear.
+                    if livekit_before && !self.groups.get(gid).is_some_and(|g| g.settings.livekit) {
+                        out.push(build_participants_event(gid, &[], relay_pubkey, now));
+                    }
                     if let Some(parent) = self.groups.get(gid).and_then(|g| g.parent.clone()) {
                         out.push(build_meta_event(
                             &parent,
@@ -1661,12 +1677,12 @@ impl GroupStore {
         const MEMBERS_EAGER_MAX: usize = 1000;
         /// Larger groups get it at most once per this many seconds.
         const MEMBERS_INTERVAL_SECS: u64 = 60;
-        let mut out = vec![build_admins_event(
-            gid,
-            self.groups.get(gid),
-            relay_pubkey,
-            now,
-        )];
+        let mut out = vec![
+            build_admins_event(gid, self.groups.get(gid), relay_pubkey, now),
+            // NIP-29's `39003` (the roles in use): small and cheap, so it
+            // rides every membership change like the admin list.
+            build_roles_event(gid, self.groups.get(gid), relay_pubkey, now),
+        ];
         let members = self.groups.get(gid).map(|g| g.members.len()).unwrap_or(0);
         let due = members <= MEMBERS_EAGER_MAX
             || self
@@ -1685,11 +1701,11 @@ impl GroupStore {
         out
     }
 
-    /// Builds the relay-signed metadata events (39000/39001/39002/39005)
-    /// for every live group. Used after a rebuild from stored events: a
-    /// database whose state was rebuilt — a migration from another relay,
-    /// or a dropped snapshot — has no (or stale) stored metadata, and
-    /// clients need it to display the groups.
+    /// Builds the relay-signed metadata events (39000/39001/39002/39003/
+    /// 39005) for every live group. Used after a rebuild from stored
+    /// events: a database whose state was rebuilt — a migration from
+    /// another relay, or a dropped snapshot — has no (or stale) stored
+    /// metadata, and clients need it to display the groups.
     pub(crate) fn all_metadata_events(&mut self, relay_pubkey: &str, now: u64) -> Vec<Event> {
         let gids: Vec<String> = self.groups.keys().cloned().collect();
         let mut out = Vec::with_capacity(gids.len().saturating_mul(4));

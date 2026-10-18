@@ -17,6 +17,7 @@ public_url = "wss://YOUR-DOMAIN.example.com"
 livekit_url = ""
 livekit_api_key = ""
 livekit_api_secret = ""
+livekit_participants_interval_secs = 15
 enabled_nips = []
 disabled_nips = []
 reject_ephemeral = false
