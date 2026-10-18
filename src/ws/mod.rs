@@ -1611,9 +1611,7 @@ pub async fn handle_connection(
                 }
                 None => match receiver.next().await {
                     Some(Ok(frame)) => Ok(frame),
-                    Some(Err(e)) => {
-                        Err(is_capacity_error(&e))
-                    }
+                    Some(Err(e)) => Err(is_capacity_error(&e)),
                     None => Err(false),
                 },
             }
@@ -1932,7 +1930,10 @@ mod tests {
     fn capacity_error_is_detected() {
         use tungstenite::error::CapacityError;
         let cap = axum::Error::new(tungstenite::Error::Capacity(
-            CapacityError::MessageTooLong { size: 2, max_size: 1 },
+            CapacityError::MessageTooLong {
+                size: 2,
+                max_size: 1,
+            },
         ));
         assert!(is_capacity_error(&cap));
         let other = axum::Error::new(tungstenite::Error::ConnectionClosed);
@@ -8744,10 +8745,7 @@ mod tests {
     async fn ws_next_json<S>(ws: &mut S) -> Value
     where
         S: futures_util::Stream<
-                Item = Result<
-                    tokio_tungstenite::tungstenite::Message,
-                    tungstenite::Error,
-                >,
+                Item = Result<tokio_tungstenite::tungstenite::Message, tungstenite::Error>,
             > + Unpin,
     {
         let deadline = tokio::time::sleep(Duration::from_secs(5));
@@ -8830,10 +8828,7 @@ mod tests {
     async fn ws_next_text<S>(ws: &mut S) -> Option<String>
     where
         S: futures_util::Stream<
-                Item = Result<
-                    tokio_tungstenite::tungstenite::Message,
-                    tungstenite::Error,
-                >,
+                Item = Result<tokio_tungstenite::tungstenite::Message, tungstenite::Error>,
             > + Unpin,
     {
         let deadline = tokio::time::sleep(Duration::from_secs(5));
