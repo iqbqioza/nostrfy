@@ -131,8 +131,11 @@ impl TrustedProxy {
 /// the right-most `X-Forwarded-For` entry that is not itself a trusted
 /// proxy is returned: the header is appended per hop, so the right-most
 /// untrusted entry is the address that connected to the nearest trusted
-/// hop; anything to its left is client-controlled. An absent, empty or
-/// malformed header falls back to the peer (fail closed).
+/// hop; anything to its left is client-controlled. Entries left of the
+/// right-most one that do not parse are skipped as client junk — a single
+/// garbage token must not hide the address the proxy appended — while the
+/// right-most entry is the nearest hop's own value: if it does not parse,
+/// or the header is absent or empty, the peer is used (fail closed).
 pub fn client_ip(peer: IpAddr, forwarded_for: Option<&str>, trusted: &[TrustedProxy]) -> IpAddr {
     let peer = normalize_ip(peer);
     if trusted.is_empty() || !trusted.iter().any(|proxy| proxy.contains(peer)) {
@@ -144,18 +147,27 @@ pub fn client_ip(peer: IpAddr, forwarded_for: Option<&str>, trusted: &[TrustedPr
     if value.is_empty() {
         return peer;
     }
-    let mut client = None;
-    for entry in value.split(',') {
+    // Walk right to left: the right-most entry is written by the nearest
+    // trusted hop itself, so if it does not parse the chain cannot be
+    // trusted (fall back to the peer). Entries further left are
+    // client-controlled: unparseable ones are skipped instead of poisoning
+    // the whole header, and the first untrusted address wins.
+    let mut nearest = true;
+    for entry in value.rsplit(',') {
         let entry = entry.trim();
-        let Some(ip) = parse_forwarded_entry(entry) else {
-            return peer;
-        };
-        let ip = normalize_ip(ip);
-        if !trusted.iter().any(|proxy| proxy.contains(ip)) {
-            client = Some(ip);
+        match parse_forwarded_entry(entry) {
+            Some(ip) => {
+                let ip = normalize_ip(ip);
+                if !trusted.iter().any(|proxy| proxy.contains(ip)) {
+                    return ip;
+                }
+            }
+            None if nearest => return peer,
+            None => {}
         }
+        nearest = false;
     }
-    client.unwrap_or(peer)
+    peer
 }
 
 /// Parses one `X-Forwarded-For` entry: a bare IP, `host:port` or
@@ -167,9 +179,9 @@ fn parse_forwarded_entry(entry: &str) -> Option<IpAddr> {
     if let Some(rest) = entry.strip_prefix('[') {
         let (ip, tail) = rest.split_once(']')?;
         // Like the `host:port` branch below, anything after the bracket
-        // must be empty or a numeric port: `[::1]garbage` is malformed and
-        // fails the whole chain closed (falls back to the peer) instead of
-        // parsing as the bracketed address.
+        // must be empty or a numeric port: `[::1]garbage` is malformed
+        // (skipped as client junk when it is left of the right-most entry;
+        // as the right-most entry it falls back to the peer).
         let tail_ok = tail.is_empty()
             || tail
                 .strip_prefix(':')
@@ -362,7 +374,9 @@ mod tests {
         assert_eq!(client_ip(peer, Some(""), &trusted), peer);
         assert_eq!(client_ip(peer, Some("   "), &trusted), peer);
         assert_eq!(client_ip(peer, Some("not-an-ip"), &trusted), peer);
-        // One malformed entry poisons the whole chain (fail closed).
+        // The right-most entry is the nearest hop's own value: a malformed
+        // value there fails the chain closed instead of peeling to
+        // client-controlled entries further left.
         assert_eq!(
             client_ip(peer, Some("203.0.113.9, garbage"), &trusted),
             peer
@@ -382,6 +396,44 @@ mod tests {
         // An all-trusted chain names no client: fall back to the peer.
         assert_eq!(
             client_ip(peer, Some("127.0.0.1, 127.0.0.1"), &trusted),
+            peer
+        );
+    }
+
+    #[test]
+    fn client_ip_skips_client_controlled_junk_left_of_the_appended_entry() {
+        // The proxy appends the real client to whatever the client sent:
+        // a garbage token on the left is client-controlled and must not
+        // hide the address the nearest hop wrote (that would bypass
+        // `blockip` and the per-IP caps for every request carrying junk).
+        let trusted = [TrustedProxy::parse("127.0.0.1").unwrap()];
+        let peer = "127.0.0.1".parse::<IpAddr>().unwrap();
+        assert_eq!(
+            client_ip(peer, Some("garbage, 203.0.113.9"), &trusted),
+            "203.0.113.9".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(
+            client_ip(peer, Some("not an ip, 203.0.113.9:443"), &trusted),
+            "203.0.113.9".parse::<IpAddr>().unwrap()
+        );
+        // A leading empty entry (a stray comma) is skipped too.
+        assert_eq!(
+            client_ip(peer, Some(", 203.0.113.9"), &trusted),
+            "203.0.113.9".parse::<IpAddr>().unwrap()
+        );
+        // A chain through a further trusted hop with junk in the middle:
+        // the nearest untrusted address is still found.
+        let chain = [
+            TrustedProxy::parse("127.0.0.1").unwrap(),
+            TrustedProxy::parse("10.0.1.0/24").unwrap(),
+        ];
+        assert_eq!(
+            client_ip(peer, Some("junk, 198.51.100.7, 10.0.1.5"), &chain),
+            "198.51.100.7".parse::<IpAddr>().unwrap()
+        );
+        // The right-most entry still must parse.
+        assert_eq!(
+            client_ip(peer, Some("203.0.113.9, garbage"), &trusted),
             peer
         );
     }
