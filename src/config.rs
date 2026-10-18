@@ -191,6 +191,8 @@ pub struct ServerConfig {
     /// the API host when one is configured; without `api_host` the metrics
     /// are public on every host.
     pub metrics_enabled: bool,
+    /// Omit the exact software version from the NIP-11 document.
+    pub omit_version: bool,
     /// Which paths serve the WebSocket endpoint (and the NIP-11 document):
     /// `root` (default) serves `/` only (the legacy `/ws` and `/ws/` paths
     /// are no longer served); `inbox-outbox` serves only `/inbox` and
@@ -468,6 +470,7 @@ impl Default for ServerConfig {
             port: 8080,
             api_host: String::new(),
             metrics_enabled: true,
+            omit_version: false,
             ws_paths: "root".into(),
             inbox_write_policy: "any".into(),
             outbox_write_policy: "any".into(),
@@ -2779,6 +2782,7 @@ fn known_config_keys() -> &'static [(&'static str, &'static [&'static str])] {
                 "outbox_write_policy",
                 "trusted_proxies",
                 "metrics_enabled",
+                "omit_version",
                 "landing_page_file",
                 "assets_dir",
                 "management_token",

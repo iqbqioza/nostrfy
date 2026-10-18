@@ -72,6 +72,11 @@ pub fn relay_info(
     if let Some(self_pubkey) = self_pubkey {
         info["self"] = json!(self_pubkey);
     }
+    if config.server.omit_version {
+        info.as_object_mut()
+            .expect("relay_info builds an object")
+            .remove("version");
+    }
     for field in [
         "pubkey",
         "contact",
@@ -306,6 +311,24 @@ mod tests {
         assert!(info.get("icon").is_none());
         assert!(info.get("posting_policy").is_none());
         assert!(info.get("payments_url").is_none());
+    }
+
+    #[test]
+    fn version_can_be_omitted_without_changing_other_metadata() {
+        let mut cfg = Config::default();
+        let stats = Stats::new();
+        let access = AccessControl::default();
+
+        let info = relay_info(&cfg, &access, &stats, None);
+        assert_eq!(info["version"], env!("CARGO_PKG_VERSION"));
+
+        cfg.server.omit_version = true;
+        let info = relay_info(&cfg, &access, &stats, None);
+        assert!(info.get("version").is_none());
+        assert_eq!(info["software"], env!("CARGO_PKG_REPOSITORY"));
+        assert_eq!(info["name"], cfg.relay.name);
+        assert!(info.get("supported_nips").is_some());
+        assert!(info.get("limitation").is_some());
     }
 
     #[test]

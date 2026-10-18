@@ -189,6 +189,7 @@ The changes take effect immediately and are persisted (same lists as `nostrfy re
 | `port` | integer | `8080` | Port (1–65535). Port 80 requires root |
 | `api_host` | string | `""` | Hostname dedicated to the REST API (must be a bare hostname — no scheme, port, path or whitespace; validated at `nostrfy check`/startup) |
 | `metrics_enabled` | boolean | `true` | Serve Prometheus metrics at `/metrics` |
+| `omit_version` | boolean | `false` | Omit the exact software version from the NIP-11 document |
 | `ws_paths` | string | `"root"` | WebSocket endpoint paths: `root` (`/` only), `inbox-outbox`, or `all` |
 | `inbox_write_policy` | string | `"any"` | Write policy for `/inbox`: `any` or `relay` |
 | `outbox_write_policy` | string | `"any"` | Write policy for `/outbox`: `any` or `relay` |
@@ -673,6 +674,7 @@ host = "0.0.0.0"
 port = 8080
 api_host = "api.example.com"
 metrics_enabled = true
+omit_version = false
 # Proxies on this host (nginx/Caddy); remove for direct exposure.
 trusted_proxies = ["127.0.0.1/32", "::1/128"]
 landing_page_file = ""

@@ -152,6 +152,9 @@ api_host = ""
 # every host (set this to false to hide them).
 metrics_enabled = true
 
+# Omit the exact software version from the NIP-11 document.
+omit_version = false
+
 # Which paths serve the WebSocket endpoint (and the NIP-11 document):
 #   root         - "/" only (default)
 #   inbox-outbox - only "/inbox" and "/outbox"
