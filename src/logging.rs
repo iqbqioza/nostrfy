@@ -582,8 +582,34 @@ fn format_record(record: &log::Record) -> String {
         utc_format(now),
         record.level(),
         record.target(),
-        record.args()
+        escaped_message(record.args().to_string())
     )
+}
+
+/// Escapes control characters in a log message: a client-controlled value
+/// (a NIP-29 group id, a role label, a reason) must not be able to forge
+/// extra log lines (`\n`/`\r`) or inject terminal escapes into whatever
+/// views the log. Tab is kept (it cannot break the line). Applied centrally
+/// so every logging path — including the audit trail — is covered.
+fn escaped_message(message: String) -> String {
+    if !message
+        .chars()
+        .any(|c| matches!(c, '\n' | '\r') || (c.is_control() && c != '\t'))
+    {
+        return message;
+    }
+    let mut escaped = String::with_capacity(message.len() + 8);
+    for c in message.chars() {
+        match c {
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            c if c.is_control() && c != '\t' => {
+                escaped.push_str(&format!("\\u{{{:x}}}", c as u32));
+            }
+            c => escaped.push(c),
+        }
+    }
+    escaped
 }
 
 /// Formats a unix timestamp as UTC in ISO 8601 (HH:MM:SS) with a date
@@ -770,6 +796,40 @@ mod tests {
             utc_format(1_700_000_000 + 86_400 * 40),
             "2023-12-24T22:13:20Z"
         );
+    }
+
+    #[test]
+    fn client_controlled_messages_cannot_forge_log_lines() {
+        // A NIP-29 group id (or any client value) may contain newlines and
+        // terminal escapes: the formatted record must stay one line with
+        // the control characters escaped, or a client could inject look-
+        // alike records (e.g. fake `nostrfy::audit` lines) into the log.
+        let forged = "gid x\n[2026-01-01T00:00:00Z INFO  nostrfy::audit] admin banpubkey";
+        let args = format_args!("{forged}");
+        let record = log::Record::builder()
+            .level(log::Level::Warn)
+            .target("nostrfy::library")
+            .args(args)
+            .build();
+        let line = format_record(&record);
+        assert_eq!(
+            line.matches('\n').count(),
+            1,
+            "only the record's own newline"
+        );
+        assert!(line.contains("\\n"), "the embedded newline is escaped");
+        // Carriage returns and terminal escapes are escaped too; tabs and
+        // ordinary text stay untouched.
+        let args = format_args!("a\tb\rc\u{1b}[31m");
+        let record = log::Record::builder()
+            .level(log::Level::Info)
+            .target("nostrfy::library")
+            .args(args)
+            .build();
+        let line = format_record(&record);
+        assert!(line.contains("a\tb"), "tab is kept: {line:?}");
+        assert!(line.contains("\\r") && line.contains("\\u{1b}"), "{line:?}");
+        assert!(!line.contains('\u{1b}'), "no raw escape: {line:?}");
     }
 
     #[test]
