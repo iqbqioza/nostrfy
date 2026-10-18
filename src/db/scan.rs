@@ -937,6 +937,16 @@ impl Store {
             self.term_dfs(&rtxn, &all_terms)
         };
 
+        // Whether any filter from `start` on can still add to the union: a
+        // REQ `limit: 0` filter returns nothing by definition (it keeps the
+        // subscription alive), while COUNT ignores per-filter limits, so
+        // every filter can contribute.
+        let can_contribute = |start: usize| {
+            filters[start..]
+                .iter()
+                .any(|f| count_mode || f.limit != Some(0))
+        };
+
         for (index, filter) in filters.iter().enumerate() {
             // NIP-01: `limit: 0` returns nothing for that filter but keeps
             // the subscription alive — it must neither collect nor report
@@ -951,11 +961,15 @@ impl Store {
             // a later one.
             out.begin_filter(index);
             // The global collection cap is reached: later filters cannot
-            // contribute anything holdable, so stop. `more` is not set
-            // here: a previous filter that was cut short already set it
-            // inside its walk, while a filter that exhausted exactly at
-            // the cap is complete and must not report `approximate`.
+            // contribute anything holdable, so stop. If one of them could
+            // still match a new event, the union may extend past the cap:
+            // the result is not complete (`more`, and COUNT's
+            // `approximate`). A filter that exhausts exactly at the cap is
+            // complete only when no contributor remains (single filter).
             if out.full() {
+                if can_contribute(index) {
+                    more = true;
+                }
                 break;
             }
             let has_search = filter.has_search();
@@ -1021,6 +1035,9 @@ impl Store {
                 more = true;
             }
             if out.full() {
+                if can_contribute(index + 1) {
+                    more = true;
+                }
                 break;
             }
         }

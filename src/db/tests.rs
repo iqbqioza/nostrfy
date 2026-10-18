@@ -335,6 +335,90 @@ fn count_at_the_exact_cap_is_not_approximate() {
 }
 
 #[test]
+fn a_multi_filter_count_filling_the_cap_is_approximate() {
+    // The first filter alone exhausts exactly at the cap, but a later
+    // filter matches an event the first did not: the union is past the cap,
+    // so the exact-cap count must not be presented as exact (NIP-45).
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        for i in 0..3u64 {
+            let e = event(1, "first", now - 10 + i, vec![vec!["t".into(), "a".into()]]);
+            assert_eq!(db.put(e, now).await, PutOutcome::Stored);
+        }
+        let e = event(1, "second", now, vec![vec!["t".into(), "b".into()]]);
+        assert_eq!(db.put(e, now).await, PutOutcome::Stored);
+        let f_a: Filter =
+            serde_json::from_value(serde_json::json!({"kinds": [1], "#t": ["a"]})).unwrap();
+        let f_b: Filter =
+            serde_json::from_value(serde_json::json!({"kinds": [1], "#t": ["b"]})).unwrap();
+        let (counted, more) = db
+            .count_reported(vec![f_a, f_b], 3, now)
+            .await
+            .expect("count must not fail");
+        assert_eq!(counted.len(), 3);
+        assert!(
+            more,
+            "the unscanned filter can extend the union past the cap: approximate"
+        );
+    });
+    db.shutdown();
+}
+
+#[test]
+fn a_multi_filter_query_filling_the_tie_cap_reports_more() {
+    // Same-second ties may exceed a filter's limit, but the global tie cap
+    // must not silently drop an unscanned later filter: the EOSE must not
+    // claim completeness (`more`).
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        for i in 0..4u64 {
+            let e = event(
+                1,
+                &format!("tie {i}"),
+                now,
+                vec![vec!["t".into(), "a".into()]],
+            );
+            assert_eq!(db.put(e, now).await, PutOutcome::Stored);
+        }
+        let e = event(1, "later", now, vec![vec!["t".into(), "b".into()]]);
+        assert_eq!(db.put(e, now).await, PutOutcome::Stored);
+        let f_a: Filter =
+            serde_json::from_value(serde_json::json!({"kinds": [1], "#t": ["a"]})).unwrap();
+        let f_b: Filter =
+            serde_json::from_value(serde_json::json!({"kinds": [1], "#t": ["b"]})).unwrap();
+        let (events, more) = db.query(vec![f_a, f_b], 1, now).await;
+        assert_eq!(events.len(), 4, "the boundary tie block is collected");
+        assert!(
+            more,
+            "the unscanned later filter must not be silently dropped"
+        );
+    });
+    db.shutdown();
+}
+
+#[test]
 fn maximal_timestamp_is_included_by_indexed_queries() {
     let db = DbClient::open(
         &config(),
