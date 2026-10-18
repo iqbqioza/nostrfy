@@ -4643,8 +4643,10 @@ fn foreign_group_metadata_scan_and_removal() {
             assert_eq!(db.put(ev.clone(), now).await, PutOutcome::Stored);
         }
 
+        let kinds: Vec<u64> =
+            (crate::nips::nip29::GROUP_META..=crate::nips::nip29::GROUP_PINS).collect();
         let ids = db
-            .foreign_group_metadata_ids(&current)
+            .foreign_relay_event_ids(&current, &kinds)
             .await
             .expect("the scan must succeed");
         let mut got: Vec<String> = ids.iter().map(hex::encode).collect();
@@ -4691,7 +4693,7 @@ fn foreign_group_metadata_scan_and_removal() {
 
         // The next startup finds nothing to heal.
         assert!(
-            db.foreign_group_metadata_ids(&current)
+            db.foreign_relay_event_ids(&current, &kinds)
                 .await
                 .expect("the scan must succeed")
                 .is_empty()

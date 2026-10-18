@@ -657,12 +657,13 @@ enum Msg {
     ClearGroupsSnapshot {
         reply: oneshot::Sender<bool>,
     },
-    /// Ids of stored relay-generated NIP-29 metadata events (39000-39005)
-    /// that are not signed by the given relay pubkey (see
-    /// `Store::foreign_group_metadata_ids`). `None` reports a failed read:
-    /// the caller must not mistake it for "none found" and skip the heal.
-    ForeignGroupMetadata {
+    /// Ids of stored relay-signed events of `kinds` that are not signed by
+    /// the given relay pubkey (see `Store::foreign_relay_event_ids`).
+    /// `None` reports a failed read: the caller must not mistake it for
+    /// "none found" and skip the heal.
+    ForeignRelayEvents {
         relay_pubkey: String,
+        kinds: Vec<u64>,
         reply: oneshot::Sender<Option<Vec<[u8; crate::db::store::ID_LEN]>>>,
     },
     /// Removes the stored events named by `ids` (see
@@ -905,7 +906,11 @@ fn msg_bytes(msg: &Msg) -> usize {
         // gigabytes while `max_db_queue_bytes` ignored them entirely.
         Msg::SaveGroups { snapshot, .. } => groups_snapshot_bytes(snapshot),
         Msg::SaveRoles { snapshot, .. } => roles_snapshot_bytes(snapshot),
-        Msg::ForeignGroupMetadata { relay_pubkey, .. } => relay_pubkey.len(),
+        Msg::ForeignRelayEvents {
+            relay_pubkey,
+            kinds,
+            ..
+        } => relay_pubkey.len() + kinds.len() * 8,
         Msg::RemoveEvents { ids, .. } => ids.len() * crate::db::store::ID_LEN,
         Msg::Delete {
             targets,
@@ -2591,16 +2596,18 @@ impl DbClient {
             .await
     }
 
-    /// Ids of stored NIP-29 metadata events (39000-39005) not signed by
-    /// `relay_pubkey` (see `Store::foreign_group_metadata_ids`). `None`
+    /// Ids of stored relay-signed events of `kinds` not signed by
+    /// `relay_pubkey` (see `Store::foreign_relay_event_ids`). `None`
     /// reports a failed read: the startup heal then skips instead of
     /// mistaking the failure for "nothing to clean".
-    pub async fn foreign_group_metadata_ids(
+    pub async fn foreign_relay_event_ids(
         &self,
         relay_pubkey: &str,
+        kinds: &[u64],
     ) -> Option<Vec<[u8; crate::db::store::ID_LEN]>> {
-        self.request_read_blocking(|reply| Msg::ForeignGroupMetadata {
+        self.request_read_blocking(|reply| Msg::ForeignRelayEvents {
             relay_pubkey: relay_pubkey.to_string(),
+            kinds: kinds.to_vec(),
             reply,
         })
         .await

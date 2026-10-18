@@ -719,6 +719,13 @@ async fn restore_role_state(relay: &Relay) -> Result<()> {
         }
         relay.persist_roles().await;
     }
+    // A relay key rotation leaves the previous key's relay-signed role
+    // state (33534/13534/8000/8001) stored: the current key can neither
+    // replace nor delete it, and clients that verify the relay signature
+    // against NIP-11 `self` reject it. Heal it here — after the store
+    // holds the restored/rebuilt state, so the republished events reflect
+    // the state the relay is about to serve.
+    relay.heal_rotated_role_state().await;
     Ok(())
 }
 
@@ -2848,6 +2855,99 @@ mod tests {
                 .created_at,
             meta.created_at,
             "the heal must not republish when the stored metadata is current"
+        );
+        relay_b.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_relay_key_rotation_heals_the_nip43_role_state() {
+        // A relay key rotation leaves the former key's relay-signed role
+        // state (33534/13534/8000/8001) stored: the current key can neither
+        // replace nor delete it (replacement is per author), and clients
+        // that verify the relay signature against NIP-11 `self` reject it.
+        // The startup heal republishes the restored state under the current
+        // key, removes the former key's events, and re-persists the
+        // snapshot so the snapshot-only invite codes survive the next
+        // startup (the republished events advance the role-state sequence).
+        let path = std::env::temp_dir()
+            .join("nostrfy-server-test")
+            .join(format!("rotate-roles-{:x}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        let now = crate::util::unix_now();
+        let member = "bb".repeat(32);
+        let role_filter = || -> crate::filter::Filter {
+            serde_json::from_value(serde_json::json!({"kinds": [33534, 13534, 8000, 8001]}))
+                .unwrap()
+        };
+
+        // First life: key A creates a role, assigns it and stores a claim.
+        let relay_a = blossom_relay_with_key_at(&"02".repeat(32), path.clone()).await;
+        let key_a = relay_a.relay_pubkey().expect("key A must be configured");
+        assert!(relay_a.create_role("mod", "Mod", "", "", None).await);
+        assert_eq!(
+            relay_a.assign_role(&member, "mod").await,
+            crate::relay::roles::RoleChange::Applied
+        );
+        assert!(relay_a.create_claim("welcome").await);
+        assert!(
+            relay_a.persist_roles().await,
+            "the snapshot must be current"
+        );
+        let (before, _) = relay_a.db.query(vec![role_filter()], 100, now).await;
+        assert!(
+            !before.is_empty() && before.iter().all(|event| event.pubkey == key_a),
+            "key A must have published its role state"
+        );
+        relay_a.db.shutdown();
+        drop(relay_a);
+
+        // Second life: the same database with key B. The snapshot is
+        // current, so the state restores and the heal republishes under
+        // the current key and removes key A's events.
+        let relay_b = blossom_relay_with_key_at(&"03".repeat(32), path).await;
+        let key_b = relay_b.relay_pubkey().expect("key B must be configured");
+        assert_ne!(key_a, key_b);
+        restore_role_state(&relay_b)
+            .await
+            .expect("the healed startup must succeed");
+        let (healed, _) = relay_b.db.query(vec![role_filter()], 100, now).await;
+        assert!(!healed.is_empty(), "the role state must be republished");
+        assert!(
+            healed.iter().all(|event| event.pubkey == key_b),
+            "every role-state event must be signed by the current key"
+        );
+        let membership = healed
+            .iter()
+            .find(|event| event.kind == 13534)
+            .expect("the membership list must be republished");
+        assert!(
+            membership
+                .tags
+                .iter()
+                .any(|t| t.len() >= 2 && t[1] == member),
+            "the member must survive the heal: {:?}",
+            membership.tags
+        );
+        assert!(
+            healed.iter().any(|event| event.kind == 33534),
+            "the role definition must be republished"
+        );
+        // The claim is snapshot-only: the re-persisted snapshot must still
+        // carry it, or the next startup would rebuild from the events and
+        // drop it.
+        let saved = relay_b.db.load_roles().await.expect_loaded("snapshot");
+        assert!(
+            saved.claims.contains("welcome"),
+            "the invite code must survive in the re-persisted snapshot: {:?}",
+            saved.claims
+        );
+        // A second heal must be a no-op: nothing foreign is left to find.
+        relay_b.heal_rotated_role_state().await;
+        let (again, _) = relay_b.db.query(vec![role_filter()], 100, now).await;
+        assert_eq!(
+            again.len(),
+            healed.len(),
+            "the heal must not duplicate the role state"
         );
         relay_b.db.shutdown();
     }

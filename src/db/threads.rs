@@ -369,14 +369,15 @@ fn handle_read_msg(store: &Store, errors: &Arc<std::sync::atomic::AtomicU64>, ms
             let _ = reply.send(outcome);
             false
         }
-        Msg::ForeignGroupMetadata {
+        Msg::ForeignRelayEvents {
             relay_pubkey,
+            kinds,
             reply,
         } => {
             // A failed scan is reported as `None`: the startup heal must
-            // not mistake it for "the stored metadata is the current
+            // not mistake it for "the stored events are the current
             // key's" and leave a former key's events in place.
-            let ids = match store.foreign_group_metadata_ids(&relay_pubkey) {
+            let ids = match store.foreign_relay_event_ids(&relay_pubkey, &kinds) {
                 Ok(ids) => Some(ids),
                 Err(e) => {
                     db_error(errors, &e);
@@ -1116,14 +1117,16 @@ pub(crate) fn spawn(
                                     };
                                     let _ = reply.send(outcome);
                                 }
-                                Msg::ForeignGroupMetadata {
+                                Msg::ForeignRelayEvents {
                                     relay_pubkey,
+                                    kinds,
                                     reply,
                                 } => {
                                     // Same failure reporting as the reader
                                     // arm: `None` must not read as "the
-                                    // stored metadata is the current key's".
-                                    let ids = match store.foreign_group_metadata_ids(&relay_pubkey)
+                                    // stored events are the current key's".
+                                    let ids = match store
+                                        .foreign_relay_event_ids(&relay_pubkey, &kinds)
                                     {
                                         Ok(ids) => Some(ids),
                                         Err(e) => {

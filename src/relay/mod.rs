@@ -3341,7 +3341,8 @@ impl Relay {
         let Some(relay_pubkey) = self.relay_pubkey() else {
             return;
         };
-        let Some(foreign) = self.db.foreign_group_metadata_ids(&relay_pubkey).await else {
+        let kinds: Vec<u64> = (nip29::GROUP_META..=nip29::GROUP_PINS).collect();
+        let Some(foreign) = self.db.foreign_relay_event_ids(&relay_pubkey, &kinds).await else {
             log::error!(
                 "cannot read the stored NIP-29 metadata authors; leaving the stored \
                  metadata untouched (the next startup retries)"
@@ -3371,6 +3372,110 @@ impl Relay {
                 "cannot remove the former relay key's NIP-29 group metadata; the next \
                  startup retries"
             ),
+        }
+    }
+
+    /// Publishes the current NIP-43 role state: the membership list and
+    /// every role definition (the events clients need to see the roles and
+    /// the members). Returns whether every expected event stored; the
+    /// rotation heal keeps a former key's events until this succeeds.
+    pub(crate) async fn publish_role_state(&self) -> bool {
+        let Some(relay_pubkey) = self.relay_pubkey() else {
+            return false;
+        };
+        let now = self.stamp_floor(unix_now());
+        let events = {
+            let roles = self.roles.read().await;
+            let mut events = vec![roles.membership_event(&relay_pubkey, now)];
+            for id in roles.roles.keys() {
+                events.push(roles.role_event(id, &relay_pubkey, now));
+            }
+            events
+        };
+        let mut all_stored = true;
+        for mut event in events {
+            all_stored &= self.store_relay_event(&mut event).await.is_ok();
+        }
+        all_stored
+    }
+
+    /// Heals the NIP-43 role state left by a previous relay key.
+    ///
+    /// The role definitions, membership lists and add/remove-user events
+    /// (33534/13534/8000/8001) are relay-signed: a relay key rotation
+    /// leaves the previous key's events stored, and the current key can
+    /// neither replace nor delete them (replacement and deletion are per
+    /// author). Clients that verify the relay signature against the NIP-11
+    /// `self` pubkey then reject the role state, and a plain restart never
+    /// heals it: the snapshot restores and no rebuild republishes
+    /// anything.
+    ///
+    /// When the stored events are not the current key's, this publishes
+    /// the current state's events and then removes the foreign ones. The
+    /// publication runs first on purpose (like the group-metadata heal): a
+    /// partial failure leaves the former key's events in place, so the
+    /// next startup retries instead of leaving the roles with no events at
+    /// all.
+    ///
+    /// The snapshot is re-persisted afterwards because storing a
+    /// role-state event advances the role-state sequence: without it the
+    /// next startup would reject the snapshot and rebuild from the
+    /// surviving events, which drops the snapshot-only invite codes.
+    pub(crate) async fn heal_rotated_role_state(&self) {
+        let Some(relay_pubkey) = self.relay_pubkey() else {
+            return;
+        };
+        let kinds = [
+            nip43::ROLE_DEFINITION,
+            nip43::MEMBERSHIP_LIST,
+            nip43::ADD_USER,
+            nip43::REMOVE_USER,
+            nip43::INVITE,
+        ];
+        let Some(foreign) = self.db.foreign_relay_event_ids(&relay_pubkey, &kinds).await else {
+            log::error!(
+                "cannot read the stored NIP-43 role-state authors; leaving the stored \
+                 events untouched (the next startup retries)"
+            );
+            return;
+        };
+        if foreign.is_empty() {
+            return;
+        }
+        log::warn!(
+            "{} stored NIP-43 role-state event(s) are not signed by the current relay key; \
+             republishing the current state's events and removing them",
+            foreign.len()
+        );
+        if !self.publish_role_state().await {
+            log::error!(
+                "could not republish every NIP-43 role-state event; keeping the former \
+                 relay key's events so the next startup retries the cleanup"
+            );
+            return;
+        }
+        match self.db.remove_events_by_id(&foreign).await {
+            Some(removed) => {
+                log::info!("removed {removed} NIP-43 role-state event(s) of a former relay key")
+            }
+            None => {
+                log::error!(
+                    "cannot remove the former relay key's NIP-43 role-state events; the \
+                     next startup retries"
+                );
+                return;
+            }
+        }
+        // The republished events advanced the role-state sequence: persist
+        // the (unchanged) in-memory state under the current generation so
+        // the next startup restores the snapshot instead of rebuilding —
+        // a rebuild drops the snapshot-only invite codes.
+        if !self.persist_roles().await {
+            log::error!(
+                "could not re-persist the NIP-43 role snapshot after the key-rotation \
+                 cleanup; the next startup rebuilds the roles from the events (invite \
+                 codes are lost)"
+            );
         }
     }
 

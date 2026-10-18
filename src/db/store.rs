@@ -1204,58 +1204,56 @@ impl Store {
         Ok(Some(serde_json::from_slice(raw)?))
     }
 
-    /// Ids of the stored relay-generated NIP-29 metadata events
-    /// (39000-39005) that are not signed by `relay_pubkey`.
+    /// Ids of the stored relay-signed events of `kinds` that are not signed
+    /// by `relay_pubkey`.
     ///
-    /// These are the events a relay key rotation leaves behind: NIP-29
-    /// metadata is addressable, replacement is per author, so the current
-    /// key can neither replace nor delete the previous key's events (and
-    /// clients that verify the relay signature against NIP-11 `self`
-    /// reject them). An import from another relay stores the same shape.
-    /// The startup heals them: see `Relay::heal_rotated_group_metadata`.
+    /// These are the events a relay key rotation leaves behind: addressable
+    /// replacement and deletion are per author, so the current key can
+    /// neither replace nor delete the previous key's events (and clients
+    /// that verify the relay signature against NIP-11 `self` reject them).
+    /// An import from another relay stores the same shape. The startup
+    /// heals them: see `Relay::heal_rotated_group_metadata` and
+    /// `Relay::heal_rotated_role_state`.
     ///
-    /// The scan walks the `by_kind` range of the six metadata kinds, so it
-    /// is bounded by the stored metadata count (four events per group at
-    /// most) and never touches the general event history.
-    pub(crate) fn foreign_group_metadata_ids(
+    /// The scan walks the `by_kind` range of each requested kind, so it is
+    /// bounded by the stored events of those kinds and never touches the
+    /// general event history.
+    pub(crate) fn foreign_relay_event_ids(
         &self,
         relay_pubkey: &str,
+        kinds: &[u64],
     ) -> Result<Vec<[u8; ID_LEN]>> {
         let rtxn = self.env.read_txn()?;
-        let start = kind_key(crate::nips::nip29::GROUP_META, 0, &[0u8; ID_LEN]);
-        let end = range_end(
-            kind_key(crate::nips::nip29::GROUP_PINS, u64::MAX, &[0xffu8; ID_LEN]),
-            u64::MAX,
-        );
         let mut ids = Vec::new();
-        let iter = self.by_kind.range(
-            &rtxn,
-            &(
-                std::ops::Bound::Included(start.as_slice()),
-                std::ops::Bound::Excluded(end.as_slice()),
-            ),
-        )?;
-        for item in iter {
-            let (key, _) = item?;
-            // by_kind keys are always kind(8) + created(8) + id(32);
-            // anything shorter is corruption and is skipped.
-            if key.len() < CREATED_LEN + ID_LEN {
-                continue;
-            }
-            let id = &key[key.len() - ID_LEN..];
-            let Some(raw) = self.events.get(&rtxn, id)? else {
-                continue;
-            };
-            let Ok(event) = serde_json::from_slice::<Event>(raw) else {
-                continue;
-            };
-            // Classify by the stored event, not the index key: a corrupt
-            // index entry must not get an ordinary event deleted.
-            if (crate::nips::nip29::GROUP_META..=crate::nips::nip29::GROUP_PINS)
-                .contains(&event.kind)
-                && !event.pubkey.eq_ignore_ascii_case(relay_pubkey)
-            {
-                ids.push(id.try_into().expect("by_kind keys carry a full id"));
+        for &kind in kinds {
+            let start = kind_key(kind, 0, &[0u8; ID_LEN]);
+            let end = range_end(kind_key(kind, u64::MAX, &[0xffu8; ID_LEN]), u64::MAX);
+            let iter = self.by_kind.range(
+                &rtxn,
+                &(
+                    std::ops::Bound::Included(start.as_slice()),
+                    std::ops::Bound::Excluded(end.as_slice()),
+                ),
+            )?;
+            for item in iter {
+                let (key, _) = item?;
+                // by_kind keys are always kind(8) + created(8) + id(32);
+                // anything shorter is corruption and is skipped.
+                if key.len() < CREATED_LEN + ID_LEN {
+                    continue;
+                }
+                let id = &key[key.len() - ID_LEN..];
+                let Some(raw) = self.events.get(&rtxn, id)? else {
+                    continue;
+                };
+                let Ok(event) = serde_json::from_slice::<Event>(raw) else {
+                    continue;
+                };
+                // Classify by the stored event, not the index key: a corrupt
+                // index entry must not get an ordinary event deleted.
+                if event.kind == kind && !event.pubkey.eq_ignore_ascii_case(relay_pubkey) {
+                    ids.push(id.try_into().expect("by_kind keys carry a full id"));
+                }
             }
         }
         Ok(ids)
