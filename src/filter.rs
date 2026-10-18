@@ -589,6 +589,28 @@ mod tests {
     }
 
     #[test]
+    fn empty_filter_lists_match_nothing() {
+        // NIP-2504: an empty list attribute (`ids`/`authors`/`kinds`/`#e`)
+        // matches no event and must not be treated as if the attribute were
+        // absent (which would match everything). The stored scan and COUNT
+        // are covered by the db tests; this pins the live/in-memory matcher
+        // that decides live delivery.
+        let e = ev(1, vec![vec!["e".into(), "aa".into()]]);
+        for filter in [
+            json!({"ids": []}),
+            json!({"authors": []}),
+            json!({"kinds": []}),
+            json!({"#e": []}),
+            // AND semantics: an empty list next to a satisfiable constraint
+            // still makes the whole filter unsatisfiable.
+            json!({"kinds": [1], "authors": []}),
+        ] {
+            let f: Filter = serde_json::from_value(filter.clone()).unwrap();
+            assert!(!f.matches(&e), "an empty list must match nothing: {filter}");
+        }
+    }
+
+    #[test]
     fn empty_tag_name_matches_nothing() {
         // A `#` key with an empty tag name must match nothing on every
         // path: the live index never wakes such subscriptions, so history

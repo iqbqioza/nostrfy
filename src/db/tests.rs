@@ -238,6 +238,59 @@ fn database_dir_probe_creates_nothing_and_reports_the_state() {
 }
 
 #[test]
+fn empty_filter_lists_match_nothing_in_the_scan_and_count() {
+    // NIP-2504: an empty list attribute (`ids`/`authors`/`kinds`/`#e`)
+    // matches no event and must not be treated as if the attribute were
+    // absent (which would return the whole store). The scan, COUNT and the
+    // live matcher (see the filter tests) must agree.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        for i in 0..3 {
+            let e = event(1, &format!("note-{i}"), now - i, vec![]);
+            assert_eq!(db.put(e, now).await, PutOutcome::Stored);
+        }
+        for filter in [
+            serde_json::json!({"ids": []}),
+            serde_json::json!({"authors": []}),
+            serde_json::json!({"kinds": []}),
+            serde_json::json!({"#e": []}),
+            // AND semantics: an empty list next to a satisfiable constraint
+            // still makes the whole filter unsatisfiable.
+            serde_json::json!({"kinds": [1], "authors": []}),
+        ] {
+            let f: Filter = serde_json::from_value(filter.clone()).unwrap();
+            let (res, more) = db.query(vec![f.clone()], 10, now).await;
+            assert!(res.is_empty(), "the scan must match nothing: {filter}");
+            assert!(
+                !more,
+                "an impossible filter is exhausted, not cut: {filter}"
+            );
+            let (count, approximate) = db
+                .count_result(vec![f], 10, now)
+                .await
+                .expect("the count must answer");
+            assert_eq!(count, 0, "COUNT must agree: {filter}");
+            assert!(
+                !approximate,
+                "an impossible filter is not approximate: {filter}"
+            );
+        }
+    });
+    db.shutdown();
+}
+
+#[test]
 fn count_at_the_exact_cap_is_not_approximate() {
     // A walk that exhausts exactly at the request cap is complete: only a
     // walk cut short by the cap reports `approximate`.
