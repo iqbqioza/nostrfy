@@ -3462,7 +3462,12 @@ impl Relay {
     /// publication runs first on purpose (like the group-metadata heal): a
     /// partial failure leaves the former key's events in place, so the
     /// next startup retries instead of leaving the roles with no events at
-    /// all.
+    /// all. The removal only runs when the current state covers every
+    /// member and role the foreign events carry
+    /// ([`Self::rotated_role_state_covered`]): a rebuild that could not
+    /// read them (NIP-43 role metadata MUST be signed by `self`, and they
+    /// are not) cannot reconstruct what they hold, and deleting them would
+    /// destroy the only copy.
     ///
     /// The snapshot is re-persisted afterwards because storing a
     /// role-state event advances the role-state sequence: without it the
@@ -3491,7 +3496,7 @@ impl Relay {
         }
         log::warn!(
             "{} stored NIP-43 role-state event(s) are not signed by the current relay key; \
-             republishing the current state's events and removing them",
+             republishing the current state's events",
             foreign.len()
         );
         if !self.publish_role_state().await {
@@ -3501,17 +3506,29 @@ impl Relay {
             );
             return;
         }
-        match self.db.remove_events_by_id(&foreign).await {
-            Some(removed) => {
-                log::info!("removed {removed} NIP-43 role-state event(s) of a former relay key")
+        // The republished state may only stand in for the former key's
+        // events when it actually covers them (see the method doc): deleting
+        // events whose members or roles the current state cannot
+        // reconstruct would destroy the only copy.
+        if self.rotated_role_state_covered(&relay_pubkey).await {
+            match self.db.remove_events_by_id(&foreign).await {
+                Some(removed) => {
+                    log::info!("removed {removed} NIP-43 role-state event(s) of a former relay key")
+                }
+                None => {
+                    log::error!(
+                        "cannot remove the former relay key's NIP-43 role-state events; the \
+                         next startup retries"
+                    );
+                    return;
+                }
             }
-            None => {
-                log::error!(
-                    "cannot remove the former relay key's NIP-43 role-state events; the \
-                     next startup retries"
-                );
-                return;
-            }
+        } else {
+            log::warn!(
+                "the current NIP-43 role state does not cover every member and role of the \
+                 stored former relay key's events; keeping them so the cleanup cannot delete \
+                 state a rebuild could not reconstruct"
+            );
         }
         // The republished events advanced the role-state sequence: persist
         // the (unchanged) in-memory state under the current generation so
@@ -3524,6 +3541,86 @@ impl Relay {
                  codes are lost)"
             );
         }
+    }
+
+    /// Whether the current role state covers every member and role carried by
+    /// the stored former-key membership lists and role definitions — the
+    /// precondition for deleting them (see
+    /// [`Self::heal_rotated_role_state`]). A tombstoned role definition
+    /// carries no state and needs no cover.
+    ///
+    /// A rebuild without a usable snapshot reads the current key's events
+    /// only (NIP-43 role metadata MUST be signed by `self`), so after a key
+    /// rotation it cannot reconstruct members or roles the former key
+    /// defined; such a state fails this check and the foreign events must be
+    /// kept. A restored snapshot is complete by construction and passes.
+    /// Failing closed on an unreadable or truncated query keeps the events
+    /// too.
+    async fn rotated_role_state_covered(&self, relay_pubkey: &str) -> bool {
+        let filter: crate::filter::Filter = serde_json::from_value(serde_json::json!({
+            "kinds": [nip43::ROLE_DEFINITION, nip43::MEMBERSHIP_LIST],
+        }))
+        .expect("static filter");
+        // These kinds are replaceable/addressable per author, so the stored
+        // set is small; cap it anyway and fail closed on a truncation or a
+        // database that does not answer.
+        const MAX_FOREIGN: usize = 4096;
+        let Some((events, more)) = self
+            .db
+            .query_req_reported(vec![filter], MAX_FOREIGN, unix_now())
+            .await
+        else {
+            return false;
+        };
+        if more {
+            return false;
+        }
+        let roles = self.roles.read().await;
+        for event in events {
+            if event.pubkey.eq_ignore_ascii_case(relay_pubkey) {
+                continue;
+            }
+            match event.kind {
+                nip43::ROLE_DEFINITION => {
+                    // A `["deleted"]` tombstone states that the role is gone
+                    // (and the current state enforces that by not having it),
+                    // so it carries nothing to cover.
+                    if event
+                        .tags
+                        .iter()
+                        .any(|t| t.first().map(String::as_str) == Some(nip43::DELETED_TAG))
+                    {
+                        continue;
+                    }
+                    let Some(id) = event
+                        .tags
+                        .iter()
+                        .find(|t| t.first().map(String::as_str) == Some("d"))
+                        .and_then(|t| t.get(1))
+                    else {
+                        continue;
+                    };
+                    if !roles.roles.contains_key(id.as_str()) {
+                        return false;
+                    }
+                }
+                nip43::MEMBERSHIP_LIST => {
+                    for tag in &event.tags {
+                        if tag.len() < 2 || tag[0] != "member" {
+                            continue;
+                        }
+                        let Some(assigned) = roles.assignments.get(&tag[1]) else {
+                            return false;
+                        };
+                        if !tag[2..].iter().all(|role| assigned.contains(role)) {
+                            return false;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        true
     }
 
     /// Refreshes the NIP-29 `kind:39004` participant lists from the LiveKit
@@ -9246,6 +9343,85 @@ mod tests {
                 PutOutcome::Stored
             ),
             "a resumed, confirmed purge must leave the id re-creatable"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_heal_keeps_former_key_role_state_the_current_store_cannot_cover() {
+        // A key rotation plus a rebuild (no usable snapshot) leaves the
+        // store without the former key's members and roles: the rebuild
+        // reads the current key's events only. The heal must keep the
+        // former key's events (deleting them would destroy the only copy),
+        // while a state that covers them is still cleaned up.
+        use crate::db::PutOutcome;
+        use crate::nips::nip01;
+
+        let relay = build_relay_with_key(false, &"03".repeat(32)).await;
+        let current_key = relay.relay_pubkey().expect("the relay has a key");
+        let former_key = "02".repeat(32);
+        let member = "bb".repeat(32);
+        let now = crate::util::unix_now();
+        let role_filter = || -> crate::filter::Filter {
+            serde_json::from_value(serde_json::json!({
+                "kinds": [
+                    crate::nips::nip43::MEMBERSHIP_LIST,
+                    crate::nips::nip43::ROLE_DEFINITION,
+                ],
+            }))
+            .unwrap()
+        };
+        let build = |kind: u64, tags: Vec<Vec<String>>| {
+            let mut event = crate::event::Event {
+                id: String::new(),
+                pubkey: former_key.clone(),
+                created_at: now,
+                kind,
+                tags,
+                content: String::new(),
+                sig: String::new(),
+            };
+            event.id = nip01::compute_id(&event);
+            event
+        };
+        for event in [
+            build(
+                crate::nips::nip43::MEMBERSHIP_LIST,
+                vec![vec!["member".into(), member.clone(), "mod".into()]],
+            ),
+            build(
+                crate::nips::nip43::ROLE_DEFINITION,
+                vec![vec!["d".into(), "mod".into()]],
+            ),
+        ] {
+            assert_eq!(relay.db.put(event, now).await, PutOutcome::Stored);
+        }
+        // The rebuilt store is empty: the former key's state is not
+        // covered, so it must stay.
+        relay.heal_rotated_role_state().await;
+        let (stored, _) = relay.db.query(vec![role_filter()], 100, now).await;
+        assert!(
+            stored.iter().any(|event| event.pubkey == former_key),
+            "former-key state the rebuild cannot reconstruct must be kept"
+        );
+        assert!(
+            stored.iter().any(|event| event.pubkey == current_key),
+            "the current state is still published under the new key"
+        );
+        // A state that covers the former events (a restored snapshot would
+        // be one) lets the cleanup proceed.
+        {
+            let mut roles = relay.roles.write().await;
+            roles.roles.insert("mod".into(), Default::default());
+            roles
+                .assignments
+                .insert(member.clone(), vec!["mod".into()]);
+        }
+        relay.heal_rotated_role_state().await;
+        let (stored, _) = relay.db.query(vec![role_filter()], 100, now).await;
+        assert!(
+            stored.iter().all(|event| event.pubkey == current_key),
+            "a covering state must still clean up the former key's events"
         );
         relay.db.shutdown();
     }

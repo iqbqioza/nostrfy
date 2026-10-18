@@ -2999,6 +2999,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_rotation_rebuild_keeps_role_state_it_cannot_reconstruct() {
+        // A relay key rotation plus a snapshot-less startup (first run on
+        // this database, a dropped snapshot, a state event removed) makes
+        // the role rebuild read the current key's events only: the former
+        // key's membership/role events are skipped and cannot be
+        // reconstructed. The heal must keep them instead of deleting the
+        // only copy; it still publishes the current state under the new
+        // key.
+        let path = std::env::temp_dir()
+            .join("nostrfy-server-test")
+            .join(format!("rotate-roles-rebuild-{:x}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        let now = crate::util::unix_now();
+        let member = "bb".repeat(32);
+        let key_a = "02".repeat(32);
+        let role_filter = || -> crate::filter::Filter {
+            serde_json::from_value(serde_json::json!({"kinds": [33534, 13534, 8000, 8001]}))
+                .unwrap()
+        };
+
+        // First life: key A's role state is in the database, and no
+        // snapshot exists, so the next startup must rebuild.
+        {
+            let relay_a = blossom_relay_with_key_at(&key_a, path.clone()).await;
+            let mut membership = crate::event::Event {
+                id: String::new(),
+                pubkey: key_a.clone(),
+                created_at: now,
+                kind: 13534,
+                tags: vec![vec!["member".into(), member.clone(), "mod".into()]],
+                content: String::new(),
+                sig: String::new(),
+            };
+            membership.id = crate::nips::nip01::compute_id(&membership);
+            let mut role = crate::event::Event {
+                id: String::new(),
+                pubkey: key_a.clone(),
+                created_at: now,
+                kind: 33534,
+                tags: vec![vec!["d".into(), "mod".into()]],
+                content: String::new(),
+                sig: String::new(),
+            };
+            role.id = crate::nips::nip01::compute_id(&role);
+            for event in [membership, role] {
+                assert!(matches!(
+                    relay_a.db.put(event, now).await,
+                    crate::db::PutOutcome::Stored
+                ));
+            }
+            relay_a.db.shutdown();
+        }
+
+        // Second life: key B. The rebuild skips key A's events, so the
+        // rebuilt state cannot cover them and the heal must keep them.
+        let relay_b = blossom_relay_with_key_at(&"03".repeat(32), path).await;
+        let key_b = relay_b.relay_pubkey().expect("key B must be configured");
+        restore_role_state(&relay_b)
+            .await
+            .expect("the startup must succeed");
+        let (stored, _) = relay_b.db.query(vec![role_filter()], 100, now).await;
+        assert!(
+            stored.iter().any(|event| event.pubkey == key_a),
+            "former-key state a rebuild cannot reconstruct must be kept"
+        );
+        assert!(
+            stored.iter().any(|event| event.pubkey == key_b),
+            "the current state must still be published under the new key"
+        );
+        relay_b.db.shutdown();
+    }
+
+    #[tokio::test]
     async fn startup_with_nip29_disabled_and_no_snapshot_fails_closed() {
         // A legacy database (no snapshot) started with NIP-29 disabled: the
         // store stays empty, and unknown group ids must read as private
