@@ -1990,12 +1990,18 @@ async fn serve_limited(
                 // detached WebSocket task (`crate::conn::ConnSlot`). For a
                 // trusted proxy only the global count is reserved here (the
                 // middleware acquires the per-IP slot under the forwarded
-                // address); releasing the never-acquired peer key is a
-                // no-op.
+                // address), so the slot carries no per-IP key to release.
                 let slot = crate::conn::ConnSlot::new(
                     Arc::clone(&active),
                     Arc::clone(&ip_counter),
-                    accounting,
+                    // Only an untrusted connection acquires its per-IP slot
+                    // here. A trusted proxy's per-IP slot is acquired by the
+                    // request middleware under the forwarded address, so the
+                    // accept-layer slot owns no peer key to release: when
+                    // the forwarded chain falls back to the peer, that key
+                    // belongs to the middleware's guard, and releasing it
+                    // here would free another request's slot.
+                    (!trusted).then_some(accounting),
                 );
 
                 // Keep per-connection kernel buffers small so that hundreds

@@ -64,13 +64,21 @@ const OWNED: u8 = 1;
 const RELEASED: u8 = 2;
 
 /// One accepted TCP connection's reserved slot: the global connection count
-/// plus the per-IP count. `ConnSlot` itself is only shared state; the
-/// release happens through [`AcceptSlotGuard`] (accept task) or
-/// [`ConnSlotGuard`] (handed-over WebSocket).
+/// plus the per-IP count when the accept layer acquired one. `ConnSlot`
+/// itself is only shared state; the release happens through
+/// [`AcceptSlotGuard`] (accept task) or [`ConnSlotGuard`] (handed-over
+/// WebSocket).
+///
+/// A trusted-proxy connection reserves the global count only: its per-IP
+/// slot is acquired by the request middleware under the forwarded client
+/// address, and the peer key is never acquired here. Releasing the peer key
+/// anyway would free another request's slot whenever the forwarded chain
+/// fell back to the peer (an absent or malformed header), so the per-IP key
+/// is `Option`: `None` releases the global count alone.
 pub(crate) struct ConnSlot {
     active: Arc<AtomicUsize>,
     ip_counter: Arc<IpConnCounter>,
-    ip: IpAddr,
+    per_ip: Option<IpAddr>,
     state: AtomicU8,
 }
 
@@ -78,12 +86,12 @@ impl ConnSlot {
     pub(crate) fn new(
         active: Arc<AtomicUsize>,
         ip_counter: Arc<IpConnCounter>,
-        ip: IpAddr,
+        per_ip: Option<IpAddr>,
     ) -> Arc<Self> {
         Arc::new(Self {
             active,
             ip_counter,
-            ip,
+            per_ip,
             state: AtomicU8::new(PENDING),
         })
     }
@@ -122,7 +130,9 @@ impl ConnSlot {
 
     fn release(&self) {
         self.active.fetch_sub(1, Ordering::Relaxed);
-        self.ip_counter.release(self.ip);
+        if let Some(ip) = self.per_ip {
+            self.ip_counter.release(ip);
+        }
     }
 }
 
@@ -194,7 +204,7 @@ mod tests {
         let addr = ip("198.51.100.10");
         assert!(counter.try_acquire(addr, 1));
         active.fetch_add(1, Ordering::Relaxed);
-        let slot = ConnSlot::new(Arc::clone(&active), Arc::clone(&counter), addr);
+        let slot = ConnSlot::new(Arc::clone(&active), Arc::clone(&counter), Some(addr));
         drop(AcceptSlotGuard::new(Arc::clone(&slot)));
         assert_eq!(
             active.load(Ordering::Relaxed),
@@ -214,7 +224,7 @@ mod tests {
         let addr = ip("198.51.100.11");
         assert!(counter.try_acquire(addr, 1));
         active.fetch_add(1, Ordering::Relaxed);
-        let slot = ConnSlot::new(Arc::clone(&active), Arc::clone(&counter), addr);
+        let slot = ConnSlot::new(Arc::clone(&active), Arc::clone(&counter), Some(addr));
         let accept_guard = AcceptSlotGuard::new(Arc::clone(&slot));
         let ws_guard = slot.handover().expect("the first handover must win");
         // The accept task ends (the HTTP connection resolved at upgrade):
@@ -238,7 +248,7 @@ mod tests {
         let addr = ip("198.51.100.12");
         assert!(counter.try_acquire(addr, 1));
         active.fetch_add(1, Ordering::Relaxed);
-        let slot = ConnSlot::new(Arc::clone(&active), Arc::clone(&counter), addr);
+        let slot = ConnSlot::new(Arc::clone(&active), Arc::clone(&counter), Some(addr));
         // The accept task ends first (no upgrade completed).
         drop(AcceptSlotGuard::new(Arc::clone(&slot)));
         assert_eq!(active.load(Ordering::Relaxed), 0);
@@ -268,7 +278,8 @@ mod tests {
                             continue;
                         }
                         active.fetch_add(1, Ordering::Relaxed);
-                        let slot = ConnSlot::new(Arc::clone(&active), Arc::clone(&counter), addr);
+                        let slot =
+                            ConnSlot::new(Arc::clone(&active), Arc::clone(&counter), Some(addr));
                         let accept = AcceptSlotGuard::new(Arc::clone(&slot));
                         // Deterministic interleaving: hand over on some
                         // iterations (the accept guard must then not
@@ -313,7 +324,7 @@ mod tests {
         let addr = ip("198.51.100.13");
         assert!(counter.try_acquire(addr, 2));
         active.fetch_add(1, Ordering::Relaxed);
-        let slot = ConnSlot::new(Arc::clone(&active), Arc::clone(&counter), addr);
+        let slot = ConnSlot::new(Arc::clone(&active), Arc::clone(&counter), Some(addr));
         let first = slot.handover().expect("the first handover wins");
         assert!(
             slot.handover().is_none(),
@@ -321,5 +332,36 @@ mod tests {
         );
         drop(first);
         assert_eq!(active.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn a_slot_without_a_per_ip_key_releases_only_the_global_count() {
+        // A trusted-proxy connection reserves only the global count: the
+        // per-IP slot belongs to the request middleware, which acquires it
+        // under the forwarded client address. When the forwarded chain
+        // falls back to the peer (an absent or malformed header), that key
+        // is the same one the middleware holds; releasing it from the
+        // accept-layer slot would free another request's slot and let the
+        // per-IP cap admit more connections than configured.
+        let counter = Arc::new(IpConnCounter::default());
+        let active = Arc::new(AtomicUsize::new(0));
+        let peer = ip("198.51.100.30");
+        // The middleware's slot for the fallback-attributed request.
+        assert!(counter.try_acquire(peer, 1));
+        active.fetch_add(1, Ordering::Relaxed);
+        let slot = ConnSlot::new(Arc::clone(&active), Arc::clone(&counter), None);
+        drop(AcceptSlotGuard::new(slot));
+        assert_eq!(
+            active.load(Ordering::Relaxed),
+            0,
+            "the global slot is freed"
+        );
+        assert!(
+            !counter.try_acquire(peer, 1),
+            "the peer key still belongs to the middleware's slot"
+        );
+        // Only the middleware's own release frees it.
+        counter.release(peer);
+        assert!(counter.try_acquire(peer, 1), "the owner's release frees it");
     }
 }
