@@ -1396,6 +1396,12 @@ async fn ws_handler(State(relay): State<Arc<Relay>>, request: Request) -> Respon
                 .max_message_size(max_msg)
                 .max_frame_size(max_msg)
                 .max_write_buffer_size(max_write)
+                // RFC 6455 / WHATWG WebSocket: a browser that lists
+                // subprotocols fails the handshake unless the server selects
+                // one. NIP-01 clients commonly offer `nostr`, so select it
+                // when (and only when) the client offered it — axum checks
+                // the request's list before echoing.
+                .protocols(["nostr"])
                 .on_upgrade(move |socket| async move {
                     // Holds the derived per-IP slot for the whole WebSocket
                     // lifetime (released when the connection task ends).
@@ -3855,6 +3861,78 @@ mod tests {
             .unwrap();
         let response = root_inbox_outbox(State(relay.clone()), request).await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        relay.db.shutdown();
+    }
+
+    /// Sends a minimal WebSocket handshake and returns the response head
+    /// (through the blank line), optionally offering a subprotocol list.
+    async fn handshake_head(addr: std::net::SocketAddr, protocols: Option<&str>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut request = format!(
+            "GET / HTTP/1.1\r\nHost: {addr}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n"
+        );
+        if let Some(protocols) = protocols {
+            request.push_str(&format!("Sec-WebSocket-Protocol: {protocols}\r\n"));
+        }
+        request.push_str("\r\n");
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut head = String::new();
+        let mut buf = [0u8; 1024];
+        while !head.contains("\r\n\r\n") {
+            let n = stream.read(&mut buf).await.unwrap();
+            assert!(n > 0, "the server closed before answering the handshake");
+            head.push_str(&String::from_utf8_lossy(&buf[..n]));
+        }
+        head
+    }
+
+    #[tokio::test]
+    async fn websocket_handshake_echoes_only_an_offered_nostr_subprotocol() {
+        // RFC 6455: a browser that lists subprotocols fails the handshake
+        // unless the server selects one. NIP-01 clients commonly offer
+        // `nostr`; the relay must echo it, but only when it was offered.
+        let relay = blossom_relay().await;
+        let app = build_router(&relay, None).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let offered = handshake_head(addr, Some("chat, nostr")).await;
+        assert!(
+            offered.starts_with("HTTP/1.1 101"),
+            "the handshake must upgrade: {offered}"
+        );
+        assert!(
+            offered
+                .to_ascii_lowercase()
+                .contains("sec-websocket-protocol: nostr\r\n"),
+            "an offered NIP-01 subprotocol must be echoed: {offered}"
+        );
+        // A client that offers only other subprotocols must not get one
+        // selected for it.
+        let other = handshake_head(addr, Some("chat")).await;
+        assert!(other.starts_with("HTTP/1.1 101"), "{other}");
+        assert!(
+            !other
+                .to_ascii_lowercase()
+                .contains("sec-websocket-protocol:"),
+            "an unoffered subprotocol must not be selected: {other}"
+        );
+        // No offer, no selection.
+        let bare = handshake_head(addr, None).await;
+        assert!(bare.starts_with("HTTP/1.1 101"), "{bare}");
+        assert!(
+            !bare
+                .to_ascii_lowercase()
+                .contains("sec-websocket-protocol:"),
+            "a bare handshake must not select a subprotocol: {bare}"
+        );
+
+        server.abort();
         relay.db.shutdown();
     }
 
