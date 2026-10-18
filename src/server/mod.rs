@@ -1008,6 +1008,13 @@ pub async fn run_server(
     {
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
+    // The debounced snapshot persists must commit before the database
+    // stops: the drain worker's final pass runs concurrently with this
+    // teardown, and a mutation arriving after the drain leaves its store
+    // dirty with no worker scheduled. A skipped role snapshot makes the
+    // next startup rebuild from the surviving events, which drops the
+    // snapshot-only invite codes.
+    relay.finish_snapshot_persists().await;
     relay.db.shutdown();
     info!("relay stopped");
     Ok(())

@@ -1412,6 +1412,11 @@ async fn groups_rebuild_worker(
 /// at startup and rebuilt from the surviving events.
 const SNAPSHOT_PERSIST_INTERVAL_MS: u64 = 1_000;
 
+/// Bound on the shutdown wait for the debounced worker's final pass (see
+/// [`Relay::finish_snapshot_persists`]): the pass is a database write
+/// (milliseconds), and a stuck worker must not delay the exit beyond this.
+const SNAPSHOT_FINISH_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Debounced persistence of the NIP-29 group and NIP-43 role snapshots.
 /// The mutation paths only set a dirty flag and schedule the single
 /// background worker, so the O(total state) clone+serialize stays off the
@@ -1499,6 +1504,9 @@ async fn snapshot_persist_worker(
             persist_roles_now(&db, &roles, &roles_rebuild, &persist_roles_lock).await;
         }
         if *drain.borrow() {
+            // Release the claim: the shutdown waits for it before stopping
+            // the database (see `Relay::finish_snapshot_persists`).
+            state.running.store(false, Ordering::SeqCst);
             break;
         }
         if state.any_dirty() {
@@ -1842,6 +1850,40 @@ impl Relay {
     /// A receiver for a connection loop to observe [`Self::signal_drain`].
     pub fn subscribe_drain(&self) -> tokio::sync::watch::Receiver<bool> {
         self.drain_tx.subscribe()
+    }
+
+    /// Completes the debounced snapshot persists during shutdown.
+    ///
+    /// The drain worker's final pass runs concurrently with the server
+    /// teardown, and the scheduler refuses a new worker once the drain is
+    /// set: without this wait and flush the database could stop while a
+    /// persist is still in flight (or a store is still marked dirty), and
+    /// a skipped role snapshot makes the next startup rebuild from the
+    /// surviving events — dropping the snapshot-only invite codes.
+    pub async fn finish_snapshot_persists(&self) {
+        let deadline = std::time::Instant::now() + SNAPSHOT_FINISH_GRACE;
+        while self.snapshot_persist.running.load(Ordering::SeqCst)
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        // The swap claims the dirty flag exactly once: a concurrent worker
+        // pass either cleared it already (nothing left to save) or this
+        // flush saves the state it would have.
+        if self
+            .snapshot_persist
+            .groups_dirty
+            .swap(false, Ordering::SeqCst)
+        {
+            self.persist_groups().await;
+        }
+        if self
+            .snapshot_persist
+            .roles_dirty
+            .swap(false, Ordering::SeqCst)
+        {
+            self.persist_roles().await;
+        }
     }
 
     /// Spawns the live batching task. Must be called once, after the relay
@@ -6211,6 +6253,27 @@ mod tests {
                 .dirty
                 .load(std::sync::atomic::Ordering::SeqCst),
             "the unchanged state must stay dirty so the next startup rebuilds"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn finish_snapshot_persists_flushes_a_drain_race() {
+        // A mutation after the drain signal: the scheduler refuses a new
+        // worker once the drain is set, so the shutdown must flush the
+        // dirty store itself — otherwise the database stops with the
+        // snapshot unsaved and the next startup rebuilds from the events,
+        // dropping the snapshot-only invite codes.
+        let key = "01".repeat(32);
+        let relay = build_role_relay(Some(&key)).await;
+        relay.signal_drain();
+        assert!(relay.create_claim("welcome").await);
+        relay.finish_snapshot_persists().await;
+        let saved = relay.db.load_roles().await.expect_loaded("snapshot");
+        assert!(
+            saved.claims.contains("welcome"),
+            "a mutation drained before its debounce pass must be flushed: {:?}",
+            saved.claims
         );
         relay.db.shutdown();
     }
