@@ -253,6 +253,29 @@ fn participants_from_response(status: u16, body: &str) -> Result<Vec<String>> {
     Ok(participant_pubkeys(participants))
 }
 
+/// The HTTP origin of the Room Service API for a configured LiveKit URL.
+///
+/// `relay.livekit_url` is the WebSocket endpoint clients dial (`wss://`,
+/// which the config guidance asks for), but the Room Service API is plain
+/// HTTPS and reqwest rejects the WebSocket schemes outright ("URL scheme
+/// is not allowed"): handing it the configured URL verbatim failed every
+/// participant poll, so no `kind:39004` list was ever published. `ws`/`wss`
+/// map to `http`/`https` (case-insensitively, like URL schemes generally);
+/// HTTP URLs pass through, path included, so a reverse-proxied LiveKit
+/// keeps working. Any other scheme is left for reqwest's own clear error.
+fn room_service_origin(url: &str) -> String {
+    let url = url.trim_end_matches('/');
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    let http = match scheme.to_ascii_lowercase().as_str() {
+        "wss" => "https",
+        "ws" => "http",
+        _ => return url.to_string(),
+    };
+    format!("{http}://{rest}")
+}
+
 /// Fetches the live participants of one LiveKit room through the Room
 /// Service API (Twirp/JSON). Errors are reported so the caller can skip the
 /// group instead of publishing an empty (wrong) list.
@@ -264,7 +287,7 @@ pub(crate) async fn fetch_livekit_participants(
 ) -> Result<Vec<String>> {
     let url = format!(
         "{}/twirp/livekit.RoomService/ListParticipants",
-        url.trim_end_matches('/')
+        room_service_origin(url)
     );
     let token = issue_livekit_admin_token(api_key, api_secret, room)?;
     let response = livekit_http_client()
@@ -968,6 +991,120 @@ mod tests {
             vec![alice, bob],
             "only valid identities survive, sorted and deduplicated"
         );
+    }
+
+    #[test]
+    fn room_service_origin_rewrites_websocket_schemes() {
+        // The configured URL is what clients dial (`wss://`), but reqwest
+        // only speaks http(s): the Room Service API origin must be the
+        // HTTP counterpart, or every poll fails with "URL scheme is not
+        // allowed" and no 39004 is ever published.
+        assert_eq!(
+            room_service_origin("wss://nostrfy-dx4ms3xk.livekit.cloud/"),
+            "https://nostrfy-dx4ms3xk.livekit.cloud"
+        );
+        assert_eq!(
+            room_service_origin("ws://127.0.0.1:7880"),
+            "http://127.0.0.1:7880"
+        );
+        // Schemes are case-insensitive, and a host case is preserved.
+        assert_eq!(
+            room_service_origin("WSS://Lk.Example.com"),
+            "https://Lk.Example.com"
+        );
+        // An HTTP URL (and its path) passes through unchanged.
+        assert_eq!(
+            room_service_origin("https://lk.example.com/livekit/"),
+            "https://lk.example.com/livekit"
+        );
+        // Anything else is left for reqwest to reject with its own error.
+        assert_eq!(room_service_origin("ftp://x"), "ftp://x");
+    }
+
+    /// What the stub recorded from the Room Service request: the path, the
+    /// `Authorization` header and the body.
+    struct SeenRequest {
+        path: String,
+        auth: String,
+        body: String,
+    }
+
+    type StubState = std::sync::Arc<tokio::sync::Mutex<Option<SeenRequest>>>;
+
+    /// Records one Room Service request and answers with a participants
+    /// list, standing in for the LiveKit server.
+    async fn room_service_stub(
+        axum::extract::State(seen): axum::extract::State<StubState>,
+        uri: axum::http::Uri,
+        headers: HeaderMap,
+        body: String,
+    ) -> Json<serde_json::Value> {
+        *seen.lock().await = Some(SeenRequest {
+            path: uri.path().to_string(),
+            auth: headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string(),
+            body,
+        });
+        Json(json!({
+            "participants": [{ "identity": format!("{}deadbeef", "aa".repeat(32)) }],
+        }))
+    }
+
+    #[tokio::test]
+    async fn fetch_participants_reaches_the_room_service_behind_a_websocket_url() {
+        // The regression this locks: `fetch_livekit_participants` handed
+        // reqwest the configured `wss://` URL verbatim, reqwest rejected
+        // the scheme, and the background poll logged a builder error
+        // every interval while participants came and went. The fetch must
+        // reach the HTTP Room Service API and parse its response.
+        let seen = std::sync::Arc::new(tokio::sync::Mutex::new(None));
+        let app = axum::Router::new()
+            .route(
+                "/twirp/livekit.RoomService/ListParticipants",
+                axum::routing::post(room_service_stub),
+            )
+            .with_state(seen.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        // `ws://` stands in for the production `wss://`: both must be
+        // rewritten before reqwest sees the URL.
+        let participants = fetch_livekit_participants(
+            &format!("ws://{addr}"),
+            "test-key",
+            "test-secret",
+            "room-a",
+        )
+        .await
+        .expect("the rewritten URL must reach the stub");
+        assert_eq!(participants, vec!["aa".repeat(32)]);
+
+        let seen = seen
+            .lock()
+            .await
+            .take()
+            .expect("the stub must have been reached");
+        assert_eq!(seen.path, "/twirp/livekit.RoomService/ListParticipants");
+        assert_eq!(seen.body, r#"{"room":"room-a"}"#);
+        // The request carries the roomAdmin token for exactly this room.
+        use base64::Engine as _;
+        let token = seen.auth.strip_prefix("Bearer ").expect("a bearer token");
+        let payload = token.split('.').nth(1).expect("a JWT has a payload");
+        let claims: serde_json::Value = serde_json::from_slice(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(payload)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(claims["iss"], "test-key");
+        assert_eq!(claims["video"]["room"], "room-a");
+        assert_eq!(claims["video"]["roomAdmin"], true);
     }
 
     /// Builds a webhook token the way LiveKit does (HS256 with a `sha256`
