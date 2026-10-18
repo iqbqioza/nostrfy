@@ -42,14 +42,19 @@ toml = "0.8"
 ureq = { version = "2", default-features = false, features = ["tls", "gzip"] }
 anyhow = "1.0.104"
 
-# Release build tuning: full LTO across all crates, single codegen unit and
-# stripped symbols give the best runtime performance and the smallest binary
-# at the cost of a slower build. `panic = "unwind"` is required: the database
-# threads recover from panics with `catch_unwind`, which `panic = "abort"`
-# would silently disable (a panic would then kill the whole relay).
+# Release build tuning: LTO is off on purpose. The hot paths live in C
+# libraries (libsecp256k1 verifies signatures, LMDB stores events) and in
+# generic Rust that monomorphizes into this crate, so the ingest and
+# fan-out benchmarks are within run-to-run noise with LTO off — while fat
+# LTO made every release rebuild take ~3 minutes because its final phase is
+# single-threaded (raising codegen-units does not parallelize it). LTO off
+# with parallel codegen units rebuilds in ~1 minute. `panic = "unwind"` is
+# required: the database threads recover from panics with `catch_unwind`,
+# which `panic = "abort"` would silently disable (a panic would then kill
+# the whole relay).
 [profile.release]
-lto = "fat"
-codegen-units = 1
+lto = "off"
+codegen-units = 16
 strip = "symbols"
 panic = "unwind"
 
@@ -66,10 +71,15 @@ opt-level = 3
 # arithmetic where wraparound would matter, so they are disabled.
 [profile.dev]
 # Light optimization for the relay's own crate: a debug build keeps
-# debuginfo and assertions, but opt-level 1 makes the hot loops (event
-# validation, window processing) fast enough for load testing.
+# assertions, but opt-level 1 makes the hot loops (event validation,
+# window processing) fast enough for load testing.
 opt-level = 1
 overflow-checks = false
+# Line tables only: backtraces keep file and line numbers, while the
+# local-variable debug info that dominates compile and link time is
+# dropped. (The FreeBSD CI job drops debug info entirely because its link
+# would otherwise run out of memory.)
+debug = "line-tables-only"
 
 [dev-dependencies]
 tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
