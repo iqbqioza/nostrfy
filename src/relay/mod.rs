@@ -8906,6 +8906,70 @@ mod tests {
     }
 
     #[test]
+    fn a_join_request_is_validated_for_freshness_and_vanish() {
+        // NIP-43: the join's `created_at` MUST be now ± a few minutes, and a
+        // vanished pubkey must not rejoin through an invite code: the
+        // admission path never reaches the store's put-time vanish gate.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            use crate::db::PutOutcome;
+
+            let relay = build_relay_with_key(false, &hex::encode([23u8; 32])).await;
+            let secret = secp256k1::SecretKey::from_slice(&[24u8; 32]).unwrap();
+            let keypair =
+                secp256k1::Keypair::from_seckey_slice(relay.secp(), &secret.secret_bytes())
+                    .unwrap();
+            let pubkey = secp256k1::XOnlyPublicKey::from_keypair(&keypair)
+                .0
+                .to_string();
+            relay.roles.write().await.add_claim("JOINCODE");
+            let now = crate::util::unix_now();
+            let signed_at = |created_at: u64| {
+                let mut e = crate::event::Event {
+                    id: String::new(),
+                    pubkey: pubkey.clone(),
+                    created_at,
+                    kind: crate::nips::nip43::JOIN,
+                    tags: vec![vec!["claim".into(), "JOINCODE".into()]],
+                    content: String::new(),
+                    sig: String::new(),
+                };
+                e.id = crate::nips::nip01::compute_id(&e);
+                let id = e.id_bytes().unwrap();
+                e.sig = relay
+                    .secp()
+                    .sign_schnorr_no_aux_rand(&id, &keypair)
+                    .to_string();
+                e
+            };
+            // A stale join is refused before the code is considered.
+            assert!(
+                matches!(
+                    relay.accept_event(signed_at(now - 601), &[], None).await,
+                    PutOutcome::Invalid(msg) if msg.contains("join request is too old")
+                ),
+                "a stale join must be refused"
+            );
+            // A vanished pubkey cannot rejoin: the marker blocks the
+            // admission that never reaches the store's put gate.
+            let key: [u8; 32] = hex::decode(&pubkey).unwrap().try_into().unwrap();
+            relay.db.apply_vanish(key, now).await;
+            assert!(
+                matches!(
+                    relay.accept_event(signed_at(now), &[], None).await,
+                    PutOutcome::Invalid(msg) if msg.contains("requested to vanish")
+                ),
+                "a vanished pubkey must not rejoin with an invite code"
+            );
+            assert!(
+                !relay.roles.read().await.is_member_of(&pubkey),
+                "the vanish must win over the invite code"
+            );
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
     fn deleting_a_moderation_event_revokes_the_derived_group_state() {
         // NIP-09: deleting the 9002 that made a group private must revoke
         // the in-memory setting (the state is rebuilt from the survivors),

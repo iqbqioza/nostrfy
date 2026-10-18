@@ -275,6 +275,18 @@ fn handle_read_msg(store: &Store, errors: &Arc<std::sync::atomic::AtomicU64>, ms
             let _ = reply.send(exists);
             false
         }
+        Msg::VanishStatus { pubkey, reply } => {
+            match store.is_vanished(&pubkey) {
+                Ok(vanished) => {
+                    let _ = reply.send(vanished);
+                }
+                // A failed point lookup keeps the caller fail-closed: the
+                // dropped reply surfaces as `None` (see
+                // `DbClient::request_read_result`).
+                Err(e) => db_error(errors, &e),
+            }
+            false
+        }
         Msg::PrefixesExist { prefixes, reply } => {
             let out = match store.prefixes_exist(&prefixes) {
                 Ok(out) => out,
@@ -1710,7 +1722,8 @@ pub(crate) fn spawn(
                                 | Msg::Put { .. }
                                 | Msg::Shutdown
                                 | Msg::LoadAccess { .. }
-                                | Msg::FirstSeenStatus { .. } => {
+                                | Msg::FirstSeenStatus { .. }
+                                | Msg::VanishStatus { .. } => {
                                     unreachable!()
                                 }
                             }

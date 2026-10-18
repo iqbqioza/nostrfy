@@ -794,6 +794,14 @@ enum Msg {
     VanishCounts {
         reply: oneshot::Sender<Option<(u64, u64)>>,
     },
+    /// Point lookup of the NIP-62 vanish marker for the NIP-43 join
+    /// precheck (whose Admit path never reaches the store's put-time vanish
+    /// gate). The reply is dropped on a read error, so the caller sees
+    /// `None` and fails closed.
+    VanishStatus {
+        pubkey: Vec<u8>,
+        reply: oneshot::Sender<bool>,
+    },
     /// Last used LMDB page number. The map is opened at its fixed ceiling
     /// and never resized, so tests assert real page growth instead of the
     /// constant `map_size`.
@@ -2292,6 +2300,25 @@ impl DbClient {
     pub async fn event_id_prefix_exists(&self, prefix: &[u8]) -> bool {
         self.request_read(|reply| Msg::PrefixExists {
             prefix: prefix.to_vec(),
+            reply,
+        })
+        .await
+    }
+
+    /// Whether `pubkey` is NIP-62 vanished: `Some(false)` for a malformed
+    /// key (it cannot have a marker) and `None` when the database did not
+    /// answer, so the caller can fail closed. The NIP-43 join precheck
+    /// asks directly because its Admit path never reaches the store's
+    /// put-time vanish gate.
+    pub async fn is_vanished(&self, pubkey: &str) -> Option<bool> {
+        let Ok(bytes) = hex::decode(pubkey) else {
+            return Some(false);
+        };
+        if bytes.len() != 32 {
+            return Some(false);
+        }
+        self.request_read_result(|reply| Msg::VanishStatus {
+            pubkey: bytes,
             reply,
         })
         .await

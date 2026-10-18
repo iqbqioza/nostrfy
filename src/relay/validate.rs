@@ -226,6 +226,29 @@ impl super::Relay {
         // with the spec's `restricted:` wording. NIP-43 mandates an OK
         // reply on every path.
         if cfg.nip_enabled(43) && event.kind == nip43::JOIN {
+            // NIP-43: "The event's created_at MUST be now, plus or minus a
+            // few minutes." The leave request has always been checked; the
+            // join needs the same window (a stale, pre-signed request must
+            // not admit its author later).
+            if event.created_at.abs_diff(now) > 600 {
+                return Precheck::Reject("invalid: join request is too old".into());
+            }
+            // A vanished pubkey must not rejoin through an invite code: the
+            // relay documents a permanent publishing ban, and the Admit
+            // path never reaches the store's put-time vanish gate. A
+            // database that cannot answer fails closed; the join can be
+            // retried.
+            match self.db.is_vanished(&event.pubkey).await {
+                Some(false) => {}
+                Some(true) => {
+                    return Precheck::Reject("blocked: this pubkey has requested to vanish".into());
+                }
+                None => {
+                    return Precheck::Reject(
+                        "error: cannot verify the vanish status; retry".into(),
+                    );
+                }
+            }
             let roles = self.roles.read().await;
             if roles.is_member_of(&event.pubkey) {
                 // NIP-43: the spec's example replies OK `true` with the

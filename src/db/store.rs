@@ -2478,6 +2478,20 @@ impl Store {
         Ok(self.vanish_pending.get(wtxn, pubkey)?.is_some())
     }
 
+    /// Read-transaction point lookup of the vanish marker, for the NIP-43
+    /// join precheck (see `DbClient::is_vanished`). Mirrors
+    /// [`Self::vanished_or_pending`].
+    pub(crate) fn is_vanished(&self, pubkey: &[u8]) -> Result<bool> {
+        let rtxn = self.env.read_txn()?;
+        if self.vanish.get(&rtxn, pubkey)?.is_some() {
+            return Ok(true);
+        }
+        if self.vanish_pending.is_empty(&rtxn)? {
+            return Ok(false);
+        }
+        Ok(self.vanish_pending.get(&rtxn, pubkey)?.is_some())
+    }
+
     /// Row counts of the NIP-62 bookkeeping: `(completed vanish markers,
     /// pending vanish records)`. Exposed as gauges so operators can see the
     /// (permanently growing) marker table and confirm that interrupted
