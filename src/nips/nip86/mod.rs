@@ -1258,6 +1258,39 @@ impl std::fmt::Display for Identity {
 /// decides. A banned pubkey is refused on every authenticated service.
 /// Returns the identity for the audit trail: the NIP-98 pubkey or
 /// `"management-token"`.
+/// Whether the request was presented on the host the relay's canonical
+/// origin names (see the call site in [`rpc_authenticated`]): the `Host`
+/// header — or the HTTP/2 `:authority` fallback — must name the configured
+/// identity host. A request with neither cannot be bound and keeps the
+/// configured-origin behavior (the full-URL check in
+/// [`nip98::matches_request_url`] still applies). The bearer management
+/// token names no origin and is not affected.
+fn presented_on_identity_host(
+    cfg: &crate::config::Config,
+    headers: &HeaderMap,
+    uri: &axum::http::Uri,
+) -> bool {
+    let Some(presented) = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .map(str::to_string)
+        .or_else(|| {
+            uri.authority()
+                .map(|authority| authority.host().to_string())
+        })
+    else {
+        return true;
+    };
+    let identity = cfg.relay_identity();
+    let authority = crate::nips::nip62::authority_of(&identity);
+    let identity_host = crate::nips::nip62::split_host_port(&authority).0;
+    let presented_host = crate::nips::nip62::split_host_port(&presented).0;
+    presented_host
+        .trim_end_matches('.')
+        .eq_ignore_ascii_case(identity_host.trim_end_matches('.'))
+}
+
 async fn rpc_authenticated(
     relay: &Relay,
     headers: &HeaderMap,
@@ -1273,6 +1306,15 @@ async fn rpc_authenticated(
         && ct_eq(token, &cfg.rpc.management_token)
     {
         return Some(Identity::Admin("management-token".into()));
+    }
+    // NIP-98: the `u` tag is matched against the relay's configured origin
+    // (`matches_request_url`), but the request itself may arrive with any
+    // `Host` — every hostname that is not the API or Blossom host is a
+    // relay host. A token signed for the canonical origin must be presented
+    // on that host, or a token captured for one public hostname could be
+    // replayed through another hostname that fronts the same relay.
+    if !presented_on_identity_host(&cfg, headers, uri) {
+        return None;
     }
     let payload = nip98::payload_sha256_hex(body.as_bytes());
     // Full administrator: the configured admin pubkey.
@@ -1422,20 +1464,69 @@ mod tests {
         assert_eq!(strip_bearer_scheme(""), None);
     }
 
-    /// Calls the RPC as a non-admin pubkey with a fresh NIP-98 signature
-    /// (the grantee path: `u` = this endpoint, `method` = POST, payload =
-    /// the body hash). A per-call salt in the auth event's `content` keeps
-    /// the event id unique: the relay's 60-second replay guard would
-    /// otherwise reject two identical calls in the same second. The salt
-    /// rides `content` (which this relay leniently ignores) rather than
-    /// the RPC body, so strict param validation sees pristine inputs.
-    /// Returns the keypair's pubkey with the response.
-    async fn nip98_call(
+    #[tokio::test]
+    async fn nip98_auth_is_bound_to_the_identity_host() {
+        // NIP-98: the `u` tag names the relay's canonical origin. A request
+        // carrying that authorization must be presented on that host: the
+        // relay port is otherwise reachable through any other hostname, and
+        // a token captured for the canonical one must not work there.
+        let relay = build_admin_relay().await;
+        let identity_host = {
+            let cfg = relay.config.read().await;
+            let authority = crate::nips::nip62::authority_of(&cfg.relay_identity());
+            crate::nips::nip62::split_host_port(&authority)
+                .0
+                .to_string()
+        };
+        // A forged Host: refused before the method is considered.
+        let (_, mut headers, body) =
+            nip98_headers(&relay, &[9u8; 32], "supportedmethods", vec![]).await;
+        headers.insert(header::HOST, "evil.example.com".parse().unwrap());
+        let resp = rpc_handler(
+            State(relay.clone()),
+            axum::extract::ConnectInfo("127.0.0.1:1234".parse().unwrap()),
+            axum::http::Uri::from_static("/"),
+            headers,
+            body,
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "a token for the relay origin must not be accepted on another host"
+        );
+        // The identity host (a proxy may add the port) is accepted.
+        let (_, mut headers, body) =
+            nip98_headers(&relay, &[9u8; 32], "supportedmethods", vec![]).await;
+        headers.insert(
+            header::HOST,
+            format!("{identity_host}:8080").parse().unwrap(),
+        );
+        let resp = rpc_handler(
+            State(relay.clone()),
+            axum::extract::ConnectInfo("127.0.0.1:1234".parse().unwrap()),
+            axum::http::Uri::from_static("/"),
+            headers,
+            body,
+        )
+        .await;
+        assert_ne!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "the identity host must accept the authorization"
+        );
+        relay.db.shutdown();
+    }
+
+    /// Builds the fresh NIP-98 grantee authorization (pubkey, headers,
+    /// body) of [`nip98_call`]; the caller owns the request so it can vary
+    /// the `Host` header.
+    async fn nip98_headers(
         relay: &std::sync::Arc<Relay>,
         seckey: &[u8; 32],
         method: &str,
         params: Vec<Value>,
-    ) -> (String, Response) {
+    ) -> (String, HeaderMap, String) {
         use base64::Engine as _;
         static SALT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let salt = SALT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1473,6 +1564,24 @@ mod tests {
             format!("Nostr {encoded}").parse().unwrap(),
         );
         headers.insert(header::CONTENT_TYPE, RPC_CONTENT_TYPE.parse().unwrap());
+        (pubkey, headers, body)
+    }
+
+    /// Calls the RPC as a non-admin pubkey with a fresh NIP-98 signature
+    /// (the grantee path: `u` = this endpoint, `method` = POST, payload =
+    /// the body hash). A per-call salt in the auth event's `content` keeps
+    /// the event id unique: the relay's 60-second replay guard would
+    /// otherwise reject two identical calls in the same second. The salt
+    /// rides `content` (which this relay leniently ignores) rather than
+    /// the RPC body, so strict param validation sees pristine inputs.
+    /// Returns the keypair's pubkey with the response.
+    async fn nip98_call(
+        relay: &std::sync::Arc<Relay>,
+        seckey: &[u8; 32],
+        method: &str,
+        params: Vec<Value>,
+    ) -> (String, Response) {
+        let (pubkey, headers, body) = nip98_headers(relay, seckey, method, params).await;
         let resp = rpc_handler(
             State(relay.clone()),
             axum::extract::ConnectInfo("127.0.0.1:1234".parse().unwrap()),

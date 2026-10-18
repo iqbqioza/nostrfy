@@ -481,27 +481,45 @@ async fn host_split(api_host: &str, blossom_host: &str, request: Request, next: 
                 .map(|authority| authority.host().to_ascii_lowercase())
         })
         .unwrap_or_default();
-    if host_route_allowed(api_host, blossom_host, &host, request.uri().path()) {
+    if host_route_allowed(
+        api_host,
+        blossom_host,
+        &host,
+        request.uri().path(),
+        request.method(),
+    ) {
         next.run(request).await
     } else {
         StatusCode::NOT_FOUND.into_response()
     }
 }
 
-/// Decides whether a request (host + path) may reach the next handler:
-/// the `api_host` serves only the API paths, the `blossom.host` serves only
-/// the Blossom routes, and every other host serves only the relay endpoints.
-/// API paths are relay-side when `api_host` is unset (so `restrict_uploads` /
-/// blossom alone never hides `/health`, `/metrics` or `/api/v1`).
-fn host_route_allowed(api_host: &str, blossom_host: &str, host: &str, path: &str) -> bool {
+/// Decides whether a request (host + path + method) may reach the next
+/// handler: the `api_host` serves only the API paths, the `blossom.host`
+/// serves only the Blossom routes, and every other host serves only the
+/// relay endpoints. API paths are relay-side when `api_host` is unset (so
+/// `restrict_uploads` / blossom alone never hides `/health`, `/metrics` or
+/// `/api/v1`).
+fn host_route_allowed(
+    api_host: &str,
+    blossom_host: &str,
+    host: &str,
+    path: &str,
+    method: &axum::http::Method,
+) -> bool {
     let is_api = !api_host.is_empty() && host == api_host;
     let is_blossom = !blossom_host.is_empty() && host == blossom_host;
     let is_relay = !is_api && !is_blossom;
     let api_path = !api_host.is_empty()
         && (path.starts_with("/api/v1") || path == "/health" || path == "/metrics");
     // The root `/` is dispatched by the WS handler (relay info or Blossom
-    // server info), so it must pass through on the Blossom host too.
-    let blossom_path = blossom::is_blossom_path(path) || (is_blossom && path == "/");
+    // server info) for reads, so it must pass through on the Blossom host.
+    // The relay host's root also carries the NIP-86 management RPC (POST),
+    // which the media host must not expose through the split: writes to `/`
+    // stay on the relay host (a CDN-fronted media hostname would otherwise
+    // reach the management API).
+    let root_read = matches!(*method, axum::http::Method::GET | axum::http::Method::HEAD);
+    let blossom_path = blossom::is_blossom_path(path) || (is_blossom && path == "/" && root_read);
     (is_api && api_path) || (is_blossom && blossom_path) || (is_relay && !api_path && !blossom_path)
 }
 
@@ -5402,33 +5420,44 @@ mod tests {
             "api.example.com",
             "",
             &norm("api.example.com"),
-            "/api/v1/x"
+            "/api/v1/x",
+            &axum::http::Method::GET
         ));
         assert!(host_route_allowed(
             "api.example.com",
             "",
             &norm("api.example.com:8080"),
-            "/api/v1/x"
+            "/api/v1/x",
+            &axum::http::Method::GET
         ));
         assert!(host_route_allowed(
             "api.example.com",
             "",
             &norm("API.EXAMPLE.COM"),
-            "/api/v1/x"
+            "/api/v1/x",
+            &axum::http::Method::GET
         ));
         assert!(!host_route_allowed(
             "api.example.com",
             "",
             &norm("notapi.example.com"),
-            "/api/v1/x"
+            "/api/v1/x",
+            &axum::http::Method::GET
         ));
         // HTTP requires bracket form for IPv6 Host headers.
-        assert!(host_route_allowed("", "::1", &norm("[::1]"), "/upload"));
+        assert!(host_route_allowed(
+            "",
+            "::1",
+            &norm("[::1]"),
+            "/upload",
+            &axum::http::Method::GET
+        ));
         assert!(host_route_allowed(
             "",
             "::1",
             &norm("[::1]:8080"),
-            "/upload"
+            "/upload",
+            &axum::http::Method::GET
         ));
     }
 
@@ -5440,93 +5469,170 @@ mod tests {
             "",
             "media.test",
             "relay.example.com",
-            "/health"
+            "/health",
+            &axum::http::Method::GET
         ));
         assert!(host_route_allowed(
             "",
             "media.test",
             "relay.example.com",
-            "/metrics"
+            "/metrics",
+            &axum::http::Method::GET
         ));
         assert!(host_route_allowed(
             "",
             "media.test",
             "relay.example.com",
-            "/api/v1/npub1x"
+            "/api/v1/npub1x",
+            &axum::http::Method::GET
         ));
         assert!(host_route_allowed(
             "",
             "media.test",
             "relay.example.com",
-            "/ws"
+            "/ws",
+            &axum::http::Method::GET
         ));
         assert!(host_route_allowed(
             "",
             "media.test",
             "media.test",
-            &format!("/{sha}")
+            &format!("/{sha}"),
+            &axum::http::Method::GET
         ));
         assert!(host_route_allowed(
             "",
             "media.test",
             "media.test",
-            "/upload"
+            "/upload",
+            &axum::http::Method::GET
         ));
-        assert!(!host_route_allowed("", "media.test", "media.test", "/ws"));
+        assert!(!host_route_allowed(
+            "",
+            "media.test",
+            "media.test",
+            "/ws",
+            &axum::http::Method::GET
+        ));
         assert!(!host_route_allowed(
             "",
             "media.test",
             "relay.example.com",
-            &format!("/{sha}")
+            &format!("/{sha}"),
+            &axum::http::Method::GET
         ));
         // api + blossom: each host serves only its own paths.
         assert!(host_route_allowed(
             "api.example.com",
             "media.test",
             "api.example.com",
-            "/api/v1/npub1x"
+            "/api/v1/npub1x",
+            &axum::http::Method::GET
         ));
         assert!(host_route_allowed(
             "api.example.com",
             "media.test",
             "api.example.com",
-            "/health"
+            "/health",
+            &axum::http::Method::GET
         ));
         assert!(!host_route_allowed(
             "api.example.com",
             "media.test",
             "api.example.com",
-            "/ws"
+            "/ws",
+            &axum::http::Method::GET
         ));
         assert!(!host_route_allowed(
             "api.example.com",
             "media.test",
             "relay.example.com",
-            "/health"
+            "/health",
+            &axum::http::Method::GET
         ));
         assert!(host_route_allowed(
             "api.example.com",
             "media.test",
             "relay.example.com",
-            "/ws"
+            "/ws",
+            &axum::http::Method::GET
         ));
         assert!(!host_route_allowed(
             "api.example.com",
             "media.test",
             "media.test",
-            "/api/v1/npub1x"
+            "/api/v1/npub1x",
+            &axum::http::Method::GET
         ));
         // neither split: everything is a relay path (a bare 64-hex path is
         // still a Blossom-shaped path and 404s — no Blossom routes are
         // mounted without `blossom.host`).
-        assert!(host_route_allowed("", "", "relay.example.com", "/health"));
+        assert!(host_route_allowed(
+            "",
+            "",
+            "relay.example.com",
+            "/health",
+            &axum::http::Method::GET
+        ));
         assert!(!host_route_allowed(
             "",
             "",
             "relay.example.com",
-            &format!("/{sha}")
+            &format!("/{sha}"),
+            &axum::http::Method::GET
         ));
-        assert!(!host_route_allowed("", "", "relay.example.com", "/upload"));
+        assert!(!host_route_allowed(
+            "",
+            "",
+            "relay.example.com",
+            "/upload",
+            &axum::http::Method::GET
+        ));
+    }
+
+    #[test]
+    fn blossom_host_serves_only_reads_at_the_root() {
+        // The media host's root is its server-info document (`GET`/`HEAD`).
+        // The relay host's root also carries the NIP-86 management RPC
+        // (`POST`): reaching it through the media hostname (which may be
+        // CDN-exposed) would break the "Blossom routes only" isolation.
+        assert!(host_route_allowed(
+            "",
+            "media.test",
+            "media.test",
+            "/",
+            &axum::http::Method::GET
+        ));
+        assert!(host_route_allowed(
+            "",
+            "media.test",
+            "media.test",
+            "/",
+            &axum::http::Method::HEAD
+        ));
+        assert!(!host_route_allowed(
+            "",
+            "media.test",
+            "media.test",
+            "/",
+            &axum::http::Method::POST
+        ));
+        // The relay host's root still reaches the management RPC.
+        assert!(host_route_allowed(
+            "",
+            "media.test",
+            "relay.example.com",
+            "/",
+            &axum::http::Method::POST
+        ));
+        // The API host's root belongs to neither (no API route, no RPC).
+        assert!(!host_route_allowed(
+            "api.example.com",
+            "media.test",
+            "api.example.com",
+            "/",
+            &axum::http::Method::GET
+        ));
     }
 
     #[test]
