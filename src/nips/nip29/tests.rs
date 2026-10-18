@@ -1044,6 +1044,70 @@ fn a_placeholder_child_is_adopted_when_the_creator_is_a_parent_admin() {
 }
 
 #[test]
+fn a_declared_placeholder_child_gets_no_metadata_emit() {
+    // A `child` tag may name an id whose group does not exist yet (a
+    // placeholder). The relay must not publish a bare 39000 for it: stored,
+    // that metadata makes a later snapshot-less rebuild treat the id as a
+    // group whose state was lost and ghost it — the id could never be
+    // created again, and the ghost consumes a group slot.
+    let mut store = GroupStore::with_cap(10);
+    store.apply(
+        &event(CREATE_GROUP, ADMIN, Some("g1"), vec![]),
+        "relay",
+        1,
+        false,
+        false,
+    );
+    let is_g2_meta = |out: &[Event]| {
+        out.iter().any(|e| {
+            e.kind == GROUP_META
+                && e.tags
+                    .iter()
+                    .any(|t| t == &vec![D.to_string(), "g2".into()])
+        })
+    };
+    let declare = event(
+        9002,
+        ADMIN,
+        Some("g1"),
+        vec![vec!["child".into(), "g2".into()]],
+    );
+    let out = store.apply(&declare, "relay", 2, true, false);
+    assert!(
+        !is_g2_meta(&out),
+        "a placeholder child must not get a stored 39000"
+    );
+    // A later edit re-lists the placeholder: still no metadata for it.
+    let edit = event(
+        9002,
+        ADMIN,
+        Some("g1"),
+        vec![
+            vec!["child".into(), "g2".into()],
+            vec!["name".into(), "g1".into()],
+        ],
+    );
+    let out = store.apply(&edit, "relay", 3, true, false);
+    assert!(
+        !is_g2_meta(&out),
+        "re-listing a placeholder must not emit its metadata"
+    );
+    // Once the child exists, the parent's edit republishes its metadata.
+    store.apply(
+        &event(CREATE_GROUP, ADMIN, Some("g2"), vec![]),
+        "relay",
+        4,
+        true,
+        false,
+    );
+    let out = store.apply(&edit, "relay", 5, true, false);
+    assert!(
+        is_g2_meta(&out),
+        "an existing child's metadata is republished"
+    );
+}
+
+#[test]
 fn deleted_group_content_is_hidden() {
     let mut store = seeded();
     let edit = event(9002, ADMIN, Some("g1"), vec![vec!["private".into()]]);
@@ -1549,6 +1613,71 @@ fn rebuild_ghosts_group_whose_only_surviving_events_are_relay_metadata() {
         assert!(
             !store.visible_gid("g1", true, None),
             "the ghosted group's metadata is withheld"
+        );
+    });
+}
+
+#[test]
+fn rebuild_ignores_metadata_signed_by_other_keys() {
+    // While NIP-29 was disabled a client could store a `39000` with a `d`
+    // tag. Enabling the NIP must not let that junk ghost the id: no group
+    // state ever existed and a keyed relay never published it.
+    // Relay-signed metadata keeps ghosting (the vanished-creator case).
+    use crate::db::DbClient;
+    use crate::nips::nip01;
+    use std::sync::Arc;
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = std::env::temp_dir()
+        .join("nostrfy-nip29-ghost-signer")
+        .join(format!("{:x}-{id}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&path);
+    let cfg = crate::config::DatabaseConfig {
+        path,
+        map_size: 16 * 1024 * 1024,
+        max_map_size: 32 * 1024 * 1024,
+        ..Default::default()
+    };
+    let db = DbClient::open(
+        &cfg,
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let now = 1_700_000_000;
+        let relay_key = "22".repeat(32);
+        let client_key = "11".repeat(32);
+        for (gid, pubkey) in [("g1", &relay_key), ("g2", &client_key)] {
+            let mut meta = Event {
+                id: String::new(),
+                pubkey: pubkey.clone(),
+                created_at: now,
+                kind: GROUP_META,
+                tags: vec![vec![D.to_string(), gid.to_string()]],
+                content: String::new(),
+                sig: String::new(),
+            };
+            meta.id = nip01::compute_id(&meta);
+            assert_eq!(db.put(meta, now).await, crate::db::PutOutcome::Stored);
+        }
+        let mut store = GroupStore::default();
+        assert!(
+            store.rebuild(&db, Some(&relay_key)).await,
+            "the rebuild must complete"
+        );
+        assert!(
+            store.ghost.contains("g1"),
+            "relay-signed metadata still ghosts a state-less id"
+        );
+        assert!(
+            !store.ghost.contains("g2"),
+            "client-signed metadata must not ghost an id"
         );
     });
 }

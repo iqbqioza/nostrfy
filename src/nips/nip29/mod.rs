@@ -1220,7 +1220,13 @@ impl GroupStore {
                         child_group.parent = Some(gid.to_string());
                     }
                     // The child's metadata changed (its parent tag): republish
-                    // it so peers see the new link.
+                    // it so peers see the new link. A declared child that does
+                    // not exist yet (a placeholder) has no metadata to
+                    // republish: a bare `39000` for it would store a group id
+                    // the state machine knows nothing about — the create path
+                    // refuses the same ("emit only for a live group") — and a
+                    // snapshot-less rebuild would take that metadata for
+                    // surviving history and ghost the id permanently.
                     if emit {
                         if let Some(old) = &old_parent {
                             out.push(build_meta_event(
@@ -1230,12 +1236,14 @@ impl GroupStore {
                                 now,
                             ));
                         }
-                        out.push(build_meta_event(
-                            child,
-                            self.groups.get(child),
-                            relay_pubkey,
-                            now,
-                        ));
+                        if self.groups.contains_key(child) {
+                            out.push(build_meta_event(
+                                child,
+                                self.groups.get(child),
+                                relay_pubkey,
+                                now,
+                            ));
+                        }
                     }
                 }
                 for child in &child_removed {
@@ -1295,6 +1303,13 @@ impl GroupStore {
                         .map(|g| g.children.clone())
                         .unwrap_or_default()
                     {
+                        // Only an existing child has metadata to republish: a
+                        // placeholder's bare `39000` would ghost the id on the
+                        // next snapshot-less rebuild (see the child-adoption
+                        // emit above).
+                        if !self.groups.contains_key(&child) {
+                            continue;
+                        }
                         out.push(build_meta_event(
                             &child,
                             self.groups.get(&child),
@@ -1569,6 +1584,12 @@ impl GroupStore {
     /// the id's content even when the scan reconstructs part of it.
     pub(crate) fn ghost_group_ids(&self) -> Vec<String> {
         self.ghost.iter().cloned().collect()
+    }
+
+    /// Whether `gid` carries the fail-closed ghost marker (see
+    /// [`Self::mark_ghost`]).
+    pub(crate) fn is_ghosted(&self, gid: &str) -> bool {
+        self.ghost.contains(gid)
     }
 
     /// Removes `pubkey` from every group's member map (a vanish) and keeps
@@ -2025,7 +2046,15 @@ impl GroupStore {
                     // 30023, app data, ...) carries a `d` tag that must not
                     // ghost a non-existent group or consume the group
                     // budget. Mirrors `group_id_any`.
-                    seen_gids.insert(gid.to_string());
+                    //
+                    // A keyed relay publishes this metadata itself:
+                    // metadata stored by anyone else (possible only while
+                    // NIP-29 was disabled) is not evidence that a group
+                    // existed and must not ghost the id. Keyless rebuilds
+                    // keep the conservative rule.
+                    if relay_pubkey.is_none_or(|pk| event.pubkey.eq_ignore_ascii_case(pk)) {
+                        seen_gids.insert(gid.to_string());
+                    }
                 }
             }
             if !more || min_created == 0 {

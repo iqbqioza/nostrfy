@@ -62,6 +62,19 @@ pub(crate) const MAX_NEG_MSG_ROUNDS: u32 = 128;
 /// the cap, hence the connection-wide counter).
 pub(crate) const MAX_NEG_OPENS: u32 = 256;
 
+/// The subscription id a NEG reply may echo: the client's id when it is at
+/// most `max_sub_id_len` characters, the empty string otherwise. Replies go
+/// through `send_control`, which bypasses the output-queue caps, so echoing
+/// an over-long id would pin the client's full message size per reply (B-2:
+/// the id is only a correlation handle, and NIP-77 requires no exact echo).
+fn neg_echo_id(id: &str, max_sub_id_len: usize) -> String {
+    if id.chars().count() > max_sub_id_len {
+        String::new()
+    } else {
+        id.to_string()
+    }
+}
+
 impl super::Conn {
     pub(crate) fn send_neg_err(&mut self, sub_id: &str, reason: &str) {
         self.send_control(json!(["NEG-ERR", sub_id, reason]));
@@ -138,13 +151,20 @@ impl super::Conn {
 
     pub(crate) async fn handle_neg_open(&mut self, rest: &[Value]) {
         // NIP-77 errors are NEG-ERR when a subscription id can be
-        // correlated, NOTICE only when no id exists to echo.
+        // correlated, NOTICE only when no id exists to echo. `send_control`
+        // bypasses the queue caps, so the correlated id is bounded before it
+        // is echoed (B-2): the frame can be as large as
+        // `max_ws_message_bytes`, and a reply must never pin that size.
+        let (nip77_enabled, max_sub_id_len) = {
+            let cfg = self.relay.config.read().await;
+            (cfg.nip_enabled(77), cfg.limits.max_sub_id_len)
+        };
         let correl_id: Option<String> = rest
             .first()
             .and_then(|v| v.as_str())
-            .map(str::to_string)
-            .filter(|s| !s.is_empty());
-        if !self.relay.config.read().await.nip_enabled(77) {
+            .filter(|s| !s.is_empty())
+            .map(|s| neg_echo_id(s, max_sub_id_len));
+        if !nip77_enabled {
             if let Some(sub_id) = correl_id {
                 self.neg_err(&sub_id, "error: negentropy is not enabled on this relay");
             } else {
@@ -170,11 +190,9 @@ impl super::Conn {
                 return;
             }
         };
-        let max_sub_id_len = self.relay.config.read().await.limits.max_sub_id_len;
         // NIP-01 bounds the id in *chars*, like the REQ/COUNT paths. The
-        // over-long id is not echoed back (B-2): it can be as large as the
-        // whole message, and the reply carrying it would pin that many bytes
-        // in the queue; the empty id is the correlation the client gets.
+        // over-long id is not echoed back (B-2, see the correlated id
+        // above): the empty id is the correlation the client gets.
         if sub_id.chars().count() > max_sub_id_len {
             self.neg_err("", "error: NEG-OPEN subscription id too long");
             return;
@@ -496,16 +514,30 @@ impl super::Conn {
     }
 
     pub(crate) async fn handle_neg_msg(&mut self, rest: &[Value]) {
+        // NIP-77 disabled mid-session (SIGHUP reload or a command event):
+        // stop the in-flight sync like any other refusal instead of letting
+        // a disabled feature keep running. The configured item cap sizes
+        // the relay-wide CPU budget charged below.
+        let (nip77_enabled, configured_max_items, max_sub_id_len) = {
+            let cfg = self.relay.config.read().await;
+            (
+                cfg.nip_enabled(77),
+                cfg.limits.max_neg_items,
+                cfg.limits.max_sub_id_len,
+            )
+        };
         if rest.len() < 2 {
             // Correlate with NEG-ERR when the id is known, else NOTICE.
             // NIP-77: after NEG-ERR the subscription is closed, so a named
-            // id is released like every other malformed continuation.
+            // id is released like every other malformed continuation. The
+            // echoed id is bounded (B-2): `send_control` bypasses the queue
+            // caps and the frame can be as large as `max_ws_message_bytes`.
             if let Some(sub_id) = rest
                 .first()
                 .and_then(|v| v.as_str())
-                .map(str::to_string)
                 .filter(|s| !s.is_empty())
             {
+                let sub_id = neg_echo_id(sub_id, max_sub_id_len);
                 self.neg_err(
                     &sub_id,
                     "error: NEG-MSG requires a subscription id and message",
@@ -523,16 +555,14 @@ impl super::Conn {
             self.send_notice("error: NEG-MSG subscription id must be a non-empty string");
             return;
         }
-        // NIP-77 disabled mid-session (SIGHUP reload or a command event):
-        // stop the in-flight sync like any other refusal instead of letting
-        // a disabled feature keep running. The configured item cap sizes
-        // the relay-wide CPU budget charged below.
-        let (nip77_enabled, configured_max_items) = {
-            let cfg = self.relay.config.read().await;
-            (cfg.nip_enabled(77), cfg.limits.max_neg_items)
-        };
+        // Every reply below echoes the id. An id longer than the configured
+        // limit cannot name a stored subscription (they are opened under the
+        // same limit), so it is echoed as the empty string — the same
+        // correlation a frame without an id gets (B-2). The raw id is kept
+        // for the state lookup.
+        let echo_id = neg_echo_id(&sub_id, max_sub_id_len);
         if !nip77_enabled {
-            self.neg_err(&sub_id, "error: negentropy is not enabled on this relay");
+            self.neg_err(&echo_id, "error: negentropy is not enabled on this relay");
             return;
         }
         // The access lists gate in-flight syncs too: a pubkey that was
@@ -540,34 +570,34 @@ impl super::Conn {
         // (per NIP-77 a NEG-ERR closes the subscription) — no reconnect
         // needed.
         if !self.access_allows_read().await {
-            self.neg_err(&sub_id, "restricted: you are not allowed to sync");
+            self.neg_err(&echo_id, "restricted: you are not allowed to sync");
             return;
         }
         // Check the subscription before decoding the message: an unknown id
         // must not cost a hex decode (and allocation) of a large frame.
         if !self.neg.contains_key(&sub_id) {
-            self.neg_err(&sub_id, "closed: unknown subscription");
+            self.neg_err(&echo_id, "closed: unknown subscription");
             return;
         }
         let Some(message) = rest[1].as_str() else {
             // NIP-77: after NEG-ERR the subscription is closed — malformed
             // continuations close the id they name instead of lingering open.
-            self.neg_err(&sub_id, "error: NEG-MSG message must be hex");
+            self.neg_err(&echo_id, "error: NEG-MSG message must be hex");
             return;
         };
         let Ok(message) = hex::decode(message) else {
-            self.neg_err(&sub_id, "error: NEG-MSG message must be hex");
+            self.neg_err(&echo_id, "error: NEG-MSG message must be hex");
             return;
         };
         // NIP-77: "After a NEG-ERR is issued, the subscription is considered
         // to be closed." Exhausting the round budget closes it too.
         // Check without holding the borrow so the close can release it.
         if self.neg.get(&sub_id).is_some_and(|s| s.rounds_left == 0) {
-            self.neg_err(&sub_id, "error: too many negentropy messages");
+            self.neg_err(&echo_id, "error: too many negentropy messages");
             return;
         }
         let Some(state) = self.neg.get_mut(&sub_id) else {
-            self.neg_err(&sub_id, "closed: unknown subscription");
+            self.neg_err(&echo_id, "closed: unknown subscription");
             return;
         };
         state.rounds_left -= 1;
@@ -579,7 +609,7 @@ impl super::Conn {
             state.items.len().max(1) as u64,
             super::neg_cpu_budget_units(configured_max_items),
         ) {
-            self.neg_err(&sub_id, "error: overloaded, please retry");
+            self.neg_err(&echo_id, "error: overloaded, please retry");
             return;
         }
         match nip77::respond(&state.items, &message) {
@@ -597,23 +627,23 @@ impl super::Conn {
                 let over_budget = budget > 0 && wire_size > budget;
                 if over_budget {
                     self.neg_err(
-                        &sub_id,
+                        &echo_id,
                         "blocked: negentropy response too large (increase limits.max_req_response_bytes)",
                     );
                     return;
                 }
                 if self.neg_backpressured() {
-                    self.neg_err(&sub_id, "blocked: overloaded, please retry");
+                    self.neg_err(&echo_id, "blocked: overloaded, please retry");
                     return;
                 }
-                self.send_neg_msg(&sub_id, &response);
+                self.send_neg_msg(&echo_id, &response);
                 // The round succeeded: refresh this sync and reclaim the
                 // other silent ones. Failing rounds must not sweep — one
                 // bad frame must not close unrelated syncs.
                 self.touch_and_reap_neg(&sub_id)
             }
             Err(e) => {
-                self.neg_err(&sub_id, &format!("error: {e}"));
+                self.neg_err(&echo_id, &format!("error: {e}"));
             }
         }
     }
