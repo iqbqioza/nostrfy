@@ -409,6 +409,8 @@ Set this whenever a reverse proxy (nginx, Caddy, a cloud load balancer, Cloudfla
 
 **`max_map_size`** — The memory-map ceiling in bytes. The map is opened at this size as a **sparse virtual reservation** — physical disk grows only with the data actually written, so a large ceiling costs nothing until used. When the map fills, writes fail with `database map is full: increase database.max_map_size` (reads keep working). Must be ≥ `map_size`.
 
+> **Constrained hosts (Android/Termux, strict-overcommit containers):** the default 1 TiB reservation is accepted by standard Linux overcommit but can be refused, failing startup with `Out of memory (os error 12)`. Set a smaller ceiling, e.g. `max_map_size = 33554432` (32 MiB) or a value that fits your data, and raise it (plus `restart`) if writes report `database map is full`. Keep `map_size` ≤ `max_map_size`.
+
 **`purge_interval_secs`** — How often (seconds) NIP-40 expired events are physically removed from the database. Expired events are hidden from queries even between purges. Values below 10 are raised to 10 seconds (including `0`); there is no way to disable the purge pass entirely.
 
 **`search_index`** — When `true`, event content is word-indexed for fast NIP-50 search. When `false`, search still works (whole-word matching against content) but scans are slower. Toggling takes effect at startup. For a tiny VPS (0.25 vCPU / 512 MB) set `search_index = false` — it **halves the database** (41.8 MB → 20.5 MB per 10,000 events with 3 tags and 21 words in testing) and saves CPU/IO; see the Manual's [Low-spec Tuning](MANUAL.md#low-spec-vps-025-vcpu--512-mb).
