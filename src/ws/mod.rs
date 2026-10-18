@@ -7629,6 +7629,64 @@ mod tests {
     }
 
     #[test]
+    fn an_oversized_id_is_not_echoed_in_neg_or_auth_replies() {
+        // B-2 for the NEG and AUTH paths: NEG-ERR frames and the AUTH
+        // attempt-cap OK go through `send_control`, which bypasses the
+        // output-queue caps, so an oversized id must be echoed as the empty
+        // string (the same correlation a frame without an id gets).
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let huge = "a".repeat(1024 * 1024);
+            // A short NEG-OPEN with an oversized id: the NEG-ERR must not
+            // pin it.
+            conn.handle_text(&format!(r#"["NEG-OPEN","{huge}"]"#)).await;
+            let msgs = outgoing_json(&conn);
+            let err = msgs
+                .iter()
+                .find(|m| m[0] == "NEG-ERR")
+                .expect("a short NEG-OPEN must get a NEG-ERR");
+            assert_eq!(err[1], "", "an oversized NEG id must not be echoed");
+            assert!(
+                msgs.iter().all(|m| m.to_string().len() < 4096),
+                "no reply may pin the client's message size"
+            );
+            // An unknown NEG-MSG id of that size takes the same path.
+            conn.outgoing.clear();
+            conn.out_bytes = 0;
+            conn.handle_text(&format!(r#"["NEG-MSG","{huge}","00"]"#))
+                .await;
+            let msgs = outgoing_json(&conn);
+            let err = msgs
+                .iter()
+                .find(|m| m[0] == "NEG-ERR")
+                .expect("an unknown NEG-MSG id must get a NEG-ERR");
+            assert_eq!(err[1], "", "an oversized NEG-MSG id must not be echoed");
+            assert!(
+                msgs.iter().all(|m| m.to_string().len() < 4096),
+                "no reply may pin the client's message size"
+            );
+            // The AUTH attempt-cap refusal uses the event-id sanitizer: an
+            // oversized id gets the empty string.
+            conn.outgoing.clear();
+            conn.out_bytes = 0;
+            conn.auth_attempts = 256;
+            conn.handle_auth(&[json!({"id": huge})]).await;
+            let msgs = outgoing_json(&conn);
+            let ok = msgs
+                .iter()
+                .find(|m| m[0] == "OK")
+                .expect("the attempt-cap refusal must answer OK");
+            assert_eq!(ok[1], "", "an oversized AUTH id must not be echoed");
+            assert!(
+                msgs.iter().all(|m| m.to_string().len() < 4096),
+                "no reply may pin the client's message size"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
     fn uppercase_auth_pubkey_is_rejected() {
         // NIP-01: hex fields are lowercase. An uppercase AUTH pubkey would
         // verify but never match the exact-case author checks, so it must be

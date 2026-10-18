@@ -852,7 +852,12 @@ impl super::Conn {
                 .and_then(|v| v.get("id"))
                 .and_then(Value::as_str)
                 .unwrap_or("");
-            self.send_control(json!(["OK", id, false, "error: too many AUTH attempts"]));
+            self.send_control(json!([
+                "OK",
+                echo_event_id(id),
+                false,
+                "error: too many AUTH attempts"
+            ]));
             return;
         }
         // NIP-42: a parsed AUTH message is always answered with OK, even
