@@ -89,24 +89,12 @@ jobs:
           prepare: |
             env IGNORE_OSVERSION=yes pkg update -f
             env IGNORE_OSVERSION=yes pkg install -y rust
-            # Pre-build the dependency graph into the cached VM image
-            # (`cache-after-prepare` below): ordinary source changes then
-            # only recompile the relay's own crate, skipping the several
-            # minutes the cold dependency build used to take. Debug info is
-            # dropped like in `run` (it is what OOM'd the link).
-            CARGO_PROFILE_DEV_DEBUG=0 cargo test --all-targets --no-run
-          # The compiled dependencies only change with the manifest or the
-          # lockfile, so the prepared image is keyed on both: a dependency
-          # update rebuilds it instead of reusing a stale one.
-          cache-after-prepare: true
-          cache-after-prepare-key-suffix: ${{ hashFiles('Cargo.toml', 'Cargo.lock') }}
           run: |
-            # The VM runs a cold, debuginfo-heavy `cargo test` build and
-            # the final link of the nostrfy test binary exceeded the VM
-            # memory, OOM-killing the compiler. Debug info is not needed
-            # to run the tests, so drop it (debug assertions are an
-            # independent setting and stay on).
-            CARGO_PROFILE_DEV_DEBUG=0 cargo test --all-targets
+            # `dev-vm` builds the dependencies without optimization: the
+            # emulated VM recompiles the whole graph on every run and the
+            # suite itself only takes seconds, so trading test speed for
+            # compile time pays off here (it is not the Linux profile).
+            cargo test --profile dev-vm --all-targets
 
   build:
     # Plain "Build": this is the CI compile check, not the tag-triggered

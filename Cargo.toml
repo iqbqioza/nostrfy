@@ -81,5 +81,19 @@ overflow-checks = false
 # would otherwise run out of memory.)
 debug = "line-tables-only"
 
+# The FreeBSD CI job builds the whole dependency graph inside an emulated
+# VM on every run (there is no cargo cache in there), and that cold build
+# is over 6 of the job's 8 minutes. The suite itself only takes seconds on
+# that machine, so the job trades dependency optimization for compile
+# time: unoptimized dependencies build in a fraction of the time and the
+# tests still exercise the same code. Debug info is off too (its link is
+# what ran out of memory before).
+[profile.dev-vm]
+inherits = "dev"
+debug = 0
+
+[profile.dev-vm.package."*"]
+opt-level = 1
+
 [dev-dependencies]
 tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
