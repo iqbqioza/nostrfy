@@ -112,14 +112,24 @@ impl log::Log for Logger {
         // A poisoned mutex (a thread panicked while holding it) must not
         // take the logging down with it: the inner state is still valid,
         // so the guard is recovered with `into_inner`.
-        self.inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
-            .is_none_or(|l| l.enabled(metadata))
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        match inner.as_ref() {
+            Some(logger) => logger.enabled(metadata),
+            // No backend installed yet (before config load): the stderr
+            // fallback applies the same per-target filter.
+            None => {
+                let (directives, default) = target_filters();
+                metadata.level() <= level_for_target(directives, *default, metadata.target())
+            }
+        }
     }
     fn log(&self, record: &log::Record) {
-        if SUPPRESSED.load(Ordering::Relaxed) > 0 {
+        // `log` 0.4's macros consult the process-wide max level only — the
+        // per-target directives collapse into it — and never call
+        // `enabled`: the filter must run here, or `nostrfy::server=trace`
+        // would trace every module (see [`init`]). Records reach this point
+        // at or below that maximum, and `enabled` prunes the rest.
+        if !self.enabled(record.metadata()) {
             return;
         }
         if let Some(l) = self
@@ -154,9 +164,11 @@ pub fn init() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         let _ = log::set_logger(&LOGGER);
-        // The global max must cover the most verbose directive: per-target
-        // filtering happens in `FileLogger::enabled`, which the macros only
-        // reach for records at or below this level.
+        // The global max must cover the most verbose directive: `log` 0.4's
+        // macros consult only this process-wide level, so it has to admit
+        // every directive's records. The per-target filter runs inside
+        // `Logger::log`/`enabled`; records above this maximum never reach
+        // the logger at all.
         let level = std::env::var("RUST_LOG")
             .ok()
             .map(|v| {
@@ -175,7 +187,7 @@ pub fn init() {
 
 /// Parsed `RUST_LOG` directives: the per-target list plus the default
 /// level (a bare level, or `info` when nothing usable is present).
-/// `FileLogger::enabled` matches a record's target against this list so
+/// `Logger::enabled` matches a record's target against this list so
 /// `nostrfy::server=trace` traces only that module instead of collapsing
 /// to a process-wide trace level.
 fn parse_directives(value: &str) -> (Vec<(String, log::LevelFilter)>, log::LevelFilter) {
@@ -229,7 +241,7 @@ fn parse_max_level(value: &str) -> log::LevelFilter {
 }
 
 /// The parsed `RUST_LOG` directives for per-target filtering, parsed once.
-/// `FileLogger::enabled` consults this so `nostrfy::server=trace` traces
+/// `Logger::enabled` consults this so `nostrfy::server=trace` traces
 /// only that module instead of collapsing to a process-wide trace level.
 static TARGET_FILTERS: std::sync::OnceLock<(Vec<(String, log::LevelFilter)>, log::LevelFilter)> =
     std::sync::OnceLock::new();
@@ -857,6 +869,54 @@ mod tests {
         assert_eq!(
             level_for_target(&directives, default, "nostrfy::db"),
             LevelFilter::Info
+        );
+    }
+
+    #[test]
+    fn logger_log_consults_enabled_before_forwarding() {
+        // `log` 0.4's macros check only the process-wide max level and never
+        // call `enabled` (see the comment in `Logger::log`), so the
+        // per-target filter must run inside `log` itself: without it a
+        // module-scoped directive would forward every module's records. A
+        // local logger instance keeps the process-global backend out of the
+        // test.
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Default)]
+        struct Probe {
+            forwarded: AtomicUsize,
+        }
+        struct ProbeHandle(Arc<Probe>);
+        impl log::Log for ProbeHandle {
+            fn enabled(&self, metadata: &log::Metadata) -> bool {
+                // The probe refuses one marker target, like a directive
+                // scoped to another module would.
+                metadata.target() != "nostrfy::probe::skip"
+            }
+            fn log(&self, _record: &log::Record) {
+                self.0.forwarded.fetch_add(1, Ordering::Relaxed);
+            }
+            fn flush(&self) {}
+        }
+
+        let probe = Arc::new(Probe::default());
+        let logger = Logger {
+            inner: Mutex::new(Some(Box::new(ProbeHandle(Arc::clone(&probe))))),
+        };
+        for target in ["nostrfy::probe::skip", "nostrfy::probe::keep"] {
+            let args = format_args!("probe");
+            let record = log::Record::builder()
+                .level(log::Level::Info)
+                .target(target)
+                .args(args)
+                .build();
+            logger.log(&record);
+        }
+        assert_eq!(
+            probe.forwarded.load(Ordering::Relaxed),
+            1,
+            "a record `enabled` refuses must not reach the backend"
         );
     }
 
