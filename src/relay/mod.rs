@@ -9251,6 +9251,173 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_create_repairs_a_ghost_backed_only_by_bare_metadata() {
+        // A snapshot-less rebuild could ghost an id whose only stored event
+        // was the bare 39000 the pre-fix emit wrote for a declared
+        // placeholder child. A create must recover such an id, while real
+        // ghosts (h-tagged history, membership metadata) stay fail-closed.
+        use crate::db::PutOutcome;
+        use crate::nips::nip01;
+
+        let relay = build_relay_with_key(false, &"11".repeat(32)).await;
+        let now = crate::util::unix_now();
+        let relay_pubkey = relay.relay_pubkey().expect("the relay has a key");
+        let build = |kind: u64, gid: &str, pubkey: &str| {
+            let mut event = crate::event::Event {
+                id: String::new(),
+                pubkey: pubkey.to_string(),
+                created_at: now,
+                kind,
+                tags: vec![vec!["d".into(), gid.to_string()]],
+                content: String::new(),
+                sig: String::new(),
+            };
+            event.id = nip01::compute_id(&event);
+            event
+        };
+        // g1: only the bare placeholder metadata survives.
+        assert_eq!(
+            relay
+                .db
+                .put(
+                    build(crate::nips::nip29::GROUP_META, "g1", &relay_pubkey),
+                    now
+                )
+                .await,
+            PutOutcome::Stored
+        );
+        // g2: an ordinary h-tagged post (history the ghost protects).
+        let mut post = crate::event::Event {
+            id: String::new(),
+            pubkey: "aa".repeat(32),
+            created_at: now,
+            kind: 1,
+            tags: vec![vec!["h".into(), "g2".into()]],
+            content: String::new(),
+            sig: String::new(),
+        };
+        post.id = nip01::compute_id(&post);
+        assert_eq!(relay.db.put(post, now).await, PutOutcome::Stored);
+        // g3: membership metadata proves a real group existed.
+        assert_eq!(
+            relay
+                .db
+                .put(
+                    build(crate::nips::nip29::GROUP_MEMBERS, "g3", &relay_pubkey),
+                    now
+                )
+                .await,
+            PutOutcome::Stored
+        );
+        {
+            let mut groups = relay.groups.write().await;
+            for gid in ["g1", "g2", "g3"] {
+                groups.mark_ghost(gid);
+            }
+        }
+        assert!(
+            relay.repair_unbacked_group_ghost("g1", now).await,
+            "bare relay metadata alone must be repairable"
+        );
+        assert!(
+            !relay.repair_unbacked_group_ghost("g2", now).await,
+            "h-tagged history must keep the ghost"
+        );
+        assert!(
+            !relay.repair_unbacked_group_ghost("g3", now).await,
+            "membership metadata must keep the ghost"
+        );
+        let groups = relay.groups.read().await;
+        assert!(!groups.is_ghosted("g1"), "g1 is downgraded");
+        assert!(
+            groups.deleted_group_ids().contains(&"g1".to_string()),
+            "g1 becomes the ordinary delete tombstone"
+        );
+        assert!(
+            groups.is_ghosted("g2") && groups.is_ghosted("g3"),
+            "the negative cases stay fail-closed"
+        );
+        drop(groups);
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_create_keeps_a_ghost_with_a_pending_purge() {
+        // The repair must not clear a ghost whose purge is still recorded:
+        // the resume runs an unbounded purge that would delete a group
+        // re-created here.
+        use crate::db::store::{Store, encode_pending_purge, purged_group_key};
+        use crate::nips::nip01;
+
+        let now = crate::util::unix_now();
+        let mut cfg = crate::config::Config::default();
+        cfg.database.map_size = 16 * 1024 * 1024;
+        cfg.database.max_map_size = 64 * 1024 * 1024;
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        cfg.database.path = std::env::temp_dir()
+            .join("nostrfy-repair-ghost-pending")
+            .join(format!("{:x}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&cfg.database.path);
+        let expiry = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let store = Store::open(&cfg.database, std::sync::Arc::clone(&expiry), 128)
+            .expect("the scratch store opens");
+        {
+            let mut wtxn = store.env.write_txn().unwrap();
+            let mut meta = crate::event::Event {
+                id: String::new(),
+                pubkey: "22".repeat(32),
+                created_at: now,
+                kind: crate::nips::nip29::GROUP_META,
+                tags: vec![vec!["d".into(), "g1".into()]],
+                content: String::new(),
+                sig: String::new(),
+            };
+            meta.id = nip01::compute_id(&meta);
+            store.put_event_in(&mut wtxn, &meta, now).unwrap();
+            store
+                .purge_pending
+                .put(
+                    &mut wtxn,
+                    &purged_group_key("g1"),
+                    &encode_pending_purge("g1", now, now, u64::MAX, None),
+                )
+                .unwrap();
+            wtxn.commit().unwrap();
+        }
+        let db = crate::db::DbClient::open_with_store(
+            &cfg.database,
+            store,
+            expiry,
+            std::sync::Arc::new(Default::default()),
+            0,
+            128,
+            4096,
+        )
+        .unwrap();
+        let config = std::sync::Arc::new(tokio::sync::RwLock::new(cfg));
+        let relay = Relay::new(
+            config,
+            db,
+            crate::stats::Stats::new(),
+            "",
+            crate::relay::LiveBusConfig {
+                buffer: 1024,
+                batch_interval_ms: 10,
+                batch_size: 64,
+            },
+        )
+        .await;
+        relay.groups.write().await.mark_ghost("g1");
+        assert!(
+            !relay.repair_unbacked_group_ghost("g1", now).await,
+            "a recorded pending purge must keep the ghost"
+        );
+        assert!(relay.groups.read().await.is_ghosted("g1"));
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
     async fn a_bounded_pending_purge_resumes_and_reveals_the_recreated_group() {
         // A migration-recorded purge is bounded by the 9008's timestamp: a
         // crash mid-purge leaves the re-created group's later events, and

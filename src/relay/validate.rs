@@ -289,6 +289,23 @@ impl super::Relay {
                 {
                     return Precheck::Reject("invalid: event is too old for this group".into());
                 }
+                // A ghosted id normally refuses every create (fail-closed:
+                // the ghost marks un-purged history). The relay's own bare
+                // metadata, however, could ghost an id that never was a
+                // group: before the emit fix, a declared placeholder child
+                // received a bare `39000`, and a snapshot-less rebuild took
+                // it for surviving history. When the database shows nothing
+                // but that bare metadata — no h-tagged event, no other group
+                // metadata, no recorded pending purge — there is no history
+                // to protect, and the id is downgraded to the ordinary
+                // delete tombstone (the same downgrade a confirmed purge
+                // performs). Anything else stays fail-closed.
+                if event.kind == nip29::CREATE_GROUP
+                    && let Some(gid) = nip29::group_id(event)
+                    && self.groups.read().await.is_ghosted(gid)
+                {
+                    self.repair_unbacked_group_ghost(gid, now).await;
+                }
                 let reason = {
                     let groups = self.groups.read().await;
                     // Moderation events may also come from the relay's own
@@ -374,6 +391,78 @@ impl super::Relay {
             }
         }
         Precheck::Accept
+    }
+
+    /// Whether a ghosted group id has no stored history behind it, and if so
+    /// downgrades it to the ordinary delete tombstone (see the call site in
+    /// [`Self::precheck`]). Returns whether the id was repaired.
+    ///
+    /// The pre-fix `9002` emit stored a bare relay `39000` for a declared
+    /// placeholder child; a snapshot-less rebuild read that metadata as
+    /// surviving history and ghosted the id (nothing could ever create it
+    /// again). The repair is deliberately narrow and fail-closed: any
+    /// h-tagged event, any metadata other than bare `39000`s, a recorded
+    /// pending purge (its resume would purge the id again), or a database
+    /// that does not answer keeps the ghost.
+    pub(crate) async fn repair_unbacked_group_ghost(&self, gid: &str, now: u64) -> bool {
+        // A recorded pending purge keeps the id ghosted: its resume runs an
+        // unbounded purge that would delete a group re-created here.
+        match self.db.pending_purges().await {
+            Some(pending) if !pending.iter().any(|(pending_gid, _, _)| pending_gid == gid) => {}
+            _ => return false,
+        }
+        let query = |value: serde_json::Value| -> Vec<crate::filter::Filter> {
+            serde_json::from_value(value).expect("static filter")
+        };
+        // Any stored h-tagged event is group history the ghost protects.
+        let history = query(serde_json::json!([{ "#h": [gid] }]));
+        match self.db.query_req_reported(history, 1, now).await {
+            Some((stored, _)) if stored.is_empty() => {}
+            _ => return false,
+        }
+        // Membership/roles/participants/pins metadata proves a real group
+        // existed (the relay publishes them for live groups only).
+        let members = query(serde_json::json!([{
+            "kinds": [
+                nip29::GROUP_ADMINS,
+                nip29::GROUP_MEMBERS,
+                nip29::GROUP_ROLES,
+                nip29::GROUP_PARTICIPANTS,
+                nip29::GROUP_PINS,
+            ],
+            "#d": [gid],
+        }]));
+        match self.db.query_req_reported(members, 1, now).await {
+            Some((stored, _)) if stored.is_empty() => {}
+            _ => return false,
+        }
+        // The surviving `39000` must be bare (`d` tag only): settings tags
+        // mean the group was more than a placeholder.
+        let meta = query(serde_json::json!([{
+            "kinds": [nip29::GROUP_META],
+            "#d": [gid],
+        }]));
+        let stored = match self.db.query_req_reported(meta, 4, now).await {
+            Some((stored, _)) => stored,
+            None => return false,
+        };
+        if stored.is_empty()
+            || !stored.iter().all(|event| {
+                event.tags.len() == 1
+                    && event.tags[0].len() == 2
+                    && event.tags[0][0] == "d"
+                    && event.tags[0][1] == gid
+            })
+        {
+            return false;
+        }
+        self.groups.write().await.unghost(gid);
+        log::warn!(
+            "group id {gid:?} was ghosted by bare relay metadata alone (a declared \
+             placeholder child); downgraded to the delete tombstone so it can be \
+             created again"
+        );
+        true
     }
 }
 
