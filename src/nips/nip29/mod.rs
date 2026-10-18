@@ -726,7 +726,7 @@ impl GroupStore {
                 bail!("restricted: you are not an admin of this group");
             }
             if event.kind == 9002 {
-                validate_edit_metadata(self, gid, group, event, relay_signed)?;
+                validate_edit_metadata(self, gid, group, event, relay_signed, false)?;
             }
             // NIP-29 allows the relay to limit pins: bound the 9010 list
             // so one event cannot pin unbounded state (the apply side caps
@@ -860,10 +860,12 @@ impl GroupStore {
     /// capacity limit must not become "unknown" (its private content would
     /// turn world-readable), and the limit still applies to new creations at
     /// runtime — while the state-dependent runtime checks (the member
-    /// budgets, the last-admin invariant, the metadata graph re-check) run
-    /// on every path: an effect the live path dropped under a race is not
-    /// resurrected by the next rebuild, so a rebuilt state cannot contain a
-    /// cycle or an admin-less group that live would have refused.
+    /// budgets, the last-admin invariant, the metadata graph's structural
+    /// invariants) run on every path: an effect the live path dropped under
+    /// a race is not resurrected by the next rebuild, so a rebuilt state
+    /// cannot contain a cycle or an admin-less group that live would have
+    /// refused. The metadata re-check's authorization/fidelity half is
+    /// live-only (see `validate_edit_metadata`).
     pub fn apply(
         &mut self,
         event: &Event,
@@ -1108,7 +1110,9 @@ impl GroupStore {
                 if let Some(group) = self.groups.get(gid) {
                     let relay_signed =
                         !relay_pubkey.is_empty() && event.pubkey.eq_ignore_ascii_case(relay_pubkey);
-                    if validate_edit_metadata(self, gid, group, event, relay_signed).is_err() {
+                    if validate_edit_metadata(self, gid, group, event, relay_signed, history_replay)
+                        .is_err()
+                    {
                         return Vec::new();
                     }
                 }
@@ -1121,10 +1125,33 @@ impl GroupStore {
                             // Deduplicate while preserving order: a repeated
                             // `child` tag must not list the same child twice.
                             let mut seen = HashSet::new();
-                            group.children = tag_values(event, "child")
+                            let declared: Vec<String> = tag_values(event, "child")
                                 .map(str::to_string)
                                 .filter(|c| seen.insert(c.clone()))
                                 .collect();
+                            group.children = if history_replay {
+                                // A replay cannot reproduce the live arrival
+                                // order within one second. Live validation
+                                // requires a parent-side edit to carry every
+                                // live-known child, so a *stored* edit that
+                                // omits one only ever raced that child's
+                                // addition (or skipped live validation, which
+                                // the migration gates): merging keeps the
+                                // link instead of detaching it. Child
+                                // removals happen on the child's own side, so
+                                // no live removal is reverted here.
+                                let mut present: HashSet<String> =
+                                    group.children.iter().cloned().collect();
+                                let mut merged = group.children.clone();
+                                for child in declared {
+                                    if present.insert(child.clone()) {
+                                        merged.push(child);
+                                    }
+                                }
+                                merged
+                            } else {
+                                declared
+                            };
                             let before = group.parent.clone();
                             let after = tag_value(event, "parent").map(str::to_string);
                             (
@@ -1152,8 +1179,8 @@ impl GroupStore {
                 // a later CREATE_GROUP scan for the (deterministically
                 // smallest) adopting parent. The hint is bounded (see
                 // `declare_child`).
-                for child in children_after {
-                    self.declare_child(&child);
+                for child in &children_after {
+                    self.declare_child(child);
                 }
                 let mut linked_to_new_parent = false;
                 if parent_before != parent_after {
@@ -1193,11 +1220,15 @@ impl GroupStore {
                 // consistent.
                 let child_added: Vec<String> =
                     tag_values(event, "child").map(str::to_string).collect();
-                let added_set: std::collections::HashSet<&str> =
-                    child_added.iter().map(String::as_str).collect();
+                // Detect removals against the list the edit actually left
+                // behind, not the event's own tags: on a replay the list is
+                // the merge of the stored children and the tags, and a child
+                // the replayed edit merely omits must not be detached.
+                let children_now: std::collections::HashSet<&str> =
+                    children_after.iter().map(String::as_str).collect();
                 let mut child_removed: Vec<String> = Vec::new();
                 for child in &children_before {
-                    if !added_set.contains(child.as_str()) {
+                    if !children_now.contains(child.as_str()) {
                         child_removed.push(child.clone());
                     }
                 }
@@ -1860,10 +1891,14 @@ impl GroupStore {
         // events of the same kind within the same second are ordered by id,
         // not by arrival — two conflicting 9000 edits in the same second
         // (e.g. grant-then-revoke of a role) may replay in the wrong order
-        // after a restart. The relay stamps its generated metadata strictly
-        // monotonic, so the *stored* 39000-39005 always reflect the latest
-        // state; only the in-memory member map could diverge until the next
-        // edit. The rank ordering also inverts cross-kind arrival order
+        // after a restart. A stored 9002 is replayed as it was accepted (the
+        // replay skips the live-only fidelity/authorization re-checks) and
+        // merges its child list instead of replacing it, so a same-second
+        // race neither drops the edit's settings nor detaches a child the
+        // other edit added; the stored 39000-39005 are regenerated from that
+        // state. The in-memory member map can still diverge from the
+        // pre-restart state until the next edit. The rank ordering also
+        // inverts cross-kind arrival order
         // within a second: a 9001 remove followed in the same second by a
         // 9021 JOIN replays as [9001, JOIN] (correct) but a JOIN followed by
         // a 9001 replays as [9001, JOIN] too — the removed member resurrects
@@ -2167,17 +2202,29 @@ pub(crate) fn event_code(event: &Event) -> Option<&str> {
     tag_value(event, CODE)
 }
 
-/// Validates the subgroup rules of a `kind:9002` edit-metadata event.
+/// Validates the subgroup rules of a `kind:9002` edit-metadata event against
+/// the graph as the edit will leave it. The structural and safety invariants
+/// (a single `parent` tag, no self/two-way links, no cycles, the
+/// declared-children bound) always run. The authorization/fidelity checks —
+/// the parent existing and the author administering it, the edit carrying
+/// every existing child, consent over newly adopted children — run only on
+/// the live path (`replay == false`): a replay applies the stored edits as
+/// they were accepted at intake, and the arrival order inside one second is
+/// not recoverable, so re-running those checks would drop edits the live path
+/// had accepted and roll the derived state back. Imported moderation is the
+/// migration's gate, not the rebuild's.
+///
 /// `relay_signed` marks an event from the relay's own key, which NIP-29
 /// treats as the group master key: it is an implicit admin of every group
-/// (see `validate_write_for_relay`), so the group-admin requirements below
-/// do not apply to it.
+/// (see `validate_write_for_relay`), so the group-admin requirements do not
+/// apply to it.
 fn validate_edit_metadata(
     store: &GroupStore,
     gid: &str,
-    _group: &Group,
+    group: &Group,
     event: &Event,
     relay_signed: bool,
+    replay: bool,
 ) -> anyhow::Result<()> {
     // NIP-29: "A kind:9002 MAY carry at most one parent tag". A second
     // parent tag would be silently ignored (only the first is applied), so
@@ -2280,8 +2327,10 @@ fn validate_edit_metadata(
         }
     }
     // A parent value must name an existing group, and the author must be its
-    // admin.
-    if let Some(parent) = parent_value {
+    // admin. Live only: a replay cannot re-adjudicate the author's role (it
+    // may have been revoked since acceptance), and the apply side already
+    // drops a link whose parent is gone instead of dangling it.
+    if !replay && let Some(parent) = parent_value {
         let parent_group = store
             .groups
             .get(&parent)
@@ -2296,42 +2345,48 @@ fn validate_edit_metadata(
     // NIP-29: a metadata edit must carry every existing child as a child
     // tag, or the edit is rejected — otherwise a partial edit (e.g. only a
     // name change) would silently drop the children on the apply side,
-    // which replaces the list.
-    let children: HashSet<&str> = tag_values(event, "child").collect();
-    if !_group
-        .children
-        .iter()
-        .all(|c| children.contains(c.as_str()))
-    {
-        bail!("restricted: missing child tags in metadata edit");
+    // which replaces the list. Live only: a replay merges the declared
+    // children into the stored list instead of replacing it (see the
+    // `apply` arm), so a stored edit that raced a same-second child addition
+    // cannot detach that child, and the check has nothing left to protect.
+    if !replay {
+        let children: HashSet<&str> = tag_values(event, "child").collect();
+        if !group.children.iter().all(|c| children.contains(c.as_str())) {
+            bail!("restricted: missing child tags in metadata edit");
+        }
     }
     // Adopting a new child through the parent's list requires authority
     // over the child too: otherwise a foreign admin could hijack an
     // orphan group by listing it (each group's own 39001 is authoritative
     // for its scope). Reordering already-linked children stays parent-only.
-    // Unknown ids (no group yet) are still listable as placeholders.
-    for child in tag_values(event, "child") {
-        // "Already linked" means the *child's own* stored parent names this
-        // group: only then did the child's side consent to the link, and a
-        // reorder needs no further authority. An id that is merely present
-        // in this group's stored children list may be a placeholder
-        // declared before the child existed (see `declare_child`): its
-        // creator never consented, so the child-admin check below still
-        // applies. Otherwise the declaring parent could graft a group it
-        // does not administer by re-listing the placeholder after the
-        // child's creation.
-        let linked = store
-            .groups
-            .get(child)
-            .is_some_and(|g| g.parent.as_deref() == Some(gid));
-        if linked {
-            continue;
-        }
-        if !relay_signed
-            && let Some(child_group) = store.groups.get(child)
-            && !child_group.is_admin(event.pubkey.as_str())
-        {
-            bail!("restricted: you are not an admin of the child group");
+    // Unknown ids (no group yet) are still listable as placeholders. Live
+    // only: a replay cannot re-adjudicate consent (child admins may have
+    // changed since acceptance) and imported moderation is the migration's
+    // gate, not the rebuild's.
+    if !replay {
+        for child in tag_values(event, "child") {
+            // "Already linked" means the *child's own* stored parent names
+            // this group: only then did the child's side consent to the
+            // link, and a reorder needs no further authority. An id that is
+            // merely present in this group's stored children list may be a
+            // placeholder declared before the child existed (see
+            // `declare_child`): its creator never consented, so the
+            // child-admin check below still applies. Otherwise the declaring
+            // parent could graft a group it does not administer by
+            // re-listing the placeholder after the child's creation.
+            let linked = store
+                .groups
+                .get(child)
+                .is_some_and(|g| g.parent.as_deref() == Some(gid));
+            if linked {
+                continue;
+            }
+            if !relay_signed
+                && let Some(child_group) = store.groups.get(child)
+                && !child_group.is_admin(event.pubkey.as_str())
+            {
+                bail!("restricted: you are not an admin of the child group");
+            }
         }
     }
     // Bound the declared-children adoption hint: beyond its cap the edit is

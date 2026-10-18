@@ -89,9 +89,11 @@ fn apply_covers_parent_child_roles_pins_and_delete() {
     store.apply(&adopt, "relay", now, true, false);
     assert_eq!(store.group("g3").unwrap().parent.as_deref(), Some("g1"));
     // g1 drops g3 from its children (g2 stays listed): NIP-29 requires
-    // every existing child, so the edit is invalid at runtime — and the
-    // replay drops it the same way (B-1: a restart must not apply an edit
-    // the live path refuses), leaving g3 attached.
+    // every existing child, so the live path refuses the edit. A replay
+    // applies stored edits as they were accepted and merges children
+    // instead of replacing them (the arrival order within a second is not
+    // recoverable), so the new child is added while the existing link is
+    // not detached.
     let drop_child = event(
         9002,
         ADMIN,
@@ -101,10 +103,11 @@ fn apply_covers_parent_child_roles_pins_and_delete() {
             vec!["child".into(), "g4".into()],
         ],
     );
-    let out = store.apply(&drop_child, "relay", now, true, true);
-    assert!(
-        out.is_empty(),
-        "the invalid edit must be dropped on the replay"
+    let _ = store.apply(&drop_child, "relay", now, true, true);
+    assert_eq!(
+        store.group("g1").unwrap().children,
+        vec!["g2".to_string(), "g3".to_string(), "g4".to_string()],
+        "the replay merges the declared children instead of replacing the list"
     );
     assert_eq!(store.group("g3").unwrap().parent.as_deref(), Some("g1"));
     // The old parent's metadata is republished when the parent changes.
@@ -213,7 +216,7 @@ fn apply_covers_parent_child_roles_pins_and_delete() {
     let leave = event(LEAVE, OTHER, Some("g1"), vec![]);
     store.apply(&leave, "relay", now, true, false);
     assert!(!store.group("g1").unwrap().is_member(OTHER));
-    // DELETE_GROUP removes the group; the dropped edit above never
+    // DELETE_GROUP removes the group; the replayed merge above never
     // re-parented g3, so its link to g1 stands.
     store.apply(
         &event(DELETE_GROUP, ADMIN, Some("g2"), vec![]),
@@ -226,7 +229,7 @@ fn apply_covers_parent_child_roles_pins_and_delete() {
     assert_eq!(
         store.group("g3").unwrap().parent.as_deref(),
         Some("g1"),
-        "the dropped edit never re-parented g3 away from g1"
+        "the replayed merge never re-parented g3 away from g1"
     );
     // privacy_gated: private groups are gated; unknown groups are not.
     store.apply(
@@ -248,9 +251,10 @@ fn apply_covers_parent_child_roles_pins_and_delete() {
             Some("g1"),
             vec![
                 vec!["private".into()],
-                // Keep the existing child alive in the replacing list
+                // Keep the existing children alive in the replacing list
                 // (a metadata edit must carry every existing child).
                 vec!["child".into(), "g3".into()],
+                vec!["child".into(), "g4".into()],
             ],
         ),
         "relay",
@@ -1965,9 +1969,10 @@ fn replay_linking_to_deleted_parent_keeps_child_orphaned() {
         false,
     );
     assert_eq!(store.groups["c"].parent, None);
-    // Rank-inverted rebuild replay of the (once-valid) link: the parent
-    // is gone, so the assignment is dropped like the live validation
-    // rejects it (`history_replay` mirrors the startup rebuild).
+    // Rank-inverted rebuild replay of the (once-valid) link: the replay
+    // skips the live-only parent checks, and the apply side drops a link
+    // whose parent is gone instead of dangling it (`history_replay`
+    // mirrors the startup rebuild).
     let out = store.apply(&link, "relay", now, true, true);
     assert_eq!(
         store.groups["c"].parent, None,
@@ -1979,6 +1984,75 @@ fn replay_linking_to_deleted_parent_keeps_child_orphaned() {
                 .iter()
                 .any(|t| t == &vec![D.to_string(), "p".to_string()])),
         "no metadata may be resurrected for the deleted parent"
+    );
+}
+
+#[test]
+fn replay_keeps_a_rename_a_same_second_child_link_outranked() {
+    // The parent's rename is live-valid (the group had no children yet). A
+    // child group then links itself with its own 9002, and that child-side
+    // edit does not touch the parent's settings. If the rebuild replays the
+    // child link first (same second, id tie-break), re-running the live
+    // fidelity check would drop the rename and roll the name back after a
+    // restart; the replay must keep it instead.
+    let now = 1_600_000_000;
+    let child_link = event(
+        9002,
+        ADMIN,
+        Some("c1"),
+        vec![vec!["parent".into(), "g1".into()]],
+    );
+    let rename = event(
+        9002,
+        ADMIN,
+        Some("g1"),
+        vec![vec!["name".into(), "alpha".into()]],
+    );
+    // Live: the rename lands first (no children to carry), then the child
+    // links itself.
+    let mut store = GroupStore::with_cap(10);
+    for group in ["g1", "c1"] {
+        store.apply(
+            &event(CREATE_GROUP, ADMIN, Some(group), vec![]),
+            "relay",
+            now,
+            false,
+            false,
+        );
+    }
+    store.apply(&rename, "relay", now, false, false);
+    store.apply(&child_link, "relay", now, false, false);
+    assert_eq!(store.group("g1").unwrap().settings.name, "alpha");
+    assert_eq!(store.group("g1").unwrap().children, vec!["c1".to_string()]);
+    assert_eq!(store.group("c1").unwrap().parent.as_deref(), Some("g1"));
+    // Rebuild replay with the id tie-break reversed (child link first): the
+    // rename is then "missing" the child from its own tag list.
+    let mut replay = GroupStore::with_cap(10);
+    for group in ["g1", "c1"] {
+        replay.apply(
+            &event(CREATE_GROUP, ADMIN, Some(group), vec![]),
+            "relay",
+            now,
+            false,
+            true,
+        );
+    }
+    replay.apply(&child_link, "relay", now, false, true);
+    replay.apply(&rename, "relay", now, false, true);
+    assert_eq!(
+        replay.group("g1").unwrap().settings.name,
+        "alpha",
+        "the replayed rename must not roll back"
+    );
+    assert_eq!(
+        replay.group("g1").unwrap().children,
+        vec!["c1".to_string()],
+        "the child link established by the other stored edit must survive"
+    );
+    assert_eq!(
+        replay.group("c1").unwrap().parent.as_deref(),
+        Some("g1"),
+        "the replayed rename must not detach the child"
     );
 }
 
