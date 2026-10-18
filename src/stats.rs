@@ -58,6 +58,10 @@ pub struct Stats {
     pub conn_refused_proxy: AtomicU64,
     /// Requests refused with `403` because the client IP is NIP-86 blocked.
     pub conn_refused_blocked: AtomicU64,
+    /// NIP-86 management calls refused with `401` (the management token or
+    /// the NIP-98 authorization failed). Successful mutations are recorded
+    /// in the audit log; a burst here signals a brute-force probe.
+    pub rpc_auth_failures: AtomicU64,
     /// `accept()` failures on the listener (e.g. EMFILE): the relay backs off
     /// and keeps serving, so a growing value means the host is out of file
     /// descriptors or otherwise unable to accept.
@@ -246,6 +250,9 @@ impl Stats {
                 "blocked_ip": self.conn_refused_blocked.load(Ordering::Relaxed),
             },
             "accept_errors": self.accept_errors.load(Ordering::Relaxed),
+            // Refused management authentications (see the Prometheus metric
+            // of the same name): mutations are audited, attempts are not.
+            "rpc_auth_failures": self.rpc_auth_failures.load(Ordering::Relaxed),
             // Database queue depth and storage health (see the Prometheus
             // metrics of the same names).
             "db_queue": {
@@ -482,6 +489,12 @@ impl Stats {
             "Requests refused with 403 because the client IP is NIP-86 blocked.",
             "counter",
             self.conn_refused_blocked.load(Ordering::Relaxed),
+        );
+        metric(
+            "nostrfy_rpc_auth_failures",
+            "NIP-86 management calls refused with 401 (authentication failed).",
+            "counter",
+            self.rpc_auth_failures.load(Ordering::Relaxed),
         );
         metric(
             "nostrfy_accept_errors",
@@ -733,6 +746,7 @@ mod tests {
         stats.bump(&stats.conn_refused_proxy, 4);
         stats.bump(&stats.conn_refused_blocked, 5);
         stats.bump(&stats.accept_errors, 6);
+        stats.bump(&stats.rpc_auth_failures, 24);
         stats.db_pending_msgs.store(7, Ordering::Relaxed);
         stats.db_pending_events.store(8, Ordering::Relaxed);
         stats.db_pending_bytes.store(9, Ordering::Relaxed);
@@ -759,6 +773,11 @@ mod tests {
         assert_eq!(refusals["trusted_proxy"].as_u64(), Some(4));
         assert_eq!(refusals["blocked_ip"].as_u64(), Some(5));
         assert_eq!(json["accept_errors"].as_u64(), Some(6));
+        assert_eq!(
+            json["rpc_auth_failures"].as_u64(),
+            Some(24),
+            "refused management authentications must be in the JSON snapshot"
+        );
         let queue = &json["db_queue"];
         assert_eq!(queue["pending_msgs"].as_u64(), Some(7));
         assert_eq!(queue["pending_events"].as_u64(), Some(8));

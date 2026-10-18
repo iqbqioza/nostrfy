@@ -132,6 +132,30 @@ impl log::Log for Logger {
         if !self.enabled(record.metadata()) {
             return;
         }
+        self.log_unfiltered(record);
+    }
+    fn flush(&self) {
+        if let Some(l) = self
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            l.flush();
+        }
+    }
+}
+
+impl Logger {
+    /// Dispatches a record without the level/target filter: the audit trail
+    /// must be recorded even when `RUST_LOG` hides `info` records (raising
+    /// the level is a choice about volume, not about dropping the
+    /// management trail; see [`write_audit_entry`]). Panic-time suppression
+    /// still applies, so a panic inside the logger cannot deadlock here.
+    fn log_unfiltered(&self, record: &log::Record) {
+        if SUPPRESSED.load(Ordering::Relaxed) > 0 {
+            return;
+        }
         if let Some(l) = self
             .inner
             .lock()
@@ -144,16 +168,19 @@ impl log::Log for Logger {
             eprintln!("{}", format_record(record));
         }
     }
-    fn flush(&self) {
-        if let Some(l) = self
-            .inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
-        {
-            l.flush();
-        }
-    }
+}
+
+/// Writes an audit-log line, bypassing the level/target filters and the
+/// process-wide `RUST_LOG` maximum: the management trail (what an admin
+/// changed) must survive a raised log level, unlike routine output. The
+/// line format matches every other record.
+pub(crate) fn write_audit_entry(args: std::fmt::Arguments<'_>) {
+    let record = log::Record::builder()
+        .level(log::Level::Info)
+        .target("nostrfy::audit")
+        .args(args)
+        .build();
+    LOGGER.log_unfiltered(&record);
 }
 
 /// Installs the delegating logger as the process-wide logger (idempotent).
@@ -872,51 +899,70 @@ mod tests {
         );
     }
 
+    /// Backend probe for the dispatch-contract tests: refuses one marker
+    /// target (like a directive scoped to another module would) and counts
+    /// what it receives. A local logger keeps the process-global backend
+    /// out of these tests.
+    #[derive(Default)]
+    struct ProbeBackend {
+        forwarded: std::sync::atomic::AtomicUsize,
+    }
+    struct ProbeBackendHandle(std::sync::Arc<ProbeBackend>);
+    impl log::Log for ProbeBackendHandle {
+        fn enabled(&self, metadata: &log::Metadata) -> bool {
+            metadata.target() != "nostrfy::probe::skip"
+        }
+        fn log(&self, _record: &log::Record) {
+            self.0
+                .forwarded
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        fn flush(&self) {}
+    }
+    fn probe_logger(probe: &std::sync::Arc<ProbeBackend>) -> Logger {
+        Logger {
+            inner: Mutex::new(Some(Box::new(ProbeBackendHandle(std::sync::Arc::clone(
+                probe,
+            ))))),
+        }
+    }
+    fn probe_record(target: &'static str) -> log::Record<'static> {
+        log::Record::builder()
+            .level(log::Level::Info)
+            .target(target)
+            .args(format_args!("probe"))
+            .build()
+    }
+
     #[test]
     fn logger_log_consults_enabled_before_forwarding() {
         // `log` 0.4's macros check only the process-wide max level and never
         // call `enabled` (see the comment in `Logger::log`), so the
         // per-target filter must run inside `log` itself: without it a
-        // module-scoped directive would forward every module's records. A
-        // local logger instance keeps the process-global backend out of the
-        // test.
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        #[derive(Default)]
-        struct Probe {
-            forwarded: AtomicUsize,
-        }
-        struct ProbeHandle(Arc<Probe>);
-        impl log::Log for ProbeHandle {
-            fn enabled(&self, metadata: &log::Metadata) -> bool {
-                // The probe refuses one marker target, like a directive
-                // scoped to another module would.
-                metadata.target() != "nostrfy::probe::skip"
-            }
-            fn log(&self, _record: &log::Record) {
-                self.0.forwarded.fetch_add(1, Ordering::Relaxed);
-            }
-            fn flush(&self) {}
-        }
-
-        let probe = Arc::new(Probe::default());
-        let logger = Logger {
-            inner: Mutex::new(Some(Box::new(ProbeHandle(Arc::clone(&probe))))),
-        };
-        for target in ["nostrfy::probe::skip", "nostrfy::probe::keep"] {
-            let args = format_args!("probe");
-            let record = log::Record::builder()
-                .level(log::Level::Info)
-                .target(target)
-                .args(args)
-                .build();
-            logger.log(&record);
-        }
+        // module-scoped directive would forward every module's records.
+        let probe = std::sync::Arc::new(ProbeBackend::default());
+        let logger = probe_logger(&probe);
+        logger.log(&probe_record("nostrfy::probe::skip"));
+        logger.log(&probe_record("nostrfy::probe::keep"));
         assert_eq!(
-            probe.forwarded.load(Ordering::Relaxed),
+            probe.forwarded.load(std::sync::atomic::Ordering::Relaxed),
             1,
             "a record `enabled` refuses must not reach the backend"
+        );
+    }
+
+    #[test]
+    fn unfiltered_dispatch_bypasses_the_target_filter() {
+        // `write_audit_entry` uses this path: the management trail must
+        // survive a raised `RUST_LOG` level, which is a choice about volume
+        // and not about dropping the audit record.
+        let probe = std::sync::Arc::new(ProbeBackend::default());
+        let logger = probe_logger(&probe);
+        logger.log_unfiltered(&probe_record("nostrfy::probe::skip"));
+        assert_eq!(
+            probe.forwarded.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the unfiltered path must forward what `log` would refuse"
         );
     }
 

@@ -6,6 +6,10 @@
 //! dropped and summarized once per window. A bounded ring of the recent
 //! entries is kept for tests and for a quick operational look at what
 //! changed.
+//!
+//! Entries bypass the `RUST_LOG` level/target filters (see
+//! [`crate::logging::write_audit_entry`]): raising the log level hides
+//! routine output, never the record of what an admin changed.
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -74,7 +78,10 @@ impl AuditLog {
         }
         if state.count < MAX_PER_WINDOW {
             state.count += 1;
-            log::info!("admin {entry}");
+            // Bypasses the `log` level/target filters: a raised `RUST_LOG`
+            // must not drop the management trail (see
+            // `logging::write_audit_entry`).
+            crate::logging::write_audit_entry(format_args!("admin {entry}"));
             if state.recent.len() >= RING_CAP {
                 state.recent.pop_front();
             }

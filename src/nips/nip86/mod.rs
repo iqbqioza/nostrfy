@@ -261,6 +261,29 @@ macro_rules! audit {
 }
 
 /// NIP-86 JSON-RPC handler, mounted on `POST /` and `POST /ws`.
+/// Unix time of the last authentication-failure warning: a brute-force
+/// probe must leave a visible trace without one log line per attempt
+/// (successful mutations go to the audit log; failed attempts do not).
+static LAST_AUTH_FAILURE_WARN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Warns, at most once a minute, that a management call failed
+/// authentication, naming the client: the audit trail covers successful
+/// mutations only, so refused attempts need their own signal.
+fn warn_auth_failure(client: std::net::IpAddr, now: u64) {
+    use std::sync::atomic::Ordering;
+    const WARN_INTERVAL: u64 = 60;
+    let last = LAST_AUTH_FAILURE_WARN.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < WARN_INTERVAL {
+        return;
+    }
+    if LAST_AUTH_FAILURE_WARN
+        .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
+    {
+        log::warn!("NIP-86 authentication failed (management call refused) from {client}");
+    }
+}
+
 pub async fn rpc_handler(
     State(relay): State<Arc<Relay>>,
     axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
@@ -289,6 +312,8 @@ pub async fn rpc_handler(
             .into_response();
     }
     let Some(identity) = rpc_authenticated(&relay, &headers, &uri, &body).await else {
+        relay.stats.bump(&relay.stats.rpc_auth_failures, 1);
+        warn_auth_failure(peer.ip(), crate::util::unix_now());
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({ "error": "unauthorized" })),
@@ -2909,6 +2934,14 @@ mod tests {
         .await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         assert!(relay.audit.recent().is_empty());
+        assert_eq!(
+            relay
+                .stats
+                .rpc_auth_failures
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "a refused authentication must be counted (mutations are audited, attempts are not)"
+        );
         relay.db.shutdown();
     }
 
