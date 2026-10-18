@@ -331,7 +331,17 @@ impl super::Conn {
             items
                 .into_iter()
                 .filter(|item| {
-                    if item.protected && !self.is_authed() {
+                    // The relay's own relay-signed events (NIP-43's role
+                    // state) carry the `-` tag by spec while remaining the
+                    // relay's advertisement: they stay readable anonymously
+                    // (see `nip70::hidden_from_anonymous`).
+                    if item.protected
+                        && !self.is_authed()
+                        && !crate::nips::nip70::relay_authored(
+                            &item.pubkey,
+                            self.relay.relay_pubkey.as_deref(),
+                        )
+                    {
                         return false;
                     }
                     // NIP-78: application-specific events are only synced

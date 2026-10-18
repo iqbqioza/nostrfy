@@ -38,6 +38,26 @@ pub fn tags_protected(tags: &[Vec<String>]) -> bool {
         .any(|t| t.first().is_some_and(|name| name == PROTECTED_TAG))
 }
 
+/// Whether `pubkey` is the relay's own identity. The relay's relay-signed
+/// events carry the `-` tag by spec (NIP-43's role state) but remain the
+/// relay's advertisement: the read-side policy must not hide them (see
+/// [`hidden_from_anonymous`]).
+pub fn relay_authored(pubkey: &str, relay_pubkey: Option<&str>) -> bool {
+    relay_pubkey.is_some_and(|pk| pubkey.eq_ignore_ascii_case(pk))
+}
+
+/// Whether a protected event is withheld from an anonymous reader.
+///
+/// The `-` tag constrains *publication* (author-only, enforced on the write
+/// path) and re-publication, not the reads; withholding protected events
+/// from anonymous clients is a closed-access policy. It must not apply to
+/// the relay's own events: NIP-43's role state carries the tag by spec
+/// while being the relay's advertisement, and hiding it would leave
+/// anonymous clients with a silently empty role/membership view.
+pub fn hidden_from_anonymous(event: &Event, relay_pubkey: Option<&str>) -> bool {
+    is_protected(event) && !relay_authored(&event.pubkey, relay_pubkey)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

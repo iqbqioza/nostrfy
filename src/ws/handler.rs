@@ -1088,7 +1088,7 @@ impl super::Conn {
             events
                 .into_iter()
                 .filter(|e| {
-                    (self.is_authed() || !nip70::is_protected(e))
+                    (self.is_authed() || !self.nip70_hidden(e))
                         && self.gift_wrap_visible(e)
                         && self.nip78_visible(e)
                         && groups.as_deref().is_none_or(|g| {
@@ -1191,13 +1191,25 @@ impl super::Conn {
             .any(|pk| self.relay.relay_pubkey.as_ref().is_some_and(|r| r == pk) || admin == pk)
     }
 
+    /// Whether a NIP-70 protected event is withheld from this (anonymous)
+    /// client. The `-` tag constrains *publication* (author-only, enforced
+    /// on the write path) and re-publication, not the reads; the relay's
+    /// *own* relay-signed events carry it by spec (NIP-43's role state)
+    /// while remaining the relay's advertisement, so hiding those would
+    /// leave anonymous clients with a silently empty role/membership view.
+    fn nip70_hidden(&self, event: &Event) -> bool {
+        nip70::hidden_from_anonymous(event, self.relay.relay_pubkey.as_deref())
+    }
+
     pub(crate) fn auth_hidden_behind(
         &self,
         groups: Option<&nip29::GroupStore>,
         event: &Event,
     ) -> bool {
-        // NIP-70: protected events are served to any authenticated client.
-        if !self.is_authed() && nip70::is_protected(event) {
+        // NIP-70: protected events are served to any authenticated client
+        // (the relay's own relay-signed events stay readable anonymously,
+        // see `nip70_hidden`).
+        if !self.is_authed() && self.nip70_hidden(event) {
             return true;
         }
         // NIP-59 gift wraps are served to the authenticated recipient and
@@ -1251,11 +1263,10 @@ impl super::Conn {
     /// event: the expensive group-store lock is skipped then, and the
     /// NIP-29 check (which can only fail for a group event) does not run.
     pub(crate) fn visible_to(&self, groups: Option<&nip29::GroupStore>, event: &Event) -> bool {
-        // NIP-70: protected events are only served to authenticated clients.
-        // The `-` tag constrains *publication* (author-only, enforced on the
-        // write path); NIP-43's relay-generated membership metadata carries
-        // it by spec while remaining readable to authenticated clients.
-        if !self.is_authed() && nip70::is_protected(event) {
+        // NIP-70: protected events are only served to authenticated clients
+        // (the relay's own relay-signed events stay readable anonymously,
+        // see `nip70_hidden`).
+        if !self.is_authed() && self.nip70_hidden(event) {
             return false;
         }
         if !self.gift_wrap_visible(event) {

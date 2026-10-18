@@ -2391,6 +2391,51 @@ mod tests {
     }
 
     #[test]
+    fn relay_signed_protected_events_stay_readable_anonymously() {
+        // NIP-43's role state carries the NIP-70 `-` tag by spec, but the
+        // tag constrains publication (author-only) and re-publication, not
+        // the reads: the relay's own advertisement must stay readable to
+        // anonymous clients, or they would see a silently empty
+        // role/membership view. Foreign protected events stay hidden.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn_with(&"02".repeat(32)).await;
+            let now = unix_now();
+            let relay_pk = conn
+                .relay
+                .relay_pubkey
+                .clone()
+                .expect("the keyed test relay must have a pubkey");
+            // The relay's own relay-signed event: `-`-tagged by spec.
+            let mut relay_signed = signed_note(conn.relay.secp(), "relay state", now, vec![]);
+            relay_signed.pubkey = relay_pk;
+            relay_signed.tags = vec![vec!["-".into()]];
+            relay_signed.id = crate::nips::nip01::compute_id(&relay_signed);
+            // A foreign protected event: still hidden.
+            let foreign = signed_note(conn.relay.secp(), "secret", now, vec![vec!["-".into()]]);
+            conn.relay.db.put(relay_signed.clone(), now).await;
+            conn.relay.db.put(foreign.clone(), now).await;
+            conn.handle_req(&[json!("sub"), json!({"kinds": [1]})])
+                .await;
+            conn.pump_pending_reqs();
+            let ids: Vec<String> = outgoing_json(&conn)
+                .iter()
+                .filter(|m| m[0] == "EVENT")
+                .map(|m| m[2]["id"].as_str().unwrap().to_string())
+                .collect();
+            assert!(
+                ids.contains(&relay_signed.id),
+                "the relay's own protected event must stay readable: {ids:?}"
+            );
+            assert!(
+                !ids.contains(&foreign.id),
+                "a foreign protected event must stay hidden: {ids:?}"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
     fn req_inbox_outbox_filters() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {

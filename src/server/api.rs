@@ -402,10 +402,11 @@ fn excluded_tags(params: &ApiParams) -> Vec<&'static str> {
 
 /// Whether a stored event is visible to the REST API. It applies the same
 /// per-event visibility rules as an anonymous WebSocket connection:
-/// NIP-70 protected events, NIP-59 gift wraps, NIP-29 private/hidden group
-/// content and (when the NIP-78 AUTH gate is active) NIP-78
-/// application-specific events are withheld. `relay.require_auth` is
-/// enforced separately by [`api_auth_middleware`]; this predicate stays
+/// NIP-70 protected events (except the relay's own relay-signed events,
+/// see [`nip70::hidden_from_anonymous`]), NIP-59 gift wraps, NIP-29
+/// private/hidden group content and (when the NIP-78 AUTH gate is active)
+/// NIP-78 application-specific events are withheld. `relay.require_auth`
+/// is enforced separately by [`api_auth_middleware`]; this predicate stays
 /// the anonymous-visibility one, so an authorized caller sees the same
 /// event set as before (the API exposes no identity-scoped reads).
 fn api_visible(
@@ -413,8 +414,9 @@ fn api_visible(
     groups: Option<&nip29::GroupStore>,
     excluded: &[&str],
     nip78: bool,
+    relay_pubkey: Option<&str>,
 ) -> bool {
-    !nip70::is_protected(event)
+    !nip70::hidden_from_anonymous(event, relay_pubkey)
         && event.kind != nip62::GIFT_WRAP_KIND
         && !(nip78 && nip78::is_app_specific(event))
         && groups.is_none_or(|g| g.visible_to(event, None))
@@ -750,7 +752,15 @@ pub async fn api_monthly_handler(
                 };
                 start_ts = events
                     .iter()
-                    .find(|e| api_visible(e, groups.as_deref(), &no_tags_probe, nip78_probe))
+                    .find(|e| {
+                        api_visible(
+                            e,
+                            groups.as_deref(),
+                            &no_tags_probe,
+                            nip78_probe,
+                            relay.relay_pubkey.as_deref(),
+                        )
+                    })
                     .map(|e| e.created_at);
                 drop(groups);
                 if start_ts.is_some() || fetch >= 1024 {
@@ -840,7 +850,15 @@ pub async fn api_monthly_handler(
         };
         let count = events
             .iter()
-            .filter(|e| api_visible(e, groups.as_deref(), &no_tags, nip78))
+            .filter(|e| {
+                api_visible(
+                    e,
+                    groups.as_deref(),
+                    &no_tags,
+                    nip78,
+                    relay.relay_pubkey.as_deref(),
+                )
+            })
             .count();
         drop(groups);
         total += count as u64;
@@ -934,7 +952,15 @@ pub async fn api_count_handler(
     };
     let count = events
         .iter()
-        .filter(|e| api_visible(e, groups.as_deref(), &no_tags, nip78))
+        .filter(|e| {
+            api_visible(
+                e,
+                groups.as_deref(),
+                &no_tags,
+                nip78,
+                relay.relay_pubkey.as_deref(),
+            )
+        })
         .count();
     drop(groups);
     (
@@ -983,10 +1009,15 @@ pub async fn api_kinds_handler(
     let no_tags = excluded_tags(&params);
     let nip78 = enabled_nip78_auth_active(&relay).await;
     let mut by_kind: std::collections::BTreeMap<u64, usize> = std::collections::BTreeMap::new();
-    for e in events
-        .iter()
-        .filter(|e| api_visible(e, groups.as_deref(), &no_tags, nip78))
-    {
+    for e in events.iter().filter(|e| {
+        api_visible(
+            e,
+            groups.as_deref(),
+            &no_tags,
+            nip78,
+            relay.relay_pubkey.as_deref(),
+        )
+    }) {
         *by_kind.entry(e.kind).or_default() += 1;
     }
     drop(groups);
@@ -1089,7 +1120,15 @@ pub async fn api_daily_handler(
         };
         let count = events
             .iter()
-            .filter(|e| api_visible(e, groups.as_deref(), &no_tags, nip78))
+            .filter(|e| {
+                api_visible(
+                    e,
+                    groups.as_deref(),
+                    &no_tags,
+                    nip78,
+                    relay.relay_pubkey.as_deref(),
+                )
+            })
             .count();
         drop(groups);
         total += count as u64;
@@ -1201,10 +1240,15 @@ pub async fn api_stats_handler(
     };
     let mut by_kind: std::collections::BTreeMap<u64, usize> = std::collections::BTreeMap::new();
     let mut total = 0usize;
-    for e in events
-        .iter()
-        .filter(|e| api_visible(e, groups.as_deref(), &no_tags, nip78))
-    {
+    for e in events.iter().filter(|e| {
+        api_visible(
+            e,
+            groups.as_deref(),
+            &no_tags,
+            nip78,
+            relay.relay_pubkey.as_deref(),
+        )
+    }) {
         *by_kind.entry(e.kind).or_default() += 1;
         total += 1;
     }
@@ -1245,14 +1289,26 @@ pub async fn api_stats_handler(
             };
             let stats_groups = relay.groups.read().await;
             if first_visible.is_none() {
-                first_visible = first
-                    .into_iter()
-                    .find(|e| api_visible(e, Some(&stats_groups), &no_tags, nip78));
+                first_visible = first.into_iter().find(|e| {
+                    api_visible(
+                        e,
+                        Some(&stats_groups),
+                        &no_tags,
+                        nip78,
+                        relay.relay_pubkey.as_deref(),
+                    )
+                });
             }
             if last_visible.is_none() {
-                last_visible = last
-                    .into_iter()
-                    .find(|e| api_visible(e, Some(&stats_groups), &no_tags, nip78));
+                last_visible = last.into_iter().find(|e| {
+                    api_visible(
+                        e,
+                        Some(&stats_groups),
+                        &no_tags,
+                        nip78,
+                        relay.relay_pubkey.as_deref(),
+                    )
+                });
             }
             drop(stats_groups);
             if first_visible.is_some() && last_visible.is_some() {
@@ -1394,7 +1450,15 @@ pub async fn api_hourly_handler(
         };
         let count = events
             .iter()
-            .filter(|e| api_visible(e, groups.as_deref(), &no_tags, nip78))
+            .filter(|e| {
+                api_visible(
+                    e,
+                    groups.as_deref(),
+                    &no_tags,
+                    nip78,
+                    relay.relay_pubkey.as_deref(),
+                )
+            })
             .count();
         drop(groups);
         total += count as u64;
@@ -1535,9 +1599,12 @@ fn aggregate_visible(
     item: &crate::db::NegItem,
     groups: Option<&nip29::GroupStore>,
     nip78: bool,
+    relay_pubkey: Option<&str>,
 ) -> bool {
-    // NIP-70: protected events are never served to anonymous readers.
-    if item.protected {
+    // NIP-70: protected events are never served to anonymous readers
+    // (except the relay's own relay-signed events: see
+    // `nip70::hidden_from_anonymous`).
+    if item.protected && !nip70::relay_authored(&item.pubkey, relay_pubkey) {
         return false;
     }
     // NIP-59: gift wraps are withheld from anonymous readers (`Some` only
@@ -1598,7 +1665,12 @@ pub async fn api_relay_kinds_handler(
             None
         };
         for item in &items {
-            if aggregate_visible(item, groups.as_deref(), nip78) {
+            if aggregate_visible(
+                item,
+                groups.as_deref(),
+                nip78,
+                relay.relay_pubkey.as_deref(),
+            ) {
                 *counts.entry(item.kind).or_default() += 1;
             }
         }
@@ -1665,7 +1737,12 @@ pub async fn api_top_authors_handler(
             None
         };
         for item in &items {
-            if aggregate_visible(item, groups.as_deref(), nip78) {
+            if aggregate_visible(
+                item,
+                groups.as_deref(),
+                nip78,
+                relay.relay_pubkey.as_deref(),
+            ) {
                 *counts.entry(item.pubkey.as_str()).or_default() += 1;
             }
         }
@@ -1921,7 +1998,15 @@ async fn query_and_respond(
         };
         let visible_count = events
             .iter()
-            .filter(|e| api_visible(e, groups.as_deref(), no_tags, nip78))
+            .filter(|e| {
+                api_visible(
+                    e,
+                    groups.as_deref(),
+                    no_tags,
+                    nip78,
+                    relay.relay_pubkey.as_deref(),
+                )
+            })
             .count();
         drop(groups);
         if visible_count >= want_visible || !db_more || fetch >= hard_cap {
@@ -1947,7 +2032,15 @@ async fn query_and_respond(
     };
     let visible: Vec<Event> = events
         .into_iter()
-        .filter(|e| api_visible(e, groups.as_deref(), no_tags, nip78))
+        .filter(|e| {
+            api_visible(
+                e,
+                groups.as_deref(),
+                no_tags,
+                nip78,
+                relay.relay_pubkey.as_deref(),
+            )
+        })
         .collect();
     drop(groups);
 
@@ -2281,16 +2374,43 @@ mod tests {
         let mut no_p = plain.clone();
         no_p.tags = vec![vec!["p".into(), "bb".repeat(32)]];
 
-        assert!(api_visible(&plain, None, &[], false));
-        assert!(!api_visible(&protected, None, &[], false), "NIP-70 hidden");
-        assert!(!api_visible(&wrap, None, &[], false), "gift wraps hidden");
+        assert!(api_visible(&plain, None, &[], false, None));
         assert!(
-            api_visible(&app, None, &[], false),
+            !api_visible(&protected, None, &[], false, None),
+            "NIP-70 hidden"
+        );
+        // The relay's own relay-signed protected events (NIP-43's role
+        // state) stay readable: the `-` tag constrains publication, and
+        // hiding the relay's advertisement would leave anonymous clients
+        // with an empty role/membership view.
+        let relay_pk = "cc".repeat(32);
+        let mut relay_protected = protected.clone();
+        relay_protected.pubkey = relay_pk.clone();
+        assert!(
+            api_visible(&relay_protected, None, &[], false, Some(&relay_pk)),
+            "the relay's own protected events stay readable"
+        );
+        assert!(
+            !api_visible(&relay_protected, None, &[], false, None),
+            "without the relay identity they are foreign protected events"
+        );
+        assert!(
+            !api_visible(&wrap, None, &[], false, None),
+            "gift wraps hidden"
+        );
+        assert!(
+            api_visible(&app, None, &[], false, None),
             "NIP-78 app-specific is public without the AUTH gate"
         );
-        assert!(!api_visible(&app, None, &[], true), "AUTH gate hides it");
-        assert!(!api_visible(&no_p, None, &["p"], false), "no_p excludes");
-        assert!(api_visible(&no_p, None, &["e"], false));
+        assert!(
+            !api_visible(&app, None, &[], true, None),
+            "AUTH gate hides it"
+        );
+        assert!(
+            !api_visible(&no_p, None, &["p"], false, None),
+            "no_p excludes"
+        );
+        assert!(api_visible(&no_p, None, &["e"], false, None));
     }
 
     #[test]
