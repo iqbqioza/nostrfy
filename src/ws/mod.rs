@@ -681,6 +681,20 @@ impl Conn {
         }
     }
 
+    /// RFC 6455 Close(1009) "message too big": queued (ahead of teardown)
+    /// when the protocol layer rejects an oversized inbound frame, so the
+    /// client can tell it from a network failure.
+    fn queue_close_too_big(&mut self) {
+        self.outgoing.push_back(OutFrame {
+            message: Message::Close(Some(axum::extract::ws::CloseFrame {
+                code: axum::extract::ws::close_code::SIZE,
+                reason: "message too big".into(),
+            })),
+            event_sub: None,
+        });
+        self.out_msgs = self.out_msgs.saturating_add(1);
+    }
+
     pub(crate) fn send_notice(&mut self, text: &str) {
         self.send_json(json!(["NOTICE", text]));
     }
@@ -1235,6 +1249,21 @@ where
     outcome
 }
 
+/// Whether a receive error is the protocol layer's size-limit rejection.
+fn is_capacity_error(e: &axum::Error) -> bool {
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    while let Some(err) = cur {
+        if matches!(
+            err.downcast_ref::<tungstenite::Error>(),
+            Some(tungstenite::Error::Capacity(_))
+        ) {
+            return true;
+        }
+        cur = err.source();
+    }
+    false
+}
+
 /// Flushes the queued outgoing frames and closes the sink, bounded by
 /// `grace`. A peer that stopped reading makes `send`/`close` park forever;
 /// without the bound the connection task (and with it the connection slot,
@@ -1570,16 +1599,22 @@ pub async fn handle_connection(
                     }
                     tokio::select! {
                         biased;
-                        _ = sleep.as_mut() => Err(()),
+                        _ = sleep.as_mut() => Err(false),
                         frame = receiver.next() => match frame {
                             Some(Ok(frame)) => Ok(frame),
-                            _ => Err(()),
+                            Some(Err(e)) => {
+                                Err(is_capacity_error(&e))
+                            }
+                            None => Err(false),
                         },
                     }
                 }
                 None => match receiver.next().await {
                     Some(Ok(frame)) => Ok(frame),
-                    _ => Err(()),
+                    Some(Err(e)) => {
+                        Err(is_capacity_error(&e))
+                    }
+                    None => Err(false),
                 },
             }
         };
@@ -1587,7 +1622,12 @@ pub async fn handle_connection(
             incoming = incoming_fut => {
                 match incoming {
                     // Idle timeout (ws_idle_timeout_secs): no inbound frames.
-                    Err(_) => break,
+                    Err(too_big) => {
+                        if too_big {
+                            conn.queue_close_too_big();
+                        }
+                        break;
+                    }
                     Ok(Message::Close(_)) => break,
                     Ok(frame) => {
                         last_activity = std::time::Instant::now();
@@ -1637,7 +1677,13 @@ pub async fn handle_connection(
                         biased;
                         frame = receiver.next() => match frame {
                             Some(Ok(frame)) => frame,
-                            _ => break,
+                            Some(Err(e)) => {
+                                if is_capacity_error(&e) {
+                                    conn.queue_close_too_big();
+                                }
+                                break;
+                            }
+                            None => break,
                         },
                         _ = &mut window_deadline => break,
                     };
@@ -1881,6 +1927,17 @@ pub async fn handle_connection(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capacity_error_is_detected() {
+        use tungstenite::error::CapacityError;
+        let cap = axum::Error::new(tungstenite::Error::Capacity(
+            CapacityError::MessageTooLong { size: 2, max_size: 1 },
+        ));
+        assert!(is_capacity_error(&cap));
+        let other = axum::Error::new(tungstenite::Error::ConnectionClosed);
+        assert!(!is_capacity_error(&other));
+    }
     use secp256k1::{Keypair, Secp256k1, XOnlyPublicKey};
     use serde_json::Value;
     use tokio::sync::RwLock;
@@ -8689,7 +8746,7 @@ mod tests {
         S: futures_util::Stream<
                 Item = Result<
                     tokio_tungstenite::tungstenite::Message,
-                    tokio_tungstenite::tungstenite::Error,
+                    tungstenite::Error,
                 >,
             > + Unpin,
     {
@@ -8775,7 +8832,7 @@ mod tests {
         S: futures_util::Stream<
                 Item = Result<
                     tokio_tungstenite::tungstenite::Message,
-                    tokio_tungstenite::tungstenite::Error,
+                    tungstenite::Error,
                 >,
             > + Unpin,
     {

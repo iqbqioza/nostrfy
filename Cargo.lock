@@ -1099,6 +1099,7 @@ dependencies = [
  "tokio-tungstenite",
  "toml",
  "tower",
+ "tungstenite",
  "ureq",
 ]
 
