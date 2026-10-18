@@ -9413,9 +9413,7 @@ mod tests {
         {
             let mut roles = relay.roles.write().await;
             roles.roles.insert("mod".into(), Default::default());
-            roles
-                .assignments
-                .insert(member.clone(), vec!["mod".into()]);
+            roles.assignments.insert(member.clone(), vec!["mod".into()]);
         }
         relay.heal_rotated_role_state().await;
         let (stored, _) = relay.db.query(vec![role_filter()], 100, now).await;
