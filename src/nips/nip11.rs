@@ -39,10 +39,12 @@ pub fn relay_info(
             "max_subid_length": limits.max_sub_id_len,
             "max_event_tags": limits.max_tags,
             "max_content_length": limits.max_content_bytes,
-            // Only advertise the PoW floor when NIP-13 is enabled and it is
-            // actually enforced; otherwise reporting `require_pow` would
-            // claim a difficulty the relay never checks.
-            "min_pow_difficulty": if config.nip_enabled(13) { config.relay.require_pow } else { 0 },
+            // NIP-13: the floor is enforced whenever it is configured,
+            // independent of the advertisement toggle (hiding the NIP from
+            // `supported_nips` must not silently disable the operator's
+            // spam defense), so the document must report the real floor
+            // rather than claim PoW is unchecked.
+            "min_pow_difficulty": config.relay.require_pow,
             "auth_required": config.relay.require_auth,
             "payment_required": false,
             // NIP-11: true when users must know a write policy up front —
@@ -199,6 +201,32 @@ mod tests {
         // NIP-11's examples are relative seconds (300, 3), not absolute
         // timestamps.
         assert_eq!(upper, Config::default().limits.max_created_at_future_secs);
+    }
+
+    #[test]
+    fn a_hidden_nip13_still_reports_the_enforced_pow_floor() {
+        // The floor is enforced whenever it is configured, regardless of the
+        // NIP-13 advertisement toggle: a hidden NIP-13 must not make the
+        // document claim PoW is unchecked while `pow:` rejections continue.
+        let mut cfg = Config::default();
+        cfg.relay.require_pow = 25;
+        cfg.relay.disabled_nips = vec![13];
+        let info = relay_info(&cfg, &AccessControl::default(), &Stats::new(), None);
+        assert_eq!(
+            info["limitation"]["min_pow_difficulty"].as_u64(),
+            Some(25),
+            "the enforced floor must be advertised"
+        );
+        let nips: Vec<u64> = info["supported_nips"]
+            .as_array()
+            .expect("supported_nips is an array")
+            .iter()
+            .filter_map(|v| v.as_u64())
+            .collect();
+        assert!(
+            !nips.contains(&13),
+            "the operator's NIP-13 toggle still hides the NIP"
+        );
     }
 
     #[test]

@@ -116,7 +116,11 @@ pub(crate) fn relay_discovery_event(
     } else {
         tags.push(vec!["R".into(), "!writes".into()]);
     }
-    if cfg.nip_enabled(13) && cfg.relay.require_pow > 0 {
+    // NIP-66's `R` keys cover auth, writes, pow and payment: the pow
+    // requirement follows the enforced floor (`validate` checks it
+    // regardless of the NIP-13 advertisement toggle), so a hidden NIP-13
+    // must not make the discovery event claim PoW is unchecked.
+    if cfg.relay.require_pow > 0 {
         tags.push(vec!["R".into(), "pow".into()]);
     } else {
         tags.push(vec!["R".into(), "!pow".into()]);
@@ -173,6 +177,42 @@ mod tests {
         let doc: serde_json::Value = serde_json::from_str(&ev.content).unwrap();
         assert_eq!(doc["supported_nips"], serde_json::to_value(&nips).unwrap());
         assert_eq!(doc["name"], cfg.relay.name);
+    }
+
+    #[test]
+    fn a_hidden_nip13_still_reports_the_enforced_pow_requirement() {
+        // The pow requirement follows the enforced floor (validate checks
+        // it regardless of the NIP-13 advertisement toggle): a hidden
+        // NIP-13 must not make the discovery event claim PoW is unchecked.
+        let mut cfg = Config::default();
+        cfg.relay.require_pow = 20;
+        cfg.relay.disabled_nips = vec![13];
+        let ev = relay_discovery_event(
+            &cfg,
+            &AccessControl::default(),
+            &"bb".repeat(32),
+            &Stats::new(),
+            1_700_000_000,
+        );
+        let reqs: Vec<&str> = ev
+            .tags
+            .iter()
+            .filter(|t| t[0] == "R")
+            .map(|t| t[1].as_str())
+            .collect();
+        assert!(
+            reqs.contains(&"pow") && !reqs.contains(&"!pow"),
+            "the enforced floor must be advertised: {reqs:?}"
+        );
+        let doc: serde_json::Value = serde_json::from_str(&ev.content).unwrap();
+        assert_eq!(doc["limitation"]["min_pow_difficulty"].as_u64(), Some(20));
+        let nips: Vec<u64> = doc["supported_nips"]
+            .as_array()
+            .expect("supported_nips is an array")
+            .iter()
+            .filter_map(|v| v.as_u64())
+            .collect();
+        assert!(!nips.contains(&13), "the NIP-13 toggle still hides the NIP");
     }
 
     #[test]

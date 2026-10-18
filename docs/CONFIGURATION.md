@@ -132,7 +132,7 @@ Every key is optional; a missing key uses the default shown below.
 
 **`enabled_git`** — When `true`, NIP-34 git events (kinds `1617`-`1633`, `30617`/`30618`) are accepted and NIP-34 is advertised in the NIP-11 document. Default `false`: the kinds are rejected with `blocked: NIP-34 git events are disabled` (patch payloads can be large, so this is opt-in) and NIP-34 stays out of `supported_nips`. Takes effect immediately on `SIGHUP` reload and on the next publish.
 
-**`require_pow`** — The required proof-of-work difficulty: the event id must start with at least this many zero bits (NIP-13), enforced only when NIP-13 is enabled. High values (≥ 64) make publishing practically impossible — the relay warns.
+**`require_pow`** — The required proof-of-work difficulty: the event id must start with at least this many zero bits (NIP-13), enforced whenever it is set — regardless of whether NIP-13 is advertised (hiding the NIP from `supported_nips` must not silently disable the spam defense, and the NIP-11 `min_pow_difficulty` reports the real floor). High values (≥ 64) make publishing practically impossible — the relay warns.
 
 **`new_pubkey_min_age_secs`** — Spam defense: a pubkey's first accepted event is recorded, and events from pubkeys first seen less than this many seconds ago are rejected with `restricted: your account is too new`. `0` disables the check.
 
