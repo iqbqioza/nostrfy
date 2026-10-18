@@ -1025,11 +1025,13 @@ impl Config {
                         .iter()
                         .any(|k| self.is_kind_effectively_allowed(*k, access))
                 } else {
-                    // No associated kinds (e.g. NIP-11, NIP-86, or NIPs like
-                    // NIP-33 whose range cannot be enumerated against block
-                    // lists) — always advertised when enabled. A restrictive
-                    // `allowed_kinds` may therefore still advertise these;
-                    // the kind filter itself is still enforced on writes.
+                    // No associated publishable kinds (NIP-11, NIP-42/98
+                    // whose auth events are verified outside the publish
+                    // path, NIP-86, or NIPs like NIP-33 whose range cannot
+                    // be enumerated against block lists) — always advertised
+                    // when enabled. A restrictive `allowed_kinds` may
+                    // therefore still advertise these; the kind filter
+                    // itself is still enforced on writes.
                     true
                 }
             })
@@ -1109,7 +1111,7 @@ impl Config {
                 1617, 1618, 1619, 1621, 1622, 1630, 1631, 1632, 1633, 30617, 30618,
             ]),
             40 => None,
-            42 => Some(&[22242]),
+            42 => None, // AUTH message — verified outside the publish path
             43 => Some(&[8000, 8001, 28934, 28935, 28936, 33534, 13534]),
             45 => None,
             46 => Some(&[24133]),
@@ -1130,7 +1132,7 @@ impl Config {
             87 => Some(&[38000, 38172, 38173]),
             88 => Some(&[1018, 1068]),
             94 => Some(&[1063]),
-            98 => Some(&[27235]),
+            98 => None, // Authorization header — verified outside the publish path
             _ => None,
         }
     }
@@ -3993,6 +3995,44 @@ max_log_files = 2
             nips.contains(&40),
             "NIP-40 (no kinds) is always advertised when enabled"
         );
+    }
+
+    #[test]
+    fn auth_nips_survive_the_publish_kind_lists() {
+        // NIP-42 AUTH events are client messages verified by the AUTH
+        // handler, and NIP-98 is verified from the HTTP Authorization
+        // header: neither passes through the publish kind allow/block
+        // lists. A restrictive `allowed_kinds` must not hide auth support
+        // (with `auth_required` that would read as "auth required, auth
+        // unsupported").
+        let cfg = Config::default();
+        let access = AccessControl {
+            allowed_kinds: vec![1],
+            ..Default::default()
+        };
+        let nips = cfg.effective_supported_nips(&access);
+        assert!(nips.contains(&42), "NIP-42 must stay advertised");
+        assert!(nips.contains(&98), "NIP-98 must stay advertised");
+        // The block list only gates publishable kinds as well.
+        let access = AccessControl {
+            blocked_kinds: vec![22242, 27235],
+            ..Default::default()
+        };
+        let nips = cfg.effective_supported_nips(&access);
+        assert!(
+            nips.contains(&42),
+            "blocking kind 22242 must not hide NIP-42"
+        );
+        assert!(
+            nips.contains(&98),
+            "blocking kind 27235 must not hide NIP-98"
+        );
+        // Explicitly disabling the NIP still hides it (restart reload).
+        let mut cfg = Config::default();
+        cfg.relay.disabled_nips = vec![42, 98];
+        let nips = cfg.effective_supported_nips(&AccessControl::default());
+        assert!(!nips.contains(&42), "disabled_nips still hides NIP-42");
+        assert!(!nips.contains(&98), "disabled_nips still hides NIP-98");
     }
 
     #[test]
