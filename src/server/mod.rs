@@ -139,6 +139,11 @@ pub async fn cors_middleware(request: Request, next: Next) -> Response {
 /// read under the deadline and re-injected, so the handler's extractors
 /// still see the exact bytes (and `DefaultBodyLimit` still applies).
 /// The documented `0 = disabled` config passes through untouched.
+/// Upper bound for a LiveKit webhook POST: the room/participant event JSON
+/// is a few KiB, so anything larger is not a webhook this relay needs to
+/// parse (and must not pin the connection's read buffers).
+const LIVEKIT_WEBHOOK_BODY_LIMIT: usize = 64 * 1024;
+
 async fn body_read_timeout_middleware(
     request: Request,
     next: Next,
@@ -364,7 +369,26 @@ async fn build_router(
             .route("/.well-known/nip29/livekit/{group}", get(livekit_token))
             .route(
                 "/.well-known/nip29/livekit/webhook",
-                get(livekit_token_webhook_group).post(livekit_webhook),
+                get(livekit_token_webhook_group)
+                    .post(livekit_webhook)
+                    // The webhook body is read under the same deadline as
+                    // the other HTTP bodies; without it a POST that never
+                    // produces a byte pins the connection (and its per-IP
+                    // slot) indefinitely. The size cap applies even when
+                    // the timeout is disabled (`http_read_timeout_secs =
+                    // 0`).
+                    .layer(axum::extract::DefaultBodyLimit::max(
+                        LIVEKIT_WEBHOOK_BODY_LIMIT,
+                    ))
+                    .layer(axum::middleware::from_fn(move |request, next| async move {
+                        body_read_timeout_middleware(
+                            request,
+                            next,
+                            body_read_timeout,
+                            LIVEKIT_WEBHOOK_BODY_LIMIT,
+                        )
+                        .await
+                    })),
             );
     }
     // The Blossom routes are reachable only on the Blossom host (the host
@@ -4169,6 +4193,57 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn livekit_webhook_body_read_is_bounded_by_the_read_timeout() {
+        // The webhook accepts a POST body from the network: a body that
+        // never produces a byte must be cut at the HTTP read deadline (like
+        // the NIP-86 POST), not pin the connection and its per-IP slot
+        // forever.
+        let relay = blossom_relay().await;
+        {
+            let mut cfg = relay.config.write().await;
+            cfg.limits.http_read_timeout_secs = 1;
+            cfg.relay.livekit_url = "wss://livekit.example.com".into();
+            cfg.relay.livekit_api_key = "key".into();
+            cfg.relay.livekit_api_secret = "secret".into();
+        }
+        let app = build_router(&relay, None).await;
+        let stalled = Body::from_stream(futures_util::stream::pending::<
+            std::result::Result<axum::body::Bytes, std::io::Error>,
+        >());
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/.well-known/nip29/livekit/webhook")
+            .header(axum::http::header::HOST, "relay.example.com")
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(stalled)
+            .unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(3), app.clone().oneshot(request))
+            .await
+            .expect("the webhook body read must be cut at the configured deadline")
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+        // The size cap is enforced from the declared length before any read
+        // (the middleware path), and the DefaultBodyLimit keeps the bound
+        // when the timeout itself is disabled.
+        relay.config.write().await.limits.http_read_timeout_secs = 0;
+        let app = build_router(&relay, None).await;
+        let oversized = Request::builder()
+            .method(Method::POST)
+            .uri("/.well-known/nip29/livekit/webhook")
+            .header(axum::http::header::HOST, "relay.example.com")
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .header(
+                axum::http::header::CONTENT_LENGTH,
+                (LIVEKIT_WEBHOOK_BODY_LIMIT + 1).to_string(),
+            )
+            .body(Body::from(vec![b'x'; LIVEKIT_WEBHOOK_BODY_LIMIT + 1]))
+            .unwrap();
+        let response = app.oneshot(oversized).await.unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
         relay.db.shutdown();
     }
 
