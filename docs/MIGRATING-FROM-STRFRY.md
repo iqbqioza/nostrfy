@@ -255,8 +255,8 @@ nak req -k 39000 "$R"
 nak req -k 39001 "$R"
 nak req -k 39002 "$R"
 
-# 5. NIP-43 membership list (protected; needs NIP-42 AUTH).
-nak req --auth --force-pre-auth --sec <nsec> -k 13534 "$R"
+# 5. NIP-43 membership list (the relay's own relay-signed list is public).
+nak req -k 13534 "$R"
 
 # 6. Private groups: anonymous must NOT see their posts; a member must.
 nak req -k 9 -h <group-id> "$R"

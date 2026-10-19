@@ -1,7 +1,9 @@
 //! NIP-70: Protected Events.
 //!
 //! Events carrying a `["-"]` tag must come from authenticated clients and are
-//! only delivered to authenticated subscribers.
+//! only delivered to authenticated subscribers — except the relay's own
+//! relay-signed events: their protected advertisement stays publicly
+//! readable (see [`hidden_from_anonymous`]).
 
 use crate::event::Event;
 

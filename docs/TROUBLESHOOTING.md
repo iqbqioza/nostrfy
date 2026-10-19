@@ -261,7 +261,7 @@ When publishing fails, the 4th element of the `OK` message explains why. The com
 
 Possible causes:
 
-1. **NIP-70 protected events** (with a `-` tag) are only delivered to authenticated clients. If the subscriber is not authenticated, it cannot see them (by spec)
+1. **NIP-70 protected events** (with a `-` tag) from other authors are only delivered to authenticated clients. The relay's own protected events (the NIP-43 `13534`/`33534` metadata) stay publicly readable: the tag constrains publication and re-publication, not the relay's own advertisement
 2. **NIP-29 private-group** events are only delivered to members
 3. **NIP-40 expired** events are not delivered
 

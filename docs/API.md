@@ -81,7 +81,7 @@ Author identifiers (`{npub1...}`) may also be given as a **64-hex pubkey** (case
 - `since` / `until` bound the range (unix seconds); without them the **whole period** is covered, from the earliest visible event of that author and kind to now (an author with no events returns an empty list). When more than 1024 hidden events (protected, gift-wrap, owner-only or private-group content) precede the earliest visible one, the start cannot be determined by the bounded visibility probe and the request returns `400` — pass `since` explicitly.
 - Every month in the range is reported, zero-filled, oldest first; the range is capped at **120 months** (exceeding it returns `400`, as does `until < since`).
 - `approximate: true` marks a month whose count hit the collection limit (`limits.max_count`), mirroring NIP-45.
-- The same visibility rules as the rest of the API apply (protected events, gift wraps, owner-only application data and private/hidden group content are withheld).
+- The same visibility rules as the rest of the API apply (NIP-70 events from other authors, gift wraps, owner-only application data and private/hidden group content are withheld).
 
 ### `server.api_host` (host-based routing)
 
@@ -204,7 +204,7 @@ Pagination is computed over the **visible** sequence (see [Visibility Rules](#6-
 
 The API applies the same per-event visibility rules as an **anonymous** WebSocket connection, and `relay.require_auth` gates it like one: every request must then carry a NIP-98 `Authorization: Nostr <base64 kind:27235 event>` whose `u` tag is the exact request URL (path and query; with `server.api_host` set, that host's URL) and whose `method` tag is `GET`; the event must be fresh (60 seconds) and each authorization is accepted once. Anonymous requests are refused with `401 {"error":"auth-required: this relay requires NIP-98 authorization"}`. An authorized caller still sees the anonymous-visibility event set — the API has no identity-scoped reads. The following events are withheld:
 
-- **NIP-70 protected events** (carrying a `-` tag)
+- **NIP-70 protected events** from other authors (carrying a `-` tag; the relay's own protected metadata stays visible)
 - **NIP-59 gift wraps** (kind 1059)
 - **NIP-78 application-specific events** (kinds 78/30078, owner-only while `relay.enabled_nip78_auth` is set)
 - **NIP-29 private/hidden group content** (visible only to members)

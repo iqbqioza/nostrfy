@@ -1398,19 +1398,22 @@ impl Config {
                 "NIP-42 is disabled: gift wraps (kind 1059) are served to anyone; enable NIP-42 to restrict them to their recipients"
             );
         }
-        // Same footgun, one surface over. NIP-43 stamps its relay-generated
-        // membership state with a NIP-70 `-` tag (13534 membership list,
-        // 33534 role definitions) and requires that tag on leave requests
-        // (28936). The `-` tag is only accepted from — and served to —
-        // authenticated clients, and the only authentication here is
-        // NIP-42. With NIP-42 disabled every client is anonymous, so
-        // 13534/33534 are withheld from everyone and leave requests are
-        // rejected at intake: the entire NIP-43 membership surface silently
-        // stops working. A startup error would over-reach (an open relay
-        // without AUTH is legal); the operator needs the consequence named.
+        // Same footgun, one surface over. NIP-43 requires the NIP-70 `-`
+        // tag on leave requests (28936), and NIP-70 accepts a protected
+        // event only from its author's own NIP-42 authentication. With
+        // NIP-42 disabled every client is anonymous, so leave requests are
+        // rejected at intake: members cannot leave. The relay's own
+        // relay-signed metadata (13534/33534) is unaffected — it also
+        // carries the tag by spec, but the read gate exempts the relay's
+        // own advertisement (`nip70::hidden_from_anonymous`), so it stays
+        // publicly readable. A startup error would over-reach (an open
+        // relay without AUTH is legal); the operator needs the consequence
+        // named.
         if self.nip_enabled(43) && !self.nip_enabled(42) {
             log::warn!(
-                "NIP-42 is disabled: NIP-43 membership metadata (kinds 13534/33534) is withheld from every client and leave requests (28936) are rejected; enable NIP-42 to make these work"
+                "NIP-42 is disabled: NIP-43 leave requests (28936) are rejected because \
+                 protected events need the author's AUTH; the relay's own membership \
+                 metadata (13534/33534) stays publicly readable"
             );
         }
         // Limits must be usable (zero would disable core functionality or
@@ -4737,9 +4740,11 @@ max_log_files = 2
         // M15: `validate` stays `Ok` — an open relay without NIP-42 is
         // legitimate, so this can only be a `log::warn`, not a startup
         // error. But the combination still pulls the NIP-70 `-` gate into
-        // a corner: the NIP-43 membership snapshot (13534/33534) and leave
-        // requests (28936) carry the tag, so with NIP-42 off no client can
-        // ever satisfy the auth the gate demands. The warning names that
+        // a corner: leave requests (28936) carry the tag and may only be
+        // published by their author's own AUTH, so with NIP-42 off no
+        // client can ever satisfy the gate. (The relay's own 13534/33534
+        // metadata also carries the tag but stays publicly readable; see
+        // `nip70::hidden_from_anonymous`.) The warning names that
         // consequence; this pins that nothing escalates to a hard error.
         let mut cfg = Config::default();
         cfg.relay.enabled_nip78_auth = false;
