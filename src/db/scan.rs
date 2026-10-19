@@ -1213,9 +1213,11 @@ impl Store {
                 // turns a one-word query into a seconds-long scan. The
                 // term stays in the per-event matching, so an event that
                 // contains it AND a rarer query term is still found via
-                // the rarer term's range; an event matching only common
-                // terms is not a candidate (such terms weigh ~0 in the
-                // relevance order anyway).
+                // the rarer term's range; an event matching only the
+                // dropped term is not a candidate at all, so the walk
+                // reports `more` below (the live path and the index-less
+                // fallback match every term, and the page must not claim a
+                // completeness the walk cannot deliver).
                 // The per-filter terms are normally a subset of `all_terms`
                 // (the query-wide set), so their document frequencies come
                 // from the shared count instead of a second index walk. A
@@ -1233,6 +1235,7 @@ impl Store {
                     })
                     .collect();
                 let mut ranges: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(terms.len());
+                let mut common_dropped = false;
                 for (word, df) in terms.iter().zip(dfs.iter()) {
                     // A common term (df reaching the sampling cap) is
                     // dropped from the walk. A term absent from the index
@@ -1243,6 +1246,9 @@ impl Store {
                     // where the term *is* indexed and must still be
                     // walked.
                     if *df >= DF_SAMPLE || word.len() > WORD_INDEX_MAX {
+                        if *df >= DF_SAMPLE {
+                            common_dropped = true;
+                        }
                         continue;
                     }
                     // Bound each term range by the filter's time window like
@@ -1264,6 +1270,14 @@ impl Store {
                 // correct — a relay big enough for "nostr" to reach the
                 // sampling cap must still find notes containing it.
                 if !ranges.is_empty() {
+                    // A dropped common term makes this walk an incomplete
+                    // candidate set: an event matching only that term is
+                    // never visited, though the filter's any-of semantics
+                    // and the live delivery accept it. Report `more`
+                    // (COUNT: approximate) instead of claiming completeness.
+                    if common_dropped {
+                        *more = true;
+                    }
                     // The word index only stores the first
                     // `max_indexed_words` tokens of each event; long events
                     // also carry one overflow marker, and their full content

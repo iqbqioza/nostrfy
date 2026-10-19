@@ -133,7 +133,11 @@ pub fn terms(search: &str) -> Vec<String> {
 /// the index never returns (e.g. the term "ru" against the indexed word
 /// "rust"), making search results depend on whether the word index is
 /// enabled. With whole-word matching the index, the non-indexed fallback
-/// scan and the live delivery all agree.
+/// scan and the live delivery all agree on which content matches a term.
+/// The index walk may nevertheless skip events matching only a *common*
+/// term (the `DF_SAMPLE` exclusion in the scan drops its flood range) and
+/// reports `more` for that: the matching rule is shared, only the candidate
+/// set can be incomplete.
 ///
 /// The words are compared while streaming the content: the previous
 /// implementation materialized every word as a `String` in a `Vec` (once
@@ -141,7 +145,7 @@ pub fn terms(search: &str) -> Vec<String> {
 /// engine). The single reused buffer keeps the exact [`tokenize`] rules
 /// (Unicode-aware lowercasing, words shorter than two bytes and
 /// numeric-only words are not words), so the index, the fallback scan and
-/// the live delivery still agree.
+/// the live delivery apply the same matching rule.
 pub fn matches_terms(content: &str, terms: &[String]) -> bool {
     if terms.is_empty() {
         return true;

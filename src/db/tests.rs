@@ -4045,6 +4045,58 @@ fn search_ranks_rare_terms_higher() {
 }
 
 #[test]
+fn a_common_search_term_makes_the_page_incomplete() {
+    // A term whose document frequency reaches the sampling cap is dropped
+    // from the index walk (its range is a flood source), so an event
+    // matching only that term is not a walk candidate while the live path
+    // (and the index-less fallback) match any term. The page must report
+    // `more` instead of claiming completeness.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        // 4096 events make "common" reach the `DF_SAMPLE` cap.
+        let mut events: Vec<(Event, u64)> = Vec::new();
+        for i in 0..4096u64 {
+            events.push((event(1, &format!("common {i}"), now, vec![]), now));
+        }
+        events.push((event(1, "rare only", now, vec![]), now));
+        let common_only = event(1, "common only", now + 1, vec![]);
+        events.push((common_only.clone(), now + 1));
+        let outcomes = db.put_batch(events).await;
+        assert!(
+            outcomes.iter().all(|o| matches!(o, PutOutcome::Stored)),
+            "the seed batch must store every event"
+        );
+        let f: Filter =
+            serde_json::from_value(serde_json::json!({"search": "rare common"})).unwrap();
+        let (res, more) = db.query(vec![f], 10, now + 2).await;
+        assert!(
+            res.iter().any(|e| e.content == "rare only"),
+            "the rare term's match is still walked: {res:?}"
+        );
+        assert!(
+            !res.iter().any(|e| e.id == common_only.id),
+            "the common-only event is not a walk candidate"
+        );
+        assert!(
+            more,
+            "dropping a common term must report the page as incomplete"
+        );
+    });
+    db.shutdown();
+}
+
+#[test]
 fn search_index_walk_respects_time_bounds() {
     // The word-index walk must honour `since`/`until` like the pubkey/kind
     // walks: without the range bounds the walk starts at the newest entry
