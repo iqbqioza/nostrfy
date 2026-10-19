@@ -267,7 +267,7 @@ Possible causes:
 
 ### 3-3. Old group events are rejected
 
-Group posts have a time limit (`group_late_publish_secs`, default 7 days). Older events are rejected with `invalid: event is too old for this group`.
+Group posts have a time limit (`group_late_publish_secs`, default 1 hour / 3600 seconds). Older events are rejected with `invalid: event is too old for this group`.
 
 ---
 

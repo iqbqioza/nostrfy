@@ -992,9 +992,8 @@ impl Store {
                 let terms = nip50::terms(filter.search.as_deref().unwrap_or(""));
                 // Cap the terms used for the index walk and the ranking: a
                 // pathological search string must not fan out into hundreds
-                // of index ranges. Events matching only the truncated terms
-                // are not candidates; the most common terms (last, in
-                // token order) are dropped first.
+                // of index ranges. Events matching only the terms past the
+                // cap (in query order) are not candidates.
                 let terms: Vec<String> = terms.into_iter().take(SEARCH_MAX_TERMS).collect();
                 terms
             } else {

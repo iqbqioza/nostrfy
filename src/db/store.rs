@@ -376,9 +376,10 @@ pub(crate) const WORD_INDEX_MAX: usize = MAX_INDEX_KEY - 1 - CREATED_LEN - ID_LE
 pub(crate) const MAX_INDEX_KEY: usize = 511;
 
 /// Minimum free space required before a batch of writes is committed.
-/// Writing to the memory map of a file on a completely full disk raises
-/// SIGBUS (killing the process), so the relay refuses to commit while the
-/// free space is below this margin and keeps serving reads.
+/// A completely full disk fails the commit (`ENOSPC` from the write
+/// syscalls, or an LMDB map-full error), so the relay refuses to commit
+/// while the free space is below this margin and keeps serving reads: the
+/// failure is reported early instead of turning into a write error mid-batch.
 pub(crate) const DISK_FREE_MARGIN: u64 = 32 * 1024 * 1024;
 
 /// How many index entries `remove_corrupt_event` scans per table before it
@@ -414,10 +415,10 @@ pub(crate) fn path_free_space(path: &std::path::Path) -> Option<u64> {
     }
 }
 
-/// Whether `free` bytes is below the write margin: a write to the memory
-/// map of a file on a full disk raises SIGBUS, so every writing path refuses
-/// to commit below [`DISK_FREE_MARGIN`]. A tiny helper so the margin
-/// comparison itself is unit-testable without filling a filesystem.
+/// Whether `free` bytes is below the write margin: a full disk fails the
+/// commit (ENOSPC / map full), so every writing path refuses to commit below
+/// [`DISK_FREE_MARGIN`]. A tiny helper so the margin comparison itself is
+/// unit-testable without filling a filesystem.
 pub(crate) fn disk_below_margin(free: u64) -> bool {
     free < DISK_FREE_MARGIN
 }
@@ -444,9 +445,9 @@ pub(crate) fn take_chunk_fault(counter: &std::sync::atomic::AtomicUsize) -> bool
     }
 }
 
-/// Refuses a write when the disk hosting `env` is too full for a safe mmap
-/// commit (a write to a full disk raises SIGBUS and kills the process).
-/// For the CLI and migration paths that own no `Store` handle.
+/// Refuses a write when the disk hosting `env` is too full for a safe
+/// commit (a full disk fails the write). For the CLI and migration paths
+/// that own no `Store` handle.
 pub(crate) fn check_env_space(env: &Env) -> Result<()> {
     if let Some(free) = path_free_space(env.path())
         && disk_below_margin(free)
@@ -477,11 +478,11 @@ pub(crate) fn apply_put_batch(
         }
         return Vec::new();
     }
-    // Disk-full guard: writing to the memory map of a file on a full disk
-    // raises SIGBUS and kills the process, so refuse to commit while the
-    // free space is below the margin. Reads keep working. The refusal is a
-    // database fault (like the removals' guard), so it must be counted in
-    // the error metric, not silently reported only through the replies.
+    // Disk-full guard: a full disk fails the commit (ENOSPC / map full), so
+    // refuse to commit while the free space is below the margin. Reads keep
+    // working. The refusal is a database fault (like the removals' guard),
+    // so it must be counted in the error metric, not silently reported only
+    // through the replies.
     if let Err(e) = store.disk_full_error() {
         db_error(thread_errors, &e);
         log::error!("disk is full: refusing to commit {} events", puts.len());
@@ -850,7 +851,7 @@ impl Store {
         let map_size = map_max_size as usize;
         let env = unsafe {
             EnvOpenOptions::new()
-                // 22 named tables, plus the word index when search is on.
+                // 23 named tables (22 base plus the word index).
                 .max_dbs(cfg.max_dbs.max(23))
                 // Every reader thread can hold a concurrent read transaction,
                 // the writer/API/startup paths take slots too, and some read
@@ -958,7 +959,7 @@ impl Store {
             wtxn.commit()?;
             (configured_words, false)
         };
-        let tables = if by_word.is_some() { 22 } else { 21 };
+        let tables = if by_word.is_some() { 23 } else { 22 };
         log::info!(
             "database ready at {} ({} tables, map {} MiB)",
             cfg.path.display(),
@@ -1039,8 +1040,7 @@ impl Store {
     }
 
     /// Whether the filesystem hosting the data directory is too full to
-    /// safely write to the memory map (writing to a full disk raises
-    /// SIGBUS and kills the process). Test-only: an armed
+    /// safely commit writes (a full disk fails them). Test-only: an armed
     /// `disk_full_override` reports full without touching a real
     /// filesystem, so the failure mode is injectable on any machine.
     pub(crate) fn disk_full(&self) -> bool {
@@ -1950,8 +1950,8 @@ fn relay_pubkeys_json(deny: &[(String, String)], allow: &[(String, String)]) -> 
 /// server start would silently skip the legacy entries.
 pub(crate) fn migrate_access_pubkeys(env: &Env, access: &Database<Bytes, Bytes>) -> Result<()> {
     // Disk-full guard like every other write path: committing a migration
-    // on a full disk would SIGBUS-kill the process (server at startup, CLI
-    // before the first post-upgrade start) instead of failing cleanly.
+    // on a full disk would fail mid-way (server at startup, CLI before the
+    // first post-upgrade start) instead of failing cleanly up front.
     check_env_space(env)?;
     let rtxn = env.read_txn()?;
     if access.get(&rtxn, b"relay_pubkeys")?.is_some() {
@@ -2175,10 +2175,11 @@ pub(crate) fn replaceable_key_range_end(kind: u64, pubkey: &[u8]) -> Vec<u8> {
 /// Builds the index-key form of a `d` tag: the value itself when it fits
 /// under LMDB's key-size limit (see [`MAX_INDEX_KEY`]), otherwise a
 /// truncated prefix followed by a 4-byte fingerprint of the full value.
-/// The fingerprint guarantees that two distinct long `d` tags sharing the
-/// same prefix never collide in the index (a collision would make one
-/// replace the other, breaking NIP-33); the stored event keeps its full
-/// `d` tag.
+/// The 32-bit fingerprint (compared within the same truncated prefix) makes
+/// a collision between two distinct long `d` tags unlikely rather than
+/// impossible: they collide with probability about 2^-32, and a collision
+/// would make one replace the other in the index (breaking NIP-33). The
+/// stored event keeps its full `d` tag.
 pub(crate) fn dtag_key_safe(dtag: &str) -> String {
     dtag_key_safe_max(dtag, MAX_INDEX_KEY.saturating_sub(CREATED_LEN + ID_LEN + 4))
 }
@@ -2928,7 +2929,7 @@ impl Store {
     /// called once at startup when the index is stale).
     pub(crate) fn rebuild_event_meta(&self) -> Result<usize> {
         // Like the sibling rebuilds: refuse below the free-space margin
-        // instead of committing into a full disk (SIGBUS). Callers degrade
+        // instead of committing into a full disk. Callers degrade
         // gracefully (scans fall back to the full JSON parse).
         self.disk_full_error()?;
         let Some(meta) = self.event_meta else {

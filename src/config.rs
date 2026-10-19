@@ -70,8 +70,8 @@ pub struct BlossomConfig {
     pub max_upload_bytes: usize,
     /// Local-storage disk-full guard: uploads are refused while the free
     /// space on the filesystem hosting `local_path` is below this many
-    /// bytes (a full disk would make the LMDB writer fail and risk
-    /// SIGBUS on memory-map writes). 0 disables the check.
+    /// bytes (a full disk would make the LMDB writer fail). 0 disables
+    /// the check.
     pub min_free_bytes: u64,
     /// S3 endpoint (e.g. `https://<account>.r2.cloudflarestorage.com` for
     /// Cloudflare R2, `https://s3.amazonaws.com` for AWS).

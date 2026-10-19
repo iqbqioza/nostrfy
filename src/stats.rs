@@ -26,10 +26,10 @@ pub struct Stats {
     pub buffers_dropped: AtomicU64,
     pub db_errors: AtomicU64,
     pub db_size_bytes: AtomicU64,
-    /// Recorded NIP-29 group purges still pending after the startup resume:
-    /// a non-zero value means a purge could not be completed, so the group
-    /// stays fail-closed (ghosted) until it is retried. A startup snapshot,
-    /// not a live count.
+    /// NIP-29 group purges still pending: a non-zero value means a purge
+    /// could not be completed, so the group stays fail-closed (ghosted)
+    /// until it is retried. A live gauge (it drops as the resume and its
+    /// retries finish), not a startup snapshot.
     pub pending_purges: AtomicU64,
     /// Completed NIP-62 vanish markers. The table grows permanently by
     /// design (a vanished identity stays barred), so this gauge exists to
@@ -324,7 +324,7 @@ impl Stats {
         );
         metric(
             "nostrfy_events_accepted",
-            "Events accepted and stored since start.",
+            "Events accepted since start (including ephemeral events).",
             "counter",
             self.events_accepted.load(Ordering::Relaxed),
         );
@@ -342,7 +342,7 @@ impl Stats {
         );
         metric(
             "nostrfy_events_deleted",
-            "Events deleted (NIP-09) since start.",
+            "Events deleted (NIP-09/29/62) since start.",
             "counter",
             self.events_deleted.load(Ordering::Relaxed),
         );

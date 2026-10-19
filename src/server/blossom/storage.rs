@@ -960,7 +960,7 @@ struct LocalStore {
     min_free_bytes: u64,
     /// Bytes reserved by in-flight uploads. Without this the uploads each
     /// check the raw free space and can collectively cross the floor
-    /// (TOCTOU on `min_free_bytes`), which risks SIGBUS on LMDB writes.
+    /// (TOCTOU on `min_free_bytes`), which fails LMDB writes.
     reserved: std::sync::atomic::AtomicU64,
 }
 

@@ -1222,10 +1222,11 @@ async fn blossom_root_info(
     };
     let info = json!({
         "name": format!("{name} (media)"),
-        // File-related NIPs this server implements: 94 (file-metadata
-        // events are stored and served) and 98 (HTTP auth, used for the
-        // uploads). NIP-96 (HTTP file storage) is a different protocol and
-        // is not implemented: the file server speaks Blossom/BUD.
+        // File-related NIPs the relay implements: 94 (file-metadata events
+        // are stored and served) and 98 (HTTP auth for the REST API).
+        // Blossom uploads authorize with BUD-11 kind 24242, not NIP-98.
+        // NIP-96 (HTTP file storage) is a different protocol and is not
+        // implemented: the file server speaks Blossom/BUD.
         "supported_nips": [94, 98],
         "supported_file_hashes": ["sha256"],
         "tos_url": null,

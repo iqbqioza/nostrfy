@@ -68,6 +68,9 @@ public_url = ""
 livekit_url = ""
 livekit_api_key = ""
 livekit_api_secret = ""
+# How often the relay refreshes the LiveKit participant list for kind:39004
+# (seconds; 0 disables the refresh).
+livekit_participants_interval_secs = 15
 
 # Explicit NIP allowlist: when non-empty, only the listed NIPs are advertised
 # and their behavior is enabled. Empty means "all except disabled_nips".
@@ -142,7 +145,7 @@ port = 8080
 # Hostname dedicated to the REST API, e.g. "api.example.com". When set, the
 # API and the WebSocket relay are split by Host header on the same port:
 #   - requests whose Host header matches this value serve ONLY /api/v1
-#     (and /health);
+#     (and /health, /metrics);
 #   - every other host serves ONLY the WebSocket/NIP-11/NIP-86 routes.
 # Empty = the API is served on every host, next to the WebSocket endpoint.
 api_host = ""
@@ -466,11 +469,12 @@ max_log_files = 5
 # -----------------------------------------------------------------------------
 [access]
 
-# true = only allow-listed pubkeys may publish AND read. The pubkey allow and
-# deny lists are NOT config keys: they live in the relay database (LMDB) and
-# are managed with `nostrfy relay allow/deny` (or via command events when
-# enabled_command_events is on). A denied pubkey is always rejected, even
-# with restrict_relay = false.
+# true = only allow-listed pubkeys may publish; reading stays open to
+# everyone except denied pubkeys. The pubkey allow and deny lists are NOT
+# config keys: they live in the relay database (LMDB) and are managed with
+# `nostrfy relay allow/deny` (or via command events when
+# enabled_command_events is on). A denied pubkey is always rejected (and
+# never served), even with restrict_relay = false.
 restrict_relay = false
 
 # Event kinds rejected at publish time.

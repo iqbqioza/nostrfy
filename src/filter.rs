@@ -444,9 +444,10 @@ pub(crate) fn rewrite_inbox_outbox(value: &mut Value) -> Result<()> {
             pubkeys.push(hex_pk);
         }
         let entry = map.entry(dst.to_string()).or_insert_with(|| json!([]));
-        // A single-string `#p`/`authors` is valid NIP-01 (`tag_values` and
-        // `invalid_tag_values` accept it): promote it to an array instead of
-        // rejecting the subscription.
+        // A single-string `#p`/`authors` is a nostrfy compatibility
+        // extension (NIP-01 only defines arrays): `tag_values` and
+        // `invalid_tag_values` accept it, so promote it to an array instead
+        // of rejecting the subscription.
         if entry.is_string() {
             let s = entry.as_str().unwrap_or_default().to_string();
             *entry = json!([s]);
@@ -590,7 +591,7 @@ mod tests {
 
     #[test]
     fn empty_filter_lists_match_nothing() {
-        // NIP-2504: an empty list attribute (`ids`/`authors`/`kinds`/`#e`)
+        // NIP-01: an empty list attribute (`ids`/`authors`/`kinds`/`#e`)
         // matches no event and must not be treated as if the attribute were
         // absent (which would match everything). The stored scan and COUNT
         // are covered by the db tests; this pins the live/in-memory matcher

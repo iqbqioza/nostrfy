@@ -2499,10 +2499,10 @@ fn open_db_env(cfg: &Config) -> Result<heed::Env> {
     // process exits.
     let env = unsafe {
         heed::EnvOpenOptions::new()
-            // Mirror the store's floor: 22 named tables, plus the word
-            // index when search is on. A lower value made opening an
-            // existing database fail with MDB_DBS_FULL (the CLI commands
-            // must open the same tables the server created).
+            // Mirror the store's floor: 23 named tables (22 base tables
+            // plus the word index). A lower value made opening an existing
+            // database fail with MDB_DBS_FULL (the CLI commands must open
+            // the same tables the server created).
             .max_dbs(cfg.database.max_dbs.max(23))
             .max_readers(cfg.database.max_readers.max(8))
             .map_size(map_size as usize)
@@ -2722,7 +2722,7 @@ fn load_access_state(cfg: &Config) -> Result<PersistedAccess> {
 fn save_access_state(cfg: &Config, state: &PersistedAccess) -> Result<()> {
     let env = open_db_env(cfg)?;
     // Disk-full guard like the server write paths: an mmap commit on a
-    // full disk raises SIGBUS instead of failing cleanly.
+    // full disk fails the write instead of failing cleanly.
     crate::db::store::check_env_space(&env)?;
     let mut wtxn = env.write_txn()?;
     let access =

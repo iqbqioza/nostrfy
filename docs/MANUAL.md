@@ -261,7 +261,7 @@ To generate a secret key, use the `nostrfy genkey` command (see [5. Command Refe
 
 | Option | Description | Default |
 | --- | --- | --- |
-| `pid_file` | PID file path (written in daemon **and** foreground mode, so `stats`/`stop`/`restart` find the instance; removed on exit) | `./nostrfy.pid` |
+| `pid_file` | PID file path (written in daemon **and** foreground mode, so `stats`/`stop`/`restart` find the instance; `nostrfy stop` removes it, a foreground exit removes it, and a daemon killed with SIGTERM leaves it behind — the next `start` clears a stale file) | `./nostrfy.pid` |
 | `log_file` | Log file path (used in daemon mode; foreground mode logs to stderr) | `./nostrfy.log` |
 | `stats_file` | Statistics file path | `./nostrfy.stats.json` |
 | `stats_interval_secs` | Statistics write interval (must be ≥ 1) | `5` |
@@ -604,6 +604,8 @@ From these moderation events, the relay generates the following **relay-signed s
 - `kind:39000` — group metadata (name, visibility settings, ...)
 - `kind:39001` — admin list
 - `kind:39002` — member list
+- `kind:39003` — roles in use
+- `kind:39004` — LiveKit participants (only while rooms are live)
 - `kind:39005` — pinned events
 
 ### Group visibility settings
@@ -692,7 +694,7 @@ Both backends use the `bucket/{npub1xxx}/{file}` hierarchy: every upload is stor
 - User-uploaded bytes are served with `X-Content-Type-Options: nosniff`; active document types (HTML/SVG/XML/JavaScript) additionally get `Content-Disposition: attachment` and `Content-Security-Policy: default-src 'none'; sandbox`, so the media origin cannot be used for stored XSS. (An SVG used as an `<img>` subresource is unaffected.)
 - The CORS pre-flight accepts the BUD-05/06 headers (`X-SHA-256`, `X-Content-Type`, `X-Content-Length`) plus the BUD-01 `*` wildcard, so browser clients like nostter can upload to `/media`.
 
-Uploads, deletes and listings authenticate with a Nostr auth event (kind 24242, `server` tag naming the Blossom host), sent as `Authorization: Nostr <base64>`. Per BUD-11 the token must carry an `expiration` tag set to a unix timestamp in the future, the `t` verb matching the endpoint (`upload` / `media` / `delete` / `list`), and — for upload and delete — an `x` tag with the blob's sha256. The `/list` inventory is owner-only: the token must be issued by the listed pubkey. A pubkey banned with NIP-86 `banpubkey` is refused on every Blossom endpoint as well.
+Uploads, deletes and listings authenticate with a Nostr auth event (kind 24242, sent as `Authorization: Nostr <base64>`; the optional BUD-11 `server` tag, when present, must name the Blossom host). The relay's access policy applies here too: a denied pubkey is refused on every Blossom endpoint, and with `access.restrict_relay = true` the token's author must be on the allow list (the operator keys are exempt). Per BUD-11 the token must carry an `expiration` tag set to a unix timestamp in the future, the `t` verb matching the endpoint (`upload` / `media` / `delete` / `list`), and — for upload and delete — an `x` tag with the blob's sha256. The `/list` inventory is owner-only: the token must be issued by the listed pubkey. A pubkey banned with NIP-86 `banpubkey` is refused on every Blossom endpoint as well.
 
 The descriptor `url` includes the MIME-derived extension (e.g. `https://media.example.com/<sha256>.png`; unknown types get `.bin`), like the Blossom spec's examples. The extension is advisory: the file is served by its hash alone, and `/<sha256>.<ext>` (any extension) resolves to the same blob.
 
@@ -857,8 +859,8 @@ The `[access]` kind/IP lists are runtime-managed via NIP-86 (a config edit is ig
   piling up in memory.
 - The LMDB map opens at its configured ceiling and is never resized at
   runtime (a sparse reservation: physical memory grows only with real
-  data). Writing to a full disk would raise SIGBUS, so writes are
-  refused below a free-space margin while reads keep serving.
+  data). A full disk would fail the commit, so writes are refused
+  below a free-space margin while reads keep serving.
 - Multi-range filters walk a merged newest-first iterator with a
   per-scan work budget; NIP-67 ties never split across pages.
 - Task panics are contained and logged; connection accounting is

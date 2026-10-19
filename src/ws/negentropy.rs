@@ -326,8 +326,10 @@ impl super::Conn {
             self.neg_err(&sub_id, "error: database unavailable; retry");
             return;
         };
-        // The scan's collect cap is `max_items`, so the collected count can
-        // never exceed it: `more` alone marks a query too large to answer.
+        // `more` marks a query the scan would not answer in one round
+        // (quota/tie/budget truncation), not a fixed item count: boundary
+        // ties and the search over-fetch budget can push the collected set
+        // past `max_items`, so the NEG-ERR fourth element reports the cap.
         if more {
             // NIP-77: the maximum number of processable records may be
             // returned as the fourth element. NEG-ERR closes the id.

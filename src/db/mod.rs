@@ -2406,7 +2406,7 @@ impl DbClient {
     }
 
     /// Whether the database filesystem is below the write margin the put
-    /// path refuses to commit under (a write to a full disk raises SIGBUS).
+    /// path refuses to commit under (a full disk fails the commit).
     /// `false` when the free space cannot be probed.
     pub fn disk_full(&self) -> bool {
         self.free_disk_bytes().is_some_and(store::disk_below_margin)

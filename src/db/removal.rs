@@ -349,7 +349,7 @@ impl Store {
         state_removed: &mut StateRemoved,
     ) -> Result<()> {
         // Disk-full guard: a removal still writes (the deleted marker),
-        // so the same SIGBUS protection as the put path applies.
+        // so the same free-space margin as the put path applies.
         self.disk_full_error()?;
         // Fail closed: a deletion must be scoped to a requester (author /
         // delegator) or to a group. The old signature allowed both to be
@@ -1400,7 +1400,7 @@ impl Store {
     /// cannot lose the fact that the derived state changed.
     fn finish_vanish(&self, pubkey: &[u8], until_created: u64) -> Result<(usize, StateRemoved)> {
         // The resume path enters here directly: refuse to write to a full
-        // disk like every other write path (SIGBUS protection).
+        // disk like every other write path (free-space margin).
         self.disk_full_error()?;
         let mut removed = 0usize;
         // Which derived-state families the removed events feed (NIP-29

@@ -239,7 +239,7 @@ fn database_dir_probe_creates_nothing_and_reports_the_state() {
 
 #[test]
 fn empty_filter_lists_match_nothing_in_the_scan_and_count() {
-    // NIP-2504: an empty list attribute (`ids`/`authors`/`kinds`/`#e`)
+    // NIP-01: an empty list attribute (`ids`/`authors`/`kinds`/`#e`)
     // matches no event and must not be treated as if the attribute were
     // absent (which would return the whole store). The scan, COUNT and the
     // live matcher (see the filter tests) must agree.
@@ -5984,7 +5984,7 @@ fn meta_rebuild_converges_when_a_row_cannot_be_indexed() {
 fn rebuild_event_meta_refuses_full_disk() {
     // Like its sibling rebuilds, the metadata backfill must fail with a
     // clean error below the free-space margin instead of committing into
-    // a full disk (which raises SIGBUS and kills the process).
+    // a full disk (which fails the commit).
     let expiry = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let store = crate::db::store::Store::open(&config(), expiry, 128).unwrap();
     store
@@ -6291,8 +6291,9 @@ fn group_and_role_snapshots_survive_restart() {
 
 #[test]
 fn sixteen_max_dbs_still_opens_with_the_word_index() {
-    // 22 named tables are created (21 plus the word index); an operator
-    // value of 16 must not fail at startup (the clamp raises it to 22).
+    // 23 named tables are created (22 base tables plus the word index); an
+    // operator value of 16 must not fail at startup (the clamp raises it to
+    // 23).
     let mut cfg = config();
     cfg.max_dbs = 16;
     assert!(cfg.search_index);
@@ -6305,7 +6306,7 @@ fn sixteen_max_dbs_still_opens_with_the_word_index() {
         4096,
         262144,
     )
-    .expect("22 tables must fit via the clamp");
+    .expect("23 tables must fit via the clamp");
     db.shutdown();
 }
 

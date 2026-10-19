@@ -126,7 +126,7 @@ Every key is optional; a missing key uses the default shown below.
 
 **`enabled_nips`** — An explicit allowlist of NIP numbers. When non-empty, **only** these NIPs are advertised (NIP-11) and their relay-side behavior is active; `disabled_nips` is ignored. Requires a `restart` to change.
 
-**`disabled_nips`** — Removes specific NIPs from the default set. For example `[50]` disables search (REQ/COUNT/API `search` is then ignored), `[28]` disables public-chat semantics. Requires a `restart` to change. Only relay-side NIPs are relevant: [1, 9, 11, 13, 17, 22, 26, 29, 32, 33, 34, 40, 42, 43, 45, 46, 47, 50, 57, 59, 62, 65, 66, 67, 70, 77, 78, 84, 85, 86, 87, 88, 94, 98] (NIP-28 is a behavior gate only — it is never advertised; NIP-A3 is a `draft` without an integer identifier, so it cannot appear in `supported_nips`; NIP-34 git events additionally require `relay.enabled_git`).
+**`disabled_nips`** — Removes specific NIPs from the default set. For example `[50]` disables search (REQ/COUNT/API `search` is then ignored). Requires a `restart` to change. Only relay-side NIPs are relevant: [1, 9, 11, 13, 17, 22, 26, 29, 32, 33, 34, 40, 42, 43, 45, 46, 47, 50, 57, 59, 62, 65, 66, 67, 70, 77, 78, 84, 85, 86, 87, 88, 94, 98] (NIP-28 is client-side: listing it changes nothing, and it is never advertised; NIP-A3 is a `draft` without an integer identifier, so it cannot appear in `supported_nips`; NIP-34 git events additionally require `relay.enabled_git`).
 
 **`reject_ephemeral`** — When `true`, NIP-01 ephemeral events (kinds `20000-29999`) are rejected at publish time with `blocked: ephemeral events not allowed`. Exempt kinds that NIPs require to be relayed are still forwarded: `22242` (NIP-42 AUTH), `27235` (NIP-98 HTTP auth), `28934`/`28935`/`28936` (NIP-43 JOIN/Invite/LEAVE), `24133` (NIP-46 Nostr Connect), `23194`/`23195` (NIP-47 wallet request/response), `24242` (BUD-02 Blossom), `21059` (NIP-59 ephemeral gift wrap). Takes effect immediately on `SIGHUP` reload and on the next publish.
 
@@ -203,7 +203,7 @@ The changes take effect immediately and are persisted (same lists as `nostrfy re
 
 **`port`** — The TCP port, 1-65535; 80 requires root. This one port serves the WebSocket relay, the NIP-11 document, the REST API and the NIP-86 RPC together.
 
-**`api_host`** — A hostname (e.g. `api.example.com`) dedicated to the REST API. Requests whose Host header matches it are served only `/api/v1`, `/health` and `/metrics`; every other host gets `404` for those paths, and the API host gets `404` for the relay endpoints. This lets you serve the API and the relay on the same port behind one reverse proxy. Host matching ignores case, `:port` suffixes and IPv6 brackets. Empty = the API is available on every host. Fixed at startup — requires a `restart`.
+**`api_host`** — A hostname (e.g. `api.example.com`) dedicated to the REST API. Requests whose Host header matches it are served only `/api/v1`, `/health` and `/metrics`; every other host gets `404` for those paths, and the API host gets `404` for the relay endpoints. This lets you serve the API and the relay on the same port behind one reverse proxy. Host matching ignores case, `:port` suffixes and IPv6 brackets. Empty = the API is available on every host. The split is a routing boundary only: a client that can reach the port directly can send any `Host` header, so expose the port through a proxy (or firewall it) when the API must not be publicly reachable. Fixed at startup — requires a `restart`.
 
 **`ws_paths`** — Which paths serve the WebSocket endpoint and the NIP-11 document: `root` serves `/` only (the default; the legacy `/ws` and `/ws/` paths are removed); `inbox-outbox` serves only `/inbox` and `/outbox`; `all` serves the root and the inbox/outbox paths. The inbox/outbox paths give the relay distinct endpoints for the inbox/outbox routing model (e.g. `wss://relay.example.com/inbox` and `wss://relay.example.com/outbox`). In `inbox-outbox` mode the root path returns 404 on every host except a configured Blossom host, where it answers the Blossom server-info document. Fixed at startup — requires a `restart`.
 
@@ -224,7 +224,7 @@ Set this whenever a reverse proxy (nginx, Caddy, a cloud load balancer, Cloudfla
 ### Behavior notes
 
 - **`require_auth = true` with `send_auth_challenge = false`** locks everyone out — the challenge is never sent, so nobody can ever authenticate. The relay warns about this combination at startup.
-- **`management_token` and `admin_pubkey`** can both be configured at once; either one authorizes. When both are empty, the management APIs are effectively disabled (every request gets `401`).
+- **`management_token` and `admin_pubkey`** can both be configured at once; either one authorizes. When both are empty, only `supportedmethods` (which needs no grant) and methods granted to specific pubkeys with `rpc.method_grants`/`assignmethod` remain reachable; every other request gets `401`.
 - The NIP-86 RPC is served on `POST /` of the main port (and on the paths selected by `server.ws_paths`).
 
 ---
@@ -318,7 +318,7 @@ Set this whenever a reverse proxy (nginx, Caddy, a cloud load balancer, Cloudfla
 
 **`ws_idle_timeout_secs`** — Connections with no inbound frames for this long are closed. While enabled, the relay also sends periodic WebSocket PINGs: healthy clients answer with a PONG (an inbound frame, which resets the timer) and stay connected; dead peers are reaped. `0` = disabled (no timeout, no pings).
 
-**`http_read_timeout_secs`** — Seconds a connection has to deliver a complete HTTP request head (the request line and headers) before it is closed. This closes slow-loris sockets that trickle bytes without ever completing a request — the attack would otherwise pin file descriptors and memory. Applies to every HTTP connection, WebSocket upgrades included (an upgrade request is a normal HTTP request head). The same deadline bounds the NIP-86 `POST` body read (a body that delivers no byte within the window is answered with `408 Request Timeout`), and Blossom uploads use it as their per-chunk idle timeout. `0` disables the timeout.
+**`http_read_timeout_secs`** — Seconds a connection has to deliver a complete HTTP request head (the request line and headers) before it is closed. This closes slow-loris sockets that trickle bytes without ever completing a request — the attack would otherwise pin file descriptors and memory. Applies to every HTTP connection, WebSocket upgrades included (an upgrade request is a normal HTTP request head). The same deadline bounds the NIP-86 `POST` body read (a body that delivers no byte within the window is answered with `408 Request Timeout`), and Blossom uploads use it as their per-chunk idle timeout with a 60-second floor: `0` still gives each Blossom chunk 60 seconds (the upload stream never waits forever). `0` disables the head/body timeout on the other paths.
 
 **`max_connections_per_sec_per_ip`** — Maximum number of new connections a single source IP may open per second (sliding window). Sockets beyond the window are refused immediately. The limiter tracks at most 10,000 source IPs; when that map is full of still-active windows, a previously unseen IP is **refused** (fail closed) instead of passed through — a host with more than 10,000 active addresses cannot bypass the limit, and already-tracked IPs are always enforced. The full-map eviction walk is throttled to at most once per second, so the refusal is immediate and the accept loop stays O(1) per connection. `0` = unlimited.
 
@@ -386,7 +386,7 @@ Set this whenever a reverse proxy (nginx, Caddy, a cloud load balancer, Cloudfla
 | `db_request_timeout_secs` | integer | `30` | Database request timeout (`0` = wait forever) |
 | `max_db_queue_msgs` | integer | `4096` | Max queued database messages before failing fast |
 | `max_db_queue_events` | integer | `262144` | Max queued database events before failing fast |
-| `max_dbs` | integer | `32` | LMDB max named databases (raised to 22 when lower) |
+| `max_dbs` | integer | `32` | LMDB max named databases (raised to 23 when lower) |
 | `max_readers` | integer | `128` | LMDB max concurrent readers (raised to `2 * reader_threads + 3` when lower) |
 | `map_size` | integer | `1073741824` (1 GB) | Floor for the memory map size (bytes) |
 | `max_map_size` | integer | `1099511627776` (1 TB) | Memory-map ceiling (bytes) |
@@ -402,7 +402,7 @@ Set this whenever a reverse proxy (nginx, Caddy, a cloud load balancer, Cloudfla
 
 **`path`** — The directory holding the LMDB database files. Relative paths are resolved against the config file's directory, so they stay valid after the daemon changes its working directory. Do not point two relay instances at the same directory.
 
-**`max_dbs`** — LMDB's maximum number of named databases. The relay uses 22 when `search_index = true` (21 tables plus the word index) and 21 otherwise; values below 22 are raised to 22 so every table can always be created.
+**`max_dbs`** — LMDB's maximum number of named databases. The relay uses 23 when `search_index = true` (22 base tables plus the word index) and 22 otherwise; values below 23 are raised to 23 so every table can always be created.
 
 **`max_readers`** — LMDB's maximum number of concurrent read transactions. Values below `2 * reader_threads + 3` are raised to that floor (two slots per reader thread plus the writer/API/startup paths, which nest transactions); a lower value would fail queries with `MDB_READERS_FULL`. The documented ≥ 8 minimum is subsumed by this formula.
 
@@ -439,7 +439,7 @@ Set this whenever a reverse proxy (nginx, Caddy, a cloud load balancer, Cloudfla
 - **Data migrations** run automatically once, at startup:
   - access pubkey lists moved into their dedicated key (legacy `access` blob → `relay_pubkeys`),
   - the Blossom sha→owner mapping rebuilt from legacy files (marker key, skipped on later restarts).
-- The startup log reports `database ready at ... (22 tables, map ... MiB)` — 21 named tables plus the NIP-50 word index (21 tables when `database.search_index = false`) — and the migration checks.
+- The startup log reports `database ready at ... (23 tables, map ... MiB)` — 22 base tables plus the NIP-50 word index (22 tables when `database.search_index = false`) — and the migration checks.
 
 ---
 
@@ -540,7 +540,7 @@ All CLI access mutations (`nostrfy relay allow/deny`, `nostrfy blossom allow/den
 | `storage` | string | `"local"` | Storage backend: `"local"` or `"s3"` (any S3-compatible service, including Cloudflare R2) |
 | `local_path` | string | `"./data/images"` | Local storage directory: `<local_path>/<npub1...>/<sha256>` |
 | `max_upload_bytes` | integer | `20971520` | Maximum accepted upload size (the `PUT /upload` body limit) |
-| `min_free_bytes` | integer | `33554432` | Local-storage disk-full guard: uploads are refused with `507` while the free space on the filesystem hosting `local_path` is below this many bytes (a full disk would otherwise risk SIGBUS on the LMDB memory map). `0` disables the check |
+| `min_free_bytes` | integer | `33554432` | Local-storage disk-full guard: uploads are refused with `507` while the free space on the filesystem hosting `local_path` is below this many bytes (a full disk would otherwise fail the LMDB writer's commits). `0` disables the check |
 | `s3_endpoint` | string | `""` | S3 endpoint, e.g. `https://<account>.r2.cloudflarestorage.com` for R2 |
 | `s3_region` | string | `""` | S3 region (R2 uses `"auto"`) |
 | `s3_bucket` | string | `""` | S3 bucket — the `bucket` of the `bucket/{npub1}/{file}` layout |
@@ -559,7 +559,7 @@ All CLI access mutations (`nostrfy relay allow/deny`, `nostrfy blossom allow/den
 
 **`local_path`** — Local storage. The store refuses paths that a local attacker has replaced with symlinks (reads, writes and deletes never follow a symlinked blob file or npub directory), so the blob tree cannot be redirected outside the configured root.
 
-**`min_free_bytes`** — Local-storage disk-full guard. Before writing a blob, the relay checks the free space on the filesystem hosting `local_path` (the same `statvfs` check the LMDB writer uses) and refuses the upload with `507 Insufficient Storage` while the free space is below this margin — a full disk would otherwise fail the LMDB writer and risk SIGBUS on memory-map writes. `0` disables the check. The S3 backend has no local disk, so the guard only applies to `storage = "local"`.
+**`min_free_bytes`** — Disk-full guard for uploads. Before writing a blob, the relay checks the free space on the filesystem hosting `local_path` (the same `statvfs` check the LMDB writer uses) and refuses the upload with `507 Insufficient Storage` while the free space is below this margin — a full disk would otherwise fail the LMDB writer's commits. `0` disables the check. With `storage = "s3"` uploads spool through the system temp directory, so the same floor is applied there (a burst of S3 uploads must not fill `/tmp` until writes fail mid-body).
 
 **S3 keys** — With `storage = "s3"`, `s3_endpoint`, `s3_bucket`, `s3_access_key` and `s3_secret_key` are required. The endpoint must be the *path-style* HTTPS form (`https://s3.amazonaws.com` or `https://<account>.r2.cloudflarestorage.com`); the request signing follows AWS Signature Version 4. Plain `http://` is rejected because SigV4 credentials would travel in cleartext — only loopback hosts (`127.0.0.1`, `localhost`, `[::1]`) may use `http://`, so a local MinIO remains usable for testing.
 

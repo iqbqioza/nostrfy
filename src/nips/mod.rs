@@ -25,8 +25,9 @@ pub mod nip98;
 
 /// Registry of Nostr Improvement Proposals.
 ///
-/// File-storage related NIPs (git NIP-34, file metadata NIP-94, HTTP file
-/// storage NIP-96) are deliberately not included per the project rules.
+/// File-storage related NIPs (file metadata NIP-94, file storage NIP-95,
+/// HTTP file storage NIP-96) are deliberately not included per the project
+/// rules. NIP-34 (git) is implemented behind `relay.enabled_git`.
 /// The deprecated NIP-04 is also omitted.
 ///
 /// Note: [`Config::supported_nips`] advertises only the relay-side NIPs

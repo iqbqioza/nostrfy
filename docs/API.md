@@ -94,7 +94,7 @@ When `server.api_host` is configured (e.g. `api.example.com`), the API and the W
 
 Without `api_host`, the API is served on every host, next to the WebSocket endpoint.
 
-> **Note**: Only `GET` is supported. WebSocket upgrade requests to `/api/v1` are rejected with `403 Forbidden`.
+> **Note**: Only `GET` is supported. WebSocket upgrade requests to `/api/v1` are rejected with `403 Forbidden` — or `401` first when `relay.require_auth` is set and the request carries no NIP-98 authorization (the auth layer runs before the upgrade rejection).
 
 ---
 
@@ -245,7 +245,7 @@ Errors return a JSON body with an `error` field:
 | --- | --- |
 | `200` | Success |
 | `400` | Invalid identifier or query parameter (malformed query value types like `?limit=abc` fail URL parsing with a plain-text `400`, not the JSON body above) |
-| `403` | WebSocket upgrade attempt to `/api/v1` |
+| `403` | WebSocket upgrade attempt to `/api/v1` (or `401` under `require_auth` without NIP-98) |
 | `404` | Unknown path, or wrong Host for the API (`api_host` configured) |
 | `503` | API concurrency limit reached, or the database reader saturated/timed out — retry shortly |
 
