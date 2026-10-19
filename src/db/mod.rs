@@ -2342,6 +2342,23 @@ impl DbClient {
         self.overloads.swap(0, std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Test hook: make the writer fail-fast gate see a saturated queue, so
+    /// the next checked write fails fast exactly like under overload
+    /// without a real backlog. Clear it with `false` before any further
+    /// request: the failed request rolls back only its own reservation, so
+    /// the forced count would otherwise keep the gate closed.
+    #[cfg(test)]
+    pub(crate) fn force_overload_for_test(&self, full: bool) {
+        self.pending_msgs.store(
+            if full {
+                self.max_pending_msgs.saturating_add(1)
+            } else {
+                0
+            },
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
     /// Messages queued on the writer channel but not yet drained.
     pub fn pending_msgs(&self) -> usize {
         self.pending_msgs.load(std::sync::atomic::Ordering::Relaxed)

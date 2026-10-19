@@ -3253,13 +3253,16 @@ impl Relay {
                 Some(removed) => self.stats.bump(&self.stats.events_deleted, removed as u64),
                 None => {
                     // The deletion event stored but its side effect was
-                    // dropped (writer overload). A walk that failed
-                    // mid-way already recorded itself in `delete_pending`
-                    // and the startup resume will finish it; only the
-                    // fail-fast case (the message never reached the writer)
-                    // needs the request held here.
+                    // dropped: a queue-cap fail-fast (counted by the send
+                    // path in `db_overloaded`), a lost writer, or a
+                    // writer-side store error (counted by the writer's own
+                    // counter, which the server's stats task drains into
+                    // `db_errors`). A walk that failed mid-way already
+                    // recorded itself in `delete_pending` and the startup
+                    // resume will finish it; only the fail-fast case (the
+                    // message never reached the writer) needs the request
+                    // held here.
                     log::error!("NIP-09 deletion side effect was not applied");
-                    self.stats.bump(&self.stats.db_errors, 1);
                     removal_failed = true;
                     unapplied = Some(crate::db::store::PendingDeletion {
                         targets: nip09::deletion_targets(&event),
@@ -4336,11 +4339,12 @@ impl Relay {
                 None => {
                     // The vanish side effect was dropped: the marker is not
                     // stored (and no pending record exists), so the pubkey
-                    // would come back. Surface the failure in the logs and
-                    // metrics; the accept path turns the request into a
-                    // retryable failure.
+                    // would come back. The accounting is the sender's and
+                    // the writer's (a fail-fast in `db_overloaded`, a
+                    // store error in the writer's counter, drained into
+                    // `db_errors` by the stats task); the accept path turns
+                    // the failure into a retryable reply.
                     log::error!("NIP-62 vanish side effect was not applied");
-                    self.stats.bump(&self.stats.db_errors, 1);
                     return false;
                 }
             };
@@ -4541,14 +4545,16 @@ impl Relay {
                 match removed {
                     Some(removed) => self.stats.bump(&self.stats.events_deleted, removed as u64),
                     None => {
-                        // The 9005 stored but its side effect was dropped
-                        // (writer overload): report the retryable failure
+                        // The 9005 stored but its side effect was dropped:
+                        // a queue-cap fail-fast (counted by the send path
+                        // in `db_overloaded`) or a writer-side store error
+                        // (counted by the writer's own counter, drained
+                        // into `db_errors`). Report the retryable failure
                         // instead of a silent success (same OK semantics as
                         // the NIP-09 deletion path). The request is held for
                         // the `delete_pending` flush so the client does not
                         // have to (and cannot usefully) re-send it.
                         log::error!("NIP-29 9005 deletion side effect was not applied");
-                        self.stats.bump(&self.stats.db_errors, 1);
                         removal_failed = true;
                         unapplied = Some(crate::db::store::PendingDeletion {
                             targets: nip29::delete_targets(event),
@@ -9230,6 +9236,40 @@ mod tests {
                 !relay.roles.read().await.is_member_of(&pubkey),
                 "the rate-limited rejoin must not record the member"
             );
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn an_overload_fail_fast_is_not_counted_as_a_database_error() {
+        // M-12: a checked write that never reached the writer (queue-cap
+        // fail-fast) is the relay shedding load, not a storage fault. It is
+        // counted in `db_overloaded` by the send path; the relay must not
+        // count it in `db_errors` as well (false storage alerts), and a
+        // real writer-side error is already recorded by the writer's own
+        // counter (drained by the stats task), so the old relay-side bump
+        // double-counted that case too.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            use std::sync::atomic::Ordering;
+            let relay = build_relay().await;
+            let now = crate::util::unix_now();
+            relay.db.force_overload_for_test(true);
+            assert!(
+                !relay.vanish_pubkey([7u8; 32], now).await,
+                "the dropped vanish side effect must surface as a failure"
+            );
+            assert_eq!(
+                relay.stats.db_errors.load(Ordering::Relaxed),
+                0,
+                "a queue-cap fail-fast is load shedding, not a database fault"
+            );
+            assert_eq!(
+                relay.db.take_overloads(),
+                1,
+                "the fail-fast belongs to the overload counter"
+            );
+            relay.db.force_overload_for_test(false);
             relay.db.shutdown();
         });
     }
