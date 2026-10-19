@@ -4164,6 +4164,48 @@ mod tests {
         });
     }
     #[test]
+    fn an_unsupported_verb_notice_is_bounded() {
+        // The client chooses the verb length: a NOTICE must not echo the
+        // whole frame back (a cheap amplification vector), and the cap must
+        // not split a multi-byte character.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let long = "x".repeat(10_000);
+            conn.handle_text(&format!("[\"{long}\"]")).await;
+            let prefix = "error: unsupported message type ";
+            let notice = outgoing_json(&conn)
+                .into_iter()
+                .find(|m| m[0] == "NOTICE")
+                .and_then(|m| m[1].as_str().map(str::to_string))
+                .expect("an unsupported verb must produce a NOTICE");
+            assert_eq!(
+                notice.len(),
+                prefix.len() + 64,
+                "the echoed verb must be capped at 64 characters: {notice:?}"
+            );
+            // The cap counts characters, not bytes: an all-multi-byte verb
+            // is truncated at a boundary and stays valid text.
+            conn.outgoing.clear();
+            conn.out_bytes = 0;
+            let accented = "é".repeat(100);
+            conn.handle_text(&format!("[\"{accented}\"]")).await;
+            let notice = outgoing_json(&conn)
+                .into_iter()
+                .find(|m| m[0] == "NOTICE")
+                .and_then(|m| m[1].as_str().map(str::to_string))
+                .expect("an unsupported verb must produce a NOTICE");
+            assert_eq!(
+                notice.chars().count(),
+                prefix.chars().count() + 64,
+                "the cap is in characters: {notice:?}"
+            );
+            assert!(notice.ends_with(&"é".repeat(64)));
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
     fn first_token_extracts_the_verb_without_a_parse() {
         assert_eq!(Conn::first_token("[\"EVENT\",{}]"), Some("EVENT"));
         assert_eq!(Conn::first_token("[ \"REQ\", \"s\", {}]"), Some("REQ"));

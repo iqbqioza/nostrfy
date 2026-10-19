@@ -142,7 +142,12 @@ impl super::Conn {
             }
             other => {
                 self.flush_pending_events().await;
-                self.send_notice(&format!("error: unsupported message type {other}"));
+                // The client chooses the verb length: cap the echo (at a
+                // character boundary) so one frame cannot turn into an
+                // arbitrarily large NOTICE reply. 64 characters is enough to
+                // show a typo.
+                let shown: String = other.chars().take(64).collect();
+                self.send_notice(&format!("error: unsupported message type {shown}"));
             }
         }
     }
