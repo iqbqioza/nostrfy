@@ -29,6 +29,19 @@ pub(crate) enum RoleChange {
     Failed,
 }
 
+/// Outcome of a NIP-43 claim admission (see [`super::Relay::admit_member`]).
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum Admission {
+    /// The membership is recorded (a new member, or one already listed).
+    Recorded,
+    /// The relay member list is at
+    /// [`crate::nips::nip43::MAX_RELAY_MEMBERS`]: the admission was refused
+    /// instead of growing it.
+    Full,
+    /// NIP-43 is disabled or the relay key is missing.
+    Unavailable,
+}
+
 impl super::Relay {
     /// Applies a role mutation to the live store, capturing it for replay
     /// when a rebuild is pending or in flight (see
@@ -477,9 +490,13 @@ impl super::Relay {
 
     /// Admits a `kind:28934` join by invite code: records the membership,
     /// schedules the snapshot persist, and republishes the member list
-    /// with an add-user event (NIP-43 SHOULD + MAY). Returns false only
-    /// when NIP-43 is disabled or the relay key is missing (the caller
-    /// reports a retryable error instead of a false welcome).
+    /// with an add-user event (NIP-43 SHOULD + MAY). Returns
+    /// [`Admission::Unavailable`] only when NIP-43 is disabled or the
+    /// relay key is missing (the caller reports a retryable error instead
+    /// of a false welcome), and [`Admission::Full`] when the member list
+    /// is at [`crate::nips::nip43::MAX_RELAY_MEMBERS`] (the check is
+    /// repeated here under the write lock: the precheck's read-side check
+    /// can race two concurrent joins past the cap).
     ///
     /// `nip43_enabled` is passed in instead of read from `self.config`
     /// here. The batched accept path held a `config` read guard across this
@@ -492,21 +509,23 @@ impl super::Relay {
     /// `kill -9` recovered). Taking the flag from the caller's snapshot
     /// removes the re-entrancy entirely and keeps the decision consistent
     /// with the `precheck` that produced it.
-    pub(crate) async fn admit_member(&self, pubkey: &str, nip43_enabled: bool) -> bool {
+    pub(crate) async fn admit_member(&self, pubkey: &str, nip43_enabled: bool) -> Admission {
         if !nip43_enabled || self.key.is_none() {
-            return false;
+            return Admission::Unavailable;
         }
-        let added = self
+        let (outcome, added) = self
             .mutate_roles(
                 super::BufferedRoleMutation::AdmitMember {
                     pubkey: pubkey.to_string(),
                 },
                 |roles| {
                     if roles.assignments.contains_key(pubkey) {
-                        (false, false)
+                        ((Admission::Recorded, false), false)
+                    } else if roles.assignments.len() >= crate::nips::nip43::MAX_RELAY_MEMBERS {
+                        ((Admission::Full, false), false)
                     } else {
                         roles.admit(pubkey);
-                        (true, true)
+                        ((Admission::Recorded, true), true)
                     }
                 },
             )
@@ -525,7 +544,7 @@ impl super::Relay {
                 );
             }
         }
-        true
+        outcome
     }
 
     /// NIP-43 leave request: removes the user from the member list and

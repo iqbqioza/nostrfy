@@ -148,7 +148,10 @@ pub struct RelayConfig {
     /// rejected with `restricted: your account is too new` (0 disables).
     pub new_pubkey_min_age_secs: u64,
     /// Spam defense: a pubkey may publish at most this many events per
-    /// minute (a sliding 60-second window). 0 disables the check.
+    /// minute (a sliding 60-second window). 0 disables the check. NIP-43
+    /// join admissions count against the same window (the admit path
+    /// returns before the ordinary publish-rate check, so it applies the
+    /// limiter itself).
     pub max_events_per_min_per_pubkey: u64,
     /// Cap on the in-memory NIP-29 group store (active groups plus
     /// deleted-group markers). Must be at least 1 (unbounded stores would

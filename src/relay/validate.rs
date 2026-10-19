@@ -264,6 +264,13 @@ impl super::Relay {
                 .find(|t| t.len() >= 2 && t[0] == "claim")
                 .map(|t| t[1].as_str());
             if code.is_some_and(|code| roles.has_claim(code)) {
+                // NIP-43: the member list is capped (each admission
+                // re-signs the whole list, so an uncapped list is an
+                // amplification vector for one reusable invite code).
+                // `admit_member` repeats the check under its write lock.
+                if roles.assignments.len() >= nip43::MAX_RELAY_MEMBERS {
+                    return Precheck::Reject("restricted: the relay member list is full".into());
+                }
                 return Precheck::Admit("info: welcome to this relay!".into());
             }
             return Precheck::Reject("restricted: that is an invalid invite code.".into());

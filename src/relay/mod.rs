@@ -2495,21 +2495,48 @@ impl Relay {
                 // guards are dropped: `admit_member` must not re-acquire the
                 // config lock (see the comment on `admit_member`).
                 let nip43_enabled = cfg.nip_enabled(43);
+                // This branch returns before the shared publish-rate check
+                // below, so the limiter is applied here: a claim-holder
+                // cycling leave/rejoin would otherwise re-sign the whole
+                // member list on every admission without ever being
+                // rate-limited.
+                if !self.publish_rate_allowed(&cfg, &event.pubkey, now) {
+                    drop(cfg);
+                    drop(access);
+                    self.stats.bump(&self.stats.events_rejected, 1);
+                    return PutOutcome::Invalid("rate-limited: too many events".into());
+                }
                 drop(cfg);
                 drop(access);
-                if !self.admit_member(&event.pubkey, nip43_enabled).await {
-                    // NIP-43 is disabled or the relay key is missing: the
-                    // membership was not recorded, so a welcome would lie.
-                    self.stats.bump(&self.stats.events_rejected, 1);
-                    return PutOutcome::Invalid(
-                        "error: membership could not be recorded; retry".into(),
-                    );
+                match self.admit_member(&event.pubkey, nip43_enabled).await {
+                    crate::relay::roles::Admission::Recorded => {
+                        // Acknowledged without storing (the welcome text
+                        // rides the duplicate-style ack): counted like the
+                        // member-rejoin verdict below.
+                        self.stats.bump(&self.stats.events_duplicate, 1);
+                        return PutOutcome::Duplicate(msg);
+                    }
+                    crate::relay::roles::Admission::Full => {
+                        // The list is at its cap (a concurrent admission
+                        // raced the precheck): the rate reservation is
+                        // released, like a rejected store below.
+                        self.publish_rate_rollback(&event.pubkey, now);
+                        self.stats.bump(&self.stats.events_rejected, 1);
+                        return PutOutcome::Invalid(
+                            "restricted: the relay member list is full".into(),
+                        );
+                    }
+                    crate::relay::roles::Admission::Unavailable => {
+                        // NIP-43 is disabled or the relay key is missing:
+                        // the membership was not recorded, so a welcome
+                        // would lie.
+                        self.publish_rate_rollback(&event.pubkey, now);
+                        self.stats.bump(&self.stats.events_rejected, 1);
+                        return PutOutcome::Invalid(
+                            "error: membership could not be recorded; retry".into(),
+                        );
+                    }
                 }
-                // Acknowledged without storing (the welcome text rides the
-                // duplicate-style ack): counted like the member-rejoin
-                // verdict below.
-                self.stats.bump(&self.stats.events_duplicate, 1);
-                return PutOutcome::Duplicate(msg);
             }
             crate::relay::validate::Precheck::Vanish => {
                 // NIP-62: delete everything by this pubkey and never
@@ -3015,15 +3042,42 @@ impl Relay {
                     // Should it ever be reached, the cost is a stall, not a
                     // deadlock: the admission's two database commits would
                     // run under both read guards.
-                    if !self.admit_member(&event.pubkey, cfg.nip_enabled(43)).await {
+                    // The same per-pubkey publish limiter the single-event
+                    // path applies to this branch (which returns before the
+                    // shared check): a claim-holder cycling leave/rejoin
+                    // must not re-sign the whole member list unthrottled.
+                    if !self.publish_rate_allowed(&cfg, &event.pubkey, now) {
                         self.stats.bump(&self.stats.events_rejected, 1);
                         results.push((
                             id,
-                            PutOutcome::Invalid(
-                                "error: membership could not be recorded; retry".into(),
-                            ),
+                            PutOutcome::Invalid("rate-limited: too many events".into()),
                         ));
                         continue;
+                    }
+                    match self.admit_member(&event.pubkey, cfg.nip_enabled(43)).await {
+                        crate::relay::roles::Admission::Recorded => {}
+                        crate::relay::roles::Admission::Full => {
+                            self.publish_rate_rollback(&event.pubkey, now);
+                            self.stats.bump(&self.stats.events_rejected, 1);
+                            results.push((
+                                id,
+                                PutOutcome::Invalid(
+                                    "restricted: the relay member list is full".into(),
+                                ),
+                            ));
+                            continue;
+                        }
+                        crate::relay::roles::Admission::Unavailable => {
+                            self.publish_rate_rollback(&event.pubkey, now);
+                            self.stats.bump(&self.stats.events_rejected, 1);
+                            results.push((
+                                id,
+                                PutOutcome::Invalid(
+                                    "error: membership could not be recorded; retry".into(),
+                                ),
+                            ));
+                            continue;
+                        }
                     }
                     Self::insert_event_prefixes(&mut known_set, &id);
                     self.stats.bump(&self.stats.events_duplicate, 1);
@@ -5450,7 +5504,10 @@ mod tests {
         let b = "bb".repeat(32);
         assert!(relay.create_role("r1", "R1", "", "", None).await);
         assert!(
-            relay.admit_member(&a, true).await,
+            matches!(
+                relay.admit_member(&a, true).await,
+                crate::relay::roles::Admission::Recorded
+            ),
             "the claim-holder is admitted (role-less member)"
         );
         assert_eq!(relay.assign_role(&b, "r1").await, RoleChange::Applied);
@@ -9031,6 +9088,147 @@ mod tests {
             assert!(
                 !relay.roles.read().await.is_member_of(&pubkey),
                 "the vanish must win over the invite code"
+            );
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn nip43_claim_admission_is_capped() {
+        // Every admission re-signs the whole 13534 list, so a reusable
+        // invite code must not admit unbounded keys. The precheck rejects
+        // first; `admit_member` repeats the check under its write lock (two
+        // concurrent joins can race the precheck past the cap).
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            use crate::db::PutOutcome;
+            use crate::nips::nip43::MAX_RELAY_MEMBERS;
+
+            let relay = build_relay_with_key(false, &hex::encode([31u8; 32])).await;
+            relay.roles.write().await.add_claim("FULLCODE");
+            {
+                let mut roles = relay.roles.write().await;
+                for i in 0..MAX_RELAY_MEMBERS {
+                    roles.assignments.insert(format!("{i:064x}"), Vec::new());
+                }
+            }
+            let secret = secp256k1::SecretKey::from_slice(&[32u8; 32]).unwrap();
+            let keypair =
+                secp256k1::Keypair::from_seckey_slice(relay.secp(), &secret.secret_bytes())
+                    .unwrap();
+            let pubkey = secp256k1::XOnlyPublicKey::from_keypair(&keypair)
+                .0
+                .to_string();
+            let now = crate::util::unix_now();
+            let join = {
+                let mut e = crate::event::Event {
+                    id: String::new(),
+                    pubkey: pubkey.clone(),
+                    created_at: now,
+                    kind: crate::nips::nip43::JOIN,
+                    tags: vec![vec!["claim".into(), "FULLCODE".into()]],
+                    content: String::new(),
+                    sig: String::new(),
+                };
+                e.id = crate::nips::nip01::compute_id(&e);
+                let id = e.id_bytes().unwrap();
+                e.sig = relay
+                    .secp()
+                    .sign_schnorr_no_aux_rand(&id, &keypair)
+                    .to_string();
+                e
+            };
+            let outcome = relay.accept_event(join.clone(), &[], None).await;
+            assert!(
+                matches!(&outcome, PutOutcome::Invalid(msg) if msg.contains("member list is full")),
+                "a full member list must refuse the admission: {outcome:?}"
+            );
+            assert!(
+                !relay.roles.read().await.is_member_of(&pubkey),
+                "the refused admission must not record the member"
+            );
+            // The write-lock check is authoritative on its own.
+            assert_eq!(
+                relay.admit_member(&pubkey, true).await,
+                crate::relay::roles::Admission::Full,
+                "admit_member itself must refuse at the cap"
+            );
+            // A listed member is unaffected by the cap: the claim gets the
+            // spec's duplicate welcome, not a capacity error.
+            relay
+                .roles
+                .write()
+                .await
+                .assignments
+                .insert(pubkey.clone(), Vec::new());
+            let outcome = relay.accept_event(join, &[], None).await;
+            assert!(
+                matches!(&outcome, PutOutcome::Duplicate(msg) if msg.contains("already a member")),
+                "a listed member's claim stays the duplicate verdict: {outcome:?}"
+            );
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn nip43_claim_admission_counts_against_the_publish_rate() {
+        // The admit branch returns before the shared publish-rate check, so
+        // it applies the limiter itself: a member cycling leave/rejoin
+        // cannot re-sign the whole member list unthrottled.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            use crate::db::PutOutcome;
+
+            let relay = build_relay_with_key(false, &hex::encode([33u8; 32])).await;
+            relay
+                .config
+                .write()
+                .await
+                .relay
+                .max_events_per_min_per_pubkey = 1;
+            relay.roles.write().await.add_claim("RATECODE");
+            let secret = secp256k1::SecretKey::from_slice(&[34u8; 32]).unwrap();
+            let keypair =
+                secp256k1::Keypair::from_seckey_slice(relay.secp(), &secret.secret_bytes())
+                    .unwrap();
+            let pubkey = secp256k1::XOnlyPublicKey::from_keypair(&keypair)
+                .0
+                .to_string();
+            let now = crate::util::unix_now();
+            let join = {
+                let mut e = crate::event::Event {
+                    id: String::new(),
+                    pubkey: pubkey.clone(),
+                    created_at: now,
+                    kind: crate::nips::nip43::JOIN,
+                    tags: vec![vec!["claim".into(), "RATECODE".into()]],
+                    content: String::new(),
+                    sig: String::new(),
+                };
+                e.id = crate::nips::nip01::compute_id(&e);
+                let id = e.id_bytes().unwrap();
+                e.sig = relay
+                    .secp()
+                    .sign_schnorr_no_aux_rand(&id, &keypair)
+                    .to_string();
+                e
+            };
+            let first = relay.accept_event(join.clone(), &[], None).await;
+            assert!(
+                matches!(&first, PutOutcome::Duplicate(msg) if msg.contains("welcome")),
+                "the first admission must land: {first:?}"
+            );
+            assert!(relay.roles.read().await.is_member_of(&pubkey));
+            // Leave and rejoin inside the same 60-second window.
+            assert!(relay.roles.write().await.remove_pubkey(&pubkey));
+            let second = relay.accept_event(join, &[], None).await;
+            assert!(
+                matches!(&second, PutOutcome::Invalid(msg) if msg.contains("rate-limited")),
+                "a leave/rejoin cycle must be rate-limited: {second:?}"
+            );
+            assert!(
+                !relay.roles.read().await.is_member_of(&pubkey),
+                "the rate-limited rejoin must not record the member"
             );
             relay.db.shutdown();
         });

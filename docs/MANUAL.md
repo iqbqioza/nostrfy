@@ -171,7 +171,7 @@ If anything is wrong, it tells you exactly what. It is strongly recommended to r
 | `enabled_git` | When `true`, accept NIP-34 git events (kinds 1617–1633, 30617/30618) and advertise NIP-34. Off by default: the kinds are rejected (`blocked: NIP-34 git events are disabled`) | `false` |
 | `require_pow` | Required proof-of-work difficulty in bits (0 = none) | `0` |
 | `new_pubkey_min_age_secs` | Reject posts from accounts younger than this (spam defense, 0 = off) | `0` |
-| `max_events_per_min_per_pubkey` | Max events a pubkey may publish per minute (0 = unlimited) | `0` |
+| `max_events_per_min_per_pubkey` | Max events a pubkey may publish per minute (0 = unlimited; NIP-43 join admissions count against the same window) | `0` |
 | `max_groups` | NIP-29 in-memory group store cap (active + deleted markers; must be ≥ 1, `0` is rejected) | `1000` |
 | `require_auth` | Require NIP-42 auth for everything (subscriptions and publishing; REST API reads require NIP-98) | `false` |
 | `send_auth_challenge` | Send an AUTH challenge on connect | `true` |
@@ -535,7 +535,7 @@ curl -X POST http://127.0.0.1:8080/ \
 | 34 | git stuff (kinds 1617-1619, 1621, 1622, 1630-1633, 30617/30618 — **opt-in** via `relay.enabled_git`, off by default) |
 | 40 | Expiration timestamp |
 | 42 | Client authentication |
-| 43 | Relay access metadata (roles) — kinds 33534/13534/8000/8001 plus ephemeral 28934/28935/28936; the relay-signed metadata events (33534/13534/8000/8001) carry the NIP-70 `-` tag as the spec requires, so they are only served to authenticated clients (AUTH-gated, like NIP-78). Invite codes are issued with NIP-86 `createclaim`/`deleteclaim` (listed by `listclaims`); a `kind:28934` carrying a listed `claim` tag admits its author to the member list |
+| 43 | Relay access metadata (roles) — kinds 33534/13534/8000/8001 plus ephemeral 28934/28935/28936; the relay-signed metadata events (33534/13534/8000/8001) carry the NIP-70 `-` tag as the spec requires, so they are only served to authenticated clients (AUTH-gated, like NIP-78). Invite codes are issued with NIP-86 `createclaim`/`deleteclaim` (listed by `listclaims`); a `kind:28934` carrying a listed `claim` tag admits its author to the member list, which is capped at 10,000 members (`restricted: the relay member list is full`), and the admission itself counts against `max_events_per_min_per_pubkey` |
 | 45 | Counting results (COUNT / HyperLogLog) |
 | 46 | Nostr Connect (ephemeral kind 24133, exempt from `reject_ephemeral`) |
 | 47 | Nostr Wallet Connect (ephemeral kinds 23194/23195, exempt from `reject_ephemeral`) |

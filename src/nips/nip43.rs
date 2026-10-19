@@ -28,6 +28,13 @@ pub const INVITE: u64 = 28935;
 pub const LEAVE: u64 = 28936;
 /// Tag on a `kind:33534` tombstone marking a role as deleted.
 pub const DELETED_TAG: &str = "deleted";
+/// Upper bound on the NIP-43 relay member list (the claim-admitted
+/// `assignments`, published as `kind:13534`). Every admission re-signs the
+/// whole list with an add-user event, so an uncapped list lets one invite
+/// code admit unbounded keys: each admission grows the O(n) republish into
+/// O(n²) total work and the memory without limit. Mirrors the NIP-29
+/// per-group member cap; members already listed are unaffected.
+pub(crate) const MAX_RELAY_MEMBERS: usize = 10_000;
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Role {
