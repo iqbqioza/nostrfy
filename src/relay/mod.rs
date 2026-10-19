@@ -26,7 +26,7 @@ mod validate;
 use std::sync::Arc;
 
 use secp256k1::{Keypair, Secp256k1, XOnlyPublicKey};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, AtomicUsize, Ordering};
 use tokio::sync::RwLock;
 use tokio::sync::mpsc;
@@ -45,6 +45,124 @@ use crate::util::unix_now;
 /// connection that stops reading is closed when its queue fills so it can
 /// reconnect and resynchronize instead of missing events silently.
 pub(crate) const LIVE_QUEUE_CAPACITY: usize = 64;
+
+/// The bounded per-pubkey publish-rate tracker
+/// (`relay.max_events_per_min_per_pubkey`): a sliding 60-second window of
+/// accepted timestamps per pubkey, plus a recency index used to evict the
+/// least recently active window when the map is full.
+#[derive(Default)]
+struct PublishRate {
+    /// Accepted timestamps per pubkey; a window holds at most `max` values,
+    /// so one key pins at most that many `u64`s.
+    windows: HashMap<String, VecDeque<u64>>,
+    /// `(last accepted timestamp, pubkey)` for every tracked window: the
+    /// first entry is the least recently active one. The pubkey makes
+    /// entries unique when timestamps collide.
+    recency: BTreeSet<(u64, String)>,
+    /// When the windows were last pruned. Pruning walks every window, so a
+    /// flood of fresh pubkeys must not run that walk once per event.
+    pruned_at: u64,
+}
+
+impl PublishRate {
+    /// Whether `pubkey` may publish another event; records `now` when it
+    /// may. The map is bounded at `cap` pubkeys and never rejects a fresh
+    /// identity: a full map prunes expired windows (at most once per
+    /// second) and then evicts the least recently active window. Holding
+    /// the cap with 10k active keys therefore cannot lock new pubkeys out
+    /// (the alternative — rejecting untracked identities — is a permanent
+    /// denial of service). Eviction never clears the map and never resets
+    /// the other windows; an evicted key starts a fresh window on its next
+    /// publish.
+    fn allow(&mut self, max: usize, pubkey: &str, now: u64, cap: usize) -> bool {
+        if let Some(window) = self.windows.get_mut(pubkey) {
+            while window.front().is_some_and(|t| now.saturating_sub(*t) >= 60) {
+                window.pop_front();
+            }
+            if window.len() >= max {
+                return false;
+            }
+            let previous = window.back().copied();
+            window.push_back(now);
+            self.retouch(pubkey, previous, now);
+            return true;
+        }
+        if self.windows.len() >= cap {
+            if now.saturating_sub(self.pruned_at) >= 1 {
+                self.pruned_at = now;
+                self.prune(now);
+            }
+            while self.windows.len() >= cap {
+                let Some((timestamp, oldest)) = self.recency.pop_first() else {
+                    break;
+                };
+                // The recency index mirrors the windows; a stale entry is
+                // skipped instead of evicting a live window under the wrong
+                // identity (defensive: `prune` and `retouch` keep it
+                // exact).
+                if self.windows.get(&oldest).and_then(|w| w.back()) != Some(&timestamp) {
+                    continue;
+                }
+                self.windows.remove(&oldest);
+            }
+        }
+        self.windows
+            .insert(pubkey.to_string(), VecDeque::from([now]));
+        self.recency.insert((now, pubkey.to_string()));
+        true
+    }
+
+    /// Moves `pubkey`'s recency index entry from its previous last
+    /// timestamp to `now`.
+    fn retouch(&mut self, pubkey: &str, previous: Option<u64>, now: u64) {
+        if let Some(previous) = previous {
+            self.recency.remove(&(previous, pubkey.to_string()));
+        }
+        self.recency.insert((now, pubkey.to_string()));
+    }
+
+    /// Drops every expired timestamp (one stale value must not discard the
+    /// live ones behind it) and rebuilds the recency index.
+    fn prune(&mut self, now: u64) {
+        self.windows.retain(|_, window| {
+            window.retain(|timestamp| now.saturating_sub(*timestamp) < 60);
+            !window.is_empty()
+        });
+        self.recency = self
+            .windows
+            .iter()
+            .map(|(pubkey, window)| {
+                let last = *window.back().expect("pruned windows are never left empty");
+                (last, pubkey.clone())
+            })
+            .collect();
+    }
+
+    /// Releases one recorded reservation (see `publish_rate_rollback`).
+    fn rollback(&mut self, pubkey: &str, now: u64) {
+        let Some(window) = self.windows.get_mut(pubkey) else {
+            return;
+        };
+        let previous = window.back().copied();
+        if let Some(pos) = window.iter().rposition(|timestamp| *timestamp == now) {
+            window.remove(pos);
+        }
+        let new_back = window.back().copied();
+        if new_back == previous {
+            return;
+        }
+        if let Some(previous) = previous {
+            self.recency.remove(&(previous, pubkey.to_string()));
+        }
+        if window.is_empty() {
+            self.windows.remove(pubkey);
+            return;
+        }
+        if let Some(new_back) = new_back {
+            self.recency.insert((new_back, pubkey.to_string()));
+        }
+    }
+}
 
 pub struct Relay {
     pub config: Arc<RwLock<Config>>,
@@ -94,14 +212,10 @@ pub struct Relay {
     pub api_limit: Arc<ApiLimiter>,
     /// Per-pubkey sliding window of accepted event timestamps
     /// (`relay.max_events_per_min_per_pubkey`). Bounded: at most 10k
-    /// pubkeys are tracked — a full map evicts expired windows at most once
-    /// per second and otherwise rejects fresh pubkeys (fail-closed, so an
-    /// untracked identity cannot bypass the configured limit).
-    publish_rate: std::sync::Mutex<HashMap<String, std::collections::VecDeque<u64>>>,
-    /// When the publish-rate map was last pruned. The map is bounded, and
-    /// pruning it is a full scan: a flood of fresh pubkeys must not run that
-    /// scan once per event.
-    publish_rate_pruned_at: std::sync::atomic::AtomicU64,
+    /// pubkeys are tracked; a full map prunes expired windows (at most once
+    /// per second) and evicts the least recently active window, so it never
+    /// rejects a fresh pubkey and never clears the map (`PublishRate`).
+    publish_rate: std::sync::Mutex<PublishRate>,
     /// Serializes `persist_access`: two concurrent NIP-86 mutations must
     /// not capture snapshots in one order and queue their writes in the
     /// other, or the older snapshot lands last and loses the newer entry
@@ -1802,8 +1916,7 @@ impl Relay {
             roles: Arc::new(RwLock::new(RoleStore::default())),
             roles_rebuild: std::sync::Arc::new(RolesRebuild::default()),
             api_limit: ApiLimiter::new(api_max_concurrent),
-            publish_rate: std::sync::Mutex::new(HashMap::new()),
-            publish_rate_pruned_at: std::sync::atomic::AtomicU64::new(0),
+            publish_rate: std::sync::Mutex::new(PublishRate::default()),
             persist_access_lock: tokio::sync::Mutex::new(()),
             access_ops: std::sync::Mutex::new(seed_ops),
             pending_removals: std::sync::Mutex::new(Vec::new()),
@@ -2016,13 +2129,9 @@ impl Relay {
 
     /// Whether `pubkey` may publish another event under
     /// `relay.max_events_per_min_per_pubkey` (a sliding 60-second window;
-    /// 0 = unlimited). Each window holds at most `max` timestamps, so one
-    /// key pins at most that many `u64`s. The window map is bounded at
-    /// 10,000 pubkeys — the
-    /// cap never clears the whole map (a clear would reset every window
-    /// and permanently disable the limit): expired windows are evicted
-    /// first, and a still-full map rejects the new pubkey because its
-    /// window cannot be tracked safely.
+    /// 0 = unlimited). See [`PublishRate::allow`] for the bounded-map
+    /// policy: at the 10k cap the least recently active window is evicted
+    /// instead of rejecting a fresh pubkey or clearing the map.
     pub(crate) fn publish_rate_allowed(&self, cfg: &Config, pubkey: &str, now: u64) -> bool {
         const MAX_TRACKED_PUBKEYS: usize = 10_000;
         let max = cfg.relay.max_events_per_min_per_pubkey;
@@ -2030,42 +2139,7 @@ impl Relay {
             return true;
         }
         let mut rate = self.publish_rate.lock().unwrap_or_else(|p| p.into_inner());
-        // Already-tracked pubkeys are always enforced: the cap logic below
-        // only decides whether a *new* pubkey is tracked, so a full map
-        // can never disable the limit for tracked keys.
-        if let Some(window) = rate.get_mut(pubkey) {
-            while window.front().is_some_and(|t| now.saturating_sub(*t) >= 60) {
-                window.pop_front();
-            }
-            if window.len() >= max as usize {
-                return false;
-            }
-            window.push_back(now);
-            return true;
-        }
-        // New pubkey: never clear the whole map (a clear would reset every
-        // window and permanently disable the limit). Expired windows are
-        // evicted first; a still-full map rejects the new pubkey because
-        // admitting an untracked identity would bypass the configured
-        // limit. The eviction is a full scan, so it runs at most once per
-        // second: a flood of fresh pubkeys would otherwise walk the whole
-        // map per event.
-        if rate.len() >= MAX_TRACKED_PUBKEYS {
-            let last_pruned = self
-                .publish_rate_pruned_at
-                .load(std::sync::atomic::Ordering::Relaxed);
-            if now.saturating_sub(last_pruned) >= 1 {
-                self.publish_rate_pruned_at
-                    .store(now, std::sync::atomic::Ordering::Relaxed);
-                rate.retain(|_, w| w.front().is_some_and(|t| now.saturating_sub(*t) < 60));
-            }
-            if rate.len() >= MAX_TRACKED_PUBKEYS {
-                return false;
-            }
-        }
-
-        rate.entry(pubkey.to_string()).or_default().push_back(now);
-        true
+        rate.allow(max as usize, pubkey, now, MAX_TRACKED_PUBKEYS)
     }
 
     /// Releases one publish-rate reservation when database admission rejects
@@ -2073,14 +2147,7 @@ impl Relay {
     /// reservation only by count, so remove exactly one matching entry.
     pub(crate) fn publish_rate_rollback(&self, pubkey: &str, now: u64) {
         let mut rate = self.publish_rate.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(window) = rate.get_mut(pubkey)
-            && let Some(pos) = window.iter().rposition(|timestamp| *timestamp == now)
-        {
-            window.remove(pos);
-        }
-        if rate.get(pubkey).is_some_and(|window| window.is_empty()) {
-            rate.remove(pubkey);
-        }
+        rate.rollback(pubkey, now);
     }
 
     /// Hex pubkey of the relay's own key, if configured.

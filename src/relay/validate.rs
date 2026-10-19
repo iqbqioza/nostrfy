@@ -1283,43 +1283,70 @@ mod tests {
             let cfg = Config::default();
             assert!(relay.publish_rate_allowed(&cfg, &"a".repeat(64), unix_now()));
             assert_eq!(
-                relay.publish_rate.lock().unwrap().len(),
+                relay.publish_rate.lock().unwrap().windows.len(),
                 0,
                 "no window is recorded when the limit is disabled"
             );
-            // The map is bounded: with the limit on, many pubkeys are
-            // rejected once the map is full instead of growing it, and a
-            // full map must not clear everyone's windows — the first 10k
-            // pubkeys are still rate-limited.
+            // The map is bounded but never rejects a fresh pubkey: once it
+            // is full, each new identity evicts the least recently active
+            // window, so 10k active attacker keys cannot lock new users
+            // out.
             let mut cfg = Config::default();
             cfg.relay.max_events_per_min_per_pubkey = 1;
+            let now = unix_now();
             for i in 0..20_000u64 {
                 let pk = format!("{i:064x}");
-                assert_eq!(
-                    relay.publish_rate_allowed(&cfg, &pk, unix_now()),
-                    i < 10_000,
-                    "only identities with a tracking slot may publish"
+                assert!(
+                    relay.publish_rate_allowed(&cfg, &pk, now),
+                    "identity {i} must not be locked out by a full map"
                 );
             }
-            assert!(
-                relay.publish_rate.lock().unwrap().len() <= 10_000,
-                "the tracked-pubkey map must not exceed its bound"
+            assert_eq!(
+                relay.publish_rate.lock().unwrap().windows.len(),
+                10_000,
+                "the tracked-pubkey map must stay at its bound"
             );
-            // A tracked pubkey stays limited while the map is full: its
-            // second event within the 60-second window is rejected.
-            let tracked = format!("{:064x}", 0u64);
+            // The most recent identity is still tracked ("a full map must
+            // not reset a tracked pubkey's window"): its second event in
+            // the 60-second window is rejected.
+            let tracked = format!("{:064x}", 19_999u64);
             assert!(
-                !relay.publish_rate_allowed(&cfg, &tracked, unix_now()),
+                !relay.publish_rate_allowed(&cfg, &tracked, now),
                 "a full map must not reset a tracked pubkey's window"
             );
-            // A fresh pubkey is rejected when no tracking slot is available;
-            // admitting it would bypass the configured per-pubkey limit.
+            // An expired timestamp must not discard the live timestamps
+            // behind it: seed a window with one expired and one live value,
+            // force the prune with the next admission, and the live value
+            // must keep counting against the key's limit.
+            let partial = "e".repeat(64);
+            relay.publish_rate.lock().unwrap().windows.insert(
+                partial.clone(),
+                std::collections::VecDeque::from([now - 61, now]),
+            );
             let fresh = "f".repeat(64);
-            assert!(!relay.publish_rate_allowed(&cfg, &fresh, unix_now()));
+            assert!(
+                relay.publish_rate_allowed(&cfg, &fresh, now + 1),
+                "a fresh pubkey must be admitted by evicting the LRU window"
+            );
             assert_eq!(
-                relay.publish_rate.lock().unwrap().len(),
+                relay.publish_rate.lock().unwrap().windows.len(),
                 10_000,
-                "the map is never cleared"
+                "the map is never cleared and never exceeds its bound"
+            );
+            assert_eq!(
+                relay
+                    .publish_rate
+                    .lock()
+                    .unwrap()
+                    .windows
+                    .get(&partial)
+                    .map(|window| window.len()),
+                Some(1),
+                "the prune must drop only the expired timestamp"
+            );
+            assert!(
+                !relay.publish_rate_allowed(&cfg, &partial, now + 1),
+                "the live timestamp behind the expired one must still count"
             );
             relay.db.shutdown();
         });
