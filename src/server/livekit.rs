@@ -231,14 +231,27 @@ pub(crate) fn participant_pubkeys(participants: &[serde_json::Value]) -> Vec<Str
     out
 }
 
-/// Maps a Room Service response to the participant pubkeys. A `404` is the
-/// Twirp `not_found` code LiveKit returns for a room that no longer exists:
-/// a deleted room has nobody live, so it maps to an empty list (returning
-/// an error would keep a stale list from before the room died, because
-/// every later poll would skip the group the same way).
+/// Maps a Room Service response to the participant pubkeys. A `404` maps to
+/// an empty list only when the body carries the Twirp `not_found` code
+/// LiveKit returns for a room that no longer exists (a deleted room has
+/// nobody live; returning an error would keep a stale list from before the
+/// room died, because every later poll would skip the group the same way).
+/// Twirp also answers `404` for `bad_route` (a wrong Room Service URL/path)
+/// and a reverse proxy may answer `404` with its own page: treating those as
+/// "the room is empty" would silently clear the live list while the API is
+/// misconfigured, so they stay errors (the caller keeps the previous list).
 fn participants_from_response(status: u16, body: &str) -> Result<Vec<String>> {
     if status == 404 {
-        return Ok(Vec::new());
+        let twirp_code = serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|value| value.get("code")?.as_str().map(str::to_string));
+        if twirp_code.as_deref() == Some("not_found") {
+            return Ok(Vec::new());
+        }
+        return Err(anyhow!(
+            "livekit ListParticipants returned 404 without Twirp code `not_found`              (got {}); keeping the previous participant list",
+            twirp_code.as_deref().unwrap_or("no Twirp code")
+        ));
     }
     if !(200..300).contains(&status) {
         return Err(anyhow!("livekit ListParticipants failed: HTTP {status}"));
@@ -948,13 +961,28 @@ mod tests {
     #[test]
     fn participants_from_response_treats_a_deleted_room_as_empty() {
         let alice = "aa".repeat(32);
-        // A 404 is Twirp's `not_found`: the room no longer exists, so
-        // nobody is live (an error would keep a stale list forever).
+        // A 404 with Twirp's `not_found` code: the room no longer exists,
+        // so nobody is live (an error would keep a stale list forever).
         assert_eq!(
             participants_from_response(404, r#"{"code":"not_found","msg":"room not found"}"#)
                 .unwrap(),
             Vec::<String>::new()
         );
+        // A 404 for any other reason must not be read as "empty room": a
+        // wrong Room Service path returns Twirp `bad_route`, and a proxy may
+        // answer with its own page. Clearing the list there would silently
+        // hide live participants while the API is misconfigured.
+        for body in [
+            r#"{"code":"bad_route","msg":"no handler for path"}"#,
+            r#"{"msg":"missing code"}"#,
+            "<html>404 Not Found</html>",
+            "",
+        ] {
+            assert!(
+                participants_from_response(404, body).is_err(),
+                "a 404 without Twirp `not_found` must stay an error: {body:?}"
+            );
+        }
         // A live room's list is parsed; an empty room yields no pubkeys.
         let body =
             json!({ "participants": [{ "identity": format!("{alice}deadbeef") }] }).to_string();
