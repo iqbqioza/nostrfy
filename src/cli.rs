@@ -2444,7 +2444,11 @@ fn running_pid(pid_file: &Path) -> Option<u32> {
         .trim()
         .parse::<u32>()
         .ok()?;
-    if pid == 0 {
+    // `pid_t` is a signed 32-bit integer: a larger value from a corrupted
+    // or hostile pid file wraps negative, and `kill(-1, 0)` probes every
+    // process — the daemon would look alive forever and `stop` could never
+    // clear it. Treat it as stale (the start path removes the file).
+    if pid == 0 || pid > i32::MAX as u32 {
         return None;
     }
     if process_alive(pid) { Some(pid) } else { None }
@@ -2452,6 +2456,9 @@ fn running_pid(pid_file: &Path) -> Option<u32> {
 
 #[cfg(target_os = "linux")]
 fn signal_process(pid: u32, signal: libc::c_int) -> libc::c_int {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return -1;
+    };
     // A pidfd remains attached to the process opened here, so PID reuse
     // cannot redirect the signal after the pid-file check.
     let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
@@ -2477,7 +2484,10 @@ fn signal_process(pid: u32, signal: libc::c_int) -> libc::c_int {
 fn signal_process(pid: u32, signal: libc::c_int) -> libc::c_int {
     // pidfd is Linux-specific; retain the existing Unix signal mechanism on
     // platforms without it.
-    unsafe { libc::kill(pid as i32, signal) }
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return -1;
+    };
+    unsafe { libc::kill(pid, signal) }
 }
 
 /// Opens the relay database environment for a short-lived CLI access
@@ -2778,9 +2788,14 @@ fn is_pubkey_or_npub(value: &str) -> bool {
 /// unrelated process is not mistaken for a running relay (which would make
 /// `start` refuse and `stop` signal an innocent process).
 fn process_alive(pid: u32) -> bool {
+    // `pid_t` is signed: a wrapped negative pid would target a process
+    // group (or, at -1, every process) instead of the named one.
+    let Ok(raw_pid) = i32::try_from(pid) else {
+        return false;
+    };
     // SAFETY: signal 0 only probes for the existence of the process.
     let alive = {
-        let ret = unsafe { libc::kill(pid as i32, 0) };
+        let ret = unsafe { libc::kill(raw_pid, 0) };
         ret == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
     };
     if !alive {
@@ -2896,6 +2911,27 @@ mod tests {
     use super::*;
 
     const KEY: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+
+    #[test]
+    fn a_pid_beyond_i32_is_stale() {
+        // `pid_t` is a signed 32-bit value: a pid past i32::MAX wraps
+        // negative, and `kill(-1, 0)` succeeds while any process exists.
+        // The daemon would look alive forever (and `stop` could not signal
+        // the wrapped pid).
+        assert!(
+            !process_alive(u32::MAX),
+            "a wrapped pid must never probe every process"
+        );
+        let dir = std::env::temp_dir().join(format!("nostrfy-pid-of-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("nostrfy.pid");
+        for raw in ["0", "2147483648", "4294967295"] {
+            std::fs::write(&path, raw).unwrap();
+            assert_eq!(running_pid(&path), None, "pid {raw} must be stale");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn upgrade_asset_names_cover_the_release_platforms() {
