@@ -728,8 +728,15 @@ pub(crate) struct Store {
     pub(crate) max_indexed_words: usize,
     /// The limit the existing word index was built with (persisted in
     /// `index_meta`; used by put/remove so they stay symmetric across a
-    /// config change).
-    pub(crate) indexed_words: usize,
+    /// config change). Atomic so the one-time rebuild can apply a changed
+    /// `max_indexed_words` without a restart (writer-only field).
+    pub(crate) indexed_words: std::sync::atomic::AtomicUsize,
+    /// Whether the NIP-50 word index is complete and usable by the scans.
+    /// False while the one-time backfill runs (or after it failed, or when
+    /// the index is disabled): scans then fall back to the time-range walk,
+    /// which matches the terms per event, so a partial index never yields
+    /// silently short search results. Shared with the reader clones.
+    pub(crate) word_index_ready: Arc<std::sync::atomic::AtomicBool>,
     /// Ceiling for the memory map (bytes): the map is opened at this size
     /// and never resized at runtime.
     pub(crate) map_max_size: u64,
@@ -916,7 +923,7 @@ impl Store {
         // leave stale word keys, or clear a marker that the old limit
         // wrote).
         let configured_words = max_indexed_words.max(1);
-        let indexed_words = if by_word.is_some() {
+        let (indexed_words, word_index_ready) = if by_word.is_some() {
             let mut wtxn = env.write_txn()?;
             let value = match index_meta.get(&wtxn, b"word_limit")? {
                 Some(raw) if raw.len() >= 8 => {
@@ -935,13 +942,21 @@ impl Store {
             if value != configured_words {
                 log::warn!(
                     "search.max_indexed_words changed from {value} to {configured_words}; \
-                     the existing word index keeps its original limit (put/remove stay \
-                     symmetric) until the index is rebuilt"
+                     the existing word index will be re-keyed at startup"
                 );
             }
-            value
+            let rtxn = env.read_txn()?;
+            let ready = index_meta.get(&rtxn, b"word_index")?.is_some();
+            (value, ready)
         } else {
-            configured_words
+            // A database running without the index does not index the
+            // events it stores: drop the completion marker so enabling the
+            // index later backfills every event (the earlier entries, if
+            // any, stay and are re-added idempotently).
+            let mut wtxn = env.write_txn()?;
+            index_meta.delete(&mut wtxn, b"word_index")?;
+            wtxn.commit()?;
+            (configured_words, false)
         };
         let tables = if by_word.is_some() { 22 } else { 21 };
         log::info!(
@@ -979,7 +994,8 @@ impl Store {
             expiry_enabled,
             cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             max_indexed_words: max_indexed_words.max(1),
-            indexed_words,
+            indexed_words: std::sync::atomic::AtomicUsize::new(indexed_words),
+            word_index_ready: Arc::new(std::sync::atomic::AtomicBool::new(word_index_ready)),
             map_max_size,
             df_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             #[cfg(test)]
@@ -1106,7 +1122,11 @@ impl Store {
             expiry_enabled: Arc::clone(&self.expiry_enabled),
             cancel: Arc::clone(&self.cancel),
             max_indexed_words: self.max_indexed_words,
-            indexed_words: self.indexed_words,
+            indexed_words: std::sync::atomic::AtomicUsize::new(
+                self.indexed_words
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            word_index_ready: Arc::clone(&self.word_index_ready),
             map_max_size: self.map_max_size,
             df_cache: Arc::clone(&self.df_cache),
             // The fault hooks are shared: a test keeps a clone (arming it
@@ -2072,6 +2092,45 @@ pub(crate) fn word_key(word: &str, created: u64, id: &[u8]) -> Vec<u8> {
     key.extend_from_slice(&created.to_be_bytes());
     key.extend_from_slice(id);
     key
+}
+
+/// Writes the word-index entries of one event: the first `limit` tokens of
+/// its content, plus the overflow marker when the content has more tokens
+/// (or a token too long to key). Shared by the put path and the one-time
+/// rebuild so both derive exactly the same keys.
+pub(crate) fn index_event_words(
+    by_word: &Database<Bytes, Bytes>,
+    wtxn: &mut heed::RwTxn,
+    event: &Event,
+    id: &[u8],
+    limit: usize,
+) -> Result<()> {
+    let words = crate::nips::nip50::tokenize(&event.content);
+    let mut overflow = words.len() > limit;
+    for word in words.iter().take(limit) {
+        let key = word_key(word, event.created_at, id);
+        // Skip rather than error: an over-long word would abort the whole
+        // write batch (see MAX_INDEX_KEY). The skip must force the overflow
+        // marker: such a word can never be found through its own index
+        // range, only through the full-content overflow walk, and without
+        // the marker a query mixing an indexed term with this long term
+        // would miss the event.
+        if key.len() <= MAX_INDEX_KEY {
+            by_word.put(wtxn, &key, b"")?;
+        } else {
+            overflow = true;
+        }
+    }
+    // Long events also carry the overflow marker so the search scan can
+    // check their full content (NIP-50 searches the whole content, but the
+    // index only stores the first N tokens).
+    if overflow {
+        let key = word_key(WORD_OVERFLOW, event.created_at, id);
+        if key.len() <= MAX_INDEX_KEY {
+            by_word.put(wtxn, &key, b"")?;
+        }
+    }
+    Ok(())
 }
 
 /// Sentinel word marking an event whose content has more tokens than
@@ -3042,6 +3101,147 @@ impl Store {
         Ok(indexed)
     }
 
+    /// Whether the NIP-50 word index needs its one-time backfill (marker
+    /// missing: a database that ran with `search_index = false`, or a fresh
+    /// one) or a re-key after `max_indexed_words` changed (the persisted
+    /// limit the existing entries were written with differs from the
+    /// configured one).
+    pub(crate) fn word_index_needs_rebuild(&self) -> Result<bool> {
+        if self.by_word.is_none() {
+            // Disabled: searches use the time-range fallback, and the marker
+            // is dropped on every open (see `open`) so a later enable
+            // backfills.
+            return Ok(false);
+        }
+        let rtxn = self.env.read_txn()?;
+        if self.index_meta.get(&rtxn, b"word_index")?.is_none() {
+            return Ok(true);
+        }
+        let persisted = match self.index_meta.get(&rtxn, b"word_limit")? {
+            Some(raw) if raw.len() >= 8 => {
+                u64::from_be_bytes(raw[..8].try_into().unwrap()) as usize
+            }
+            _ => 0,
+        };
+        Ok(persisted != self.max_indexed_words.max(1))
+    }
+
+    /// Rebuilds the word index from the stored events (chunked read/write
+    /// like the sibling rebuilds) and writes the completion marker last.
+    /// Existing entries are cleared first only when the persisted limit
+    /// differs from the configured one: the old keys would never be removed
+    /// by the new put/remove rules, so a limit change re-keys the index.
+    /// `word_index_ready` stays false until the marker commit, so scans fall
+    /// back to the time-range walk instead of reading a partial index.
+    pub(crate) fn rebuild_word_index(&self) -> Result<usize> {
+        const CHUNK: usize = 4096;
+        let Some(by_word) = self.by_word else {
+            return Ok(0);
+        };
+        self.disk_full_error()?;
+        self.word_index_ready
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        let limit = self.max_indexed_words.max(1);
+        let persisted = {
+            let rtxn = self.env.read_txn()?;
+            match self.index_meta.get(&rtxn, b"word_limit")? {
+                Some(raw) if raw.len() >= 8 => {
+                    u64::from_be_bytes(raw[..8].try_into().unwrap()) as usize
+                }
+                _ => 0,
+            }
+        };
+        if persisted != limit {
+            // Clear in bounded chunks: a huge index must not pin one
+            // unbounded write transaction.
+            let mut last: Option<Vec<u8>> = None;
+            loop {
+                let chunk: Vec<Vec<u8>> = {
+                    let rtxn = self.env.read_txn()?;
+                    let range = (
+                        last.as_deref()
+                            .map(std::ops::Bound::Excluded)
+                            .unwrap_or(std::ops::Bound::Unbounded),
+                        std::ops::Bound::Unbounded,
+                    );
+                    let mut out = Vec::with_capacity(CHUNK);
+                    for item in by_word.range(&rtxn, &range)? {
+                        let (key, _) = item?;
+                        out.push(key.to_vec());
+                        if out.len() >= CHUNK {
+                            break;
+                        }
+                    }
+                    out
+                };
+                if chunk.is_empty() {
+                    break;
+                }
+                let mut wtxn = self.env.write_txn()?;
+                for key in &chunk {
+                    by_word.delete(&mut wtxn, key)?;
+                }
+                wtxn.commit()?;
+                last = chunk.last().cloned();
+                if chunk.len() < CHUNK {
+                    break;
+                }
+            }
+        }
+        // Re-index every stored event in bounded chunks.
+        let mut indexed = 0usize;
+        let mut last: Option<Vec<u8>> = None;
+        loop {
+            let chunk: Vec<(Vec<u8>, Option<Event>)> = {
+                let rtxn = self.env.read_txn()?;
+                let range = (
+                    last.as_deref()
+                        .map(std::ops::Bound::Excluded)
+                        .unwrap_or(std::ops::Bound::Unbounded),
+                    std::ops::Bound::Unbounded,
+                );
+                let mut out = Vec::with_capacity(CHUNK);
+                for item in self.events.range(&rtxn, &range)? {
+                    let (id, raw) = item?;
+                    // A corrupt row is skipped (nothing to index) but still
+                    // advances the cursor, so the rebuild terminates.
+                    out.push((id.to_vec(), serde_json::from_slice::<Event>(raw).ok()));
+                    if out.len() >= CHUNK {
+                        break;
+                    }
+                }
+                out
+            };
+            if chunk.is_empty() {
+                break;
+            }
+            last = chunk.last().map(|(id, _)| id.clone());
+            let mut wtxn = self.env.write_txn()?;
+            for (id, event) in &chunk {
+                let Some(event) = event else { continue };
+                index_event_words(&by_word, &mut wtxn, event, id, limit)?;
+                indexed += 1;
+            }
+            wtxn.commit()?;
+            if chunk.len() < CHUNK {
+                break;
+            }
+        }
+        // The limit and the completion marker are written last: a crash
+        // mid-rebuild leaves the marker absent, so the next startup reruns
+        // the idempotent backfill.
+        let mut wtxn = self.env.write_txn()?;
+        self.index_meta
+            .put(&mut wtxn, b"word_limit", &(limit as u64).to_be_bytes())?;
+        self.index_meta.put(&mut wtxn, b"word_index", b"1")?;
+        wtxn.commit()?;
+        self.indexed_words
+            .store(limit, std::sync::atomic::Ordering::Relaxed);
+        self.word_index_ready
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        Ok(indexed)
+    }
+
     fn put_indexes(
         &self,
         wtxn: &mut heed::RwTxn,
@@ -3104,31 +3304,10 @@ impl Store {
             self.expiry.put(wtxn, &created_key(exp, id), b"")?;
         }
         if let Some(by_word) = self.by_word {
-            let words = nip50::tokenize(&event.content);
-            let mut overflow = words.len() > self.indexed_words;
-            for word in words.iter().take(self.indexed_words) {
-                let key = word_key(word, created, id);
-                // Skip rather than error: an over-long word would abort the
-                // whole write batch (see MAX_INDEX_KEY). The skip must
-                // force the overflow marker: such a word can never be found
-                // through its own index range, only through the full-content
-                // overflow walk, and without the marker a query mixing an
-                // indexed term with this long term would miss the event.
-                if key.len() <= MAX_INDEX_KEY {
-                    by_word.put(wtxn, &key, b"")?;
-                } else {
-                    overflow = true;
-                }
-            }
-            // Long events also carry the overflow marker so the search scan
-            // can check their full content (NIP-50 searches the whole
-            // content, but the index only stores the first N tokens).
-            if overflow {
-                let key = word_key(WORD_OVERFLOW, created, id);
-                if key.len() <= MAX_INDEX_KEY {
-                    by_word.put(wtxn, &key, b"")?;
-                }
-            }
+            let limit = self
+                .indexed_words
+                .load(std::sync::atomic::Ordering::Relaxed);
+            index_event_words(&by_word, wtxn, event, id, limit)?;
         }
         Ok(())
     }
@@ -3220,9 +3399,12 @@ impl Store {
             self.expiry.delete(wtxn, &created_key(exp, id))?;
         }
         if let Some(by_word) = self.by_word {
+            let limit = self
+                .indexed_words
+                .load(std::sync::atomic::Ordering::Relaxed);
             let words = nip50::tokenize(&event.content);
-            let mut overflow = words.len() > self.indexed_words;
-            for word in words.iter().take(self.indexed_words) {
+            let mut overflow = words.len() > limit;
+            for word in words.iter().take(limit) {
                 // Mirror the put path for the same reason as tags above
                 // (including the overflow-marker rule for over-long words:
                 // `delete` on a key that was never written is a no-op).

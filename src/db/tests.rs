@@ -4097,6 +4097,193 @@ fn a_common_search_term_makes_the_page_incomplete() {
 }
 
 #[test]
+fn word_index_backfills_events_stored_while_disabled() {
+    // A database that ran with `search_index = false` has the events but no
+    // word entries. Enabling the index must backfill them at startup; the
+    // completion marker makes it one-time, and readiness stays false (the
+    // scans fall back to the per-event match) until the rebuild finishes.
+    let mut cfg = config();
+    let expiry = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let now = unix_now();
+    let first = event(1, "needle one", now, vec![]);
+    let second = event(1, "needle two", now + 1, vec![]);
+    cfg.search_index = false;
+    {
+        let store = crate::db::store::Store::open(&cfg, Arc::clone(&expiry), 128).unwrap();
+        assert!(
+            store.by_word.is_none(),
+            "no word index in the legacy database"
+        );
+        let mut wtxn = store.env.write_txn().unwrap();
+        for ev in [&first, &second] {
+            let id = ev.id_bytes().unwrap();
+            store
+                .events
+                .put(&mut wtxn, &id, &serde_json::to_vec(ev).unwrap())
+                .unwrap();
+        }
+        wtxn.commit().unwrap();
+    }
+    cfg.search_index = true;
+    let store = crate::db::store::Store::open(&cfg, expiry, 128).unwrap();
+    assert!(store.by_word.is_some());
+    assert!(
+        !store
+            .word_index_ready
+            .load(std::sync::atomic::Ordering::Relaxed),
+        "an unbuilt index must not be used by scans"
+    );
+    assert!(store.word_index_needs_rebuild().unwrap());
+    assert_eq!(store.rebuild_word_index().unwrap(), 2);
+    assert!(!store.word_index_needs_rebuild().unwrap());
+    assert!(
+        store
+            .word_index_ready
+            .load(std::sync::atomic::Ordering::Relaxed),
+        "the completion marker enables the index"
+    );
+    let rtxn = store.env.read_txn().unwrap();
+    let by_word = store.by_word.unwrap();
+    for ev in [&first, &second] {
+        let id = ev.id_bytes().unwrap();
+        let key = crate::db::store::word_key("needle", ev.created_at, &id);
+        assert!(
+            by_word.get(&rtxn, &key).unwrap().is_some(),
+            "the backfill must index every stored event"
+        );
+    }
+}
+
+#[test]
+fn word_index_rekeys_after_a_limit_change() {
+    // The persisted limit keeps put/remove symmetric; a config change must
+    // therefore re-key the whole index, or the old keys would never be
+    // removed. The rebuild clears the stale entries and applies the new
+    // limit.
+    let cfg = config();
+    let expiry = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let now = unix_now();
+    let ev = event(1, "alpha beta gamma delta", now, vec![]);
+    let id = ev.id_bytes().unwrap();
+    {
+        let store = crate::db::store::Store::open(&cfg, Arc::clone(&expiry), 2).unwrap();
+        let mut wtxn = store.env.write_txn().unwrap();
+        store
+            .events
+            .put(&mut wtxn, &id, &serde_json::to_vec(&ev).unwrap())
+            .unwrap();
+        wtxn.commit().unwrap();
+        assert_eq!(store.rebuild_word_index().unwrap(), 1);
+        let rtxn = store.env.read_txn().unwrap();
+        let by_word = store.by_word.unwrap();
+        let indexed = |word: &str| {
+            by_word
+                .get(&rtxn, &crate::db::store::word_key(word, ev.created_at, &id))
+                .unwrap()
+                .is_some()
+        };
+        assert!(indexed("beta"));
+        assert!(
+            !indexed("gamma"),
+            "a word past the old limit is not indexed"
+        );
+    }
+    // Reopen with a larger limit: the persisted key set is stale.
+    let store = crate::db::store::Store::open(&cfg, expiry, 4).unwrap();
+    assert!(
+        store.word_index_needs_rebuild().unwrap(),
+        "a changed limit needs a re-key"
+    );
+    assert_eq!(store.rebuild_word_index().unwrap(), 1);
+    assert!(!store.word_index_needs_rebuild().unwrap());
+    let rtxn = store.env.read_txn().unwrap();
+    let by_word = store.by_word.unwrap();
+    for word in ["alpha", "beta", "gamma", "delta"] {
+        assert!(
+            by_word
+                .get(&rtxn, &crate::db::store::word_key(word, ev.created_at, &id))
+                .unwrap()
+                .is_some(),
+            "the re-key must index {word} with the new limit"
+        );
+    }
+}
+
+#[test]
+fn enabling_the_search_index_backfills_at_startup() {
+    // End-to-end for the startup wiring: events stored while the index was
+    // disabled must become searchable after a restart with the index on
+    // (before this fix the fresh by_word table stayed empty forever and
+    // reads claimed completeness with `more = false`).
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let mut cfg = config();
+        cfg.search_index = false;
+        let now = unix_now();
+        {
+            let db = DbClient::open(
+                &cfg,
+                true,
+                Arc::new(Default::default()),
+                0,
+                128,
+                4096,
+                262144,
+            )
+            .unwrap();
+            for i in 0..3u64 {
+                let e = event(1, &format!("needle {i}"), now, vec![]);
+                assert_eq!(db.put(e, now).await, PutOutcome::Stored);
+            }
+            let f: Filter =
+                serde_json::from_value(serde_json::json!({"search": "needle"})).unwrap();
+            let (res, _) = db.query(vec![f], 10, now).await;
+            assert_eq!(res.len(), 3, "the index-less fallback already matches");
+            db.shutdown();
+        }
+        cfg.search_index = true;
+        let db = DbClient::open(
+            &cfg,
+            true,
+            Arc::new(Default::default()),
+            0,
+            128,
+            4096,
+            262144,
+        )
+        .unwrap();
+        // The writer runs the startup backfill before draining messages:
+        // awaiting one put is the completion barrier.
+        assert_eq!(
+            db.put(event(1, "barrier", now, vec![]), now).await,
+            PutOutcome::Stored
+        );
+        let f: Filter = serde_json::from_value(serde_json::json!({"search": "needle"})).unwrap();
+        let (res, more) = db.query(vec![f], 10, now).await;
+        assert_eq!(
+            res.len(),
+            3,
+            "the startup backfill must index the pre-existing events"
+        );
+        assert!(!more);
+        db.shutdown();
+        // The completion marker persists: a reopen does not rebuild.
+        let store = crate::db::store::Store::open(
+            &cfg,
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            128,
+        )
+        .unwrap();
+        assert!(!store.word_index_needs_rebuild().unwrap());
+        assert!(
+            store
+                .word_index_ready
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+    });
+}
+
+#[test]
 fn search_index_walk_respects_time_bounds() {
     // The word-index walk must honour `since`/`until` like the pubkey/kind
     // walks: without the range bounds the walk starts at the newest entry

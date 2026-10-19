@@ -1207,7 +1207,15 @@ impl Store {
             // `key:value` extensions (NIP-50: unsupported extensions are
             // ignored); such a query matches everything, like an empty
             // search would.
-            if let Some(by_word) = self.by_word {
+            // While the one-time backfill runs (or after it failed) the
+            // index can be partial: fall through to the time-range scan
+            // below, which matches the terms per event, so a partial index
+            // never yields silently short search results.
+            if let Some(by_word) = self.by_word
+                && self
+                    .word_index_ready
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            {
                 // A common term (df reaching the sampling cap) is dropped
                 // from the index walk: its range is the flood source that
                 // turns a one-word query into a seconds-long scan. The

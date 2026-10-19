@@ -828,6 +828,22 @@ pub(crate) fn spawn(
             Ok(false) => {}
             Err(e) => db_error(&thread_errors, &e),
         }
+        // One-time backfill of the NIP-50 word index: a database that ran
+        // with `search_index = false` has the events but no word entries,
+        // and a `max_indexed_words` change needs re-keying. The rebuild runs
+        // on the writer thread before any put (like the meta/Blossom
+        // backfills), so nothing is stored while the index is rewritten.
+        // Searches fall back to the time-range walk until the completion
+        // marker is written (see `Store::word_index_ready`), so a partial
+        // index never looks like a complete result set.
+        match store.word_index_needs_rebuild() {
+            Ok(true) => match store.rebuild_word_index() {
+                Ok(n) => log::info!("word index rebuilt ({n} events)"),
+                Err(e) => db_error(&thread_errors, &e),
+            },
+            Ok(false) => {}
+            Err(e) => db_error(&thread_errors, &e),
+        }
         // Puts are applied in batches sharing one write transaction so
         // that the LMDB commit cost (a full fsync by default) is paid
         // once per batch instead of once per event. Replies are only
