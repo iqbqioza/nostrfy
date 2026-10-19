@@ -613,11 +613,19 @@ impl super::Conn {
         // response empty while matching events exist. One drop is enough
         // for progress: the client's cursor is the oldest event received,
         // and its next request drops that block and serves the one after.
+        //
+        // A response without `unplaced` is never dropped: a pure-search
+        // REQ discards its excess inside the scan (relevance ordering has
+        // no `created_at` cursor to advance through), so dropping its full
+        // same-second page would answer with nothing while matching events
+        // exist. The tie block is delivered whole instead, and the `more`
+        // hint still reports the discarded excess.
         let page_capacity = limits.iter().copied().min().unwrap_or(0);
         let mut tie_truncated = false;
         if (more || truncated)
             && kept.len() >= page_capacity
             && !kept.is_empty()
+            && !unplaced.is_empty()
             && kept
                 .iter()
                 .all(|event| event.created_at == kept[0].created_at)
@@ -625,19 +633,12 @@ impl super::Conn {
             // Drop the boundary second (all of `kept`) and give the
             // over-fetched older events a fresh attribution.
             let (next, next_unplaced) = attribute_visible_page(&mut unplaced, &stored, &limits);
-            if next.is_empty() {
-                // The scan collected only the boundary second: its tie
-                // block hit the collection bound (a flood sharing one
-                // timestamp). There is no reserve to serve, and a partial
-                // tie must not be delivered: the block is dropped and the
-                // client proceeds from `T - 1` on the next request.
-                kept.clear();
-            } else {
+            if !next.is_empty() {
                 kept = next;
                 unplaced = next_unplaced;
                 truncated = !unplaced.is_empty();
+                tie_truncated = true;
             }
-            tie_truncated = true;
         }
         to_send = kept;
         // Bound the memory this response pins while it waits for the

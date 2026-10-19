@@ -5870,6 +5870,43 @@ mod tests {
     }
 
     #[test]
+    fn search_same_second_page_is_delivered_instead_of_dropped_empty() {
+        // A pure-search REQ discards its excess inside the scan (relevance
+        // ordering has no created_at cursor to advance through), so the
+        // same-second guard has no reserve to serve: dropping the full
+        // same-second page would answer with nothing while matching events
+        // exist. The page must be delivered whole, with the `more` hint.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let now = unix_now();
+            for i in 0..5 {
+                let ev = signed_note(conn.relay.secp(), &format!("topic {i}"), now, vec![]);
+                conn.relay.db.put(ev, now).await;
+            }
+            conn.handle_req(&[json!("sub"), json!({"search": "topic", "limit": 3})])
+                .await;
+            conn.pump_pending_reqs();
+            let msgs = outgoing_json(&conn);
+            let delivered = msgs
+                .iter()
+                .filter(|m| m[0] == "EVENT" && m[1] == "sub")
+                .count();
+            assert_eq!(
+                delivered, 3,
+                "the relevance page must not be dropped because every hit shares one second: \
+                 {msgs:?}"
+            );
+            assert!(
+                msgs.iter()
+                    .any(|m| m[0] == "EOSE" && m[1] == "sub" && m[2] == json!(["more"])),
+                "the discarded excess must keep the more hint: {msgs:?}"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
     fn req_response_chunks_through_the_outgoing_byte_cap() {
         // Backpressure: REQ responses are pumped through the capped
         // outgoing queue in bounded chunks — the queue never holds more
