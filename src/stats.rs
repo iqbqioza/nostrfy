@@ -7,9 +7,25 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::util::unix_now;
 
+/// Monotonic process start for [`Stats::uptime_secs`]. `Instant` is immune
+/// to wall-clock steps (NTP corrections, manual clock changes); the Unix
+/// `started_at` timestamp stays for display and for the CLI's staleness
+/// checks.
+#[derive(Debug, Clone, Copy)]
+struct MonotonicStart(std::time::Instant);
+
+impl Default for MonotonicStart {
+    fn default() -> Self {
+        Self(std::time::Instant::now())
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct Stats {
     pub started_at: AtomicU64,
+    /// Monotonic start; `uptime_secs` is derived from it, never from a
+    /// wall-clock subtraction.
+    started: MonotonicStart,
     pub connections_total: AtomicU64,
     pub connections_active: AtomicU64,
     pub subscriptions_total: AtomicU64,
@@ -137,6 +153,13 @@ impl Stats {
         Arc::new(stats)
     }
 
+    /// Seconds since the process started, measured on the monotonic clock:
+    /// a wall-clock step must not move the gauge (the `started_at` Unix
+    /// timestamp is display metadata, not the uptime source).
+    pub fn uptime_secs(&self) -> u64 {
+        self.started.0.elapsed().as_secs()
+    }
+
     pub fn bump(&self, counter: &AtomicU64, delta: u64) {
         // Saturate instead of wrapping: a counter that wrapped to a small
         // value would make the metrics lie. The load is relaxed and the
@@ -189,7 +212,7 @@ impl Stats {
             // lack it.
             "written_at": unix_now(),
             "started_at": self.started_at.load(Ordering::Relaxed),
-            "uptime_secs": unix_now().saturating_sub(self.started_at.load(Ordering::Relaxed)),
+            "uptime_secs": self.uptime_secs(),
             "connections": {
                 "active": self.connections_active.load(Ordering::Relaxed),
                 "total": self.connections_total.load(Ordering::Relaxed),
@@ -290,7 +313,7 @@ impl Stats {
             "nostrfy_uptime_seconds",
             "Seconds since the relay started.",
             "gauge",
-            unix_now().saturating_sub(self.started_at.load(Ordering::Relaxed)),
+            self.uptime_secs(),
         );
         metric(
             "nostrfy_connections_active",
@@ -581,6 +604,31 @@ impl Stats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uptime_comes_from_the_monotonic_clock() {
+        // A wall-clock step must not move the gauge: uptime is derived from
+        // `Instant`, not from `unix_now() - started_at`. Backdate the
+        // recorded wall start (as a clock correction would) and the
+        // monotonic elapsed time stays authoritative.
+        let mut stats = Stats::default();
+        let wall_start = unix_now().saturating_sub(3_600);
+        stats.started_at.store(wall_start, Ordering::Relaxed);
+        stats.started =
+            MonotonicStart(std::time::Instant::now() - std::time::Duration::from_secs(42));
+        assert_eq!(stats.uptime_secs(), 42);
+        let json = stats.as_json();
+        assert_eq!(
+            json.get("uptime_secs").and_then(Value::as_u64),
+            Some(42),
+            "the snapshot must use the monotonic uptime"
+        );
+        assert_eq!(
+            json.get("started_at").and_then(Value::as_u64),
+            Some(wall_start),
+            "the Unix start stays for display"
+        );
+    }
 
     #[test]
     fn json_snapshot_carries_a_written_at_marker() {
