@@ -1246,6 +1246,164 @@ fn live_absent_target_deleters_never_promote_to_an_unconditional_block() {
 }
 
 #[test]
+fn a_wrap_only_deletion_leaves_a_pending_record_for_the_resume() {
+    // A deletion with no e/a tags still walks (and can be interrupted in)
+    // the requester's gift-wrap purge: it used to be treated as "nothing to
+    // do" and wrote no pending record, so a cancellation lost the purge.
+    use crate::db::store::Store;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    let store = Store::open(&config(), Arc::new(AtomicBool::new(true)), 512).unwrap();
+    // The wrap walk refuses to run without its index marker; build it so
+    // the cancellation check is reached.
+    assert_eq!(store.rebuild_gift_wrap_index().unwrap(), 0);
+    store.cancel.store(true, Ordering::Relaxed);
+    let author = "aa".repeat(32);
+    let report = store.apply_deletion_group(&[], &[], Some(&author), 1_000, None, true);
+    assert!(!report.is_clean(), "the cancelled wrap walk must fail");
+    assert_eq!(
+        store.pending_deletions().unwrap().len(),
+        1,
+        "a wrap-only walk must leave the startup resume record"
+    );
+    // Clearing the cancellation lets the resume finish and clear it.
+    store.cancel.store(false, Ordering::Relaxed);
+    let errors = Arc::new(AtomicU64::new(0));
+    let (completed, _) = store.resume_pending_deletions(&errors);
+    assert_eq!(completed, 1, "the pending wrap walk must resume");
+    assert_eq!(errors.load(Ordering::Relaxed), 0);
+    assert!(store.pending_deletions().unwrap().is_empty());
+}
+
+#[test]
+fn a_deletion_request_is_not_blocked_by_its_own_absent_marker() {
+    // NIP-09: "Deleting a deletion request has no effect." An absent-target
+    // marker naming a kind:5 event's id (a delayed/re-broadcast request)
+    // must not reject the request itself; a normal event stays blocked.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let author = "00".repeat(32);
+        let deletion = event(5, "", now, vec![]);
+        assert_eq!(
+            db.apply_deletion(vec![deletion.id.clone()], vec![], Some(author.clone()), now)
+                .await,
+            0,
+            "the request itself is not held yet"
+        );
+        assert_eq!(
+            db.put(deletion, now).await,
+            PutOutcome::Stored,
+            "a deletion request must not be blocked by a marker for its id"
+        );
+        // The exception is kind-specific: a plain event under the same
+        // author-scoped marker is still refused.
+        let note = event(1, "note", now, vec![]);
+        assert_eq!(
+            db.apply_deletion(vec![note.id.clone()], vec![], Some(author), now)
+                .await,
+            0
+        );
+        assert_eq!(db.put(note, now).await, PutOutcome::PreviouslyDeleted);
+    });
+    db.shutdown();
+}
+
+#[test]
+fn a_corrupt_pending_deletion_key_does_not_abort_the_resume() {
+    // One non-32-byte key (bitrot/hand edit) must not stop the startup
+    // resume of the healthy pending deletions.
+    use crate::db::store::{Store, encode_pending_deletion, pending_deletion_key};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    let store = Store::open(&config(), Arc::new(AtomicBool::new(true)), 512).unwrap();
+    let target = "ab".repeat(32);
+    let author = "aa".repeat(32);
+    let encoded = encode_pending_deletion(
+        std::slice::from_ref(&target),
+        &[],
+        Some(&author),
+        1_000,
+        None,
+        false,
+    );
+    let key = pending_deletion_key(&encoded);
+    let mut wtxn = store.env.write_txn().unwrap();
+    store.delete_pending.put(&mut wtxn, &key, &encoded).unwrap();
+    store
+        .delete_pending
+        .put(&mut wtxn, b"short", b"junk")
+        .unwrap();
+    wtxn.commit().unwrap();
+    let errors = Arc::new(AtomicU64::new(0));
+    let (completed, _) = store.resume_pending_deletions(&errors);
+    assert_eq!(
+        errors.load(Ordering::Relaxed),
+        0,
+        "a corrupt key is skipped, not a database fault"
+    );
+    assert_eq!(completed, 1, "the healthy record must still resume");
+    assert!(store.pending_deletions().unwrap().is_empty());
+}
+
+#[test]
+fn access_and_allowlist_messages_count_towards_the_queue_byte_cap() {
+    // Access mutations carry the whole access blob / pubkey lists; counting
+    // them as zero let a queue of them bypass `max_db_queue_bytes`.
+    use crate::config::AccessControl;
+
+    let mut access = AccessControl::default();
+    access.blocked_pubkeys.push(("a".repeat(64), "why".into()));
+    access.allowed_pubkeys.push(("b".repeat(64), String::new()));
+    access.blocked_kinds = vec![1, 2, 3, 4];
+    access
+        .method_grants
+        .insert("c".repeat(64), vec!["listbannedpubkeys".into()]);
+    let expected = access.heap_bytes();
+    assert!(expected > 2 * 64 + 4 * 8, "the estimate covers the lists");
+    let (reply, _rx) = tokio::sync::oneshot::channel();
+    assert_eq!(
+        super::msg_bytes(&super::Msg::SaveAccess { access, reply }),
+        expected
+    );
+    let (reply, _rx) = tokio::sync::oneshot::channel();
+    assert_eq!(
+        super::msg_bytes(&super::Msg::Ban {
+            id: vec![1; 32],
+            reason: "because".into(),
+            reply,
+        }),
+        32 + 7
+    );
+    let (reply, _rx) = tokio::sync::oneshot::channel();
+    assert_eq!(
+        super::msg_bytes(&super::Msg::SaveBlossomAllow {
+            entries: vec!["x".repeat(64)],
+            reply,
+        }),
+        64
+    );
+    let (reply, _rx) = tokio::sync::oneshot::channel();
+    assert!(
+        super::msg_bytes(&super::Msg::SaveRelayPubkeys {
+            deny: vec![("a".repeat(64), "r".into())],
+            allow: vec![("b".repeat(64), String::new())],
+            reply,
+        }) >= 128
+    );
+}
+
+#[test]
 fn is_replaceable() {
     assert!(super::store::is_replaceable(&event(10000, "", 1, vec![])));
     assert!(super::store::is_replaceable(&event(30023, "", 1, vec![])));

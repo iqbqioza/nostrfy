@@ -2266,6 +2266,34 @@ where
 }
 
 impl AccessControl {
+    /// Rough heap size of the access state, for the database queue's byte
+    /// cap (see `db::msg_bytes`). An estimate is enough: the cap only has
+    /// to bound the queue.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        let pubkeys = |list: &[(String, String)]| {
+            list.iter()
+                .map(|(pubkey, reason)| pubkey.len() + reason.len())
+                .sum::<usize>()
+        };
+        let ips = self
+            .blocked_ips
+            .entries
+            .iter()
+            .map(|(ip, reason)| ip.len() + reason.len())
+            .sum::<usize>();
+        let grants = self
+            .method_grants
+            .iter()
+            .map(|(pubkey, methods)| pubkey.len() + methods.iter().map(String::len).sum::<usize>())
+            .sum::<usize>();
+        pubkeys(&self.blocked_pubkeys)
+            + pubkeys(&self.allowed_pubkeys)
+            + self.blocked_kinds.len() * std::mem::size_of::<u64>()
+            + self.allowed_kinds.len() * std::mem::size_of::<u64>()
+            + ips
+            + grants
+    }
+
     pub fn allows_pubkey(&self, pubkey: &str) -> bool {
         // A denied pubkey is always rejected — even when restrict_relay
         // is off (the default: everyone else may publish). The comparison

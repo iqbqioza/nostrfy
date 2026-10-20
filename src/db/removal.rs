@@ -387,8 +387,9 @@ impl Store {
             return Ok(());
         }
         // Record the request before the first removal chunk. A request with
-        // nothing to walk (no tags) cannot be interrupted, so it writes no
-        // record that would need clearing.
+        // only a wrap purge is a chunked walk too (it can hit a cancellation
+        // or a store error), so it must leave the pending record like the
+        // `e`/`a` walks; a request with nothing at all to walk writes none.
         let pending_encoded = encode_pending_deletion(
             targets,
             addresses,
@@ -398,7 +399,7 @@ impl Store {
             purge_wraps,
         );
         let pending_key = pending_deletion_key(&pending_encoded);
-        let has_work = !targets.is_empty() || !addresses.is_empty();
+        let has_work = !targets.is_empty() || !addresses.is_empty() || purge_wraps;
         if has_work {
             self.put_pending_deletion(&pending_key, &pending_encoded)?;
         }

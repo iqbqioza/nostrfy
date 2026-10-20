@@ -1900,9 +1900,19 @@ impl Store {
             let (key, raw) = item?;
             match decode_pending_deletion(raw) {
                 Some(request) => {
-                    let key: [u8; 32] = key
-                        .try_into()
-                        .map_err(|_| anyhow::anyhow!("pending deletion key is not 32 bytes"))?;
+                    let key: [u8; 32] = match key.try_into() {
+                        Ok(key) => key,
+                        Err(_) => {
+                            // A corrupt key (bitrot/hand edit) cannot be
+                            // cleared by the resume; skip it instead of
+                            // aborting the healthy records' resume.
+                            log::warn!(
+                                "skipping corrupt pending deletion key ({} bytes)",
+                                key.len()
+                            );
+                            continue;
+                        }
+                    };
                     out.push((key, request));
                 }
                 None => log::warn!(
@@ -2772,10 +2782,15 @@ impl Store {
         if self.banned.get(wtxn, &id)?.is_some() {
             return Ok(PutOutcome::Invalid("blocked: event has been banned".into()));
         }
-        if self
-            .deleted
-            .get(wtxn, &id)?
-            .is_some_and(|marker| deletion_marker_blocks(marker, event))
+        // NIP-09: "Deleting a deletion request has no effect." A marker
+        // recorded for an absent target may name a kind:5 event that arrives
+        // later (a delayed/re-broadcast request); the request itself must be
+        // accepted, not reported as previously deleted.
+        if event.kind != crate::nips::nip09::DELETION_KIND
+            && self
+                .deleted
+                .get(wtxn, &id)?
+                .is_some_and(|marker| deletion_marker_blocks(marker, event))
         {
             return Ok(PutOutcome::PreviouslyDeleted);
         }

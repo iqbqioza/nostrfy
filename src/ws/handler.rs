@@ -595,7 +595,13 @@ impl super::Conn {
         // report `more`. That is conservative on purpose: it prompts the
         // client to authenticate (see the `auth` hint) instead of wrongly
         // claiming completeness.
-        let (mut kept, mut unplaced) = attribute_visible_page(&mut to_send, &stored, &limits);
+        // A pure-search response is relevance-ordered: its per-filter
+        // limits are a top-N cut, not a created_at cursor, so the boundary
+        // tie continuation (which may return more than the limit) does not
+        // apply to it.
+        let search_ordered = !stored.is_empty() && stored.iter().all(Filter::has_search);
+        let (mut kept, mut unplaced) =
+            attribute_visible_page(&mut to_send, &stored, &limits, !search_ordered);
         let mut truncated = !unplaced.is_empty();
         // Same-second pagination guard: when the page is incomplete and
         // every kept event shares one `created_at`, the scan ended at (or
@@ -627,7 +633,8 @@ impl super::Conn {
         // hint still reports the discarded excess.
         let page_capacity = limits.iter().copied().min().unwrap_or(0);
         let mut tie_truncated = false;
-        if (more || truncated)
+        if !search_ordered
+            && (more || truncated)
             && kept.len() >= page_capacity
             && !kept.is_empty()
             && !unplaced.is_empty()
@@ -637,7 +644,8 @@ impl super::Conn {
         {
             // Drop the boundary second (all of `kept`) and give the
             // over-fetched older events a fresh attribution.
-            let (next, next_unplaced) = attribute_visible_page(&mut unplaced, &stored, &limits);
+            let (next, next_unplaced) =
+                attribute_visible_page(&mut unplaced, &stored, &limits, true);
             if !next.is_empty() {
                 kept = next;
                 unplaced = next_unplaced;
@@ -1441,9 +1449,12 @@ impl super::Conn {
 /// event (the same rule the scan's search path applies), so a filter that
 /// matched many events cannot starve a later filter. Events at the
 /// boundary timestamp of a filter whose quota is already exhausted still
-/// belong to that filter's page (NIP-01/NIP-67: a page never splits a
-/// created_at tie), exactly like the scan's per-filter boundary
-/// continuation. Returns the kept events and the unplaced ones: a
+/// belong to that filter's page when `allow_boundary_ties` is set
+/// (NIP-01/NIP-67: a page never splits a created_at tie), exactly like the
+/// scan's per-filter boundary continuation. Relevance-ordered (pure-search)
+/// pages pass `false`: their limit is a top-N cut, and over-returning the
+/// tie block would both break the limit and starve the visibility slack.
+/// Returns the kept events and the unplaced ones: a
 /// non-empty unplaced set is the caller's `more` completeness hint, and
 /// the events themselves are re-attributed after the caller drops a
 /// boundary second. Drains `events` (order preserved).
@@ -1451,6 +1462,7 @@ fn attribute_visible_page(
     events: &mut Vec<Event>,
     filters: &[Filter],
     limits: &[usize],
+    allow_boundary_ties: bool,
 ) -> (Vec<Event>, Vec<Event>) {
     let mut remaining = limits.to_vec();
     let mut boundaries: Vec<Option<u64>> = vec![None; remaining.len()];
@@ -1471,7 +1483,7 @@ fn attribute_visible_page(
                 break;
             }
         }
-        if !placed {
+        if !placed && allow_boundary_ties {
             placed = filters.iter().enumerate().any(|(i, filter)| {
                 boundaries[i] == Some(event.created_at) && filter.matches(&event)
             });

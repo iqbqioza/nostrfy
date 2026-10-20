@@ -939,6 +939,32 @@ fn msg_bytes(msg: &Msg) -> usize {
             .saturating_add(request_pubkey.as_deref().map_or(0, str::len))
             .saturating_add(group.as_deref().map_or(0, str::len)),
         Msg::RecordAbsentDeletionTargets { targets, .. } => targets.iter().map(String::len).sum(),
+        // NIP-86 access/allowlist mutations carry pubkey lists, reasons and
+        // the whole access blob: counting them as zero let a queue of large
+        // access updates bypass `max_db_queue_bytes` entirely.
+        Msg::Ban { id, reason, .. } | Msg::Allow { id, reason, .. } => id.len() + reason.len(),
+        Msg::Unban { id, .. } | Msg::Unallow { id, .. } => id.len(),
+        Msg::SaveAccess { access, .. } => access.heap_bytes(),
+        Msg::SaveAccessAndPubkeys {
+            access,
+            deny,
+            allow,
+            ..
+        } => {
+            access.heap_bytes()
+                + deny
+                    .iter()
+                    .chain(allow.iter())
+                    .map(|(pubkey, reason)| pubkey.len() + reason.len())
+                    .sum::<usize>()
+        }
+        Msg::SaveRelayPubkeys { deny, allow, .. } => deny
+            .iter()
+            .chain(allow.iter())
+            .map(|(pubkey, reason)| pubkey.len() + reason.len())
+            .sum(),
+        Msg::SaveBlossomAllow { entries, .. } => entries.iter().map(String::len).sum(),
+        Msg::Vanish { pubkey, .. } | Msg::GiftWrapPurge { pubkey, .. } => pubkey.len(),
         _ => 0,
     }
 }
@@ -2991,9 +3017,11 @@ impl DbClient {
             let _ = tx.send(Msg::Shutdown);
         }
         let _ = self.api_read_tx.send(Msg::Shutdown);
-        // Join the threads so the final flush and the shutdown sync finish
-        // before the process exits (messages queued behind `Shutdown` used
-        // to be dropped without a reply).
+        // Join the threads so the in-flight drain and the final flush/sync
+        // finish before the process exits. The writer returns as soon as it
+        // handles `Shutdown`: messages queued behind it are dropped without
+        // a reply (their callers see the failed request), so this join does
+        // not drain the rest of the queue.
         let handles = std::mem::take(
             &mut *self
                 .threads

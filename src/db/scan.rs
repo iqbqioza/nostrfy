@@ -188,10 +188,18 @@ trait ScanCollector {
     fn truncate_to(&mut self, take: usize);
     /// Applies per-filter limits after a relevance sort: drains the
     /// relevance-ordered events, attributing each to the first filter with
-    /// remaining quota that matches it. Returns whether any event was
-    /// dropped (caller reports `more`). The default keeps everything.
-    fn apply_search_limits(&mut self, filters: &[Filter], max_limit: usize) -> bool {
-        let _ = (filters, max_limit);
+    /// remaining quota that matches it. `hidden_slack` over-fetches the
+    /// quota like [`filter_collect_cap`], so events withheld by the
+    /// connection visibility rules do not consume the visible limit.
+    /// Returns whether any event was dropped (caller reports `more`). The
+    /// default keeps everything.
+    fn apply_search_limits(
+        &mut self,
+        filters: &[Filter],
+        max_limit: usize,
+        hidden_slack: usize,
+    ) -> bool {
+        let _ = (filters, max_limit, hidden_slack);
         false
     }
 }
@@ -414,10 +422,19 @@ impl ScanCollector for EventCollector {
     fn truncate_to(&mut self, take: usize) {
         self.events.truncate(take);
     }
-    fn apply_search_limits(&mut self, filters: &[Filter], max_limit: usize) -> bool {
+    fn apply_search_limits(
+        &mut self,
+        filters: &[Filter],
+        max_limit: usize,
+        hidden_slack: usize,
+    ) -> bool {
+        // Over-fetch each filter's quota by the hidden-space slack (bounded
+        // by `max_limit`): a pure-search REQ filters visibility after the
+        // relevance sort, so a protected/gift-wrap/private event among the
+        // first `limit` hits must have an over-fetched replacement.
         let mut takes: Vec<usize> = filters
             .iter()
-            .map(|f| f.limit.unwrap_or(max_limit).min(max_limit))
+            .map(|f| filter_collect_cap(f, max_limit, hidden_slack))
             .collect();
         let mut kept = Vec::with_capacity(self.events.len());
         let mut dropped = false;
@@ -1053,7 +1070,7 @@ impl Store {
                 // created_at, and the limit is applied after that ordering.
                 let weights = Self::weights_from_dfs(&all_dfs);
                 out.sort_relevance(&all_terms, &weights);
-                if out.apply_search_limits(filters, max_limit) {
+                if out.apply_search_limits(filters, max_limit, hidden_slack) {
                     more = true;
                 }
             } else if ascending {

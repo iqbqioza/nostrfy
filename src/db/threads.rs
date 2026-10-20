@@ -164,9 +164,10 @@ pub(crate) struct DbThreads {
     /// [`super::DbClient::set_max_api_pending`], e.g. on SIGHUP reload).
     pub(crate) max_api_pending: Arc<std::sync::atomic::AtomicUsize>,
     /// The spawned database threads, joined by `DbClient::shutdown` after
-    /// the Shutdown signals are sent: without the join a queued write could
-    /// be dropped with no reply (and the process could exit before the
-    /// final flush).
+    /// the Shutdown signals are sent: the join waits for the in-flight
+    /// drain and the final flush, not for messages queued behind
+    /// `Shutdown` (those are dropped without a reply once the writer
+    /// returns, like any request after it exits).
     pub(crate) threads: std::sync::Mutex<Vec<std::thread::JoinHandle<()>>>,
 }
 

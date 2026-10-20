@@ -6099,6 +6099,47 @@ mod tests {
     }
 
     #[test]
+    fn a_pure_search_page_backfills_hidden_hits() {
+        // Pure-search REQs apply the visibility rules after the relevance
+        // sort. Without the hidden-space slack, protected hits inside the
+        // first `limit` consumed the quota and the visible page came back
+        // short (here: empty, because the two newest hits are protected).
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let now = unix_now();
+            for (i, protected) in [(0, true), (1, true), (2, false), (3, false)] {
+                let mut event =
+                    signed_note(conn.relay.secp(), &format!("topic {i}"), now - i, vec![]);
+                if protected {
+                    event.tags = vec![vec!["-".into()]];
+                    event.id = crate::nips::nip01::compute_id(&event);
+                }
+                conn.relay.db.put(event, now).await;
+            }
+            conn.handle_req(&[json!("sub"), json!({"search": "topic", "limit": 2})])
+                .await;
+            conn.pump_pending_reqs();
+            let msgs = outgoing_json(&conn);
+            let visible: Vec<&str> = msgs
+                .iter()
+                .filter(|m| m[0] == "EVENT")
+                .map(|m| m[2]["content"].as_str().unwrap_or_default())
+                .collect();
+            assert_eq!(
+                visible.len(),
+                2,
+                "the search page must backfill hidden hits: {visible:?}"
+            );
+            assert!(
+                visible.iter().all(|content| !content.is_empty()),
+                "only visible hits may be delivered: {visible:?}"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
     fn req_response_chunks_through_the_outgoing_byte_cap() {
         // Backpressure: REQ responses are pumped through the capped
         // outgoing queue in bounded chunks — the queue never holds more
