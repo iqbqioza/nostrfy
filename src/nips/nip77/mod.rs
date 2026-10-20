@@ -117,6 +117,15 @@ fn fingerprint(items: &[Item]) -> [u8; 16] {
 /// `items` must already be sorted ascending by (timestamp, id) via
 /// [`sort_items`]. Returns the raw response message (without hex encoding).
 pub fn respond(items: &[Item], client_message: &[u8]) -> anyhow::Result<Vec<u8>> {
+    // `items` is sorted by (timestamp, id); a duplicate record (the same
+    // pair twice) cannot come from the database (keyed by event id), but
+    // `respond` is a public helper. An adjacent duplicate makes the
+    // fingerprint split below unable to advance its lower bound (both
+    // halves compare equal), so it would emit unbounded output; drop
+    // duplicates before walking.
+    let mut deduped: Vec<Item> = items.to_vec();
+    deduped.dedup();
+    let items: &[Item] = &deduped;
     if client_message.first() != Some(&PROTOCOL_VERSION) {
         // Protocol version negotiation: reply with the highest version we
         // support (a single byte).
@@ -385,6 +394,38 @@ mod tests {
         assert_eq!(&resp[5..37], &items[0].1);
         assert_eq!(&resp[37..69], &items[1].1);
         assert_eq!(&resp[69..101], &items[2].1);
+    }
+
+    #[test]
+    fn duplicate_items_are_deduplicated() {
+        // `respond` is a public helper: an adjacent duplicate (same
+        // timestamp and id) made the fingerprint split unable to advance its
+        // lower bound, so the old code emitted ranges forever. Duplicates
+        // are dropped before walking.
+        let mut msg = vec![PROTOCOL_VERSION];
+        let mut buf = [0u8; 10];
+        let n = write_varint(&mut buf, 0); // infinity upper
+        msg.extend_from_slice(&buf[..n]);
+        let n = write_varint(&mut buf, 0); // empty id prefix
+        msg.extend_from_slice(&buf[..n]);
+        let n = write_varint(&mut buf, 1); // mode = fingerprint
+        msg.extend_from_slice(&buf[..n]);
+        msg.extend_from_slice(&[0u8; 16]); // client's (empty-set) fingerprint
+        let id = [0x07u8; 32];
+        let duplicate = (1u64, id);
+        let other = (3u64, [0x09u8; 32]);
+        let resp = respond(&[duplicate, duplicate, duplicate, other], &msg)
+            .expect("duplicates must not fail the response");
+        assert!(
+            resp.len() < 128,
+            "duplicates must not explode the response: {} bytes",
+            resp.len()
+        );
+        assert_eq!(
+            resp.windows(32).filter(|window| *window == id).count(),
+            1,
+            "the duplicated id must be listed once"
+        );
     }
 
     #[test]

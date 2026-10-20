@@ -603,6 +603,16 @@ impl super::Conn {
             self.neg_err(&echo_id, "restricted: you are not allowed to sync");
             return;
         }
+        // A SIGHUP enabling `require_auth` stops in-flight syncs too: the
+        // open checked the flag, but later rounds must not keep serving an
+        // anonymous connection (same policy as the live/REQ paths).
+        if self.require_auth && !self.is_authed() {
+            self.neg_err(
+                &echo_id,
+                "auth-required: please authenticate before syncing",
+            );
+            return;
+        }
         // Check the subscription before decoding the message: an unknown id
         // must not cost a hex decode (and allocation) of a large frame.
         if !self.neg.contains_key(&sub_id) {

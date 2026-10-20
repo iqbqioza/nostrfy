@@ -256,6 +256,12 @@ pub struct RpcConfig {
     pub max_admin_body_bytes: usize,
 }
 
+/// Hard ceiling for `limits.max_created_at_future_secs` (7 days). A larger
+/// window lets an event with `created_at = u64::MAX` be stored: that value
+/// is NIP-77's "infinity" bound sentinel, so a real event would sit at the
+/// unbounded end of every negentropy range.
+pub(crate) const MAX_CREATED_AT_FUTURE_SECS: u64 = 7 * 24 * 60 * 60;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LimitsConfig {
@@ -1466,6 +1472,14 @@ impl Config {
             return Err(config_err(
                 "limits.socket_recv_buffer_kb must be at most 4096",
             ));
+        }
+        if self.limits.max_created_at_future_secs > MAX_CREATED_AT_FUTURE_SECS {
+            return Err(config_err(format!(
+                "limits.max_created_at_future_secs = {} must be at most \
+                 {MAX_CREATED_AT_FUTURE_SECS} (7 days); a larger window lets \
+                 created_at = u64::MAX (NIP-77's infinity sentinel) be stored",
+                self.limits.max_created_at_future_secs
+            )));
         }
         if !(1..=64).contains(&self.database.reader_threads) {
             return Err(config_err(
@@ -4754,6 +4768,24 @@ max_log_files = 2
         assert!(
             cfg.validate().is_ok(),
             "an NIP-43 + NIP-42-disabled relay is legal and must start"
+        );
+    }
+
+    #[test]
+    fn validation_rejects_a_future_window_reaching_the_infinity_sentinel() {
+        // NIP-77 uses created_at = u64::MAX as its "infinity" bound: a real
+        // event with that timestamp would occupy the unbounded end of every
+        // range, so the tolerated future window is capped well below it.
+        let mut cfg = Config::default();
+        cfg.limits.max_created_at_future_secs = MAX_CREATED_AT_FUTURE_SECS;
+        assert!(
+            cfg.validate().is_ok(),
+            "the documented ceiling (7 days) must be accepted"
+        );
+        cfg.limits.max_created_at_future_secs = u64::MAX;
+        assert!(
+            cfg.validate().is_err(),
+            "a window reaching u64::MAX must be rejected"
         );
     }
 

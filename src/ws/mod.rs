@@ -868,6 +868,20 @@ impl Conn {
                 }
                 break;
             }
+            // A SIGHUP enabling `require_auth` applies to a response that is
+            // already being pumped too: close the anonymous subscriptions
+            // instead of handing them stored events fetched before the flip.
+            // Mirrors the REQ intake and the live-delivery gate.
+            if self.require_auth && !self.is_authed() {
+                let ids: Vec<String> = self.pending_reqs.iter().map(|p| p.sub_id.clone()).collect();
+                self.pending_reqs.clear();
+                for id in ids {
+                    self.remove_req_subscription(&id);
+                    self.purge_queued_events_for(&id);
+                    self.send_closed(&id, "auth-required: please authenticate before subscribing");
+                }
+                break;
+            }
             // A subscription closed while its response was still pumping
             // is dropped without an EOSE (the client already closed it).
             let closed = self
@@ -4256,6 +4270,70 @@ mod tests {
                     .any(|m| m[0] == "NOTICE" || m[0] == "OK"),
                 "a malformed event must produce a diagnostic"
             );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn an_anonymous_pending_req_is_closed_when_require_auth_turns_on() {
+        // SIGHUP enabling require_auth must apply to a response already
+        // being pumped: the stored events were fetched before the flip, but
+        // handing them to an anonymous connection would bypass the new
+        // policy (the REQ intake and live delivery already enforce it).
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let now = unix_now();
+            let ev = signed_note(conn.relay.secp(), "stored", now, vec![]);
+            conn.relay.db.put(ev, now).await;
+            conn.handle_req(&[json!("sub"), json!({"kinds": [1]})])
+                .await;
+            assert!(conn.pending_reqs.len() == 1, "the response is pending");
+            // The SIGHUP reload propagates the flag to the connection cache.
+            conn.require_auth = true;
+            conn.pump_pending_reqs();
+            let msgs = outgoing_json(&conn);
+            assert!(
+                !msgs.iter().any(|m| m[0] == "EVENT"),
+                "no stored event may reach an anonymous connection after the flip: {msgs:?}"
+            );
+            assert!(
+                msgs.iter().any(|m| m[0] == "CLOSED"
+                    && m[1] == "sub"
+                    && m[2].as_str().is_some_and(|r| r.contains("auth-required"))),
+                "the pending response must be closed with auth-required: {msgs:?}"
+            );
+            assert!(
+                !conn.subs.contains_key("sub"),
+                "the subscription must be released"
+            );
+            assert!(conn.pending_reqs.is_empty());
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn an_anonymous_neg_round_is_closed_when_require_auth_turns_on() {
+        // A require_auth flip must also stop an in-flight negentropy sync:
+        // the open checked the flag, but later rounds would keep serving an
+        // anonymous connection.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            conn.handle_neg_open(&[json!("neg"), json!({"kinds": [1]}), json!("61000000")])
+                .await;
+            assert!(conn.neg.contains_key("neg"), "the sync is open");
+            conn.require_auth = true;
+            conn.handle_neg_msg(&[json!("neg"), json!("61000000")])
+                .await;
+            let msgs = outgoing_json(&conn);
+            assert!(
+                msgs.iter().any(|m| m[0] == "NEG-ERR"
+                    && m[1] == "neg"
+                    && m[2].as_str().is_some_and(|r| r.contains("auth-required"))),
+                "the anonymous round must be refused with auth-required: {msgs:?}"
+            );
+            assert!(!conn.neg.contains_key("neg"), "the sync must be closed");
             conn.relay.db.shutdown();
         });
     }
@@ -9116,6 +9194,84 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
         (addr, server)
+    }
+
+    #[test]
+    fn the_accept_slot_is_released_when_the_websocket_ends() {
+        // The accept-layer `ConnSlot` is handed over at the upgrade and must
+        // be released exactly when the WebSocket ends. The integration
+        // harness used to pass `None`, leaving this handover path untested.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_relay_with("").await;
+            let ip: std::net::IpAddr = "198.51.100.77".parse().unwrap();
+            let active = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+            let ip_counter = Arc::new(crate::conn::IpConnCounter::default());
+            assert!(ip_counter.try_acquire(ip, 1));
+            let slot =
+                crate::conn::ConnSlot::new(Arc::clone(&active), Arc::clone(&ip_counter), Some(ip));
+            let guard = slot
+                .handover()
+                .expect("the accept task hands the slot over");
+            let slots = Arc::new(std::sync::Mutex::new(vec![guard]));
+            let app = axum::Router::new()
+                .route(
+                    "/",
+                    axum::routing::any({
+                        let slots = Arc::clone(&slots);
+                        move |ws: axum::extract::ws::WebSocketUpgrade,
+                              axum::extract::State(relay): axum::extract::State<Arc<Relay>>| {
+                            let slots = Arc::clone(&slots);
+                            async move {
+                                ws.on_upgrade(move |socket| async move {
+                                    // The production upgrade hands the slot
+                                    // over here, before the connection task:
+                                    // this test does the same and asserts the
+                                    // guard is released on disconnect.
+                                    let slot = slots.lock().unwrap().pop();
+                                    crate::ws::handle_connection(
+                                        socket,
+                                        relay,
+                                        ip,
+                                        "/".to_string(),
+                                        slot,
+                                    )
+                                    .await;
+                                })
+                            }
+                        }
+                    }),
+                )
+                .with_state(Arc::clone(&relay));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+            let ws = connect_ws(addr, None).await;
+            assert!(
+                slots.lock().unwrap().is_empty(),
+                "the upgrade must consume the accept slot"
+            );
+            wait_for(
+                || active.load(std::sync::atomic::Ordering::Relaxed) == 1,
+                "the accepted connection to hold its slot",
+            )
+            .await;
+            drop(ws);
+            wait_for(
+                || active.load(std::sync::atomic::Ordering::Relaxed) == 0,
+                "the connection slot release",
+            )
+            .await;
+            assert!(
+                ip_counter.try_acquire(ip, 1),
+                "the per-IP slot must be free after the WebSocket ends"
+            );
+            ip_counter.release(ip);
+            server.abort();
+            relay.db.shutdown();
+        });
     }
 
     /// Connects a real tokio-tungstenite client over a TCP socket the test

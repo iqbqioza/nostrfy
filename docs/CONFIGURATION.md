@@ -266,7 +266,7 @@ Set this whenever a reverse proxy (nginx, Caddy, a cloud load balancer, Cloudfla
 | `max_groups` | integer | `1000` | Cap on the in-memory NIP-29 group store (active groups + deleted-group markers). Creates beyond it are rejected with `restricted: group limit reached`. Must be ≥ 1 (`0` is rejected). Canonical key `relay.max_groups` (see §3); the `[limits]` spelling is a legacy alias |
 | `max_tags` | integer | `2000` | Max tags per event |
 | `max_tag_value_bytes` | integer | `1024` | Max bytes per tag value |
-| `max_created_at_future_secs` | integer | `3600` | Tolerated future skew of `created_at` (seconds) |
+| `max_created_at_future_secs` | integer | `3600` | Tolerated future skew of `created_at` (seconds; at most 604800 = 7 days) |
 | `require_pow` | integer | `0` | Required proof-of-work difficulty in leading zero bits (legacy alias of `relay.require_pow`) |
 | `max_indexed_words` | integer | `32` | Words of content indexed for NIP-50 search (legacy alias of `database.max_indexed_words`) |
 
@@ -340,7 +340,7 @@ Set this whenever a reverse proxy (nginx, Caddy, a cloud load balancer, Cloudfla
 
 **`max_tag_value_bytes`** — The maximum size (bytes) of a single tag value. Longer values are rejected with `invalid: tag value too large`.
 
-**`max_created_at_future_secs`** — How far into the future an event's `created_at` may be. Beyond this the event is rejected as invalid (`OK false` with `invalid: event creation date is in the future`).
+**`max_created_at_future_secs`** — How far into the future an event's `created_at` may be. Beyond this the event is rejected as invalid (`OK false` with `invalid: event creation date is in the future`). The value is capped at `604800` (7 days): a larger window would let `created_at = u64::MAX` — NIP-77's "infinity" bound sentinel — be stored, placing a real event at the unbounded end of every negentropy range.
 
 **`max_neg_items`** — The maximum number of records a single NIP-77 negentropy sync may process. Larger syncs are refused with a `NEG-ERR`. The whole sync window is held in memory: values above 1,000,000 are warned about and anything above 10,000,000 is rejected as a clear mistake (a unit typo can turn one NEG-OPEN into an out-of-memory trigger).
 
