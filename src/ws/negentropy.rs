@@ -77,7 +77,11 @@ fn neg_echo_id(id: &str, max_sub_id_len: usize) -> String {
 
 impl super::Conn {
     pub(crate) fn send_neg_err(&mut self, sub_id: &str, reason: &str) {
-        self.send_control(json!(["NEG-ERR", sub_id, reason]));
+        // Tag the frame so a NEG-CLOSE or same-id re-open purges a stale
+        // error (NIP-77: NEG-ERR closes the id). An uncorrelated error has
+        // no id to tag.
+        let tag = (!sub_id.is_empty()).then(|| super::neg_sub_fingerprint(sub_id));
+        self.send_control_tagged(json!(["NEG-ERR", sub_id, reason]), tag);
     }
 
     /// Closes negentropy subscriptions idle longer than
@@ -129,11 +133,19 @@ impl super::Conn {
     /// subscription is gone.
     pub(crate) fn neg_err(&mut self, sub_id: &str, reason: &str) {
         self.remove_neg_subscription(sub_id);
+        // NEG-ERR closes the id: queued rounds of the closed incarnation
+        // must not follow it (or reach a later re-open under the same id).
+        self.purge_queued_neg_frames_for(sub_id);
         self.send_neg_err(sub_id, reason);
     }
 
     pub(crate) fn send_neg_msg(&mut self, sub_id: &str, message: &[u8]) {
-        self.send_control(json!(["NEG-MSG", sub_id, hex::encode(message)]));
+        // NEG frames are tagged with the (NIP-77-namespaced) id so a
+        // NEG-CLOSE or same-id re-open can purge them from the outgoing
+        // queue: a replaced sync must not deliver the previous
+        // incarnation's rounds under the same id.
+        let tag = (!sub_id.is_empty()).then(|| super::neg_sub_fingerprint(sub_id));
+        self.send_control_tagged(json!(["NEG-MSG", sub_id, hex::encode(message)]), tag);
     }
 
     /// Whether the outgoing queue is too deep for another (potentially
@@ -475,6 +487,10 @@ impl super::Conn {
             // subscription (the new one re-acquires it below). Dropping
             // `old` also releases its budget reservation.
             self.release_neg_stats_subscription();
+            // NIP-77: the same-id open replaces the subscription, so the
+            // old incarnation's queued rounds must not be delivered under
+            // the new one.
+            self.purge_queued_neg_frames_for(&sub_id);
         }
         let item_bytes = items.len() as u64 * super::NEG_ITEM_BYTES;
         let Some(reserved) = self
@@ -680,5 +696,8 @@ impl super::Conn {
         };
         // NIP-77 separate namespace: NEG-CLOSE releases only NEG state.
         self.remove_neg_subscription(&sub_id);
+        // The client ended this id: drop its still-queued NEG frames so a
+        // later re-open cannot receive the previous incarnation's rounds.
+        self.purge_queued_neg_frames_for(&sub_id);
     }
 }

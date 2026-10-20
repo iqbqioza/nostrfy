@@ -407,6 +407,13 @@ pub(crate) fn sub_fingerprint(sub_id: &str) -> u64 {
     hasher.finish()
 }
 
+/// Fingerprint used to tag queued NEG frames. NIP-77 subscription ids are a
+/// separate namespace from REQ ids, so a NEG id that spells a REQ id must
+/// not purge (or be purged with) that REQ's queued frames.
+pub(crate) fn neg_sub_fingerprint(sub_id: &str) -> u64 {
+    sub_fingerprint(&format!("neg\u{0}{sub_id}"))
+}
+
 pub struct Conn {
     pub(crate) relay: Arc<Relay>,
     /// The WebSocket endpoint path this connection was established on
@@ -612,12 +619,12 @@ impl Conn {
     }
 
     /// Like [`Conn::send_control`], but tags the frame with the
-    /// subscription fingerprint of the response it ends (EOSE/CLOSED). A
-    /// re-REQ or CLOSE under the same id purges the still-queued tagged
-    /// frames, so the client can never receive an EOSE or CLOSED belonging
-    /// to a replaced subscription (including a CLOSED queued by an earlier
-    /// failed REQ). The control-queue caps and overflow accounting are
-    /// unchanged.
+    /// subscription fingerprint of the response it ends (EOSE/CLOSED), or
+    /// the NEG namespace fingerprint for NEG-MSG/NEG-ERR. A re-REQ, CLOSE,
+    /// NEG-CLOSE or same-id NEG-OPEN purges the still-queued tagged frames,
+    /// so the client can never receive a frame belonging to a replaced
+    /// subscription (including a CLOSED queued by an earlier failed REQ).
+    /// The control-queue caps and overflow accounting are unchanged.
     pub(crate) fn send_control_tagged(&mut self, value: Value, event_sub: Option<u64>) {
         if self.outgoing.len() >= OUT_QUEUE_LIMIT * 2 {
             self.dropped += 1;
@@ -6884,6 +6891,115 @@ mod tests {
                     .iter()
                     .all(|message| message[0] != "EVENT" && message[0] != "EOSE"),
                 "closing a subscription must discard its pending response"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn neg_close_purges_queued_neg_frames() {
+        // NIP-77: NEG-CLOSE ends the sync. A round already queued for that
+        // id must not be delivered afterwards (a later re-open under the
+        // same id must not receive the previous incarnation's frames).
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            conn.send_neg_msg("neg", b"deadbeef");
+            assert!(
+                outgoing_json(&conn)
+                    .iter()
+                    .any(|m| m[0] == "NEG-MSG" && m[1] == "neg"),
+                "the frame must be queued first"
+            );
+            conn.handle_neg_close(&[json!("neg")]);
+            assert!(
+                !outgoing_json(&conn)
+                    .iter()
+                    .any(|m| m[0] == "NEG-MSG" && m[1] == "neg"),
+                "NEG-CLOSE must purge the id's queued frames"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn neg_err_purges_queued_frames_before_it_is_delivered() {
+        // NEG-ERR closes the id (NIP-77): a queued round of the closed
+        // incarnation must not follow it.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            conn.send_neg_msg("neg", b"deadbeef");
+            conn.neg_err("neg", "error: test");
+            let msgs = outgoing_json(&conn);
+            assert!(
+                !msgs.iter().any(|m| m[0] == "NEG-MSG" && m[1] == "neg"),
+                "the queued round must be dropped: {msgs:?}"
+            );
+            assert!(
+                msgs.iter().any(|m| m[0] == "NEG-ERR" && m[1] == "neg"),
+                "the closing error must be delivered: {msgs:?}"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn neg_reopen_purges_frames_of_the_previous_incarnation() {
+        // NIP-77: a same-id NEG-OPEN replaces the subscription. Rounds and
+        // errors of the previous incarnation must not be delivered under
+        // the new one.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            conn.handle_neg_open(&[json!("neg"), json!({"kinds": [1]}), json!("61000000")])
+                .await;
+            conn.send_neg_msg("neg", b"deadbeef");
+            conn.send_neg_err("neg", "error: stale");
+            conn.handle_neg_open(&[json!("neg"), json!({"kinds": [1]}), json!("61000000")])
+                .await;
+            let msgs = outgoing_json(&conn);
+            assert!(
+                !msgs.iter().any(|m| {
+                    m[1] == "neg"
+                        && (m[2]
+                            .as_str()
+                            .is_some_and(|s| s.contains("deadbeef") || s.contains("stale")))
+                }),
+                "a same-id re-open must drop the old incarnation's frames: {msgs:?}"
+            );
+            assert_eq!(
+                msgs.iter()
+                    .filter(|m| m[0] == "NEG-MSG" && m[1] == "neg")
+                    .count(),
+                1,
+                "only the new open's initial round remains: {msgs:?}"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn neg_purge_does_not_cross_the_req_namespace() {
+        // NIP-77 ids are a separate namespace: closing a NEG id that spells
+        // a REQ id must not purge the REQ's queued frames (or vice versa).
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            conn.send_control_tagged(
+                json!(["EOSE", "same"]),
+                Some(crate::ws::sub_fingerprint("same")),
+            );
+            conn.send_neg_msg("same", b"deadbeef");
+            conn.handle_neg_close(&[json!("same")]);
+            let msgs = outgoing_json(&conn);
+            assert!(
+                msgs.iter().any(|m| m[0] == "EOSE" && m[1] == "same"),
+                "the REQ frame must survive a NEG-CLOSE: {msgs:?}"
+            );
+            assert!(
+                !msgs.iter().any(|m| m[0] == "NEG-MSG" && m[1] == "same"),
+                "the NEG frame must be purged: {msgs:?}"
             );
             conn.relay.db.shutdown();
         });

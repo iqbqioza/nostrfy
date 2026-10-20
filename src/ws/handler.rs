@@ -807,7 +807,17 @@ impl super::Conn {
     /// message and lifetime-traffic accounting is adjusted for the removed
     /// frames — they were counted when queued but never reach the wire.
     pub(crate) fn purge_queued_events_for(&mut self, sub_id: &str) {
-        let tag = super::sub_fingerprint(sub_id);
+        self.purge_queued_frames_with_tag(super::sub_fingerprint(sub_id));
+    }
+
+    /// Like [`Self::purge_queued_events_for`], for the NIP-77 namespace.
+    pub(crate) fn purge_queued_neg_frames_for(&mut self, sub_id: &str) {
+        self.purge_queued_frames_with_tag(super::neg_sub_fingerprint(sub_id));
+    }
+
+    /// Drops the queued frames tagged with `tag` (the tag namespaces the
+    /// id: REQ and NEG ids may spell the same string).
+    fn purge_queued_frames_with_tag(&mut self, tag: u64) {
         let mut removed_bytes = 0usize;
         let mut removed_msgs = 0u64;
         self.outgoing.retain(|frame| {
