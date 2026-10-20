@@ -1311,11 +1311,14 @@ impl std::fmt::Display for Identity {
 /// decides. A banned pubkey is refused on every authenticated service.
 /// Returns the identity for the audit trail: the NIP-98 pubkey or
 /// `"management-token"`.
-/// Whether the request was presented on the host the relay's canonical
-/// origin names (see the call site in [`rpc_authenticated`]): the `Host`
-/// header — or the HTTP/2 `:authority` fallback — must name the configured
-/// identity host. A request with neither cannot be bound and keeps the
-/// configured-origin behavior (the full-URL check in
+/// Whether the request was presented on the host and port the relay's
+/// canonical origin names (see the call site in [`rpc_authenticated`]): the
+/// `Host` header — or the HTTP/2 `:authority` fallback, including its port
+/// — must name the configured identity authority. The port matters: a token
+/// signed for `https://relay.example.com:8443` must not be replayable on
+/// port 443 (or vice versa). Default ports are normalized from the origin's
+/// scheme. A request with neither header nor authority cannot be bound and
+/// keeps the configured-origin behavior (the full-URL check in
 /// [`nip98::matches_request_url`] still applies). The bearer management
 /// token names no origin and is not affected.
 fn presented_on_identity_host(
@@ -1329,19 +1332,38 @@ fn presented_on_identity_host(
         .map(str::trim)
         .map(str::to_string)
         .or_else(|| {
+            // Keep the port: HTTP/2 carries the full authority here. The old
+            // `host()` call dropped a non-default port and let a token for
+            // :8443 match :443.
             uri.authority()
-                .map(|authority| authority.host().to_string())
+                .map(|authority| authority.as_str().to_string())
         })
     else {
         return true;
     };
     let identity = cfg.relay_identity();
+    let origin = identity.http_origin();
+    let expected_scheme = if origin.starts_with("https://") {
+        "https"
+    } else {
+        "http"
+    };
+    let default_port = if expected_scheme == "https" { 443 } else { 80 };
+    // Origin-form HTTP/1 requests carry no scheme; when the URI does carry
+    // one (absolute-form or HTTP/2), it must agree with the configured
+    // public origin.
+    if let Some(scheme) = uri.scheme_str()
+        && !scheme.eq_ignore_ascii_case(expected_scheme)
+    {
+        return false;
+    }
     let authority = crate::nips::nip62::authority_of(&identity);
-    let identity_host = crate::nips::nip62::split_host_port(&authority).0;
-    let presented_host = crate::nips::nip62::split_host_port(&presented).0;
+    let (identity_host, identity_port) = crate::nips::nip62::split_host_port(&authority);
+    let (presented_host, presented_port) = crate::nips::nip62::split_host_port(&presented);
     presented_host
         .trim_end_matches('.')
         .eq_ignore_ascii_case(identity_host.trim_end_matches('.'))
+        && presented_port.unwrap_or(default_port) == identity_port.unwrap_or(default_port)
 }
 
 async fn rpc_authenticated(
@@ -1529,12 +1551,19 @@ mod tests {
         // relay port is otherwise reachable through any other hostname, and
         // a token captured for the canonical one must not work there.
         let relay = build_admin_relay().await;
-        let identity_host = {
+        let identity_authority = {
             let cfg = relay.config.read().await;
-            let authority = crate::nips::nip62::authority_of(&cfg.relay_identity());
-            crate::nips::nip62::split_host_port(&authority)
-                .0
-                .to_string()
+            crate::nips::nip62::authority_of(&cfg.relay_identity())
+        };
+        let (identity_host, identity_port) =
+            crate::nips::nip62::split_host_port(&identity_authority);
+        let identity_host = identity_host.to_string();
+        let host_with_port = |port: u16| {
+            if identity_host.contains(':') {
+                format!("[{identity_host}]:{port}")
+            } else {
+                format!("{identity_host}:{port}")
+            }
         };
         // A forged Host: refused before the method is considered.
         let (_, mut headers, body) =
@@ -1553,13 +1582,10 @@ mod tests {
             StatusCode::UNAUTHORIZED,
             "a token for the relay origin must not be accepted on another host"
         );
-        // The identity host (a proxy may add the port) is accepted.
+        // The exact identity authority (host + port) is accepted.
         let (_, mut headers, body) =
             nip98_headers(&relay, &[9u8; 32], "supportedmethods", vec![]).await;
-        headers.insert(
-            header::HOST,
-            format!("{identity_host}:8080").parse().unwrap(),
-        );
+        headers.insert(header::HOST, identity_authority.parse().unwrap());
         let resp = rpc_handler(
             State(relay.clone()),
             axum::extract::ConnectInfo("127.0.0.1:1234".parse().unwrap()),
@@ -1571,7 +1597,30 @@ mod tests {
         assert_ne!(
             resp.status(),
             StatusCode::UNAUTHORIZED,
-            "the identity host must accept the authorization"
+            "the identity authority must accept the authorization"
+        );
+        // A different port must not match the identity authority: a token
+        // signed for :8443 must not be replayable on :443 (or vice versa).
+        let wrong_port = if identity_port.unwrap_or(443) == 8080 {
+            8081
+        } else {
+            8080
+        };
+        let (_, mut headers, body) =
+            nip98_headers(&relay, &[9u8; 32], "supportedmethods", vec![]).await;
+        headers.insert(header::HOST, host_with_port(wrong_port).parse().unwrap());
+        let resp = rpc_handler(
+            State(relay.clone()),
+            axum::extract::ConnectInfo("127.0.0.1:1234".parse().unwrap()),
+            axum::http::Uri::from_static("/"),
+            headers,
+            body,
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "a different port must not accept an authorization signed for the identity authority"
         );
         relay.db.shutdown();
     }

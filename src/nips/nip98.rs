@@ -23,8 +23,15 @@ pub const METHOD_TAG: &str = "method";
 /// Returns `None` for another scheme (`Bearer`, ...) or a scheme with no
 /// token.
 pub fn strip_nostr_scheme(value: &str) -> Option<&str> {
-    let (scheme, token) = value.split_once(' ')?;
-    scheme.eq_ignore_ascii_case("Nostr").then_some(token)
+    // RFC 9110: the scheme and credentials are separated by one or more
+    // whitespace characters. Split at the first one and trim the rest, so
+    // `Nostr  tok` and `Nostr\ttok` work; an empty token is no token.
+    let (scheme, token) = value.split_once(char::is_whitespace)?;
+    let token = token.trim();
+    scheme
+        .eq_ignore_ascii_case("Nostr")
+        .then_some(token)
+        .filter(|token| !token.is_empty())
 }
 
 /// Verifies an encoded NIP-98 event. The token is accepted in both the
@@ -137,23 +144,31 @@ pub struct Verified {
 /// process-local replay protection; restarting clears the guard.
 pub struct ReplayGuard {
     seen: std::sync::Mutex<std::collections::HashMap<String, Entry>>,
+    /// Monotonic presentation sequence (see [`Entry::presented`]).
+    next_presentation: std::sync::atomic::AtomicU64,
     /// Unix time of the last capacity warning: `accept` runs for every
     /// authenticated request, so a flood that fills the guard must not log
     /// one line per evicted authorization.
     last_capacity_warning: std::sync::atomic::AtomicU64,
 }
 
-/// One live authorization: when it stops verifying, and who presented it.
-/// The author drives the fair eviction at capacity (see [`ReplayGuard`]).
+/// One live authorization: when it stops verifying, who presented it, and a
+/// monotonic presentation sequence. The author and sequence drive the fair
+/// eviction at capacity (see [`ReplayGuard`]); the sequence is deliberately
+/// not derived from the client-signed `created_at`.
 struct Entry {
     expiry: u64,
     pubkey: String,
+    /// Monotonic acceptance order. A flood is presented after a captured
+    /// authorization, so this (unlike `created_at`) cannot be backdated.
+    presented: u64,
 }
 
 impl Default for ReplayGuard {
     fn default() -> Self {
         ReplayGuard {
             seen: std::sync::Mutex::new(std::collections::HashMap::new()),
+            next_presentation: std::sync::atomic::AtomicU64::new(0),
             last_capacity_warning: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -181,6 +196,10 @@ impl ReplayGuard {
     pub fn accept(&self, id: &str, now: u64, created_at: u64, pubkey: &str) -> bool {
         let valid_until = created_at.saturating_add(61);
         let pubkey = pubkey.to_ascii_lowercase();
+        let presented = self
+            .next_presentation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(1);
         let mut warn = false;
         let accepted = {
             let mut seen = self.seen.lock().unwrap_or_else(|p| p.into_inner());
@@ -197,6 +216,7 @@ impl ReplayGuard {
                     Entry {
                         expiry: valid_until,
                         pubkey,
+                        presented,
                     },
                 );
                 true
@@ -217,17 +237,19 @@ impl ReplayGuard {
     /// consists of fresh entries, while a quiet identity's older (possibly
     /// captured) authorization must stay tracked — with an oldest-first
     /// tie-break a fresh-key flood evicted exactly that authorization and
-    /// flipped it back into a usable replay. Within the victim author the
-    /// entry closest to natural expiry is removed. Called only with a map
-    /// at capacity, so there is always an entry to evict.
+    /// flipped it back into a usable replay. The sequence is the guard's
+    /// own acceptance order, not the client-signed `created_at` (which an
+    /// attacker can backdate by the full ±60 s window). Within the victim
+    /// author the entry closest to natural expiry is removed. Called only
+    /// with a map at capacity, so there is always an entry to evict.
     fn evict_most_prolific(seen: &mut std::collections::HashMap<String, Entry>, requester: &str) {
-        // (entry count, latest expiry) per author.
+        // (entry count, latest presentation sequence) per author.
         let mut stats: std::collections::HashMap<&str, (usize, u64)> =
             std::collections::HashMap::new();
         for entry in seen.values() {
             let stat = stats.entry(entry.pubkey.as_str()).or_insert((0, 0));
             stat.0 += 1;
-            stat.1 = stat.1.max(entry.expiry);
+            stat.1 = stat.1.max(entry.presented);
         }
         let victim = stats
             .iter()
@@ -373,6 +395,10 @@ mod tests {
         assert_eq!(strip_nostr_scheme("nostr abc"), Some("abc"));
         assert_eq!(strip_nostr_scheme("NOSTR abc"), Some("abc"));
         assert_eq!(strip_nostr_scheme("NoStR abc"), Some("abc"));
+        // RFC 9110 allows one or more whitespace characters.
+        assert_eq!(strip_nostr_scheme("Nostr  abc"), Some("abc"));
+        assert_eq!(strip_nostr_scheme("Nostr\tabc"), Some("abc"));
+        assert_eq!(strip_nostr_scheme("Nostr   "), None);
         // Only the first space separates the scheme from the token.
         assert_eq!(strip_nostr_scheme("Nostr a b"), Some("a b"));
         // Other schemes and malformed values are not a NIP-98 authorization.
@@ -761,6 +787,25 @@ mod tests {
         assert!(
             !guard.accept("quiet-old", 1_002, 1_002, "pk-quiet"),
             "the quiet identity's earlier authorization must stay tracked"
+        );
+    }
+
+    #[test]
+    fn replay_guard_does_not_evict_a_capture_for_a_backdated_flood() {
+        // A client can backdate its auth events by the full ±60 s window.
+        // The eviction tie-break must use the guard's own presentation
+        // order, not `created_at`/`expiry`: with the old "latest expiry"
+        // rule a flood at created_at = now-60 made the victim the unique
+        // latest expiry and evicted it on the first overflow.
+        let guard = ReplayGuard::default();
+        assert!(guard.accept("victim", 1_000, 1_000, "pk-victim"));
+        for n in 0..ReplayGuard::MAX_ENTRIES - 1 {
+            assert!(guard.accept(&format!("flood-{n}"), 1_000, 940, &format!("pk-flood-{n}")));
+        }
+        assert!(guard.accept("extra", 1_002, 1_002, "pk-extra"));
+        assert!(
+            !guard.accept("victim", 1_002, 1_002, "pk-victim"),
+            "a backdated flood must not evict the capture"
         );
     }
 
