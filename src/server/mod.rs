@@ -1464,7 +1464,14 @@ async fn ws_handler(State(relay): State<Arc<Relay>>, request: Request) -> Respon
             // Media types are case-insensitive: `APPLICATION/NOSTR+JSON`
             // must get the JSON document too.
             .is_some_and(|a| a.to_ascii_lowercase().contains("application/nostr+json"));
-        return nip11_doc(relay.clone(), wants_nostr_json).await;
+        // The same URL serves the landing/decoy page and the NIP-11
+        // document depending on `Accept`: shared caches must key on it.
+        let mut response = nip11_doc(relay.clone(), wants_nostr_json).await;
+        response.headers_mut().insert(
+            axum::http::header::VARY,
+            axum::http::HeaderValue::from_static("Accept"),
+        );
+        return response;
     }
     let path = request.uri().path().to_string();
     let (mut parts, _) = request.into_parts();
@@ -2773,6 +2780,10 @@ async fn apply_reloaded_config(
     new_config.relay.livekit_url = old.relay.livekit_url.clone();
     new_config.relay.livekit_api_key = old.relay.livekit_api_key.clone();
     new_config.relay.livekit_api_secret = old.relay.livekit_api_secret.clone();
+    // The poll loop captures its interval at startup; keeping the running
+    // value makes `config.read()` match the actual timer.
+    new_config.relay.livekit_participants_interval_secs =
+        old.relay.livekit_participants_interval_secs;
     // NIP toggles shape routing and stored behavior: keep
     // them restart-required so a reload cannot half-apply
     // (dynamic gates would flip while routes stay old).
@@ -4663,6 +4674,16 @@ mod tests {
             response.headers()[axum::http::header::CONTENT_TYPE],
             "text/html; charset=utf-8"
         );
+        assert_eq!(
+            response.headers()[axum::http::header::VARY],
+            "Accept",
+            "the root content negotiation must key shared caches on Accept"
+        );
+        assert_eq!(
+            response.headers()[axum::http::header::CACHE_CONTROL],
+            "no-cache",
+            "the landing page is re-read on change; caches must revalidate"
+        );
         assert_eq!(body_of(response).await, "<html>relay stats v1</html>");
         // Rewritten in place (different size): served without a restart.
         std::fs::write(&page, "<html>relay stats v2 (updated)</html>").unwrap();
@@ -4671,16 +4692,22 @@ mod tests {
             body_of(response).await,
             "<html>relay stats v2 (updated)</html>"
         );
-        // NIP-11 is unaffected.
+        // NIP-11 is unaffected (and varies on Accept too).
         let response = ws_handler(State(relay.clone()), get("application/nostr+json")).await;
         assert_eq!(
             response.headers()[axum::http::header::CONTENT_TYPE],
             "application/nostr+json"
         );
+        assert_eq!(response.headers()[axum::http::header::VARY], "Accept");
         // A missing file falls back to the decoy, never to the relay
         // document.
         std::fs::remove_file(&page).unwrap();
         let response = ws_handler(State(relay.clone()), get("text/html")).await;
+        assert_eq!(
+            response.headers()[axum::http::header::VARY],
+            "Accept",
+            "the decoy branch must vary on Accept as well"
+        );
         assert!(body_of(response).await.contains("How to Open a Door"));
         // A directory (not a regular file) falls back to the decoy too.
         relay.config.write().await.server.landing_page_file = dir.to_string_lossy().into_owned();

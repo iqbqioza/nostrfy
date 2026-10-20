@@ -38,13 +38,19 @@ struct Cached {
 
 static LANDING_CACHE: Mutex<Option<Cached>> = Mutex::new(None);
 
-/// Metadata of `path` when it is a regular file within the size cap.
-/// `symlink_metadata` is used so a symlink is not followed: the operator
-/// names the real file, and a link planted in a writable directory cannot
-/// redirect the route to another file.
-fn regular_file_meta(path: &Path) -> Option<std::fs::Metadata> {
-    let meta = std::fs::symlink_metadata(path).ok()?;
-    (meta.file_type().is_file() && meta.len() <= MAX_FILE_BYTES).then_some(meta)
+/// Opens `path` without following a symlink and validates the *opened*
+/// descriptor (a regular file within the size cap). The check and the read
+/// use the same fd, so replacing the path between them (the previous
+/// stat-then-read TOCTOU) cannot redirect the read to another file.
+fn open_regular(path: &Path) -> Option<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .ok()?;
+    let meta = file.metadata().ok()?;
+    (meta.file_type().is_file() && meta.len() <= MAX_FILE_BYTES).then_some(file)
 }
 
 /// The landing page body for `path`, or `None` when it cannot be served
@@ -52,23 +58,30 @@ fn regular_file_meta(path: &Path) -> Option<std::fs::Metadata> {
 /// back to the decoy page, never to the relay document: a broken landing
 /// page must not reveal more than the default does.
 pub(crate) fn landing_page(path: &Path) -> Option<axum::body::Bytes> {
-    let meta = regular_file_meta(path)?;
+    let file = open_regular(path)?;
+    let meta = file.metadata().ok()?;
     let mtime = meta.modified().ok();
     let len = meta.len();
-    let mut cache = LANDING_CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(c) = cache.as_ref()
-        && c.path == path
-        && c.mtime == mtime
-        && c.len == len
     {
-        return Some(c.body.clone());
+        let cache = LANDING_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(c) = cache.as_ref()
+            && c.path == path
+            && c.mtime == mtime
+            && c.len == len
+        {
+            return Some(c.body.clone());
+        }
     }
-    let body = axum::body::Bytes::from(std::fs::read(path).ok()?);
-    // The file may have grown between the stat and the read.
+    // Read from the already-open fd (no path re-resolution) and bound the
+    // allocation even if the file grew after the fstat.
+    use std::io::Read as _;
+    let mut body = Vec::with_capacity(len as usize);
+    file.take(MAX_FILE_BYTES + 1).read_to_end(&mut body).ok()?;
     if body.len() as u64 > MAX_FILE_BYTES {
         return None;
     }
-    *cache = Some(Cached {
+    let body = axum::body::Bytes::from(body);
+    *LANDING_CACHE.lock().unwrap_or_else(|e| e.into_inner()) = Some(Cached {
         path: path.to_path_buf(),
         mtime,
         len,
@@ -90,6 +103,9 @@ pub(crate) fn landing_response(body: axum::body::Bytes) -> Response {
                 header::X_CONTENT_TYPE_OPTIONS,
                 HeaderValue::from_static("nosniff"),
             ),
+            // The page is re-read when its mtime/size changes: make shared
+            // and browser caches revalidate instead of pinning an old copy.
+            (header::CACHE_CONTROL, HeaderValue::from_static("no-cache")),
         ],
         body,
     )
@@ -141,12 +157,22 @@ pub(crate) async fn asset_response(dir: &Path, name: &str) -> Response {
         return StatusCode::NOT_FOUND.into_response();
     }
     let path = dir.join(name);
-    let Some(_) = regular_file_meta(&path) else {
+    // Same atomic O_NOFOLLOW check as the landing page: the asset is read
+    // from the descriptor that was validated, not from a re-resolved path.
+    let Some(file) = open_regular(&path) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let Ok(data) = tokio::fs::read(&path).await else {
+    use tokio::io::AsyncReadExt as _;
+    let mut data = Vec::new();
+    let file = tokio::fs::File::from_std(file);
+    if file
+        .take(MAX_FILE_BYTES + 1)
+        .read_to_end(&mut data)
+        .await
+        .is_err()
+    {
         return StatusCode::NOT_FOUND.into_response();
-    };
+    }
     if data.len() as u64 > MAX_FILE_BYTES {
         return StatusCode::NOT_FOUND.into_response();
     }

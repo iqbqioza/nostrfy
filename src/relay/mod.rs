@@ -291,6 +291,12 @@ pub struct Relay {
     /// [`Self::poll_livekit_participants`]): the `kind:39004` event is only
     /// re-published when the list changes.
     livekit_participants: tokio::sync::Mutex<std::collections::HashMap<String, Vec<String>>>,
+    /// Striped per-group locks serializing a LiveKit participant refresh
+    /// with the group apply that clears its `39004` (a `9002` leaving
+    /// LiveKit). Without the lock, a refresh that passed
+    /// `is_livekit_group` can store a stale list after the leave's empty
+    /// one, which then wins the replaceable-event race.
+    livekit_locks: Vec<tokio::sync::Mutex<()>>,
     /// Shared signature-verification context. It is an `Arc` because the
     /// accept path hands it to `spawn_blocking` verification tasks; the
     /// precomputed tables are far too large to rebuild per batch, and
@@ -1530,6 +1536,11 @@ async fn groups_rebuild_worker(
 /// at startup and rebuilt from the surviving events.
 const SNAPSHOT_PERSIST_INTERVAL_MS: u64 = 1_000;
 
+/// Number of striped per-group LiveKit refresh/apply locks (see
+/// [`Relay::livekit_locks`]). Collisions only serialize unrelated groups;
+/// the memory is fixed.
+const LIVEKIT_LOCK_COUNT: usize = 64;
+
 /// Bound on the shutdown wait for the debounced worker's final pass (see
 /// [`Relay::finish_snapshot_persists`]): the pass is a database write
 /// (milliseconds), and a stuck worker must not delay the exit beyond this.
@@ -1943,6 +1954,9 @@ impl Relay {
             command_events: std::sync::Mutex::new(std::collections::HashSet::new()),
             nip11_cache: std::sync::Mutex::new(None),
             livekit_participants: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            livekit_locks: (0..LIVEKIT_LOCK_COUNT)
+                .map(|_| tokio::sync::Mutex::new(()))
+                .collect(),
         }
     }
 
@@ -3782,6 +3796,15 @@ impl Relay {
         gids
     }
 
+    /// The striped lock serializing a LiveKit refresh for `gid` with the
+    /// group apply that may clear its participant list.
+    fn livekit_lock(&self, gid: &str) -> &tokio::sync::Mutex<()> {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        gid.hash(&mut hasher);
+        &self.livekit_locks[(hasher.finish() as usize) % self.livekit_locks.len()]
+    }
+
     /// Whether the group exists and has a LiveKit room (the webhook gate: a
     /// signed event for any other room is ignored).
     pub(crate) async fn is_livekit_group(&self, gid: &str) -> bool {
@@ -3822,17 +3845,16 @@ impl Relay {
         // The group may have been deleted (or left LiveKit) while the fetch
         // was in flight: publishing would resurrect metadata for a group
         // that no longer wants it (a poll or webhook can race a 9008/9002).
+        // The per-group lock covers the check, the store and the cache
+        // update, so a 9002 either lands before this check (skip) or after
+        // this store (its empty list is stamped later and wins).
+        let _livekit_guard = self.livekit_lock(gid).lock().await;
         if !self.is_livekit_group(gid).await {
             return;
         }
         let changed = {
-            let mut last = self.livekit_participants.lock().await;
-            if last.get(gid) == Some(&participants) {
-                false
-            } else {
-                last.insert(gid.to_string(), participants.clone());
-                true
-            }
+            let last = self.livekit_participants.lock().await;
+            last.get(gid) != Some(&participants)
         };
         if !changed {
             return;
@@ -3844,7 +3866,15 @@ impl Relay {
             &relay_pubkey,
             now,
         );
-        if self.store_relay_event(&mut event).await.is_err() {
+        if self.store_relay_event(&mut event).await.is_ok() {
+            // Only a stored list is the current one: updating the cache
+            // before the store made a failed publish look like an
+            // unchanged list, so the next poll skipped the retry.
+            self.livekit_participants
+                .lock()
+                .await
+                .insert(gid.to_string(), participants);
+        } else {
             log::warn!("could not publish the livekit participants list for {gid}");
         }
     }
@@ -4501,6 +4531,16 @@ impl Relay {
         event: &Event,
         now: u64,
     ) -> (bool, Option<crate::db::store::PendingDeletion>) {
+        // Serialize the apply and its generated events with a LiveKit
+        // refresh for the same group: a refresh that passed
+        // `is_livekit_group` before a 9002 left LiveKit could otherwise
+        // store a stale 39004 after the leave's empty list (and after its
+        // cache clear), making the stale list the newest replaceable event.
+        let livekit_gid = nip29::group_id(event);
+        let _livekit_guard = match livekit_gid {
+            Some(gid) => Some(self.livekit_lock(gid).lock().await),
+            None => None,
+        };
         let mut removal_failed = false;
         let mut unapplied = None;
         // A `kind:9008` purge may fail (or the process may crash before it
@@ -9466,6 +9506,125 @@ mod tests {
             ))
             .await;
         assert!(text.starts_with("error:"), "{text}");
+    }
+
+    /// A mock LiveKit RoomService `ListParticipants` endpoint. `started`
+    /// signals when a request arrives (so a test can act while the fetch is
+    /// in flight), and the response is the current `participants` list.
+    async fn mock_livekit_list_participants(
+        participants: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        delay_ms: u64,
+    ) -> (String, tokio::sync::mpsc::Receiver<()>) {
+        #[derive(Clone)]
+        struct MockState {
+            participants: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+            started: tokio::sync::mpsc::Sender<()>,
+            delay_ms: u64,
+        }
+        async fn list_participants(
+            axum::extract::State(state): axum::extract::State<MockState>,
+        ) -> axum::Json<serde_json::Value> {
+            let _ = state.started.send(()).await;
+            tokio::time::sleep(std::time::Duration::from_millis(state.delay_ms)).await;
+            let participants = state.participants.lock().unwrap().clone();
+            axum::Json(serde_json::json!({
+                "participants": participants
+                    .iter()
+                    .map(|pubkey| serde_json::json!({ "identity": pubkey }))
+                    .collect::<Vec<_>>()
+            }))
+        }
+        let (started, rx) = tokio::sync::mpsc::channel(4);
+        let state = MockState {
+            participants,
+            started,
+            delay_ms,
+        };
+        let app = axum::Router::new()
+            .route(
+                "/twirp/livekit.RoomService/ListParticipants",
+                axum::routing::post(list_participants),
+            )
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}"), rx)
+    }
+
+    #[tokio::test]
+    async fn a_failed_livekit_publish_keeps_the_previous_list_for_retry() {
+        // A list may only become the cached "current" list after its 39004
+        // was stored: updating the cache before the store made a failed
+        // publish look like an unchanged list, so the next poll skipped the
+        // retry and the stored event stayed stale forever.
+        use crate::db::PutOutcome;
+
+        let relay = build_relay_with_key(false, &"01".repeat(32)).await;
+        let gid = "g1";
+        let participants = std::sync::Arc::new(std::sync::Mutex::new(vec!["aa".repeat(32)]));
+        let (endpoint, _started) =
+            mock_livekit_list_participants(std::sync::Arc::clone(&participants), 0).await;
+        {
+            let mut cfg = relay.config.write().await;
+            cfg.relay.livekit_url = endpoint;
+            cfg.relay.livekit_api_key = "key".into();
+            cfg.relay.livekit_api_secret = "secret".into();
+        }
+        let now = crate::util::unix_now();
+        let secp = secp256k1::Secp256k1::new();
+        let admin = secp256k1::Keypair::from_seckey_slice(&secp, &[4u8; 32]).unwrap();
+        let create = signed_group_event(
+            &secp,
+            &admin,
+            crate::nips::nip29::CREATE_GROUP,
+            gid,
+            vec![],
+            now,
+        );
+        assert!(matches!(
+            relay.accept_event(create, &[], None).await,
+            PutOutcome::Stored
+        ));
+        // A create installs default settings; LiveKit is enabled by a
+        // metadata edit (the same path an operator uses).
+        let enable = signed_group_event(
+            &secp,
+            &admin,
+            9002,
+            gid,
+            vec![
+                vec!["livekit".to_string()],
+                vec!["name".to_string(), "G".to_string()],
+            ],
+            now + 1,
+        );
+        assert!(matches!(
+            relay.accept_event(enable, &[], None).await,
+            PutOutcome::Stored
+        ));
+        assert!(
+            relay.is_livekit_group(gid).await,
+            "the group must be livekit-enabled"
+        );
+        relay.refresh_livekit_participants(gid).await;
+        assert_eq!(
+            relay.livekit_participants.lock().await.get(gid),
+            Some(&vec!["aa".repeat(32)]),
+            "a stored list becomes the cached current list"
+        );
+        // A new list arrives while the database is down: the store fails,
+        // so the cache must keep the old list and the next poll must retry.
+        *participants.lock().unwrap() = vec!["bb".repeat(32)];
+        relay.db.shutdown();
+        relay.refresh_livekit_participants(gid).await;
+        assert_eq!(
+            relay.livekit_participants.lock().await.get(gid),
+            Some(&vec!["aa".repeat(32)]),
+            "a failed publish must not be recorded as the current list"
+        );
     }
 
     /// A NIP-01-signed group event for the rebuild tests.
