@@ -317,11 +317,19 @@ struct FileLogger {
     path: PathBuf,
     max_size: u64,
     max_files: u32,
+    /// Test-only one-shot fault: the next post-rotation reopen fails, so the
+    /// "never write through the rotated handle" path is testable.
+    #[cfg(test)]
+    fail_next_open: std::sync::atomic::AtomicBool,
     inner: Mutex<FileState>,
 }
 
 struct FileState {
-    file: std::fs::File,
+    /// `None` after a failed post-rotation reopen: the previous handle now
+    /// points at the rotated `.1` (the rename moves the inode, not the open
+    /// file description), so writing through it would grow the backup and
+    /// leave the live log missing. `log` retries the open per record.
+    file: Option<std::fs::File>,
     size: u64,
     /// Whether the last write failed (reported once per failure streak, so
     /// a full disk cannot flood the log with one line per record).
@@ -379,14 +387,28 @@ impl FileLogger {
             path,
             max_size,
             max_files: max_files.max(1),
+            #[cfg(test)]
+            fail_next_open: std::sync::atomic::AtomicBool::new(false),
             inner: Mutex::new(FileState {
-                file,
+                file: Some(file),
                 size,
                 write_failed: false,
                 rotate_failed: false,
                 rotate_attempt_size: 0,
             }),
         })
+    }
+
+    /// Opens the live log file (or the test-only injected failure).
+    fn open_current(&self) -> std::io::Result<std::fs::File> {
+        #[cfg(test)]
+        if self
+            .fail_next_open
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(std::io::Error::other("test-only log reopen failure"));
+        }
+        open_log_file(&self.path)
     }
 
     /// Records a logger failure without recursing through the logging
@@ -491,9 +513,9 @@ impl FileLogger {
                 false
             }
         };
-        match open_log_file(&self.path) {
+        match self.open_current() {
             Ok(file) => {
-                state.file = file;
+                state.file = Some(file);
                 // Only a successful rotation may reset the size counter: a
                 // failed rename leaves the (still oversized) current file
                 // in place, and resetting to 0 would stop rotation attempts
@@ -503,6 +525,11 @@ impl FileLogger {
                 }
             }
             Err(e) => {
+                // The old handle was renamed to `.1` (or the current file
+                // was never re-created): never write through it again. The
+                // `log` path retries the open for every record until it
+                // succeeds, so a transient failure heals without a restart.
+                state.file = None;
                 failure.get_or_insert_with(|| format!("cannot reopen log file: {e}"));
             }
         }
@@ -548,7 +575,33 @@ impl log::Log for FileLogger {
     fn log(&self, record: &log::Record) {
         let line = format_record(record);
         let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        match state.file.write_all(line.as_bytes()) {
+        if state.file.is_none() {
+            // A post-rotation reopen failed: the previous handle points at
+            // the rotated `.1`, so retry the live log for this record
+            // instead of growing the backup. The emergency marker (written
+            // once per failure streak) may already have re-created the
+            // file; `metadata` keeps the size accounting honest either way.
+            match self.open_current() {
+                Ok(file) => {
+                    state.size = file.metadata().map(|m| m.len()).unwrap_or(0);
+                    state.file = Some(file);
+                    state.write_failed = false;
+                    // The next rotation budget belongs to the fresh file,
+                    // not to the oversized one that was just rotated away.
+                    state.rotate_failed = false;
+                    state.rotate_attempt_size = 0;
+                }
+                Err(e) => {
+                    if !state.write_failed {
+                        state.write_failed = true;
+                        self.emergency(&format!("cannot reopen the log file: {e}"));
+                    }
+                    return;
+                }
+            }
+        }
+        let file = state.file.as_mut().expect("reopened above");
+        match file.write_all(line.as_bytes()) {
             Ok(()) => {
                 state.write_failed = false;
                 state.size += line.len() as u64;
@@ -567,7 +620,9 @@ impl log::Log for FileLogger {
     }
     fn flush(&self) {
         let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let _ = state.file.flush();
+        if let Some(file) = state.file.as_mut() {
+            let _ = file.flush();
+        }
     }
 }
 
@@ -1058,6 +1113,60 @@ mod tests {
         );
         assert!(backup_path(&path, 2).exists(), ".1 must shift to .2");
         assert!(backup_path(&path, 4).exists(), ".3 must shift to .4");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_reopen_never_writes_to_the_rotated_backup() {
+        // Rotation renames the current log to `.1` and opens a fresh file.
+        // If that open fails, the old handle still points at `.1` (the
+        // rename moves the inode, not the open file description), so
+        // writing through it would grow the backup and leave the live log
+        // missing. The logger must retry the live file per record instead.
+        let dir = std::env::temp_dir().join("nostrfy-log-reopen-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("nostrfy.log");
+        std::fs::write(&path, "old").unwrap();
+        let logger = FileLogger::open(path.clone(), 1 << 20, 2).unwrap();
+        {
+            // Force the first record to rotate without relying on a tiny
+            // max_size: after the failed reopen, the emergency marker would
+            // immediately exceed a tiny size and rotate the live file again.
+            let mut state = logger.inner.lock().unwrap();
+            state.size = 1 << 20;
+        }
+        logger
+            .fail_next_open
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        // The first record goes to the current log; rotation then renames
+        // it and the injected reopen failure drops the handle.
+        let first = log::Record::builder()
+            .args(format_args!("first"))
+            .level(log::Level::Info)
+            .build();
+        logger.log(&first);
+        assert!(
+            backup_path(&path, 1).exists(),
+            "the old log must have rotated to .1"
+        );
+        // The next record retries the open: it belongs to the live log,
+        // never to the rotated backup.
+        let second = log::Record::builder()
+            .args(format_args!("second"))
+            .level(log::Level::Info)
+            .build();
+        logger.log(&second);
+        let live = std::fs::read_to_string(&path).unwrap_or_default();
+        assert!(
+            live.contains("second"),
+            "the record after the failed reopen must land in the live log: {live:?}"
+        );
+        let backup = std::fs::read_to_string(backup_path(&path, 1)).unwrap_or_default();
+        assert!(
+            !backup.contains("second"),
+            "the rotated backup must not receive new records: {backup:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
