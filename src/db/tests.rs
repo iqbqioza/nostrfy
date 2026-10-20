@@ -1165,6 +1165,87 @@ fn an_absent_target_gets_the_deleter_scoped_marker_but_moderation_does_not() {
 }
 
 #[test]
+fn live_absent_target_deleters_never_promote_to_an_unconditional_block() {
+    // F-18-3: on live traffic, SCOPED_TOMBSTONE_MAX + 1 keys naming the same
+    // absent id used to promote the marker to an unconditional tombstone, so
+    // a handful of colluding keys could censor any preselected future event
+    // id (regardless of its author) and grow a marker per target. The live
+    // walk must keep the block scoped and drop the extra deleter; only the
+    // migration (operator-controlled history) may promote, where losing the
+    // author's own deletion would fail open.
+    use crate::db::removal::SCOPED_TOMBSTONE_MAX;
+    use crate::db::store::Store;
+    use crate::db::store::{ID_LEN, deletion_marker_blocks};
+    use std::sync::atomic::AtomicBool;
+
+    let store = Store::open(&config(), Arc::new(AtomicBool::new(true)), 512).unwrap();
+    let now = 1_000_000u64;
+    let absent = authored_event(1, &"aa".repeat(32), "late", now, vec![]);
+    let absent_id = hex::decode(&absent.id).unwrap();
+    let deleters: Vec<String> = (1..=SCOPED_TOMBSTONE_MAX + 1)
+        .map(|i| format!("{i:064x}"))
+        .collect();
+    for (index, deleter) in deleters.iter().enumerate() {
+        let report = store.apply_deletion_group(
+            std::slice::from_ref(&absent.id),
+            &[],
+            Some(deleter),
+            now,
+            None,
+            false,
+        );
+        assert_eq!(report.removed, 0, "the target is not held");
+        let rtxn = store.env.read_txn().unwrap();
+        let marker = store
+            .deleted
+            .get(&rtxn, &absent_id)
+            .unwrap()
+            .expect("every live deleter records a scoped marker");
+        assert_eq!(
+            marker.len(),
+            (index + 1).min(SCOPED_TOMBSTONE_MAX) * ID_LEN,
+            "the live marker stays scoped to at most {SCOPED_TOMBSTONE_MAX} deleters"
+        );
+        assert!(
+            !marker.is_empty() || index + 1 >= SCOPED_TOMBSTONE_MAX,
+            "live traffic must never promote to an unconditional block"
+        );
+    }
+    // The first four deleters remain blocked; the fifth (dropped) fails open
+    // only for itself — never for another author.
+    let rtxn = store.env.read_txn().unwrap();
+    let marker = store
+        .deleted
+        .get(&rtxn, &absent_id)
+        .unwrap()
+        .unwrap()
+        .to_vec();
+    for (index, deleter) in deleters.iter().enumerate() {
+        let event = authored_event(1, deleter, "x", now, vec![]);
+        assert_eq!(
+            deletion_marker_blocks(&marker, &event),
+            index < SCOPED_TOMBSTONE_MAX,
+            "deleter {index}'s re-publication block state"
+        );
+    }
+    drop(rtxn);
+    // The migration pass still promotes a full scoped list (operator data).
+    let extra = format!("{:064x}", 99u32);
+    store
+        .record_absent_deletion_targets(
+            &hex::decode(&extra).unwrap(),
+            std::slice::from_ref(&absent.id),
+        )
+        .unwrap();
+    let rtxn = store.env.read_txn().unwrap();
+    assert_eq!(
+        store.deleted.get(&rtxn, &absent_id).unwrap(),
+        Some([].as_slice()),
+        "the migration may promote a full scoped marker"
+    );
+}
+
+#[test]
 fn is_replaceable() {
     assert!(super::store::is_replaceable(&event(10000, "", 1, vec![])));
     assert!(super::store::is_replaceable(&event(30023, "", 1, vec![])));

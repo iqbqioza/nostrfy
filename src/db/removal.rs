@@ -24,12 +24,14 @@ use crate::nips::nip09;
 /// so entries the caller leaves in place cannot loop forever.
 const REMOVAL_CHUNK: usize = 4096;
 
-/// How many deleter pubkeys one migration-recorded (absent-target) tombstone
-/// keeps. Bounds the marker value when many deletion requests name the same
-/// missing id; beyond the bound the marker becomes unconditional (the id
-/// was deleted by many keys, and dropping the extra deleter would fail open
-/// when it is the author's own deletion).
-const SCOPED_TOMBSTONE_MAX: usize = 4;
+/// How many deleter pubkeys one absent-target tombstone keeps. Bounds the
+/// marker value when many deletion requests name the same missing id.
+/// Past the bound the extra deleter is dropped on the live path (keeping
+/// the marker scoped) so a handful of keys cannot promote an arbitrary
+/// absent id to an unconditional, cross-author block; the migration, which
+/// replays operator-controlled history, may still promote (see
+/// [`Store::extend_absent_deletion_marker`]).
+pub(crate) const SCOPED_TOMBSTONE_MAX: usize = 4;
 
 /// The partial outcome of a chunked removal walk: what was removed before
 /// the walk ended, which derived-state families the removed events feed
@@ -121,10 +123,13 @@ impl Store {
     /// The value is one or more 32-byte deleter pubkeys (at most
     /// [`SCOPED_TOMBSTONE_MAX`]), so only those authors' re-publication is
     /// blocked — the event id commits to its author, and this mirrors
-    /// strfry's `(id, pubkey)` deletion record. Returns how many absent
-    /// targets carry a re-publication block after the pass (the live
-    /// deletion walk records the same marker while replaying the request,
-    /// so this pass is then usually a no-op).
+    /// strfry's `(id, pubkey)` deletion record. Only this migration pass
+    /// promotes a full scoped list to an unconditional tombstone (see
+    /// [`Self::extend_absent_deletion_marker`]): the live walk keeps it
+    /// scoped, so live traffic cannot censor an arbitrary absent id.
+    /// Returns how many absent targets carry a re-publication block after
+    /// the pass (the live deletion walk records the same scoped marker while
+    /// replaying the request, so this pass is then usually a no-op).
     pub(crate) fn record_absent_deletion_targets(
         &self,
         pubkey: &[u8],
@@ -150,7 +155,7 @@ impl Store {
             // Record the marker — the live deletion walk recorded the same
             // one while replaying the request, so this is usually a no-op —
             // and count the target: either way the block is in place.
-            self.extend_absent_deletion_marker(&mut wtxn, &id, pubkey)?;
+            self.extend_absent_deletion_marker(&mut wtxn, &id, pubkey, true)?;
             recorded += 1;
         }
         wtxn.commit()?;
@@ -165,13 +170,22 @@ impl Store {
     /// recipient, which `deletion_marker_blocks` matches by `p` tag). An
     /// unconditional (empty) or corrupt marker already blocks the id and is
     /// left as is; a scoped marker gains the deleter unless it is already
-    /// covered, and a full scoped list falls back to an unconditional
-    /// tombstone (the earliest deleters win).
+    /// covered.
+    ///
+    /// `promote` decides what happens when the scoped list is full: the
+    /// migration (`true`) falls back to an unconditional tombstone so the
+    /// author's own deletion is not lost, while the live paths (`false`)
+    /// keep the marker scoped and drop the extra deleter. Promotion is a
+    /// cross-author block, and on live traffic a handful of keys could use
+    /// it to censor an arbitrary absent id (and grow a marker per target);
+    /// the price is that a fifth deleter's own re-publication is not
+    /// blocked, which fails open only for that deleter.
     fn extend_absent_deletion_marker(
         &self,
         wtxn: &mut heed::RwTxn,
         id: &[u8],
         pubkey: &[u8],
+        promote: bool,
     ) -> Result<()> {
         match self.deleted.get(wtxn, id)? {
             Some(existing) => {
@@ -184,12 +198,26 @@ impl Store {
                     return Ok(());
                 }
                 if existing.len() >= ID_LEN * SCOPED_TOMBSTONE_MAX {
-                    // More deleters than the scoped list holds. Dropping this
-                    // one would fail open when it is the author's own deletion
-                    // (the target is absent precisely because it was deleted on
-                    // the author's request), so fall back to an unconditional
-                    // tombstone: the event id was deleted by many keys, and
-                    // NIP-09 makes the deletion permanent for that id.
+                    if !promote {
+                        // Live traffic: keep the block scoped. An
+                        // unconditional marker here would let SCOPED_TOMBSTONE_MAX
+                        // + 1 keys censor any absent event id regardless of
+                        // its author. Debug, not warn: a client can trigger
+                        // this with many deleters, so a warn would be a log
+                        // flood vector.
+                        log::debug!(
+                            "deletion target {} already has {SCOPED_TOMBSTONE_MAX} \
+                             deleters; keeping the re-publication block scoped",
+                            hex::encode(id)
+                        );
+                        return Ok(());
+                    }
+                    // The migration replays operator-controlled history:
+                    // dropping this deleter would fail open when it is the
+                    // author's own deletion, so fall back to an
+                    // unconditional tombstone (the event id was deleted by
+                    // many keys, and NIP-09 makes the deletion permanent for
+                    // that id).
                     log::warn!(
                         "deletion target {} has more than {SCOPED_TOMBSTONE_MAX} \
                          deleters; recording an unconditional re-publication block",
@@ -284,7 +312,7 @@ impl Store {
                 // the same wrap is stored again and undoes the recipient's
                 // deletion; the migration records the same marker, so live
                 // and migrated databases agree.
-                self.extend_absent_deletion_marker(&mut wtxn, &id, pubkey)?;
+                self.extend_absent_deletion_marker(&mut wtxn, &id, pubkey, false)?;
                 self.remove_event(&mut wtxn, &id)?;
                 *removed += 1;
             }
@@ -420,7 +448,7 @@ impl Store {
                         && let Ok(pubkey) = hex::decode(pubkey)
                         && pubkey.len() == ID_LEN
                     {
-                        self.extend_absent_deletion_marker(&mut wtxn, &id, &pubkey)?;
+                        self.extend_absent_deletion_marker(&mut wtxn, &id, &pubkey, false)?;
                     }
                     continue;
                 };
