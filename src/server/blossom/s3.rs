@@ -18,6 +18,81 @@ const S3_HEADER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30
 /// blobs, but a stalled endpoint must not pin the upload permit forever.
 const S3_PUT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// Bounded retries for idempotent S3 operations: a transient 5xx/429 or a
+/// connection reset must not surface as a generic 500 on the first try.
+const S3_RETRY_ATTEMPTS: usize = 3;
+const S3_RETRY_BASE_MS: u64 = 50;
+
+/// Why one signed request failed before a response arrived.
+enum SendFailure {
+    Request(reqwest::Error),
+    Timeout,
+}
+
+/// One S3 operation's request parameters (grouped to keep the retry
+/// helpers within clippy's argument budget).
+struct SignedRequest<'a> {
+    http: &'a reqwest::Client,
+    method: &'a str,
+    key: &'a str,
+    query: &'a str,
+    body: Option<&'a [u8]>,
+    content_type: Option<&'a str>,
+    extra_headers: &'a [(&'a str, &'a str)],
+    timeout: Option<std::time::Duration>,
+}
+
+fn retryable_status(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 429 | 500 | 502 | 503 | 504)
+}
+
+/// The upstream `Retry-After` (seconds), when it is a plain number.
+fn retry_after(response: &reqwest::Response) -> Option<u64> {
+    response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+}
+
+/// Backoff before retrying `attempt` (1-based). A long `Retry-After` is
+/// honored by returning `None` (propagate the throttling response instead
+/// of sleeping in the request handler).
+fn retry_delay(
+    attempt: usize,
+    response: Option<&reqwest::Response>,
+) -> Option<std::time::Duration> {
+    if let Some(response) = response
+        && let Some(secs) = retry_after(response)
+    {
+        if secs > 1 {
+            return None;
+        }
+        return Some(std::time::Duration::from_secs(secs));
+    }
+    Some(std::time::Duration::from_millis(
+        S3_RETRY_BASE_MS * (1u64 << (attempt.saturating_sub(1)).min(3)),
+    ))
+}
+
+/// Maps a final (post-retry) status to an error. Throttling/unavailable
+/// statuses stay typed so the HTTP layer can propagate 429/503 and the
+/// upstream `Retry-After`; other failures keep the operation-specific
+/// message the logs/tests already use.
+fn status_error(
+    operation: &str,
+    status: reqwest::StatusCode,
+    retry_after: Option<u64>,
+) -> anyhow::Error {
+    if matches!(status.as_u16(), 429 | 503) {
+        return anyhow::Error::new(super::storage::UpstreamStatus {
+            status: status.as_u16(),
+            retry_after,
+        });
+    }
+    anyhow!(format!("s3 {operation} failed: {status}"))
+}
+
 #[derive(Clone)]
 pub(crate) struct S3Client {
     endpoint: String,
@@ -78,8 +153,107 @@ impl S3Client {
         format!("{}/{}/{}", self.endpoint, self.bucket, encoded_key(key))
     }
 
-    /// Sends a signed request and returns the raw response (the caller
-    /// reads the body — either fully, or streamed for large objects).
+    /// Sends one signed request. The signature is rebuilt on every call
+    /// because `x-amz-date` changes; retries call this again.
+    async fn send_once(
+        &self,
+        request: &SignedRequest<'_>,
+    ) -> std::result::Result<reqwest::Response, SendFailure> {
+        let url = self.url(request.key);
+        let url = if request.query.is_empty() {
+            url
+        } else {
+            format!("{url}?{}", request.query)
+        };
+        let now = crate::util::unix_now();
+        let amz_date = amz_datetime(now);
+        let date = &amz_date[..8];
+        let payload_hash =
+            if request.body.is_some() || request.method == "PUT" || request.method == "GET" {
+                sha256_hex(request.body.unwrap_or(b""))
+            } else {
+                // HEAD/DELETE may be signed without a payload hash
+                // ("UNSIGNED-PAYLOAD" is accepted by R2 and S3 for these).
+                "UNSIGNED-PAYLOAD".to_string()
+            };
+        let authorization = self.sign(
+            request.method,
+            request.key,
+            request.query,
+            &payload_hash,
+            &amz_date,
+            date,
+            request.content_type,
+            request.extra_headers,
+        );
+        let mut builder = request
+            .http
+            .request(
+                reqwest::Method::from_bytes(request.method.as_bytes()).unwrap(),
+                &url,
+            )
+            .header("x-amz-date", &amz_date)
+            .header("x-amz-content-sha256", &payload_hash)
+            .header("Authorization", authorization);
+        if let Some(ct) = request.content_type {
+            builder = builder.header("Content-Type", ct);
+        }
+        for (name, value) in request.extra_headers {
+            builder = builder.header(*name, *value);
+        }
+        if let Some(bytes) = request.body {
+            builder = builder.body(bytes.to_vec());
+        }
+        let send = builder.send();
+        match request.timeout {
+            Some(limit) => match tokio::time::timeout(limit, send).await {
+                Ok(Ok(response)) => Ok(response),
+                Ok(Err(e)) => Err(SendFailure::Request(e)),
+                Err(_) => Err(SendFailure::Timeout),
+            },
+            None => send.await.map_err(SendFailure::Request),
+        }
+    }
+
+    /// Sends a signed request with bounded retries for transient upstream
+    /// failures. Only the initial response is retried (a body stream that
+    /// fails mid-transfer cannot be resumed transparently).
+    async fn send_retrying(&self, request: &SignedRequest<'_>) -> Result<reqwest::Response> {
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            match self.send_once(request).await {
+                Ok(response) => {
+                    if attempt < S3_RETRY_ATTEMPTS
+                        && retryable_status(response.status())
+                        && let Some(delay) = retry_delay(attempt, Some(&response))
+                    {
+                        drop(response);
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                    return Ok(response);
+                }
+                Err(SendFailure::Request(e)) => {
+                    // A spent total timeout or a malformed builder is not
+                    // transient; only connection-level failures retry.
+                    if attempt < S3_RETRY_ATTEMPTS
+                        && !e.is_timeout()
+                        && !e.is_builder()
+                        && let Some(delay) = retry_delay(attempt, None)
+                    {
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                    return Err(anyhow!(format!("s3 request failed: {e}")));
+                }
+                Err(SendFailure::Timeout) => {
+                    return Err(anyhow!("s3 request timed out waiting for a response"));
+                }
+            }
+        }
+    }
+
     async fn request(
         &self,
         method: &str,
@@ -89,61 +263,23 @@ impl S3Client {
         content_type: Option<&str>,
         extra_headers: &[(&str, &str)],
     ) -> Result<reqwest::Response> {
-        let url = self.url(key);
-        let url = if query.is_empty() {
-            url
-        } else {
-            format!("{url}?{query}")
-        };
-        let now = crate::util::unix_now();
-        let amz_date = amz_datetime(now);
-        let date = &amz_date[..8];
-        let payload_hash = if body.is_some() || matches!(method, "PUT") || method == "GET" {
-            sha256_hex(body.unwrap_or(b""))
-        } else {
-            // HEAD/DELETE may be signed without a payload hash ("UNSIGNED-PAYLOAD"
-            // is accepted by R2 and S3 for these).
-            "UNSIGNED-PAYLOAD".to_string()
-        };
-        let authorization = self.sign(
+        self.send_retrying(&SignedRequest {
+            http: &self.http,
             method,
             key,
             query,
-            &payload_hash,
-            &amz_date,
-            date,
+            body,
             content_type,
             extra_headers,
-        );
-
-        let mut builder = self
-            .http
-            .request(
-                reqwest::Method::from_bytes(method.as_bytes()).unwrap(),
-                &url,
-            )
-            .header("x-amz-date", &amz_date)
-            .header("x-amz-content-sha256", &payload_hash)
-            .header("Authorization", authorization);
-        if let Some(ct) = content_type {
-            builder = builder.header("Content-Type", ct);
-        }
-        for (name, value) in extra_headers {
-            builder = builder.header(*name, *value);
-        }
-        if let Some(bytes) = body {
-            builder = builder.body(bytes.to_vec());
-        }
-        builder
-            .send()
-            .await
-            .map_err(|e| anyhow!(format!("s3 request failed: {e}")))
+            timeout: None,
+        })
+        .await
     }
 
     /// Like [`Self::request`] but on the unbounded-streaming client, used
     /// only by the blob GET whose body is relayed to the client (a total
     /// timeout would truncate slow downloads; the client connection
-    /// bounds the stream lifetime).
+    /// bounds the stream lifetime). The header wait is bounded per attempt.
     async fn request_stream(
         &self,
         method: &str,
@@ -152,53 +288,17 @@ impl S3Client {
         content_type: Option<&str>,
         extra_headers: &[(&str, &str)],
     ) -> Result<reqwest::Response> {
-        let url = self.url(key);
-        let url = if query.is_empty() {
-            url
-        } else {
-            format!("{url}?{query}")
-        };
-        let now = crate::util::unix_now();
-        let amz_date = amz_datetime(now);
-        let date = &amz_date[..8];
-        let payload_hash = if method == "GET" {
-            sha256_hex(b"")
-        } else {
-            "UNSIGNED-PAYLOAD".to_string()
-        };
-        let authorization = self.sign(
+        self.send_retrying(&SignedRequest {
+            http: &self.http_stream,
             method,
             key,
             query,
-            &payload_hash,
-            &amz_date,
-            date,
+            body: None,
             content_type,
             extra_headers,
-        );
-        let mut builder = self
-            .http_stream
-            .request(
-                reqwest::Method::from_bytes(method.as_bytes()).unwrap(),
-                &url,
-            )
-            .header("x-amz-date", &amz_date)
-            .header("x-amz-content-sha256", &payload_hash)
-            .header("Authorization", authorization);
-        if let Some(ct) = content_type {
-            builder = builder.header("Content-Type", ct);
-        }
-        for (name, value) in extra_headers {
-            builder = builder.header(*name, *value);
-        }
-        // Bound the header wait: the streaming client has no total timeout
-        // (bodies may be large), but an unresponsive endpoint must not hold
-        // a Blossom permit or connection forever.
-        match tokio::time::timeout(S3_HEADER_TIMEOUT, builder.send()).await {
-            Ok(Ok(response)) => Ok(response),
-            Ok(Err(e)) => Err(anyhow!(format!("s3 request failed: {e}"))),
-            Err(_) => Err(anyhow!("s3 request timed out waiting for a response")),
-        }
+            timeout: Some(S3_HEADER_TIMEOUT),
+        })
+        .await
     }
 
     async fn send(
@@ -209,17 +309,18 @@ impl S3Client {
         body: Option<&[u8]>,
         content_type: Option<&str>,
         extra_headers: &[(&str, &str)],
-    ) -> Result<(reqwest::StatusCode, Vec<u8>)> {
+    ) -> Result<(reqwest::StatusCode, Vec<u8>, Option<u64>)> {
         let resp = self
             .request(method, key, query, body, content_type, extra_headers)
             .await?;
         let status = resp.status();
+        let retry_after = retry_after(&resp);
         let bytes = resp
             .bytes()
             .await
             .map_err(|e| anyhow!(format!("s3 response failed: {e}")))?
             .to_vec();
-        Ok((status, bytes))
+        Ok((status, bytes, retry_after))
     }
 
     /// Builds the SigV4 `Authorization` header.
@@ -295,11 +396,11 @@ impl S3Client {
 
     #[cfg(test)]
     pub(crate) async fn put_object(&self, key: &str, bytes: &[u8], mime: &str) -> Result<()> {
-        let (status, _) = self
+        let (status, _, retry_after) = self
             .send("PUT", key, "", Some(bytes), Some(mime), &[])
             .await?;
         if !status.is_success() {
-            return Err(anyhow!(format!("s3 put failed: {status}")));
+            return Err(status_error("put", status, retry_after));
         }
         Ok(())
     }
@@ -313,68 +414,105 @@ impl S3Client {
     ) -> Result<()> {
         use tokio::io::AsyncReadExt;
 
-        let file = tokio::fs::File::open(path).await?;
-        let stream = futures_util::stream::unfold(file, |mut file| async move {
-            let mut chunk = vec![0u8; 64 * 1024];
-            match file.read(&mut chunk).await {
-                Ok(0) => None,
-                Ok(n) => {
-                    chunk.truncate(n);
-                    Some((Ok::<bytes::Bytes, std::io::Error>(chunk.into()), file))
+        // PUT is idempotent for the same key/bytes: a transient status or
+        // connection failure is retried by reopening the source file and
+        // rebuilding the stream.
+        for attempt in 1..=S3_RETRY_ATTEMPTS {
+            let file = tokio::fs::File::open(path).await?;
+            let stream = futures_util::stream::unfold(file, |mut file| async move {
+                let mut chunk = vec![0u8; 64 * 1024];
+                match file.read(&mut chunk).await {
+                    Ok(0) => None,
+                    Ok(n) => {
+                        chunk.truncate(n);
+                        Some((Ok::<bytes::Bytes, std::io::Error>(chunk.into()), file))
+                    }
+                    Err(e) => Some((Err(e), file)),
                 }
-                Err(e) => Some((Err(e), file)),
+            });
+            let url = self.url(key);
+            let now = crate::util::unix_now();
+            let amz_date = amz_datetime(now);
+            let date = &amz_date[..8];
+            let payload_hash = "UNSIGNED-PAYLOAD";
+            let authorization = self.sign(
+                "PUT",
+                key,
+                "",
+                payload_hash,
+                &amz_date,
+                date,
+                Some(mime),
+                &[("Content-Length", &size.to_string())],
+            );
+            // Total bound for the upload: generous for large blobs, but a
+            // stalled endpoint must not pin the upload permit forever.
+            let response = match tokio::time::timeout(
+                S3_PUT_TIMEOUT,
+                self.http_stream
+                    .put(url)
+                    .header("x-amz-date", &amz_date)
+                    .header("x-amz-content-sha256", payload_hash)
+                    .header("Authorization", authorization)
+                    .header("Content-Type", mime)
+                    .header("Content-Length", size)
+                    .body(reqwest::Body::wrap_stream(stream))
+                    .send(),
+            )
+            .await
+            {
+                Ok(Ok(response)) => response,
+                Ok(Err(e)) => {
+                    if attempt < S3_RETRY_ATTEMPTS
+                        && !e.is_timeout()
+                        && let Some(delay) = retry_delay(attempt, None)
+                    {
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                    return Err(anyhow!(format!("s3 request failed: {e}")));
+                }
+                Err(_) => return Err(anyhow!("s3 put timed out")),
+            };
+            let status = response.status();
+            if status.is_success() {
+                return Ok(());
             }
-        });
-        let url = self.url(key);
-        let now = crate::util::unix_now();
-        let amz_date = amz_datetime(now);
-        let date = &amz_date[..8];
-        let payload_hash = "UNSIGNED-PAYLOAD";
-        let authorization = self.sign(
-            "PUT",
-            key,
-            "",
-            payload_hash,
-            &amz_date,
-            date,
-            Some(mime),
-            &[("Content-Length", &size.to_string())],
-        );
-        // Total bound for the upload: generous for large blobs, but a
-        // stalled endpoint must not pin the upload permit forever.
-        let response = match tokio::time::timeout(
-            S3_PUT_TIMEOUT,
-            self.http_stream
-                .put(url)
-                .header("x-amz-date", &amz_date)
-                .header("x-amz-content-sha256", payload_hash)
-                .header("Authorization", authorization)
-                .header("Content-Type", mime)
-                .header("Content-Length", size)
-                .body(reqwest::Body::wrap_stream(stream))
-                .send(),
-        )
-        .await
-        {
-            Ok(Ok(response)) => response,
-            Ok(Err(e)) => return Err(anyhow!(format!("s3 request failed: {e}"))),
-            Err(_) => return Err(anyhow!("s3 put timed out")),
-        };
-        if !response.status().is_success() {
-            return Err(anyhow!(format!("s3 put failed: {}", response.status())));
+            if attempt < S3_RETRY_ATTEMPTS
+                && retryable_status(status)
+                && let Some(delay) = retry_delay(attempt, Some(&response))
+            {
+                drop(response);
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+            return Err(status_error("put", status, retry_after(&response)));
         }
-        Ok(())
+        unreachable!("the retry loop returns on its last attempt")
     }
 
     pub(crate) async fn get_object(&self, key: &str) -> Result<Option<Vec<u8>>> {
-        let (status, bytes) = self.send("GET", key, "", None, None, &[]).await?;
+        let (status, bytes, retry_after) = self.send("GET", key, "", None, None, &[]).await?;
         if status == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
         if !status.is_success() {
-            return Err(anyhow!(format!("s3 get failed: {status}")));
+            return Err(status_error("get", status, retry_after));
         }
         Ok(Some(bytes))
+    }
+
+    /// A HEAD request: existence without downloading the object (the
+    /// Blossom HEAD path must not issue a full GET and discard the body).
+    pub(crate) async fn head_object(&self, key: &str) -> Result<bool> {
+        let (status, _, retry_after) = self.send("HEAD", key, "", None, None, &[]).await?;
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+        if !status.is_success() {
+            return Err(status_error("head", status, retry_after));
+        }
+        Ok(true)
     }
 
     /// Fetches the `bytes=start-(start+len-1)` range and returns the raw
@@ -408,7 +546,7 @@ impl S3Client {
             return Ok(None);
         }
         if !status.is_success() {
-            return Err(anyhow!(format!("s3 get failed: {status}")));
+            return Err(status_error("get", status, retry_after(&resp)));
         }
         Ok(Some(resp))
     }
@@ -417,11 +555,16 @@ impl S3Client {
         // S3 answers 204 for DELETE of a missing key, so existence is
         // checked with a HEAD first (the caller's `existed` flag must be
         // meaningful).
-        let (head, _) = self.send("HEAD", key, "", None, None, &[]).await?;
+        let (head, _, head_retry) = self.send("HEAD", key, "", None, None, &[]).await?;
         if head == reqwest::StatusCode::NOT_FOUND {
             return Ok(false);
         }
-        let (status, _) = self.send("DELETE", key, "", None, None, &[]).await?;
+        if !head.is_success() {
+            // A failed existence probe means the DELETE result would be
+            // meaningless; surface it instead of guessing.
+            return Err(status_error("delete", head, head_retry));
+        }
+        let (status, _, retry_after) = self.send("DELETE", key, "", None, None, &[]).await?;
         if status == reqwest::StatusCode::NOT_FOUND {
             return Ok(false);
         }
@@ -429,7 +572,7 @@ impl S3Client {
             // Propagate the failure: the caller must not drop the owner
             // mapping for an object that is still in the bucket (that
             // would orphan a billed object with no way to delete it).
-            return Err(anyhow!(format!("s3 delete failed: {status}")));
+            return Err(status_error("delete", status, retry_after));
         }
         Ok(true)
     }
@@ -470,9 +613,9 @@ impl S3Client {
                 format!("&continuation-token={}", percent_encode(token))
             }
         );
-        let (status, bytes) = self.send("GET", "", &query, None, None, &[]).await?;
+        let (status, bytes, retry_after) = self.send("GET", "", &query, None, None, &[]).await?;
         if !status.is_success() {
-            return Err(anyhow!(format!("s3 list failed: {status}")));
+            return Err(status_error("list", status, retry_after));
         }
         let xml = String::from_utf8_lossy(&bytes);
         let mut keys = Vec::new();
@@ -700,6 +843,20 @@ pub(crate) mod mock_server {
         Response::new(Body::from(data))
     }
 
+    async fn head(
+        Path((_bucket, key)): Path<(String, String)>,
+        State(store): State<Store>,
+    ) -> Response {
+        match store.lock().unwrap().get(&key) {
+            Some(data) => Response::builder()
+                .status(StatusCode::OK)
+                .header("content-length", data.len())
+                .body(Body::empty())
+                .unwrap(),
+            None => StatusCode::NOT_FOUND.into_response(),
+        }
+    }
+
     async fn delete(
         Path((_bucket, key)): Path<(String, String)>,
         State(store): State<Store>,
@@ -778,7 +935,7 @@ pub(crate) mod mock_server {
         let app = axum::Router::new()
             .route(
                 "/{bucket}/{*key}",
-                axum::routing::put(put).get(get).delete(delete),
+                axum::routing::put(put).get(get).head(head).delete(delete),
             )
             .route("/{bucket}/", axum::routing::get(list))
             .with_state(store.clone());
@@ -828,6 +985,11 @@ pub(crate) mod mock_server {
         let missing = client.get_object_range("nope", 0, 8).await.unwrap();
         assert!(missing.is_none());
 
+        // HEAD: existence without a body (the Blossom HEAD path uses this
+        // instead of fetching the object).
+        assert!(client.head_object("dir/file.txt").await.unwrap());
+        assert!(!client.head_object("nope").await.unwrap());
+
         // delete_object: present -> true, missing -> false.
         assert!(client.delete_object("dir/file.txt").await.unwrap());
         assert!(!client.delete_object("dir/file.txt").await.unwrap());
@@ -875,6 +1037,76 @@ pub(crate) mod mock_server {
         assert!(err.to_string().contains("delete failed"), "{err}");
         let err = failing.list_keys("").await.unwrap_err();
         assert!(err.to_string().contains("list failed"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn transient_s3_statuses_are_retried_and_throttling_propagates() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // A bucket that answers 503 twice (with Retry-After: 0) and then
+        // succeeds: the client must retry rather than surface the first
+        // transient failure.
+        let hits = Arc::new(AtomicUsize::new(0));
+        let app = axum::Router::new().route(
+            "/bucket/{*key}",
+            axum::routing::get({
+                let hits = Arc::clone(&hits);
+                move || {
+                    let attempt = hits.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        if attempt < 2 {
+                            (
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                [("retry-after", "0")],
+                                "busy",
+                            )
+                                .into_response()
+                        } else {
+                            "hello".into_response()
+                        }
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = S3Client::new(&format!("http://{addr}"), "us-east-1", "bucket", "ak", "sk");
+        assert_eq!(
+            client.get_object("k").await.unwrap().unwrap(),
+            b"hello",
+            "two transient 503s must be retried"
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
+
+        // A persistent 429 must not be flattened to a generic storage
+        // fault: the typed error carries the upstream status and the
+        // Retry-After for the HTTP layer.
+        let app = axum::Router::new().route(
+            "/bucket/{*key}",
+            axum::routing::get(|| async {
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    [("retry-after", "0")],
+                    "slow down",
+                )
+                    .into_response()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let throttled = S3Client::new(&format!("http://{addr}"), "us-east-1", "bucket", "ak", "sk");
+        let err = throttled.get_object("k").await.unwrap_err();
+        let upstream = err
+            .downcast_ref::<super::super::storage::UpstreamStatus>()
+            .expect("429 must stay typed");
+        assert_eq!(upstream.status, 429);
+        assert_eq!(upstream.retry_after, Some(0));
     }
 
     #[test]

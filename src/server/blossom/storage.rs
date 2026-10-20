@@ -74,6 +74,24 @@ fn db_unavailable() -> anyhow::Error {
     anyhow::Error::new(DbUnavailable)
 }
 
+/// An S3-compatible backend returned a throttling/unavailable status after
+/// the client's bounded retries. The handlers propagate 429/503 (and the
+/// upstream `Retry-After`) instead of misreporting the backend as a generic
+/// storage fault (500).
+#[derive(Debug)]
+pub(crate) struct UpstreamStatus {
+    pub(crate) status: u16,
+    pub(crate) retry_after: Option<u64>,
+}
+
+impl std::fmt::Display for UpstreamStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "upstream storage returned {}", self.status)
+    }
+}
+
+impl std::error::Error for UpstreamStatus {}
+
 /// A new owner past the per-blob cap. This is a client-visible conflict
 /// (the database refuses the same add), not an internal fault: the handler
 /// answers 409 instead of the generic 500.
@@ -94,6 +112,16 @@ impl std::error::Error for BlobOwnerLimit {}
 /// enforces the real cap, so a drift degrades the status to 500, never
 /// correctness.
 const MAX_BLOB_OWNERS: usize = 64;
+
+/// How long an all-owners-missing observation suppresses the owner scan.
+/// An upload of the same hash clears the entry immediately; a short TTL
+/// also recovers from an out-of-band restoration (another relay instance
+/// writing the shared bucket).
+const MISSING_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Upper bound on the negative cache (a lost object is one entry per
+/// sha256; the map must not grow without bound).
+const MISSING_CACHE_MAX: usize = 1024;
 
 /// The outcome of a store-level object lookup. `Missing` is a definitive
 /// "the object is not there" (local `NotFound`, S3 `404`); `Refused` means
@@ -138,6 +166,11 @@ pub(crate) struct BlobStore {
     /// orphan/interrupted-upload signal. Exposed via
     /// [`Self::orphan_spools_swept`] for the stats owner.
     orphan_spools_swept: std::sync::atomic::AtomicU64,
+    /// Blobs observed with a mapping but no reachable object. Without this,
+    /// every GET of a lost blob walks all owners (up to 64) × two npub
+    /// spellings, issuing that many S3 GETs each time. Uploads clear the
+    /// entry; unmapped hashes are never cached.
+    missing_objects: std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
     /// Test-only one-shot fault injection: the next owner-mapping commit is
     /// treated as a database failure so the publish-first ordering (an
     /// orphan object, never a phantom mapping) is testable without a real
@@ -177,6 +210,7 @@ impl BlobStore {
                 .map(|_| tokio::sync::Mutex::new(()))
                 .collect(),
             orphan_spools_swept: std::sync::atomic::AtomicU64::new(0),
+            missing_objects: std::sync::Mutex::new(std::collections::HashMap::new()),
             #[cfg(test)]
             fail_next_mapping: std::sync::atomic::AtomicBool::new(false),
         })
@@ -376,6 +410,7 @@ impl BlobStore {
             Storage::S3(s) => s.put(&npub, sha256, bytes, mime, uploaded).await,
         };
         stored?;
+        self.forget_missing(sha256);
         if !self
             .commit_owner(sha256, mime, bytes.len() as u64, uploaded, pubkey)
             .await
@@ -453,6 +488,7 @@ impl BlobStore {
         // would be a phantom that 404s and consumes an owner slot. A
         // failed publish leaves the pre-existing mapping untouched.
         stored?;
+        self.forget_missing(sha256);
         if !self
             .commit_owner(sha256, mime, size, uploaded, pubkey)
             .await
@@ -509,12 +545,60 @@ impl BlobStore {
         }))
     }
 
+    /// Whether a recent lookup found every owner's object missing: the
+    /// owner scan is skipped until the entry expires or an upload clears
+    /// it. See [`Self::remember_missing`].
+    fn missing_cached(&self, sha256: &str) -> bool {
+        let mut cache = self
+            .missing_objects
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match cache.get(sha256) {
+            Some(at) if at.elapsed() < MISSING_CACHE_TTL => true,
+            Some(_) => {
+                cache.remove(sha256);
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// Records a definitive all-owners-missing lookup. The map is bounded:
+    /// expired entries are pruned first, and a still-full map is cleared
+    /// (the cache is an optimization, never a correctness requirement).
+    fn remember_missing(&self, sha256: &str) {
+        let mut cache = self
+            .missing_objects
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if cache.len() >= MISSING_CACHE_MAX {
+            cache.retain(|_, at| at.elapsed() < MISSING_CACHE_TTL);
+            if cache.len() >= MISSING_CACHE_MAX {
+                cache.clear();
+            }
+        }
+        cache.insert(sha256.to_string(), std::time::Instant::now());
+    }
+
+    /// Clears the negative cache for a hash (an upload healed the object).
+    fn forget_missing(&self, sha256: &str) {
+        self.missing_objects
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(sha256);
+    }
+
     /// Opens a blob by hash, trying every owner in upload order. The first
     /// owner's file may be gone (crash/manual delete) while a later owner's
     /// copy is intact: opening only `owners[0]` would 404 a retrievable
     /// blob. A storage error for one owner (S3 5xx, local I/O error) is
     /// logged and skipped for the same reason; it is only returned when no
     /// owner could be opened.
+    ///
+    /// A prior all-owners-missing result is served from the negative cache
+    /// (see [`Self::missing_cached`]) so a lost object does not repeat the
+    /// 64-owner × 2-spelling scan on every request.
+    ///
     /// Returns the stream and the owner whose file was opened.
     pub(crate) async fn open_stream_any(
         &self,
@@ -531,12 +615,18 @@ impl BlobStore {
         let Some(meta) = meta else {
             return Ok(None);
         };
+        if self.missing_cached(sha256) {
+            return Ok(None);
+        }
         let mut last_error: Option<anyhow::Error> = None;
         let mut missing = false;
         for owner in &meta.owners {
             match self.open_stream(owner, sha256, start, len).await {
-                // Found: stream it.
-                Ok(OpenOutcome::Found(stream)) => return Ok(Some((stream, owner.clone()))),
+                // Found: stream it (and lift any negative-cache entry).
+                Ok(OpenOutcome::Found(stream)) => {
+                    self.forget_missing(sha256);
+                    return Ok(Some((stream, owner.clone())));
+                }
                 // Missing under this owner (a definitive local NotFound, or
                 // an S3 404): try the next copy.
                 Ok(OpenOutcome::Missing) => missing = true,
@@ -556,13 +646,80 @@ impl BlobStore {
                     // The mapping exists but every owner's object is
                     // definitively gone: count the mapped-but-missing blob
                     // (best effort, no behavior change — the mapping is
-                    // kept and a re-upload heals it). An owner error above
-                    // means the state is unknown, so it is not counted.
+                    // kept and a re-upload heals it) and suppress the
+                    // repeated owner scan. An owner error above means the
+                    // state is unknown, so it is neither counted nor
+                    // cached.
+                    self.remember_missing(sha256);
                     self.stats.bump(&self.stats.blossom_missing_objects, 1);
                 }
                 Ok(None)
             }
         }
+    }
+
+    /// Whether any owner's object is reachable, without opening a stream
+    /// (a HEAD must not turn into a full S3 GET). The negative cache is
+    /// shared with [`Self::open_stream_any`].
+    pub(crate) async fn exists_any(&self, sha256: &str) -> Result<bool> {
+        let Some(meta) = self.db.blossom_load_checked(sha256).await else {
+            return Err(db_unavailable());
+        };
+        let Some(meta) = meta else {
+            return Ok(false);
+        };
+        if self.missing_cached(sha256) {
+            return Ok(false);
+        }
+        let mut last_error: Option<anyhow::Error> = None;
+        let mut missing = false;
+        for owner in &meta.owners {
+            match self.exists(owner, sha256).await {
+                Ok(Some(true)) => {
+                    self.forget_missing(sha256);
+                    return Ok(true);
+                }
+                // A definitive absence for this owner: keep looking, but
+                // only a definitive result may feed the negative cache (a
+                // `None`/refused lookup means the state is unknown).
+                Ok(Some(false)) => missing = true,
+                Ok(None) => {}
+                Err(e) => {
+                    log::warn!("blossom: checking {sha256} for owner {owner} failed: {e}");
+                    last_error = Some(e);
+                }
+            }
+        }
+        match last_error {
+            Some(e) => Err(e),
+            None => {
+                if missing {
+                    self.remember_missing(sha256);
+                }
+                Ok(false)
+            }
+        }
+    }
+
+    /// Whether one owner's copy exists, trying the canonical and legacy
+    /// npub directories. `None` means the lookup was refused (symlinked
+    /// path), matching [`Self::open_stream`]'s `Refused` semantics.
+    async fn exists(&self, pubkey: &str, sha256: &str) -> Result<Option<bool>> {
+        let npub = npub_of(pubkey);
+        let legacy = legacy_npub_of(pubkey);
+        let mut refused = false;
+        for candidate in [npub.as_str(), legacy.as_str()] {
+            let outcome = match &self.storage {
+                Storage::Local(s) => s.exists(candidate, sha256).await?,
+                Storage::S3(s) => s.exists(candidate, sha256).await?,
+            };
+            match outcome {
+                Some(true) => return Ok(Some(true)),
+                Some(false) => {}
+                None => refused = true,
+            }
+        }
+        Ok(if refused { None } else { Some(false) })
     }
 
     /// Whether `pubkey` has uploaded this blob. A database failure is an
@@ -1235,6 +1392,33 @@ impl LocalStore {
     /// Opens the blob for streaming, seeked to `start`; the caller reads
     /// at most `len` bytes from the returned file (`len` is enforced by
     /// the streaming wrapper, not by the file handle).
+    /// Existence check for HEAD: same symlink guards as `open`, without
+    /// opening the file or reading a byte.
+    async fn exists(&self, npub: &str, sha256: &str) -> Result<Option<bool>> {
+        if !self.parent_within_root(npub).await {
+            let dir = self.root.join(npub);
+            return match tokio::fs::symlink_metadata(&dir).await {
+                Ok(meta) if meta.file_type().is_symlink() => Ok(None),
+                Ok(meta) if !meta.is_dir() => {
+                    Err(anyhow!("blossom storage directory is not a directory"))
+                }
+                Ok(_) => Ok(None),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Some(false)),
+                Err(_) => Ok(None),
+            };
+        }
+        match tokio::fs::symlink_metadata(self.rooted_path(npub, sha256)).await {
+            Ok(meta) if meta.file_type().is_file() && !meta.file_type().is_symlink() => {
+                Ok(Some(true))
+            }
+            // A symlink or directory at the blob path is not a readable
+            // blob: unknown, matching `open`'s `Refused`.
+            Ok(_) => Ok(None),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Some(false)),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     async fn open(&self, npub: &str, sha256: &str, start: u64, _len: u64) -> Result<OpenOutcome> {
         // Symlink-escape guard: a symlinked npub directory would resolve
         // outside the root; a symlinked blob file would be followed by a
@@ -1489,6 +1673,15 @@ impl S3Store {
         self.client
             .put_object_file(&format!("{npub}/{sha256}"), source, size, mime)
             .await
+    }
+
+    /// Existence check for HEAD: a signed HEAD, not a GET whose body is
+    /// discarded.
+    async fn exists(&self, npub: &str, sha256: &str) -> Result<Option<bool>> {
+        self.client
+            .head_object(&format!("{npub}/{sha256}"))
+            .await
+            .map(Some)
     }
 
     /// Opens the blob for streaming: fetches the `bytes=start-...` range
@@ -1832,6 +2025,16 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Relaxed),
             before + 1,
             "a mapped-but-missing object must be counted"
+        );
+        // A second lookup inside the negative-cache window is served from
+        // the cache: no repeated owner scan and no second count.
+        assert!(s.open_stream_any(&sha, 0, 1).await.unwrap().is_none());
+        assert_eq!(
+            s.stats
+                .blossom_missing_objects
+                .load(std::sync::atomic::Ordering::Relaxed),
+            before + 1,
+            "a cached missing object must not be scanned/counted again"
         );
         // A missing mapping is not a missing object.
         assert!(
@@ -3023,6 +3226,36 @@ mod scan_debug {
                 .iter()
                 .any(|(s, _, _, _, p)| s == &sha && p == &pub_b),
             "the blob-only second owner must migrate too: {entries:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn s3_exists_uses_a_head_request() {
+        let (endpoint, bucket) = crate::server::blossom::s3::mock_server::build_mock().await;
+        let pubkey = "aa".repeat(32);
+        let sha = "cd".repeat(32);
+        // Only the legacy spelling has the object: the HEAD fallback must
+        // find it (and must not need a GET).
+        bucket.lock().unwrap().insert(
+            format!("{}/{sha}", legacy_npub_of(&pubkey)),
+            b"legacy".to_vec(),
+        );
+        let s = S3Store::new(S3Config {
+            endpoint,
+            region: "us-east-1".into(),
+            bucket: "bucket".into(),
+            access_key: "ak".into(),
+            secret_key: "sk".into(),
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            s.exists(&legacy_npub_of(&pubkey), &sha).await.unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            s.exists(&npub_of(&pubkey), &"ee".repeat(32)).await.unwrap(),
+            Some(false)
         );
     }
 

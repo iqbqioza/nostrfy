@@ -149,13 +149,21 @@ pub(crate) fn is_blossom_path(path: &str) -> bool {
     if let Some(rest) = path.strip_prefix("/list/") {
         return is_pubkey(rest);
     }
-    // `/<sha256>` or `/<sha256>.<ext>`
-    let segment = path.trim_start_matches('/');
+    // Any other single-segment path is the blob route (`/<blob>` or
+    // `/<blob>.<ext>`). The handler validates the hash and answers 400 for
+    // a malformed one (BUD-01); checking 64-hex here first turned that 400
+    // into the host split's 404. Known single-segment relay endpoints stay
+    // on the relay.
+    let Some(segment) = path.strip_prefix('/') else {
+        return false;
+    };
     if segment.is_empty() || segment.contains('/') {
         return false;
     }
-    let hash = segment.split('.').next().unwrap_or(segment);
-    hash.len() == 64 && hex::decode(hash).is_ok()
+    !matches!(
+        segment,
+        "health" | "metrics" | "inbox" | "outbox" | "ws" | "list"
+    )
 }
 
 fn is_pubkey(value: &str) -> bool {
@@ -506,6 +514,22 @@ fn store_error_head(e: anyhow::Error) -> Response {
             "blob lookup unavailable, please retry",
         );
     }
+    if let Some(upstream) = e.downcast_ref::<storage::UpstreamStatus>() {
+        let status = if upstream.status == 429 {
+            StatusCode::TOO_MANY_REQUESTS
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        };
+        let mut response = head_error(status, "blob storage temporarily unavailable, please retry");
+        if let Some(secs) = upstream.retry_after
+            && let Ok(value) = secs.to_string().parse()
+        {
+            response
+                .headers_mut()
+                .insert(axum::http::header::RETRY_AFTER, value);
+        }
+        return response;
+    }
     log::error!("blossom storage error: {e}");
     head_error(StatusCode::INTERNAL_SERVER_ERROR, "storage error")
 }
@@ -520,6 +544,22 @@ fn store_error(e: anyhow::Error) -> Response {
             StatusCode::SERVICE_UNAVAILABLE,
             "blob lookup unavailable, please retry",
         );
+    }
+    if let Some(upstream) = e.downcast_ref::<storage::UpstreamStatus>() {
+        let status = if upstream.status == 429 {
+            StatusCode::TOO_MANY_REQUESTS
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        };
+        let mut response = error(status, "blob storage temporarily unavailable, please retry");
+        if let Some(secs) = upstream.retry_after
+            && let Ok(value) = secs.to_string().parse()
+        {
+            response
+                .headers_mut()
+                .insert(axum::http::header::RETRY_AFTER, value);
+        }
+        return response;
     }
     // Keep the backend detail (S3 XML, OS messages) in the log: the
     // response only carries a generic message.
@@ -901,12 +941,11 @@ async fn head_blob(
     };
     let size = desc.size;
     // Resolve the backing object exactly like GET: a mapping without a
-    // readable blob must 404. The byte window is always the whole blob
-    // (a HEAD Range is ignored, and `If-Range` is meaningless without
-    // one), so there is no 206/416 path here.
-    match state.store.open_stream_any(&sha, 0, size).await {
-        Ok(Some(_)) => {}
-        Ok(None) => return head_error(StatusCode::NOT_FOUND, "blob not found"),
+    // readable blob must 404. This is a HEAD request on the backend
+    // (`exists_any`), not an S3 GET whose body is discarded.
+    match state.store.exists_any(&sha).await {
+        Ok(true) => {}
+        Ok(false) => return head_error(StatusCode::NOT_FOUND, "blob not found"),
         Err(e) => return store_error_head(e),
     }
     let mut response = (
@@ -1419,15 +1458,24 @@ async fn head_preflight(relay: Arc<Relay>, headers: HeaderMap, verb: &str) -> Re
         return head_error(StatusCode::BAD_REQUEST, "malformed X-SHA-256 header");
     }
     // `X-Content-Length` is required and bounded by the upload ceiling.
-    let Some(len) = headers
-        .get("x-content-length")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u64>().ok())
-    else {
+    // BUD-06: a missing header is 411, but a present and malformed value is
+    // a bad request (400) — and surrounding whitespace is trimmed before
+    // parsing. Treating both as 411 hid client bugs behind a misleading
+    // "length required".
+    let Some(raw_len) = headers.get("x-content-length") else {
         return head_error(
             StatusCode::LENGTH_REQUIRED,
             "missing X-Content-Length header",
         );
+    };
+    let Some(len) = raw_len
+        .to_str()
+        .ok()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .and_then(|value| value.parse::<u64>().ok())
+    else {
+        return head_error(StatusCode::BAD_REQUEST, "malformed X-Content-Length header");
     };
     let max_upload = state.max_upload_bytes as u64;
     if len > max_upload {
@@ -2126,6 +2174,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn head_preflight_distinguishes_a_missing_content_length_from_a_malformed_one() {
+        // BUD-06: a missing `X-Content-Length` is 411, but a value that is
+        // not a number is a bad request (400), not another "length
+        // required"; surrounding whitespace is trimmed.
+        let relay = build_blossom_relay(0).await;
+        let sha = sha256_hex(b"x");
+        let mut headers = HeaderMap::new();
+        headers.insert("x-sha-256", sha.parse().unwrap());
+        let resp = head_preflight(relay.clone(), headers.clone(), "upload").await;
+        assert_eq!(resp.status(), StatusCode::LENGTH_REQUIRED);
+        headers.insert("x-content-length", "not-a-number".parse().unwrap());
+        let resp = head_preflight(relay.clone(), headers.clone(), "upload").await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        // A valid (padded) length reaches the auth gate: 401 without a
+        // token, rather than being rejected as malformed.
+        headers.insert("x-content-length", " 1 ".parse().unwrap());
+        let resp = head_preflight(relay.clone(), headers, "upload").await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
     async fn get_blob_serves_empty_blob() {
         let relay = build_blossom_relay(0).await;
         let state = relay.blossom.read().await.clone().unwrap();
@@ -2418,6 +2488,29 @@ mod tests {
             "the operator must not lock themselves out of Blossom"
         );
         relay.db.shutdown();
+    }
+
+    #[test]
+    fn upstream_throttling_is_propagated_instead_of_a_generic_500() {
+        // F-13-4: an S3 429/503 after the client's bounded retries keeps
+        // its status (and Retry-After) instead of reading as a local
+        // storage fault.
+        let throttled = store_error(anyhow::Error::new(
+            crate::server::blossom::storage::UpstreamStatus {
+                status: 429,
+                retry_after: Some(7),
+            },
+        ));
+        assert_eq!(throttled.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(throttled.headers()["retry-after"], "7");
+        let unavailable = store_error_head(anyhow::Error::new(
+            crate::server::blossom::storage::UpstreamStatus {
+                status: 503,
+                retry_after: None,
+            },
+        ));
+        assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(unavailable.headers().get("retry-after").is_none());
     }
 
     #[tokio::test]
@@ -3305,8 +3398,15 @@ mod tests {
         assert!(is_blossom_path(&format!("/{}.jpg", "a".repeat(64))));
         assert!(is_blossom_path(&format!("/{}", "a".repeat(64))));
         assert!(!is_blossom_path("/ws"));
+        assert!(!is_blossom_path("/health"));
+        assert!(!is_blossom_path("/metrics"));
+        assert!(!is_blossom_path("/inbox"));
+        assert!(!is_blossom_path("/outbox"));
         assert!(!is_blossom_path("/api/v1/npub1..."));
-        assert!(!is_blossom_path(&format!("/{}", "a".repeat(63))));
+        // A malformed blob hash is still the blob route: the handler must
+        // answer 400 (BUD-01), not be short-circuited by the host split.
+        assert!(is_blossom_path(&format!("/{}", "a".repeat(63))));
+        assert!(is_blossom_path("/not-a-sha256"));
         assert!(!is_blossom_path("/list/nothex"));
     }
 

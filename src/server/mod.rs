@@ -5872,6 +5872,37 @@ mod tests {
             &format!("/{sha}"),
             &axum::http::Method::GET
         ));
+        // A malformed blob hash on the media host is a Blossom request:
+        // the handler must answer 400 (BUD-01), not the split's 404.
+        assert!(host_route_allowed(
+            "",
+            "media.test",
+            "media.test",
+            "/not-a-sha256",
+            &axum::http::Method::GET
+        ));
+        assert!(host_route_allowed(
+            "",
+            "media.test",
+            "media.test",
+            "/not-a-sha256.png",
+            &axum::http::Method::HEAD
+        ));
+        // Single-segment relay endpoints stay off the media host.
+        assert!(!host_route_allowed(
+            "",
+            "media.test",
+            "media.test",
+            "/health",
+            &axum::http::Method::GET
+        ));
+        assert!(!host_route_allowed(
+            "",
+            "media.test",
+            "media.test",
+            "/ws",
+            &axum::http::Method::GET
+        ));
         // api + blossom: each host serves only its own paths.
         assert!(host_route_allowed(
             "api.example.com",
