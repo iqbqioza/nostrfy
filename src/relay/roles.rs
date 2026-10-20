@@ -331,34 +331,35 @@ impl super::Relay {
         if !self.config.read().await.nip_enabled(43) || self.key.is_none() {
             return RoleChange::Failed;
         }
-        let outcome = self
+        let (outcome, was_member) = self
             .mutate_roles(
                 super::BufferedRoleMutation::Assign {
                     pubkey: pubkey.to_string(),
                     role: role.to_string(),
                 },
                 |roles| {
+                    let was_member = roles.assignments.contains_key(pubkey);
                     if !roles.roles.contains_key(role) {
-                        (RoleChange::Unknown, false)
+                        ((RoleChange::Unknown, was_member), false)
                     } else if roles
                         .assignments
                         .get(pubkey)
                         .is_some_and(|grants| grants.iter().any(|r| r == role))
                     {
-                        (RoleChange::Noop, false)
+                        ((RoleChange::Noop, was_member), false)
                     } else {
                         roles.assign(pubkey, role);
-                        (RoleChange::Applied, true)
+                        ((RoleChange::Applied, was_member), true)
                     }
                 },
             )
             .await;
         if outcome == RoleChange::Applied {
             self.schedule_roles_persist();
-            if !self
-                .publish_membership(Some((true, pubkey.to_string())))
-                .await
-            {
+            // NIP-43's 8000 announces a *membership* change; granting a role
+            // to an existing member only changes the 13534 list.
+            let change = (!was_member).then(|| (true, pubkey.to_string()));
+            if !self.publish_membership(change).await {
                 return RoleChange::Failed;
             }
         }
@@ -376,7 +377,7 @@ impl super::Relay {
         // revoked store.
         let mut rebuild_pending = self.roles_rebuild.dirty.load(Ordering::SeqCst)
             || self.roles_rebuild.running.load(Ordering::SeqCst);
-        let outcome = self
+        let (outcome, is_member) = self
             .mutate_roles(
                 super::BufferedRoleMutation::Unassign {
                     pubkey: pubkey.to_string(),
@@ -384,6 +385,7 @@ impl super::Relay {
                 },
                 |roles| {
                     let revoked = roles.unassign(pubkey, role);
+                    let is_member = roles.assignments.contains_key(pubkey);
                     // Re-read inside the mutation (under the write lock): see
                     // `delete_role` for why the pre-lock snapshot is not
                     // enough.
@@ -393,9 +395,9 @@ impl super::Relay {
                     // no-op success, per NIP-86's always-`true`; with a
                     // rebuild pending the revocation is buffered instead.
                     if revoked || pending {
-                        (RoleChange::Applied, true)
+                        ((RoleChange::Applied, is_member), true)
                     } else {
-                        (RoleChange::Noop, false)
+                        ((RoleChange::Noop, is_member), false)
                     }
                 },
             )
@@ -417,10 +419,10 @@ impl super::Relay {
                 }
             } else {
                 self.schedule_roles_persist();
-                if !self
-                    .publish_membership(Some((false, pubkey.to_string())))
-                    .await
-                {
+                // NIP-43's 8001 announces a *membership* removal; losing one
+                // of several roles only changes the 13534 list.
+                let change = (!is_member).then(|| (false, pubkey.to_string()));
+                if !self.publish_membership(change).await {
                     return RoleChange::Failed;
                 }
             }

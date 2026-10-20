@@ -564,11 +564,14 @@ impl super::Conn {
         // NIP-67: whether any withheld event could be revealed by AUTH, in
         // which case the `EOSE` carries the `"auth"` hint (challenges must
         // be enabled for the hint to make sense, mirroring
-        // `send_auth_challenge`).
-        let hint_eligible = {
+        // `send_auth_challenge`). A relay that never sends a challenge
+        // cannot be authenticated against, so the page must not claim
+        // `finish` when AUTH-revealable events were withheld.
+        let (auth_enabled, challenge_enabled) = {
             let cfg = self.relay.config.read().await;
-            cfg.nip_enabled(42) && cfg.relay.send_auth_challenge
+            (cfg.nip_enabled(42), cfg.relay.send_auth_challenge)
         };
+        let hint_eligible = auth_enabled && challenge_enabled;
         let mut auth_hidden = false;
         {
             // The global group-store read lock is only needed when the
@@ -582,7 +585,7 @@ impl super::Conn {
             };
             for event in events {
                 if !self.visible_to(groups.as_deref(), &event) {
-                    if hint_eligible && self.auth_hidden_behind(groups.as_deref(), &event) {
+                    if auth_enabled && self.auth_hidden_behind(groups.as_deref(), &event) {
                         auth_hidden = true;
                     }
                     continue;
@@ -718,8 +721,11 @@ impl super::Conn {
         pending.events = to_send.into();
         pending.budget = Some(std::sync::Arc::clone(&self.pending_budget));
         pending.reserved = reserved;
-        pending.truncated_or_more = truncated || more || byte_truncated || tie_truncated;
-        pending.auth_hint = auth_hidden;
+        pending.truncated_or_more =
+            truncated || more || byte_truncated || tie_truncated || (auth_hidden && !hint_eligible);
+        // The `"auth"` hint requires a challenge; without one the withheld
+        // events are still reported as `more` (not `finish`).
+        pending.auth_hint = auth_hidden && hint_eligible;
     }
 
     pub(crate) fn handle_close(&mut self, rest: &[Value]) {

@@ -5059,6 +5059,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn role_changes_announce_membership_only_on_membership_transitions() {
+        // NIP-43's 8000/8001 are *membership* events. Granting or revoking
+        // one role of an existing member changes the 13534 list (roles are
+        // part of it) but not the membership, so it must not publish an
+        // add/remove-user event that contradicts the list.
+        let relay = build_role_relay(Some(&"01".repeat(32))).await;
+        relay.config.write().await.relay.enabled_nips = vec![43];
+        assert!(relay.create_role("r1", "R1", "", "", None).await);
+        assert!(relay.create_role("r2", "R2", "", "", None).await);
+        let member = "aa".repeat(32);
+        assert!(matches!(
+            relay.admit_member(&member, true).await,
+            crate::relay::roles::Admission::Recorded
+        ));
+        let now = crate::util::unix_now();
+        let filter = |kind: u64| -> crate::filter::Filter {
+            serde_json::from_value(serde_json::json!({
+                "kinds": [kind],
+                "#p": [member],
+            }))
+            .unwrap()
+        };
+        assert_eq!(
+            relay.db.query(vec![filter(8000)], 10, now).await.0.len(),
+            1,
+            "the admission publishes one add-user"
+        );
+        assert_eq!(relay.assign_role(&member, "r1").await, RoleChange::Applied);
+        assert_eq!(
+            relay.db.query(vec![filter(8000)], 10, now).await.0.len(),
+            1,
+            "granting a role to an existing member is not a membership change"
+        );
+        assert_eq!(relay.assign_role(&member, "r2").await, RoleChange::Applied);
+        assert_eq!(
+            relay.unassign_role(&member, "r1").await,
+            RoleChange::Applied
+        );
+        assert!(
+            relay
+                .db
+                .query(vec![filter(8001)], 10, now)
+                .await
+                .0
+                .is_empty(),
+            "revoking one of several roles is not a membership removal"
+        );
+        assert_eq!(
+            relay.unassign_role(&member, "r2").await,
+            RoleChange::Applied
+        );
+        assert_eq!(
+            relay.db.query(vec![filter(8001)], 10, now).await.0.len(),
+            1,
+            "losing the last role removes the member"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
     async fn role_admin_lifecycle() {
         let key = "01".repeat(32);
         let relay = build_role_relay(Some(&key)).await;

@@ -1103,7 +1103,7 @@ impl Config {
             9 => Some(&[5]),
             11 => None,
             13 => None,
-            17 => Some(&[14, 15, 1059, 21059]),
+            17 => Some(&[14, 15, 1059, 21059, 10050]),
             22 => Some(&[1111]),
             26 => None,
             29 => Some(&[
@@ -1124,10 +1124,10 @@ impl Config {
             43 => Some(&[8000, 8001, 28934, 28935, 28936, 33534, 13534]),
             45 => None,
             46 => Some(&[24133]),
-            47 => Some(&[23194, 23195]),
+            47 => Some(&[23194, 23195, 13194]),
             50 => None,
             57 => Some(&[9734, 9735]),
-            59 => Some(&[1059, 21059]),
+            59 => Some(&[1059, 21059, 13]),
             62 => Some(&[62]),
             65 => Some(&[10002]),
             66 => Some(&[30166, 10166]),
@@ -1723,6 +1723,21 @@ impl Config {
                 "relay.require_auth is true but relay.send_auth_challenge is false: the \
                  AUTH challenge is never sent, so no client can authenticate and all \
                  REQ/EVENT/COUNT messages will be refused"
+            );
+        }
+        // The NIP-78 gate has the same dependency but only for kinds
+        // 78/30078: without a challenge, the owner can never authenticate, so
+        // the feature is silently unpublishable while the rest works.
+        if self.nip_enabled(78)
+            && self.relay.enabled_nip78_auth
+            && self.nip_enabled(42)
+            && !self.relay.send_auth_challenge
+            && !self.relay.require_auth
+        {
+            log::warn!(
+                "relay.send_auth_challenge is false while relay.enabled_nip78_auth is true: \
+                 kind 78/30078 events require AUTH, but no challenge is ever sent, so they \
+                 cannot be published until AUTH is sent or enabled_nip78_auth is disabled"
             );
         }
 
@@ -4092,13 +4107,13 @@ max_log_files = 2
         // Each advertised client-side NIP is dropped when all its kinds are
         // blocked.
         for (nip, kinds) in [
-            (17, &[14u64, 15, 1059, 21059][..]),
+            (17, &[14u64, 15, 1059, 21059, 10050][..]),
             (22, &[1111][..]),
             (32, &[1985][..]),
             (46, &[24133][..]),
-            (47, &[23194, 23195][..]),
+            (47, &[23194, 23195, 13194][..]),
             (57, &[9734, 9735][..]),
-            (59, &[1059, 21059][..]),
+            (59, &[1059, 21059, 13][..]),
             (65, &[10002][..]),
             (66, &[30166, 10166][..]),
             (78, &[78, 30078][..]),

@@ -459,6 +459,8 @@ curl "http://127.0.0.1:8080/api/v1/npub180cvv07tjdrrgpa0j7j7tmnyl2yr6yr7l8j4s3ev
 `more: true` means there is more data; increase `offset` to continue.
 
 > **Tip**: Pagination is computed over the *visible* sequence, so hidden events (protected events etc.) never skip or duplicate a page.
+>
+> **NIP-70 read scope**: the `-` tag constrains publication and re-publication, not distribution. Foreign protected events are served to **any authenticated pubkey**, not only to recipients the author had in mind (NIP-70 defines no read ACL). Use NIP-59 gift wraps (recipient-only serving) or NIP-29 private groups when delivery must be restricted.
 
 > For the full endpoint, parameter, pagination and error reference, see [HTTP REST API Reference (API.md)](API.md).
 
@@ -559,6 +561,8 @@ curl -X POST http://127.0.0.1:8080/ \
 | A3 | Payment targets (kind 10133, replaceable). `draft` with no integer identifier — served but **not** advertised in `supported_nips` (which only holds integers) |
 
 Blossom (BUD-01/02) is not a NIP and is **not** advertised in the NIP-11 document: it is served as a separate file server on the `[blossom]` hostname (see [Section 11](#11-blossom-file-server-media-hosting)), with its own kind-24242 upload authorization.
+
+> **NIP-45 HLL scope**: a `COUNT` response carries an `hll` register set for every filter that is HLL-eligible under the spec's offset rule (the first `#` tag attribute's first value is an id, pubkey, address or hash) when all filters in the request resolve to the same offset — not only for the spec's illustrative "canonical" queries (reaction/repost/quote/reply/comment/follower). This is a compatible extension: the offset rule is what makes the registers mergeable across relays. A capped count reports `"approximate": true` and omits `hll`.
 
 ### Dynamic NIP advertisement
 

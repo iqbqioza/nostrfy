@@ -108,10 +108,11 @@ pub(crate) fn relay_discovery_event(
         tags.push(vec!["R".into(), "!auth".into()]);
     }
     tags.push(vec!["R".into(), "!payment".into()]);
-    // NIP-66's `R` keys cover auth, writes, pow and payment: when
-    // `restrict_relay` narrows writes to the allowlist, the requirement
-    // is asserted; otherwise it is negated.
-    if access.restrict_relay {
+    // NIP-66's `R` keys cover auth, writes, pow and payment: the write
+    // requirement must match the NIP-11 `restricted_writes` predicate — a
+    // kind allow/deny list restricts writes just like the pubkey allowlist.
+    if access.restrict_relay || !access.allowed_kinds.is_empty() || !access.blocked_kinds.is_empty()
+    {
         tags.push(vec!["R".into(), "writes".into()]);
     } else {
         tags.push(vec!["R".into(), "!writes".into()]);
@@ -177,6 +178,24 @@ mod tests {
         let doc: serde_json::Value = serde_json::from_str(&ev.content).unwrap();
         assert_eq!(doc["supported_nips"], serde_json::to_value(&nips).unwrap());
         assert_eq!(doc["name"], cfg.relay.name);
+        // A kind allow/deny list restricts writes just like the pubkey
+        // allowlist: NIP-66 must not claim `!writes` while NIP-11 reports
+        // `restricted_writes` for the same access state.
+        let restricted = AccessControl {
+            blocked_kinds: vec![5],
+            ..Default::default()
+        };
+        let ev = relay_discovery_event(&cfg, &restricted, &pubkey, &stats, 1_700_000_000);
+        let reqs: Vec<&str> = ev
+            .tags
+            .iter()
+            .filter(|t| t[0] == "R")
+            .map(|t| t[1].as_str())
+            .collect();
+        assert!(
+            reqs.contains(&"writes") && !reqs.contains(&"!writes"),
+            "a kind restriction must not advertise !writes: {reqs:?}"
+        );
     }
 
     #[test]

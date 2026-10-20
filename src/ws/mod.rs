@@ -4275,6 +4275,42 @@ mod tests {
     }
 
     #[test]
+    fn an_auth_hidden_page_is_not_marked_finished_without_a_challenge() {
+        // `send_auth_challenge = false` means no client can ever receive a
+        // challenge, so AUTH-hidden hits are unreachable. The EOSE must not
+        // claim `finish` (the old code did, because it skipped the hidden
+        // detection entirely when the challenge was disabled).
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            conn.relay.config.write().await.relay.send_auth_challenge = false;
+            let now = unix_now();
+            let mut event = signed_note(conn.relay.secp(), "secret", now, vec![]);
+            event.tags = vec![vec!["-".into()]];
+            event.id = crate::nips::nip01::compute_id(&event);
+            conn.relay.db.put(event, now).await;
+            conn.handle_req(&[json!("sub"), json!({"kinds": [1]})])
+                .await;
+            conn.pump_pending_reqs();
+            let msgs = outgoing_json(&conn);
+            let eose = msgs
+                .iter()
+                .find(|m| m[0] == "EOSE" && m[1] == "sub")
+                .expect("the response must end in an EOSE");
+            assert_eq!(
+                eose[2],
+                json!(["more"]),
+                "a page withheld behind AUTH must not claim finish without a challenge: {msgs:?}"
+            );
+            assert!(
+                !msgs.iter().any(|m| m[0] == "AUTH"),
+                "no challenge is sent when send_auth_challenge is false: {msgs:?}"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
     fn an_anonymous_pending_req_is_closed_when_require_auth_turns_on() {
         // SIGHUP enabling require_auth must apply to a response already
         // being pumped: the stored events were fetched before the flip, but
