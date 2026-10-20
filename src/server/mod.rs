@@ -339,15 +339,29 @@ async fn build_router(
                 })),
         );
     }
-    let cfg = relay.config.read().await;
-    if cfg.server.metrics_enabled {
+    // Snapshot the settings that shape the remaining routes before any
+    // further `relay.config.read()`: holding one read guard across a second
+    // read can deadlock against a queued writer (the write-preferring lock
+    // blocks new readers, and the writer waits for the first guard).
+    let (metrics_enabled, assets_dir, livekit_enabled) = {
+        let cfg = relay.config.read().await;
+        (
+            cfg.server.metrics_enabled,
+            cfg.server.assets_dir.trim().to_string(),
+            cfg.nip_enabled(29)
+                && !cfg.relay.livekit_url.trim().is_empty()
+                && !cfg.relay.livekit_api_key.is_empty()
+                && !cfg.relay.livekit_api_secret.is_empty(),
+        )
+    };
+    if metrics_enabled {
         app = app.route("/metrics", get(metrics_handler));
     }
     // Static files for the operator landing page. The directory is fixed at
     // startup (the route exists only when it is configured); the files in
     // it are read per request so they can be regenerated in place.
-    if !cfg.server.assets_dir.trim().is_empty() {
-        let dir = PathBuf::from(cfg.server.assets_dir.trim());
+    if !assets_dir.is_empty() {
+        let dir = PathBuf::from(assets_dir);
         app = app.route(
             "/assets/{name}",
             get(
@@ -359,11 +373,7 @@ async fn build_router(
             .layer(axum::middleware::from_fn(reject_ws_upgrade)),
         );
     }
-    if cfg.nip_enabled(29)
-        && !cfg.relay.livekit_url.trim().is_empty()
-        && !cfg.relay.livekit_api_key.is_empty()
-        && !cfg.relay.livekit_api_secret.is_empty()
-    {
+    if livekit_enabled {
         app = app
             .route("/.well-known/nip29/livekit", get(livekit_supported))
             .route("/.well-known/nip29/livekit/{group}", get(livekit_token))
@@ -406,7 +416,6 @@ async fn build_router(
         let max_upload = state.max_upload_bytes;
         app = app.merge(blossom::routes(relay, max_upload).await);
     }
-    drop(cfg);
     if !api_host.is_empty() || !blossom_host.is_empty() {
         let api_host = api_host.clone();
         let blossom_host = blossom_host.clone();
@@ -3742,6 +3751,35 @@ mod tests {
             "the reload must complete while a config writer contends for the lock"
         );
         let _ = std::fs::remove_dir_all(&dir);
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn build_router_does_not_deadlock_with_a_config_writer() {
+        // Regression guard: build_router used to hold one config read guard
+        // across a second `relay.config.read()` (the host split). With the
+        // write-preferring RwLock, a writer queued between the two reads
+        // blocked that read while waiting for the first guard, wedging
+        // startup.
+        let relay = blossom_relay().await;
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = tokio::spawn({
+            let relay = Arc::clone(&relay);
+            let stop = Arc::clone(&stop);
+            async move {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let _guard = relay.config.write().await;
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            }
+        });
+        let built = tokio::time::timeout(Duration::from_secs(10), build_router(&relay, None)).await;
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        writer.await.unwrap();
+        assert!(
+            built.is_ok(),
+            "build_router must complete while a config writer contends for the lock"
+        );
         relay.db.shutdown();
     }
 
