@@ -1326,6 +1326,21 @@ impl Config {
                 ))
             })?;
         }
+        // NIP-86 grants seeded from the config must obey the same allowlist
+        // as `assignmethod`: only moderation and read methods are grantable.
+        // Warn and ignore anything else; the runtime gate also refuses such
+        // a grant, so an older persisted snapshot can never widen a
+        // non-admin caller's rights.
+        for (pubkey, methods) in &self.access.method_grants {
+            for method in methods {
+                if !crate::nips::nip86::GRANTABLE_METHODS.contains(&method.as_str()) {
+                    log::warn!(
+                        "access.method_grants: {pubkey} lists {method:?}, which is not grantable; \
+                         only moderation and read methods can be granted — ignoring it"
+                    );
+                }
+            }
+        }
 
         // Database layout.
         if self.database.map_size > self.database.max_map_size {
@@ -2244,6 +2259,11 @@ pub fn access_seed_ops(seed: &AccessControl) -> Vec<AccessOp> {
     }
     for (pubkey, methods) in &seed.method_grants {
         for method in methods {
+            // Validation warns about these; never seed an admin-only method
+            // as a grant (the RPC gate also refuses it at call time).
+            if !crate::nips::nip86::GRANTABLE_METHODS.contains(&method.as_str()) {
+                continue;
+            }
             ops.push(AccessOp::GrantMethod {
                 pubkey: pubkey.clone(),
                 method: method.clone(),
@@ -2335,6 +2355,17 @@ impl AccessControl {
             return false;
         }
         self.allowed_kinds.is_empty() || self.allowed_kinds.contains(&kind)
+    }
+
+    /// Drops NIP-86 grants that `assignmethod` would refuse (admin-only or
+    /// unknown methods): the config seed must not create an in-memory grant
+    /// that the runtime gate refuses anyway. [`Config::validate`] warns
+    /// about each dropped entry.
+    pub(crate) fn retain_grantable_methods(&mut self) {
+        self.method_grants.retain(|_, methods| {
+            methods.retain(|m| crate::nips::nip86::GRANTABLE_METHODS.contains(&m.as_str()));
+            !methods.is_empty()
+        });
     }
 
     /// Whether `pubkey` was granted `method` through NIP-86
@@ -4726,6 +4757,45 @@ max_log_files = 2
         assert_eq!(state.blocked_kinds, once.blocked_kinds);
         assert_eq!(state.blocked_ips.entries(), once.blocked_ips.entries());
         assert_eq!(state.method_grants, once.method_grants);
+    }
+
+    #[test]
+    fn config_seed_grants_drop_admin_only_methods() {
+        // `assignmethod` only accepts GRANTABLE_METHODS; the config seed
+        // must enforce the same rule instead of letting a first run write
+        // an admin-only method into the persisted grant map.
+        let mut cfg = Config::default();
+        let pk = "aa".repeat(32);
+        cfg.access.method_grants.insert(
+            pk.clone(),
+            vec![
+                "banpubkey".into(),
+                "createclaim".into(),
+                "no-such-method".into(),
+            ],
+        );
+        assert!(cfg.validate().is_ok(), "validation warns, it does not fail");
+        cfg.access.retain_grantable_methods();
+        assert_eq!(
+            cfg.access.method_grants[&pk],
+            vec!["banpubkey".to_string()],
+            "the in-memory seed must match what is persisted"
+        );
+        let ops = access_seed_ops(&cfg.access);
+        let grants: Vec<(&str, &str)> = ops
+            .iter()
+            .filter_map(|op| match op {
+                AccessOp::GrantMethod { pubkey, method } => {
+                    Some((pubkey.as_str(), method.as_str()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            grants,
+            vec![(pk.as_str(), "banpubkey")],
+            "only the grantable method may be seeded"
+        );
     }
 
     #[test]

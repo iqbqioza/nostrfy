@@ -29,6 +29,18 @@ pub(crate) enum RoleChange {
     Failed,
 }
 
+/// Failure of a NIP-86 invite-code mutation (see
+/// [`super::Relay::create_claim`]).
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum ClaimRejection {
+    /// NIP-43 is disabled or the relay key is missing.
+    Unavailable,
+    /// The change is live in memory, but the role snapshot could not be
+    /// persisted (or a rebuild still owns it). The caller must not report
+    /// success: a lost `deleteclaim` would re-open the invite code.
+    NotDurable,
+}
+
 /// Outcome of a NIP-43 claim admission (see [`super::Relay::admit_member`]).
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub(crate) enum Admission {
@@ -431,15 +443,21 @@ impl super::Relay {
     }
 
     /// NIP-86 `createclaim`: stores an invite code. Invite codes have no
-    /// events behind them, so the debounced roles snapshot is their only
-    /// persistence (a crash before it lands loses the code — fail-closed,
-    /// and creation is idempotent, so the admin retries). Returns false
-    /// only when NIP-43 is disabled or the relay key is missing.
-    pub async fn create_claim(&self, claim: &str) -> bool {
+    /// events behind them, so the roles snapshot is their only persistence.
+    /// The mutation is written through instead of waiting for the debounced
+    /// pass: a crash in that window loses the code, and a lost
+    /// `deleteclaim` (below) is fail-open. Returns [`ClaimRejection::Unavailable`]
+    /// when NIP-43 is disabled or the relay key is missing, and
+    /// [`ClaimRejection::NotDurable`] when the snapshot could not be
+    /// persisted (the change is live and a retry is scheduled; the caller
+    /// must retry rather than report success).
+    pub async fn create_claim(&self, claim: &str) -> Result<(), ClaimRejection> {
         if !self.config.read().await.nip_enabled(43) || self.key.is_none() {
-            return false;
+            return Err(ClaimRejection::Unavailable);
         }
-        let added = self
+        // A duplicate code is a no-op success; the snapshot is still
+        // written through below to confirm that it is durably present.
+        let _ = self
             .mutate_roles(
                 super::BufferedRoleMutation::CreateClaim {
                     claim: claim.to_string(),
@@ -450,20 +468,26 @@ impl super::Relay {
                 },
             )
             .await;
-        if added {
+        if !self.persist_roles().await {
+            // Keep the debounced retry armed for a transient database
+            // error (a rebuild-pending store is persisted by its worker).
             self.schedule_roles_persist();
+            return Err(ClaimRejection::NotDurable);
         }
-        true
+        Ok(())
     }
 
     /// NIP-86 `deleteclaim`: revokes an invite code. Revoking an absent
-    /// code is a no-op success. Returns false only when NIP-43 is disabled
-    /// or the relay key is missing.
-    pub async fn delete_claim(&self, claim: &str) -> bool {
+    /// code is a no-op success, but the snapshot is still written through
+    /// so the reply states that the code is durably absent. Returns
+    /// [`ClaimRejection::Unavailable`] when NIP-43 is disabled or the relay
+    /// key is missing, and [`ClaimRejection::NotDurable`] when the snapshot
+    /// could not be persisted.
+    pub async fn delete_claim(&self, claim: &str) -> Result<(), ClaimRejection> {
         if !self.config.read().await.nip_enabled(43) || self.key.is_none() {
-            return false;
+            return Err(ClaimRejection::Unavailable);
         }
-        let removed = self
+        let _ = self
             .mutate_roles(
                 super::BufferedRoleMutation::DeleteClaim {
                     claim: claim.to_string(),
@@ -484,10 +508,11 @@ impl super::Relay {
                 },
             )
             .await;
-        if removed {
+        if !self.persist_roles().await {
             self.schedule_roles_persist();
+            return Err(ClaimRejection::NotDurable);
         }
-        true
+        Ok(())
     }
 
     /// Admits a `kind:28934` join by invite code: records the membership,

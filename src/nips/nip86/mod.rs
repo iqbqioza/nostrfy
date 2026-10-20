@@ -87,7 +87,7 @@ const SUPPORTED_METHODS: &[&str] = &[
 /// Everything else — permission management itself, role and
 /// invite-claim management, and the relay identity — stays admin-only,
 /// so a grantee can never escalate.
-const GRANTABLE_METHODS: &[&str] = &[
+pub(crate) const GRANTABLE_METHODS: &[&str] = &[
     "banpubkey",
     "unbanpubkey",
     "listbannedpubkeys",
@@ -302,7 +302,11 @@ pub async fn rpc_handler(
     let is_rpc = headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .map(|t| t.split(';').next().map(str::trim) == Some(RPC_CONTENT_TYPE))
+        .map(|t| {
+            t.split(';')
+                .next()
+                .is_some_and(|media| media.trim().eq_ignore_ascii_case(RPC_CONTENT_TYPE))
+        })
         .unwrap_or(false);
     if !is_rpc {
         return (
@@ -337,11 +341,12 @@ pub async fn rpc_handler(
     // root login.
     if !identity.is_admin()
         && method != "supportedmethods"
-        && !relay
-            .access
-            .read()
-            .await
-            .grants_method(identity.name(), method)
+        && (!GRANTABLE_METHODS.contains(&method)
+            || !relay
+                .access
+                .read()
+                .await
+                .grants_method(identity.name(), method))
     {
         return (
             StatusCode::UNAUTHORIZED,
@@ -359,7 +364,11 @@ pub async fn rpc_handler(
                 .iter()
                 .copied()
                 .filter(|m| *m != "supportedmethods")
-                .filter(|m| identity.is_admin() || access.grants_method(identity.name(), m))
+                .filter(|m| {
+                    identity.is_admin()
+                        || (GRANTABLE_METHODS.contains(m)
+                            && access.grants_method(identity.name(), m))
+                })
                 .collect();
             rpc_ok(json!(others))
         }
@@ -1166,11 +1175,17 @@ pub async fn rpc_handler(
             if let Err(e) = check_claim(claim) {
                 return rpc_err(&e.to_string());
             }
-            if relay.create_claim(claim).await {
-                audit!(&relay, &identity, "createclaim", params);
-                rpc_ok(json!(true))
-            } else {
-                rpc_err("restricted: NIP-43 is disabled or the relay key is missing")
+            match relay.create_claim(claim).await {
+                Ok(()) => {
+                    audit!(&relay, &identity, "createclaim", params);
+                    rpc_ok(json!(true))
+                }
+                Err(crate::relay::roles::ClaimRejection::Unavailable) => {
+                    rpc_err("restricted: NIP-43 is disabled or the relay key is missing")
+                }
+                Err(crate::relay::roles::ClaimRejection::NotDurable) => {
+                    rpc_err("error: cannot persist the invite code change; retry")
+                }
             }
         }
         "deleteclaim" => {
@@ -1184,11 +1199,17 @@ pub async fn rpc_handler(
                 return rpc_err(&e.to_string());
             }
             // Revoking an absent code is a no-op success.
-            if relay.delete_claim(claim).await {
-                audit!(&relay, &identity, "deleteclaim", params);
-                rpc_ok(json!(true))
-            } else {
-                rpc_err("restricted: NIP-43 is disabled or the relay key is missing")
+            match relay.delete_claim(claim).await {
+                Ok(()) => {
+                    audit!(&relay, &identity, "deleteclaim", params);
+                    rpc_ok(json!(true))
+                }
+                Err(crate::relay::roles::ClaimRejection::Unavailable) => {
+                    rpc_err("restricted: NIP-43 is disabled or the relay key is missing")
+                }
+                Err(crate::relay::roles::ClaimRejection::NotDurable) => {
+                    rpc_err("error: cannot persist the invite code change; retry")
+                }
             }
         }
         _ => rpc_err("unsupported method"),
@@ -1223,8 +1244,15 @@ fn is_pubkey(value: &str) -> bool {
 /// `bearer` or `BEARER`. Returns `None` for another scheme or a scheme
 /// with no token.
 fn strip_bearer_scheme(value: &str) -> Option<&str> {
-    let (scheme, token) = value.split_once(' ')?;
-    scheme.eq_ignore_ascii_case("Bearer").then_some(token)
+    // RFC 9110: the scheme and the credentials are separated by one or more
+    // whitespace characters. Split at the first one and trim the rest, so
+    // `Bearer  tok` and `Bearer\ttok` work; an empty token is no token.
+    let (scheme, token) = value.split_once(char::is_whitespace)?;
+    let token = token.trim();
+    scheme
+        .eq_ignore_ascii_case("Bearer")
+        .then_some(token)
+        .filter(|token| !token.is_empty())
 }
 
 /// Constant-time comparison for the management token: the token must not be
@@ -1484,6 +1512,11 @@ mod tests {
         assert_eq!(strip_bearer_scheme("bearer tok"), Some("tok"));
         assert_eq!(strip_bearer_scheme("BEARER tok"), Some("tok"));
         assert_eq!(strip_bearer_scheme("BeArEr tok"), Some("tok"));
+        // RFC 9110 allows one or more whitespace characters between the
+        // scheme and the token.
+        assert_eq!(strip_bearer_scheme("Bearer  tok"), Some("tok"));
+        assert_eq!(strip_bearer_scheme("Bearer\ttok"), Some("tok"));
+        assert_eq!(strip_bearer_scheme("Bearer   "), None);
         assert_eq!(strip_bearer_scheme("Nostr tok"), None);
         assert_eq!(strip_bearer_scheme("Bearer"), None);
         assert_eq!(strip_bearer_scheme(""), None);
@@ -1635,6 +1668,27 @@ mod tests {
             resp.status(),
             StatusCode::BAD_REQUEST,
             "missing content type"
+        );
+        // Media types are case-insensitive and parameters are allowed
+        // (RFC 9110): `Application/Nostr+Json+Rpc; Charset=UTF-8` must
+        // authenticate like the canonical lowercase form.
+        let mut mixed_case = bearer_headers();
+        mixed_case.insert(
+            header::CONTENT_TYPE,
+            "Application/Nostr+Json+Rpc; Charset=UTF-8".parse().unwrap(),
+        );
+        let resp = rpc_handler(
+            State(relay.clone()),
+            axum::extract::ConnectInfo("127.0.0.1:1234".parse().unwrap()),
+            axum::http::Uri::from_static("/"),
+            mixed_case,
+            serde_json::to_string(&json!({ "method": "supportedmethods" })).unwrap(),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "the media type comparison must ignore case and parameters"
         );
         let resp = rpc_handler(
             State(relay.clone()),
@@ -2481,6 +2535,7 @@ mod tests {
             "the mutation must be audited as the grantee: {:?}",
             relay.audit.recent()
         );
+
         // …but nothing else: admin-only arms without their own guard
         // rely on the gate alone, so probe each family.
         for method in [
@@ -2575,6 +2630,62 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .is_empty()
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_seeded_admin_only_grant_is_inert() {
+        // A config seed from an older version (or a stale persisted
+        // snapshot) can contain an admin-only method. The per-method gate
+        // requires GRANTABLE_METHODS for non-admins, and discovery must not
+        // advertise the inert grant either.
+        let relay = build_admin_relay().await;
+        let agent = [13u8; 32];
+        let (agent_pk, _) = nip98_call(&relay, &agent, "supportedmethods", vec![]).await;
+        {
+            let mut access = relay.access.write().await;
+            let grants = access.method_grants.entry(agent_pk.clone()).or_default();
+            grants.push("assignmethod".into());
+            grants.push("createrole".into());
+            grants.push("listbannedevents".into());
+        }
+        let (_, resp) = nip98_call(
+            &relay,
+            &agent,
+            "assignmethod",
+            vec![json!(agent_pk.clone()), json!("banevent")],
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "an admin-only grant must never authorize a non-admin"
+        );
+        let (_, resp) = nip98_call(&relay, &agent, "createrole", vec![json!("mod2")]).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "an admin-only grant must not reach the method either"
+        );
+        let (_, resp) = nip98_call(&relay, &agent, "supportedmethods", vec![]).await;
+        let list = rpc_result_of(resp).await;
+        let list = list.as_array().unwrap();
+        assert!(
+            !list
+                .iter()
+                .any(|m| m == "assignmethod" || m == "createrole"),
+            "discovery must filter non-grantable grants: {list:?}"
+        );
+        assert!(
+            list.iter().any(|m| m == "listbannedevents"),
+            "the real grant stays advertised: {list:?}"
+        );
+        let (_, resp) = nip98_call(&relay, &agent, "listbannedevents", vec![]).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "the grantable method still runs"
         );
         relay.db.shutdown();
     }

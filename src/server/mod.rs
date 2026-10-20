@@ -144,6 +144,27 @@ pub async fn cors_middleware(request: Request, next: Next) -> Response {
 /// parse (and must not pin the connection's read buffers).
 const LIVEKIT_WEBHOOK_BODY_LIMIT: usize = 64 * 1024;
 
+/// Reads a body under `limit`, distinguishing a size refusal from a read
+/// failure: `Limited` reports `LengthLimitError` for an oversized body (a
+/// chunked upload has no `Content-Length` to pre-check), which must be a
+/// 413 like `DefaultBodyLimit`; any other error (client abort, malformed
+/// framing) stays 400.
+async fn read_body_limited(
+    body: Body,
+    limit: usize,
+) -> std::result::Result<bytes::Bytes, StatusCode> {
+    match axum::body::to_bytes(body, limit).await {
+        Ok(bytes) => Ok(bytes),
+        Err(err) => {
+            if err.into_inner().is::<http_body_util::LengthLimitError>() {
+                Err(StatusCode::PAYLOAD_TOO_LARGE)
+            } else {
+                Err(StatusCode::BAD_REQUEST)
+            }
+        }
+    }
+}
+
 async fn body_read_timeout_middleware(
     request: Request,
     next: Next,
@@ -165,12 +186,10 @@ async fn body_read_timeout_middleware(
         return StatusCode::PAYLOAD_TOO_LARGE.into_response();
     }
     let (parts, body) = request.into_parts();
-    let bytes = match tokio::time::timeout(timeout, axum::body::to_bytes(body, limit)).await {
+    let bytes = match tokio::time::timeout(timeout, read_body_limited(body, limit)).await {
         Ok(Ok(bytes)) => bytes,
-        // Oversized or aborted body: the extractors would answer 400 for a
-        // read error, so keep that status rather than claiming a size
-        // problem that was not observed.
-        Ok(Err(_)) => return StatusCode::BAD_REQUEST.into_response(),
+        // A size refusal is 413; an aborted or malformed body stays 400.
+        Ok(Err(status)) => return status.into_response(),
         Err(_) => return StatusCode::REQUEST_TIMEOUT.into_response(),
     };
     next.run(Request::from_parts(parts, Body::from(bytes)))
@@ -3061,7 +3080,7 @@ mod tests {
             relay_a.assign_role(&member, "mod").await,
             crate::relay::roles::RoleChange::Applied
         );
-        assert!(relay_a.create_claim("welcome").await);
+        assert!(relay_a.create_claim("welcome").await.is_ok());
         assert!(
             relay_a.persist_roles().await,
             "the snapshot must be current"
@@ -5976,5 +5995,21 @@ mod tests {
         assert_eq!(host_header_host("[::1]"), "::1");
         assert_eq!(host_header_host("[::1]:8080"), "::1");
         assert_eq!(host_header_host("192.0.2.1:80"), "192.0.2.1");
+    }
+
+    #[tokio::test]
+    async fn a_body_over_the_limit_is_413_even_without_content_length() {
+        // A chunked upload carries no Content-Length, so the middleware's
+        // pre-check cannot see the size; `Limited` reports LengthLimitError
+        // and the read must map it to 413 (not the generic 400).
+        let error = read_body_limited(Body::from(vec![0u8; 2048]), 1024)
+            .await
+            .expect_err("the body exceeds the limit");
+        assert_eq!(error, StatusCode::PAYLOAD_TOO_LARGE);
+        // A body within the limit is passed through unchanged.
+        let bytes = read_body_limited(Body::from(vec![7u8; 128]), 1024)
+            .await
+            .expect("the body fits");
+        assert_eq!(bytes.len(), 128);
     }
 }

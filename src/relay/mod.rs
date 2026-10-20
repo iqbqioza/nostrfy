@@ -1832,7 +1832,8 @@ impl Relay {
                 // log) the first persist, so the seed survives the
                 // write-through merge instead of being overwritten by the
                 // empty database state.
-                let seed = config.read().await.access.clone();
+                let mut seed = config.read().await.access.clone();
+                seed.retain_grantable_methods();
                 let ops = crate::config::access_seed_ops(&seed);
                 (seed, ops)
             }
@@ -6687,6 +6688,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn invite_claims_are_written_through_before_the_debounce() {
+        // A claim has no event behind it: waiting for the 1 s debounced
+        // snapshot would lose it on a crash in that window (a lost
+        // deleteclaim is fail-open). Both claim mutations must persist
+        // before reporting success.
+        let key = "01".repeat(32);
+        let relay = build_role_relay(Some(&key)).await;
+        assert!(relay.create_claim("durable").await.is_ok());
+        let saved = relay.db.load_roles().await.expect_loaded("snapshot");
+        assert!(
+            saved.claims.contains("durable"),
+            "createclaim must persist before returning: {:?}",
+            saved.claims
+        );
+        assert!(relay.delete_claim("durable").await.is_ok());
+        let saved = relay.db.load_roles().await.expect_loaded("snapshot");
+        assert!(
+            !saved.claims.contains("durable"),
+            "deleteclaim must persist the revocation before returning: {:?}",
+            saved.claims
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
     async fn finish_snapshot_persists_flushes_a_drain_race() {
         // A mutation after the drain signal: the scheduler refuses a new
         // worker once the drain is set, so the shutdown must flush the
@@ -6696,7 +6722,7 @@ mod tests {
         let key = "01".repeat(32);
         let relay = build_role_relay(Some(&key)).await;
         relay.signal_drain();
-        assert!(relay.create_claim("welcome").await);
+        assert!(relay.create_claim("welcome").await.is_ok());
         relay.finish_snapshot_persists().await;
         let saved = relay.db.load_roles().await.expect_loaded("snapshot");
         assert!(
@@ -8617,7 +8643,7 @@ mod tests {
             use crate::db::PutOutcome;
 
             let relay = build_relay_with_key(false, &"11".repeat(32)).await;
-            assert!(relay.create_claim("keep-me").await);
+            assert!(relay.create_claim("keep-me").await.is_ok());
             assert!(relay.roles.read().await.claims.contains("keep-me"));
 
             let now = crate::util::unix_now();
