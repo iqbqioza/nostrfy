@@ -1138,13 +1138,22 @@ async fn join_supervised_bounded(tasks: &mut [SupervisedTask], grace: std::time:
     joined.is_ok()
 }
 
-/// Returns `true` when the request is a valid WebSocket handshake: the
-/// standard upgrade headers must be present (`Upgrade: websocket`,
-/// `Connection: upgrade`, `Sec-WebSocket-Version: 13` and a non-empty
-/// `Sec-WebSocket-Key`), and a proxy-provided `X-Forwarded-Proto` must name
-/// a WebSocket-capable scheme (`ws`/`wss`, or `http`/`https` when the proxy
-/// terminates TLS). Anything else is a plain HTTP request.
-fn is_websocket_request(headers: &HeaderMap) -> bool {
+/// The parsed WebSocket handshake headers (RFC 6455 §4.1).
+struct WsHandshake {
+    /// `Upgrade: websocket` (the request *is* an upgrade attempt).
+    upgrade: bool,
+    /// `Connection` contains the `upgrade` token.
+    connection: bool,
+    /// `Sec-WebSocket-Version` verbatim (compared against `13`).
+    version: Option<String>,
+    /// A non-empty `Sec-WebSocket-Key`.
+    key: bool,
+    /// A proxy-provided `X-Forwarded-Proto` names a WebSocket-capable
+    /// scheme (or is absent).
+    proxy_ok: bool,
+}
+
+fn parse_websocket_handshake(headers: &HeaderMap) -> WsHandshake {
     let upgrade = headers
         .get(axum::http::header::UPGRADE)
         .and_then(|v| v.to_str().ok())
@@ -1162,23 +1171,19 @@ fn is_websocket_request(headers: &HeaderMap) -> bool {
     let version = headers
         .get(axum::http::header::SEC_WEBSOCKET_VERSION)
         .and_then(|v| v.to_str().ok())
-        .map(|v| v == "13")
-        .unwrap_or(false);
+        .map(str::to_string);
     let key = headers
         .get(axum::http::header::SEC_WEBSOCKET_KEY)
         .and_then(|v| v.to_str().ok())
         .map(|v| !v.is_empty())
         .unwrap_or(false);
-    if !(upgrade && connection && version && key) {
-        return false;
-    }
     // Behind a proxy the request scheme is announced with
     // X-Forwarded-Proto. The value is the scheme the client used to reach
     // the proxy: `wss`/`ws` for a direct WebSocket connection, or
     // `https`/`http` when the proxy terminates TLS (e.g. Cloudflare
     // Tunnel), in which case the WebSocket upgrade is decided by the
     // upgrade headers alone.
-    match headers
+    let proxy_ok = match headers
         .get("x-forwarded-proto")
         .and_then(|v| v.to_str().ok())
     {
@@ -1191,6 +1196,58 @@ fn is_websocket_request(headers: &HeaderMap) -> bool {
             .split(',')
             .any(|t| matches!(t.trim(), "ws" | "wss" | "http" | "https")),
         None => true,
+    };
+    WsHandshake {
+        upgrade,
+        connection,
+        version,
+        key,
+        proxy_ok,
+    }
+}
+
+/// Returns `true` when the request is a valid WebSocket handshake: the
+/// standard upgrade headers must be present (`Upgrade: websocket`,
+/// `Connection: upgrade`, `Sec-WebSocket-Version: 13` and a non-empty
+/// `Sec-WebSocket-Key`), and a proxy-provided `X-Forwarded-Proto` must name
+/// a WebSocket-capable scheme. Anything else is a plain HTTP request.
+fn is_websocket_request(headers: &HeaderMap) -> bool {
+    let handshake = parse_websocket_handshake(headers);
+    handshake.upgrade
+        && handshake.connection
+        && handshake.version.as_deref() == Some("13")
+        && handshake.key
+        && handshake.proxy_ok
+}
+
+/// The response for a WebSocket upgrade *attempt* that is not a valid
+/// handshake, or `None` for a plain HTTP request (which serves the NIP-11
+/// document on the same URI).
+///
+/// RFC 6455: an unsupported `Sec-WebSocket-Version` must be answered with
+/// `426 Upgrade Required` advertising the supported version, and a
+/// handshake missing the key/`Connection: upgrade` (or carrying an
+/// unusable proxy scheme) with `400`. An upgrade attempt must never fall
+/// through to the NIP-11 document/decoy with a `200`: it is not an
+/// info-document fetch, and a client that asked for a WebSocket needs a
+/// handshake error.
+fn websocket_handshake_error(headers: &HeaderMap) -> Option<Response> {
+    let handshake = parse_websocket_handshake(headers);
+    if !handshake.upgrade {
+        return None;
+    }
+    match handshake.version.as_deref() {
+        Some("13") if handshake.connection && handshake.key && handshake.proxy_ok => None,
+        Some("13") | None => Some(StatusCode::BAD_REQUEST.into_response()),
+        Some(_) => {
+            // RFC 6455 §4.2.2: tell the client which version we speak.
+            let mut response = StatusCode::UPGRADE_REQUIRED.into_response();
+            response.headers_mut().insert(
+                axum::http::header::SEC_WEBSOCKET_VERSION,
+                HeaderValue::from_static("13"),
+            );
+            Some(response)
+        }
     }
 }
 
@@ -1353,6 +1410,12 @@ async fn ws_handler(State(relay): State<Arc<Relay>>, request: Request) -> Respon
     // `is_websocket_request` is evaluated once: it was parsed twice per
     // request (once for the Blossom root gate, once for the NIP-11 branch).
     let is_ws = is_websocket_request(request.headers());
+    // An upgrade attempt with malformed headers is a handshake error, not a
+    // NIP-11 fetch: RFC 6455 wants 426 for an unsupported version and 400
+    // for a broken handshake (never a 200 decoy/info page).
+    if !is_ws && let Some(response) = websocket_handshake_error(request.headers()) {
+        return response;
+    }
     // The Blossom server shares the root `/` route with the relay: when
     // the request Host names the Blossom host, the root path is answered
     // with the Blossom server info instead of the NIP-11 document (and
@@ -3958,6 +4021,83 @@ mod tests {
         );
 
         server.abort();
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn invalid_websocket_handshakes_are_not_served_as_nip11() {
+        // RFC 6455: a bad handshake is a handshake error, not an HTTP
+        // information document. Before this, a request carrying
+        // `Upgrade: websocket` but a missing key/version fell through to the
+        // NIP-11 page with a 200 (and the decoy in deployment), so clients
+        // could not tell a broken upgrade from a successful info fetch.
+        let relay = blossom_relay().await;
+        let app = build_router(&relay, None).await;
+        let request = |headers: Vec<(&str, &str)>| {
+            let mut builder = Request::builder()
+                .method(Method::GET)
+                .uri("/")
+                .header(axum::http::header::HOST, "relay.example.com");
+            for (name, value) in headers {
+                builder = builder.header(name, value);
+            }
+            builder.body(Body::empty()).unwrap()
+        };
+        // Unsupported version: 426 with the version the relay speaks.
+        let response = app
+            .clone()
+            .oneshot(request(vec![
+                ("upgrade", "websocket"),
+                ("connection", "Upgrade"),
+                ("sec-websocket-version", "8"),
+                ("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ=="),
+            ]))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UPGRADE_REQUIRED);
+        assert_eq!(
+            response
+                .headers()
+                .get("sec-websocket-version")
+                .and_then(|v| v.to_str().ok()),
+            Some("13"),
+            "426 must advertise the supported version"
+        );
+        // Version 13 with a broken/missing part of the handshake: 400.
+        for headers in [
+            vec![
+                ("upgrade", "websocket"),
+                ("connection", "Upgrade"),
+                ("sec-websocket-version", "13"),
+            ],
+            vec![
+                ("upgrade", "websocket"),
+                ("connection", "Upgrade"),
+                ("sec-websocket-key", "abc"),
+            ],
+            vec![
+                ("upgrade", "websocket"),
+                ("sec-websocket-version", "13"),
+                ("sec-websocket-key", "abc"),
+            ],
+            vec![
+                ("upgrade", "websocket"),
+                ("connection", "Upgrade"),
+                ("sec-websocket-version", "13"),
+                ("sec-websocket-key", "abc"),
+                ("x-forwarded-proto", "ftp"),
+            ],
+        ] {
+            let response = app.clone().oneshot(request(headers.clone())).await.unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "a malformed handshake must be 400: {headers:?}"
+            );
+        }
+        // A plain GET (no upgrade headers) still serves NIP-11.
+        let response = app.oneshot(request(Vec::new())).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
         relay.db.shutdown();
     }
 
