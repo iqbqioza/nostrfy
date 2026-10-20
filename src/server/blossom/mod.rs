@@ -239,30 +239,27 @@ async fn upload_allowed(relay: &Relay, pubkey: &str) -> anyhow::Result<()> {
     }
 }
 
-/// Normalizes the `server` tag of a Blossom auth event for comparison
-/// with `blossom.host`: strips the scheme and any path, IPv6 literals keep
-/// their bracket contents (colons are part of the host), and a DNS/IPv4
-/// `:port` suffix is removed.
+/// The host a BUD-11 `server` tag names, when the value is a bare domain
+/// name. BUD-11 requires the value to be a lowercase domain name
+/// (`cdn.example.com`), not a URL.
 ///
-/// The port is intentionally ignored: `blossom.host` is a bare hostname
-/// (validated portless), and routing matches on hostname only, so a token
-/// naming `https://media.example.com:443` and one naming the bare host are
-/// the same identity. Unlike NIP-42/98 (whose relay identity carries a
-/// port), there is no configured port to compare against.
-fn auth_server_host(server: &str) -> String {
-    let host_part = server
-        .strip_prefix("https://")
-        .or_else(|| server.strip_prefix("http://"))
-        .unwrap_or(server)
-        .split('/')
-        .next()
-        .unwrap_or(server);
-    let host = if let Some(rest) = host_part.strip_prefix('[') {
-        rest.split(']').next().unwrap_or(rest)
-    } else {
-        host_part.split(':').next().unwrap_or(host_part)
-    };
-    host.to_ascii_lowercase()
+/// Anything else names a different identity and must not match: a scheme,
+/// userinfo (`@`), a port, a path/query/fragment or IPv6 brackets. Stripping
+/// a prefix was a real bypass: `media.example.com:443@evil.example` has
+/// `media.example.com:443` as its userinfo and `evil.example` as its host,
+/// so the old parser accepted a token scoped to another server here. Case
+/// is folded: the signed value keeps what the client wrote, and hostname
+/// comparison is case-insensitive.
+fn auth_server_host(server: &str) -> Option<String> {
+    let host = server.trim();
+    if host.is_empty()
+        || !host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+    {
+        return None;
+    }
+    Some(host.to_ascii_lowercase())
 }
 
 /// Validates and normalizes the client-sent Content-Type: only the media
@@ -356,16 +353,19 @@ fn validate_auth_event(
     // The `server` tags (when present) must name our host. BUD-11: a token
     // may carry multiple `server` tags ("the token is valid for all
     // servers" listed), and the relay must accept it when its domain
-    // appears in at least one. The tag may carry a scheme and a path; IPv6
-    // hosts use brackets (`[::1]`), whose colons must not be mistaken for
-    // a port separator.
+    // appears in at least one. Each value must be a bare domain name, so
+    // only an exact hostname match counts (see `auth_server_host`).
     let host = host
         .trim()
         .trim_start_matches('[')
         .trim_end_matches(']')
         .to_ascii_lowercase();
     let servers: Vec<&str> = event_tags(event, "server").collect();
-    if !servers.is_empty() && !servers.iter().any(|s| auth_server_host(s) == host) {
+    if !servers.is_empty()
+        && !servers
+            .iter()
+            .any(|s| auth_server_host(s).as_deref() == Some(host.as_str()))
+    {
         return None;
     }
     // BUD-11: when the endpoint implies a blob hash (upload/delete), at
@@ -2869,6 +2869,24 @@ mod tests {
             validate_auth_event(&secp, &ev, host, "upload", Some(&sha), now),
             None
         );
+        // The old normalizer stripped everything before `:`/`/`, so a tag
+        // whose userinfo spelled our host (`media.example.com:443@evil...`)
+        // matched here even though the real host is `evil.example`. The
+        // value is not a bare domain, so it must not match.
+        let spoofed = format!("{host}:443@evil.example.com");
+        let ev = auth_event(
+            &secp,
+            now,
+            "upload",
+            Some(now + 300),
+            Some(&sha),
+            Some(&spoofed),
+        );
+        assert_eq!(
+            validate_auth_event(&secp, &ev, host, "upload", Some(&sha), now),
+            None,
+            "a userinfo-spoofed server tag must not match our host"
+        );
         // BUD-11: multiple `server` tags are accepted when our domain
         // appears in at least one of them.
         let mut ev = auth_event(
@@ -3163,24 +3181,40 @@ mod tests {
     }
 
     #[test]
-    fn auth_server_host_normalization() {
-        assert_eq!(auth_server_host("media.example.com"), "media.example.com");
+    fn auth_server_host_requires_a_bare_domain() {
+        // BUD-11: the tag value is a domain name, not a URL.
         assert_eq!(
-            auth_server_host("media.example.com:8080"),
-            "media.example.com"
+            auth_server_host("media.example.com").as_deref(),
+            Some("media.example.com")
         );
         assert_eq!(
-            auth_server_host("https://media.example.com"),
-            "media.example.com"
+            auth_server_host("  MEDIA.EXAMPLE.COM  ").as_deref(),
+            Some("media.example.com"),
+            "hostname comparison folds case and trims surrounding space"
         );
-        assert_eq!(
-            auth_server_host("https://media.example.com/path"),
-            "media.example.com"
-        );
-        assert_eq!(auth_server_host("[::1]"), "::1");
-        assert_eq!(auth_server_host("[::1]:8080"), "::1");
-        assert_eq!(auth_server_host("http://[::1]/upload"), "::1");
-        assert_eq!(auth_server_host("MEDIA.EXAMPLE.COM"), "media.example.com");
+        // Anything that names a *different* identity must not match: a
+        // port, a scheme, a path/query/fragment, userinfo before the real
+        // host (`media.example.com:443@evil.example`), or IPv6 brackets.
+        for bad in [
+            "media.example.com:8080",
+            "https://media.example.com",
+            "https://media.example.com/path",
+            "media.example.com/path",
+            "media.example.com?x=1",
+            "media.example.com#frag",
+            "media.example.com:443@evil.example",
+            "user@media.example.com",
+            "[::1]",
+            "[::1]:8080",
+            "http://[::1]/upload",
+            "",
+        ] {
+            assert_eq!(
+                auth_server_host(bad),
+                None,
+                "{bad:?} must not name the bare host"
+            );
+        }
     }
 
     #[test]
