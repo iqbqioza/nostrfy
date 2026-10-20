@@ -667,45 +667,40 @@ async fn apply_group_side_effects(db: &DbClient, opts: &Options, stats: &mut Sta
     // A `9005` that removes a state event changes the state later actions
     // are authorized against, and the startup rebuild sees the post-delete
     // database: reconcile to a fixpoint so the two cannot disagree. Each
-    // round applies only actions not yet applied, and only a round that
-    // removed a state event repeats (a purge always can, so it repeats
-    // once); the replay is then exactly what the restart will do.
+    // pass stops at the next unapplied `9005`/`9008` instead of collecting
+    // every action from the whole history: the caller applies that action
+    // and re-authorizes. A non-state `9005` still costs a pass, but the
+    // scan never materializes the full action/refused lists.
     let mut applied: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut dropped: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut deleted_creates: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut final_refused;
     loop {
-        // Fixpoint: apply the authorized actions, re-authorizing after
-        // every state change (the in-memory replay cannot undo an applied
-        // event).
+        // Fixpoint: find the next authorized action, apply its database
+        // side effect, then re-authorize (the in-memory replay cannot undo
+        // an applied event).
         loop {
             let mut groups = crate::nips::nip29::GroupStore::with_cap(opts.max_groups);
-            let (actions, refused) =
-                replay_stored_moderation(db, &mut groups, opts.relay_pubkey.as_deref()).await?;
-            final_refused = refused;
-            let mut state_changed = false;
-            for event in &actions {
-                if applied.contains(&event.id) {
-                    continue;
-                }
-                applied.insert(event.id.clone());
-                match event.kind {
-                    9005 => {
-                        if apply_group_deletion(db, event, &mut deleted_creates, stats).await? {
-                            state_changed = true;
-                            break;
-                        }
-                    }
-                    9008 => {
-                        apply_group_purge(db, event, stats).await?;
-                        state_changed = true;
-                        break;
-                    }
-                    _ => {}
-                }
-            }
-            if !state_changed {
+            let Some(action) = replay_stored_moderation(
+                db,
+                &mut groups,
+                opts.relay_pubkey.as_deref(),
+                &applied,
+                true,
+                None,
+            )
+            .await?
+            else {
                 break;
+            };
+            applied.insert(action.id.clone());
+            match action.kind {
+                9005 => {
+                    apply_group_deletion(db, &action, &mut deleted_creates, stats).await?;
+                }
+                9008 => {
+                    apply_group_purge(db, &action, stats).await?;
+                }
+                _ => {}
             }
         }
         // Ghost reconciliation: remove the creates that a deleted create's
@@ -792,7 +787,27 @@ async fn apply_group_side_effects(db: &DbClient, opts: &Options, stats: &mut Sta
             break;
         }
     }
-    drop_refused_moderation(db, &final_refused, &applied, &mut dropped, stats).await?;
+    // The fixpoint is stable: no unapplied action remains. Recompute the
+    // state once and drop the refused events page by page, so the refused
+    // list is never held in memory as a whole.
+    let mut groups = crate::nips::nip29::GroupStore::with_cap(opts.max_groups);
+    {
+        let mut dropper = RefusedDropper {
+            db,
+            applied: &applied,
+            dropped: &mut dropped,
+            stats,
+        };
+        replay_stored_moderation(
+            db,
+            &mut groups,
+            opts.relay_pubkey.as_deref(),
+            &applied,
+            false,
+            Some(&mut dropper),
+        )
+        .await?;
+    }
     drop_fake_group_metadata(db, opts.relay_pubkey.as_deref(), &mut dropped, stats).await?;
     Ok(())
 }
@@ -884,55 +899,67 @@ async fn drop_fake_group_metadata(
     Ok(())
 }
 
-/// Removes the moderation events the final replay refused: the live relay
-/// would not have stored them, and the rebuild (which no longer
-/// re-authorizes stored events, so a restart cannot drop legitimate ones)
-/// would otherwise apply them. The removal writes a per-id tombstone, so a
-/// re-run cannot re-import them.
+/// Drops the moderation events the final replay refused, one page at a
+/// time: the live relay would not have stored them, and the rebuild (which
+/// no longer re-authorizes stored events) would otherwise apply them. The
+/// removal writes a per-id tombstone, so a re-run cannot re-import them.
 ///
 /// An event whose side effect was already applied (`applied`) is kept and
 /// not counted: the final replay is over the post-deletion database, so an
 /// event accepted by the live relay before a later `9005` removed its
 /// author's grant replays as refused even though it was legitimate.
-async fn drop_refused_moderation(
-    db: &DbClient,
-    refused: &[Event],
-    applied: &std::collections::HashSet<String>,
-    dropped: &mut std::collections::HashSet<String>,
-    stats: &mut Stats,
-) -> Result<()> {
-    for event in refused {
-        // A refused 9005 is kept: the rebuild's state machine ignores 9005
-        // (its deletion was applied to the database when authorized), so
-        // keeping it cannot change the derived state, while dropping it
-        // made a re-run remove an event an earlier run had accepted.
-        if event.kind == 9005 || applied.contains(&event.id) || !dropped.insert(event.id.clone()) {
-            continue;
+struct RefusedDropper<'a> {
+    db: &'a DbClient,
+    applied: &'a std::collections::HashSet<String>,
+    dropped: &'a mut std::collections::HashSet<String>,
+    stats: &'a mut Stats,
+}
+
+impl RefusedDropper<'_> {
+    async fn drop_page(&mut self, page: Vec<Event>) -> Result<()> {
+        for event in page {
+            // A refused 9005 is kept: the rebuild's state machine ignores
+            // 9005 (its deletion was applied to the database when
+            // authorized), so keeping it cannot change the derived state,
+            // while dropping it made a re-run remove an event an earlier
+            // run had accepted.
+            if event.kind == 9005
+                || self.applied.contains(&event.id)
+                || !self.dropped.insert(event.id.clone())
+            {
+                continue;
+            }
+            let (removed, _) = self
+                .db
+                .apply_deletion_checked(
+                    vec![event.id.clone()],
+                    Vec::new(),
+                    Some(event.pubkey.clone()),
+                    event.created_at,
+                    false,
+                )
+                .await;
+            if removed.is_none() {
+                bail!(
+                    "could not remove a refused NIP-29 moderation event; the migration did \
+                     not complete (re-run it)"
+                );
+            }
+            self.stats.unauthorized_moderation += 1;
         }
-        let (removed, _) = db
-            .apply_deletion_checked(
-                vec![event.id.clone()],
-                Vec::new(),
-                Some(event.pubkey.clone()),
-                event.created_at,
-                false,
-            )
-            .await;
-        if removed.is_none() {
-            bail!(
-                "could not remove a refused NIP-29 moderation event; the migration did \
-                 not complete (re-run it)"
-            );
-        }
-        stats.unauthorized_moderation += 1;
+        Ok(())
     }
-    Ok(())
 }
 
 /// Replays the stored NIP-29 moderation events in the same
-/// `(created_at, group_rank, kind, id)` order as the startup rebuild,
-/// returning the authorized `9005`/`9008` events in order and the
-/// moderation events the gate refused.
+/// `(created_at, group_rank, kind, id)` order as the startup rebuild.
+///
+/// With `stop_at_action`, returns the first authorized `9005`/`9008` not
+/// in `applied` and stops there: the caller applies it, then the next pass
+/// re-authorizes from the updated database. With a `refused` dropper, the
+/// whole history is scanned (no unapplied action may remain, or the
+/// migration fails closed) and the refused events are dropped page by
+/// page, so the fixpoint never materializes the entire refused list.
 ///
 /// The replay covers the whole stored history, so a resumed migration
 /// (`--since`) or a merge into an existing database authorizes against the
@@ -943,7 +970,10 @@ async fn replay_stored_moderation(
     db: &DbClient,
     groups: &mut crate::nips::nip29::GroupStore,
     relay_pubkey: Option<&str>,
-) -> Result<(Vec<Event>, Vec<Event>)> {
+    applied: &std::collections::HashSet<String>,
+    stop_at_action: bool,
+    mut refused: Option<&mut RefusedDropper<'_>>,
+) -> Result<Option<Event>> {
     let kinds: Vec<u64> = (crate::nips::nip29::MOD_MIN..=crate::nips::nip29::MOD_MAX)
         .chain([crate::nips::nip29::JOIN, crate::nips::nip29::LEAVE])
         .collect();
@@ -966,8 +996,7 @@ async fn replay_stored_moderation(
     }
     const PAGE: usize = 50_000;
     let mut since: Option<u64> = None;
-    let mut actions = Vec::new();
-    let mut refused = Vec::new();
+    let mut page_refused = Vec::new();
     loop {
         let mut filter: crate::filter::Filter =
             serde_json::from_value(serde_json::json!({ "kinds": kinds })).expect("static filter");
@@ -1031,14 +1060,24 @@ async fn replay_stored_moderation(
                 }
             }
             if replay_moderation(groups, &event, relay_pubkey) {
-                if matches!(event.kind, 9005 | 9008) {
-                    actions.push(event);
+                if matches!(event.kind, 9005 | 9008) && !applied.contains(&event.id) {
+                    if stop_at_action {
+                        return Ok(Some(event));
+                    }
+                    bail!(
+                        "the NIP-29 moderation fixpoint was not stable: an authorized \
+                         action remained in the final replay; the migration did not \
+                         complete (re-run it)"
+                    );
                 }
-            } else {
-                refused.push(event);
+            } else if refused.is_some() {
+                page_refused.push(event);
             }
         }
         if !more {
+            if let Some(dropper) = refused.as_deref_mut() {
+                dropper.drop_page(std::mem::take(&mut page_refused)).await?;
+            }
             break;
         }
         // The collector can cut a second at its byte/tie caps while still
@@ -1046,6 +1085,9 @@ async fn replay_stored_moderation(
         // silently drop stored moderation events (and authorize against an
         // incomplete state); fail the migration instead.
         let Some(boundary) = max_created else {
+            if let Some(dropper) = refused.as_deref_mut() {
+                dropper.drop_page(std::mem::take(&mut page_refused)).await?;
+            }
             break;
         };
         if !crate::nips::nip29::boundary_second_complete(
@@ -1061,12 +1103,17 @@ async fn replay_stored_moderation(
                  the migration did not complete (re-run it)"
             );
         }
+        // Drop the page's refused events only after its boundary has been
+        // verified: the check queries the same second in the database.
+        if let Some(dropper) = refused.as_deref_mut() {
+            dropper.drop_page(std::mem::take(&mut page_refused)).await?;
+        }
         if boundary == u64::MAX {
             break;
         }
         since = Some(boundary.saturating_add(1));
     }
-    Ok((actions, refused))
+    Ok(None)
 }
 
 /// NIP-09: apply the deletion and purge the deleter's gift wraps (the relay

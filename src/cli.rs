@@ -1191,6 +1191,40 @@ impl Cli {
         String::from_utf8(body).map_err(|e| anyhow!(format!("response is not valid UTF-8: {e}")))
     }
 
+    /// Replaces `exe` with the already-verified `tmp` without a window in
+    /// which the public path is missing. The current binary is kept as a
+    /// hard link (`<exe>.prev`) for manual rollback; the temp file is then
+    /// renamed over `exe` in one atomic step (on Unix, rename replaces the
+    /// destination). A crash before the rename leaves the old binary at
+    /// `exe`; a crash after it leaves the new one. The hard link is only a
+    /// backup: if the filesystem cannot create one, a copy is used and the
+    /// public path is still untouched until the rename.
+    fn replace_binary(exe: &Path, tmp: &Path) -> Result<()> {
+        let backup = exe.with_extension("prev");
+        let _ = std::fs::remove_file(&backup);
+        if let Err(link_error) = std::fs::hard_link(exe, &backup) {
+            std::fs::copy(exe, &backup).map_err(|copy_error| {
+                anyhow!(format!(
+                    "cannot back up the current binary: hard link failed ({link_error}); \
+                     copy failed: {copy_error}"
+                ))
+            })?;
+        }
+        if let Err(e) = std::fs::rename(tmp, exe) {
+            // The original is still at `exe` (the hard link did not remove
+            // it); drop the extra link and fail cleanly.
+            let _ = std::fs::remove_file(&backup);
+            return Err(anyhow!(format!("replacing the binary failed: {e}")));
+        }
+        // fsync the directory so the rename survives a power loss, not just
+        // a process crash.
+        let dir = exe.parent().unwrap_or_else(|| Path::new("."));
+        if let Ok(d) = std::fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
+        Ok(())
+    }
+
     /// `nostrfy upgrade`: replaces the relay binary with a GitHub release
     /// asset (the version given on the command line, or the latest release).
     /// The download is written to a temp file next to the current
@@ -1198,10 +1232,15 @@ impl Cli {
     /// followed), its sha256 is verified against the published checksum,
     /// the binary is proven to run (`--version` probe with a deadline),
     /// and it is atomically renamed over the binary with an fsync of both
-    /// the file and the directory — a crash or power loss mid-upgrade
-    /// leaves the old binary intact. A running daemon keeps using the old
-    /// file (already mapped); the operator is reminded to `restart` to
-    /// apply the update.
+    /// the file and the directory. The previous binary is first kept as a
+    /// hard link (`<binary>.prev`), so the public path is never missing:
+    /// a crash before the rename leaves the old binary at the public path,
+    /// and after it the new binary is already there. The published
+    /// checksum is fetched from the same GitHub release origin: it detects
+    /// a corrupted or truncated download, not a compromised release
+    /// account; verify the release out-of-band for supply-chain protection.
+    /// A running daemon keeps using the old file (already mapped); the
+    /// operator is reminded to `restart` to apply the update.
     fn upgrade(&self, version: Option<&str>, force: bool) -> Result<()> {
         const REPO: &str = "iqbqioza/nostrfy";
         const MAX_ASSET_BYTES: u64 = 256 * 1024 * 1024;
@@ -1403,32 +1442,7 @@ impl Cli {
                      keeping the current binary"
                 ));
             };
-            // Keep the running binary for manual rollback: the post-replace
-            // probe only checks `--version`, so a binary that crashes on
-            // real startup would otherwise leave no working copy behind.
-            let backup = exe.with_extension("prev");
-            let _ = std::fs::remove_file(&backup);
-            if let Err(e) = std::fs::rename(&exe, &backup) {
-                return Err(anyhow!(format!("cannot back up the current binary: {e}")));
-            }
-            if let Err(e) = std::fs::rename(&tmp, &exe) {
-                // The original is currently at `backup`: restore it before
-                // failing, or a failed replace would leave no binary at the
-                // configured path at all.
-                if let Err(restore) = std::fs::rename(&backup, &exe) {
-                    return Err(anyhow!(format!(
-                        "replacing the binary failed ({e}) and restoring the backup failed \
-                         ({restore}); the previous binary is at {}",
-                        backup.display()
-                    )));
-                }
-                return Err(anyhow!(format!("replacing the binary failed: {e}")));
-            }
-            // fsync the directory so the rename survives a power loss, not
-            // just a process crash.
-            if let Ok(d) = std::fs::File::open(dir) {
-                let _ = d.sync_all();
-            }
+            Self::replace_binary(&exe, &tmp)?;
             Ok(())
         })();
         if result.is_err() {
@@ -2911,6 +2925,41 @@ mod tests {
     use super::*;
 
     const KEY: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+
+    #[test]
+    fn replace_binary_never_removes_the_public_path() {
+        // The upgrade must not have a window where the configured path is
+        // empty: a crash between two renames used to leave the old binary
+        // only at `.prev`. The helper keeps the old file as a hard link and
+        // replaces the public path in one rename.
+        let dir = std::env::temp_dir().join(format!(
+            "nostrfy-replace-binary-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("nostrfy");
+        let tmp = dir.join("nostrfy.new");
+        let backup = dir.join("nostrfy.prev");
+        std::fs::write(&exe, b"old binary").unwrap();
+        std::fs::write(&tmp, b"new binary").unwrap();
+        Cli::replace_binary(&exe, &tmp).unwrap();
+        assert_eq!(std::fs::read(&exe).unwrap(), b"new binary");
+        assert_eq!(std::fs::read(&backup).unwrap(), b"old binary");
+        assert!(!tmp.exists(), "the temp file was renamed into place");
+
+        // A failed replace must leave the original at the public path and
+        // not leave a stale backup behind.
+        std::fs::write(&exe, b"old binary 2").unwrap();
+        let missing = dir.join("missing");
+        assert!(Cli::replace_binary(&exe, &missing).is_err());
+        assert_eq!(std::fs::read(&exe).unwrap(), b"old binary 2");
+        assert!(!backup.exists(), "a failed replace removes the extra link");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_pid_beyond_i32_is_stale() {

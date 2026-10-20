@@ -931,7 +931,40 @@ impl Config {
         for warning in warn_unknown_fields(&raw) {
             log::warn!("{warning}");
         }
+        if let Some(warning) = Self::loose_config_permissions_warning(path, &cfg) {
+            log::warn!("{warning}");
+        }
         Ok(cfg)
+    }
+
+    /// The warning for a config file that carries secrets but is readable
+    /// by group/other, or `None` when the file is fine (or has no secrets).
+    ///
+    /// A hand-written config is not created by `nostrfy init`, so its mode
+    /// is whatever the editor/umask left behind. The docs promise the file
+    /// is kept `0600`; warn instead of failing so an existing deployment
+    /// (for example a deliberate group-readable file without secrets) keeps
+    /// working.
+    fn loose_config_permissions_warning(path: &Path, cfg: &Config) -> Option<String> {
+        let has_secrets = !cfg.relay.private_key.trim().is_empty()
+            || !cfg.rpc.management_token.trim().is_empty()
+            || !cfg.relay.livekit_api_secret.trim().is_empty()
+            || !cfg.blossom.s3_access_key.trim().is_empty()
+            || !cfg.blossom.s3_secret_key.trim().is_empty();
+        if !has_secrets {
+            return None;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path).ok()?.permissions().mode();
+        if mode & 0o077 == 0 {
+            return None;
+        }
+        Some(format!(
+            "{} contains secrets but is accessible to other users (mode {:04o});              restrict it with `chmod 600 {}`",
+            path.display(),
+            mode & 0o7777,
+            path.display()
+        ))
     }
 
     /// Canonicalizes configured public keys at the configuration boundary.
@@ -4757,6 +4790,47 @@ max_log_files = 2
         assert_eq!(state.blocked_kinds, once.blocked_kinds);
         assert_eq!(state.blocked_ips.entries(), once.blocked_ips.entries());
         assert_eq!(state.method_grants, once.method_grants);
+    }
+
+    #[test]
+    fn loose_config_permissions_warn_only_with_secrets() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "nostrfy-config-perms-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("nostrfy.toml");
+        std::fs::write(
+            &path,
+            format!("[relay]\nprivate_key = \"{}\"\n", "11".repeat(32)),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let cfg = Config::load(&path).unwrap();
+        let warning = Config::loose_config_permissions_warning(&path, &cfg)
+            .expect("a secret-bearing 0644 config must warn");
+        assert!(warning.contains("0644"), "{warning}");
+        assert!(warning.contains("chmod 600"), "{warning}");
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(
+            Config::loose_config_permissions_warning(&path, &cfg).is_none(),
+            "0600 is the expected mode"
+        );
+
+        // A loose mode without secrets is not the warning's target.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            Config::loose_config_permissions_warning(&path, &Config::default()).is_none(),
+            "no secrets, no warning"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
