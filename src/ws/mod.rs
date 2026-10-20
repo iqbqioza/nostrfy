@@ -5125,6 +5125,71 @@ mod tests {
     }
 
     #[test]
+    fn neg_open_counts_towards_subscriptions_total() {
+        // NEG-OPEN subscriptions count as active subscriptions; they must
+        // also count as created subscriptions, or `subscriptions_total` and
+        // `subscriptions_active` describe different populations.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            use std::sync::atomic::Ordering;
+            let mut conn = build_conn().await;
+            conn.relay
+                .stats
+                .subscriptions_total
+                .store(0, Ordering::Relaxed);
+            conn.relay
+                .stats
+                .subscriptions_active
+                .store(0, Ordering::Relaxed);
+            conn.handle_neg_open(&[json!("neg"), json!({"kinds": [1]}), json!("61000000")])
+                .await;
+            assert!(conn.neg.contains_key("neg"), "the NEG-OPEN must succeed");
+            assert_eq!(
+                conn.relay.stats.subscriptions_total.load(Ordering::Relaxed),
+                1,
+                "a successful NEG-OPEN is a created subscription"
+            );
+            assert_eq!(
+                conn.relay
+                    .stats
+                    .subscriptions_active
+                    .load(Ordering::Relaxed),
+                1
+            );
+            // NIP-77: a same-id NEG-OPEN replaces the subscription; it must
+            // not inflate either counter.
+            conn.handle_neg_open(&[json!("neg"), json!({"kinds": [1]}), json!("61000000")])
+                .await;
+            assert_eq!(
+                conn.relay.stats.subscriptions_total.load(Ordering::Relaxed),
+                1,
+                "a replacement is not a second created subscription"
+            );
+            assert_eq!(
+                conn.relay
+                    .stats
+                    .subscriptions_active
+                    .load(Ordering::Relaxed),
+                1
+            );
+            // NEG-CLOSE releases the active slot; the created total stays.
+            conn.handle_neg_close(&[json!("neg")]);
+            assert_eq!(
+                conn.relay.stats.subscriptions_total.load(Ordering::Relaxed),
+                1
+            );
+            assert_eq!(
+                conn.relay
+                    .stats
+                    .subscriptions_active
+                    .load(Ordering::Relaxed),
+                0
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
     fn neg_withholds_loose_protected_tag_from_anonymous() {
         // `["-", "extra"]` is protected like the REQ path: any tag named
         // `-` marks the event. An anonymous NEG-OPEN must withhold it from

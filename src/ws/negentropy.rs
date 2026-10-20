@@ -468,6 +468,7 @@ impl super::Conn {
         // replacement stays net zero even when the budget is full.
         // Over-budget opens fail retryably (`error:`) — which per NIP-77
         // closes the id — instead of pinning the items.
+        let replacing = self.neg.contains_key(&sub_id);
         if let Some(old) = self.neg.remove(&sub_id) {
             self.neg_total = self.neg_total.saturating_sub(old.items.len());
             // Release the subscription slot of the replaced negentropy
@@ -509,6 +510,17 @@ impl super::Conn {
             return;
         }
         self.send_neg_msg(&sub_id, &response);
+        // NEG-OPEN subscriptions are created subscriptions too: count a new
+        // id in `subscriptions_total` (a same-id replacement only reuses
+        // the slot, like a REQ replacement, so the total stays consistent
+        // with `subscriptions_active`). Only successful opens count: the
+        // failing paths above return before this point.
+        if !replacing {
+            self.relay
+                .stats
+                .subscriptions_total
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         // The open succeeded: refresh this sync and reclaim the other
         // silent ones. Failing opens above must not sweep — one bad frame
         // must not close unrelated syncs.
