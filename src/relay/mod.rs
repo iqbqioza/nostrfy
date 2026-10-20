@@ -164,6 +164,38 @@ impl PublishRate {
     }
 }
 
+/// In-flight/pending LiveKit refreshes per group (see
+/// [`Relay::refresh_livekit_participants`]): a burst of webhooks for the
+/// same room is coalesced into at most one extra `ListParticipants` pass
+/// instead of one request per webhook delivery.
+#[derive(Default)]
+struct LiveKitRefreshState {
+    in_flight: std::collections::HashSet<String>,
+    pending: std::collections::HashSet<String>,
+}
+
+/// Clears a group's in-flight marker if the refresh task unwinds before
+/// its normal cleanup (a leaked marker would stop every later refresh).
+struct LiveKitRefreshGuard<'a> {
+    relay: &'a Relay,
+    gid: &'a str,
+    armed: bool,
+}
+
+impl Drop for LiveKitRefreshGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.relay
+            .livekit_refresh
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .in_flight
+            .remove(self.gid);
+    }
+}
+
 pub struct Relay {
     pub config: Arc<RwLock<Config>>,
     /// The live access state. Runtime mutations must pair an apply with
@@ -297,6 +329,9 @@ pub struct Relay {
     /// `is_livekit_group` can store a stale list after the leave's empty
     /// one, which then wins the replaceable-event race.
     livekit_locks: Vec<tokio::sync::Mutex<()>>,
+    /// Coalesces webhook/poll refreshes per group (see
+    /// [`LiveKitRefreshState`]).
+    livekit_refresh: std::sync::Mutex<LiveKitRefreshState>,
     /// Shared signature-verification context. It is an `Arc` because the
     /// accept path hands it to `spawn_blocking` verification tasks; the
     /// precomputed tables are far too large to rebuild per batch, and
@@ -1957,6 +1992,7 @@ impl Relay {
             livekit_locks: (0..LIVEKIT_LOCK_COUNT)
                 .map(|_| tokio::sync::Mutex::new(()))
                 .collect(),
+            livekit_refresh: std::sync::Mutex::new(LiveKitRefreshState::default()),
         }
     }
 
@@ -3821,6 +3857,11 @@ impl Relay {
     /// changed. Shared by the periodic poll and the webhook trigger (webhook
     /// delivery is at-most-once, so the poll keeps reconciling). A failed
     /// fetch publishes nothing instead of an empty (wrong) list.
+    ///
+    /// Refreshes for the same group are coalesced: a webhook burst marks
+    /// one pending pass and returns, and the in-flight worker re-runs once
+    /// after its current fetch, so a burst costs at most one extra
+    /// `ListParticipants` request instead of one per delivery.
     pub(crate) async fn refresh_livekit_participants(&self, gid: &str) {
         let Some(relay_pubkey) = self.relay_pubkey() else {
             return;
@@ -3828,20 +3869,65 @@ impl Relay {
         let Some((url, api_key, api_secret)) = self.livekit_api_config().await else {
             return;
         };
-        let participants = match crate::server::livekit::fetch_livekit_participants(
-            &url,
-            &api_key,
-            &api_secret,
-            gid,
-        )
-        .await
         {
-            Ok(participants) => participants,
-            Err(e) => {
-                log::warn!("livekit participants for {gid}: {e}");
+            let mut state = self
+                .livekit_refresh
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !state.in_flight.insert(gid.to_string()) {
+                state.pending.insert(gid.to_string());
                 return;
             }
+        }
+        // A leaked in-flight marker would stop every later refresh for the
+        // group; clear it if this task unwinds before its normal cleanup.
+        let mut guard = LiveKitRefreshGuard {
+            relay: self,
+            gid,
+            armed: true,
         };
+        loop {
+            self.refresh_livekit_once(gid, &relay_pubkey, &url, &api_key, &api_secret)
+                .await;
+            let rerun = {
+                let mut state = self
+                    .livekit_refresh
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if state.pending.remove(gid) {
+                    true
+                } else {
+                    state.in_flight.remove(gid);
+                    guard.armed = false;
+                    false
+                }
+            };
+            if !rerun {
+                break;
+            }
+        }
+    }
+
+    /// One LiveKit fetch+publish pass (see
+    /// [`Self::refresh_livekit_participants`] for the coalescing wrapper).
+    async fn refresh_livekit_once(
+        &self,
+        gid: &str,
+        relay_pubkey: &str,
+        url: &str,
+        api_key: &str,
+        api_secret: &str,
+    ) {
+        let participants =
+            match crate::server::livekit::fetch_livekit_participants(url, api_key, api_secret, gid)
+                .await
+            {
+                Ok(participants) => participants,
+                Err(e) => {
+                    log::warn!("livekit participants for {gid}: {e}");
+                    return;
+                }
+            };
         // The group may have been deleted (or left LiveKit) while the fetch
         // was in flight: publishing would resurrect metadata for a group
         // that no longer wants it (a poll or webhook can race a 9008/9002).
@@ -3863,7 +3949,7 @@ impl Relay {
         let mut event = crate::nips::nip29::events::build_participants_event(
             gid,
             &participants,
-            &relay_pubkey,
+            relay_pubkey,
             now,
         );
         if self.store_relay_event(&mut event).await.is_ok() {
@@ -9534,7 +9620,7 @@ mod tests {
                     .collect::<Vec<_>>()
             }))
         }
-        let (started, rx) = tokio::sync::mpsc::channel(4);
+        let (started, rx) = tokio::sync::mpsc::channel(64);
         let state = MockState {
             participants,
             started,
@@ -9625,6 +9711,76 @@ mod tests {
             Some(&vec!["aa".repeat(32)]),
             "a failed publish must not be recorded as the current list"
         );
+    }
+
+    #[tokio::test]
+    async fn livekit_refresh_bursts_are_coalesced() {
+        // LiveKit webhook delivery is at-most-once and can burst; a room's
+        // refresh must not issue one ListParticipants request per delivery.
+        // The in-flight worker absorbs the burst into one extra pass.
+        use crate::db::PutOutcome;
+
+        let relay = build_relay_with_key(false, &"01".repeat(32)).await;
+        let gid = "g1";
+        let participants = std::sync::Arc::new(std::sync::Mutex::new(vec!["aa".repeat(32)]));
+        let (endpoint, mut started) =
+            mock_livekit_list_participants(std::sync::Arc::clone(&participants), 150).await;
+        {
+            let mut cfg = relay.config.write().await;
+            cfg.relay.livekit_url = endpoint;
+            cfg.relay.livekit_api_key = "key".into();
+            cfg.relay.livekit_api_secret = "secret".into();
+        }
+        let now = crate::util::unix_now();
+        let secp = secp256k1::Secp256k1::new();
+        let admin = secp256k1::Keypair::from_seckey_slice(&secp, &[4u8; 32]).unwrap();
+        let create = signed_group_event(
+            &secp,
+            &admin,
+            crate::nips::nip29::CREATE_GROUP,
+            gid,
+            vec![],
+            now,
+        );
+        assert!(matches!(
+            relay.accept_event(create, &[], None).await,
+            PutOutcome::Stored
+        ));
+        let enable = signed_group_event(
+            &secp,
+            &admin,
+            9002,
+            gid,
+            vec![vec!["livekit".to_string()]],
+            now + 1,
+        );
+        assert!(matches!(
+            relay.accept_event(enable, &[], None).await,
+            PutOutcome::Stored
+        ));
+
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let relay = std::sync::Arc::clone(&relay);
+            let gid = gid.to_string();
+            tasks.push(tokio::spawn(async move {
+                relay.refresh_livekit_participants(&gid).await;
+            }));
+        }
+        // Let every task enter the coalescer while the first fetch sleeps.
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        for task in tasks {
+            task.await.unwrap();
+        }
+        let mut requests = 0;
+        while started.try_recv().is_ok() {
+            requests += 1;
+        }
+        assert!(
+            requests <= 2,
+            "8 concurrent webhook refreshes must coalesce into at most one extra fetch (got {requests})"
+        );
+        relay.db.shutdown();
     }
 
     /// A NIP-01-signed group event for the rebuild tests.

@@ -889,7 +889,8 @@ mod tests {
 
     #[test]
     fn inbox_merges_with_single_string_tag_and_lowercases() {
-        // A single-string `#p` is valid NIP-01: promote, don't reject.
+        // A single-string `#p` is a nostrfy compatibility extension
+        // (NIP-01 only defines arrays): promote it instead of rejecting.
         let pk = "aa".repeat(32);
         let mut v = serde_json::json!({"inbox": pk, "#p": "bb".repeat(32)});
         rewrite_inbox_outbox(&mut v).unwrap();

@@ -43,6 +43,12 @@ pub const PUT_USER: u64 = 9000;
 pub const REMOVE_USER: u64 = 9001;
 pub const CREATE_GROUP: u64 = 9007;
 pub const DELETE_GROUP: u64 = 9008;
+/// NIP-29 join request. The normative section says a relay MUST reject a
+/// request from a user it has not added, while the spec's "Implementation
+/// quirks" section explicitly allows the relay to generate the `9000`
+/// immediately. nostrfy follows the quirks section: the live path still
+/// applies the closed-group/invite-code checks, and a join from an existing
+/// member is refused with the spec's `duplicate:` prefix.
 pub const JOIN: u64 = 9021;
 pub const LEAVE: u64 = 9022;
 
