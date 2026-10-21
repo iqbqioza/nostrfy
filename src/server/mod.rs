@@ -2041,6 +2041,17 @@ impl Drop for ClientIpGuard {
 /// is not capped at `max_connections_per_ip` under the proxy's single
 /// address. Untrusted peers keep the accept-time accounting on their own
 /// address, and their header is ignored (fail closed).
+/// A trusted-proxy request refused by the per-IP caps: the TCP connection
+/// is already established, so answer 429 and ask the client/proxy to close
+/// it instead of leaving a slotless keep-alive connection around.
+fn proxy_refused() -> Response {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [(axum::http::header::CONNECTION, "close")],
+    )
+        .into_response()
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn serve_limited(
     listener: tokio::net::TcpListener,
@@ -2058,6 +2069,14 @@ async fn serve_limited(
 
     let active = Arc::new(AtomicUsize::new(0));
     let ip_counter = Arc::new(crate::conn::IpConnCounter::default());
+    // Headerless trusted-proxy connections have no forwarded client address
+    // yet, so they cannot use the per-client budget. Give them a separate
+    // per-proxy counter, bounded at a quarter of the global connection
+    // budget: a header-read burst no longer collides with the (much
+    // smaller) per-client cap, and one proxy's silent flood cannot take the
+    // whole relay budget (M-4).
+    let pre_head_counter = Arc::new(crate::conn::IpConnCounter::default());
+    let pre_head_limit = max_connections.saturating_div(4).max(1);
     let (drain_tx, drain_rx) = watch::channel(());
     // Connection task handles, used to abort stragglers at shutdown. The
     // vector is pruned of finished handles above 1024 entries, so a
@@ -2125,16 +2144,16 @@ async fn serve_limited(
                 // releases this slot as soon as the head arrives and then
                 // accounts the forwarded client separately.
                 let pre_head_guard = if trusted {
-                    if !ip_counter.try_acquire(accounting, max_per_ip) {
+                    if !pre_head_counter.try_acquire(accounting, pre_head_limit) {
                         stats.bump(&stats.conn_refused_proxy, 1);
                         warn_refusal(
                             "trusted-proxy connections refused before the request head: \
-                             per-IP pre-head connection cap (limits.max_connections_per_ip)",
+                             pre-head cap (a quarter of limits.max_connections per proxy)",
                         );
                         continue;
                     }
                     Some(Arc::new(ClientIpGuard {
-                        counter: Arc::clone(&ip_counter),
+                        counter: Arc::clone(&pre_head_counter),
                         ip: accounting,
                     }))
                 } else {
@@ -2211,6 +2230,18 @@ async fn serve_limited(
                 let per_sec = per_sec_per_ip.clone();
                 let ip_counter_handle = Arc::clone(&ip_counter);
                 let stats_handle = Arc::clone(&stats);
+                // For a trusted proxy the per-IP slot must follow the
+                // connection, not the request: an idle keep-alive or a
+                // streaming body would otherwise hold the global slot
+                // without consuming the client's per-IP budget (M-5). The
+                // middleware re-keys this cell to the forwarded client on
+                // every request; the connection task keeps it alive until
+                // the socket ends (a WebSocket handover keeps its own
+                // extension reference).
+                let client_hold = Arc::new(std::sync::Mutex::new(
+                    None::<Arc<ClientIpGuard>>,
+                ));
+                let client_hold_handle = Arc::clone(&client_hold);
                 let svc = app.layer(axum::middleware::from_fn(
                     move |mut req: axum::extract::Request,
                           next: axum::middleware::Next| {
@@ -2220,12 +2251,23 @@ async fn serve_limited(
                         let per_sec = per_sec.clone();
                         let ip_counter = Arc::clone(&ip_counter_handle);
                         let stats = Arc::clone(&stats_handle);
+                        let client_hold = Arc::clone(&client_hold_handle);
                         async move {
                             // The request head is here: release the trusted
                             // proxy's pre-head per-IP slot before acquiring
                             // the forwarded client's slot (the proxy and the
                             // client may share an address on loopback).
                             drop(req.extensions_mut().remove::<Arc<ClientIpGuard>>());
+                            // A keep-alive connection re-keys its held
+                            // client slot to this request's forwarded
+                            // address. Drop the previous guard first so the
+                            // connection does not count against its own cap.
+                            drop(
+                                client_hold
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .take(),
+                            );
                             let raw_ip = normalize_ip(peer.ip());
                             let client = if trusted {
                                 client_ip(
@@ -2259,7 +2301,7 @@ async fn serve_limited(
                                         "trusted-proxy requests refused with 429: per-IP \
                                          connection rate limit",
                                     );
-                                    return StatusCode::TOO_MANY_REQUESTS.into_response();
+                                    return proxy_refused();
                                 }
                                 if !ip_counter.try_acquire(accounting, max_per_ip) {
                                     stats.bump(&stats.conn_refused_proxy, 1);
@@ -2267,7 +2309,7 @@ async fn serve_limited(
                                         "trusted-proxy requests refused with 429: per-IP \
                                          concurrent connection cap",
                                     );
-                                    return StatusCode::TOO_MANY_REQUESTS.into_response();
+                                    return proxy_refused();
                                 }
                                 // Two handles to the guard: one in the
                                 // request extensions (removed and moved into
@@ -2280,6 +2322,10 @@ async fn serve_limited(
                                     counter: Arc::clone(&ip_counter),
                                     ip: accounting,
                                 });
+                                *client_hold
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                                    Some(Arc::clone(&guard));
                                 req.extensions_mut().insert(Arc::clone(&guard));
                                 request_guard = Some(guard);
                             }
@@ -2312,6 +2358,10 @@ async fn serve_limited(
                     ),
                 );
                 conn_tasks.push(tokio::spawn(async move {
+                    // Keeps the trusted proxy's per-connection client guard
+                    // alive until this socket ends (M-5), unless the
+                    // WebSocket handover took the extension reference.
+                    let _client_hold = client_hold;
                     // Releases the accept-layer slot (global and per-IP) on
                     // every exit path of this task, including a panic. A
                     // WebSocket upgrade moves the release responsibility to
@@ -5397,6 +5447,105 @@ mod tests {
             String::from_utf8_lossy(&body).contains("200 OK"),
             "releasing the pre-head slot must admit the next connection"
         );
+        drop(second);
+        tx.send(true).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn serve_limited_holds_a_trusted_client_slot_across_keep_alive() {
+        // M-5: the per-IP slot must belong to the connection, not the
+        // request. An idle keep-alive connection used to release its client
+        // slot immediately after the response, so one client could park
+        // many connections outside max_connections_per_ip.
+        let (addr, tx, handle) = serve_limited_with_proxies(
+            10,
+            1,
+            Some(Duration::from_secs(30)),
+            None,
+            vec![TrustedProxy::parse("127.0.0.1/32").unwrap()],
+        )
+        .await;
+        let mut first = TcpStream::connect(addr).await.unwrap();
+        first
+            .write_all(
+                b"GET / HTTP/1.1\r\nHost: t\r\nX-Forwarded-For: 203.0.113.9\r\n\
+                  Connection: keep-alive\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let body = read_available(&mut first, Duration::from_secs(1)).await;
+        assert!(
+            String::from_utf8_lossy(&body).contains("200 OK"),
+            "the first request must be served"
+        );
+        // The idle keep-alive connection still owns the only client slot.
+        let refused = http_get_with_xff(addr, Some("203.0.113.9")).await;
+        assert!(
+            String::from_utf8_lossy(&refused).contains("429"),
+            "an idle keep-alive must keep the per-IP slot: {:?}",
+            String::from_utf8_lossy(&refused)
+        );
+        // Another client is unaffected.
+        let other = http_get_with_xff(addr, Some("203.0.113.10")).await;
+        assert!(
+            String::from_utf8_lossy(&other).contains("200 OK"),
+            "a different forwarded client must be admitted"
+        );
+        // Closing the idle connection releases the slot for the same
+        // client (poll: the server task may finish just after the client
+        // drops its socket).
+        drop(first);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let body = http_get_with_xff(addr, Some("203.0.113.9")).await;
+            if String::from_utf8_lossy(&body).contains("200 OK") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the keep-alive slot was not released: {:?}",
+                String::from_utf8_lossy(&body)
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tx.send(true).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn serve_limited_pre_head_cap_is_separate_from_the_client_cap() {
+        // M-4: the pre-head budget is derived from max_connections, not
+        // max_connections_per_ip. With max_per_ip = 1 but a large global
+        // budget, three headerless connections must coexist and one of them
+        // must still be able to complete its request (the old shared cap
+        // dropped the second/third immediately).
+        let (addr, tx, handle) = serve_limited_with_proxies(
+            100,
+            1,
+            Some(Duration::from_secs(30)),
+            None,
+            vec![TrustedProxy::parse("127.0.0.1/32").unwrap()],
+        )
+        .await;
+        let first = TcpStream::connect(addr).await.unwrap();
+        let second = TcpStream::connect(addr).await.unwrap();
+        let mut third = TcpStream::connect(addr).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        third
+            .write_all(
+                b"GET / HTTP/1.1\r\nHost: t\r\nX-Forwarded-For: 203.0.113.9\r\n\
+                  Connection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let (body, _) = read_to_eof(third, Duration::from_secs(3)).await;
+        assert!(
+            String::from_utf8_lossy(&body).contains("200 OK"),
+            "the pre-head cap must not collapse to max_connections_per_ip: {:?}",
+            String::from_utf8_lossy(&body)
+        );
+        drop(first);
         drop(second);
         tx.send(true).unwrap();
         handle.await.unwrap();

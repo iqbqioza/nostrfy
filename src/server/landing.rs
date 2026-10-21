@@ -15,7 +15,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use axum::body::Body;
 use axum::http::{HeaderValue, StatusCode, header};
@@ -26,6 +26,12 @@ use axum::response::{IntoResponse, Response};
 /// whole and shipped to every visitor.
 pub(crate) const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
 
+/// A cached landing page is revalidated at least this often even when its
+/// mtime and length are unchanged: a generator that rewrites in place with
+/// the same size on a coarse-mtime filesystem (NFS/ext3, `rsync -t`) must
+/// not leave a stale page served forever.
+const LANDING_CACHE_TTL: Duration = Duration::from_secs(1);
+
 /// Cached landing page: keyed by the full configured path plus the file's
 /// mtime and size, so a rewrite (or a config change to another path) is
 /// picked up on the next request.
@@ -33,6 +39,7 @@ struct Cached {
     path: PathBuf,
     mtime: Option<SystemTime>,
     len: u64,
+    cached_at: Instant,
     body: axum::body::Bytes,
 }
 
@@ -77,6 +84,7 @@ pub(crate) fn landing_page(path: &Path) -> Option<axum::body::Bytes> {
             && c.path == path
             && c.mtime == mtime
             && c.len == len
+            && c.cached_at.elapsed() < LANDING_CACHE_TTL
         {
             return Some(c.body.clone());
         }
@@ -94,6 +102,7 @@ pub(crate) fn landing_page(path: &Path) -> Option<axum::body::Bytes> {
         path: path.to_path_buf(),
         mtime,
         len,
+        cached_at: Instant::now(),
         body: body.clone(),
     });
     Some(body)
@@ -239,6 +248,41 @@ mod tests {
         .await
         .expect("a FIFO asset must not block the request");
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cache_refreshes_a_same_size_same_mtime_rewrite_after_the_ttl() {
+        // I-4: a generator that rewrites the page in place with the same
+        // length and restores the mtime (coarse-mtime FS, `rsync -t`) must
+        // still be picked up after the short TTL.
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "nostrfy-landing-cache-test-{}-{id}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("page.html");
+        std::fs::write(&path, b"AAAA").unwrap();
+        assert_eq!(&landing_page(&path).unwrap()[..], b"AAAA");
+        let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::fs::write(&path, b"BBBB").unwrap();
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_times(std::fs::FileTimes::new().set_modified(mtime))
+            .unwrap();
+        assert_eq!(
+            &landing_page(&path).unwrap()[..],
+            b"AAAA",
+            "the short TTL window may serve the cached body"
+        );
+        std::thread::sleep(LANDING_CACHE_TTL + Duration::from_millis(50));
+        assert_eq!(
+            &landing_page(&path).unwrap()[..],
+            b"BBBB",
+            "a same-size, same-mtime rewrite must refresh after the TTL"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
