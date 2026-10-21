@@ -9558,10 +9558,15 @@ mod tests {
                 let _ = axum::serve(listener, app).await;
             });
             let ws = connect_ws(addr, None).await;
-            assert!(
-                slots.lock().unwrap().is_empty(),
-                "the upgrade must consume the accept slot"
-            );
+            // The client handshake completes when the 101 is received, but
+            // the server invokes `on_upgrade` asynchronously afterwards. Wait
+            // for the callback to consume the handover instead of racing it
+            // (FreeBSD's scheduler exposed this as a flake).
+            wait_for(
+                || slots.lock().unwrap().is_empty(),
+                "the upgrade must consume the accept slot",
+            )
+            .await;
             wait_for(
                 || active.load(std::sync::atomic::Ordering::Relaxed) == 1,
                 "the accepted connection to hold its slot",
