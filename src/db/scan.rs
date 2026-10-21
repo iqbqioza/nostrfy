@@ -1813,10 +1813,15 @@ fn is_deliverable<E: crate::filter::EventFields>(
     let Ok(id) = <[u8; 32]>::try_from(id) else {
         return Ok(false);
     };
-    if ctx
-        .deleted
-        .get(ctx.rtxn, &id)?
-        .is_some_and(|marker| deletion_marker_blocks(marker, event))
+    // NIP-09: "Deleting a deletion request has no effect." The put path
+    // accepts a kind:5 request even when an absent-target marker names its
+    // id (see `Store::put`), so the scan must not hide it either; otherwise
+    // live delivery and history disagree.
+    if event.kind() != crate::nips::nip09::DELETION_KIND
+        && ctx
+            .deleted
+            .get(ctx.rtxn, &id)?
+            .is_some_and(|marker| deletion_marker_blocks(marker, event))
     {
         return Ok(false);
     }

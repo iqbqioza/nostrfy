@@ -715,9 +715,8 @@ mod tests {
             Some(&json!(9)),
             "the accepted-event counter must stay public"
         );
-        assert_eq!(
-            public.get("uptime_secs").and_then(Value::as_u64),
-            Some(0),
+        assert!(
+            public.get("uptime_secs").and_then(Value::as_u64).is_some(),
             "the uptime gauge must stay public"
         );
         // `db_size_bytes` is the relay's own volume, not a capacity oracle

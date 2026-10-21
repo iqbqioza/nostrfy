@@ -755,6 +755,13 @@ pub(crate) struct Store {
     /// the store, so a test can only arm it after startup through a clone.
     #[cfg(test)]
     pub(crate) fail_next_commit: Arc<std::sync::atomic::AtomicBool>,
+    /// Test-only one-shot fault injection for the word-index rebuild: the
+    /// first chunk commit after the completion marker is invalidated is
+    /// refused as `MapFull`, simulating a crash mid-rebuild. Kept separate
+    /// from `fail_next_commit` so startup work cannot consume a fault armed
+    /// for the writer's put path.
+    #[cfg(test)]
+    pub(crate) fail_next_word_index_commit: Arc<std::sync::atomic::AtomicBool>,
     /// Whether commits skip the fsync (`database.disabled_fsync`): the
     /// writer thread then syncs periodically instead of only at shutdown.
     /// Set once at open (the flag is not reloadable).
@@ -947,7 +954,12 @@ impl Store {
                 );
             }
             let rtxn = env.read_txn()?;
-            let ready = index_meta.get(&rtxn, b"word_index")?.is_some();
+            // A changed limit schedules a re-key at startup. Do not
+            // advertise the old (still complete for the old limit) index as
+            // ready before that re-key starts: the marker is deleted before
+            // the clear and rewritten only after a complete rebuild.
+            let ready =
+                value == configured_words && index_meta.get(&rtxn, b"word_index")?.is_some();
             (value, ready)
         } else {
             // A database running without the index does not index the
@@ -1001,6 +1013,8 @@ impl Store {
             df_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             #[cfg(test)]
             fail_next_commit: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(test)]
+            fail_next_word_index_commit: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             disabled_fsync: cfg.disabled_fsync,
             #[cfg(test)]
             panic_next_write: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1085,6 +1099,22 @@ impl Store {
         Ok(())
     }
 
+    /// Commits a word-index rebuild chunk, honoring the test-only
+    /// `fail_next_word_index_commit` hook (see its docs). The completion
+    /// marker was already deleted in its own committed transaction, so a
+    /// failure here leaves the index unready and forces a rebuild.
+    fn commit_word_index(&self, wtxn: heed::RwTxn<'_>) -> Result<()> {
+        #[cfg(test)]
+        if self
+            .fail_next_word_index_commit
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(heed::Error::Mdb(heed::MdbError::MapFull).into());
+        }
+        wtxn.commit()?;
+        Ok(())
+    }
+
     pub(crate) fn size_on_disk(&self) -> u64 {
         self.env.real_disk_size().unwrap_or(0)
     }
@@ -1135,6 +1165,8 @@ impl Store {
             // purge, so sharing them is harmless.
             #[cfg(test)]
             fail_next_commit: Arc::clone(&self.fail_next_commit),
+            #[cfg(test)]
+            fail_next_word_index_commit: Arc::clone(&self.fail_next_word_index_commit),
             disabled_fsync: self.disabled_fsync,
             #[cfg(test)]
             panic_next_write: Arc::clone(&self.panic_next_write),
@@ -3167,6 +3199,17 @@ impl Store {
                 _ => 0,
             }
         };
+        // Invalidate the completion marker *before* clearing or re-indexing.
+        // A crash after this commit leaves no marker, so the next startup
+        // rebuilds even when the operator returns to the previous limit (a
+        // surviving marker plus an unchanged persisted limit would otherwise
+        // accept a partially cleared index forever). The marker write at the
+        // end is the only point at which the index becomes ready.
+        {
+            let mut wtxn = self.env.write_txn()?;
+            self.index_meta.delete(&mut wtxn, b"word_index")?;
+            wtxn.commit()?;
+        }
         if persisted != limit {
             // Clear in bounded chunks: a huge index must not pin one
             // unbounded write transaction.
@@ -3197,7 +3240,7 @@ impl Store {
                 for key in &chunk {
                     by_word.delete(&mut wtxn, key)?;
                 }
-                wtxn.commit()?;
+                self.commit_word_index(wtxn)?;
                 last = chunk.last().cloned();
                 if chunk.len() < CHUNK {
                     break;
@@ -3238,7 +3281,7 @@ impl Store {
                 index_event_words(&by_word, &mut wtxn, event, id, limit)?;
                 indexed += 1;
             }
-            wtxn.commit()?;
+            self.commit_word_index(wtxn)?;
             if chunk.len() < CHUNK {
                 break;
             }
@@ -3250,7 +3293,7 @@ impl Store {
         self.index_meta
             .put(&mut wtxn, b"word_limit", &(limit as u64).to_be_bytes())?;
         self.index_meta.put(&mut wtxn, b"word_index", b"1")?;
-        wtxn.commit()?;
+        self.commit_word_index(wtxn)?;
         self.indexed_words
             .store(limit, std::sync::atomic::Ordering::Relaxed);
         self.word_index_ready

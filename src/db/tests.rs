@@ -1295,8 +1295,9 @@ fn a_deletion_request_is_not_blocked_by_its_own_absent_marker() {
     rt.block_on(async {
         let author = "00".repeat(32);
         let deletion = event(5, "", now, vec![]);
+        let deletion_id = deletion.id.clone();
         assert_eq!(
-            db.apply_deletion(vec![deletion.id.clone()], vec![], Some(author.clone()), now)
+            db.apply_deletion(vec![deletion_id.clone()], vec![], Some(author.clone()), now)
                 .await,
             0,
             "the request itself is not held yet"
@@ -1306,6 +1307,21 @@ fn a_deletion_request_is_not_blocked_by_its_own_absent_marker() {
             PutOutcome::Stored,
             "a deletion request must not be blocked by a marker for its id"
         );
+        // The scan must apply the same NIP-09 exception: hiding the stored
+        // request in REQ/COUNT/NEG would make live delivery and history
+        // disagree.
+        let filter: Filter =
+            serde_json::from_value(serde_json::json!({ "kinds": [5], "ids": [deletion_id] }))
+                .unwrap();
+        let (found, more) = db.query(vec![filter.clone()], 10, now).await;
+        assert_eq!(
+            found.len(),
+            1,
+            "the stored deletion request must be returned by REQ: {found:?}"
+        );
+        assert!(!more);
+        let (count, _) = db.count_reported(vec![filter], 10, now).await.unwrap();
+        assert_eq!(count.len(), 1, "COUNT must see the deletion request");
         // The exception is kind-specific: a plain event under the same
         // author-scoped marker is still refused.
         let note = event(1, "note", now, vec![]);
@@ -4444,6 +4460,95 @@ fn word_index_rekeys_after_a_limit_change() {
                 .unwrap()
                 .is_some(),
             "the re-key must index {word} with the new limit"
+        );
+    }
+}
+
+#[test]
+fn word_index_rekey_crash_invalidates_the_completion_marker() {
+    // M-6: a re-key clears the old word keys before re-indexing. If the
+    // process dies mid-clear, the old completion marker must not survive:
+    // returning to the old limit would otherwise satisfy
+    // `word_limit == configured` and accept the partial index forever.
+    let cfg = config();
+    let expiry = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let now = unix_now();
+    let ev = event(1, "alpha beta gamma delta", now, vec![]);
+    let id = ev.id_bytes().unwrap();
+    {
+        let store = crate::db::store::Store::open(&cfg, Arc::clone(&expiry), 4).unwrap();
+        let mut wtxn = store.env.write_txn().unwrap();
+        store
+            .events
+            .put(&mut wtxn, &id, &serde_json::to_vec(&ev).unwrap())
+            .unwrap();
+        wtxn.commit().unwrap();
+        assert_eq!(store.rebuild_word_index().unwrap(), 1);
+        assert!(
+            store
+                .word_index_ready
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+    }
+    // Start a re-key (4 -> 2) and fail the first clear commit, simulating a
+    // crash after the marker invalidation but before the rebuild finished.
+    {
+        let store = crate::db::store::Store::open(&cfg, Arc::clone(&expiry), 2).unwrap();
+        assert!(
+            !store
+                .word_index_ready
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "a pending re-key must not advertise the old index as ready"
+        );
+        assert!(store.word_index_needs_rebuild().unwrap());
+        store
+            .fail_next_word_index_commit
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            store.rebuild_word_index().is_err(),
+            "the injected clear failure must abort the rebuild"
+        );
+        assert!(
+            !store
+                .word_index_ready
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+        let rtxn = store.env.read_txn().unwrap();
+        assert!(
+            store
+                .index_meta
+                .get(&rtxn, b"word_index")
+                .unwrap()
+                .is_none(),
+            "the completion marker must be gone before the clear"
+        );
+    }
+    // Back at the original limit, the missing marker forces a rebuild
+    // instead of accepting the partially cleared key set.
+    let store = crate::db::store::Store::open(&cfg, expiry, 4).unwrap();
+    assert!(
+        !store
+            .word_index_ready
+            .load(std::sync::atomic::Ordering::Relaxed),
+        "the incomplete index must not be ready"
+    );
+    assert!(store.word_index_needs_rebuild().unwrap());
+    assert_eq!(store.rebuild_word_index().unwrap(), 1);
+    assert!(!store.word_index_needs_rebuild().unwrap());
+    assert!(
+        store
+            .word_index_ready
+            .load(std::sync::atomic::Ordering::Relaxed)
+    );
+    let rtxn = store.env.read_txn().unwrap();
+    let by_word = store.by_word.unwrap();
+    for word in ["alpha", "beta", "gamma", "delta"] {
+        assert!(
+            by_word
+                .get(&rtxn, &crate::db::store::word_key(word, ev.created_at, &id))
+                .unwrap()
+                .is_some(),
+            "the rebuilt index must contain {word}"
         );
     }
 }
