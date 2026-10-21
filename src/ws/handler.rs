@@ -640,21 +640,28 @@ impl super::Conn {
             && (more || truncated)
             && kept.len() >= page_capacity
             && !kept.is_empty()
-            && !unplaced.is_empty()
             && kept
                 .iter()
                 .all(|event| event.created_at == kept[0].created_at)
         {
             // Drop the boundary second (all of `kept`) and give the
-            // over-fetched older events a fresh attribution.
+            // over-fetched older events a fresh attribution. When there is
+            // no older reserve at all (a tie flood with nothing below it),
+            // the page must be empty with `more`: delivering a partial tie
+            // block would make an inclusive client request the same block
+            // forever. This is why `unplaced` must not gate the guard.
             let (next, next_unplaced) =
                 attribute_visible_page(&mut unplaced, &stored, &limits, true);
             if !next.is_empty() {
                 kept = next;
                 unplaced = next_unplaced;
                 truncated = !unplaced.is_empty();
-                tie_truncated = true;
+            } else {
+                kept.clear();
+                unplaced.clear();
+                truncated = false;
             }
+            tie_truncated = true;
         }
         to_send = kept;
         // Bound the memory this response pins while it waits for the

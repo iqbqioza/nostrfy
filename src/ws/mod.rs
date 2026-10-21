@@ -401,17 +401,24 @@ pub(crate) struct OutFrame {
 /// ids of the same connection matters, so a hash collision would merely
 /// drop an unrelated queued event (2^-64 chance with SipHash).
 pub(crate) fn sub_fingerprint(sub_id: &str) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    sub_id.hash(&mut hasher);
-    hasher.finish()
+    fingerprint(0, sub_id)
 }
 
 /// Fingerprint used to tag queued NEG frames. NIP-77 subscription ids are a
 /// separate namespace from REQ ids, so a NEG id that spells a REQ id must
-/// not purge (or be purged with) that REQ's queued frames.
+/// not purge (or be purged with) that REQ's queued frames. Domain
+/// separation is part of the hash input, not a string prefix: a REQ id
+/// literally spelled `"neg\0X"` would otherwise collide with NEG id `X`.
 pub(crate) fn neg_sub_fingerprint(sub_id: &str) -> u64 {
-    sub_fingerprint(&format!("neg\u{0}{sub_id}"))
+    fingerprint(1, sub_id)
+}
+
+fn fingerprint(namespace: u8, sub_id: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    namespace.hash(&mut hasher);
+    sub_id.hash(&mut hasher);
+    hasher.finish()
 }
 
 pub struct Conn {
@@ -438,6 +445,14 @@ pub struct Conn {
     /// shed oversized frames must not have to wait for every existing
     /// connection to reconnect.
     pub(crate) max_msg_size: usize,
+    /// Current `limits.max_sub_id_len` (refreshed on SIGHUP): used to
+    /// sanitize NEG/AUTH ids echoed by the idle reaper, which has no async
+    /// config read of its own.
+    pub(crate) max_sub_id_len: usize,
+    /// A protocol-level oversized-frame close (1009) is pending: queued
+    /// only after the post-loop event flush so already-accepted events get
+    /// their OKs before the Close.
+    pub(crate) close_too_big: bool,
     /// The relay-wide pending-response byte budget shared by every
     /// connection; each materialized response reserves its size against it
     /// and over-budget responses fail with a retryable CLOSED.
@@ -692,6 +707,19 @@ impl Conn {
     /// when the protocol layer rejects an oversized inbound frame, so the
     /// client can tell it from a network failure.
     fn queue_close_too_big(&mut self) {
+        // Defer the frame: the post-loop `flush_pending_events` queues the
+        // OKs for events already accepted in this batch, and those must be
+        // delivered before Close(1009). Pushing it here sent the Close
+        // first and abandoned every OK after the socket entered Closing.
+        self.close_too_big = true;
+    }
+
+    /// Queues the deferred Close(1009) after the pending-event flush.
+    fn enqueue_close_too_big(&mut self) {
+        if !self.close_too_big {
+            return;
+        }
+        self.close_too_big = false;
         self.outgoing.push_back(OutFrame {
             message: Message::Close(Some(axum::extract::ws::CloseFrame {
                 code: axum::extract::ws::close_code::SIZE,
@@ -1106,6 +1134,22 @@ impl Conn {
     /// paths never take the shared config lock. Besides the NIP-40/42/78
     /// flags this re-reads the queue budgets, which are otherwise cached
     /// at connect time (a reload must reach existing connections).
+    /// Refreshes the cached flags when the relay's config version moved,
+    /// without taking the shared config lock on every loop iteration. The
+    /// pump calls this before using `require_auth`: a SIGHUP that arrives
+    /// while the connection is waiting for a slow reader must not let an
+    /// already-fetched stored page through the old policy.
+    pub(crate) async fn refresh_config_if_stale(&mut self) {
+        let version = self
+            .relay
+            .config_version
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if version != self.config_version {
+            self.config_version = version;
+            self.refresh_config_cache().await;
+        }
+    }
+
     pub(crate) async fn refresh_config_cache(&mut self) {
         {
             let cfg = self.relay.config.read().await;
@@ -1116,6 +1160,7 @@ impl Conn {
             self.out_queue_bytes = cfg.limits.max_out_queue_bytes;
             self.req_response_bytes = cfg.limits.max_req_response_bytes;
             self.max_msg_size = cfg.limits.max_ws_message_bytes;
+            self.max_sub_id_len = cfg.limits.max_sub_id_len;
             self.outbox_write_policy = cfg.server.outbox_write_policy.clone();
             self.inbox_write_policy = cfg.server.inbox_write_policy.clone();
         }
@@ -1150,6 +1195,7 @@ impl Conn {
         };
         if text.len() > max_msg_size {
             self.send_notice("error: message too large");
+            self.queue_close_too_big();
             return true;
         }
         self.in_msgs += 1;
@@ -1164,6 +1210,7 @@ impl Conn {
     async fn handle_binary(&mut self, data: &[u8], max_msg_size: usize) -> bool {
         if data.len() > max_msg_size {
             self.send_notice("error: message too large");
+            self.queue_close_too_big();
             return true;
         }
         let text = String::from_utf8_lossy(data);
@@ -1382,6 +1429,7 @@ pub async fn handle_connection(
         nip78_restricted,
         require_auth,
         idle_timeout,
+        max_sub_id_len,
         outbox_write_policy,
         inbox_write_policy,
     ) = {
@@ -1395,6 +1443,7 @@ pub async fn handle_connection(
             cfg.nip_enabled(78) && cfg.relay.enabled_nip78_auth,
             cfg.relay.require_auth,
             cfg.limits.ws_idle_timeout_secs,
+            cfg.limits.max_sub_id_len,
             cfg.server.outbox_write_policy.clone(),
             cfg.server.inbox_write_policy.clone(),
         )
@@ -1488,6 +1537,8 @@ pub async fn handle_connection(
         out_queue_bytes,
         req_response_bytes,
         max_msg_size,
+        max_sub_id_len,
+        close_too_big: false,
         subs: HashMap::new(),
         sub_bytes: 0,
         neg: HashMap::new(),
@@ -1567,6 +1618,10 @@ pub async fn handle_connection(
                 break;
             }
         }
+        // A SIGHUP may have arrived while the outgoing drain was waiting
+        // for a slow reader. Refresh before the pump so a pending stored
+        // page cannot be delivered under the old `require_auth` policy.
+        conn.refresh_config_if_stale().await;
         // Pump the queued REQ responses through the capped outgoing queue
         // in bounded chunks (see `pump_pending_reqs`).
         conn.pump_pending_reqs();
@@ -1735,7 +1790,7 @@ pub async fn handle_connection(
                         .as_mut()
                         .reset(tokio::time::Instant::now() + tokio::time::Duration::from_millis(1));
                 }
-                if too_large {
+                if too_large || conn.close_too_big {
                     break;
                 }
                 conn.flush_pending_events().await;
@@ -1776,6 +1831,7 @@ pub async fn handle_connection(
                         break;
                     }
                 }
+                conn.refresh_config_if_stale().await;
                 conn.pump_pending_reqs();
             }
             _ = ping_fut => {
@@ -1786,6 +1842,7 @@ pub async fn handle_connection(
                 // connection alive but never touches NEG state, so without
                 // this an idle sync would hold its items and budget share
                 // forever.
+                conn.refresh_config_if_stale().await;
                 conn.reap_idle_negentropy();
                 // The send is bounded: a peer that stopped reading parks
                 // inside it, and the idle deadline (raced only by the
@@ -1889,6 +1946,7 @@ pub async fn handle_connection(
     // indefinitely. On expiry the connection closes without the final
     // batch; its events were never queued, so nothing partial commits.
     let _ = tokio::time::timeout(teardown_grace, conn.flush_pending_events()).await;
+    conn.enqueue_close_too_big();
 
     // Final flush: deliver any queued messages (e.g. NOTICEs) before
     // closing the connection. Bounded by `teardown_grace`: a peer that
@@ -2138,6 +2196,7 @@ mod tests {
                     overflow: overflow_tx,
                 },
             );
+        let max_sub_id_len = relay.config.read().await.limits.max_sub_id_len;
         Conn {
             pending_budget: pending_response_budget(&relay),
             neg_budget: neg_budget(&relay),
@@ -2156,6 +2215,8 @@ mod tests {
             out_queue_bytes,
             req_response_bytes: 0,
             max_msg_size,
+            max_sub_id_len,
+            close_too_big: false,
             pending_reqs: std::collections::VecDeque::new(),
             subs: HashMap::new(),
             sub_bytes: 0,
@@ -6038,6 +6099,92 @@ mod tests {
     }
 
     #[test]
+    fn req_and_neg_fingerprints_are_domain_separated() {
+        // The old NEG fingerprint hashed the string `"neg\0" + id`, so a
+        // REQ id spelled exactly like that collided with NEG id `id`.
+        assert_ne!(sub_fingerprint("a"), neg_sub_fingerprint("a"));
+        assert_ne!(sub_fingerprint("neg\0a"), neg_sub_fingerprint("a"));
+    }
+
+    #[test]
+    fn a_too_big_close_is_queued_after_pending_oks() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            conn.send_json(json!(["OK", "event", true, ""]));
+            conn.queue_close_too_big();
+            assert_eq!(
+                conn.outgoing.len(),
+                1,
+                "queueing the close must not jump the pending OK"
+            );
+            conn.enqueue_close_too_big();
+            assert_eq!(conn.outgoing.len(), 2);
+            assert!(
+                matches!(
+                    &conn.outgoing[1].message,
+                    Message::Close(Some(frame))
+                        if frame.code == axum::extract::ws::close_code::SIZE
+                ),
+                "the deferred Close(1009) must follow the OK"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn a_lowered_sub_id_limit_still_releases_the_raw_neg_state() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let id = "n".repeat(10);
+            conn.handle_neg_open(&[json!(id), json!({"kinds": [1]}), json!("61000000")])
+                .await;
+            assert!(conn.neg.contains_key(&id), "the sync is open");
+            conn.relay.config.write().await.limits.max_sub_id_len = 4;
+            conn.handle_neg_msg(&[json!(id), json!("zz")]).await;
+            assert!(
+                !conn.neg.contains_key(&id),
+                "the raw state must be released even when the echo is sanitized"
+            );
+            let msgs = outgoing_json(&conn);
+            assert!(
+                msgs.iter().any(|m| m[0] == "NEG-ERR" && m[1] == json!("")),
+                "the wire echo must be the bounded empty id: {msgs:?}"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn a_neg_reopen_purges_a_stale_neg_err() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let id = "ghost";
+            conn.handle_neg_msg(&[json!(id), json!("zz")]).await;
+            assert!(
+                outgoing_json(&conn)
+                    .iter()
+                    .any(|m| m[0] == "NEG-ERR" && m[1] == json!(id)),
+                "the unknown id queues a terminal error"
+            );
+            conn.handle_neg_open(&[json!(id), json!({"kinds": [1]}), json!("61000000")])
+                .await;
+            let msgs = outgoing_json(&conn);
+            assert!(
+                !msgs.iter().any(|m| m[0] == "NEG-ERR" && m[1] == json!(id)),
+                "a re-open must purge the stale NEG-ERR: {msgs:?}"
+            );
+            assert!(
+                msgs.iter().any(|m| m[0] == "NEG-MSG" && m[1] == json!(id)),
+                "the reopened sync response must be queued: {msgs:?}"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
     fn same_second_tie_flood_paginates_to_finish() {
         // A same-second flood larger than the scan's tie cap used to
         // return the same tie block on every page, so an inclusive client
@@ -6092,6 +6239,91 @@ mod tests {
             assert!(
                 finished,
                 "the inclusive client must reach finish within 12 rounds"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn same_second_tie_flood_without_older_events_returns_an_empty_page() {
+        // The guard must not be skipped just because there is no older
+        // reserve: delivering a partial tie block makes an inclusive client
+        // (`until = oldest seen`) loop forever. The correct answer is an
+        // empty page with `more`, then the next second finishes.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let now = unix_now();
+            for i in 0..60 {
+                let ev = signed_note(conn.relay.secp(), &format!("flood-{i}"), now, vec![]);
+                conn.relay.db.put(ev, now).await;
+            }
+            conn.handle_req(&[json!("sub"), json!({"kinds": [1], "limit": 5})])
+                .await;
+            conn.pump_pending_reqs();
+            let msgs = outgoing_json(&conn);
+            assert!(
+                !msgs.iter().any(|m| m[0] == "EVENT"),
+                "a partial tie block must not be delivered: {msgs:?}"
+            );
+            assert!(
+                msgs.iter()
+                    .any(|m| m[0] == "EOSE" && m[1] == "sub" && m[2] == json!(["more"])),
+                "the empty page must still report more: {msgs:?}"
+            );
+
+            conn.outgoing.clear();
+            conn.out_bytes = 0;
+            conn.handle_req(&[
+                json!("sub"),
+                json!({"kinds": [1], "limit": 5, "until": now - 1}),
+            ])
+            .await;
+            conn.pump_pending_reqs();
+            let msgs = outgoing_json(&conn);
+            assert!(
+                !msgs.iter().any(|m| m[0] == "EVENT"),
+                "nothing exists below the flood second: {msgs:?}"
+            );
+            assert!(
+                msgs.iter()
+                    .any(|m| m[0] == "EOSE" && m[1] == "sub" && m[2] == json!(["finish"])),
+                "the next second must finish: {msgs:?}"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn a_pending_req_is_closed_after_a_config_version_bump() {
+        // The pump must refresh the cached config itself: a SIGHUP that
+        // enables require_auth while the connection is waiting for a slow
+        // reader cannot be missed just because no inbound/live frame arrived.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let now = unix_now();
+            let ev = signed_note(conn.relay.secp(), "stored", now, vec![]);
+            conn.relay.db.put(ev, now).await;
+            conn.handle_req(&[json!("sub"), json!({"kinds": [1]})])
+                .await;
+            assert_eq!(conn.pending_reqs.len(), 1);
+            conn.relay.config.write().await.relay.require_auth = true;
+            conn.relay
+                .config_version
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            conn.refresh_config_if_stale().await;
+            conn.pump_pending_reqs();
+            let msgs = outgoing_json(&conn);
+            assert!(
+                !msgs.iter().any(|m| m[0] == "EVENT"),
+                "no stored event may reach an anonymous connection: {msgs:?}"
+            );
+            assert!(
+                msgs.iter().any(|m| m[0] == "CLOSED"
+                    && m[1] == "sub"
+                    && m[2].as_str().is_some_and(|r| r.contains("auth-required"))),
+                "the pending response must be closed: {msgs:?}"
             );
             conn.relay.db.shutdown();
         });

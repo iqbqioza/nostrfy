@@ -76,12 +76,20 @@ fn neg_echo_id(id: &str, max_sub_id_len: usize) -> String {
 }
 
 impl super::Conn {
+    #[cfg(test)]
     pub(crate) fn send_neg_err(&mut self, sub_id: &str, reason: &str) {
+        self.send_neg_err_with_echo(sub_id, sub_id, reason);
+    }
+
+    /// Sends a NEG-ERR that echoes `echo_id` on the wire but tags the frame
+    /// with the raw id, so a NEG-CLOSE can still purge it when the current
+    /// `max_sub_id_len` sanitized the echo to the empty string.
+    pub(crate) fn send_neg_err_with_echo(&mut self, raw_id: &str, echo_id: &str, reason: &str) {
         // Tag the frame so a NEG-CLOSE or same-id re-open purges a stale
         // error (NIP-77: NEG-ERR closes the id). An uncorrelated error has
         // no id to tag.
-        let tag = (!sub_id.is_empty()).then(|| super::neg_sub_fingerprint(sub_id));
-        self.send_control_tagged(json!(["NEG-ERR", sub_id, reason]), tag);
+        let tag = (!raw_id.is_empty()).then(|| super::neg_sub_fingerprint(raw_id));
+        self.send_control_tagged(json!(["NEG-ERR", echo_id, reason]), tag);
     }
 
     /// Closes negentropy subscriptions idle longer than
@@ -105,8 +113,10 @@ impl super::Conn {
             .map(|(id, _)| id.clone())
             .collect();
         for id in idle {
-            self.neg_err(
+            let echo = neg_echo_id(&id, self.max_sub_id_len);
+            self.neg_err_with_echo(
                 &id,
+                &echo,
                 "closed: negentropy subscription timed out (idle too long)",
             );
         }
@@ -132,20 +142,47 @@ impl super::Conn {
     /// id before replying, so the client and the relay agree that the
     /// subscription is gone.
     pub(crate) fn neg_err(&mut self, sub_id: &str, reason: &str) {
-        self.remove_neg_subscription(sub_id);
+        self.neg_err_with_echo(sub_id, sub_id, reason);
+    }
+
+    /// `neg_err` with a separate wire echo; the raw id owns the state and
+    /// the frame tag, the echo may be sanitized to `""` by B-2.
+    pub(crate) fn neg_err_with_echo(&mut self, raw_id: &str, echo_id: &str, reason: &str) {
+        self.remove_neg_subscription(raw_id);
         // NEG-ERR closes the id: queued rounds of the closed incarnation
         // must not follow it (or reach a later re-open under the same id).
-        self.purge_queued_neg_frames_for(sub_id);
-        self.send_neg_err(sub_id, reason);
+        self.purge_queued_neg_frames_for(raw_id);
+        self.send_neg_err_with_echo(raw_id, echo_id, reason);
+    }
+
+    /// `neg_err` that also carries the NIP-77 fourth element (the item/round
+    /// cap) while keeping the raw-id tag.
+    pub(crate) fn neg_err_extra(
+        &mut self,
+        raw_id: &str,
+        echo_id: &str,
+        reason: &str,
+        extra: serde_json::Value,
+    ) {
+        self.remove_neg_subscription(raw_id);
+        self.purge_queued_neg_frames_for(raw_id);
+        let tag = (!raw_id.is_empty()).then(|| super::neg_sub_fingerprint(raw_id));
+        self.send_control_tagged(json!(["NEG-ERR", echo_id, reason, extra]), tag);
     }
 
     pub(crate) fn send_neg_msg(&mut self, sub_id: &str, message: &[u8]) {
+        self.send_neg_msg_with_echo(sub_id, sub_id, message);
+    }
+
+    /// Sends a NEG-MSG echoing `echo_id` while tagging the frame with the
+    /// raw id (see [`Self::send_neg_err_with_echo`]).
+    pub(crate) fn send_neg_msg_with_echo(&mut self, raw_id: &str, echo_id: &str, message: &[u8]) {
         // NEG frames are tagged with the (NIP-77-namespaced) id so a
         // NEG-CLOSE or same-id re-open can purge them from the outgoing
         // queue: a replaced sync must not deliver the previous
         // incarnation's rounds under the same id.
-        let tag = (!sub_id.is_empty()).then(|| super::neg_sub_fingerprint(sub_id));
-        self.send_control_tagged(json!(["NEG-MSG", sub_id, hex::encode(message)]), tag);
+        let tag = (!raw_id.is_empty()).then(|| super::neg_sub_fingerprint(raw_id));
+        self.send_control_tagged(json!(["NEG-MSG", echo_id, hex::encode(message)]), tag);
     }
 
     /// Whether the outgoing queue is too deep for another (potentially
@@ -171,6 +208,7 @@ impl super::Conn {
             let cfg = self.relay.config.read().await;
             (cfg.nip_enabled(77), cfg.limits.max_sub_id_len)
         };
+        self.max_sub_id_len = max_sub_id_len;
         let correl_id: Option<String> = rest
             .first()
             .and_then(|v| v.as_str())
@@ -209,6 +247,11 @@ impl super::Conn {
             self.neg_err("", "error: NEG-OPEN subscription id too long");
             return;
         }
+        // A previous NEG-ERR can still be queued for this id even though no
+        // state exists (an earlier malformed NEG-MSG closed it). Purge it
+        // unconditionally: otherwise a re-open's NEG-MSG is preceded by the
+        // stale terminal error and a compliant client may discard the sync.
+        self.purge_queued_neg_frames_for(&sub_id);
         let mut raw = rest[1].clone();
         if crate::filter::rewrite_inbox_outbox(&mut raw).is_err() {
             self.neg_err(&sub_id, "error: invalid NEG-OPEN filter");
@@ -345,13 +388,13 @@ impl super::Conn {
         if more {
             // NIP-77: the maximum number of processable records may be
             // returned as the fourth element. NEG-ERR closes the id.
-            self.remove_neg_subscription(&sub_id);
-            self.send_control(json!([
-                "NEG-ERR",
-                sub_id,
+            let echo = neg_echo_id(&sub_id, max_sub_id_len);
+            self.neg_err_extra(
+                &sub_id,
+                &echo,
                 "blocked: this query is too big",
-                max_items
-            ]));
+                json!(max_items),
+            );
             return;
         }
         // NIP-70/NIP-59/NIP-29: withhold protected events from
@@ -438,13 +481,13 @@ impl super::Conn {
             .saturating_add(items.len())
             > total_cap
         {
-            self.remove_neg_subscription(&sub_id);
-            self.send_control(json!([
-                "NEG-ERR",
-                sub_id,
+            let echo = neg_echo_id(&sub_id, max_sub_id_len);
+            self.neg_err_extra(
+                &sub_id,
+                &echo,
                 "blocked: too many negentropy items",
-                total_cap
-            ]));
+                json!(total_cap),
+            );
             return;
         }
         // The response is built before the old state is replaced: on any
@@ -556,20 +599,22 @@ impl super::Conn {
                 cfg.limits.max_sub_id_len,
             )
         };
+        self.max_sub_id_len = max_sub_id_len;
         if rest.len() < 2 {
             // Correlate with NEG-ERR when the id is known, else NOTICE.
             // NIP-77: after NEG-ERR the subscription is closed, so a named
             // id is released like every other malformed continuation. The
             // echoed id is bounded (B-2): `send_control` bypasses the queue
             // caps and the frame can be as large as `max_ws_message_bytes`.
-            if let Some(sub_id) = rest
+            if let Some(raw_id) = rest
                 .first()
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty())
             {
-                let sub_id = neg_echo_id(sub_id, max_sub_id_len);
-                self.neg_err(
-                    &sub_id,
+                let echo_id = neg_echo_id(raw_id, max_sub_id_len);
+                self.neg_err_with_echo(
+                    raw_id,
+                    &echo_id,
                     "error: NEG-MSG requires a subscription id and message",
                 );
             } else {
@@ -592,7 +637,11 @@ impl super::Conn {
         // for the state lookup.
         let echo_id = neg_echo_id(&sub_id, max_sub_id_len);
         if !nip77_enabled {
-            self.neg_err(&echo_id, "error: negentropy is not enabled on this relay");
+            self.neg_err_with_echo(
+                &sub_id,
+                &echo_id,
+                "error: negentropy is not enabled on this relay",
+            );
             return;
         }
         // The access lists gate in-flight syncs too: a pubkey that was
@@ -600,14 +649,15 @@ impl super::Conn {
         // (per NIP-77 a NEG-ERR closes the subscription) — no reconnect
         // needed.
         if !self.access_allows_read().await {
-            self.neg_err(&echo_id, "restricted: you are not allowed to sync");
+            self.neg_err_with_echo(&sub_id, &echo_id, "restricted: you are not allowed to sync");
             return;
         }
         // A SIGHUP enabling `require_auth` stops in-flight syncs too: the
         // open checked the flag, but later rounds must not keep serving an
         // anonymous connection (same policy as the live/REQ paths).
         if self.require_auth && !self.is_authed() {
-            self.neg_err(
+            self.neg_err_with_echo(
+                &sub_id,
                 &echo_id,
                 "auth-required: please authenticate before syncing",
             );
@@ -616,28 +666,28 @@ impl super::Conn {
         // Check the subscription before decoding the message: an unknown id
         // must not cost a hex decode (and allocation) of a large frame.
         if !self.neg.contains_key(&sub_id) {
-            self.neg_err(&echo_id, "closed: unknown subscription");
+            self.neg_err_with_echo(&sub_id, &echo_id, "closed: unknown subscription");
             return;
         }
         let Some(message) = rest[1].as_str() else {
             // NIP-77: after NEG-ERR the subscription is closed — malformed
             // continuations close the id they name instead of lingering open.
-            self.neg_err(&echo_id, "error: NEG-MSG message must be hex");
+            self.neg_err_with_echo(&sub_id, &echo_id, "error: NEG-MSG message must be hex");
             return;
         };
         let Ok(message) = hex::decode(message) else {
-            self.neg_err(&echo_id, "error: NEG-MSG message must be hex");
+            self.neg_err_with_echo(&sub_id, &echo_id, "error: NEG-MSG message must be hex");
             return;
         };
         // NIP-77: "After a NEG-ERR is issued, the subscription is considered
         // to be closed." Exhausting the round budget closes it too.
         // Check without holding the borrow so the close can release it.
         if self.neg.get(&sub_id).is_some_and(|s| s.rounds_left == 0) {
-            self.neg_err(&echo_id, "error: too many negentropy messages");
+            self.neg_err_with_echo(&sub_id, &echo_id, "error: too many negentropy messages");
             return;
         }
         let Some(state) = self.neg.get_mut(&sub_id) else {
-            self.neg_err(&echo_id, "closed: unknown subscription");
+            self.neg_err_with_echo(&sub_id, &echo_id, "closed: unknown subscription");
             return;
         };
         state.rounds_left -= 1;
@@ -649,7 +699,7 @@ impl super::Conn {
             state.items.len().max(1) as u64,
             super::neg_cpu_budget_units(configured_max_items),
         ) {
-            self.neg_err(&echo_id, "error: overloaded, please retry");
+            self.neg_err_with_echo(&sub_id, &echo_id, "error: overloaded, please retry");
             return;
         }
         match nip77::respond(&state.items, &message) {
@@ -673,17 +723,17 @@ impl super::Conn {
                     return;
                 }
                 if self.neg_backpressured() {
-                    self.neg_err(&echo_id, "blocked: overloaded, please retry");
+                    self.neg_err_with_echo(&sub_id, &echo_id, "blocked: overloaded, please retry");
                     return;
                 }
-                self.send_neg_msg(&echo_id, &response);
+                self.send_neg_msg_with_echo(&sub_id, &echo_id, &response);
                 // The round succeeded: refresh this sync and reclaim the
                 // other silent ones. Failing rounds must not sweep — one
                 // bad frame must not close unrelated syncs.
                 self.touch_and_reap_neg(&sub_id)
             }
             Err(e) => {
-                self.neg_err(&echo_id, &format!("error: {e}"));
+                self.neg_err_with_echo(&sub_id, &echo_id, &format!("error: {e}"));
             }
         }
     }
