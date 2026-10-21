@@ -2265,7 +2265,8 @@ impl Relay {
     /// flood of one-shot keys cannot reset a rate-limited window), falling
     /// back to the least recently active window when every tracked window is
     /// saturated. A fresh pubkey is never rejected and the map is never
-    /// cleared.
+    /// cleared. The protection requires `max >= 2`: at `max = 1` every
+    /// window is immediately saturated, so eviction falls back to LRU.
     pub(crate) fn publish_rate_allowed(&self, cfg: &Config, pubkey: &str, now: u64) -> bool {
         const MAX_TRACKED_PUBKEYS: usize = 10_000;
         let max = cfg.relay.max_events_per_min_per_pubkey;

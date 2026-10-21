@@ -600,7 +600,10 @@ impl super::Relay {
         // rejected as invalid (the NIP-01 example for this case carries
         // the `invalid:` prefix; `mute:` is reserved for ignored ephemeral
         // events).
-        if event.created_at > now.saturating_add(limits.max_created_at_future_secs) {
+        let max_future = limits
+            .max_created_at_future_secs
+            .min(crate::config::MAX_CREATED_AT_FUTURE_SECS);
+        if event.created_at > now.saturating_add(max_future) {
             bail!("invalid: event creation date is in the future");
         }
 

@@ -7,7 +7,7 @@ This page collects the errors you are most likely to meet while running nostrfy,
 1. `nostrfy check` validates your config (9 out of 10 errors are config mistakes)
 2. Check the log — the cause of the error is almost always there:
    - daemon mode: `tail -f nostrfy.log`
-   - systemd (daemon mode): `tail -f /var/lib/nostrfy/nostrfy.log`
+   - systemd (foreground units): `journalctl -u nostrfy -f` (user unit: `journalctl --user -u nostrfy -f`)
    - foreground mode: the terminal (logs go to stderr)
 3. `nostrfy restart` restarts the relay cleanly; under systemd use `systemctl restart nostrfy` (the unit's `Restart=always` would immediately restart a process stopped by `nostrfy stop`/`restart`)
 
@@ -487,7 +487,7 @@ The `/metrics` endpoint (Prometheus text format; `metrics_enabled = true`) and t
 
 **Fix**: Run `nostrfy start` (or `restart`), wait at least one `stats_interval_secs`, and try again. If the relay is running but the snapshot stays stale, check the log for stats-writer errors (e.g. an unwritable `daemon.stats_file`).
 
-> **Foreground lifecycle**: foreground mode writes the same `daemon.pid_file` as the daemon (removed on exit), so `stats`/`stop` find it. The systemd unit runs daemon mode; prefer `systemctl stop/restart nostrfy` under systemd. Daemon logs go to `daemon.log_file`.
+> **Foreground lifecycle**: foreground mode writes the same `daemon.pid_file` as the daemon (removed on exit), so `stats`/`stop` find it. The shipped systemd units run foreground mode (`Type=simple`); prefer `systemctl stop/restart nostrfy` under systemd. Their logs go to the journal (`journalctl -u nostrfy -f`); only daemon mode writes `daemon.log_file`.
 
 ### 6-2. The log grows without bound
 

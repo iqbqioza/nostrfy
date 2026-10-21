@@ -109,6 +109,7 @@ max_db_queue_bytes = 268435456
 # systemd tracks the foreground process itself (Type=simple), so no unit
 # PIDFile needs to match this value.
 pid_file = "/var/lib/nostrfy/nostrfy.pid"
+# Daemon mode only; the shipped foreground/systemd units log to the journal.
 log_file = "/var/lib/nostrfy/nostrfy.log"
 stats_file = "/var/lib/nostrfy/nostrfy.stats.json"
 stats_interval_secs = 5

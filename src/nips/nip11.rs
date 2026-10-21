@@ -56,7 +56,9 @@ pub fn relay_info(
             "created_at_lower_limit": 0,
             // NIP-11 limits are *relative* seconds from now (the spec's
             // examples are `300` and `3`), not absolute timestamps.
-            "created_at_upper_limit": limits.max_created_at_future_secs,
+            "created_at_upper_limit": limits
+                .max_created_at_future_secs
+                .min(crate::config::MAX_CREATED_AT_FUTURE_SECS),
             "default_limit": limits.max_limit,
         },
         "relay_countries": [],
@@ -190,6 +192,23 @@ mod tests {
         let access = crate::config::AccessControl::default();
         let stats = Stats::new();
         relay_info(&cfg, &access, &stats, None)
+    }
+
+    #[test]
+    fn upper_limit_reports_the_enforced_clamp() {
+        let mut cfg = Config::default();
+        cfg.limits.max_created_at_future_secs = u64::MAX;
+        let info = relay_info(
+            &cfg,
+            &crate::config::AccessControl::default(),
+            &Stats::new(),
+            None,
+        );
+        assert_eq!(
+            info["limitation"]["created_at_upper_limit"],
+            json!(crate::config::MAX_CREATED_AT_FUTURE_SECS),
+            "NIP-11 must report the clamped enforced window"
+        );
     }
 
     #[test]

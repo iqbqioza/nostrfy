@@ -63,7 +63,7 @@ sudo systemctl status nostrfy
 Logs:
 
 ```sh
-sudo tail -f /var/lib/nostrfy/nostrfy.log
+sudo journalctl -u nostrfy -f
 ```
 
 ### User mode (`systemd --user`)

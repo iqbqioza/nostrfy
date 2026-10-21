@@ -69,7 +69,7 @@ livekit_url = ""
 livekit_api_key = ""
 livekit_api_secret = ""
 # How often the relay refreshes the LiveKit participant list for kind:39004
-# (seconds; 0 disables the refresh).
+# (seconds; must be at least 1).
 livekit_participants_interval_secs = 15
 
 # Explicit NIP allowlist: when non-empty, only the listed NIPs are advertised

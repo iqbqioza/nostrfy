@@ -1141,17 +1141,20 @@ impl Config {
     }
 
     /// NIPs whose advertised behaviour requires **every** listed kind.
-    /// NIP-17 private messages need the rumor (14), the NIP-59 seal (13)
-    /// and the gift wrap (1059); NIP-47 needs both the wallet request and
-    /// response; NIP-59 needs the seal and gift wrap. Their other kinds
-    /// (file messages, DM relay lists, ephemeral gift wraps, wallet info)
-    /// are auxiliary: blocking one of those must not drop the NIP, while a
-    /// surviving auxiliary kind must not keep a broken flow advertised.
+    /// NIP-17 and NIP-59 both need the relay-visible gift wrap (1059): the
+    /// rumor (14), seal (13), file message (15), DM relay list (10050) and
+    /// ephemeral gift wrap (21059) are interior/auxiliary and must not keep
+    /// a flow advertised when the wire kind is blocked. NIP-47 needs both
+    /// the wallet request and response; wallet info (13194) is auxiliary.
     fn nip_required_kinds(nip: u16) -> Option<&'static [u64]> {
         match nip {
-            17 => Some(&[14, 13, 1059]),
+            // Only kind 1059 reaches the relay: kind 14 is an unsigned
+            // rumor and kind 13 is the inner seal (neither is a stored wire
+            // event). Requiring them hid a working NIP when an auxiliary
+            // kind was blocked (L-9).
+            17 => Some(&[1059]),
             47 => Some(&[23194, 23195]),
-            59 => Some(&[13, 1059]),
+            59 => Some(&[1059]),
             _ => None,
         }
     }
@@ -1548,12 +1551,15 @@ impl Config {
             ));
         }
         if self.limits.max_created_at_future_secs > MAX_CREATED_AT_FUTURE_SECS {
-            return Err(config_err(format!(
-                "limits.max_created_at_future_secs = {} must be at most \
-                 {MAX_CREATED_AT_FUTURE_SECS} (7 days); a larger window lets \
-                 created_at = u64::MAX (NIP-77's infinity sentinel) be stored",
+            // Legacy configurations may carry a larger tolerance. Clamp the
+            // enforced value instead of refusing to start (a value at
+            // u64::MAX would let the NIP-77 infinity sentinel be stored).
+            log::warn!(
+                "limits.max_created_at_future_secs = {} exceeds the supported \
+                 {MAX_CREATED_AT_FUTURE_SECS} (7 days); clamping the enforced \
+                 window",
                 self.limits.max_created_at_future_secs
-            )));
+            );
         }
         if !(1..=64).contains(&self.database.reader_threads) {
             return Err(config_err(
@@ -4289,20 +4295,22 @@ max_log_files = 2
             "NIP-47 needs request+response, not just kind 13194"
         );
 
-        // Blocking only auxiliary kinds leaves the whole flow usable.
+        // Blocking only auxiliary/interior kinds leaves the wire flow
+        // usable: 14/13 never reach the relay and 15/10050/21059/13194 are
+        // optional.
         let access = AccessControl {
-            blocked_kinds: vec![15, 10050, 21059, 13194],
+            blocked_kinds: vec![13, 14, 15, 10050, 21059, 13194],
             ..Default::default()
         };
         let nips = cfg.effective_supported_nips(&access);
-        assert!(nips.contains(&17), "NIP-17 still has rumor+seal+gift wrap");
+        assert!(nips.contains(&17), "NIP-17 still has the gift wrap");
         assert!(nips.contains(&47), "NIP-47 still has request+response");
-        assert!(nips.contains(&59), "NIP-59 still has seal+gift wrap");
+        assert!(nips.contains(&59), "NIP-59 still has the gift wrap");
 
         // An allowlist that only carries auxiliary kinds must not advertise
-        // a flow whose required kinds are all missing.
+        // a flow whose wire kind is missing.
         let access = AccessControl {
-            allowed_kinds: vec![15, 10050, 21059, 13194],
+            allowed_kinds: vec![13, 14, 15, 10050, 21059, 13194],
             ..Default::default()
         };
         let nips = cfg.effective_supported_nips(&access);
@@ -5037,10 +5045,12 @@ max_log_files = 2
     }
 
     #[test]
-    fn validation_rejects_a_future_window_reaching_the_infinity_sentinel() {
+    fn validation_clamps_a_legacy_future_window_instead_of_failing_startup() {
         // NIP-77 uses created_at = u64::MAX as its "infinity" bound: a real
         // event with that timestamp would occupy the unbounded end of every
         // range, so the tolerated future window is capped well below it.
+        // Older configs with a larger value must still start; the enforced
+        // window is clamped at use (NIP-11 and validate_base).
         let mut cfg = Config::default();
         cfg.limits.max_created_at_future_secs = MAX_CREATED_AT_FUTURE_SECS;
         assert!(
@@ -5049,8 +5059,8 @@ max_log_files = 2
         );
         cfg.limits.max_created_at_future_secs = u64::MAX;
         assert!(
-            cfg.validate().is_err(),
-            "a window reaching u64::MAX must be rejected"
+            cfg.validate().is_ok(),
+            "a legacy oversized window is clamped, not fatal"
         );
     }
 
