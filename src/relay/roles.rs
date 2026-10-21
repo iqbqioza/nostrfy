@@ -385,6 +385,10 @@ impl super::Relay {
             // to an existing member only changes the 13534 list.
             let change = (!was_member).then(|| (true, pubkey.to_string()));
             if rebuild_pending {
+                // Persist the grant even while the rebuild owns the store:
+                // the debounced pass retries after the worker exits, so a
+                // post-swap capture is not lost on a graceful restart.
+                self.schedule_roles_persist();
                 // Announce the membership transition with an add-user event
                 // alone: the live store is revoked, so its full member list
                 // must not be published. The buffered assignment replays
@@ -493,13 +497,21 @@ impl super::Relay {
                 },
             )
             .await;
-        if !self.persist_roles().await {
-            // Keep the debounced retry armed for a transient database
-            // error (a rebuild-pending store is persisted by its worker).
-            self.schedule_roles_persist();
-            return Err(ClaimRejection::NotDurable);
+        match self.persist_roles_outcome().await {
+            super::PersistOutcome::Failed => {
+                // Keep the debounced retry armed for a transient database
+                // error (a rebuild-pending store is persisted by its worker).
+                self.schedule_roles_persist();
+                Err(ClaimRejection::NotDurable)
+            }
+            super::PersistOutcome::Deferred => {
+                // The in-flight derived mutation will schedule the retry;
+                // the claim is live and not a durability failure.
+                self.schedule_roles_persist();
+                Ok(())
+            }
+            super::PersistOutcome::Committed => Ok(()),
         }
-        Ok(())
     }
 
     /// NIP-86 `deleteclaim`: revokes an invite code. Revoking an absent
@@ -533,11 +545,17 @@ impl super::Relay {
                 },
             )
             .await;
-        if !self.persist_roles().await {
-            self.schedule_roles_persist();
-            return Err(ClaimRejection::NotDurable);
+        match self.persist_roles_outcome().await {
+            super::PersistOutcome::Failed => {
+                self.schedule_roles_persist();
+                Err(ClaimRejection::NotDurable)
+            }
+            super::PersistOutcome::Deferred => {
+                self.schedule_roles_persist();
+                Ok(())
+            }
+            super::PersistOutcome::Committed => Ok(()),
         }
-        Ok(())
     }
 
     /// Admits a `kind:28934` join by invite code: records the membership,
@@ -568,8 +586,15 @@ impl super::Relay {
         if !nip43_enabled || self.key.is_none() {
             return Admission::Unavailable;
         }
-        let mut rebuild_pending = self.roles_rebuild.dirty.load(Ordering::SeqCst)
-            || self.roles_rebuild.running.load(Ordering::SeqCst);
+        // A rebuild revokes the live store. Accepting a join then would
+        // either replay against the cap and be dropped after a welcome
+        // (L-4) or disappear with a failed rebuild; a retryable refusal is
+        // the honest answer.
+        if self.roles_rebuild.dirty.load(Ordering::SeqCst)
+            || self.roles_rebuild.running.load(Ordering::SeqCst)
+        {
+            return Admission::Unavailable;
+        }
         let (outcome, added) = self
             .mutate_roles(
                 super::BufferedRoleMutation::AdmitMember {
@@ -586,24 +611,34 @@ impl super::Relay {
                 },
             )
             .await;
-        rebuild_pending = rebuild_pending
-            || self.roles_rebuild.dirty.load(Ordering::SeqCst)
-            || self.roles_rebuild.running.load(Ordering::SeqCst);
-        // NIP-43 join-vanish TOCTOU: the precheck checked the vanish marker
-        // before this admission, but a VANISH commits the marker before it
-        // drops the vanished key's roles. Re-check after the live mutation:
-        // if the marker landed first, roll the admission (or a surviving
-        // duplicate) back; if it lands after this check, the vanish's own
-        // role removal (which follows the marker) wins.
+        // NIP-43 join-vanish TOCTOU: a VANISH commits the marker before it
+        // drops the vanished key's roles. Re-check after the live mutation;
+        // if the marker landed first, roll the admission back. If it lands
+        // after this check, the vanish's own role removal wins.
         match self.db.is_vanished(pubkey).await {
             Some(true) => {
-                self.rollback_admission(pubkey).await;
+                let _ = self.rollback_admission(pubkey).await;
+                // Announce the removal even when the vanish handler already
+                // dropped the store entry: the stored 13534 may still list
+                // the key (L-5). Publishing the full list is safe after the
+                // live store no longer contains it; while a rebuild owns
+                // the store only the remove-user event is published.
+                let pending = self.roles_rebuild.dirty.load(Ordering::SeqCst)
+                    || self.roles_rebuild.running.load(Ordering::SeqCst);
+                if !self.publish_remove_user(pubkey).await {
+                    log::warn!(
+                        "admit_member: cannot publish the remove-user for vanished {pubkey}"
+                    );
+                } else if !pending && !self.publish_membership(None).await {
+                    log::warn!(
+                        "admit_member: cannot republish kind 13534 after removing vanished {pubkey}"
+                    );
+                }
                 return Admission::Vanished;
             }
             None => {
-                // Fail closed for a fresh admission; the caller reports a
-                // retryable error. A pre-existing member is left alone:
-                // removing it on a transient read failure would be wrong.
+                // Fail closed for a fresh admission; a pre-existing member
+                // is left alone on a transient read failure.
                 if added {
                     self.rollback_admission(pubkey).await;
                 }
@@ -611,30 +646,29 @@ impl super::Relay {
             }
             Some(false) => {}
         }
+        // The DB round-trip above is long enough for a rebuild to start
+        // after the pre-check. Re-check now: publishing the revoked
+        // store's list would store a partial 13534 (M-2).
+        if self.roles_rebuild.dirty.load(Ordering::SeqCst)
+            || self.roles_rebuild.running.load(Ordering::SeqCst)
+        {
+            if added {
+                self.rollback_admission(pubkey).await;
+            }
+            return Admission::Unavailable;
+        }
         if added {
-            if rebuild_pending {
-                // The live store is revoked: never publish its partial
-                // member list (M-1). The add-user still announces the new
-                // membership; the buffered admission replays onto the
-                // rebuilt store.
-                if !self.publish_add_user(pubkey).await {
-                    log::warn!(
-                        "admit_member: the add-user event could not be published; {pubkey} may be missing from kind 13534 until the next change"
-                    );
-                }
-            } else {
-                self.schedule_roles_persist();
-                // A failed republish is logged, not fatal: the membership is
-                // recorded and the next change republishes the full list
-                // (same contract as the leave path).
-                if !self
-                    .publish_membership(Some((true, pubkey.to_string())))
-                    .await
-                {
-                    log::warn!(
-                        "admit_member: the membership list could not be republished; {pubkey} may be missing from kind 13534 until the next change"
-                    );
-                }
+            self.schedule_roles_persist();
+            // A failed republish is logged, not fatal: the membership is
+            // recorded and the next change republishes the full list (same
+            // contract as the leave path).
+            if !self
+                .publish_membership(Some((true, pubkey.to_string())))
+                .await
+            {
+                log::warn!(
+                    "admit_member: the membership list could not be republished; {pubkey} may be missing from kind 13534 until the next change"
+                );
             }
         }
         outcome
@@ -644,7 +678,7 @@ impl super::Relay {
     /// post-admission vanish recheck finds the key vanished. Buffered like
     /// [`Self::apply_leave_request`] while a rebuild is pending, so the
     /// removal replays onto the rebuilt store instead of being resurrected.
-    async fn rollback_admission(&self, pubkey: &str) {
+    async fn rollback_admission(&self, pubkey: &str) -> bool {
         let mut rebuild_pending = self.roles_rebuild.dirty.load(Ordering::SeqCst)
             || self.roles_rebuild.running.load(Ordering::SeqCst);
         let removed = self
@@ -666,6 +700,7 @@ impl super::Relay {
         if removed && !rebuild_pending {
             self.schedule_roles_persist();
         }
+        removed
     }
 
     /// NIP-43 leave request: removes the user from the member list and

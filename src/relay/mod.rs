@@ -1738,7 +1738,14 @@ async fn snapshot_persist_worker(
             groups_rebuild.persist(&db, &groups).await;
         }
         if state.roles_dirty.swap(false, Ordering::SeqCst) {
-            persist_roles_now(&db, &roles, &roles_rebuild, &persist_roles_lock).await;
+            let outcome = persist_roles_now(&db, &roles, &roles_rebuild, &persist_roles_lock).await;
+            if outcome == PersistOutcome::Failed && roles_rebuild.running.load(Ordering::SeqCst) {
+                // The rebuild owns the store: persist refused a stale
+                // snapshot. Keep the dirty flag set so this worker retries
+                // after `running` clears instead of losing a post-swap
+                // role mutation (M-1).
+                state.roles_dirty.store(true, Ordering::SeqCst);
+            }
         }
         if *drain.borrow() {
             // Release the claim: the shutdown waits for it before stopping
@@ -4110,6 +4117,13 @@ impl Relay {
     /// instead; this immediate form is kept for the rebuild worker and the
     /// fail-closed paths.
     pub(crate) async fn persist_roles(&self) -> bool {
+        self.persist_roles_outcome().await == PersistOutcome::Committed
+    }
+
+    /// Like [`Self::persist_roles`] but distinguishes a deferred save from
+    /// a failed one. The claim paths use this so a merely in-flight derived
+    /// mutation is not reported as a durability failure (L-13).
+    async fn persist_roles_outcome(&self) -> PersistOutcome {
         persist_roles_now(
             &self.db,
             &self.roles,
@@ -4117,7 +4131,6 @@ impl Relay {
             &self.persist_roles_lock,
         )
         .await
-            == PersistOutcome::Committed
     }
 
     /// Marks the group snapshot dirty and wakes the debounced worker (see
@@ -6927,7 +6940,9 @@ mod tests {
             "the marking path must revoke the live store"
         );
         // Re-create the role in the revoked store (an admin RPC accepted
-        // during the rebuild), then assign/admit new members.
+        // during the rebuild), then assign a member. A join during the
+        // rebuild is refused with a retryable error instead of being
+        // welcomed and then dropped by the replay cap (L-4).
         assert!(relay.create_role("mod", "Mod", "", "", None).await);
         let assigned = "aa".repeat(32);
         assert_eq!(
@@ -6935,10 +6950,12 @@ mod tests {
             RoleChange::Applied
         );
         let admitted = "cc".repeat(32);
-        assert!(matches!(
+        assert_eq!(
             relay.admit_member(&admitted, true).await,
-            crate::relay::roles::Admission::Recorded
-        ));
+            crate::relay::roles::Admission::Unavailable,
+            "a join during a rebuild must be retryable, not falsely welcomed"
+        );
+        assert!(!relay.roles.read().await.is_member_of(&admitted));
         let now = crate::util::unix_now();
         let filter: crate::filter::Filter =
             serde_json::from_value(serde_json::json!({ "kinds": [13534] })).unwrap();
@@ -6970,7 +6987,10 @@ mod tests {
         }
         assert!(fresh.is_member_of(&existing));
         assert!(fresh.is_member_of(&assigned));
-        assert!(fresh.is_member_of(&admitted));
+        assert!(
+            !fresh.is_member_of(&admitted),
+            "the refused join must not be replayed"
+        );
         assert!(
             fresh.assignments[&assigned]
                 .iter()
@@ -9470,6 +9490,22 @@ mod tests {
                 crate::relay::roles::Admission::Vanished
             );
             assert!(!relay.roles.read().await.is_member_of(&existing));
+            // The stored membership list must be republished without the
+            // vanished member, not just removed from the in-memory store
+            // (L-5).
+            let now = crate::util::unix_now();
+            let filter: crate::filter::Filter =
+                serde_json::from_value(serde_json::json!({ "kinds": [13534] })).unwrap();
+            let lists = relay.db.query(vec![filter], 10, now).await.0;
+            for list in &lists {
+                assert!(
+                    !list.tags.iter().any(|tag| {
+                        tag.first().map(String::as_str) == Some("member")
+                            && tag.get(1).map(String::as_str) == Some(existing.as_str())
+                    }),
+                    "the vanished member must not remain in kind 13534"
+                );
+            }
 
             // A fresh admission (the precheck ran before the marker) is
             // rolled back too.
