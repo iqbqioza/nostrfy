@@ -131,7 +131,8 @@ server {
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection "upgrade";
-        proxy_set_header Host $host;
+        # Preserve a non-default port: NIP-98 binds the Host authority.
+        proxy_set_header Host $http_host;
         proxy_set_header X-Forwarded-Proto $scheme;
         # The relay's per-IP caps / blockip need the real client address.
         # nginx appends the direct peer to any client-supplied header.
@@ -179,7 +180,8 @@ server {
 
     location / {
         proxy_pass http://127.0.0.1:8080;
-        proxy_set_header Host $host;
+        # Preserve a non-default port: NIP-98 binds the Host authority.
+        proxy_set_header Host $http_host;
         proxy_set_header X-Forwarded-Proto $scheme;
     }
 }

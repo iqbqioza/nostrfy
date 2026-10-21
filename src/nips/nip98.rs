@@ -158,10 +158,12 @@ pub struct ReplayGuard {
 /// not derived from the client-signed `created_at`.
 struct Entry {
     expiry: u64,
-    pubkey: String,
     /// Monotonic acceptance order. A flood is presented after a captured
     /// authorization, so this (unlike `created_at`) cannot be backdated.
     presented: u64,
+    /// A management identity (admin or method grantee) authorization:
+    /// never evicted, so a flood cannot reset a captured header.
+    protected: bool,
 }
 
 impl Default for ReplayGuard {
@@ -180,22 +182,44 @@ impl ReplayGuard {
     /// Minimum seconds between capacity warnings.
     const WARNING_INTERVAL: u64 = 60;
 
-    /// Records `id` (valid until the event stops verifying); returns
-    /// `false` when it was already used (a replay). Expired entries are
-    /// pruned first. At capacity a live entry of the most prolific author
-    /// is evicted to admit the new authorization (see [`ReplayGuard`]), so
-    /// one identity's flood cannot lock another out and a fresh-key flood
-    /// evicts its own entries rather than a quiet identity's older ones.
-    /// `pubkey` is the authorization's author (normalized to lowercase: hex
-    /// case variants of one key must not buy extra footprint from the
-    /// fairness policy). `valid_until` must cover the whole NIP-98 validity
-    /// interval of the event: callers pass its `created_at` and the guard
-    /// extends past the inclusive 60-second boundary, so a replay at the
-    /// last valid second (or inside a future-dated event's extended window)
-    /// is still refused.
+    /// Records an **unprotected** authorization (an identity without a
+    /// management grant); equivalent to [`Self::accept_as`] with
+    /// `protected = false`. Kept as the simple entry point for callers that
+    /// only need replay detection.
     pub fn accept(&self, id: &str, now: u64, created_at: u64, pubkey: &str) -> bool {
+        self.accept_as(id, now, created_at, pubkey, false)
+    }
+
+    /// Records `id` (valid until the event stops verifying); returns
+    /// `false` when it was already used (a replay) or when the guard is full
+    /// of protected entries. Expired entries are pruned first.
+    ///
+    /// `protected` marks an authorization of a management identity (the
+    /// configured admin pubkey or a pubkey with a method grant). Protected
+    /// entries are **never** evicted: a flood of unknown identities must not
+    /// be able to remove a captured admin/grantee authorization and make it
+    /// replayable. At capacity the guard evicts the oldest unprotected
+    /// entry; if every entry is protected it refuses the new authorization
+    /// (fail closed) instead. A protected entry can only be admitted while
+    /// capacity remains, so a flood cannot lock management out by evicting
+    /// its captures.
+    ///
+    /// `_pubkey` is retained in the API for callers that identify the
+    /// author; protection now decides eviction, so no per-author map is
+    /// kept. `valid_until` must cover the whole
+    /// NIP-98 validity interval of the event: callers pass its `created_at`
+    /// and the guard extends past the inclusive 60-second boundary, so a
+    /// replay at the last valid second (or inside a future-dated event's
+    /// extended window) is still refused.
+    pub(crate) fn accept_as(
+        &self,
+        id: &str,
+        now: u64,
+        created_at: u64,
+        _pubkey: &str,
+        protected: bool,
+    ) -> bool {
         let valid_until = created_at.saturating_add(61);
-        let pubkey = pubkey.to_ascii_lowercase();
         let presented = self
             .next_presentation
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -207,19 +231,26 @@ impl ReplayGuard {
             if seen.contains_key(id) {
                 false
             } else {
+                let mut admit = true;
                 if seen.len() >= Self::MAX_ENTRIES {
-                    Self::evict_most_prolific(&mut seen, &pubkey);
                     warn = true;
+                    // Never evict a protected capture. If every live entry
+                    // is protected, fail closed for this request; the caller
+                    // reports 401 and the caller can retry after entries
+                    // expire.
+                    admit = Self::evict_unprotected(&mut seen);
                 }
-                seen.insert(
-                    id.to_string(),
-                    Entry {
-                        expiry: valid_until,
-                        pubkey,
-                        presented,
-                    },
-                );
-                true
+                if admit {
+                    seen.insert(
+                        id.to_string(),
+                        Entry {
+                            expiry: valid_until,
+                            presented,
+                            protected,
+                        },
+                    );
+                }
+                admit
             }
         };
         if warn {
@@ -228,48 +259,22 @@ impl ReplayGuard {
         accepted
     }
 
-    /// Removes the oldest live entry of the most prolific author. Ties on
-    /// the count prefer an author other than `requester`, so a request
-    /// never evicts its own author's earlier authorizations while another
-    /// author can be evicted instead (a single-key flood has no other
-    /// author at its count and evicts its own). Further ties prefer the
-    /// author whose live entries were presented most recently: a flood
-    /// consists of fresh entries, while a quiet identity's older (possibly
-    /// captured) authorization must stay tracked — with an oldest-first
-    /// tie-break a fresh-key flood evicted exactly that authorization and
-    /// flipped it back into a usable replay. The sequence is the guard's
-    /// own acceptance order, not the client-signed `created_at` (which an
-    /// attacker can backdate by the full ±60 s window). Within the victim
-    /// author the entry closest to natural expiry is removed. Called only
-    /// with a map at capacity, so there is always an entry to evict.
-    fn evict_most_prolific(seen: &mut std::collections::HashMap<String, Entry>, requester: &str) {
-        // (entry count, latest presentation sequence) per author.
-        let mut stats: std::collections::HashMap<&str, (usize, u64)> =
-            std::collections::HashMap::new();
-        for entry in seen.values() {
-            let stat = stats.entry(entry.pubkey.as_str()).or_insert((0, 0));
-            stat.0 += 1;
-            stat.1 = stat.1.max(entry.presented);
-        }
-        let victim = stats
+    /// Removes the oldest **unprotected** authorization (by the guard's own
+    /// presentation order, not the client-signed `created_at`). Returns
+    /// false when every live entry is protected: evicting one could make a
+    /// captured admin/grantee header replayable, so the caller must refuse
+    /// the new authorization instead of evicting.
+    fn evict_unprotected(seen: &mut std::collections::HashMap<String, Entry>) -> bool {
+        let victim = seen
             .iter()
-            .max_by_key(|(pubkey, (count, latest))| {
-                // Highest count first; at equal counts a non-requester, then
-                // the author whose live entries were presented most recently
-                // (the flood's fresh entries, not a pre-flood capture).
-                (*count, **pubkey != requester, *latest)
-            })
-            .map(|(pubkey, _)| pubkey.to_string());
-        let Some(victim) = victim else {
-            return;
-        };
-        if let Some(id) = seen
-            .iter()
-            .filter(|(_, entry)| entry.pubkey == victim)
-            .min_by_key(|(_, entry)| entry.expiry)
-            .map(|(id, _)| id.clone())
-        {
+            .filter(|(_, entry)| !entry.protected)
+            .min_by_key(|(_, entry)| entry.presented)
+            .map(|(id, _)| id.clone());
+        if let Some(id) = victim {
             seen.remove(&id);
+            true
+        } else {
+            false
         }
     }
 
@@ -287,8 +292,8 @@ impl ReplayGuard {
             .is_ok()
         {
             log::warn!(
-                "NIP-98 replay guard is at capacity ({} live authorizations): evicting \
-                 a live authorization of the most prolific author",
+                "NIP-98 replay guard is at capacity ({} live authorizations); \
+                 protected management captures are never evicted",
                 Self::MAX_ENTRIES
             );
         }
@@ -722,16 +727,15 @@ mod tests {
     }
 
     #[test]
-    fn replay_guard_evicts_the_most_prolific_author_at_capacity() {
-        // A single-key flood must not lock other identities out (the
-        // fail-closed cap let it): at capacity the flood's own oldest entry
-        // is evicted, so the quiet identity is admitted and stays tracked,
-        // and what is lost is the flood's own replay protection — worth
-        // nothing, since the flood can re-sign at will.
+    fn replay_guard_evicts_the_oldest_unprotected_entry_at_capacity() {
+        // A single-key flood must not lock other identities out: at
+        // capacity the oldest unprotected entry is evicted, so the quiet
+        // identity is admitted and stays tracked, and what is lost is the
+        // flood's own replay protection — worth nothing, since the flood
+        // can re-sign at will.
         let guard = ReplayGuard::default();
-        // flood-0 carries the earliest expiry, so it is deterministically
-        // the flood entry closest to natural expiry (the eviction's
-        // tie-break among one author's entries).
+        // flood-0 is presented first, so it is the oldest unprotected
+        // entry and the deterministic eviction victim.
         assert!(guard.accept("flood-0", 1_000, 1_000, "pk-flood"));
         for n in 1..ReplayGuard::MAX_ENTRIES {
             assert!(guard.accept(&format!("flood-{n}"), 1_000, 1_000 + n as u64, "pk-flood"));
@@ -770,9 +774,9 @@ mod tests {
     #[test]
     fn replay_guard_at_capacity_keeps_a_quiet_identity_tracked() {
         // The guard full of one-entry authors (an attacker with 4096 keys):
-        // a quiet identity's new authorization evicts another author's
-        // entry, and the quiet identity's own earlier entries are not the
-        // victim (the tie prefers a non-requester).
+        // a quiet identity's new authorization evicts another unprotected
+        // author's entry; the quiet identity's own earlier entry is newer
+        // than the flood entries, so it is not the oldest victim.
         let guard = ReplayGuard::default();
         for n in 0..ReplayGuard::MAX_ENTRIES {
             assert!(guard.accept(&format!("id-{n}"), 1_000, 1_000, &format!("pk-{n}")));
@@ -798,13 +802,13 @@ mod tests {
         // rule a flood at created_at = now-60 made the victim the unique
         // latest expiry and evicted it on the first overflow.
         let guard = ReplayGuard::default();
-        assert!(guard.accept("victim", 1_000, 1_000, "pk-victim"));
+        assert!(guard.accept_as("victim", 1_000, 1_000, "pk-victim", true));
         for n in 0..ReplayGuard::MAX_ENTRIES - 1 {
             assert!(guard.accept(&format!("flood-{n}"), 1_000, 940, &format!("pk-flood-{n}")));
         }
         assert!(guard.accept("extra", 1_002, 1_002, "pk-extra"));
         assert!(
-            !guard.accept("victim", 1_002, 1_002, "pk-victim"),
+            !guard.accept_as("victim", 1_002, 1_002, "pk-victim", true),
             "a backdated flood must not evict the capture"
         );
     }
@@ -819,7 +823,7 @@ mod tests {
         // exactly that entry the victim).
         let guard = ReplayGuard::default();
         // The captured authorization, presented before the flood.
-        assert!(guard.accept("victim", 1_000, 1_000, "pk-victim"));
+        assert!(guard.accept_as("victim", 1_000, 1_000, "pk-victim", true));
         // A fresh-key flood whose entries are all newer fills the guard.
         for n in 0..ReplayGuard::MAX_ENTRIES - 1 {
             assert!(guard.accept(
@@ -833,8 +837,71 @@ mod tests {
         assert!(guard.accept("extra", 1_002, 1_002, "pk-extra"));
         // ...never the pre-flood capture: replaying it is still refused.
         assert!(
-            !guard.accept("victim", 1_002, 1_002, "pk-victim"),
+            !guard.accept_as("victim", 1_002, 1_002, "pk-victim", true),
             "a pre-flood capture must not be evicted by a fresh-key flood"
+        );
+    }
+
+    #[test]
+    fn replay_guard_protects_a_capture_presented_during_a_flood() {
+        // The older tie-break evicted the newest non-requester, i.e. an
+        // authorization presented while the flood was already running.
+        // Protected entries are now never victims.
+        let guard = ReplayGuard::default();
+        for n in 0..ReplayGuard::MAX_ENTRIES - 1 {
+            assert!(guard.accept(&format!("flood-{n}"), 1_000, 1_000, &format!("pk-{n}")));
+        }
+        assert!(guard.accept_as("victim", 1_001, 1_001, "pk-victim", true));
+        // One more unknown-key request would have evicted the newest
+        // non-requester under the old rule.
+        assert!(guard.accept("extra", 1_002, 1_002, "pk-extra"));
+        assert!(
+            !guard.accept_as("victim", 1_002, 1_002, "pk-victim", true),
+            "a capture presented during the flood must stay tracked"
+        );
+    }
+
+    #[test]
+    fn replay_guard_protects_a_multi_entry_management_identity() {
+        // Two admin authorizations make the author "most prolific"; the old
+        // count-first eviction removed the older one (the likely capture).
+        let guard = ReplayGuard::default();
+        for n in 0..ReplayGuard::MAX_ENTRIES - 2 {
+            assert!(guard.accept(&format!("flood-{n}"), 1_000, 1_000, &format!("pk-{n}")));
+        }
+        assert!(guard.accept_as("admin-1", 1_000, 1_000, "pk-admin", true));
+        assert!(guard.accept_as("admin-2", 1_000, 1_000, "pk-admin", true));
+        assert!(guard.accept("extra", 1_002, 1_002, "pk-extra"));
+        assert!(
+            !guard.accept_as("admin-1", 1_002, 1_002, "pk-admin", true),
+            "the older protected entry must not be evicted"
+        );
+        assert!(
+            !guard.accept_as("admin-2", 1_002, 1_002, "pk-admin", true),
+            "the newer protected entry must not be evicted"
+        );
+    }
+
+    #[test]
+    fn replay_guard_fails_closed_when_every_entry_is_protected() {
+        // Evicting a protected entry could make a capture replayable. If
+        // the guard is full of protected entries, refuse the new
+        // authorization instead (the caller returns 401; entries expire).
+        let guard = ReplayGuard::default();
+        for n in 0..ReplayGuard::MAX_ENTRIES {
+            assert!(guard.accept_as(&format!("p-{n}"), 1_000, 1_000, &format!("pk-{n}"), true));
+        }
+        assert!(
+            !guard.accept_as("new", 1_001, 1_001, "pk-new", true),
+            "a new protected authorization must not evict another capture"
+        );
+        assert!(
+            !guard.accept("u", 1_001, 1_001, "pk-u"),
+            "an unprotected authorization cannot evict a protected capture either"
+        );
+        assert!(
+            !guard.accept_as("p-0", 1_001, 1_001, "pk-0", true),
+            "the existing protected entries stay tracked"
         );
     }
 }

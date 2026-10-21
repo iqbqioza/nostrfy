@@ -1326,9 +1326,9 @@ impl std::fmt::Display for Identity {
 /// signed for `https://relay.example.com:8443` must not be replayable on
 /// port 443 (or vice versa). Default ports are normalized from the origin's
 /// scheme. A request with neither header nor authority cannot be bound and
-/// keeps the configured-origin behavior (the full-URL check in
-/// [`nip98::matches_request_url`] still applies). The bearer management
-/// token names no origin and is not affected.
+/// is refused (fail closed): accepting it would let a token signed for
+/// `:8443` be replayed on `:443` merely by omitting `Host`. The bearer
+/// management token names no origin and is not affected.
 fn presented_on_identity_host(
     cfg: &crate::config::Config,
     headers: &HeaderMap,
@@ -1347,7 +1347,7 @@ fn presented_on_identity_host(
                 .map(|authority| authority.as_str().to_string())
         })
     else {
-        return true;
+        return false;
     };
     let identity = cfg.relay_identity();
     let origin = identity.http_origin();
@@ -1415,11 +1415,12 @@ async fn rpc_authenticated(
             "POST",
             |url| nip98::matches_request_url(url, &cfg.relay_identity(), uri.path(), uri.query()),
         )
-        && relay.nip98_replay.accept(
+        && relay.nip98_replay.accept_as(
             &verified.id,
             crate::util::unix_now(),
             verified.created_at,
             &verified.pubkey,
+            true,
         )
     {
         return Some(Identity::Admin(verified.pubkey));
@@ -1440,21 +1441,31 @@ async fn rpc_authenticated(
             "POST",
             |url| nip98::matches_request_url(url, &cfg.relay_identity(), uri.path(), uri.query()),
         )
-        && relay.nip98_replay.accept(
+    {
+        let access = relay.access.read().await;
+        // A management identity's authorization is protected from the
+        // unknown-key flood: the guard never evicts it. The admin pubkey is
+        // also protected here in case the admin branch above reported a
+        // replay for it (the grantee path must not insert an unprotected
+        // duplicate).
+        let protected = cfg.rpc.admin_pubkey.eq_ignore_ascii_case(&verified.pubkey)
+            || access
+                .method_grants
+                .keys()
+                .any(|pk| pk.eq_ignore_ascii_case(&verified.pubkey));
+        if relay.nip98_replay.accept_as(
             &verified.id,
             crate::util::unix_now(),
             verified.created_at,
             &verified.pubkey,
-        )
-        && !relay
-            .access
-            .read()
-            .await
+            protected,
+        ) && !access
             .blocked_pubkeys
             .iter()
             .any(|(banned, _)| banned.eq_ignore_ascii_case(&verified.pubkey))
-    {
-        return Some(Identity::Grantee(verified.pubkey));
+        {
+            return Some(Identity::Grantee(verified.pubkey));
+        }
     }
     None
 }
@@ -1573,6 +1584,23 @@ mod tests {
                 format!("{identity_host}:{port}")
             }
         };
+        // Missing Host: fail closed rather than skipping the binding.
+        let (_, mut headers, body) =
+            nip98_headers(&relay, &[9u8; 32], "supportedmethods", vec![]).await;
+        headers.remove(header::HOST);
+        let resp = rpc_handler(
+            State(relay.clone()),
+            axum::extract::ConnectInfo("127.0.0.1:1234".parse().unwrap()),
+            axum::http::Uri::from_static("/"),
+            headers,
+            body,
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "a NIP-98 request without Host/authority must fail closed"
+        );
         // A forged Host: refused before the method is considered.
         let (_, mut headers, body) =
             nip98_headers(&relay, &[9u8; 32], "supportedmethods", vec![]).await;
@@ -1651,7 +1679,14 @@ mod tests {
             .0
             .to_string();
         let body = serde_json::to_string(&json!({ "method": method, "params": params })).unwrap();
-        let origin = relay.config.read().await.relay_identity().http_origin();
+        let (origin, authority) = {
+            let cfg = relay.config.read().await;
+            let identity = cfg.relay_identity();
+            (
+                identity.http_origin(),
+                crate::nips::nip62::authority_of(&identity),
+            )
+        };
         let mut ev = crate::event::Event {
             id: String::new(),
             pubkey: pubkey.clone(),
@@ -1679,6 +1714,7 @@ mod tests {
             format!("Nostr {encoded}").parse().unwrap(),
         );
         headers.insert(header::CONTENT_TYPE, RPC_CONTENT_TYPE.parse().unwrap());
+        headers.insert(header::HOST, authority.parse().unwrap());
         (pubkey, headers, body)
     }
 
