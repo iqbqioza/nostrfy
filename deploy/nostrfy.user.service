@@ -1,0 +1,30 @@
+# systemd user unit for running nostrfy as an unprivileged user
+# (systemd --user). Install:
+#   mkdir -p ~/.config/systemd/user
+#   curl -fsSL -o ~/.config/systemd/user/nostrfy.service #     https://raw.githubusercontent.com/iqbqioza/nostrfy/main/deploy/nostrfy.user.service
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now nostrfy
+#   loginctl enable-linger "$USER"   # keep it running after logout
+#
+# The paths are under the user's home; create the config first (see
+# docs/deploy/vps.md, "User mode"). Foreground mode lets systemd supervise
+# the process directly (no PIDFile/readiness race).
+
+[Unit]
+Description=nostrfy Nostr relay (user)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/nostrfy --config %h/.config/nostrfy/nostrfy.toml start --foreground
+Restart=always
+RestartSec=5
+# Every connection (and every live WebSocket) holds a file descriptor; the
+# systemd default is far below `limits.max_connections = 10000`.
+LimitNOFILE=65536
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

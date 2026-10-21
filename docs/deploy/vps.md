@@ -45,6 +45,11 @@ nostrfy --config /tmp/nostrfy-genkey.toml init && nostrfy --config /tmp/nostrfy-
 
 ## 3. Run as a systemd service
 
+The shipped unit runs the relay in **foreground mode** (`Type=simple`), so
+systemd supervises the process directly: there is no daemon fork/readiness
+race on a large database and no `PIDFile=` that has to match
+`daemon.pid_file`.
+
 Fetch the hardened unit (no repository clone needed) and start it:
 
 ```sh
@@ -60,6 +65,37 @@ Logs:
 ```sh
 sudo tail -f /var/lib/nostrfy/nostrfy.log
 ```
+
+### User mode (`systemd --user`)
+
+The same foreground design works without root. Install the binary with
+`install.sh` (it does not require sudo), create a per-user config, and use
+the shipped user unit:
+
+```sh
+mkdir -p ~/.config/nostrfy ~/.config/systemd/user \
+  ~/.local/share/nostrfy ~/.local/state/nostrfy
+curl -fsSL -o ~/.config/nostrfy/nostrfy.toml \
+  https://raw.githubusercontent.com/iqbqioza/nostrfy/main/deploy/nostrfy.toml
+# Edit the config: point the data and daemon paths at your home. The TOML
+# does not expand `~`/`%h`, so use absolute paths (or relative paths, which
+# are anchored to the config's directory):
+#   [database] path = "/home/<you>/.local/share/nostrfy/db"
+#   [daemon] pid_file/log_file/stats_file = "/home/<you>/.local/state/nostrfy/..."
+curl -fsSL -o ~/.config/systemd/user/nostrfy.service \
+  https://raw.githubusercontent.com/iqbqioza/nostrfy/main/deploy/nostrfy.user.service
+systemctl --user daemon-reload
+systemctl --user enable --now nostrfy
+loginctl enable-linger "$USER"   # keep it running after logout
+systemctl --user status nostrfy
+```
+
+The user unit executes `%h/.local/bin/nostrfy`; adjust `ExecStart` if
+`install.sh` placed the binary elsewhere. Logs are written to
+`daemon.log_file` (and `journalctl --user -u nostrfy -f` shows the unit's
+stdout/stderr). To stop/restart, use `systemctl --user stop|restart nostrfy`
+— not `nostrfy stop`, because `Restart=always` would immediately restart the
+process that `nostrfy stop` terminated.
 
 ## 4. Open the port and verify
 

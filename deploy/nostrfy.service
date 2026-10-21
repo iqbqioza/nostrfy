@@ -1,6 +1,11 @@
 # systemd unit for running nostrfy on a VM (see docs/deploy/).
 # Copy to /etc/systemd/system/nostrfy.service, adjust the config path,
 # then: sudo systemctl daemon-reload && sudo systemctl enable --now nostrfy
+#
+# Foreground mode is deliberate: systemd supervises the relay process
+# directly, so there is no fork/readiness race (a large database or group
+# rebuild may take longer than the CLI's 10 s daemon probe) and no PIDFile
+# to keep in sync with daemon.pid_file. Use the user unit for systemd --user.
 
 [Unit]
 Description=nostrfy Nostr relay server
@@ -8,9 +13,8 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=forking
-PIDFile=/var/lib/nostrfy/nostrfy.pid
-ExecStart=/usr/local/bin/nostrfy --config /etc/nostrfy/nostrfy.toml start
+Type=simple
+ExecStart=/usr/local/bin/nostrfy --config /etc/nostrfy/nostrfy.toml start --foreground
 Restart=always
 RestartSec=5
 # Every connection (and every live WebSocket) holds a file descriptor, and

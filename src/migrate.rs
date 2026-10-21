@@ -675,32 +675,46 @@ async fn apply_group_side_effects(db: &DbClient, opts: &Options, stats: &mut Sta
     let mut dropped: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut deleted_creates: std::collections::HashSet<String> = std::collections::HashSet::new();
     loop {
-        // Fixpoint: find the next authorized action, apply its database
-        // side effect, then re-authorize (the in-memory replay cannot undo
-        // an applied event).
+        // Fixpoint: collect the authorized actions from one replay, apply
+        // all non-state deletions in that pass, and restart only when an
+        // action actually removed a state event (the in-memory replay cannot
+        // undo an applied event). A non-state 9005 (an ordinary chat
+        // message deletion) must not cost a full-history re-scan.
         loop {
             let mut groups = crate::nips::nip29::GroupStore::with_cap(opts.max_groups);
-            let Some(action) = replay_stored_moderation(
+            let mut actions = Vec::new();
+            replay_stored_moderation(
                 db,
                 &mut groups,
                 opts.relay_pubkey.as_deref(),
                 &applied,
-                true,
+                Some(&mut actions),
                 None,
             )
-            .await?
-            else {
+            .await?;
+            let mut state_changed = false;
+            for action in actions {
+                if applied.contains(&action.id) {
+                    continue;
+                }
+                applied.insert(action.id.clone());
+                match action.kind {
+                    9005 => {
+                        if apply_group_deletion(db, &action, &mut deleted_creates, stats).await? {
+                            state_changed = true;
+                            break;
+                        }
+                    }
+                    9008 => {
+                        apply_group_purge(db, &action, stats).await?;
+                        state_changed = true;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            if !state_changed {
                 break;
-            };
-            applied.insert(action.id.clone());
-            match action.kind {
-                9005 => {
-                    apply_group_deletion(db, &action, &mut deleted_creates, stats).await?;
-                }
-                9008 => {
-                    apply_group_purge(db, &action, stats).await?;
-                }
-                _ => {}
             }
         }
         // Ghost reconciliation: remove the creates that a deleted create's
@@ -803,7 +817,7 @@ async fn apply_group_side_effects(db: &DbClient, opts: &Options, stats: &mut Sta
             &mut groups,
             opts.relay_pubkey.as_deref(),
             &applied,
-            false,
+            None,
             Some(&mut dropper),
         )
         .await?;
@@ -954,12 +968,12 @@ impl RefusedDropper<'_> {
 /// Replays the stored NIP-29 moderation events in the same
 /// `(created_at, group_rank, kind, id)` order as the startup rebuild.
 ///
-/// With `stop_at_action`, returns the first authorized `9005`/`9008` not
-/// in `applied` and stops there: the caller applies it, then the next pass
-/// re-authorizes from the updated database. With a `refused` dropper, the
-/// whole history is scanned (no unapplied action may remain, or the
-/// migration fails closed) and the refused events are dropped page by
-/// page, so the fixpoint never materializes the entire refused list.
+/// With `actions`, the whole history is scanned and every authorized
+/// `9005`/`9008` not in `applied` is appended there for the caller to apply
+/// (non-state deletions can then be batched in one pass). With a `refused`
+/// dropper, the whole history is scanned (no unapplied action may remain,
+/// or the migration fails closed) and the refused events are dropped page
+/// by page, so the fixpoint never materializes the entire refused list.
 ///
 /// The replay covers the whole stored history, so a resumed migration
 /// (`--since`) or a merge into an existing database authorizes against the
@@ -971,9 +985,9 @@ async fn replay_stored_moderation(
     groups: &mut crate::nips::nip29::GroupStore,
     relay_pubkey: Option<&str>,
     applied: &std::collections::HashSet<String>,
-    stop_at_action: bool,
+    mut actions: Option<&mut Vec<Event>>,
     mut refused: Option<&mut RefusedDropper<'_>>,
-) -> Result<Option<Event>> {
+) -> Result<()> {
     let kinds: Vec<u64> = (crate::nips::nip29::MOD_MIN..=crate::nips::nip29::MOD_MAX)
         .chain([crate::nips::nip29::JOIN, crate::nips::nip29::LEAVE])
         .collect();
@@ -1061,14 +1075,14 @@ async fn replay_stored_moderation(
             }
             if replay_moderation(groups, &event, relay_pubkey) {
                 if matches!(event.kind, 9005 | 9008) && !applied.contains(&event.id) {
-                    if stop_at_action {
-                        return Ok(Some(event));
+                    match actions.as_deref_mut() {
+                        Some(actions) => actions.push(event),
+                        None => bail!(
+                            "the NIP-29 moderation fixpoint was not stable: an authorized \
+                             action remained in the final replay; the migration did not \
+                             complete (re-run it)"
+                        ),
                     }
-                    bail!(
-                        "the NIP-29 moderation fixpoint was not stable: an authorized \
-                         action remained in the final replay; the migration did not \
-                         complete (re-run it)"
-                    );
                 }
             } else if refused.is_some() {
                 page_refused.push(event);
@@ -1113,7 +1127,7 @@ async fn replay_stored_moderation(
         }
         since = Some(boundary.saturating_add(1));
     }
-    Ok(None)
+    Ok(())
 }
 
 /// NIP-09: apply the deletion and purge the deleter's gift wraps (the relay

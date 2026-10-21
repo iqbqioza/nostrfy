@@ -313,7 +313,7 @@ responsive under abuse:
 ./target/release/nostrfy --config nostrfy.toml start --foreground
 ```
 
-> **Foreground lifecycle**: foreground mode writes the same `daemon.pid_file`, so `nostrfy stats` and `nostrfy stop` find the instance and the pid file is removed on exit. The systemd unit runs daemon mode; prefer `systemctl stop nostrfy` / `systemctl restart nostrfy` because the unit's `Restart=always` would immediately restart a process that `nostrfy stop`/`restart` terminated. Daemon logs go to `daemon.log_file`.
+> **Foreground lifecycle**: foreground mode writes the same `daemon.pid_file`, so `nostrfy stats` and `nostrfy stop` find the instance and the pid file is removed on exit. The shipped systemd units (`deploy/nostrfy.service`, `deploy/nostrfy.user.service`) run foreground mode with `Type=simple`: systemd supervises the relay directly, so there is no daemon fork/readiness race and no `PIDFile=` to match. Prefer `systemctl stop nostrfy` / `systemctl restart nostrfy` (or the `--user` equivalents) because `Restart=always` would immediately restart a process that `nostrfy stop`/`restart` terminated. Daemon/foreground logs go to `daemon.log_file`.
 
 ### Stop
 
