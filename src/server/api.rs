@@ -612,16 +612,24 @@ pub async fn api_handler(
             };
             // d_tag from naddr1 is primary; user ?d= overrides if present
             let d_value = params.d.as_deref().unwrap_or(&d_tag);
-            filter.tags.insert("#d".to_string(), json!(d_value));
+            if d_value.is_empty() {
+                // Normal replaceable events (0/3/10000-19999) have no `d`
+                // tag, so `#d: ""` cannot match them. Query by author/kind
+                // and apply the empty-d predicate below; addressable events
+                // with an empty d tag match the same predicate.
+            } else {
+                filter.tags.insert("#d".to_string(), json!(d_value));
+            }
             filter = apply_params(filter, &params);
             let no_tags = excluded_tags(&params);
-            query_and_respond(
+            query_and_respond_dtag(
                 &relay,
                 vec![filter],
                 limit,
                 params.offset,
                 sort_ascending(&params.sort),
                 &no_tags,
+                Some(d_value),
             )
             .await
         }
@@ -1911,6 +1919,23 @@ async fn query_and_respond(
     ascending: bool,
     no_tags: &[&str],
 ) -> (StatusCode, Json<Value>) {
+    query_and_respond_dtag(relay, filters, max_limit, offset, ascending, no_tags, None).await
+}
+
+/// Like [`query_and_respond`], additionally requiring `nip33::dtag(event)`
+/// to equal `required_dtag`. Used by the naddr route when `d` is empty:
+/// the filter cannot express "no d tag" (`#d: ""` matches only events that
+/// carry an explicit empty tag), so the predicate does the final match.
+#[allow(clippy::too_many_arguments)]
+async fn query_and_respond_dtag(
+    relay: &Arc<Relay>,
+    filters: Vec<Filter>,
+    max_limit: usize,
+    offset: Option<usize>,
+    ascending: bool,
+    no_tags: &[&str],
+    required_dtag: Option<&str>,
+) -> (StatusCode, Json<Value>) {
     // Concurrency limiter: at most `api_max_concurrent` `/api/v1` queries
     // run at once. When saturated, the request fails fast with 503 so a
     // flood of REST traffic cannot pile up behind the shared database. One
@@ -2005,7 +2030,7 @@ async fn query_and_respond(
                     no_tags,
                     nip78,
                     relay.relay_pubkey.as_deref(),
-                )
+                ) && required_dtag.is_none_or(|d| crate::nips::nip33::dtag(e) == d)
             })
             .count();
         drop(groups);
@@ -2039,7 +2064,7 @@ async fn query_and_respond(
                 no_tags,
                 nip78,
                 relay.relay_pubkey.as_deref(),
-            )
+            ) && required_dtag.is_none_or(|d| crate::nips::nip33::dtag(e) == d)
         })
         .collect();
     drop(groups);
@@ -3080,6 +3105,94 @@ mod tests {
             assert_eq!(events.len(), 1);
             assert_eq!(events[0]["kind"], 0);
 
+            relay.db.shutdown();
+        });
+    }
+
+    fn naddr_identifier(kind: u64, pubkey: &str, d: &str) -> String {
+        let mut data = Vec::new();
+        data.push(0);
+        data.push(d.len() as u8);
+        data.extend_from_slice(d.as_bytes());
+        data.push(2);
+        data.push(32);
+        data.extend_from_slice(&hex::decode(pubkey).unwrap());
+        data.push(3);
+        data.push(4);
+        data.extend_from_slice(&(kind as u32).to_be_bytes());
+        crate::nips::nip19::bech32_encode("naddr", &data).unwrap()
+    }
+
+    #[test]
+    fn naddr_with_empty_d_resolves_normal_replaceable_events() {
+        // AUD-11: normal replaceable events have no `d` tag; `#d: ""` only
+        // matches an explicit empty tag. The naddr route must fall back to
+        // author+kind and apply the empty-d predicate.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_relay().await;
+            let secp = relay.secp();
+            let pk = XOnlyPublicKey::from_keypair(
+                &Keypair::from_seckey_slice(secp, &[1u8; 32]).unwrap(),
+            )
+            .0
+            .to_string();
+            let now = unix_now().saturating_sub(10);
+            let profile = signed_kind_note(secp, 0, "{\"name\":\"t\"}", now, vec![]);
+            let empty = signed_kind_note(
+                secp,
+                30023,
+                "empty-d",
+                now + 1,
+                vec![vec!["d".into(), "".into()]],
+            );
+            let other = signed_kind_note(
+                secp,
+                30023,
+                "other-d",
+                now + 2,
+                vec![vec!["d".into(), "x".into()]],
+            );
+            for e in [&profile, &empty, &other] {
+                assert_eq!(
+                    relay.db.put(e.clone(), now + 3).await,
+                    crate::db::PutOutcome::Stored
+                );
+            }
+
+            let (code, Json(resp)) = api_handler(
+                State(relay.clone()),
+                Path(naddr_identifier(0, &pk, "")),
+                Query(ApiParams::default()),
+            )
+            .await;
+            assert_eq!(code, StatusCode::OK);
+            let events = resp["events"].as_array().unwrap();
+            assert_eq!(events.len(), 1, "the kind-0 profile must resolve");
+            assert_eq!(events[0]["kind"], 0);
+
+            let (code, Json(resp)) = api_handler(
+                State(relay.clone()),
+                Path(naddr_identifier(30023, &pk, "")),
+                Query(ApiParams::default()),
+            )
+            .await;
+            assert_eq!(code, StatusCode::OK);
+            let events = resp["events"].as_array().unwrap();
+            assert_eq!(events.len(), 1, "only the empty-d address matches");
+            assert_eq!(events[0]["id"], empty.id);
+
+            // A non-empty d still uses the indexed tag filter.
+            let (code, Json(resp)) = api_handler(
+                State(relay.clone()),
+                Path(naddr_identifier(30023, &pk, "x")),
+                Query(ApiParams::default()),
+            )
+            .await;
+            assert_eq!(code, StatusCode::OK);
+            let events = resp["events"].as_array().unwrap();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0]["id"], other.id);
             relay.db.shutdown();
         });
     }

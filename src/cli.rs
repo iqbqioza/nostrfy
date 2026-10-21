@@ -1993,7 +1993,7 @@ fn wait_for_ready(cfg: &Config, pid: Option<u32>) -> Result<()> {
 /// not self-heal, so it must not count as ready for `nostrfy start` (which
 /// would otherwise report `nostrfy started` for a read-only relay and let
 /// deploy automation believe a full-disk relay is healthy).
-fn probe_http(addr: &std::net::SocketAddr) -> bool {
+fn probe_http(addr: &std::net::SocketAddr, host_header: &str) -> bool {
     use std::io::{Read, Write};
     let Ok(stream) = std::net::TcpStream::connect_timeout(addr, Duration::from_millis(500)) else {
         return false;
@@ -2013,10 +2013,12 @@ fn probe_http(addr: &std::net::SocketAddr) -> bool {
         return false;
     }
     let mut stream = stream;
-    if stream
-        .write_all(b"GET /health HTTP/1.0\r\nHost: probe\r\n\r\n")
-        .is_err()
-    {
+    // `host_split` routes `/health` to the API host when one is
+    // configured; a fixed `Host: probe` therefore 404s every probe in that
+    // deployment. Use the configured host name (the listener is the same
+    // port, so the Host header alone decides the route).
+    let request = format!("GET /health HTTP/1.0\r\nHost: {host_header}\r\n\r\n");
+    if stream.write_all(request.as_bytes()).is_err() {
         return false;
     }
     // The status line fits in the first bytes; read until the first LF
@@ -2059,6 +2061,11 @@ fn wait_for_ready_within(cfg: &Config, pid: Option<u32>, timeout: Duration) -> R
     // A wildcard bind address is not connectable: probe loopback, which the
     // wildcard listener also accepts.
     let host = probe_host(&cfg.server.host);
+    let host_header = if cfg.server.api_host.trim().is_empty() {
+        "probe"
+    } else {
+        cfg.server.api_host.trim()
+    };
     let started = Instant::now();
     let deadline = started + timeout;
     loop {
@@ -2079,7 +2086,7 @@ fn wait_for_ready_within(cfg: &Config, pid: Option<u32>, timeout: Duration) -> R
             .map(|addrs| addrs.collect())
             .unwrap_or_default();
         for addr in addrs {
-            if probe_http(&addr) {
+            if probe_http(&addr, host_header) {
                 // The connect may have reached a *foreign* listener while
                 // our child died on the bind (the probe cannot tell whose
                 // listener answered): settle briefly and re-check the child
@@ -3511,6 +3518,65 @@ name = \"nostrfy\"\n",
         assert!(!http_status_ready(b"garbage\r"));
         assert!(!http_status_ready(b"HTTP/1.0\r"));
         assert!(!http_status_ready(b"HTTP/1.0 20 OK\r"));
+    }
+
+    /// A tiny HTTP responder that requires a specific `Host` header and
+    /// returns 404 otherwise, modelling the `api_host` split.
+    fn http_responder_expect_host(
+        bind: &str,
+        expected: &'static str,
+    ) -> (std::net::TcpListener, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind(format!("{bind}:0")).unwrap();
+        let serving = listener.try_clone().unwrap();
+        let handle = std::thread::spawn(move || {
+            for stream in serving.incoming().take(50) {
+                let Ok(mut stream) = stream else { break };
+                use std::io::{Read, Write};
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 512];
+                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut tmp) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                    }
+                }
+                let request = String::from_utf8_lossy(&buf);
+                let ok = request.lines().any(|line| {
+                    line.split_once(':').is_some_and(|(name, value)| {
+                        name.eq_ignore_ascii_case("host") && value.trim() == expected
+                    })
+                });
+                let status = if ok { "200 OK" } else { "404 Not Found" };
+                let _ = stream.write_all(
+                    format!("HTTP/1.0 {status}\r\nContent-Length: 0\r\n\r\n").as_bytes(),
+                );
+            }
+        });
+        (listener, handle)
+    }
+
+    #[test]
+    fn readiness_probe_uses_the_configured_api_host() {
+        // AUD-09: with `server.api_host` set, `/health` is routed only for
+        // that Host. A fixed `Host: probe` would 404 and every daemon start
+        // would report a timeout.
+        let (listener, responder) = http_responder_expect_host("127.0.0.1", "api.example.test");
+        let mut cfg = Config::default();
+        cfg.daemon.pid_file = std::env::temp_dir().join(format!(
+            "nostrfy-ready-api-host-{:x}.pid",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&cfg.daemon.pid_file);
+        cfg.server.host = "127.0.0.1".into();
+        cfg.server.port = listener.local_addr().unwrap().port();
+        cfg.server.api_host = "api.example.test".into();
+        wait_for_ready_within(&cfg, None, Duration::from_secs(1))
+            .expect("the probe must use the configured api_host");
+        let _ = std::fs::remove_file(&cfg.daemon.pid_file);
+        drop(listener);
+        // The responder thread parks on accept after the probe; the test
+        // process exits without joining it (joining would wait forever).
+        drop(responder);
     }
 
     #[test]

@@ -22,13 +22,18 @@ pub fn relay_info(
     // NIP-11: any field may be omitted. Empty string fields are omitted
     // too: some clients try to decode the pubkey/icon as data and fail on
     // an empty value.
+    // Resolve the advertised set once: the `nip29` object must not appear
+    // when 29 is hidden (no relay key, blocked kinds, disabled NIP), even
+    // though `nip_enabled(29)` is true.
+    let supported_nips = config.effective_supported_nips(access);
+    let advertise_nip29 = supported_nips.contains(&29);
     let mut info = json!({
         "name": config.relay.name,
         "description": config.relay.description,
         "pubkey": config.relay.pubkey,
         "contact": config.relay.contact,
         "icon": config.relay.icon,
-        "supported_nips": config.effective_supported_nips(access),
+        "supported_nips": supported_nips,
         "software": env!("CARGO_PKG_REPOSITORY"),
         "version": env!("CARGO_PKG_VERSION"),
         "limitation": {
@@ -52,7 +57,8 @@ pub fn relay_info(
             // ordinary anti-spam heuristics do not.
             "restricted_writes": access.restrict_relay
                 || !access.allowed_kinds.is_empty()
-                || !access.blocked_kinds.is_empty(),
+                || !access.blocked_kinds.is_empty()
+                || config.relay.reject_ephemeral,
             "created_at_lower_limit": 0,
             // NIP-11 limits are *relative* seconds from now (the spec's
             // examples are `300` and `3`), not absolute timestamps.
@@ -94,7 +100,7 @@ pub fn relay_info(
                 .remove(field);
         }
     }
-    if config.nip_enabled(29) {
+    if advertise_nip29 {
         info["nip29"] = json!({ "subgroups": true });
     }
     info
@@ -220,6 +226,44 @@ mod tests {
         // NIP-11's examples are relative seconds (300, 3), not absolute
         // timestamps.
         assert_eq!(upper, Config::default().limits.max_created_at_future_secs);
+    }
+
+    #[test]
+    fn nip29_object_requires_nip29_in_supported_nips() {
+        // AUD-29: the object is part of NIP-29's advertisement. Without a
+        // relay key (or with the NIP hidden) the NIP is not in
+        // supported_nips and the object must be absent.
+        let no_key = info();
+        assert!(
+            no_key.get("nip29").is_none(),
+            "NIP-29 must not be advertised without its supported_nips entry"
+        );
+        let mut cfg = Config::default();
+        cfg.relay.private_key = "11".repeat(32);
+        let info = relay_info(
+            &cfg,
+            &crate::config::AccessControl::default(),
+            &Stats::new(),
+            None,
+        );
+        let supported = info["supported_nips"].as_array().unwrap();
+        assert!(supported.iter().any(|nip| nip == &json!(29)));
+        assert_eq!(info["nip29"]["subgroups"], json!(true));
+    }
+
+    #[test]
+    fn reject_ephemeral_is_advertised_as_restricted_writes() {
+        // AUD-29: a client that publishes an ephemeral event needs to know
+        // up front that the relay rejects the whole ephemeral class.
+        let mut cfg = Config::default();
+        cfg.relay.reject_ephemeral = true;
+        let info = relay_info(
+            &cfg,
+            &crate::config::AccessControl::default(),
+            &Stats::new(),
+            None,
+        );
+        assert_eq!(info["limitation"]["restricted_writes"], json!(true));
     }
 
     #[test]

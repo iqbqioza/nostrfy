@@ -2271,12 +2271,17 @@ async fn serve_limited(
                             // client slot to this request's forwarded
                             // address. Drop the previous guard first so the
                             // connection does not count against its own cap.
-                            drop(
-                                client_hold
+                            // The connection rate limiter is charged once,
+                            // at the first request head: it counts new
+                            // connections, not HTTP requests.
+                            let first_request = {
+                                let mut held = client_hold
                                     .lock()
-                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                    .take(),
-                            );
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                let first = held.is_none();
+                                held.take();
+                                first
+                            };
                             let raw_ip = normalize_ip(peer.ip());
                             let client = if trusted {
                                 client_ip(
@@ -2302,7 +2307,8 @@ async fn serve_limited(
                                 // accept-layer drop, because the TCP socket
                                 // is already established.
                                 let accounting = accounting_ip(client);
-                                if let Some(limiter) = &per_sec
+                                if first_request
+                                    && let Some(limiter) = &per_sec
                                     && !limiter.allow_now(accounting)
                                 {
                                     stats.bump(&stats.conn_refused_proxy, 1);
@@ -5643,6 +5649,56 @@ mod tests {
         assert!(
             String::from_utf8_lossy(&other).contains("200 OK"),
             "a different forwarded client must pass"
+        );
+        tx.send(true).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn serve_limited_rate_limits_trusted_proxy_connections_not_requests() {
+        // AUD-10: the limit is new *connections* per second. A keep-alive
+        // connection's second request must not consume it again (the old
+        // middleware charged every request and answered 429 + close).
+        let now = Arc::new(std::sync::atomic::AtomicU64::new(1_700_000_000));
+        let limiter = IpConnLimiter::with_clock(
+            1,
+            Arc::new({
+                let now = Arc::clone(&now);
+                move || now.load(std::sync::atomic::Ordering::Relaxed)
+            }),
+        )
+        .expect("a positive limit yields a limiter");
+        let (addr, tx, handle) = serve_limited_with_proxies(
+            10,
+            0,
+            Some(Duration::from_secs(30)),
+            Some(limiter),
+            vec![TrustedProxy::parse("127.0.0.1/32").unwrap()],
+        )
+        .await;
+        let mut conn = TcpStream::connect(addr).await.unwrap();
+        let request = b"GET / HTTP/1.1\r\nHost: t\r\nX-Forwarded-For: 203.0.113.9\r\n\
+                        Connection: keep-alive\r\n\r\n";
+        conn.write_all(request).await.unwrap();
+        let first = read_available(&mut conn, Duration::from_millis(300)).await;
+        assert!(
+            String::from_utf8_lossy(&first).contains("200 OK"),
+            "the first request on a new connection must pass: {:?}",
+            String::from_utf8_lossy(&first)
+        );
+        conn.write_all(request).await.unwrap();
+        let second = read_available(&mut conn, Duration::from_millis(300)).await;
+        assert!(
+            String::from_utf8_lossy(&second).contains("200 OK")
+                && !String::from_utf8_lossy(&second).contains("429"),
+            "the keep-alive request must not be rate-limited again: {:?}",
+            String::from_utf8_lossy(&second)
+        );
+        // A genuinely new connection for the same client is still refused.
+        let refused = http_get_with_xff(addr, Some("203.0.113.9")).await;
+        assert!(
+            String::from_utf8_lossy(&refused).contains("429"),
+            "a new connection must still consume the per-second budget"
         );
         tx.send(true).unwrap();
         handle.await.unwrap();
