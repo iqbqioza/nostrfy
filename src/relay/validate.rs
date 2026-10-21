@@ -300,6 +300,16 @@ impl super::Relay {
                 "invalid: member tag must be a lowercase 32-byte hex pubkey (got {malformed:?})"
             ));
         }
+        // NIP-29 group state is derived from these client-authored events.
+        // While the NIP is disabled, precheck does not run the group
+        // validator; storing them would let a later enable/rebuild apply
+        // unvalidated grants/settings (the replay is not a live validation
+        // substitute). They are inert without NIP-29, so reject them at
+        // intake rather than persisting a state event that may later be
+        // replayed.
+        if !cfg.nip_enabled(29) && nip29::is_group_action(event) {
+            return Precheck::Reject("blocked: NIP-29 is disabled".into());
+        }
         if cfg.nip_enabled(29) {
             // Group metadata events MUST be signed by the relay's own key.
             if (nip29::GROUP_META..=nip29::GROUP_PINS).contains(&event.kind)
@@ -480,8 +490,12 @@ impl super::Relay {
             // be proven from a truncated page. Keep the ghost (fail closed).
             return false;
         }
-        if stored.is_empty()
-            || !stored.iter().all(|event| {
+        // No surviving metadata at all is the stronger version of the
+        // bare-39000 case: history/membership/pending checks above already
+        // proved there is nothing to protect, so a crash between a
+        // confirmed purge and the unghost persist must stay re-creatable.
+        if !stored.is_empty()
+            && !stored.iter().all(|event| {
                 event.tags.len() == 1
                     && event.tags[0].len() == 2
                     && event.tags[0][0] == "d"
@@ -1841,6 +1855,42 @@ mod tests {
             );
             relay.db.shutdown();
         });
+    }
+
+    #[tokio::test]
+    async fn group_actions_are_rejected_while_nip29_is_disabled() {
+        // H-2: storing 9000-9022 while NIP-29 is disabled would let a
+        // later enable/rebuild apply unvalidated grants/settings. They are
+        // inert without the NIP, so intake rejects them.
+        let relay = build_validate_relay("nostrfy-nip29-disabled-test").await;
+        relay.config.write().await.relay.disabled_nips = vec![29];
+        let cfg = relay.config.read().await;
+        let access = AccessControl::default();
+        let now = unix_now();
+        for kind in [
+            crate::nips::nip29::PUT_USER,
+            9002,
+            crate::nips::nip29::CREATE_GROUP,
+            crate::nips::nip29::DELETE_GROUP,
+            crate::nips::nip29::JOIN,
+        ] {
+            let event = signed_with_seed(7, kind, vec![vec!["h".into(), "g".into()]]);
+            let out = relay
+                .precheck(&cfg, &access, &event, now, &[], None, None)
+                .await;
+            assert!(
+                matches!(out, super::Precheck::Reject(msg) if msg.contains("NIP-29 is disabled")),
+                "kind {kind} must be refused while NIP-29 is disabled"
+            );
+        }
+        // Ordinary events are unaffected.
+        let normal = signed_with_seed(7, 1, vec![]);
+        let out = relay
+            .precheck(&cfg, &access, &normal, now, &[], None, None)
+            .await;
+        assert!(!matches!(out, super::Precheck::Reject(_)));
+        drop(cfg);
+        relay.db.shutdown();
     }
 
     #[test]

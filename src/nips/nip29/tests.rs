@@ -49,18 +49,22 @@ fn replay_does_not_adopt_a_foreign_child() {
         9002,
         ADMIN,
         Some("a"),
-        vec![vec!["child".into(), "b".into()]],
+        vec![
+            vec!["child".into(), "b".into()],
+            vec!["name".into(), "renamed".into()],
+        ],
     );
-    let out = store.apply(&edit, "relay", now, true, true);
-    assert!(
-        out.is_empty(),
-        "replay must refuse a foreign child: {out:?}"
-    );
+    let _out = store.apply(&edit, "relay", now, true, true);
     assert!(
         store.group("b").unwrap().parent.is_none(),
         "the victim's parent must stay unchanged"
     );
     assert!(!store.group("a").unwrap().children.contains(&"b".into()));
+    assert_eq!(
+        store.group("a").unwrap().settings.name,
+        "renamed",
+        "the edit settings must survive a denied child link"
+    );
 }
 
 #[test]
@@ -87,16 +91,20 @@ fn replay_does_not_adopt_a_foreign_parent() {
         9002,
         ADMIN,
         Some("a"),
-        vec![vec!["parent".into(), "b".into()]],
+        vec![
+            vec!["parent".into(), "b".into()],
+            vec!["name".into(), "renamed".into()],
+        ],
     );
-    let out = store.apply(&edit, "relay", now, true, true);
-    assert!(
-        out.is_empty(),
-        "replay must refuse a foreign parent: {out:?}"
-    );
+    let _out = store.apply(&edit, "relay", now, true, true);
     assert!(
         store.group("a").unwrap().parent.is_none(),
         "the attacker's group must stay a root"
+    );
+    assert_eq!(
+        store.group("a").unwrap().settings.name,
+        "renamed",
+        "the edit settings must survive a denied parent link"
     );
 }
 

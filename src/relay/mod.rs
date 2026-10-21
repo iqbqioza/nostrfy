@@ -1575,7 +1575,16 @@ async fn groups_rebuild_worker(
                     // scope read and the swap.
                     let mut store = groups.write().await;
                     for buffered in buffered {
-                        fresh.apply(&buffered.event, "", buffered.now, false, true);
+                        // Pass the relay key so relay-signed 9002 edits in
+                        // the buffer keep their master-key authority on
+                        // replay (L-2).
+                        fresh.apply(
+                            &buffered.event,
+                            relay_pubkey.as_deref().unwrap_or(""),
+                            buffered.now,
+                            false,
+                            true,
+                        );
                     }
                     *store = fresh;
                 }
@@ -10576,7 +10585,7 @@ mod tests {
         );
         {
             let mut groups = relay.groups.write().await;
-            for gid in ["g1", "g2", "g3"] {
+            for gid in ["g1", "g2", "g3", "g4"] {
                 groups.mark_ghost(gid);
             }
         }
@@ -10592,11 +10601,20 @@ mod tests {
             !relay.repair_unbacked_group_ghost("g3", now).await,
             "membership metadata must keep the ghost"
         );
+        assert!(
+            relay.repair_unbacked_group_ghost("g4", now).await,
+            "a fully purged ghost with no metadata must be repairable"
+        );
         let groups = relay.groups.read().await;
         assert!(!groups.is_ghosted("g1"), "g1 is downgraded");
+        assert!(!groups.is_ghosted("g4"), "g4 is downgraded");
         assert!(
             groups.deleted_group_ids().contains(&"g1".to_string()),
             "g1 becomes the ordinary delete tombstone"
+        );
+        assert!(
+            groups.deleted_group_ids().contains(&"g4".to_string()),
+            "g4 becomes the ordinary delete tombstone"
         );
         assert!(
             groups.is_ghosted("g2") && groups.is_ghosted("g3"),

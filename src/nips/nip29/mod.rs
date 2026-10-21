@@ -732,7 +732,7 @@ impl GroupStore {
                 bail!("restricted: you are not an admin of this group");
             }
             if event.kind == 9002 {
-                validate_edit_metadata(self, gid, group, event, relay_signed, false)?;
+                let _ = validate_edit_metadata(self, gid, group, event, relay_signed, false)?;
             }
             // NIP-29 allows the relay to limit pins: bound the 9010 list
             // so one event cannot pin unbounded state (the apply side caps
@@ -1113,15 +1113,23 @@ impl GroupStore {
                 // last-admin invariant). The re-check runs on the replay
                 // too, so an effect dropped here is final: a rebuild cannot
                 // introduce a cycle (B-1).
+                let mut denials = EditLinkDenials::default();
                 if let Some(group) = self.groups.get(gid) {
                     let relay_signed =
                         !relay_pubkey.is_empty() && event.pubkey.eq_ignore_ascii_case(relay_pubkey);
-                    if validate_edit_metadata(self, gid, group, event, relay_signed, history_replay)
-                        .is_err()
-                    {
-                        return Vec::new();
+                    match validate_edit_metadata(
+                        self,
+                        gid,
+                        group,
+                        event,
+                        relay_signed,
+                        history_replay,
+                    ) {
+                        Ok(links) => denials = links,
+                        Err(_) => return Vec::new(),
                     }
                 }
+                let child_cap = self.declared_children_cap();
                 let (parent_before, parent_after, children_before, children_after, livekit_before) = {
                     match self.groups.get_mut(gid) {
                         Some(group) => {
@@ -1130,8 +1138,12 @@ impl GroupStore {
                             let children_before = group.children.clone();
                             // Deduplicate while preserving order: a repeated
                             // `child` tag must not list the same child twice.
+                            // A link the replay could not re-authorize is
+                            // dropped here, not the whole event: the
+                            // settings above still apply (M-7).
                             let mut seen = HashSet::new();
                             let declared: Vec<String> = tag_values(event, "child")
+                                .filter(|child| !denials.children.contains(*child))
                                 .map(str::to_string)
                                 .filter(|c| seen.insert(c.clone()))
                                 .collect();
@@ -1145,11 +1157,17 @@ impl GroupStore {
                                 // the migration gates): merging keeps the
                                 // link instead of detaching it. Child
                                 // removals happen on the child's own side, so
-                                // no live removal is reverted here.
+                                // no live removal is reverted here. The merge
+                                // is bounded like the declared-children hint
+                                // (a history full of unvalidated 9002s cannot
+                                // grow the list without limit).
                                 let mut present: HashSet<String> =
                                     group.children.iter().cloned().collect();
                                 let mut merged = group.children.clone();
                                 for child in declared {
+                                    if merged.len() >= child_cap {
+                                        break;
+                                    }
                                     if present.insert(child.clone()) {
                                         merged.push(child);
                                     }
@@ -1159,7 +1177,13 @@ impl GroupStore {
                                 declared
                             };
                             let before = group.parent.clone();
-                            let after = tag_value(event, "parent").map(str::to_string);
+                            // A denied link must not detach an existing
+                            // parent: keep the group where it was.
+                            let after = if denials.parent {
+                                before.clone()
+                            } else {
+                                tag_value(event, "parent").map(str::to_string)
+                            };
                             (
                                 before,
                                 after,
@@ -1224,8 +1248,10 @@ impl GroupStore {
                 // removed children is cleared, and the added children get
                 // their back-pointer set, keeping the two directions
                 // consistent.
-                let child_added: Vec<String> =
-                    tag_values(event, "child").map(str::to_string).collect();
+                let child_added: Vec<String> = tag_values(event, "child")
+                    .filter(|child| !denials.children.contains(*child))
+                    .map(str::to_string)
+                    .collect();
                 // Detect removals against the list the edit actually left
                 // behind, not the event's own tags: on a replay the list is
                 // the merge of the stored children and the tags, and a child
@@ -2217,17 +2243,28 @@ pub(crate) fn event_code(event: &Event) -> Option<&str> {
     tag_value(event, CODE)
 }
 
+/// Links a replay could not re-authorize. The caller applies the event's
+/// settings but drops only these links (M-7): re-adjudicating authority is
+/// order-dependent, so it must not discard an otherwise live-accepted
+/// metadata edit wholesale.
+#[derive(Default)]
+struct EditLinkDenials {
+    parent: bool,
+    children: HashSet<String>,
+}
+
 /// Validates the subgroup rules of a `kind:9002` edit-metadata event against
 /// the graph as the edit will leave it. The structural and safety invariants
 /// (a single `parent` tag, no self/two-way links, no cycles, the
 /// declared-children bound) always run. The authorization/fidelity checks —
 /// the parent existing and the author administering it, the edit carrying
-/// every existing child, consent over newly adopted children — run only on
-/// the live path (`replay == false`): a replay applies the stored edits as
-/// they were accepted at intake, and the arrival order inside one second is
-/// not recoverable, so re-running those checks would drop edits the live path
-/// had accepted and roll the derived state back. Imported moderation is the
-/// migration's gate, not the rebuild's.
+/// every existing child, consent over newly adopted children — reject on the
+/// live path (`replay == false`). On replay they record the denied links in
+/// [`EditLinkDenials`] instead: the caller drops only those links and still
+/// applies the edit's settings, because the arrival order inside one second
+/// is not recoverable and dropping the whole edit would roll the derived
+/// state back. Imported moderation is the migration's gate, not the
+/// rebuild's.
 ///
 /// `relay_signed` marks an event from the relay's own key, which NIP-29
 /// treats as the group master key: it is an implicit admin of every group
@@ -2240,7 +2277,8 @@ fn validate_edit_metadata(
     event: &Event,
     relay_signed: bool,
     replay: bool,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<EditLinkDenials> {
+    let mut denials = EditLinkDenials::default();
     // NIP-29: "A kind:9002 MAY carry at most one parent tag". A second
     // parent tag would be silently ignored (only the first is applied), so
     // the edit is rejected outright instead.
@@ -2362,15 +2400,19 @@ fn validate_edit_metadata(
                     // so a relay-signed 9002 can reparent or adopt without an
                     // explicit role.
                     if !relay_signed && !parent_group.is_admin(event.pubkey.as_str()) {
-                        bail!("restricted: you are not an admin of the parent group");
+                        if replay {
+                            denials.parent = true;
+                        } else {
+                            bail!("restricted: you are not an admin of the parent group");
+                        }
                     }
                 }
                 None => {
                     if !replay {
                         bail!("restricted: parent group does not exist");
                     }
-                    // Replay: the apply side drops a link whose parent is
-                    // gone instead of dangling it.
+                    // Replay: drop the dangling link but apply the settings.
+                    denials.parent = true;
                 }
             }
         }
@@ -2418,7 +2460,11 @@ fn validate_edit_metadata(
             && let Some(child_group) = store.groups.get(child)
             && !child_group.is_admin(event.pubkey.as_str())
         {
-            bail!("restricted: you are not an admin of the child group");
+            if replay {
+                denials.children.insert(child.to_string());
+            } else {
+                bail!("restricted: you are not an admin of the child group");
+            }
         }
     }
     // Bound the declared-children adoption hint: beyond its cap the edit is
@@ -2439,9 +2485,10 @@ fn validate_edit_metadata(
         .filter(|id| live.contains(id.as_str()))
         .map(String::as_str)
         .collect();
-    declared_after.extend(tag_values(event, "child"));
+    declared_after
+        .extend(tag_values(event, "child").filter(|child| !denials.children.contains(*child)));
     if declared_after.len() > cap {
         bail!("restricted: too many declared child groups");
     }
-    Ok(())
+    Ok(denials)
 }
