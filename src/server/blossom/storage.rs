@@ -620,6 +620,7 @@ impl BlobStore {
         }
         let mut last_error: Option<anyhow::Error> = None;
         let mut missing = false;
+        let mut refused = false;
         for owner in &meta.owners {
             match self.open_stream(owner, sha256, start, len).await {
                 // Found: stream it (and lift any negative-cache entry).
@@ -631,8 +632,9 @@ impl BlobStore {
                 // an S3 404): try the next copy.
                 Ok(OpenOutcome::Missing) => missing = true,
                 // Refused (unsafe symlinked path): the object's existence
-                // is unknown, so this must not feed the missing counter.
-                Ok(OpenOutcome::Refused) => {}
+                // is unknown, so this must not feed the missing counter or
+                // the negative cache.
+                Ok(OpenOutcome::Refused) => refused = true,
                 Err(e) => {
                     log::warn!("blossom: opening {sha256} for owner {owner} failed: {e}");
                     last_error = Some(e);
@@ -642,14 +644,15 @@ impl BlobStore {
         match last_error {
             Some(e) => Err(e),
             None => {
-                if missing {
+                if missing && !refused {
                     // The mapping exists but every owner's object is
                     // definitively gone: count the mapped-but-missing blob
                     // (best effort, no behavior change — the mapping is
                     // kept and a re-upload heals it) and suppress the
-                    // repeated owner scan. An owner error above means the
-                    // state is unknown, so it is neither counted nor
-                    // cached.
+                    // repeated owner scan. A refused owner (or an error
+                    // above) means the state is unknown, so it is neither
+                    // counted nor cached: a repaired copy must be visible
+                    // immediately.
                     self.remember_missing(sha256);
                     self.stats.bump(&self.stats.blossom_missing_objects, 1);
                 }
@@ -673,6 +676,7 @@ impl BlobStore {
         }
         let mut last_error: Option<anyhow::Error> = None;
         let mut missing = false;
+        let mut refused = false;
         for owner in &meta.owners {
             match self.exists(owner, sha256).await {
                 Ok(Some(true)) => {
@@ -680,10 +684,11 @@ impl BlobStore {
                     return Ok(true);
                 }
                 // A definitive absence for this owner: keep looking, but
-                // only a definitive result may feed the negative cache (a
-                // `None`/refused lookup means the state is unknown).
+                // only a definitive result from *every* owner may feed the
+                // negative cache (a `None`/refused lookup means the state
+                // is unknown).
                 Ok(Some(false)) => missing = true,
-                Ok(None) => {}
+                Ok(None) => refused = true,
                 Err(e) => {
                     log::warn!("blossom: checking {sha256} for owner {owner} failed: {e}");
                     last_error = Some(e);
@@ -693,7 +698,7 @@ impl BlobStore {
         match last_error {
             Some(e) => Err(e),
             None => {
-                if missing {
+                if missing && !refused {
                     self.remember_missing(sha256);
                 }
                 Ok(false)
@@ -1392,8 +1397,11 @@ impl LocalStore {
     /// Opens the blob for streaming, seeked to `start`; the caller reads
     /// at most `len` bytes from the returned file (`len` is enforced by
     /// the streaming wrapper, not by the file handle).
-    /// Existence check for HEAD: same symlink guards as `open`, without
-    /// opening the file or reading a byte.
+    /// Existence check for HEAD: the same O_NOFOLLOW/O_NONBLOCK open and
+    /// regular-file validation as `open`, without reading a byte. Opening
+    /// (rather than stat-ing) keeps HEAD and GET consistent for EACCES and
+    /// for a directory/FIFO at the blob path; a writer-less FIFO cannot
+    /// block because of O_NONBLOCK.
     async fn exists(&self, npub: &str, sha256: &str) -> Result<Option<bool>> {
         if !self.parent_within_root(npub).await {
             let dir = self.root.join(npub);
@@ -1407,14 +1415,30 @@ impl LocalStore {
                 Err(_) => Ok(None),
             };
         }
-        match tokio::fs::symlink_metadata(self.rooted_path(npub, sha256)).await {
-            Ok(meta) if meta.file_type().is_file() && !meta.file_type().is_symlink() => {
-                Ok(Some(true))
-            }
-            // A symlink or directory at the blob path is not a readable
-            // blob: unknown, matching `open`'s `Refused`.
-            Ok(_) => Ok(None),
+        match tokio::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(self.rooted_path(npub, sha256))
+            .await
+        {
+            Ok(file) => match file.metadata().await {
+                Ok(meta) if meta.is_file() => Ok(Some(true)),
+                // A symlink or directory at the blob path is not a
+                // readable blob: unknown, matching `open`'s `Refused`.
+                Ok(_) => Ok(None),
+                Err(_) => Ok(None),
+            },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Some(false)),
+            // A refused O_NOFOLLOW open means a symlink: unknown, like
+            // `open`'s `Refused`.
+            Err(e)
+                if e.raw_os_error() == Some(libc::ELOOP)
+                    || e.raw_os_error() == Some(libc::EMLINK) =>
+            {
+                Ok(None)
+            }
+            // EACCES and other open errors are surfaced, so HEAD reports
+            // the same 500 as GET instead of a false 200.
             Err(e) => Err(e.into()),
         }
     }
@@ -1440,7 +1464,7 @@ impl LocalStore {
         }
         let mut file = match tokio::fs::OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(self.rooted_path(npub, sha256))
             .await
         {
@@ -1459,6 +1483,14 @@ impl LocalStore {
             }
             Err(e) => return Err(e.into()),
         };
+        // A directory/FIFO/device at the blob path is not a readable blob:
+        // refuse it like a symlink instead of returning a stream whose read
+        // fails mid-response (HEAD would have 404'd).
+        match file.metadata().await {
+            Ok(meta) if meta.is_file() => {}
+            Ok(_) => return Ok(OpenOutcome::Refused),
+            Err(_) => return Ok(OpenOutcome::Refused),
+        }
         use tokio::io::AsyncSeekExt;
         file.seek(std::io::SeekFrom::Start(start)).await?;
         Ok(OpenOutcome::Found(BlobStream::Local(file)))
@@ -1995,6 +2027,108 @@ mod tests {
             .expect("second owner's copy must stream");
         assert_eq!(owner, b);
         drop(stream);
+    }
+
+    #[tokio::test]
+    async fn refused_and_missing_owners_do_not_poison_the_negative_cache() {
+        // L-3: one owner's refused lookup (a symlink) plus another owner's
+        // definitive absence must not be cached as "missing": the refused
+        // copy's state is unknown, and a repair must be visible immediately
+        // instead of after the 60 s negative-cache window.
+        let (s, _db_path) = store("refused-cache").await;
+        let a = pk(1);
+        let b = pk(2);
+        let sha = "ef".repeat(32);
+        let bytes = b"recoverable";
+        s.put(&a, &sha, bytes, "text/plain").await.unwrap();
+        s.put(&b, &sha, bytes, "text/plain").await.unwrap();
+        let npub_a = npub_of(&a);
+        let npub_b = npub_of(&b);
+        let external = std::env::temp_dir().join(format!(
+            "nostrfy-blossom-refused-cache-external-{}",
+            std::process::id()
+        ));
+        std::fs::write(&external, b"secret").unwrap();
+        // A refused (symlink) and B definitively gone.
+        std::fs::remove_file(local(&s).blob_path(&npub_a, &sha)).unwrap();
+        std::os::unix::fs::symlink(&external, local(&s).blob_path(&npub_a, &sha)).unwrap();
+        std::fs::remove_file(local(&s).blob_path(&npub_b, &sha)).unwrap();
+
+        assert!(!s.exists_any(&sha).await.unwrap(), "no copy is reachable");
+        assert!(
+            s.open_stream_any(&sha, 0, 1).await.unwrap().is_none(),
+            "the refused/missing mix must not stream"
+        );
+        // Repair A's copy. The unknown state above must not have filled the
+        // shared negative cache.
+        std::fs::remove_file(local(&s).blob_path(&npub_a, &sha)).unwrap();
+        std::fs::write(local(&s).blob_path(&npub_a, &sha), bytes).unwrap();
+        assert!(
+            s.exists_any(&sha).await.unwrap(),
+            "a repaired owner must be visible immediately"
+        );
+        assert_eq!(
+            read_all(&s, &a, &sha).await.unwrap(),
+            bytes,
+            "the repaired copy must stream too"
+        );
+        std::fs::remove_file(&external).unwrap();
+        s.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_directory_at_the_blob_path_is_a_404_for_head_and_get() {
+        // L-3: `exists` used to report an unknown directory as "missing"
+        // (HEAD 404) while `open` opened it and failed mid-response (GET
+        // 500). Both paths now refuse a non-regular file, so HEAD and GET
+        // agree and the failed lookup is not cached.
+        let (s, _db_path) = store("directory-blob").await;
+        let a = pk(1);
+        let sha = "77".repeat(32);
+        s.put(&a, &sha, b"bytes", "text/plain").await.unwrap();
+        let npub = npub_of(&a);
+        let path = local(&s).blob_path(&npub, &sha);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+
+        assert!(!s.exists_any(&sha).await.unwrap(), "HEAD must answer 404");
+        assert!(
+            s.open_stream_any(&sha, 0, 1).await.unwrap().is_none(),
+            "GET must answer 404 too, not fail with a 500"
+        );
+        // The directory is a refused (unknown) state, not a definitive
+        // missing object: restoring the file must be visible immediately.
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::write(&path, b"bytes").unwrap();
+        assert!(s.exists_any(&sha).await.unwrap());
+        s.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_blob_makes_head_and_get_fail_alike() {
+        // L-3: `exists` used stat-metadata and answered "present" for an
+        // unreadable blob (HEAD 200), while GET failed with 500. HEAD now
+        // opens the descriptor like GET, so both surface the error.
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root can read a mode-000 file; the precondition fails
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let (s, _db_path) = store("eacces-blob").await;
+        let a = pk(1);
+        let sha = "66".repeat(32);
+        s.put(&a, &sha, b"bytes", "text/plain").await.unwrap();
+        let path = local(&s).blob_path(&npub_of(&a), &sha);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        assert!(
+            s.exists_any(&sha).await.is_err(),
+            "HEAD must surface EACCES, not report the blob as present"
+        );
+        assert!(
+            s.open_stream_any(&sha, 0, 1).await.is_err(),
+            "GET must surface the same EACCES"
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        s.db.shutdown();
     }
 
     #[tokio::test]

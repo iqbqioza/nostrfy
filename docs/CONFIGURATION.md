@@ -410,7 +410,15 @@ Set this whenever a reverse proxy (nginx, Caddy, a cloud load balancer, Cloudfla
 
 **`max_map_size`** — The memory-map ceiling in bytes. The map is opened at this size as a **sparse virtual reservation** — physical disk grows only with the data actually written, so a large ceiling costs nothing until used. When the map fills, writes fail with `database map is full: increase database.max_map_size` (reads keep working). Must be ≥ `map_size`.
 
-> **Constrained hosts (Android/Termux, strict-overcommit containers):** the default 1 TiB reservation is accepted by standard Linux overcommit but can be refused, failing startup with `Out of memory (os error 12)`. Set a smaller ceiling, e.g. `max_map_size = 33554432` (32 MiB) or a value that fits your data, and raise it (plus `restart`) if writes report `database map is full`. Keep `map_size` ≤ `max_map_size`.
+> **Constrained hosts (Android/Termux, strict-overcommit containers):** the default 1 TiB reservation is accepted by standard Linux overcommit but can be refused, failing startup with `Out of memory (os error 12)`. Set a smaller floor and ceiling, for example:
+>
+> ```toml
+> [database]
+> map_size = 33554432
+> max_map_size = 33554432
+> ```
+>
+> (32 MiB; choose a value that fits your data). Raise `max_map_size` (and `restart`) if writes report `database map is full`; keep `map_size` ≤ `max_map_size`.
 
 **`purge_interval_secs`** — How often (seconds) NIP-40 expired events are physically removed from the database. Expired events are hidden from queries even between purges. Values below 10 are raised to 10 seconds (including `0`); there is no way to disable the purge pass entirely.
 

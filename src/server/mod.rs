@@ -2118,6 +2118,28 @@ async fn serve_limited(
                     );
                     continue;
                 }
+                // A trusted proxy's real client address is only known after
+                // the request head is parsed, so the middleware's per-IP cap
+                // cannot see a connection that never sends one. Cap the
+                // pre-head connections per proxy peer here; the middleware
+                // releases this slot as soon as the head arrives and then
+                // accounts the forwarded client separately.
+                let pre_head_guard = if trusted {
+                    if !ip_counter.try_acquire(accounting, max_per_ip) {
+                        stats.bump(&stats.conn_refused_proxy, 1);
+                        warn_refusal(
+                            "trusted-proxy connections refused before the request head: \
+                             per-IP pre-head connection cap (limits.max_connections_per_ip)",
+                        );
+                        continue;
+                    }
+                    Some(Arc::new(ClientIpGuard {
+                        counter: Arc::clone(&ip_counter),
+                        ip: accounting,
+                    }))
+                } else {
+                    None
+                };
                 // Per-IP concurrent cap: plain HTTP connections count too,
                 // not only WebSocket upgrades. The slot is released by the
                 // task guard on every exit path (including a panic), or by
@@ -2199,6 +2221,11 @@ async fn serve_limited(
                         let ip_counter = Arc::clone(&ip_counter_handle);
                         let stats = Arc::clone(&stats_handle);
                         async move {
+                            // The request head is here: release the trusted
+                            // proxy's pre-head per-IP slot before acquiring
+                            // the forwarded client's slot (the proxy and the
+                            // client may share an address on loopback).
+                            drop(req.extensions_mut().remove::<Arc<ClientIpGuard>>());
                             let raw_ip = normalize_ip(peer.ip());
                             let client = if trusted {
                                 client_ip(
@@ -2266,10 +2293,23 @@ async fn serve_limited(
                         }
                     },
                 ));
+                let pre_head = Arc::new(std::sync::Mutex::new(pre_head_guard));
                 let hyper_service = hyper_util::service::TowerToHyperService::new(
-                    svc.map_request(|req: hyper::Request<hyper::body::Incoming>| {
-                        req.map(axum::body::Body::new)
-                    }),
+                    svc.map_request(
+                        move |mut req: hyper::Request<hyper::body::Incoming>| {
+                            // Only the first request head consumes the
+                            // pre-head guard; keep-alive requests are
+                            // already accounted under the client address.
+                            if let Some(guard) = pre_head
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .take()
+                            {
+                                req.extensions_mut().insert(guard);
+                            }
+                            req.map(axum::body::Body::new)
+                        },
+                    ),
                 );
                 conn_tasks.push(tokio::spawn(async move {
                     // Releases the accept-layer slot (global and per-IP) on
@@ -5300,6 +5340,64 @@ mod tests {
             other_closed,
             "the `Connection: close` request must be answered and closed"
         );
+        tx.send(true).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn serve_limited_caps_pre_head_connections_of_trusted_proxies() {
+        // L-10: a trusted proxy's forwarded client address is unknown until
+        // the request head arrives, so a headerless connection used to
+        // bypass the per-IP cap and consume the global connection budget.
+        // The accept layer now caps the pre-head phase per proxy peer and
+        // releases the slot once the head is parsed.
+        let (addr, tx, handle) = serve_limited_with_proxies(
+            10,
+            2,
+            Some(Duration::from_secs(30)),
+            None,
+            vec![TrustedProxy::parse("127.0.0.1/32").unwrap()],
+        )
+        .await;
+        let mut first = TcpStream::connect(addr).await.unwrap();
+        let second = TcpStream::connect(addr).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // The third headerless connection is dropped at the accept layer.
+        let third = TcpStream::connect(addr).await.unwrap();
+        let (got, closed) = read_to_eof(third, Duration::from_secs(2)).await;
+        assert!(
+            closed && got.is_empty(),
+            "the pre-head per-IP cap must drop the third headerless connection"
+        );
+        // Completing a held connection's head releases its pre-head slot.
+        first
+            .write_all(
+                b"GET / HTTP/1.1\r\nHost: t\r\nX-Forwarded-For: 203.0.113.9\r\n\
+                  Connection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let (body, _) = read_to_eof(first, Duration::from_secs(3)).await;
+        assert!(
+            String::from_utf8_lossy(&body).contains("200 OK"),
+            "the completed request must still be served"
+        );
+        // The released slot admits another request (the second headerless
+        // connection still holds one pre-head slot).
+        let mut fourth = TcpStream::connect(addr).await.unwrap();
+        fourth
+            .write_all(
+                b"GET / HTTP/1.1\r\nHost: t\r\nX-Forwarded-For: 203.0.113.10\r\n\
+                  Connection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let (body, _) = read_to_eof(fourth, Duration::from_secs(3)).await;
+        assert!(
+            String::from_utf8_lossy(&body).contains("200 OK"),
+            "releasing the pre-head slot must admit the next connection"
+        );
+        drop(second);
         tx.send(true).unwrap();
         handle.await.unwrap();
     }

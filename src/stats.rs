@@ -69,8 +69,9 @@ pub struct Stats {
     pub conn_refused_per_ip: AtomicU64,
     /// Connections refused by the per-IP connection rate limit.
     pub conn_refused_rate: AtomicU64,
-    /// Trusted-proxy requests refused with `429` (per-IP rate/concurrent cap
-    /// evaluated under the forwarded client address).
+    /// Trusted-proxy connections refused before the request head (per-IP
+    /// pre-head cap) or requests refused with `429` (per-IP rate/concurrent
+    /// cap evaluated under the forwarded client address).
     pub conn_refused_proxy: AtomicU64,
     /// Requests refused with `403` because the client IP is NIP-86 blocked.
     pub conn_refused_blocked: AtomicU64,
@@ -145,6 +146,7 @@ const PRIVATE_STATS_KEYS: &[&str] = &[
     "rebuild_failures",
     "log_errors",
     "connection_refusals",
+    "rpc_auth_failures",
 ];
 impl Stats {
     pub fn new() -> Arc<Stats> {
@@ -666,6 +668,7 @@ mod tests {
         stats.accept_errors.store(3, Ordering::Relaxed);
         stats.rebuild_failures.store(4, Ordering::Relaxed);
         stats.conn_refused_blocked.store(6, Ordering::Relaxed);
+        stats.rpc_auth_failures.store(7, Ordering::Relaxed);
 
         let public = stats.as_public_json();
         // The list is spelled out here rather than read from the const, so
@@ -679,6 +682,7 @@ mod tests {
             "rebuild_failures",
             "log_errors",
             "connection_refusals",
+            "rpc_auth_failures",
         ] {
             assert!(
                 public.get(key).is_none(),

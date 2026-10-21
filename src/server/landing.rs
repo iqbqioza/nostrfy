@@ -44,9 +44,18 @@ static LANDING_CACHE: Mutex<Option<Cached>> = Mutex::new(None);
 /// stat-then-read TOCTOU) cannot redirect the read to another file.
 fn open_regular(path: &Path) -> Option<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
+    // Reject a symlink or a non-regular file without opening it: opening a
+    // writer-less FIFO for read blocks until a writer appears (the old
+    // O_NOFOLLOW open still blocked on FIFOs). This check is advisory (the
+    // path can change), so the open below also uses O_NONBLOCK and
+    // re-validates the descriptor before returning it.
+    let pre = std::fs::symlink_metadata(path).ok()?;
+    if !pre.file_type().is_file() {
+        return None;
+    }
     let file = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
         .ok()?;
     let meta = file.metadata().ok()?;
@@ -159,7 +168,13 @@ pub(crate) async fn asset_response(dir: &Path, name: &str) -> Response {
     let path = dir.join(name);
     // Same atomic O_NOFOLLOW check as the landing page: the asset is read
     // from the descriptor that was validated, not from a re-resolved path.
-    let Some(file) = open_regular(&path) else {
+    // Keep the blocking open off the async runtime: a slow/NFS mount (and
+    // the advisory pre-check) must not park a request worker.
+    let Some(file) = tokio::task::spawn_blocking(move || open_regular(&path))
+        .await
+        .ok()
+        .flatten()
+    else {
         return StatusCode::NOT_FOUND.into_response();
     };
     use tokio::io::AsyncReadExt as _;
@@ -198,6 +213,33 @@ mod tests {
         ] {
             assert!(!valid_asset_name(bad), "{bad:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn fifo_assets_are_refused_without_blocking() {
+        // Opening a writer-less FIFO for read blocks forever; the
+        // symlink_metadata pre-check plus O_NONBLOCK must turn it into a
+        // prompt 404 instead of parking a blocking-pool thread.
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("nostrfy-fifo-test-{}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("x.png");
+        let c_path = std::ffi::CString::new(
+            <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::as_bytes(path.as_os_str()),
+        )
+        .unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            asset_response(&dir, "x.png"),
+        )
+        .await
+        .expect("a FIFO asset must not block the request");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
