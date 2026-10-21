@@ -716,7 +716,12 @@ impl super::Conn {
                 let wire_size = response.len() as u64 * 2;
                 let over_budget = budget > 0 && wire_size > budget;
                 if over_budget {
-                    self.neg_err(
+                    // The raw id owns the state and the purge; the echo id
+                    // may be empty after a lowered max_sub_id_len, in which
+                    // case neg_err would leave the raw sync and its budget
+                    // reservation open (L-3).
+                    self.neg_err_with_echo(
+                        &sub_id,
                         &echo_id,
                         "blocked: negentropy response too large (increase limits.max_req_response_bytes)",
                     );

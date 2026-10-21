@@ -117,20 +117,24 @@ fn fingerprint(items: &[Item]) -> [u8; 16] {
 /// `items` must already be sorted ascending by (timestamp, id) via
 /// [`sort_items`]. Returns the raw response message (without hex encoding).
 pub fn respond(items: &[Item], client_message: &[u8]) -> anyhow::Result<Vec<u8>> {
+    // Protocol version negotiation is a one-byte reply and must not pay
+    // for copying the (up to 100k) item set.
+    if client_message.first() != Some(&PROTOCOL_VERSION) {
+        return Ok(vec![PROTOCOL_VERSION]);
+    }
     // `items` is sorted by (timestamp, id); a duplicate record (the same
     // pair twice) cannot come from the database (keyed by event id), but
     // `respond` is a public helper. An adjacent duplicate makes the
     // fingerprint split below unable to advance its lower bound (both
     // halves compare equal), so it would emit unbounded output; drop
-    // duplicates before walking.
-    let mut deduped: Vec<Item> = items.to_vec();
-    deduped.dedup();
-    let items: &[Item] = &deduped;
-    if client_message.first() != Some(&PROTOCOL_VERSION) {
-        // Protocol version negotiation: reply with the highest version we
-        // support (a single byte).
-        return Ok(vec![PROTOCOL_VERSION]);
-    }
+    // duplicates before walking. Only pay for the clone when a duplicate is
+    // actually present (I-2).
+    let deduped = items.windows(2).any(|pair| pair[0] == pair[1]).then(|| {
+        let mut deduped = items.to_vec();
+        deduped.dedup();
+        deduped
+    });
+    let items: &[Item] = deduped.as_deref().unwrap_or(items);
     let mut ranges = parse_message(client_message, MAX_NEG_RANGES_PER_MSG)?;
     // NIP-77: every message covers the complete timestamp/ID space. A
     // message whose final explicit range does not reach infinity implicitly

@@ -6157,6 +6157,35 @@ mod tests {
     }
 
     #[test]
+    fn an_over_budget_neg_reply_releases_the_raw_state() {
+        // L-3: the over-budget branch used the sanitized echo id in
+        // `neg_err`. After a lowered max_sub_id_len the echo is empty, so
+        // the raw sync (and its NEG budget/slot) stayed alive even though
+        // NEG-ERR told the client the sync was closed.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let id = "n".repeat(10);
+            conn.handle_neg_open(&[json!(id), json!({"kinds": [1]}), json!("61000000")])
+                .await;
+            assert!(conn.neg.contains_key(&id), "the sync is open");
+            conn.relay.config.write().await.limits.max_sub_id_len = 4;
+            conn.req_response_bytes = 1;
+            conn.handle_neg_msg(&[json!(id), json!("61000000")]).await;
+            assert!(
+                !conn.neg.contains_key(&id),
+                "an over-budget NEG-ERR must release the raw sync"
+            );
+            let msgs = outgoing_json(&conn);
+            assert!(
+                msgs.iter().any(|m| m[0] == "NEG-ERR" && m[1] == json!("")),
+                "the wire id stays bounded even though the raw id was purged: {msgs:?}"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
     fn a_neg_reopen_purges_a_stale_neg_err() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
