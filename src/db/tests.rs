@@ -1166,13 +1166,11 @@ fn an_absent_target_gets_the_deleter_scoped_marker_but_moderation_does_not() {
 
 #[test]
 fn live_absent_target_deleters_never_promote_to_an_unconditional_block() {
-    // F-18-3: on live traffic, SCOPED_TOMBSTONE_MAX + 1 keys naming the same
-    // absent id used to promote the marker to an unconditional tombstone, so
-    // a handful of colluding keys could censor any preselected future event
-    // id (regardless of its author) and grow a marker per target. The live
-    // walk must keep the block scoped and drop the extra deleter; only the
-    // migration (operator-controlled history) may promote, where losing the
-    // author's own deletion would fail open.
+    // F-18-3/M-3: SCOPED_TOMBSTONE_MAX + 1 keys naming the same absent id
+    // used to promote the marker to an unconditional tombstone, so a handful
+    // of colluding keys could censor any preselected future event id
+    // (regardless of its author). Both the live walk and the migration path
+    // keep the block scoped and drop the extra deleter.
     use crate::db::removal::SCOPED_TOMBSTONE_MAX;
     use crate::db::store::Store;
     use crate::db::store::{ID_LEN, deletion_marker_blocks};
@@ -1229,7 +1227,8 @@ fn live_absent_target_deleters_never_promote_to_an_unconditional_block() {
         );
     }
     drop(rtxn);
-    // The migration pass still promotes a full scoped list (operator data).
+    // M-3: the migration path also keeps the block scoped; the extra
+    // deleter is dropped rather than promoting to a cross-author block.
     let extra = format!("{:064x}", 99u32);
     store
         .record_absent_deletion_targets(
@@ -1238,10 +1237,20 @@ fn live_absent_target_deleters_never_promote_to_an_unconditional_block() {
         )
         .unwrap();
     let rtxn = store.env.read_txn().unwrap();
+    let marker = store
+        .deleted
+        .get(&rtxn, &absent_id)
+        .unwrap()
+        .expect("the scoped marker stays");
     assert_eq!(
-        store.deleted.get(&rtxn, &absent_id).unwrap(),
-        Some([].as_slice()),
-        "the migration may promote a full scoped marker"
+        marker.len(),
+        SCOPED_TOMBSTONE_MAX * ID_LEN,
+        "the migration must not promote a full scoped marker"
+    );
+    let extra_event = authored_event(1, &extra, "x", now, vec![]);
+    assert!(
+        !deletion_marker_blocks(marker, &extra_event),
+        "the dropped extra deleter fails open only for itself"
     );
 }
 
@@ -1273,6 +1282,44 @@ fn a_wrap_only_deletion_leaves_a_pending_record_for_the_resume() {
     assert_eq!(completed, 1, "the pending wrap walk must resume");
     assert_eq!(errors.load(Ordering::Relaxed), 0);
     assert!(store.pending_deletions().unwrap().is_empty());
+}
+
+#[test]
+fn migrated_absent_target_deleters_never_promote_to_an_unconditional_block() {
+    // M-3: `migrate-strfry` feeds arbitrary source-relay kind:5 events into
+    // `record_absent_deletion_targets`. Five distinct authors targeting one
+    // absent id must not turn the scoped marker into a cross-author block.
+    use crate::db::removal::SCOPED_TOMBSTONE_MAX;
+    use crate::db::store::{ID_LEN, Store};
+    use std::sync::atomic::AtomicBool;
+
+    let store = Store::open(&config(), Arc::new(AtomicBool::new(true)), 512).unwrap();
+    let target = "ab".repeat(32);
+    let target_id = hex::decode(&target).unwrap();
+    for i in 1..=SCOPED_TOMBSTONE_MAX + 1 {
+        let deleter = hex::decode(format!("{i:064x}")).unwrap();
+        assert_eq!(
+            store
+                .record_absent_deletion_targets(&deleter, std::slice::from_ref(&target))
+                .unwrap(),
+            1
+        );
+        let rtxn = store.env.read_txn().unwrap();
+        let marker = store
+            .deleted
+            .get(&rtxn, &target_id)
+            .unwrap()
+            .expect("the migration records a scoped marker");
+        assert_eq!(
+            marker.len(),
+            (i).min(SCOPED_TOMBSTONE_MAX) * ID_LEN,
+            "the migrated marker stays scoped to at most {SCOPED_TOMBSTONE_MAX} deleters"
+        );
+        assert!(
+            !marker.is_empty(),
+            "the migration must never promote to an unconditional block"
+        );
+    }
 }
 
 #[test]
@@ -4551,6 +4598,70 @@ fn word_index_rekey_crash_invalidates_the_completion_marker() {
             "the rebuilt index must contain {word}"
         );
     }
+}
+
+#[test]
+fn word_index_backfill_clears_orphan_keys() {
+    // L-8: events deleted while `search_index = false` cannot touch the
+    // by_word table (the handle is absent). Re-enabling with the same limit
+    // must clear the backfill rather than keep those orphan keys forever.
+    let cfg = config();
+    let expiry = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let now = unix_now();
+    let ev = event(1, "orphan needle", now, vec![]);
+    let id = ev.id_bytes().unwrap();
+    let word_key = crate::db::store::word_key("orphan", ev.created_at, &id);
+    {
+        let store = crate::db::store::Store::open(&cfg, Arc::clone(&expiry), 32).unwrap();
+        let mut wtxn = store.env.write_txn().unwrap();
+        store
+            .events
+            .put(&mut wtxn, &id, &serde_json::to_vec(&ev).unwrap())
+            .unwrap();
+        wtxn.commit().unwrap();
+        assert_eq!(store.rebuild_word_index().unwrap(), 1);
+        let rtxn = store.env.read_txn().unwrap();
+        assert!(
+            store
+                .by_word
+                .unwrap()
+                .get(&rtxn, &word_key)
+                .unwrap()
+                .is_some()
+        );
+    }
+    // Simulate a deletion while the index was disabled: the event row and
+    // completion marker are gone, the word row is not (the disabled store
+    // had no by_word handle).
+    {
+        let store = crate::db::store::Store::open(&cfg, Arc::clone(&expiry), 32).unwrap();
+        let mut wtxn = store.env.write_txn().unwrap();
+        store.events.delete(&mut wtxn, &id).unwrap();
+        store.index_meta.delete(&mut wtxn, b"word_index").unwrap();
+        wtxn.commit().unwrap();
+        let rtxn = store.env.read_txn().unwrap();
+        assert!(
+            store
+                .by_word
+                .unwrap()
+                .get(&rtxn, &word_key)
+                .unwrap()
+                .is_some()
+        );
+    }
+    let store = crate::db::store::Store::open(&cfg, expiry, 32).unwrap();
+    assert!(store.word_index_needs_rebuild().unwrap());
+    assert_eq!(store.rebuild_word_index().unwrap(), 0);
+    let rtxn = store.env.read_txn().unwrap();
+    assert!(
+        store
+            .by_word
+            .unwrap()
+            .get(&rtxn, &word_key)
+            .unwrap()
+            .is_none(),
+        "the backfill must clear word keys for deleted events"
+    );
 }
 
 #[test]

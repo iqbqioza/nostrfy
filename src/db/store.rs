@@ -965,10 +965,19 @@ impl Store {
             // A database running without the index does not index the
             // events it stores: drop the completion marker so enabling the
             // index later backfills every event (the earlier entries, if
-            // any, stay and are re-added idempotently).
-            let mut wtxn = env.write_txn()?;
-            index_meta.delete(&mut wtxn, b"word_index")?;
-            wtxn.commit()?;
+            // any, stay and are re-added idempotently). Read first: a
+            // database that has already been running disabled has no marker
+            // and must not need a write transaction at startup (a read-only
+            // or full filesystem would otherwise fail to open).
+            let marker_present = {
+                let rtxn = env.read_txn()?;
+                index_meta.get(&rtxn, b"word_index")?.is_some()
+            };
+            if marker_present {
+                let mut wtxn = env.write_txn()?;
+                index_meta.delete(&mut wtxn, b"word_index")?;
+                wtxn.commit()?;
+            }
             (configured_words, false)
         };
         let tables = if by_word.is_some() { 23 } else { 22 };
@@ -3190,14 +3199,16 @@ impl Store {
         self.word_index_ready
             .store(false, std::sync::atomic::Ordering::Relaxed);
         let limit = self.max_indexed_words.max(1);
-        let persisted = {
+        let (persisted, had_marker) = {
             let rtxn = self.env.read_txn()?;
-            match self.index_meta.get(&rtxn, b"word_limit")? {
+            let persisted = match self.index_meta.get(&rtxn, b"word_limit")? {
                 Some(raw) if raw.len() >= 8 => {
                     u64::from_be_bytes(raw[..8].try_into().unwrap()) as usize
                 }
                 _ => 0,
-            }
+            };
+            let had_marker = self.index_meta.get(&rtxn, b"word_index")?.is_some();
+            (persisted, had_marker)
         };
         // Invalidate the completion marker *before* clearing or re-indexing.
         // A crash after this commit leaves no marker, so the next startup
@@ -3210,9 +3221,12 @@ impl Store {
             self.index_meta.delete(&mut wtxn, b"word_index")?;
             wtxn.commit()?;
         }
-        if persisted != limit {
+        if !had_marker || persisted != limit {
             // Clear in bounded chunks: a huge index must not pin one
-            // unbounded write transaction.
+            // unbounded write transaction. A missing marker means this is a
+            // backfill (index was disabled or a prior rebuild was
+            // interrupted); clearing also removes word keys for events that
+            // were deleted while the index was disabled (L-8).
             let mut last: Option<Vec<u8>> = None;
             loop {
                 let chunk: Vec<Vec<u8>> = {
@@ -3298,6 +3312,13 @@ impl Store {
             .store(limit, std::sync::atomic::Ordering::Relaxed);
         self.word_index_ready
             .store(true, std::sync::atomic::Ordering::Relaxed);
+        // Searches during the backfill may have cached document
+        // frequencies from the partial index; they must not survive the
+        // completion (a 300 s under-count would misclassify a common term).
+        self.df_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
         Ok(indexed)
     }
 

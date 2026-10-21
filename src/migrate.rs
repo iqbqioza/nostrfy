@@ -666,56 +666,40 @@ async fn apply_gift_wrap_purges(db: &DbClient, stats: &mut Stats) -> Result<()> 
 async fn apply_group_side_effects(db: &DbClient, opts: &Options, stats: &mut Stats) -> Result<()> {
     // A `9005` that removes a state event changes the state later actions
     // are authorized against, and the startup rebuild sees the post-delete
-    // database: reconcile to a fixpoint so the two cannot disagree. Each
-    // pass stops at the next unapplied `9005`/`9008` instead of collecting
-    // every action from the whole history: the caller applies that action
-    // and re-authorizes. A non-state `9005` still costs a pass, but the
-    // scan never materializes the full action/refused lists.
+    // database: reconcile to a fixpoint so the two cannot disagree. The
+    // replay applies actions inline; a non-state `9005` continues the same
+    // scan, and only a state-changing action restarts it. Neither the
+    // action list nor the refused list is materialized as a whole.
     let mut applied: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut dropped: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut deleted_creates: std::collections::HashSet<String> = std::collections::HashSet::new();
     loop {
-        // Fixpoint: collect the authorized actions from one replay, apply
-        // all non-state deletions in that pass, and restart only when an
-        // action actually removed a state event (the in-memory replay cannot
-        // undo an applied event). A non-state 9005 (an ordinary chat
-        // message deletion) must not cost a full-history re-scan.
+        // Fixpoint: apply authorized actions while streaming the replay.
+        // A non-state 9005 (an ordinary chat message deletion) is applied
+        // inline and the scan continues; only an action that removes a
+        // state event / purges a group restarts the replay (the in-memory
+        // state cannot undo an applied event). No action list is
+        // materialized: memory stays bounded by the page and `applied` ids.
         loop {
             let mut groups = crate::nips::nip29::GroupStore::with_cap(opts.max_groups);
-            let mut actions = Vec::new();
-            replay_stored_moderation(
+            let mut sink = ModerationActionSink {
+                db,
+                deleted_creates: &mut deleted_creates,
+                stats,
+                applied: &mut applied,
+            };
+            let outcome = replay_stored_moderation(
                 db,
                 &mut groups,
                 opts.relay_pubkey.as_deref(),
-                &applied,
-                Some(&mut actions),
+                ReplayAction::Apply(&mut sink),
                 None,
             )
             .await?;
-            let mut state_changed = false;
-            for action in actions {
-                if applied.contains(&action.id) {
-                    continue;
-                }
-                applied.insert(action.id.clone());
-                match action.kind {
-                    9005 => {
-                        if apply_group_deletion(db, &action, &mut deleted_creates, stats).await? {
-                            state_changed = true;
-                            break;
-                        }
-                    }
-                    9008 => {
-                        apply_group_purge(db, &action, stats).await?;
-                        state_changed = true;
-                        break;
-                    }
-                    _ => {}
-                }
+            if outcome == ReplayOutcome::StateChanged {
+                continue;
             }
-            if !state_changed {
-                break;
-            }
+            break;
         }
         // Ghost reconciliation: remove the creates that a deleted create's
         // ghost must keep out. The state changes, so the fixpoint re-runs.
@@ -816,8 +800,7 @@ async fn apply_group_side_effects(db: &DbClient, opts: &Options, stats: &mut Sta
             db,
             &mut groups,
             opts.relay_pubkey.as_deref(),
-            &applied,
-            None,
+            ReplayAction::Final(&applied),
             Some(&mut dropper),
         )
         .await?;
@@ -965,15 +948,55 @@ impl RefusedDropper<'_> {
     }
 }
 
+/// Applies authorized `9005`/`9008` actions while the replay is walking
+/// the history. `apply` returns whether the action removed a state event
+/// (or purged a group); the replay stops and the caller starts a fresh pass
+/// so later actions are authorized against the post-delete database.
+struct ModerationActionSink<'a> {
+    db: &'a DbClient,
+    deleted_creates: &'a mut std::collections::HashSet<String>,
+    stats: &'a mut Stats,
+    applied: &'a mut std::collections::HashSet<String>,
+}
+
+impl ModerationActionSink<'_> {
+    async fn apply(&mut self, event: &Event) -> Result<bool> {
+        self.applied.insert(event.id.clone());
+        match event.kind {
+            9005 => apply_group_deletion(self.db, event, self.deleted_creates, self.stats).await,
+            9008 => {
+                apply_group_purge(self.db, event, self.stats).await?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+}
+
+/// How the replay handles an authorized action: apply it inline (the
+/// fixpoint pass) or fail closed when one remains (the final refused-drop
+/// pass).
+enum ReplayAction<'a> {
+    Apply(&'a mut ModerationActionSink<'a>),
+    Final(&'a std::collections::HashSet<String>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplayOutcome {
+    Complete,
+    StateChanged,
+}
+
 /// Replays the stored NIP-29 moderation events in the same
 /// `(created_at, group_rank, kind, id)` order as the startup rebuild.
 ///
-/// With `actions`, the whole history is scanned and every authorized
-/// `9005`/`9008` not in `applied` is appended there for the caller to apply
-/// (non-state deletions can then be batched in one pass). With a `refused`
-/// dropper, the whole history is scanned (no unapplied action may remain,
-/// or the migration fails closed) and the refused events are dropped page
-/// by page, so the fixpoint never materializes the entire refused list.
+/// An authorized `9005`/`9008` is handed to the [`ModerationActionSink`] as
+/// soon as it is found; non-state deletions continue the same scan, while a
+/// state change returns [`ReplayOutcome::StateChanged`] so the caller can
+/// re-authorize from the post-delete database. No action vector is
+/// materialized. With a `refused` dropper, the final pass scans the whole
+/// history (no unapplied action may remain, or the migration fails closed)
+/// and drops refused events page by page.
 ///
 /// The replay covers the whole stored history, so a resumed migration
 /// (`--since`) or a merge into an existing database authorizes against the
@@ -984,10 +1007,9 @@ async fn replay_stored_moderation(
     db: &DbClient,
     groups: &mut crate::nips::nip29::GroupStore,
     relay_pubkey: Option<&str>,
-    applied: &std::collections::HashSet<String>,
-    mut actions: Option<&mut Vec<Event>>,
+    mut action: ReplayAction<'_>,
     mut refused: Option<&mut RefusedDropper<'_>>,
-) -> Result<()> {
+) -> Result<ReplayOutcome> {
     let kinds: Vec<u64> = (crate::nips::nip29::MOD_MIN..=crate::nips::nip29::MOD_MAX)
         .chain([crate::nips::nip29::JOIN, crate::nips::nip29::LEAVE])
         .collect();
@@ -1074,14 +1096,22 @@ async fn replay_stored_moderation(
                 }
             }
             if replay_moderation(groups, &event, relay_pubkey) {
-                if matches!(event.kind, 9005 | 9008) && !applied.contains(&event.id) {
-                    match actions.as_deref_mut() {
-                        Some(actions) => actions.push(event),
-                        None => bail!(
-                            "the NIP-29 moderation fixpoint was not stable: an authorized \
-                             action remained in the final replay; the migration did not \
-                             complete (re-run it)"
-                        ),
+                if matches!(event.kind, 9005 | 9008) {
+                    match &mut action {
+                        ReplayAction::Apply(sink) => {
+                            if !sink.applied.contains(&event.id) && sink.apply(&event).await? {
+                                return Ok(ReplayOutcome::StateChanged);
+                            }
+                        }
+                        ReplayAction::Final(applied) => {
+                            if !applied.contains(&event.id) {
+                                bail!(
+                                    "the NIP-29 moderation fixpoint was not stable: an authorized \
+                                     action remained in the final replay; the migration did not \
+                                     complete (re-run it)"
+                                );
+                            }
+                        }
                     }
                 }
             } else if refused.is_some() {
@@ -1127,7 +1157,7 @@ async fn replay_stored_moderation(
         }
         since = Some(boundary.saturating_add(1));
     }
-    Ok(())
+    Ok(ReplayOutcome::Complete)
 }
 
 /// NIP-09: apply the deletion and purge the deleter's gift wraps (the relay
@@ -1960,11 +1990,11 @@ mod tests {
     }
 
     #[test]
-    fn a_tombstone_overflow_falls_back_to_an_unconditional_block() {
-        // More deleters than the scoped list holds: dropping the extra one
-        // would fail open when it is the author's own deletion (the target
-        // is absent precisely because strfry deleted it on the author's
-        // request), so the marker becomes unconditional.
+    fn a_tombstone_overflow_keeps_the_block_scoped() {
+        // More deleters than the scoped list holds: the extra deleter is
+        // dropped instead of promoting to an unconditional tombstone
+        // (M-3). The price is that the fifth deleter's own re-publication
+        // is not blocked; a cross-author censor block would be worse.
         let db = test_db("nip09-overflow");
         let now = unix_now();
         let target = signed(9, 1, now - 20, vec![], "gone");
@@ -1990,8 +2020,9 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let outcome = rt.block_on(db.put(target, unix_now()));
         assert!(
-            matches!(outcome, PutOutcome::PreviouslyDeleted),
-            "the author's block must be effective after the overflow, got {outcome:?}"
+            matches!(outcome, PutOutcome::Stored),
+            "the dropped fifth deleter fails open only for itself, not for another author: \
+             got {outcome:?}"
         );
         db.shutdown();
     }
