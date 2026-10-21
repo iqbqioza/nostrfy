@@ -864,7 +864,9 @@ fn replay_role_mutation(store: &mut RoleStore, mutation: &BufferedRoleMutation) 
             store.remove_claim(claim);
         }
         BufferedRoleMutation::AdmitMember { pubkey } => {
-            store.admit(pubkey);
+            if !store.admit(pubkey) {
+                log::warn!("replayed NIP-43 admission dropped: the member list is at its cap");
+            }
         }
     }
 }
@@ -2587,6 +2589,16 @@ impl Relay {
                             "error: membership could not be recorded; retry".into(),
                         );
                     }
+                    crate::relay::roles::Admission::Vanished => {
+                        // A VANISH won the race with this invite: the
+                        // admission was rolled back, so a welcome would be
+                        // a lie and must not be sent.
+                        self.publish_rate_rollback(&event.pubkey, now);
+                        self.stats.bump(&self.stats.events_rejected, 1);
+                        return PutOutcome::Invalid(
+                            "blocked: this pubkey has requested to vanish".into(),
+                        );
+                    }
                 }
             }
             crate::relay::validate::Precheck::Vanish => {
@@ -3125,6 +3137,17 @@ impl Relay {
                                 id,
                                 PutOutcome::Invalid(
                                     "error: membership could not be recorded; retry".into(),
+                                ),
+                            ));
+                            continue;
+                        }
+                        crate::relay::roles::Admission::Vanished => {
+                            self.publish_rate_rollback(&event.pubkey, now);
+                            self.stats.bump(&self.stats.events_rejected, 1);
+                            results.push((
+                                id,
+                                PutOutcome::Invalid(
+                                    "blocked: this pubkey has requested to vanish".into(),
                                 ),
                             ));
                             continue;
@@ -6807,6 +6830,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn role_mutations_during_a_rebuild_do_not_publish_a_partial_membership() {
+        // M-1: assigning a role or admitting a claim holder while the live
+        // role store is revoked (rebuild pending) must not publish the
+        // revoked store's one-member 13534. That partial list would replace
+        // the full one, and a crash before the rebuild would rebuild only
+        // from it.
+        let key = "01".repeat(32);
+        let relay = build_role_relay(Some(&key)).await;
+        relay.config.write().await.relay.enabled_nips = vec![43];
+        assert!(relay.create_role("mod", "Mod", "", "", None).await);
+        let existing = "bb".repeat(32);
+        assert!(matches!(
+            relay.admit_member(&existing, true).await,
+            crate::relay::roles::Admission::Recorded
+        ));
+        // Keep the rebuild window open without running the scan.
+        relay.signal_drain();
+        relay.mark_roles_stale().await;
+        assert!(
+            relay.roles.read().await.roles.is_empty(),
+            "the marking path must revoke the live store"
+        );
+        // Re-create the role in the revoked store (an admin RPC accepted
+        // during the rebuild), then assign/admit new members.
+        assert!(relay.create_role("mod", "Mod", "", "", None).await);
+        let assigned = "aa".repeat(32);
+        assert_eq!(
+            relay.assign_role(&assigned, "mod").await,
+            RoleChange::Applied
+        );
+        let admitted = "cc".repeat(32);
+        assert!(matches!(
+            relay.admit_member(&admitted, true).await,
+            crate::relay::roles::Admission::Recorded
+        ));
+        let now = crate::util::unix_now();
+        let filter: crate::filter::Filter =
+            serde_json::from_value(serde_json::json!({ "kinds": [13534] })).unwrap();
+        let lists = relay.db.query(vec![filter], 10, now).await.0;
+        assert!(!lists.is_empty(), "the initial admission stored a list");
+        for list in &lists {
+            let members: Vec<&str> = list
+                .tags
+                .iter()
+                .filter(|tag| tag.first().map(String::as_str) == Some("member"))
+                .filter_map(|tag| tag.get(1).map(String::as_str))
+                .collect();
+            assert!(
+                members.contains(&existing.as_str()),
+                "a rebuild-window mutation replaced the full 13534 with a partial one: {members:?}"
+            );
+            assert!(!members.contains(&assigned.as_str()));
+            assert!(!members.contains(&admitted.as_str()));
+        }
+        // The buffer holds the mutations for replay onto the rebuilt store.
+        let mut fresh = crate::nips::nip43::RoleStore::default();
+        fresh.create("mod", "Mod", "", "", None);
+        fresh.admit(&existing);
+        {
+            let buffer = relay.roles_rebuild.buffer.lock().await;
+            for mutation in &buffer.mutations {
+                super::replay_role_mutation(&mut fresh, mutation);
+            }
+        }
+        assert!(fresh.is_member_of(&existing));
+        assert!(fresh.is_member_of(&assigned));
+        assert!(fresh.is_member_of(&admitted));
+        assert!(
+            fresh.assignments[&assigned]
+                .iter()
+                .any(|role| role == "mod")
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
     async fn drain_prevents_new_role_rebuilds() {
         // Shutdown must not start a role rebuild scan whose result cannot be
         // persisted: the live store stays fail-closed (empty) and dirty, and
@@ -9268,6 +9367,46 @@ mod tests {
                 1,
                 "the admitted join counts exactly like the single-event path"
             );
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn admit_member_rechecks_a_racing_vanish() {
+        // L-13: the join precheck checks `is_vanished`, but a VANISH can
+        // commit before `admit_member` writes. The admission rechecks the
+        // marker after the live mutation and rolls the membership back, so
+        // a vanished key cannot be left on the member list.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_role_relay(Some(&"01".repeat(32))).await;
+            relay.config.write().await.relay.enabled_nips = vec![43];
+
+            // A member already on the list when the vanish lands is removed
+            // by the recheck (the duplicate branch).
+            let existing = "bb".repeat(32);
+            assert!(matches!(
+                relay.admit_member(&existing, true).await,
+                crate::relay::roles::Admission::Recorded
+            ));
+            let key: [u8; 32] = hex::decode(&existing).unwrap().try_into().unwrap();
+            relay.db.apply_vanish(key, crate::util::unix_now()).await;
+            assert_eq!(
+                relay.admit_member(&existing, true).await,
+                crate::relay::roles::Admission::Vanished
+            );
+            assert!(!relay.roles.read().await.is_member_of(&existing));
+
+            // A fresh admission (the precheck ran before the marker) is
+            // rolled back too.
+            let fresh = "aa".repeat(32);
+            let key: [u8; 32] = hex::decode(&fresh).unwrap().try_into().unwrap();
+            relay.db.apply_vanish(key, crate::util::unix_now()).await;
+            assert_eq!(
+                relay.admit_member(&fresh, true).await,
+                crate::relay::roles::Admission::Vanished
+            );
+            assert!(!relay.roles.read().await.is_member_of(&fresh));
             relay.db.shutdown();
         });
     }

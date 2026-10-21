@@ -1184,6 +1184,10 @@ pub async fn rpc_handler(
                     rpc_err("restricted: NIP-43 is disabled or the relay key is missing")
                 }
                 Err(crate::relay::roles::ClaimRejection::NotDurable) => {
+                    // The code change is live in memory even though the
+                    // snapshot write failed; audit it like the access
+                    // mutations above, then report the retryable error.
+                    audit!(&relay, &identity, "createclaim", params);
                     rpc_err("error: cannot persist the invite code change; retry")
                 }
             }
@@ -1208,6 +1212,10 @@ pub async fn rpc_handler(
                     rpc_err("restricted: NIP-43 is disabled or the relay key is missing")
                 }
                 Err(crate::relay::roles::ClaimRejection::NotDurable) => {
+                    // The revocation is live in memory even though the
+                    // snapshot write failed; a lost deleteclaim is
+                    // fail-open, so the audit entry is mandatory.
+                    audit!(&relay, &identity, "deleteclaim", params);
                     rpc_err("error: cannot persist the invite code change; retry")
                 }
             }
@@ -2860,6 +2868,40 @@ mod tests {
                 .is_empty()
         );
         relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn failed_claim_persistence_is_audited() {
+        // A claim change is live in memory even when the snapshot write
+        // fails, so the audit trail must record it (the RPC still reports
+        // the retryable persistence error). This matches the ban/allow
+        // mutations and is mandatory for `deleteclaim`: a lost revocation
+        // is fail-open.
+        let relay = build_admin_relay_with_key(Some(&"cd".repeat(32))).await;
+        let resp = rpc_call(&relay, "createclaim", vec![json!("audit-claim")]).await;
+        assert!(rpc_ok_of(resp).await);
+        relay.audit.clear();
+        relay.db.shutdown();
+
+        let resp = rpc_call(&relay, "createclaim", vec![json!("audit-claim-2")]).await;
+        assert!(
+            rpc_err_of(resp).await.contains("persist"),
+            "the failed snapshot write must surface a retryable error"
+        );
+        let resp = rpc_call(&relay, "deleteclaim", vec![json!("audit-claim")]).await;
+        assert!(
+            rpc_err_of(resp).await.contains("persist"),
+            "the failed revocation must surface a retryable error"
+        );
+        let recent = relay.audit.recent();
+        assert!(
+            recent.iter().any(|entry| entry.starts_with("createclaim")),
+            "a live-but-unpersisted claim creation must be audited: {recent:?}"
+        );
+        assert!(
+            recent.iter().any(|entry| entry.starts_with("deleteclaim")),
+            "a live-but-unpersisted claim revocation must be audited: {recent:?}"
+        );
     }
 
     #[tokio::test]

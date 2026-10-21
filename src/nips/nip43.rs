@@ -265,8 +265,19 @@ impl RoleStore {
 
     /// Admits a claim-holder to the member list: an entry with no roles
     /// yet (listed in `kind:13534`, counted by [`Self::is_member_of`]).
-    pub fn admit(&mut self, pubkey: &str) {
+    /// Returns false when the list is already at [`MAX_RELAY_MEMBERS`]: the
+    /// replay path enforces the cap here because its live-store check saw
+    /// the revoked empty store during a rebuild. An existing member is an
+    /// idempotent success.
+    pub fn admit(&mut self, pubkey: &str) -> bool {
+        if self.assignments.contains_key(pubkey) {
+            return true;
+        }
+        if self.assignments.len() >= MAX_RELAY_MEMBERS {
+            return false;
+        }
         self.assignments.entry(pubkey.to_string()).or_default();
+        true
     }
 
     // ----- relay-generated events -----
@@ -607,6 +618,26 @@ mod tests {
             "a member whose grant this cleanup emptied must still be dropped"
         );
         assert!(store.is_member_of(&claim_holder));
+    }
+
+    #[test]
+    fn admission_cap_is_enforced_by_admit_itself() {
+        // The replay path (rebuild + buffered `AdmitMember`) applies
+        // `RoleStore::admit` without the live write-lock cap check, so the
+        // store method itself must refuse to grow past the cap.
+        let mut store = RoleStore::default();
+        for i in 0..MAX_RELAY_MEMBERS {
+            assert!(store.admit(&format!("{i:064x}")), "admission {i} must fit");
+        }
+        assert_eq!(store.assignments.len(), MAX_RELAY_MEMBERS);
+        let extra = format!("{MAX_RELAY_MEMBERS:064x}");
+        assert!(!store.admit(&extra), "the cap must refuse a new member");
+        assert_eq!(store.assignments.len(), MAX_RELAY_MEMBERS);
+        assert!(!store.is_member_of(&extra));
+        // An existing member remains an idempotent success at the cap.
+        let existing = store.assignments.keys().next().unwrap().clone();
+        assert!(store.admit(&existing));
+        assert_eq!(store.assignments.len(), MAX_RELAY_MEMBERS);
     }
 
     #[test]
