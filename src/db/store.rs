@@ -2215,6 +2215,7 @@ pub(crate) fn replaceable_key(kind: u64, pubkey: &[u8], dtag: &str) -> Vec<u8> {
 /// owns nothing. `0xff` on the `dlen` field sorts above every real `d`
 /// length (`dtag_key_safe` caps it well below `u32::MAX`), so this bound
 /// closes the range exactly at `(kind, pubkey)`.
+#[cfg(test)]
 pub(crate) fn replaceable_key_range_end(kind: u64, pubkey: &[u8]) -> Vec<u8> {
     let mut key = Vec::with_capacity(CREATED_LEN + ID_LEN + 4);
     key.extend_from_slice(&kind.to_be_bytes());

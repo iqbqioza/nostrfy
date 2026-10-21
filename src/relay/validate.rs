@@ -589,6 +589,18 @@ impl super::Relay {
         {
             bail!("invalid: deletion request must reference at least one event");
         }
+        // AUD-03: each distinct address costs a tombstone and a slot
+        // lookup on the single writer. Reject the request at intake instead
+        // of accepting work the replay path would have to truncate.
+        if cfg.nip_enabled(9)
+            && event.kind == nip09::DELETION_KIND
+            && nip09::deletion_addresses_exceed_cap(event)
+        {
+            bail!(
+                "invalid: too many addresses in a deletion request (max {})",
+                nip09::MAX_DELETION_ADDRESSES
+            );
+        }
 
         // NIP-11's `max_content_length` is a count of unicode characters,
         // so the enforcement counts characters (the byte size is bounded by
@@ -990,6 +1002,29 @@ mod tests {
         let id = ev.id_bytes().unwrap();
         ev.sig = secp.sign_schnorr_no_aux_rand(&id, &keypair).to_string();
         ev
+    }
+
+    #[test]
+    fn an_overlong_deletion_address_list_is_rejected_at_intake() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_validate_relay("nostrfy-nip09-address-cap-test").await;
+            let cfg = relay.config.read().await;
+            let pk = "a".repeat(64);
+            let tags: Vec<Vec<String>> = (0..=crate::nips::nip09::MAX_DELETION_ADDRESSES)
+                .map(|i| vec!["a".into(), format!("30023:{pk}:d{i}")])
+                .collect();
+            let event = signed_with_seed(7, crate::nips::nip09::DELETION_KIND, tags);
+            let err = relay
+                .validate_base(&cfg, &event, unix_now(), &[], None)
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("too many addresses"),
+                "unexpected rejection: {err}"
+            );
+            drop(cfg);
+            relay.db.shutdown();
+        });
     }
 
     #[test]

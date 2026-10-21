@@ -3620,6 +3620,49 @@ impl Relay {
         !over_bound
     }
 
+    /// Retries the in-memory pending-removal flush, for shutdown. The
+    /// normal path records each request immediately, but a full writer
+    /// retains the request in memory until another failed removal retries
+    /// it; without this final pass a process exit would lose a deletion the
+    /// client was told was applied. Returns whether every held request is
+    /// now durable.
+    pub(crate) async fn flush_pending_removals(&self) -> bool {
+        let drained: Vec<crate::db::store::PendingDeletion> = {
+            let mut held = self
+                .pending_removals
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            std::mem::take(&mut *held)
+        };
+        if drained.is_empty() {
+            return true;
+        }
+        let mut retained = Vec::with_capacity(drained.len());
+        for request in drained {
+            if !self.db.record_pending_deletion(request.clone()).await {
+                retained.push(request);
+            }
+        }
+        let mut held = self
+            .pending_removals
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Anything queued while the flush awaited stays bounded like the
+        // normal path; a shutdown has already joined the request tasks.
+        retained.append(&mut held);
+        let clean = retained.is_empty();
+        let limit = self.pending_removals_limit();
+        if retained.len() > limit {
+            log::error!(
+                "dropping {} unapplied deletion(s) past the in-memory bound at shutdown",
+                retained.len() - limit
+            );
+            retained.truncate(limit);
+        }
+        *held = retained;
+        clean
+    }
+
     /// Persists the live NIP-29 group state immediately. The hot mutation
     /// path uses the debounced [`Self::schedule_groups_persist`] instead;
     /// this immediate form is kept for the fail-closed paths (a pre-delete
@@ -7783,6 +7826,49 @@ mod tests {
             );
             relay.db.shutdown();
         });
+    }
+
+    #[tokio::test]
+    async fn shutdown_flushes_in_memory_pending_removals() {
+        // AUD-20: when the writer is still full while a shed deletion is
+        // held, the request lives only in memory. The shutdown path must
+        // retry the durable write before the database stops.
+        let relay = build_relay().await;
+        let target = "ff".repeat(32);
+        relay
+            .pending_removals
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(crate::db::store::PendingDeletion {
+                targets: vec![target.clone()],
+                addresses: Vec::new(),
+                request_pubkey: Some("aa".repeat(32)),
+                request_created: crate::util::unix_now(),
+                group: None,
+                purge_wraps: true,
+            });
+        assert!(
+            relay.flush_pending_removals().await,
+            "the shutdown flush must record the held request"
+        );
+        let pending = relay
+            .db
+            .pending_deletions()
+            .await
+            .expect("the pending deletions must be readable");
+        assert!(
+            pending.iter().any(|p| p.targets == vec![target.clone()]),
+            "the held request must reach the durable delete_pending table"
+        );
+        assert!(
+            relay
+                .pending_removals
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty(),
+            "a flushed request must not stay in memory"
+        );
+        relay.db.shutdown();
     }
 
     #[tokio::test]

@@ -10306,12 +10306,12 @@ fn delegated_address_tombstone_survives_a_mid_walk_crash() {
     };
     rt.block_on(async {
         assert_eq!(db.put(ev.clone(), now).await, PutOutcome::Stored);
-        // Fail after the first committed chunk (countdown 2): the chunk
-        // holding the removal commits, then the walk errors before the
-        // post-walk tombstone merge.
+        // Fail after the (single) committed address chunk: the removal and
+        // its delegated tombstone commit atomically, then the walk reports
+        // the partial failure and the startup resume takes over.
         faults
             .chunk_after
-            .store(2, std::sync::atomic::Ordering::SeqCst);
+            .store(1, std::sync::atomic::Ordering::SeqCst);
         let (removed, _) = db
             .apply_deletion_checked(
                 vec![],

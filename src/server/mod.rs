@@ -1089,6 +1089,15 @@ pub async fn run_server(
     {
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
+    // A deletion whose side effect was shed by a full writer may still be
+    // held in memory (the durable `delete_pending` write failed at the
+    // time). Retry now that the request tasks are stopped, or the process
+    // exit loses a deletion the client was told was applied.
+    if !relay.flush_pending_removals().await {
+        warn!(
+            "some unapplied deletions could not be recorded at shutdown;              the startup resume will not see them"
+        );
+    }
     // The debounced snapshot persists must commit before the database
     // stops: the drain worker's final pass runs concurrently with this
     // teardown, and a mutation arriving after the drain leaves its store

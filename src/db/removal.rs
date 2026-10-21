@@ -10,8 +10,7 @@ use super::store::{
     CREATED_LEN, GIFT_WRAP_INDEX, ID_LEN, StateRemoved, Store, TAG_INDEX_VALUE_MAX, created_key,
     decode_pending_purge, decode_purged_group_marker, delegated_by, deleted_address_key,
     dtag_key_safe, encode_pending_deletion, encode_pending_purge, encode_purged_group_marker,
-    pending_deletion_key, pubkey_key, purged_group_key, replaceable_key, replaceable_key_range_end,
-    tag_key,
+    pending_deletion_key, pubkey_key, purged_group_key, replaceable_key, tag_key,
 };
 use crate::error::Result;
 use crate::event::Event;
@@ -515,168 +514,116 @@ impl Store {
         if group_scoped_addrs {
             log::warn!("ignoring NIP-09 a-tag targets of a group-scoped deletion request");
         }
-        for address in addresses {
-            if group_scoped_addrs {
-                continue;
-            }
-            // The author may delete their own address; a NIP-26 delegator
-            // may delete versions published on their behalf (checked per
-            // version below, mirroring the `e`-tag path). Compare decoded
-            // bytes (case-insensitive like the scan's hex decode) so an
-            // uppercase `a` value still matches the author.
-            let author_owns = request_pubkey.is_none_or(|pubkey| {
-                hex::decode(&address.pubkey)
-                    .ok()
-                    .zip(hex::decode(pubkey).ok())
-                    .is_some_and(|(a, b)| a == b)
-            });
-            let mut delegated_any = false;
-            // Whether the delegated address tombstone already rode along in
-            // a committed chunk transaction below: crash-safe without waiting
-            // for the post-walk merge (which stays as the idempotent
-            // backstop). Unmatched delegations never set it, so they still
-            // leave no tombstone.
-            let mut delegated_tombstoned = false;
-            let Ok(pubkey) = hex::decode(&address.pubkey) else {
-                continue;
-            };
-            if pubkey.len() != ID_LEN {
-                continue;
-            }
-            // NIP-09: tombstone the address up to the request's created_at
-            // *before* removing the versions, so a later re-publication of
-            // an older version cannot resurrect the address even if a crash
-            // or a MapFull interrupts the walk (mirrors `purge_group`'s
-            // marker-first ordering). The per-id tombstones below only cover
-            // the versions that exist right now. Merged with an existing
-            // tombstone by keeping the furthest cut.
-            let akey = deleted_address_key(address.kind, &pubkey, &address.d);
-            if author_owns {
-                self.merge_address_tombstone(&akey, request_created)?;
-            }
-            // Bound the walk on the `dlen` field, not on `kind`: `replaceable_key` is
-            // `kind(8) || pubkey(32) || dlen(4) || d`, so an upper bound built
-            // from `kind + 1` would leave every slot of the same kind written
-            // by a higher pubkey inside the range (LMDB compares keys
-            // bytewise) and turn one deletion into a full scan of that kind on
-            // the single writer thread.
-            let start = replaceable_key(address.kind, &pubkey, "");
-            let end = replaceable_key_range_end(address.kind, &pubkey);
-            let mut last_key: Option<Vec<u8>> = None;
-            loop {
+        if !group_scoped_addrs {
+            // One bounded transaction for all addresses. Live intake caps
+            // the distinct count at MAX_DELETION_ADDRESSES (the replay
+            // paths truncate to the same cap), so this cannot pin the
+            // writer for an unbounded time.
+            //
+            // The replaceable index has exactly one value per
+            // (kind, pubkey, d): reading that slot directly is equivalent
+            // to walking the whole (kind, pubkey) range and matching `d`,
+            // but the old walk scanned (and fsynced) every address under
+            // the same kind/pubkey once per requested d. A request naming
+            // many d values of one author therefore multiplied the cost by
+            // the number of d values.
+            let mut wtxn = self.env.write_txn()?;
+            let mut chunk_state_removed = StateRemoved::default();
+            let mut wrote = false;
+            for address in addresses {
                 if self.cancelled() {
+                    // Dropping the transaction rolls back every address
+                    // processed so far; the pending record stays, so the
+                    // startup resume re-applies the whole request.
                     return Err(anyhow::anyhow!(
                         "NIP-09 deletion cancelled during shutdown; resuming at next startup"
                     ));
                 }
+                // The author may delete their own address; a NIP-26
+                // delegator may delete versions published on their behalf
+                // (checked per version below, mirroring the `e`-tag path).
+                // Compare decoded bytes (case-insensitive like the scan's
+                // hex decode) so an uppercase `a` value still matches the
+                // author.
+                let author_owns = request_pubkey.is_none_or(|pubkey| {
+                    hex::decode(&address.pubkey)
+                        .ok()
+                        .zip(hex::decode(pubkey).ok())
+                        .is_some_and(|(a, b)| a == b)
+                });
+                let Ok(pubkey) = hex::decode(&address.pubkey) else {
+                    continue;
+                };
+                if pubkey.len() != ID_LEN {
+                    continue;
+                }
+                let akey = deleted_address_key(address.kind, &pubkey, &address.d);
+                // An author-owned tombstone is unconditional: it must block
+                // a later older re-publication even when no version is held
+                // now. It rides in the same transaction as the removals, so
+                // a crash leaves neither the tombstone nor a removal
+                // half-applied.
+                if author_owns {
+                    self.merge_address_tombstone_in(&mut wtxn, &akey, request_created)?;
+                    wrote = true;
+                }
+                let rkey = replaceable_key(address.kind, &pubkey, &dtag_key_safe(&address.d));
+                let Some(value) = self.replaceable.get(&wtxn, &rkey)? else {
+                    continue;
+                };
+                if value.len() < CREATED_LEN + ID_LEN {
+                    continue;
+                }
+                let created = u64::from_be_bytes(value[..CREATED_LEN].try_into().unwrap());
+                if created > request_created {
+                    // The request only covers history up to its own
+                    // timestamp; the current version is newer and survives.
+                    continue;
+                }
+                let id = value[CREATED_LEN..CREATED_LEN + ID_LEN].to_vec();
+                if !author_owns {
+                    let requester = request_pubkey.expect("not author_owns implies Some");
+                    let delegated = self
+                        .events
+                        .get(&wtxn, &id)?
+                        .and_then(|raw| serde_json::from_slice::<Event>(raw).ok())
+                        .is_some_and(|event| delegated_by(&event, requester));
+                    if !delegated {
+                        // No tombstone for an unmatched delegation: it must
+                        // not block the author's future publications.
+                        continue;
+                    }
+                    // The delegated guard is atomic with its first removal;
+                    // the post-walk merge that used to be the backstop is
+                    // unnecessary now that the whole request is one
+                    // transaction.
+                    self.merge_address_tombstone_in(&mut wtxn, &akey, request_created)?;
+                }
+                self.deleted.put(&mut wtxn, &id, b"")?;
+                // Every slot under this address is keyed by `address.kind`,
+                // so its kind decides whether the derived state must be
+                // invalidated. Bumped in the same transaction as the
+                // removal (see the `e`-tag path). An address names a kind,
+                // not an event, so the group cannot be resolved: `None`
+                // keeps the whole store in scope.
+                chunk_state_removed.observe(address.kind, None);
+                self.remove_event(&mut wtxn, &id)?;
+                *removed += 1;
+                wrote = true;
+            }
+            if !chunk_state_removed.is_empty() {
+                self.bump_state_stamp(&mut wtxn)?;
+            }
+            if wrote {
+                wtxn.commit()?;
+                // See the `e`-tag walk: fail after a committed chunk so the
+                // resume runs over a partial removal. The address walk is
+                // one bounded chunk now, so the fault fires after that
+                // commit (the tombstone and removal are already durable).
                 #[cfg(test)]
                 if take_chunk_fault(&self.fail_chunk_after) {
                     return Err(anyhow::anyhow!("test-only removal chunk failure"));
                 }
-                // A fresh write transaction per chunk: one address's version
-                // history is unbounded, and a single transaction across it
-                // pinned the writer while a MapFull aborted the whole
-                // deletion. A replay after a crash re-walks the remaining
-                // versions (the removed ones are already gone).
-                let mut wtxn = self.env.write_txn()?;
-                let lower = match &last_key {
-                    Some(k) => std::ops::Bound::Excluded(k.as_slice()),
-                    None => std::ops::Bound::Included(start.as_slice()),
-                };
-                // The slot values (not the keys) carry the removed id, so
-                // this walk cannot use `removal_chunk`; iteration errors
-                // still propagate so a cursor failure cannot report a
-                // partial removal as a clean one.
-                let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-                for item in self
-                    .replaceable
-                    .range(&wtxn, &(lower, std::ops::Bound::Excluded(end.as_slice())))?
-                {
-                    let (k, v) = item?;
-                    entries.push((k.to_vec(), v.to_vec()));
-                    if entries.len() == REMOVAL_CHUNK {
-                        break;
-                    }
-                }
-                if entries.is_empty() {
-                    break;
-                }
-                #[cfg(test)]
-                self.removal_scanned
-                    .fetch_add(entries.len() as u64, std::sync::atomic::Ordering::SeqCst);
-                last_key = Some(entries.last().unwrap().0.clone());
-                let mut chunk_state_removed = StateRemoved::default();
-                for (key, value) in entries {
-                    // key = kind(8) + pubkey(32) + dlen(4) + d
-                    if key.len() < CREATED_LEN + ID_LEN + 4 {
-                        continue;
-                    }
-                    if key[CREATED_LEN..CREATED_LEN + ID_LEN] != pubkey {
-                        continue;
-                    }
-                    let dlen = u32::from_be_bytes(
-                        key[CREATED_LEN + ID_LEN..CREATED_LEN + ID_LEN + 4]
-                            .try_into()
-                            .unwrap(),
-                    ) as usize;
-                    if key.len() != CREATED_LEN + ID_LEN + 4 + dlen {
-                        continue;
-                    }
-                    let d = &key[CREATED_LEN + ID_LEN + 4..];
-                    // The stored slot key truncates over-long `d` tags (see
-                    // `dtag_key_safe`), so compare against the truncated form.
-                    if d != dtag_key_safe(&address.d).as_bytes() {
-                        continue;
-                    }
-                    if value.len() < CREATED_LEN + ID_LEN {
-                        continue;
-                    }
-                    let created = u64::from_be_bytes(value[..CREATED_LEN].try_into().unwrap());
-                    if created > request_created {
-                        continue;
-                    }
-                    let id = &value[CREATED_LEN..CREATED_LEN + ID_LEN];
-                    if !author_owns {
-                        let requester = request_pubkey.expect("not author_owns implies Some");
-                        let delegated = self
-                            .events
-                            .get(&wtxn, id)?
-                            .and_then(|raw| serde_json::from_slice::<Event>(raw).ok())
-                            .is_some_and(|event| delegated_by(&event, requester));
-                        if !delegated {
-                            continue;
-                        }
-                        delegated_any = true;
-                        // Commit the address guard atomically with its first
-                        // removal: a crash after this chunk commits leaves the
-                        // tombstone behind, so the resume (finding zero
-                        // versions) no longer loses the guard and old
-                        // versions stay blocked. Same cut as the post-walk
-                        // merge, which stays idempotent.
-                        if !delegated_tombstoned {
-                            self.merge_address_tombstone_in(&mut wtxn, &akey, request_created)?;
-                            delegated_tombstoned = true;
-                        }
-                    }
-                    self.deleted.put(&mut wtxn, id, b"")?;
-                    // Every slot under this range is keyed by `address.kind`
-                    // (the walk only filters pubkey/d), so its kind decides
-                    // whether the derived state must be invalidated. Bumped
-                    // in the same transaction as the removal (see the
-                    // `e`-tag path). An address names a kind, not an event,
-                    // so the group cannot be resolved: `None` keeps the
-                    // whole store in scope.
-                    chunk_state_removed.observe(address.kind, None);
-                    self.remove_event(&mut wtxn, id)?;
-                    *removed += 1;
-                }
-                if !chunk_state_removed.is_empty() {
-                    self.bump_state_stamp(&mut wtxn)?;
-                }
-                wtxn.commit()?;
-                state_removed.merge(chunk_state_removed);
-                // See the `e`-tag walk: fail after a committed chunk so the
-                // resume runs over a partial removal.
                 #[cfg(test)]
                 if self
                     .fail_next_delete_chunk
@@ -684,15 +631,10 @@ impl Store {
                 {
                     return Err(anyhow::anyhow!("test-only delete chunk failure"));
                 }
+            } else {
+                drop(wtxn);
             }
-            // A delegated requester may only tombstone when a version
-            // actually matched (the walk above authorizes each version): an
-            // unmatched delegation must not leave a tombstone that blocks
-            // the author's future publications up to the cut. Author-owned
-            // addresses were already tombstoned before the walk.
-            if !author_owns && delegated_any {
-                self.merge_address_tombstone(&akey, request_created)?;
-            }
+            state_removed.merge(chunk_state_removed);
         }
 
         // NIP-59: the deletion walk also revokes the gift wraps addressed
@@ -727,9 +669,9 @@ impl Store {
     }
 
     /// Merges the NIP-09 `a`-tag tombstone at `akey` with the request's
-    /// `cut`, keeping the furthest cut, into the given transaction (no
-    /// commit): lets a chunk commit removals and their re-publication guard
-    /// atomically (see the delegated path in `apply_deletion_walk`).
+    /// `cut`, keeping the furthest cut, in the caller's transaction. The
+    /// tombstone must ride with the removal: a crash leaves neither half,
+    /// so the pending record's resume re-applies the whole request.
     fn merge_address_tombstone_in(
         &self,
         wtxn: &mut heed::RwTxn,
@@ -743,17 +685,6 @@ impl Store {
             _ => cut,
         };
         self.deleted.put(wtxn, akey, &merged.to_be_bytes())?;
-        Ok(())
-    }
-
-    /// Merges the NIP-09 `a`-tag tombstone at `akey` with the request's
-    /// `cut`, keeping the furthest cut, and commits it. A tombstone written
-    /// before the versions are removed keeps a crash or MapFull mid-walk
-    /// from leaving the removals without their re-publication guard.
-    fn merge_address_tombstone(&self, akey: &[u8], cut: u64) -> Result<()> {
-        let mut wtxn = self.env.write_txn()?;
-        self.merge_address_tombstone_in(&mut wtxn, akey, cut)?;
-        wtxn.commit()?;
         Ok(())
     }
 
