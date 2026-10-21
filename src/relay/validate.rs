@@ -275,6 +275,16 @@ impl super::Relay {
             }
             return Precheck::Reject("restricted: that is an invalid invite code.".into());
         }
+        // An `h` value longer than the tag index can hold is never stored
+        // in the by-tag index. A later 9008 purge then cannot find it and
+        // falls back to a full by_created scan (AUD-08). Reject it at
+        // intake, whether or not NIP-29 is currently enabled, so an old
+        // row cannot make a future enable rebuild/scan unbounded ids.
+        if let Some(gid) = nip29::group_id(event)
+            && gid.len() > crate::db::store::TAG_INDEX_VALUE_MAX
+        {
+            return Precheck::Reject("invalid: group id is too long to index".into());
+        }
         // NIP-29: group action events MUST carry an `h` tag naming a
         // non-empty group id (an empty id would create a phantom group
         // that consumes the capacity budget).
@@ -2229,6 +2239,26 @@ mod tests {
                 .precheck(&cfg, &access, &empty, now, &[], None, None)
                 .await;
             assert!(matches!(out, super::Precheck::Reject(m) if m.contains("h tag")));
+
+            // An h value too long for the tag index is rejected at intake,
+            // even for an ordinary post: a stored row would fall out of the
+            // by-tag index and force a 9008 purge into a full scan.
+            let long_gid = "x".repeat(crate::db::store::TAG_INDEX_VALUE_MAX + 1);
+            for long in [
+                h(
+                    crate::nips::nip29::JOIN,
+                    vec![vec!["h".into(), long_gid.clone()]],
+                ),
+                h(1, vec![vec!["h".into(), long_gid.clone()]]),
+            ] {
+                let out = relay
+                    .precheck(&cfg, &access, &long, now, &[], None, None)
+                    .await;
+                assert!(
+                    matches!(out, super::Precheck::Reject(m) if m.contains("too long")),
+                    "an overlong h value must be rejected at intake"
+                );
+            }
 
             // A client-signed NIP-43 invite response is rejected: kind 28935
             // "MUST be signed by the pubkey specified in the `self` field"

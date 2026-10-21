@@ -343,6 +343,16 @@ pub async fn run(
             stats.bad_delegation += 1;
             continue;
         }
+        // The live write path clamps created_at to MAX_CREATED_AT_FUTURE_SECS.
+        // The import must not be the weaker path: a future-dated export row
+        // would otherwise be stored, and the NIP-77 range arithmetic
+        // (`created_at + span`) could overflow and panic the negentropy
+        // worker. Drop such a row as invalid instead of clamping it, so the
+        // migration does not silently change its meaning.
+        if event.created_at > now.saturating_add(crate::config::MAX_CREATED_AT_FUTURE_SECS) {
+            stats.invalid += 1;
+            continue;
+        }
         batch_bytes = batch_bytes.saturating_add(trimmed.len());
         // A honored NIP-62 vanish blocks the author permanently: flush it on
         // its own so the events that follow in the export meet the marker at
@@ -1237,7 +1247,12 @@ async fn apply_group_deletion(
             && let Some(found) = events.first()
             && found.kind == nip29::CREATE_GROUP
             && let Some(target_gid) = nip29::group_id(found)
+            && target_gid == gid
         {
+            // A 9005 names ids, not necessarily same-group ids: the live
+            // moderation path refuses a cross-group target. Recording a
+            // foreign create here would ghost that other group forever
+            // after a replay, even though the delete did not apply to it.
             deleted_creates.insert(target_gid.to_string());
         }
     }
@@ -2357,6 +2372,79 @@ mod tests {
                 "members must not see ghosted history either"
             );
         });
+        db.shutdown();
+    }
+
+    #[test]
+    fn a_cross_group_9005_does_not_ghost_the_other_groups_create() {
+        // AUD-01: a 9005 names ids, but the live moderation path only
+        // deletes targets in the admin's own group. The migration used to
+        // record a foreign create id as "deleted" and then physically
+        // remove it during ghost reconciliation, permanently ghosting the
+        // other group even though the 9005 did not apply to it.
+        let db = test_db("cross-group-9005");
+        let now = unix_now();
+        let admin = 1;
+        let create_a = signed(
+            admin,
+            9007,
+            now - 60,
+            vec![vec!["h".into(), "group-a".into()]],
+            "",
+        );
+        let create_b = signed(
+            admin,
+            9007,
+            now - 50,
+            vec![vec!["h".into(), "group-b".into()]],
+            "",
+        );
+        let foreign_delete = signed(
+            admin,
+            9005,
+            now - 40,
+            vec![
+                vec!["h".into(), "group-a".into()],
+                vec!["e".into(), create_b.id.clone()],
+            ],
+            "",
+        );
+        let stats = run_str(
+            &db,
+            &jsonl(&[create_a, create_b.clone(), foreign_delete]),
+            &options(),
+        );
+        assert_eq!(stats.group_deletions, 1);
+        assert_eq!(
+            visible(&db, serde_json::json!({"ids": [create_b.id]})).len(),
+            1,
+            "the create of another group must survive the 9005"
+        );
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut store = crate::nips::nip29::GroupStore::default();
+            assert!(store.rebuild(&db, None).await);
+            assert!(
+                !store.ghost_group_ids().contains(&"group-b".to_string()),
+                "the untouched group must not be ghosted by a foreign 9005"
+            );
+        });
+        db.shutdown();
+    }
+
+    #[test]
+    fn a_future_dated_export_row_is_rejected() {
+        // AUD-06/AUD-34: the live path clamps created_at; the import used
+        // to accept u64::MAX and feed it to the NIP-77 range arithmetic.
+        let db = test_db("future-created-at");
+        let future = signed(1, 1, u64::MAX, vec![], "future");
+        let stats = run_str(&db, &jsonl(std::slice::from_ref(&future)), &options());
+        assert_eq!(stats.invalid, 1);
+        assert_eq!(stats.stored, 0);
+        assert!(
+            visible(&db, serde_json::json!({"ids": [future.id]})).is_empty(),
+            "a row outside the live future window must not be stored"
+        );
         db.shutdown();
     }
 

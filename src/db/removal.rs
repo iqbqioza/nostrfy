@@ -1078,6 +1078,7 @@ impl Store {
                     break;
                 }
                 last_key = Some(entries.last().unwrap().0.clone());
+                let removed_before = removed;
                 for (_, id) in entries {
                     let Some(raw) = self.events.get(&wtxn, &id)? else {
                         continue;
@@ -1155,6 +1156,17 @@ impl Store {
                     }
                     self.remove_event(&mut wtxn, &id)?;
                     removed += 1;
+                }
+                if removed == removed_before {
+                    // A full by_created scan (the overlong-gid fallback) can
+                    // walk thousands of chunks that match nothing. The cut
+                    // and create id only move with a matched event, so a
+                    // no-match chunk has nothing to persist: committing it
+                    // would fsync once per chunk and amplify one request.
+                    // `last_key` still advances in memory, so the walk makes
+                    // progress.
+                    drop(wtxn);
+                    continue;
                 }
                 // Persist the raised cut (and any create id) with the chunk
                 // that produced it: a crash before completion must not lose
