@@ -667,8 +667,14 @@ impl Store {
         // index entries per term, and holding the cache mutex across it
         // serialized every search on the reader threads behind the slowest.
         let mut resolved: Vec<Option<u64>> = Vec::with_capacity(terms.len());
-        {
+        // Capture the generation under the same lock as the lookup. A
+        // rebuild bumps it before clearing, so a miss computed from the
+        // partial index cannot be republished into the post-rebuild cache.
+        let generation = {
             let cache = self.df_cache.lock().unwrap_or_else(|p| p.into_inner());
+            let generation = self
+                .df_cache_generation
+                .load(std::sync::atomic::Ordering::Relaxed);
             for term in terms {
                 if term.len() > WORD_INDEX_MAX {
                     resolved.push(Some(0));
@@ -679,7 +685,8 @@ impl Store {
                     _ => resolved.push(None),
                 }
             }
-        }
+            generation
+        };
         // Count each missing term once (duplicates share the result).
         let mut computed: std::collections::HashMap<&str, u64> = std::collections::HashMap::new();
         for (term, slot) in terms.iter().zip(resolved.iter_mut()) {
@@ -722,14 +729,23 @@ impl Store {
         // map is cleared only if it is still full afterwards.
         {
             let mut cache = self.df_cache.lock().unwrap_or_else(|p| p.into_inner());
-            for (term, df) in computed {
-                if cache.len() >= DF_CACHE_MAX {
-                    cache.retain(|_, (_, expires)| *expires > now);
+            // A rebuild completed while the misses were counted: the values
+            // came from the old/partial index and must not enter the new
+            // cache. (The current request still uses them once.)
+            if self
+                .df_cache_generation
+                .load(std::sync::atomic::Ordering::Relaxed)
+                == generation
+            {
+                for (term, df) in computed {
                     if cache.len() >= DF_CACHE_MAX {
-                        cache.clear();
+                        cache.retain(|_, (_, expires)| *expires > now);
+                        if cache.len() >= DF_CACHE_MAX {
+                            cache.clear();
+                        }
                     }
+                    cache.insert(term.to_string(), (df, now.saturating_add(DF_CACHE_SECS)));
                 }
-                cache.insert(term.to_string(), (df, now.saturating_add(DF_CACHE_SECS)));
             }
         }
         resolved.into_iter().map(|df| df.unwrap_or(0)).collect()

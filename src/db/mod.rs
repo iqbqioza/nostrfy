@@ -899,11 +899,18 @@ pub struct DbClient {
 /// caps keep the exact accounting.
 fn msg_bytes(msg: &Msg) -> usize {
     match msg {
-        Msg::Put { event, .. } => event_heap_bytes(event),
-        Msg::PutBatch { events, .. } => events
-            .iter()
-            .map(|(event, _)| event_heap_bytes(event))
-            .sum(),
+        Msg::Put {
+            event, first_seen, ..
+        } => event_heap_bytes(event) + first_seen.map_or(0, |_| 40),
+        Msg::PutBatch {
+            events, first_seen, ..
+        } => {
+            events
+                .iter()
+                .map(|(event, _)| event_heap_bytes(event))
+                .sum::<usize>()
+                + first_seen.iter().flatten().count() * 40
+        }
         Msg::Query { filters, .. } | Msg::Count { filters, .. } => {
             filters.iter().map(filter_heap_bytes).sum()
         }
@@ -919,6 +926,13 @@ fn msg_bytes(msg: &Msg) -> usize {
             kinds,
             ..
         } => relay_pubkey.len() + kinds.len() * 8,
+        Msg::TouchFirstSeen { entries, .. } => entries.len() * 40,
+        Msg::FirstSeenStatus { pubkeys, .. } => pubkeys.len() * 32,
+        Msg::VanishPubkeysPage { after, .. } | Msg::VanishPubkeysRawPage { after, .. } => {
+            after.as_ref().map_or(0, Vec::len)
+        }
+        Msg::PrefixExists { prefix, .. } => prefix.len(),
+        Msg::PrefixesExist { prefixes, .. } => prefixes.iter().map(Vec::len).sum(),
         Msg::RemoveEvents { ids, .. } => ids.len() * crate::db::store::ID_LEN,
         Msg::Delete {
             targets,
@@ -939,6 +953,26 @@ fn msg_bytes(msg: &Msg) -> usize {
             .saturating_add(request_pubkey.as_deref().map_or(0, str::len))
             .saturating_add(group.as_deref().map_or(0, str::len)),
         Msg::RecordAbsentDeletionTargets { targets, .. } => targets.iter().map(String::len).sum(),
+        Msg::RecordPendingDeletion { request, .. } => pending_deletion_bytes(request),
+        Msg::GroupPurge { group, .. } => group.len(),
+        Msg::VanishStatus { pubkey, .. } => pubkey.len(),
+        Msg::BlossomAddOwner {
+            sha256,
+            mime,
+            pubkey,
+            ..
+        } => sha256.len() + mime.len() + pubkey.len(),
+        Msg::BlossomLoad { sha256, .. } => sha256.len(),
+        Msg::BlossomRemoveOwner { sha256, pubkey, .. } => sha256.len() + pubkey.len(),
+        #[cfg(test)]
+        Msg::BlossomList { pubkey, .. } => pubkey.len(),
+        Msg::BlossomListPage {
+            pubkey, after_sha, ..
+        } => pubkey.len() + after_sha.as_deref().map_or(0, str::len),
+        Msg::BlossomAddMappings { entries, .. } => entries
+            .iter()
+            .map(|(sha256, mime, _, _, pubkey)| sha256.len() + mime.len() + pubkey.len())
+            .sum(),
         // NIP-86 access/allowlist mutations carry pubkey lists, reasons and
         // the whole access blob: counting them as zero let a queue of large
         // access updates bypass `max_db_queue_bytes` entirely.
@@ -967,6 +1001,27 @@ fn msg_bytes(msg: &Msg) -> usize {
         Msg::Vanish { pubkey, .. } | Msg::GiftWrapPurge { pubkey, .. } => pubkey.len(),
         _ => 0,
     }
+}
+
+/// Heap estimate of a queued deletion resume record. The record itself is
+/// small, but a 512-address request (the intake cap) or a large `e` list is
+/// not: counting it as zero let a queue of pending deletions bypass
+/// `max_db_queue_bytes`.
+fn pending_deletion_bytes(request: &crate::db::store::PendingDeletion) -> usize {
+    request
+        .targets
+        .iter()
+        .map(String::len)
+        .sum::<usize>()
+        .saturating_add(
+            request
+                .addresses
+                .iter()
+                .map(|address| address.pubkey.len() + address.d.len())
+                .sum(),
+        )
+        .saturating_add(request.request_pubkey.as_deref().map_or(0, str::len))
+        .saturating_add(request.group.as_deref().map_or(0, str::len))
 }
 
 /// The heap bytes an event owns (content, tag strings and the hex fields).

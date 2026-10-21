@@ -840,6 +840,11 @@ pub(crate) fn spawn(
         match store.word_index_needs_rebuild() {
             Ok(true) => match store.rebuild_word_index() {
                 Ok(n) => log::info!("word index rebuilt ({n} events)"),
+                Err(_) if store.cancelled() => {
+                    log::debug!(
+                        "word index rebuild interrupted by shutdown; the next start resumes"
+                    );
+                }
                 Err(e) => db_error(&thread_errors, &e),
             },
             Ok(false) => {}

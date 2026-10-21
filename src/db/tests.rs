@@ -1467,6 +1467,54 @@ fn access_and_allowlist_messages_count_towards_the_queue_byte_cap() {
 }
 
 #[test]
+fn payload_bearing_metadata_messages_count_towards_the_queue_byte_cap() {
+    // AUD-21: these messages carry attacker-controlled lists but used to
+    // count as zero, so a queue of them bypassed `max_db_queue_bytes`.
+    let target = "a".repeat(64);
+    let pending = crate::db::store::PendingDeletion {
+        targets: vec![target.clone()],
+        addresses: Vec::new(),
+        request_pubkey: Some("b".repeat(64)),
+        request_created: 1,
+        group: None,
+        purge_wraps: true,
+    };
+    let (reply, _rx) = tokio::sync::oneshot::channel();
+    assert!(
+        super::msg_bytes(&super::Msg::RecordPendingDeletion {
+            request: pending,
+            reply,
+        }) >= target.len() + 64
+    );
+
+    let (reply, _rx) = tokio::sync::oneshot::channel();
+    assert_eq!(
+        super::msg_bytes(&super::Msg::PrefixesExist {
+            prefixes: vec![vec![1; 10], vec![2; 20]],
+            reply,
+        }),
+        30
+    );
+
+    let (reply, _rx) = tokio::sync::oneshot::channel();
+    assert_eq!(
+        super::msg_bytes(&super::Msg::TouchFirstSeen {
+            entries: vec![([1; 32], 1), ([2; 32], 2)],
+            reply,
+        }),
+        80
+    );
+
+    let (reply, _rx) = tokio::sync::oneshot::channel();
+    assert!(
+        super::msg_bytes(&super::Msg::BlossomAddMappings {
+            entries: vec![("c".repeat(64), "image/png".into(), 10, 1, "d".repeat(64))],
+            reply,
+        }) >= 128
+    );
+}
+
+#[test]
 fn is_replaceable() {
     assert!(super::store::is_replaceable(&event(10000, "", 1, vec![])));
     assert!(super::store::is_replaceable(&event(30023, "", 1, vec![])));
@@ -4598,6 +4646,138 @@ fn word_index_rekey_crash_invalidates_the_completion_marker() {
             "the rebuilt index must contain {word}"
         );
     }
+}
+
+#[test]
+fn word_index_rebuild_resumes_after_the_durable_cursor() {
+    // AUD-07: a shutdown between chunks leaves the phase and cursor in
+    // `index_meta`; the next start must resume rather than re-index the
+    // whole prefix. A phase-Index cursor skipped one of two events.
+    let cfg = config();
+    let expiry = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let now = unix_now();
+    let a = event(1, "alpha", now, vec![]);
+    let b = event(1, "beta", now + 1, vec![]);
+    let store = crate::db::store::Store::open(&cfg, Arc::clone(&expiry), 128).unwrap();
+    {
+        let mut wtxn = store.env.write_txn().unwrap();
+        for ev in [&a, &b] {
+            let id = ev.id_bytes().unwrap();
+            store
+                .events
+                .put(&mut wtxn, &id, &serde_json::to_vec(ev).unwrap())
+                .unwrap();
+        }
+        wtxn.commit().unwrap();
+    }
+    let mut ids = [a.id_bytes().unwrap(), b.id_bytes().unwrap()];
+    ids.sort();
+    let first = ids[0];
+    {
+        let mut wtxn = store.env.write_txn().unwrap();
+        store.index_meta.delete(&mut wtxn, b"word_index").unwrap();
+        let mut state = vec![1u8];
+        state.extend_from_slice(&(128u64).to_be_bytes());
+        state.extend_from_slice(&first);
+        store
+            .index_meta
+            .put(&mut wtxn, b"word_rebuild", &state)
+            .unwrap();
+        wtxn.commit().unwrap();
+    }
+    assert_eq!(
+        store.rebuild_word_index().unwrap(),
+        1,
+        "only the event after the cursor must be re-indexed"
+    );
+    assert!(!store.word_index_needs_rebuild().unwrap());
+    let rtxn = store.env.read_txn().unwrap();
+    assert!(
+        store
+            .index_meta
+            .get(&rtxn, b"word_rebuild")
+            .unwrap()
+            .is_none(),
+        "completion removes the resume record"
+    );
+}
+
+#[test]
+fn word_index_rebuild_stops_before_the_first_chunk_when_cancelled() {
+    // AUD-07: shutdown sets the store's cancel flag; the writer's startup
+    // rebuild must return promptly instead of holding the join for hours.
+    let cfg = config();
+    let expiry = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let store = crate::db::store::Store::open(&cfg, Arc::clone(&expiry), 128).unwrap();
+    let now = unix_now();
+    let ev = event(1, "cancel needle", now, vec![]);
+    {
+        let mut wtxn = store.env.write_txn().unwrap();
+        let id = ev.id_bytes().unwrap();
+        store
+            .events
+            .put(&mut wtxn, &id, &serde_json::to_vec(&ev).unwrap())
+            .unwrap();
+        wtxn.commit().unwrap();
+    }
+    store
+        .cancel
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(store.rebuild_word_index().is_err());
+    assert!(
+        !store
+            .word_index_ready
+            .load(std::sync::atomic::Ordering::Relaxed)
+    );
+    store
+        .cancel
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(store.rebuild_word_index().unwrap(), 1);
+    assert!(
+        store
+            .word_index_ready
+            .load(std::sync::atomic::Ordering::Relaxed)
+    );
+}
+
+#[test]
+fn word_index_completion_invalidates_the_partial_df_cache() {
+    // AUD-22: a search that sampled the partial index must not survive the
+    // completion. The generation bump is what makes a concurrent publisher
+    // skip; the clear removes entries published before the bump.
+    let cfg = config();
+    let expiry = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let now = unix_now();
+    let store = crate::db::store::Store::open(&cfg, Arc::clone(&expiry), 128).unwrap();
+    let ev = event(1, "df needle", now, vec![]);
+    {
+        let mut wtxn = store.env.write_txn().unwrap();
+        let id = ev.id_bytes().unwrap();
+        store
+            .events
+            .put(&mut wtxn, &id, &serde_json::to_vec(&ev).unwrap())
+            .unwrap();
+        wtxn.commit().unwrap();
+    }
+    store
+        .df_cache
+        .lock()
+        .unwrap()
+        .insert("partial".into(), (1, now + 300));
+    let generation = store
+        .df_cache_generation
+        .load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(store.rebuild_word_index().unwrap(), 1);
+    assert!(
+        store.df_cache.lock().unwrap().is_empty(),
+        "completion must drop partial frequencies"
+    );
+    assert!(
+        store
+            .df_cache_generation
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > generation
+    );
 }
 
 #[test]

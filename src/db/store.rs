@@ -746,6 +746,10 @@ pub(crate) struct Store {
     /// a popular query repeats over many requests; the scores tolerate a
     /// few minutes of staleness.
     pub(crate) df_cache: Arc<std::sync::Mutex<std::collections::HashMap<String, (u64, u64)>>>,
+    /// Generation paired with [`Self::df_cache`]. A rebuild bumps it before
+    /// clearing the cache; a concurrent search that computed frequencies
+    /// from the partial index must not publish them after that clear.
+    pub(crate) df_cache_generation: Arc<std::sync::atomic::AtomicU64>,
     /// Test-only one-shot fault injection: the next commit on a write path
     /// that honors the hook (the put batch and the single-shot
     /// snapshot/access/Blossom saves, see [`Self::commit`]) is treated as a
@@ -1020,6 +1024,7 @@ impl Store {
             word_index_ready: Arc::new(std::sync::atomic::AtomicBool::new(word_index_ready)),
             map_max_size,
             df_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            df_cache_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(test)]
             fail_next_commit: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(test)]
@@ -1168,6 +1173,7 @@ impl Store {
             word_index_ready: Arc::clone(&self.word_index_ready),
             map_max_size: self.map_max_size,
             df_cache: Arc::clone(&self.df_cache),
+            df_cache_generation: Arc::clone(&self.df_cache_generation),
             // The fault hooks are shared: a test keeps a clone (arming it
             // after startup, when the writer already owns the store) and
             // exactly one handler consumes it. The readers never commit or
@@ -3191,8 +3197,15 @@ impl Store {
     /// by the new put/remove rules, so a limit change re-keys the index.
     /// `word_index_ready` stays false until the marker commit, so scans fall
     /// back to the time-range walk instead of reading a partial index.
+    ///
+    /// A `word_rebuild` record carries the phase (clear or index) and the
+    /// last committed cursor, so a shutdown between chunks returns promptly
+    /// and the next start resumes instead of clearing/re-indexing from the
+    /// beginning. The marker stays absent for the whole rebuild: a resumed
+    /// partial index is still not readable.
     pub(crate) fn rebuild_word_index(&self) -> Result<usize> {
         const CHUNK: usize = 4096;
+        const STATE_KEY: &[u8] = b"word_rebuild";
         let Some(by_word) = self.by_word else {
             return Ok(0);
         };
@@ -3200,7 +3213,7 @@ impl Store {
         self.word_index_ready
             .store(false, std::sync::atomic::Ordering::Relaxed);
         let limit = self.max_indexed_words.max(1);
-        let (persisted, had_marker) = {
+        let (persisted, had_marker, resume) = {
             let rtxn = self.env.read_txn()?;
             let persisted = match self.index_meta.get(&rtxn, b"word_limit")? {
                 Some(raw) if raw.len() >= 8 => {
@@ -3209,27 +3222,74 @@ impl Store {
                 _ => 0,
             };
             let had_marker = self.index_meta.get(&rtxn, b"word_index")?.is_some();
-            (persisted, had_marker)
+            let resume = match self.index_meta.get(&rtxn, STATE_KEY)? {
+                Some(raw) if raw.len() >= 9 => Some((
+                    raw[0],
+                    u64::from_be_bytes(raw[1..9].try_into().unwrap()) as usize,
+                    raw[9..].to_vec(),
+                )),
+                _ => None,
+            };
+            (persisted, had_marker, resume)
         };
-        // Invalidate the completion marker *before* clearing or re-indexing.
-        // A crash after this commit leaves no marker, so the next startup
+        if self.cancelled() {
+            anyhow::bail!("word index rebuild cancelled during shutdown");
+        }
+        // A phase-Index cursor is only valid for the limit it was built
+        // with. If the operator changed the limit while the rebuild was
+        // interrupted, the already indexed prefix uses the old key set and
+        // must be cleared.
+        let resume = match resume {
+            // A phase-Index prefix is only valid for the limit it was
+            // built with. `word_limit` is written only at completion, so
+            // the state carries the rebuild's own limit (a backfill's
+            // persisted limit may still be 0).
+            Some((1, state_limit, _)) if state_limit != limit => Some((0u8, Vec::new())),
+            Some((phase @ 0..=1, _, cursor)) => Some((phase, cursor)),
+            // Unknown phase: treat as a fresh rebuild (the marker is
+            // absent, so clearing from the start is safe).
+            Some(_) => None,
+            None => None,
+        };
+        let need_clear = match resume.as_ref() {
+            Some((1, _)) => false,
+            Some(_) => true,
+            None => !(had_marker && persisted == limit),
+        };
+        let phase = if need_clear { 0u8 } else { 1u8 };
+        let mut last: Option<Vec<u8>> = match resume.as_ref() {
+            Some((p, cursor)) if *p == phase && !cursor.is_empty() => Some(cursor.clone()),
+            _ => None,
+        };
+        // Invalidate the completion marker and record the phase atomically.
+        // A crash after this commit leaves no marker, so the next start
         // rebuilds even when the operator returns to the previous limit (a
         // surviving marker plus an unchanged persisted limit would otherwise
-        // accept a partially cleared index forever). The marker write at the
-        // end is the only point at which the index becomes ready.
+        // accept a partially cleared index forever). This uses the plain
+        // commit, not `commit_word_index`: the test-only fault targets the
+        // first real clear/index chunk, matching the previous behavior.
         {
             let mut wtxn = self.env.write_txn()?;
             self.index_meta.delete(&mut wtxn, b"word_index")?;
+            let mut state = Vec::with_capacity(9 + last.as_ref().map_or(0, Vec::len));
+            state.push(phase);
+            state.extend_from_slice(&(limit as u64).to_be_bytes());
+            if let Some(cursor) = &last {
+                state.extend_from_slice(cursor);
+            }
+            self.index_meta.put(&mut wtxn, STATE_KEY, &state)?;
             wtxn.commit()?;
         }
-        if !had_marker || persisted != limit {
+        if need_clear {
             // Clear in bounded chunks: a huge index must not pin one
             // unbounded write transaction. A missing marker means this is a
             // backfill (index was disabled or a prior rebuild was
             // interrupted); clearing also removes word keys for events that
             // were deleted while the index was disabled (L-8).
-            let mut last: Option<Vec<u8>> = None;
             loop {
+                if self.cancelled() {
+                    anyhow::bail!("word index rebuild cancelled during shutdown");
+                }
                 let chunk: Vec<Vec<u8>> = {
                     let rtxn = self.env.read_txn()?;
                     let range = (
@@ -3255,17 +3315,35 @@ impl Store {
                 for key in &chunk {
                     by_word.delete(&mut wtxn, key)?;
                 }
-                self.commit_word_index(wtxn)?;
                 last = chunk.last().cloned();
+                let mut state = Vec::with_capacity(9 + last.as_ref().map_or(0, Vec::len));
+                state.push(0);
+                state.extend_from_slice(&(limit as u64).to_be_bytes());
+                if let Some(cursor) = &last {
+                    state.extend_from_slice(cursor);
+                }
+                self.index_meta.put(&mut wtxn, STATE_KEY, &state)?;
+                self.commit_word_index(wtxn)?;
                 if chunk.len() < CHUNK {
                     break;
                 }
             }
+            // The clear completed; switch to indexing. A crash after this
+            // commit resumes at the start of the index phase (no clear).
+            let mut wtxn = self.env.write_txn()?;
+            let mut state = Vec::with_capacity(9);
+            state.push(1);
+            state.extend_from_slice(&(limit as u64).to_be_bytes());
+            self.index_meta.put(&mut wtxn, STATE_KEY, &state)?;
+            self.commit_word_index(wtxn)?;
+            last = None;
         }
         // Re-index every stored event in bounded chunks.
         let mut indexed = 0usize;
-        let mut last: Option<Vec<u8>> = None;
         loop {
+            if self.cancelled() {
+                anyhow::bail!("word index rebuild cancelled during shutdown");
+            }
             let chunk: Vec<(Vec<u8>, Option<Event>)> = {
                 let rtxn = self.env.read_txn()?;
                 let range = (
@@ -3296,18 +3374,29 @@ impl Store {
                 index_event_words(&by_word, &mut wtxn, event, id, limit)?;
                 indexed += 1;
             }
+            let mut state = Vec::with_capacity(9 + last.as_ref().map_or(0, Vec::len));
+            state.push(1);
+            state.extend_from_slice(&(limit as u64).to_be_bytes());
+            if let Some(cursor) = &last {
+                state.extend_from_slice(cursor);
+            }
+            self.index_meta.put(&mut wtxn, STATE_KEY, &state)?;
             self.commit_word_index(wtxn)?;
             if chunk.len() < CHUNK {
                 break;
             }
         }
-        // The limit and the completion marker are written last: a crash
-        // mid-rebuild leaves the marker absent, so the next startup reruns
-        // the idempotent backfill.
+        if self.cancelled() {
+            anyhow::bail!("word index rebuild cancelled during shutdown");
+        }
+        // The limit and the completion marker are written last, and the
+        // resume record is dropped in the same transaction: a crash before
+        // this leaves both the marker absent and the cursor in place.
         let mut wtxn = self.env.write_txn()?;
         self.index_meta
             .put(&mut wtxn, b"word_limit", &(limit as u64).to_be_bytes())?;
         self.index_meta.put(&mut wtxn, b"word_index", b"1")?;
+        self.index_meta.delete(&mut wtxn, STATE_KEY)?;
         self.commit_word_index(wtxn)?;
         self.indexed_words
             .store(limit, std::sync::atomic::Ordering::Relaxed);
@@ -3316,6 +3405,11 @@ impl Store {
         // Searches during the backfill may have cached document
         // frequencies from the partial index; they must not survive the
         // completion (a 300 s under-count would misclassify a common term).
+        // Bump before clearing: a concurrent miss captured the old
+        // generation and skips publishing after this point; one that
+        // published before the bump is removed by the clear.
+        self.df_cache_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.df_cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
