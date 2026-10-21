@@ -708,6 +708,17 @@ impl GroupsRebuild {
                 PersistOutcome::Failed
             };
         }
+        // An unrestored store is not authoritative: saving its empty state
+        // (for example from the pending-purge resume) would make the next
+        // start treat every lost group id as public. Drop the snapshot and
+        // let the next enabled start rebuild.
+        if groups.read().await.is_unrestored() {
+            return if db.clear_groups_snapshot().await {
+                PersistOutcome::Committed
+            } else {
+                PersistOutcome::Failed
+            };
+        }
         // A mutation committed to the database but not yet applied in
         // memory: the capture would hold pre-mutation state while claiming
         // the post-commit generation. Defer (do not clear: the mutation
@@ -1410,6 +1421,20 @@ async fn groups_rebuild_worker(
             if !state.dirty.swap(false, Ordering::SeqCst) {
                 break;
             }
+            // NIP-29 is restart-toggled. A deletion accepted while it is
+            // disabled must not drive a rebuild: the live store may be the
+            // intentionally unrestored empty store, and swapping in a
+            // partial rebuild would clear that fail-closed marker. Keep the
+            // snapshot dropped; the next enabled start rebuilds.
+            if !config.read().await.nip_enabled(29) {
+                log::debug!(
+                    "group state rebuild deferred while NIP-29 is disabled; keeping the \
+                     snapshot dropped (fail-closed)"
+                );
+                state.pending.store(true, Ordering::SeqCst);
+                state.running.store(false, Ordering::SeqCst);
+                return;
+            }
             // The first scan runs immediately (`last == 0`); later requests
             // wait out the remainder of the interval. Requests that arrive
             // while waiting coalesce into this rebuild (the flag is drained
@@ -1454,12 +1479,13 @@ async fn groups_rebuild_worker(
             // posts must not become world-readable on a keyless relay), and
             // the delete tombstones must survive so a confirmed purge stays
             // re-creatable.
-            let (previous, previous_deleted, previous_ghost) = {
+            let (previous, previous_deleted, previous_ghost, live_unrestored) = {
                 let store = groups.read().await;
                 (
                     store.hidden_group_ids(),
                     store.deleted_group_ids(),
                     store.ghost_group_ids(),
+                    store.is_unrestored(),
                 )
             };
             let mut fresh = GroupStore::with_cap(cap);
@@ -1468,14 +1494,29 @@ async fn groups_rebuild_worker(
             // store is local and was never swapped in, so the live store
             // stays authoritative and the snapshot stays dropped
             // (fail-closed) until a later startup rebuild completes.
+            let rebuild_future = async {
+                if live_unrestored {
+                    // A vanish/scoped rebuild cannot prove the ids the
+                    // unrestored store lost; only the full-history walk
+                    // (including the h-tag ghost pass) may make the store
+                    // authoritative again. On success `rebuild` clears
+                    // `unrestored`; on failure the live store stays
+                    // fail-closed.
+                    fresh.rebuild(&db, relay_pubkey.as_deref()).await
+                } else {
+                    fresh
+                        .rebuild_after_vanish(
+                            &db,
+                            relay_pubkey.as_deref(),
+                            previous,
+                            previous_deleted,
+                            previous_ghost,
+                        )
+                        .await
+                }
+            };
             let rebuilt = tokio::select! {
-                rebuilt = fresh.rebuild_after_vanish(
-                    &db,
-                    relay_pubkey.as_deref(),
-                    previous,
-                    previous_deleted,
-                    previous_ghost,
-                ) => rebuilt,
+                rebuilt = rebuild_future => rebuilt,
                 _ = drain.changed() => {
                     let mut buffer = state.buffer.lock().await;
                     buffer.scanning = false;
@@ -3448,7 +3489,11 @@ impl Relay {
                 // could have revoked in its own group anyway.
                 let unknown = !touch.groups && !touch.roles;
                 if touch.groups || unknown {
-                    if touch.groups_all {
+                    if touch.groups_all || unknown {
+                        // An unclassified removal (including the empty id
+                        // list produced when both NIPs are disabled) cannot
+                        // be scoped: fail closed for the whole store rather
+                        // than marking no group at all.
                         self.mark_group_state_stale().await;
                     } else {
                         self.mark_group_state_stale_for(&touch.group_ids).await;
@@ -10194,6 +10239,83 @@ mod tests {
     }
 
     /// Waits until no role rebuild worker is running (successful or failed).
+    #[tokio::test]
+    async fn an_unrestored_group_store_is_never_persisted() {
+        // AUD-04: the pending-purge resume must not save the empty
+        // unrestored store with a current stamp (which the next start would
+        // accept, exposing every lost private group). Persisting an
+        // unrestored store clears the snapshot instead.
+        let relay = build_relay_with_key(false, "").await;
+        relay.groups.write().await.mark_unrestored();
+        assert!(
+            relay.persist_groups().await,
+            "clearing the snapshot must succeed"
+        );
+        assert!(
+            matches!(
+                relay.db.load_groups().await,
+                crate::db::LoadGroupsOutcome::Missing
+            ),
+            "an unrestored store must not leave a restorable snapshot"
+        );
+        assert!(
+            relay.groups.read().await.is_unrestored(),
+            "the fail-closed marker must survive the persist attempt"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn an_unrestored_store_uses_the_full_history_rebuild() {
+        // AUD-02: a scoped/vanish rebuild with an empty seed cannot prove
+        // the ids an unrestored store lost. The worker must use the full
+        // rebuild (including the h-tag ghost pass), which leaves the store
+        // authoritative only after the complete scan.
+        let relay = build_relay_with_key(false, "").await;
+        let now = crate::util::unix_now();
+        let mut post = crate::event::Event {
+            id: String::new(),
+            pubkey: "aa".repeat(32),
+            created_at: now,
+            kind: 1,
+            tags: vec![vec!["h".into(), "lost-private".into()]],
+            content: "private history".into(),
+            sig: "00".repeat(64),
+        };
+        post.id = crate::nips::nip01::compute_id(&post);
+        assert!(matches!(
+            relay.db.put(post, now).await,
+            crate::db::PutOutcome::Stored
+        ));
+        relay.groups.write().await.mark_unrestored();
+        relay.mark_group_state_stale().await;
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let done = !relay.groups_rebuild.running.load(Ordering::SeqCst)
+                && relay.groups_rebuild.rebuilds.load(Ordering::Relaxed) > 0;
+            if done {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the group rebuild worker did not finish"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let groups = relay.groups.read().await;
+        assert!(
+            !groups.is_unrestored(),
+            "a successful full rebuild makes the store authoritative"
+        );
+        assert!(
+            groups.is_ghosted("lost-private"),
+            "the full h-tag pass must ghost the group whose create is missing"
+        );
+        drop(groups);
+        relay.db.shutdown();
+    }
+
     async fn wait_for_roles_rebuild_worker(relay: &Relay) -> bool {
         for _ in 0..600 {
             if !relay

@@ -583,6 +583,13 @@ impl GroupStore {
         self.unrestored = true;
     }
 
+    /// Whether the store could not be restored (see [`Self::unrestored`]).
+    /// A rebuild must preserve this fail-closed state until a *full* scan
+    /// succeeds; a scoped/vanish rebuild cannot prove the lost ids.
+    pub(crate) fn is_unrestored(&self) -> bool {
+        self.unrestored
+    }
+
     /// Fails closed for the named groups only (see [`Self::stale_groups`]).
     pub fn mark_groups_stale(&mut self, gids: impl IntoIterator<Item = String>) {
         self.stale_groups.extend(gids);
@@ -2134,13 +2141,25 @@ impl GroupStore {
             until = Some(min_created - 1);
         }
         for gid in seen_gids {
-            if self.groups.contains_key(&gid) {
+            if self.groups.contains_key(&gid) || self.ghost.contains(&gid) {
                 continue;
             }
             // A deleted id whose events are gone is safe to re-create; one
             // with h-tagged survivors is not (its purge never completed).
             if self.deleted.contains(&gid) && !seen_h_gids.contains(&gid) {
                 continue;
+            }
+            // The ghost set is a fail-closed memory structure. Do not let a
+            // history full of attacker-chosen h tags grow it past the group
+            // budget: an incomplete rebuild must refuse to become
+            // authoritative rather than silently leave surplus ids public
+            // or consume unbounded memory.
+            if self.max_groups > 0 && self.groups.len() + self.ghost.len() >= self.max_groups {
+                log::error!(
+                    "NIP-29 rebuild found more unknown h-tagged group ids than                      relay.max_groups ({}) allows; refusing an incomplete ghost set",
+                    self.max_groups
+                );
+                return false;
             }
             self.ghost.insert(gid);
         }
