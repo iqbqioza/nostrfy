@@ -25,6 +25,82 @@ const OTHER: &str = "ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
 const ADMIN2: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
 
 #[test]
+fn replay_does_not_adopt_a_foreign_child() {
+    // A 9002 stored while NIP-29 was disabled was never live-validated.
+    // The rebuild replay must not let ADMIN (admin of `a` only) graft
+    // OTHER's group `b` as a child.
+    let mut store = GroupStore::default();
+    let now = 1_600_000_000;
+    store.apply(
+        &event(CREATE_GROUP, ADMIN, Some("a"), vec![]),
+        "relay",
+        now,
+        true,
+        false,
+    );
+    store.apply(
+        &event(CREATE_GROUP, OTHER, Some("b"), vec![]),
+        "relay",
+        now,
+        true,
+        false,
+    );
+    let edit = event(
+        9002,
+        ADMIN,
+        Some("a"),
+        vec![vec!["child".into(), "b".into()]],
+    );
+    let out = store.apply(&edit, "relay", now, true, true);
+    assert!(
+        out.is_empty(),
+        "replay must refuse a foreign child: {out:?}"
+    );
+    assert!(
+        store.group("b").unwrap().parent.is_none(),
+        "the victim's parent must stay unchanged"
+    );
+    assert!(!store.group("a").unwrap().children.contains(&"b".into()));
+}
+
+#[test]
+fn replay_does_not_adopt_a_foreign_parent() {
+    // The parent-side variant: ADMIN cannot reparent `a` under OTHER's `b`
+    // just because the 9002 was stored while NIP-29 was disabled.
+    let mut store = GroupStore::default();
+    let now = 1_600_000_000;
+    store.apply(
+        &event(CREATE_GROUP, ADMIN, Some("a"), vec![]),
+        "relay",
+        now,
+        true,
+        false,
+    );
+    store.apply(
+        &event(CREATE_GROUP, OTHER, Some("b"), vec![]),
+        "relay",
+        now,
+        true,
+        false,
+    );
+    let edit = event(
+        9002,
+        ADMIN,
+        Some("a"),
+        vec![vec!["parent".into(), "b".into()]],
+    );
+    let out = store.apply(&edit, "relay", now, true, true);
+    assert!(
+        out.is_empty(),
+        "replay must refuse a foreign parent: {out:?}"
+    );
+    assert!(
+        store.group("a").unwrap().parent.is_none(),
+        "the attacker's group must stay a root"
+    );
+}
+
+#[test]
 fn apply_covers_parent_child_roles_pins_and_delete() {
     let mut store = GroupStore::default();
     let now = 1_600_000_000;

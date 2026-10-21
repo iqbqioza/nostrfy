@@ -4583,6 +4583,31 @@ impl Relay {
     /// applied and persisted (see [`Self::apply_group_event`]). An
     /// in-flight rebuild scan is discarded: a scan that predates the delete
     /// could reconstruct the group and lose the fail-closed marker.
+    /// Downgrades a repairable ghost under the same coordination as a group
+    /// apply: a rebuild scan in flight is discarded (its `previous_ghost`
+    /// snapshot predates the repair), and the live store is re-checked under
+    /// `groups.write` so a concurrent create/repair cannot insert a delete
+    /// tombstone for a group that already exists. Returns whether the ghost
+    /// was actually downgraded.
+    pub(crate) async fn repair_group_ghost_for_create(&self, gid: &str) -> bool {
+        let mut buffer = self.groups_rebuild.buffer.lock().await;
+        if buffer.scanning {
+            buffer.retry = true;
+        }
+        let mut groups = self.groups.write().await;
+        if groups.group(gid).is_some() {
+            // A concurrent create already made the group live: the ghost is
+            // stale. Clear it without inserting a delete tombstone.
+            groups.clear_ghost(gid);
+            return false;
+        }
+        if !groups.is_ghosted(gid) {
+            return false;
+        }
+        groups.unghost(gid);
+        true
+    }
+
     async fn ghost_deleted_group(&self, gid: &str) {
         let mut buffer = self.groups_rebuild.buffer.lock().await;
         if buffer.scanning {
@@ -9780,6 +9805,70 @@ mod tests {
             requests <= 2,
             "8 concurrent webhook refreshes must coalesce into at most one extra fetch (got {requests})"
         );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn ghost_repair_does_not_tombstone_a_live_group() {
+        // A concurrent create can make the id live between the repair's DB
+        // checks and its unghost. The repair must re-check under groups.write
+        // and clear the stale ghost without inserting a delete tombstone.
+        use crate::db::PutOutcome;
+
+        let relay = build_relay_with_key(false, &"01".repeat(32)).await;
+        let gid = "g1";
+        let now = crate::util::unix_now();
+        let secp = secp256k1::Secp256k1::new();
+        let admin = secp256k1::Keypair::from_seckey_slice(&secp, &[4u8; 32]).unwrap();
+        let create = signed_group_event(
+            &secp,
+            &admin,
+            crate::nips::nip29::CREATE_GROUP,
+            gid,
+            vec![],
+            now,
+        );
+        assert!(matches!(
+            relay.accept_event(create, &[], None).await,
+            PutOutcome::Stored
+        ));
+        // Simulate the race: the id is now both live and marked ghosted.
+        relay.groups.write().await.mark_ghost(gid);
+        assert!(
+            !relay.repair_group_ghost_for_create(gid).await,
+            "a live group must not be unghosted as a repair"
+        );
+        let groups = relay.groups.read().await;
+        assert!(groups.group(gid).is_some(), "the live group stays live");
+        assert!(
+            !groups.is_ghosted(gid),
+            "the stale ghost must be cleared without a tombstone"
+        );
+        assert!(
+            !groups.deleted_group_ids().iter().any(|id| id == gid),
+            "no delete tombstone may be inserted for a live group"
+        );
+        drop(groups);
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn ghost_repair_marks_a_running_rebuild_for_retry() {
+        // The rebuild's previous_ghost snapshot predates the repair; a
+        // scanning worker must discard its scan and rescan after the repair.
+        let relay = build_relay_with_key(false, &"01".repeat(32)).await;
+        let gid = "g2";
+        relay.groups.write().await.mark_ghost(gid);
+        {
+            let mut buffer = relay.groups_rebuild.buffer.lock().await;
+            buffer.scanning = true;
+        }
+        assert!(relay.repair_group_ghost_for_create(gid).await);
+        assert!(
+            relay.groups_rebuild.buffer.lock().await.retry,
+            "a scanning rebuild must be marked for a retry"
+        );
+        assert!(!relay.groups.read().await.is_ghosted(gid));
         relay.db.shutdown();
     }
 

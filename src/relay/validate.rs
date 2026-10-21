@@ -472,10 +472,14 @@ impl super::Relay {
             "kinds": [nip29::GROUP_META],
             "#d": [gid],
         }]));
-        let stored = match self.db.query_req_reported(meta, 4, now).await {
-            Some((stored, _)) => stored,
-            None => return false,
+        let Some((stored, more)) = self.db.query_req_reported(meta, 4, now).await else {
+            return false;
         };
+        if more {
+            // More than four metadata events: the bare-only invariant cannot
+            // be proven from a truncated page. Keep the ghost (fail closed).
+            return false;
+        }
         if stored.is_empty()
             || !stored.iter().all(|event| {
                 event.tags.len() == 1
@@ -486,7 +490,9 @@ impl super::Relay {
         {
             return false;
         }
-        self.groups.write().await.unghost(gid);
+        if !self.repair_group_ghost_for_create(gid).await {
+            return false;
+        }
         log::warn!(
             "group id {gid:?} was ghosted by bare relay metadata alone (a declared \
              placeholder child); downgraded to the delete tombstone so it can be \

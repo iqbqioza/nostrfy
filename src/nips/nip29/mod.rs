@@ -19,7 +19,7 @@ use events::{
 /// and may send moderation events; the relay's own key is always an admin.
 use std::collections::{HashMap, HashSet};
 
-use anyhow::{anyhow, bail};
+use anyhow::bail;
 use serde_json::json;
 
 use crate::db::DbClient;
@@ -2076,11 +2076,13 @@ impl GroupStore {
                 }
             }
             for event in &page {
-                if let Some(gid) = crate::nips::nip29::group_id(event) {
+                if let Some(gid) = crate::nips::nip29::group_id(event).filter(|gid| !gid.is_empty())
+                {
                     seen_gids.insert(gid.to_string());
                     seen_h_gids.insert(gid.to_string());
                 } else if (GROUP_META..=GROUP_PINS).contains(&event.kind)
                     && let Some(gid) = crate::nips::nip29::group_id_d(event)
+                    && !gid.is_empty()
                 {
                     // Only the relay-generated metadata kinds identify a
                     // group by `d`: every addressable event (long-form
@@ -2137,6 +2139,13 @@ impl GroupStore {
     pub(crate) fn unghost(&mut self, gid: &str) {
         self.ghost.remove(gid);
         self.deleted.insert(gid.to_string());
+    }
+
+    /// Clears a stale ghost marker without asserting a delete tombstone: a
+    /// live group already proves the id need not stay hidden (the concurrent
+    /// create/repair race, see `Relay::repair_group_ghost_for_create`).
+    pub(crate) fn clear_ghost(&mut self, gid: &str) {
+        self.ghost.remove(gid);
     }
 }
 
@@ -2333,19 +2342,37 @@ fn validate_edit_metadata(
         }
     }
     // A parent value must name an existing group, and the author must be its
-    // admin. Live only: a replay cannot re-adjudicate the author's role (it
-    // may have been revoked since acceptance), and the apply side already
-    // drops a link whose parent is gone instead of dangling it.
-    if !replay && let Some(parent) = parent_value {
-        let parent_group = store
+    // admin. Live edits always re-check authority. A replay re-checks only a
+    // *new* link: an already-linked parent was consented to by an earlier
+    // accepted edit, and re-adjudicating it cannot reconstruct the historical
+    // roles. A new link in a stored event (stored while NIP-29 was disabled,
+    // or imported) must not graft a foreign group; a missing parent is
+    // dropped by the apply side on replay instead of dangling.
+    if let Some(parent) = parent_value {
+        let already_linked = store
             .groups
-            .get(&parent)
-            .ok_or_else(|| anyhow!("restricted: parent group does not exist"))?;
-        // The relay's own key is an implicit admin of every group (NIP-29:
-        // the relay master key may manage groups), so a relay-signed 9002
-        // must be able to reparent or adopt without an explicit role.
-        if !relay_signed && !parent_group.is_admin(event.pubkey.as_str()) {
-            bail!("restricted: you are not an admin of the parent group");
+            .get(gid)
+            .and_then(|group| group.parent.as_deref())
+            == Some(parent.as_str());
+        if !replay || !already_linked {
+            match store.groups.get(&parent) {
+                Some(parent_group) => {
+                    // The relay's own key is an implicit admin of every
+                    // group (NIP-29: the relay master key may manage groups),
+                    // so a relay-signed 9002 can reparent or adopt without an
+                    // explicit role.
+                    if !relay_signed && !parent_group.is_admin(event.pubkey.as_str()) {
+                        bail!("restricted: you are not an admin of the parent group");
+                    }
+                }
+                None => {
+                    if !replay {
+                        bail!("restricted: parent group does not exist");
+                    }
+                    // Replay: the apply side drops a link whose parent is
+                    // gone instead of dangling it.
+                }
+            }
         }
     }
     // NIP-29: a metadata edit must carry every existing child as a child
@@ -2365,34 +2392,33 @@ fn validate_edit_metadata(
     // over the child too: otherwise a foreign admin could hijack an
     // orphan group by listing it (each group's own 39001 is authoritative
     // for its scope). Reordering already-linked children stays parent-only.
-    // Unknown ids (no group yet) are still listable as placeholders. Live
-    // only: a replay cannot re-adjudicate consent (child admins may have
-    // changed since acceptance) and imported moderation is the migration's
-    // gate, not the rebuild's.
-    if !replay {
-        for child in tag_values(event, "child") {
-            // "Already linked" means the *child's own* stored parent names
-            // this group: only then did the child's side consent to the
-            // link, and a reorder needs no further authority. An id that is
-            // merely present in this group's stored children list may be a
-            // placeholder declared before the child existed (see
-            // `declare_child`): its creator never consented, so the
-            // child-admin check below still applies. Otherwise the declaring
-            // parent could graft a group it does not administer by
-            // re-listing the placeholder after the child's creation.
-            let linked = store
-                .groups
-                .get(child)
-                .is_some_and(|g| g.parent.as_deref() == Some(gid));
-            if linked {
-                continue;
-            }
-            if !relay_signed
-                && let Some(child_group) = store.groups.get(child)
-                && !child_group.is_admin(event.pubkey.as_str())
-            {
-                bail!("restricted: you are not an admin of the child group");
-            }
+    // Unknown ids (no group yet) are still listable as placeholders. A
+    // replay re-checks only *new* adoptions: a child that already names this
+    // group as its parent consented earlier; a new link in a stored event
+    // (stored while NIP-29 was disabled, or imported) must not graft a
+    // foreign group.
+    for child in tag_values(event, "child") {
+        // "Already linked" means the *child's own* stored parent names
+        // this group: only then did the child's side consent to the
+        // link, and a reorder needs no further authority. An id that is
+        // merely present in this group's stored children list may be a
+        // placeholder declared before the child existed (see
+        // `declare_child`): its creator never consented, so the
+        // child-admin check below still applies. Otherwise the declaring
+        // parent could graft a group it does not administer by
+        // re-listing the placeholder after the child's creation.
+        let linked = store
+            .groups
+            .get(child)
+            .is_some_and(|g| g.parent.as_deref() == Some(gid));
+        if linked {
+            continue;
+        }
+        if !relay_signed
+            && let Some(child_group) = store.groups.get(child)
+            && !child_group.is_admin(event.pubkey.as_str())
+        {
+            bail!("restricted: you are not an admin of the child group");
         }
     }
     // Bound the declared-children adoption hint: beyond its cap the edit is
