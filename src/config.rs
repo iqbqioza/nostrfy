@@ -1062,7 +1062,17 @@ impl Config {
                 if !rpc_usable && *nip == 86 {
                     return false;
                 }
-                if let Some(kinds) = Self::nip_kinds(*nip) {
+                if let Some(required) = Self::nip_required_kinds(*nip) {
+                    // A few NIPs are only usable as a whole (the private
+                    // message and wallet flows): every required kind must
+                    // be allowed, or advertising the NIP promises a broken
+                    // flow just because an auxiliary kind survived.
+                    required
+                        .iter()
+                        .all(|k| self.is_kind_effectively_allowed(*k, access))
+                } else if let Some(kinds) = Self::nip_kinds(*nip) {
+                    // The rest are partially usable: any accepted kind
+                    // keeps the NIP advertised.
                     kinds
                         .iter()
                         .any(|k| self.is_kind_effectively_allowed(*k, access))
@@ -1128,6 +1138,22 @@ impl Config {
                 | 24242 // BUD-02 Blossom / NIP-B7 blobs
                 | 21059 // NIP-59 ephemeral gift wrap
         )
+    }
+
+    /// NIPs whose advertised behaviour requires **every** listed kind.
+    /// NIP-17 private messages need the rumor (14), the NIP-59 seal (13)
+    /// and the gift wrap (1059); NIP-47 needs both the wallet request and
+    /// response; NIP-59 needs the seal and gift wrap. Their other kinds
+    /// (file messages, DM relay lists, ephemeral gift wraps, wallet info)
+    /// are auxiliary: blocking one of those must not drop the NIP, while a
+    /// surviving auxiliary kind must not keep a broken flow advertised.
+    fn nip_required_kinds(nip: u16) -> Option<&'static [u64]> {
+        match nip {
+            17 => Some(&[14, 13, 1059]),
+            47 => Some(&[23194, 23195]),
+            59 => Some(&[13, 1059]),
+            _ => None,
+        }
     }
 
     fn nip_kinds(nip: u16) -> Option<&'static [u64]> {
@@ -4231,6 +4257,58 @@ max_log_files = 2
         // NIP-65/78 are replaceable/addressable: never dropped by reject_ephemeral.
         assert!(nips.contains(&65));
         assert!(nips.contains(&78));
+    }
+
+    #[test]
+    fn auxiliary_kinds_do_not_advertise_broken_private_or_wallet_nips() {
+        // L-15: the any-kind rule advertised NIP-17/59 with the gift wrap
+        // blocked (only the seal/file-message kind survived) and NIP-47
+        // with request/response blocked (only wallet info survived).
+        let cfg = Config::default();
+        let access = AccessControl {
+            blocked_kinds: vec![1059, 21059],
+            ..Default::default()
+        };
+        let nips = cfg.effective_supported_nips(&access);
+        assert!(
+            !nips.contains(&17),
+            "NIP-17 needs the gift wrap, not just kinds 14/15/13"
+        );
+        assert!(
+            !nips.contains(&59),
+            "NIP-59 needs the gift wrap, not just kind 13"
+        );
+
+        let access = AccessControl {
+            blocked_kinds: vec![23194, 23195],
+            ..Default::default()
+        };
+        let nips = cfg.effective_supported_nips(&access);
+        assert!(
+            !nips.contains(&47),
+            "NIP-47 needs request+response, not just kind 13194"
+        );
+
+        // Blocking only auxiliary kinds leaves the whole flow usable.
+        let access = AccessControl {
+            blocked_kinds: vec![15, 10050, 21059, 13194],
+            ..Default::default()
+        };
+        let nips = cfg.effective_supported_nips(&access);
+        assert!(nips.contains(&17), "NIP-17 still has rumor+seal+gift wrap");
+        assert!(nips.contains(&47), "NIP-47 still has request+response");
+        assert!(nips.contains(&59), "NIP-59 still has seal+gift wrap");
+
+        // An allowlist that only carries auxiliary kinds must not advertise
+        // a flow whose required kinds are all missing.
+        let access = AccessControl {
+            allowed_kinds: vec![15, 10050, 21059, 13194],
+            ..Default::default()
+        };
+        let nips = cfg.effective_supported_nips(&access);
+        assert!(!nips.contains(&17));
+        assert!(!nips.contains(&47));
+        assert!(!nips.contains(&59));
     }
 
     #[test]

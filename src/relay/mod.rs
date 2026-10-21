@@ -59,6 +59,13 @@ struct PublishRate {
     /// first entry is the least recently active one. The pubkey makes
     /// entries unique when timestamps collide.
     recency: BTreeSet<(u64, String)>,
+    /// The subset of `recency` whose window is below the current limit.
+    /// Eviction pops from here first, so a flood of one-shot identities
+    /// cannot reset a rate-limited (saturated) key's window.
+    evictable: BTreeSet<(u64, String)>,
+    /// The per-pubkey limit both indices were built for. A runtime config
+    /// change rebuilds them before the next decision.
+    limit: usize,
     /// When the windows were last pruned. Pruning walks every window, so a
     /// flood of fresh pubkeys must not run that walk once per event.
     pruned_at: u64,
@@ -68,23 +75,38 @@ impl PublishRate {
     /// Whether `pubkey` may publish another event; records `now` when it
     /// may. The map is bounded at `cap` pubkeys and never rejects a fresh
     /// identity: a full map prunes expired windows (at most once per
-    /// second) and then evicts the least recently active window. Holding
-    /// the cap with 10k active keys therefore cannot lock new pubkeys out
-    /// (the alternative — rejecting untracked identities — is a permanent
-    /// denial of service). Eviction never clears the map and never resets
-    /// the other windows; an evicted key starts a fresh window on its next
-    /// publish.
+    /// second) and then evicts the least recently active window. Eviction
+    /// prefers an unsaturated window, so a flood of one-shot identities
+    /// cannot reset a rate-limited (saturated) key's window (L-17); only
+    /// when every tracked window is saturated does it fall back to the LRU
+    /// over all of them (the attacker then had to spend `max` events per
+    /// identity). Holding the cap with 10k active keys therefore cannot
+    /// lock new pubkeys out (the alternative — rejecting untracked
+    /// identities — is a permanent denial of service). Eviction never
+    /// clears the map and never resets the other windows; an evicted key
+    /// starts a fresh window on its next publish.
     fn allow(&mut self, max: usize, pubkey: &str, now: u64, cap: usize) -> bool {
-        if let Some(window) = self.windows.get_mut(pubkey) {
-            while window.front().is_some_and(|t| now.saturating_sub(*t) >= 60) {
-                window.pop_front();
+        if self.limit != max {
+            self.limit = max;
+            self.rebuild_indices();
+        }
+        if self.windows.contains_key(pubkey) {
+            let (old_last, saturated) = {
+                let window = self.windows.get_mut(pubkey).expect("checked above");
+                let old_last = window.back().copied();
+                while window.front().is_some_and(|t| now.saturating_sub(*t) >= 60) {
+                    window.pop_front();
+                }
+                if window.len() >= max {
+                    return false;
+                }
+                window.push_back(now);
+                (old_last, window.len() >= max)
+            };
+            if let Some(old_last) = old_last {
+                self.index_remove(pubkey, old_last);
             }
-            if window.len() >= max {
-                return false;
-            }
-            let previous = window.back().copied();
-            window.push_back(now);
-            self.retouch(pubkey, previous, now);
+            self.index_insert(pubkey, now, saturated);
             return true;
         }
         if self.windows.len() >= cap {
@@ -93,73 +115,113 @@ impl PublishRate {
                 self.prune(now);
             }
             while self.windows.len() >= cap {
-                let Some((timestamp, oldest)) = self.recency.pop_first() else {
+                // Prefer an unsaturated window; fall back to the LRU over
+                // saturated windows only when every tracked window is at
+                // its limit.
+                let candidate = self.evictable.pop_first();
+                let candidate = match candidate {
+                    Some(entry) => Some(entry),
+                    None => self.recency.pop_first(),
+                };
+                let Some((timestamp, oldest)) = candidate else {
                     break;
                 };
-                // The recency index mirrors the windows; a stale entry is
-                // skipped instead of evicting a live window under the wrong
-                // identity (defensive: `prune` and `retouch` keep it
+                // The indices mirror the windows; a stale entry is skipped
+                // instead of evicting a live window under the wrong
+                // identity (defensive: `index_*` and `prune` keep them
                 // exact).
                 if self.windows.get(&oldest).and_then(|w| w.back()) != Some(&timestamp) {
                     continue;
                 }
                 self.windows.remove(&oldest);
+                self.recency.remove(&(timestamp, oldest.clone()));
+                self.evictable.remove(&(timestamp, oldest));
             }
         }
         self.windows
             .insert(pubkey.to_string(), VecDeque::from([now]));
-        self.recency.insert((now, pubkey.to_string()));
+        self.index_insert(pubkey, now, 1 >= max);
         true
     }
 
-    /// Moves `pubkey`'s recency index entry from its previous last
-    /// timestamp to `now`.
-    fn retouch(&mut self, pubkey: &str, previous: Option<u64>, now: u64) {
-        if let Some(previous) = previous {
-            self.recency.remove(&(previous, pubkey.to_string()));
+    /// Adds one window's `(last, pubkey)` to the recency indices. A
+    /// saturated window is only in `recency`, so eviction skips it while an
+    /// unsaturated candidate exists.
+    fn index_insert(&mut self, pubkey: &str, last: u64, saturated: bool) {
+        let entry = (last, pubkey.to_string());
+        self.recency.insert(entry.clone());
+        if !saturated {
+            self.evictable.insert(entry);
         }
-        self.recency.insert((now, pubkey.to_string()));
+    }
+
+    /// Removes one window's index entry from both sets.
+    fn index_remove(&mut self, pubkey: &str, last: u64) {
+        let entry = (last, pubkey.to_string());
+        self.recency.remove(&entry);
+        self.evictable.remove(&entry);
+    }
+
+    /// Rebuilds both indices from `windows` for the current `limit`.
+    fn rebuild_indices(&mut self) {
+        self.recency.clear();
+        self.evictable.clear();
+        let limit = self.limit;
+        let entries: Vec<(u64, String, bool)> = self
+            .windows
+            .iter()
+            .filter_map(|(pubkey, window)| {
+                window
+                    .back()
+                    .copied()
+                    .map(|last| (last, pubkey.clone(), window.len() >= limit))
+            })
+            .collect();
+        for (last, pubkey, saturated) in entries {
+            self.index_insert(&pubkey, last, saturated);
+        }
     }
 
     /// Drops every expired timestamp (one stale value must not discard the
-    /// live ones behind it) and rebuilds the recency index.
+    /// live ones behind it) and rebuilds the indices.
     fn prune(&mut self, now: u64) {
         self.windows.retain(|_, window| {
             window.retain(|timestamp| now.saturating_sub(*timestamp) < 60);
             !window.is_empty()
         });
-        self.recency = self
-            .windows
-            .iter()
-            .map(|(pubkey, window)| {
-                let last = *window.back().expect("pruned windows are never left empty");
-                (last, pubkey.clone())
-            })
-            .collect();
+        self.rebuild_indices();
     }
 
     /// Releases one recorded reservation (see `publish_rate_rollback`).
     fn rollback(&mut self, pubkey: &str, now: u64) {
-        let Some(window) = self.windows.get_mut(pubkey) else {
-            return;
+        let limit = self.limit;
+        let (old_last, old_saturated, new_last, new_saturated, empty) = {
+            let Some(window) = self.windows.get_mut(pubkey) else {
+                return;
+            };
+            let old_last = window.back().copied();
+            let old_saturated = window.len() >= limit;
+            if let Some(pos) = window.iter().rposition(|timestamp| *timestamp == now) {
+                window.remove(pos);
+            }
+            (
+                old_last,
+                old_saturated,
+                window.back().copied(),
+                window.len() >= limit,
+                window.is_empty(),
+            )
         };
-        let previous = window.back().copied();
-        if let Some(pos) = window.iter().rposition(|timestamp| *timestamp == now) {
-            window.remove(pos);
+        if old_last != new_last || old_saturated != new_saturated {
+            if let Some(old_last) = old_last {
+                self.index_remove(pubkey, old_last);
+            }
+            if let Some(new_last) = new_last {
+                self.index_insert(pubkey, new_last, new_saturated);
+            }
         }
-        let new_back = window.back().copied();
-        if new_back == previous {
-            return;
-        }
-        if let Some(previous) = previous {
-            self.recency.remove(&(previous, pubkey.to_string()));
-        }
-        if window.is_empty() {
+        if empty {
             self.windows.remove(pubkey);
-            return;
-        }
-        if let Some(new_back) = new_back {
-            self.recency.insert((new_back, pubkey.to_string()));
         }
     }
 }
@@ -2183,8 +2245,11 @@ impl Relay {
     /// Whether `pubkey` may publish another event under
     /// `relay.max_events_per_min_per_pubkey` (a sliding 60-second window;
     /// 0 = unlimited). See [`PublishRate::allow`] for the bounded-map
-    /// policy: at the 10k cap the least recently active window is evicted
-    /// instead of rejecting a fresh pubkey or clearing the map.
+    /// policy: at the 10k cap an unsaturated window is evicted first (so a
+    /// flood of one-shot keys cannot reset a rate-limited window), falling
+    /// back to the least recently active window when every tracked window is
+    /// saturated. A fresh pubkey is never rejected and the map is never
+    /// cleared.
     pub(crate) fn publish_rate_allowed(&self, cfg: &Config, pubkey: &str, now: u64) -> bool {
         const MAX_TRACKED_PUBKEYS: usize = 10_000;
         let max = cfg.relay.max_events_per_min_per_pubkey;
@@ -9550,6 +9615,34 @@ mod tests {
             );
             relay.db.shutdown();
         });
+    }
+
+    #[test]
+    fn publish_rate_eviction_prefers_unsaturated_windows() {
+        // L-17: a saturated (rate-limited) window must not be evicted by a
+        // flood of one-shot identities. With cap 3 and max 2, the target's
+        // two-event window is the oldest; the old pure-LRU eviction picked
+        // it and reset its limit. Eviction now pops an unsaturated
+        // one-shot window first.
+        let mut rate = super::PublishRate::default();
+        let now = 1_000;
+        let max = 2;
+        let cap = 3;
+        assert!(rate.allow(max, "target", now, cap));
+        assert!(rate.allow(max, "target", now, cap));
+        assert!(
+            !rate.allow(max, "target", now, cap),
+            "the target must be saturated"
+        );
+        assert!(rate.allow(max, "a", now + 1, cap));
+        assert!(rate.allow(max, "b", now + 2, cap));
+        assert!(rate.allow(max, "c", now + 3, cap));
+        assert!(
+            !rate.allow(max, "target", now + 4, cap),
+            "a flood of one-shot keys must not reset the target's window"
+        );
+        // Fresh identities stay admissible (no permanent lockout).
+        assert!(rate.allow(max, "d", now + 5, cap));
     }
 
     #[test]

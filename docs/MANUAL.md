@@ -568,8 +568,9 @@ Blossom (BUD-01/02) is not a NIP and is **not** advertised in the NIP-11 documen
 
 The NIP-11 `supported_nips` list is not static: a NIP is dropped from it when every kind the NIP defines is rejected by the relay's access control. Concretely:
 
-- **`blocked_kinds`** — blocking all kinds of a NIP hides it (e.g. blocking kind `5` hides NIP-09). Blocking only some kinds keeps the NIP (e.g. blocking `9000` but not `9001` keeps NIP-29).
+- **`blocked_kinds`** — blocking all kinds of a NIP hides it (e.g. blocking kind `5` hides NIP-09). For most NIPs, blocking only some kinds keeps the NIP (e.g. blocking `9000` but not `9001` keeps NIP-29); the whole-flow NIPs below are the exception.
 - **`allowed_kinds`** — a NIP's kind is only accepted when listed; a NIP whose kinds are all unlisted is hidden.
+- **Required vs auxiliary kinds** — most advertised client-side NIPs are partially usable, so any surviving kind keeps them advertised. NIP-17, NIP-47 and NIP-59 are whole flows: they are advertised only when every required kind is allowed (NIP-17: `14`/`13`/`1059`; NIP-47: `23194`/`23195`; NIP-59: `13`/`1059`). Their auxiliary kinds (`15`, `10050`, `21059`, `13194`) can be blocked without hiding the NIP.
 - **`reject_ephemeral`** — ephemeral kinds that are not in the NIP-mandated exempt list (`22242`, `27235`, `28934`/`28935`/`28936`, `24133`, `23194`/`23195`, `24242`, `21059`) are rejected, so NIPs relying on them are hidden.
 - **NIP-42 / NIP-98** are advertised whenever enabled: their auth events (`22242` as an AUTH message, `27235` in the HTTP `Authorization` header) are verified outside the publish path, so `allowed_kinds`/`blocked_kinds` never hide them. Only `enabled_nips`/`disabled_nips` (restart) remove them.
 - **Prerequisites** — NIP-29, NIP-43 and NIP-66 rely on relay-signed events (group metadata, role/membership lists, the relay's own discovery event) and are hidden without `relay.private_key`; NIP-86 is hidden unless `rpc.management_token` or `rpc.admin_pubkey` is configured (otherwise every management call is refused).
