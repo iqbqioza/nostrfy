@@ -13,6 +13,16 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
+# The relay accepts untrusted network traffic and needs no privileges: run
+# it as an unprivileged system user. Create it once with a home directory
+# for relative paths:
+#   sudo useradd --system --create-home --home /var/lib/nostrfy nostrfy
+# Relative config paths (e.g. database.path = "./data") then resolve under
+# /var/lib/nostrfy. When migrating an existing install, move the data and
+# chown it: sudo chown -R nostrfy:nostrfy /var/lib/nostrfy
+User=nostrfy
+Group=nostrfy
+WorkingDirectory=/var/lib/nostrfy
 Type=simple
 ExecStart=/usr/local/bin/nostrfy --config /etc/nostrfy/nostrfy.toml start --foreground
 Restart=always
@@ -27,6 +37,17 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
 ProtectHome=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+CapabilityBoundingSet=
 
 [Install]
 WantedBy=multi-user.target

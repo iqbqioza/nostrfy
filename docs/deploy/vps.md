@@ -50,9 +50,16 @@ systemd supervises the process directly: there is no daemon fork/readiness
 race on a large database and no `PIDFile=` that has to match
 `daemon.pid_file`.
 
+The unit runs the relay as an unprivileged `nostrfy` system user with
+`WorkingDirectory=/var/lib/nostrfy`, so relative config paths (such as the
+default `database.path = "./data"`) resolve under `/var/lib/nostrfy`.
+Create the user first and, when migrating an existing install, move the
+data there and `chown` it to `nostrfy:nostrfy`.
+
 Fetch the hardened unit (no repository clone needed) and start it:
 
 ```sh
+sudo useradd --system --create-home --home /var/lib/nostrfy nostrfy
 sudo curl -fsSL -o /etc/systemd/system/nostrfy.service \
   https://raw.githubusercontent.com/iqbqioza/nostrfy/main/deploy/nostrfy.service
 sudo systemctl daemon-reload
