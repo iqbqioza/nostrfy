@@ -59,7 +59,12 @@ pub fn relay_info(
                 || !access.allowed_kinds.is_empty()
                 || !access.blocked_kinds.is_empty()
                 || config.relay.reject_ephemeral,
-            "created_at_lower_limit": 0,
+            // No global lower bound: the relay accepts arbitrarily old
+            // events. NIP-11 expresses limits as relative seconds, so
+            // emitting `0` would falsely claim "nothing older than now"
+            // rather than "no limit". Omit the field (any field may be
+            // omitted). NIP-29/NIP-43 have their own freshness rules, but
+            // those are scoped to those events, not a relay-wide limit.
             // NIP-11 limits are *relative* seconds from now (the spec's
             // examples are `300` and `3`), not absolute timestamps.
             "created_at_upper_limit": limits
@@ -198,6 +203,18 @@ mod tests {
         let access = crate::config::AccessControl::default();
         let stats = Stats::new();
         relay_info(&cfg, &access, &stats, None)
+    }
+
+    #[test]
+    fn lower_limit_is_omitted_without_a_global_bound() {
+        // AUD-29: `created_at_lower_limit: 0` would be read as a relative
+        // zero-second lower bound, not "unlimited". The relay has no
+        // relay-wide lower limit, so the field is omitted.
+        let info = info();
+        assert!(
+            info["limitation"].get("created_at_lower_limit").is_none(),
+            "no global lower bound means the field must be absent"
+        );
     }
 
     #[test]

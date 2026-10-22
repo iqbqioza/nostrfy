@@ -346,6 +346,8 @@ curl -H "Accept: application/nostr+json" http://127.0.0.1:8080/
 
 Returns the relay name, supported NIPs, limits, and more as JSON. The `supported_nips` list is dynamic — see [Section 8](#8-supported-nips) for what controls it.
 
+The `limitation` object reports `created_at_upper_limit` (the enforced future window) but **omits `created_at_lower_limit`**: this relay has no relay-wide lower bound, and NIP-11 limits are relative seconds, so a `0` would be read as "no events older than now" rather than "unlimited". NIP-29/NIP-43 keep their own freshness rules for the events they govern.
+
 Without that `Accept` header (e.g. a browser) the root URL answers a built-in decoy page that says nothing about the relay. To show your own page instead, set `server.landing_page_file` (and `server.assets_dir` for its images/CSS) — see [CONFIGURATION](CONFIGURATION.md#5-server--server-settings).
 
 ### Reload the config without replacing the process
