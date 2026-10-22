@@ -386,6 +386,10 @@ pub struct Relay {
     /// NIP-42 flags against this version and refresh them only when it
     /// changes, so the hot live path never takes the shared config lock.
     pub config_version: std::sync::atomic::AtomicU64,
+    /// Rotates the ghost candidates tried when a create hits the group
+    /// budget, so backed ghosts at the front cannot starve later unbacked
+    /// ones (H02).
+    pub(crate) ghost_reclaim_cursor: std::sync::atomic::AtomicUsize,
     /// Wake channel for config-version changes. Connections select on it so
     /// a SIGHUP that changes `ws_idle_timeout_secs` reaches even a fully
     /// idle socket (L14); the atomic alone is only observed on the next
@@ -2211,6 +2215,7 @@ impl Relay {
             persist_relay_field_lock: tokio::sync::Mutex::new(()),
             ip_blocks_tx: tokio::sync::watch::channel(0).0,
             config_version: AtomicU64::new(0),
+            ghost_reclaim_cursor: std::sync::atomic::AtomicUsize::new(0),
             config_tx: tokio::sync::watch::channel(0).0,
             drain_tx: tokio::sync::watch::channel(false).0,
             teardown_tasks: std::sync::atomic::AtomicUsize::new(0),

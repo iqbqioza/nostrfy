@@ -362,11 +362,23 @@ impl super::Relay {
             // to protect, and the id is downgraded to the ordinary
             // delete tombstone (the same downgrade a confirmed purge
             // performs). Anything else stays fail-closed.
-            if event.kind == nip29::CREATE_GROUP
-                && let Some(gid) = nip29::group_id(event)
-                && self.groups.read().await.is_ghosted(gid)
-            {
-                self.repair_unbacked_group_ghost(gid, now).await;
+            if event.kind == nip29::CREATE_GROUP {
+                if let Some(gid) = nip29::group_id(event)
+                    && self.groups.read().await.is_ghosted(gid)
+                {
+                    self.repair_unbacked_group_ghost(gid, now).await;
+                }
+                // H02: ghost markers count against max_groups, so a churn
+                // of creates whose state was later deleted could lock out
+                // every new group id forever. When the create would hit
+                // that budget, try to release an unbacked ghost (no
+                // surviving h-tagged event or group metadata) before
+                // `validate_write` refuses the create. Backed ghosts keep
+                // withholding their history and still count.
+                let at_capacity = self.groups.read().await.create_capacity_reached();
+                if at_capacity {
+                    self.reclaim_unbacked_group_ghost(now).await;
+                }
             }
             let reason = {
                 let groups = self.groups.read().await;
@@ -455,6 +467,33 @@ impl super::Relay {
             }
         }
         Precheck::Accept
+    }
+
+    /// Tries a bounded, rotating set of ghost ids and releases the first one
+    /// with no surviving history. Returns whether a slot was freed.
+    ///
+    /// A ghost with real history stays fail-closed; if all candidates in
+    /// this call are backed, the create is still refused by
+    /// `validate_write`. The rotation prevents a fixed prefix of backed
+    /// ghosts from hiding the unbacked ones forever.
+    pub(crate) async fn reclaim_unbacked_group_ghost(&self, now: u64) -> bool {
+        const MAX_CANDIDATES: usize = 8;
+        let mut candidates = self.groups.read().await.ghost_group_ids();
+        if candidates.is_empty() {
+            return false;
+        }
+        candidates.sort_unstable();
+        let start = self
+            .ghost_reclaim_cursor
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            % candidates.len();
+        for offset in 0..candidates.len().min(MAX_CANDIDATES) {
+            let gid = &candidates[(start + offset) % candidates.len()];
+            if self.repair_unbacked_group_ghost(gid, now).await {
+                return true;
+            }
+        }
+        false
     }
 
     /// Whether a ghosted group id has no stored history behind it, and if so
@@ -2804,6 +2843,90 @@ mod tests {
             assert!(
                 matches!(out, super::Precheck::Reject(_)),
                 "a blocked pubkey's regular events stay blocked"
+            );
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn an_unbacked_ghost_is_reclaimed_when_group_capacity_is_full() {
+        // H02: ghost markers counted against max_groups, so deleting the
+        // creates of a full group set locked out every new create forever.
+        // A ghost with no surviving h-tagged history must release its slot
+        // on demand.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_validate_relay("nostrfy-ghost-reclaim-test").await;
+            {
+                let mut groups = relay.groups.write().await;
+                *groups = crate::nips::nip29::GroupStore::with_cap(1);
+                groups.mark_ghost("g1");
+                assert!(groups.create_capacity_reached());
+            }
+            let cfg = relay.config.read().await;
+            let create = signed(9007, vec![vec!["h".into(), "g2".into()]]);
+            let out = relay
+                .precheck(
+                    &cfg,
+                    &AccessControl::default(),
+                    &create,
+                    unix_now(),
+                    &[],
+                    None,
+                    None,
+                )
+                .await;
+            assert!(
+                matches!(out, super::Precheck::Accept),
+                "a new group id must be accepted after reclaiming the unbacked ghost"
+            );
+            assert!(
+                !relay.groups.read().await.is_ghosted("g1"),
+                "the reclaimed ghost must leave the capacity budget"
+            );
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn a_ghost_with_surviving_history_keeps_its_capacity_slot() {
+        // H02 must not trade availability for a privacy leak: a ghost whose
+        // h-tagged history survived is not reclaimable, so the create is
+        // still refused at the group limit.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_validate_relay("nostrfy-ghost-backed-test").await;
+            let now = unix_now();
+            let survivor = signed(1, vec![vec!["h".into(), "g1".into()]]);
+            assert_eq!(
+                relay.db.put(survivor, now).await,
+                crate::db::PutOutcome::Stored
+            );
+            {
+                let mut groups = relay.groups.write().await;
+                *groups = crate::nips::nip29::GroupStore::with_cap(1);
+                groups.mark_ghost("g1");
+            }
+            let cfg = relay.config.read().await;
+            let create = signed(9007, vec![vec!["h".into(), "g2".into()]]);
+            let out = relay
+                .precheck(
+                    &cfg,
+                    &AccessControl::default(),
+                    &create,
+                    now,
+                    &[],
+                    None,
+                    None,
+                )
+                .await;
+            assert!(
+                matches!(out, super::Precheck::Reject(ref m) if m.contains("group limit")),
+                "a backed ghost must keep the create blocked: {out:?}"
+            );
+            assert!(
+                relay.groups.read().await.is_ghosted("g1"),
+                "history-bearing ghosts must stay fail-closed"
             );
             relay.db.shutdown();
         });

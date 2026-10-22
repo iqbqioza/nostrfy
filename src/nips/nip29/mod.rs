@@ -476,6 +476,13 @@ impl GroupStore {
         self.max_groups > 0 && self.groups.len() + self.ghost.len() >= self.max_groups
     }
 
+    /// Whether a create currently hits the combined live+ghost budget. The
+    /// relay uses this to try reclaiming an unbacked ghost before refusing
+    /// the create (H02).
+    pub(crate) fn create_capacity_reached(&self) -> bool {
+        self.at_capacity()
+    }
+
     /// Makes room for `room` new entries within `max_groups`, dropping
     /// tombstones as needed. The in-memory delete markers are a fast path
     /// only: the database's purge marker and the purged events remain
