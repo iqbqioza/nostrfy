@@ -611,7 +611,9 @@ impl GroupStore {
         // tags are ambiguous and dangerous: the checks below use the first
         // one while the stored tag index and subscriptions match any of
         // them, so an event validated against an open group could surface in
-        // a restricted group's feed. Reject them outright.
+        // a restricted group's feed. Reject them outright, whether or not
+        // NIP-29 is currently enabled (the disabled-window intake also
+        // enforces this in `validate_base`).
         if event
             .tags
             .iter()
@@ -620,6 +622,9 @@ impl GroupStore {
             > 1
         {
             bail!("invalid: group events must carry only one h tag");
+        }
+        if self.unrestored && event.kind != DELETE_GROUP {
+            bail!("restricted: group state is unavailable");
         }
         let Some(gid) = group_id(event).filter(|gid| !gid.is_empty()) else {
             // NIP-29 group actions MUST carry a non-empty `h` tag (mirrors
@@ -651,6 +656,13 @@ impl GroupStore {
         // confirmed purge leaves the id as `deleted`), so clearing that
         // tombstone on a create is safe.
         if self.ghost.contains(gid) {
+            // A ghost with surviving history is normally un-writable, but
+            // the relay master key may issue a 9008 to purge the surviving
+            // events and release both the id and its capacity slot.
+            let relay_signed = relay_pubkey.is_some_and(|pk| event.pubkey.eq_ignore_ascii_case(pk));
+            if event.kind == DELETE_GROUP && relay_signed {
+                return Ok(());
+            }
             bail!("blocked: the group has been deleted");
         }
         if self.deleted.contains(gid) {
@@ -1121,7 +1133,11 @@ impl GroupStore {
                 // too, so an effect dropped here is final: a rebuild cannot
                 // introduce a cycle (B-1).
                 let mut denials = EditLinkDenials::default();
-                if let Some(group) = self.groups.get(gid) {
+                // Clone the pre-edit group so the replay-only settings
+                // fallback can mutate the store after the immutable borrow
+                // ends.
+                let group_snapshot = self.groups.get(gid).cloned();
+                if let Some(group) = &group_snapshot {
                     let relay_signed =
                         !relay_pubkey.is_empty() && event.pubkey.eq_ignore_ascii_case(relay_pubkey);
                     match validate_edit_metadata(
@@ -1133,6 +1149,18 @@ impl GroupStore {
                         history_replay,
                     ) {
                         Ok(links) => denials = links,
+                        Err(_) if history_replay => {
+                            // A structural error (cycle / declared-children
+                            // cap) during replay drops the *links*, not the
+                            // whole edit: the settings are still the last
+                            // known admin intent and losing `private` would
+                            // make the group public. The live path rejects
+                            // such an edit outright.
+                            if let Some(group) = self.groups.get_mut(gid) {
+                                apply_settings(group, event);
+                            }
+                            return Vec::new();
+                        }
                         Err(_) => return Vec::new(),
                     }
                 }
@@ -1849,8 +1877,13 @@ impl GroupStore {
             // A completed full replay walked every stored group event:
             // unknown ids are genuinely unknown again (see the `unrestored`
             // field). The vanish variant does not clear the flag: it only
-            // rebuilds the ids that were already known.
+            // rebuilds the ids that were already known. A full replay also
+            // proves the removed-state gates no longer apply, so clear them;
+            // otherwise a startup recovery mark would hide every group for
+            // the process lifetime.
             self.unrestored = false;
+            self.stale = false;
+            self.stale_groups.clear();
         }
         rebuilt
     }

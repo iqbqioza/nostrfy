@@ -320,124 +320,125 @@ impl super::Relay {
         if !cfg.nip_enabled(29) && nip29::is_group_action(event) {
             return Precheck::Reject("blocked: NIP-29 is disabled".into());
         }
-        if cfg.nip_enabled(29) {
-            // Group metadata events MUST be signed by the relay's own key.
-            if (nip29::GROUP_META..=nip29::GROUP_PINS).contains(&event.kind)
-                && Some(event.pubkey.as_str()) != self.relay_pubkey_ref()
+        // Group metadata events MUST be signed by the relay's own key in
+        // every configuration. While NIP-29 is disabled these kinds are not
+        // group actions, so the disabled-window gate below does not catch
+        // them; a client-signed 39000-39005 would then be served as group
+        // metadata until the next enabled restart.
+        if (nip29::GROUP_META..=nip29::GROUP_PINS).contains(&event.kind)
+            && Some(event.pubkey.as_str()) != self.relay_pubkey_ref()
+        {
+            return Precheck::Reject(
+                "blocked: group metadata must be published by the relay".into(),
+            );
+        }
+        if cfg.nip_enabled(29) && nip29::group_id(event).is_some() {
+            // Late publication prevention for group events.
+            if cfg.limits.group_late_publish_secs > 0
+                && event
+                    .created_at
+                    .saturating_add(cfg.limits.group_late_publish_secs)
+                    < now
             {
-                return Precheck::Reject(
-                    "blocked: group metadata must be published by the relay".into(),
-                );
+                return Precheck::Reject("invalid: event is too old for this group".into());
             }
-            if nip29::group_id(event).is_some() {
-                // Late publication prevention for group events.
-                if cfg.limits.group_late_publish_secs > 0
-                    && event
-                        .created_at
-                        .saturating_add(cfg.limits.group_late_publish_secs)
-                        < now
-                {
-                    return Precheck::Reject("invalid: event is too old for this group".into());
+            // A ghosted id normally refuses every create (fail-closed:
+            // the ghost marks un-purged history). The relay's own bare
+            // metadata, however, could ghost an id that never was a
+            // group: before the emit fix, a declared placeholder child
+            // received a bare `39000`, and a snapshot-less rebuild took
+            // it for surviving history. When the database shows nothing
+            // but that bare metadata — no h-tagged event, no other group
+            // metadata, no recorded pending purge — there is no history
+            // to protect, and the id is downgraded to the ordinary
+            // delete tombstone (the same downgrade a confirmed purge
+            // performs). Anything else stays fail-closed.
+            if event.kind == nip29::CREATE_GROUP
+                && let Some(gid) = nip29::group_id(event)
+                && self.groups.read().await.is_ghosted(gid)
+            {
+                self.repair_unbacked_group_ghost(gid, now).await;
+            }
+            let reason = {
+                let groups = self.groups.read().await;
+                // Moderation events may also come from the relay's own
+                // key (NIP-29: "the relay master key or ... group
+                // admins"), so the operator can recover an admin-less
+                // group.
+                match self.relay_pubkey_ref() {
+                    Some(relay_pk) => groups
+                        .validate_write_for_relay(event, Some(relay_pk))
+                        .err()
+                        .map(|e| e.to_string()),
+                    None => groups.validate_write(event).err().map(|e| e.to_string()),
                 }
-                // A ghosted id normally refuses every create (fail-closed:
-                // the ghost marks un-purged history). The relay's own bare
-                // metadata, however, could ghost an id that never was a
-                // group: before the emit fix, a declared placeholder child
-                // received a bare `39000`, and a snapshot-less rebuild took
-                // it for surviving history. When the database shows nothing
-                // but that bare metadata — no h-tagged event, no other group
-                // metadata, no recorded pending purge — there is no history
-                // to protect, and the id is downgraded to the ordinary
-                // delete tombstone (the same downgrade a confirmed purge
-                // performs). Anything else stays fail-closed.
-                if event.kind == nip29::CREATE_GROUP
-                    && let Some(gid) = nip29::group_id(event)
-                    && self.groups.read().await.is_ghosted(gid)
-                {
-                    self.repair_unbacked_group_ghost(gid, now).await;
-                }
-                let reason = {
-                    let groups = self.groups.read().await;
-                    // Moderation events may also come from the relay's own
-                    // key (NIP-29: "the relay master key or ... group
-                    // admins"), so the operator can recover an admin-less
-                    // group.
-                    match self.relay_pubkey_ref() {
-                        Some(relay_pk) => groups
-                            .validate_write_for_relay(event, Some(relay_pk))
-                            .err()
-                            .map(|e| e.to_string()),
-                        None => groups.validate_write(event).err().map(|e| e.to_string()),
+            };
+            if let Some(reason) = reason {
+                return Precheck::Reject(reason);
+            }
+            // The in-memory invite set never forgets a code whose 9009
+            // was NIP-09-deleted or NIP-40-expired (revocation only
+            // takes effect after a restart). On a CLOSED group (where
+            // the code decides admission) a JOIN with a code is
+            // therefore confirmed against the stored, unexpired 9009
+            // before admission — the same visibility the in-memory
+            // check has (a 9009 of the same batch is not committed
+            // yet either way). On open groups the code is optional
+            // preauthorization and does not gate admission.
+            if event.kind == nip29::JOIN
+                && let Some(code) = nip29::event_code(event)
+                && let Some(gid) = nip29::group_id(event)
+            {
+                let closed = self
+                    .groups
+                    .read()
+                    .await
+                    .group(gid)
+                    .is_some_and(|g| g.settings.closed);
+                if closed {
+                    let f: Vec<crate::filter::Filter> = serde_json::from_value(serde_json::json!([
+                        { "kinds": [9009], "#h": [gid], "#code": [code] }
+                    ]))
+                    .expect("static filter");
+                    let (stored, _) = self.db.query_req(f, 1, now).await;
+                    if stored.is_empty() {
+                        return Precheck::Reject(
+                            "restricted: invalid invite code (final decision)".into(),
+                        );
                     }
+                }
+            }
+            // NIP-29 `previous` timeline references must exist.
+            // The recommendation (at least 3 refs from the last 50,
+            // 4-byte prefixes) is intentionally not enforced: zero refs
+            // are legal per spec, and any hex length is accepted so
+            // clients sending longer prefixes keep working.
+            let mut unknown: Option<&str> = None;
+            for prefix in nip29::previous_tags(event) {
+                let Ok(prefix) = hex::decode(&prefix) else {
+                    unknown = Some("invalid: malformed previous tag");
+                    break;
                 };
-                if let Some(reason) = reason {
-                    return Precheck::Reject(reason);
-                }
-                // The in-memory invite set never forgets a code whose 9009
-                // was NIP-09-deleted or NIP-40-expired (revocation only
-                // takes effect after a restart). On a CLOSED group (where
-                // the code decides admission) a JOIN with a code is
-                // therefore confirmed against the stored, unexpired 9009
-                // before admission — the same visibility the in-memory
-                // check has (a 9009 of the same batch is not committed
-                // yet either way). On open groups the code is optional
-                // preauthorization and does not gate admission.
-                if event.kind == nip29::JOIN
-                    && let Some(code) = nip29::event_code(event)
-                    && let Some(gid) = nip29::group_id(event)
-                {
-                    let closed = self
-                        .groups
-                        .read()
-                        .await
-                        .group(gid)
-                        .is_some_and(|g| g.settings.closed);
-                    if closed {
-                        let f: Vec<crate::filter::Filter> =
-                            serde_json::from_value(serde_json::json!([
-                                { "kinds": [9009], "#h": [gid], "#code": [code] }
-                            ]))
-                            .expect("static filter");
-                        let (stored, _) = self.db.query_req(f, 1, now).await;
-                        if stored.is_empty() {
-                            return Precheck::Reject(
-                                "restricted: invalid invite code (final decision)".into(),
-                            );
-                        }
-                    }
-                }
-                // NIP-29 `previous` timeline references must exist.
-                // The recommendation (at least 3 refs from the last 50,
-                // 4-byte prefixes) is intentionally not enforced: zero refs
-                // are legal per spec, and any hex length is accepted so
-                // clients sending longer prefixes keep working.
-                let mut unknown: Option<&str> = None;
-                for prefix in nip29::previous_tags(event) {
-                    let Ok(prefix) = hex::decode(&prefix) else {
-                        unknown = Some("invalid: malformed previous tag");
-                        break;
+                if !prefix.is_empty() {
+                    let exists = match known_prefixes {
+                        Some(known) => known.known.contains(&prefix),
+                        None => self.db.event_id_prefix_exists(&prefix).await,
                     };
-                    if !prefix.is_empty() {
-                        let exists = match known_prefixes {
-                            Some(known) => known.known.contains(&prefix),
-                            None => self.db.event_id_prefix_exists(&prefix).await,
-                        };
-                        if !exists {
-                            // A capped prefetch could not have resolved this
-                            // reference: report a retryable rate limit
-                            // instead of claiming the reference is wrong.
-                            unknown = Some(if known_prefixes.is_some_and(|known| known.capped) {
-                                "rate-limited: previous tag reference was not prefetched; retry"
-                            } else {
-                                "invalid: unknown previous tag reference"
-                            });
-                            break;
-                        }
+                    if !exists {
+                        // A capped prefetch could not have resolved this
+                        // reference: report a retryable rate limit
+                        // instead of claiming the reference is wrong.
+                        unknown = Some(if known_prefixes.is_some_and(|known| known.capped) {
+                            "rate-limited: previous tag reference was not prefetched; retry"
+                        } else {
+                            "invalid: unknown previous tag reference"
+                        });
+                        break;
                     }
                 }
-                if let Some(reason) = unknown {
-                    return Precheck::Reject(reason.into());
-                }
+            }
+            if let Some(reason) = unknown {
+                return Precheck::Reject(reason.into());
             }
         }
         Precheck::Accept
@@ -569,6 +570,20 @@ impl super::Relay {
         // NIP-01: each tag is an array of one or more strings.
         if event.tags.iter().any(|t| t.is_empty()) {
             bail!("invalid: empty tag");
+        }
+        // NIP-29 group identity is the single `h` tag. Multiple `h` values
+        // are indexed under every group while visibility uses only the first,
+        // so a stored event validated against a public group could surface
+        // in a private group's `#h` feed. Reject them even while NIP-29 is
+        // disabled (the disabled window is where such events were stored).
+        if event
+            .tags
+            .iter()
+            .filter(|tag| tag.first().is_some_and(|name| name == "h"))
+            .count()
+            > 1
+        {
+            bail!("invalid: events must carry only one h tag");
         }
         // NIP-59: "Tags MUST always be empty in a `kind:13`" (the seal
         // wrapping an encrypted rumor) — a seal with tags is malformed.
@@ -1964,6 +1979,38 @@ mod tests {
             .precheck(&cfg, &access, &normal, now, &[], None, None)
             .await;
         assert!(!matches!(out, super::Precheck::Reject(_)));
+
+        // M29: a multi-h event stored in the disabled window would be
+        // indexed under every h but visible under only the first.
+        let multi_h = signed_with_seed(
+            7,
+            1,
+            vec![
+                vec!["h".into(), "public".into()],
+                vec!["h".into(), "private".into()],
+            ],
+        );
+        let out = relay
+            .precheck(&cfg, &access, &multi_h, now, &[], None, None)
+            .await;
+        assert!(
+            matches!(out, super::Precheck::Reject(message) if message.contains("one h tag")),
+            "multiple h tags must be rejected even while NIP-29 is disabled"
+        );
+
+        // M29: relay-signed metadata must not be forged while disabled.
+        let fake_meta = signed_with_seed(
+            7,
+            crate::nips::nip29::GROUP_META,
+            vec![vec!["d".into(), "victim".into()]],
+        );
+        let out = relay
+            .precheck(&cfg, &access, &fake_meta, now, &[], None, None)
+            .await;
+        assert!(
+            matches!(out, super::Precheck::Reject(message) if message.contains("metadata")),
+            "client-signed 39000 must be rejected even while NIP-29 is disabled"
+        );
         drop(cfg);
         relay.db.shutdown();
     }

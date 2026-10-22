@@ -293,6 +293,11 @@ pub struct Relay {
     /// (the persisted snapshot is dropped instead and the next startup
     /// rebuilds from the surviving events).
     groups_rebuild: std::sync::Arc<GroupsRebuild>,
+    /// Set when startup recovery removed a group-state event. The startup
+    /// full rebuild is then authoritative; the coalesced worker must not be
+    /// scheduled before it (it would capture an empty `previous` set and
+    /// overwrite the ghost pass).
+    startup_group_recovery: std::sync::atomic::AtomicBool,
     /// NIP-43 role definitions and member assignments.
     pub roles: Arc<RwLock<RoleStore>>,
     /// The coalesced NIP-43 role rebuild that follows a NIP-09 deletion,
@@ -649,6 +654,10 @@ struct GroupsRebuild {
     /// persist): exposed as the `nostrfy_rebuild_failures` counter, which
     /// the startup rebuild (fatal, never counted here) cannot hide.
     failed_rebuilds: std::sync::atomic::AtomicU64,
+    /// A runtime rebuild swapped in state whose relay-signed metadata
+    /// (39000-39005) still reflects the pre-removal store. The stats worker
+    /// republishes it asynchronously.
+    metadata_dirty: std::sync::atomic::AtomicBool,
     /// Single-flight token: only the task that takes it drains the loop.
     lock: tokio::sync::Mutex<()>,
     /// Serializes snapshot capture and write (like `persist_access_lock`):
@@ -674,6 +683,7 @@ impl Default for GroupsRebuild {
             last: std::sync::atomic::AtomicU64::new(0),
             rebuilds: std::sync::atomic::AtomicU64::new(0),
             failed_rebuilds: std::sync::atomic::AtomicU64::new(0),
+            metadata_dirty: std::sync::atomic::AtomicBool::new(false),
             lock: tokio::sync::Mutex::new(()),
             persist_lock: tokio::sync::Mutex::new(()),
             buffer: tokio::sync::Mutex::new(RebuildBuffer::default()),
@@ -1682,6 +1692,11 @@ async fn groups_rebuild_worker(
                         );
                     }
                     *store = fresh;
+                    if relay_pubkey.is_some() {
+                        state
+                            .metadata_dirty
+                            .store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
                 }
                 buffer.scanning = false;
                 retry
@@ -2139,6 +2154,7 @@ impl Relay {
                 config.read().await.relay.max_groups,
             ))),
             groups_rebuild: std::sync::Arc::new(GroupsRebuild::default()),
+            startup_group_recovery: std::sync::atomic::AtomicBool::new(false),
             roles: Arc::new(RwLock::new(RoleStore::default())),
             roles_rebuild: std::sync::Arc::new(RolesRebuild::default()),
             api_limit: ApiLimiter::new(api_max_concurrent),
@@ -3764,6 +3780,27 @@ impl Relay {
     /// must not let a caller drop other copies of the metadata: the heal
     /// keeps a former key's events until this one has stored the current
     /// key's (see [`Self::heal_rotated_group_metadata`]).
+    /// Republishes the relay-signed NIP-29 metadata when a runtime rebuild
+    /// changed the derived state. A failed pass leaves the flag set for the
+    /// next stats tick.
+    pub(crate) async fn republish_group_metadata_if_dirty(&self) {
+        if !self
+            .groups_rebuild
+            .metadata_dirty
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
+        if !self.config.read().await.nip_enabled(29) {
+            return;
+        }
+        if !self.publish_group_metadata().await {
+            self.groups_rebuild
+                .metadata_dirty
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
     pub(crate) async fn publish_group_metadata(&self) -> bool {
         let Some(relay_pubkey) = self.relay_pubkey() else {
             return false;
@@ -4446,10 +4483,27 @@ impl Relay {
             // so a future replaceable group kind cannot silently narrow.
             touch.groups_all |= groups;
         }
-        let targets = nip09::deletion_targets(event);
+        // Only full 64-hex ids can be removed by the walk; prefixes are
+        // accepted by `Filter.ids` but `apply_deletion_walk` ignores them.
+        // Counting a prefix would let an attacker resolve foreign events and
+        // promote the stale scope to every group.
+        let targets: Vec<String> = nip09::deletion_targets(event)
+            .into_iter()
+            .filter(|id| {
+                id.len() == 64
+                    && hex::decode(id).is_ok_and(|bytes| bytes.len() == crate::db::store::ID_LEN)
+            })
+            .collect();
         if targets.is_empty() {
             return touch;
         }
+        // NIP-09 is author-scoped (the by-pubkey index also carries a
+        // NIP-26 delegator, so a delegated target is included). A 9005 is
+        // group-scoped instead: the admin may remove other authors' events,
+        // but only inside this group. Without this filter, 1024 foreign
+        // group-state ids in the e-tags promoted one deletion to a global
+        // NIP-29 fail-closed mark.
+        let scoped_group = nip29::group_id(event).map(str::to_string);
         // The lookup is only a per-family existence check, so one event per
         // family is enough: a single capped page over both families could
         // fill up on one side (a deletion naming 64 group-state ids plus a
@@ -4471,11 +4525,18 @@ impl Relay {
         // of failing closed for every group on the relay. The role side
         // only needs its existence bit, so it keeps a single-row page.
         for (kinds, is_group) in [(group_kinds, true), (role_kinds, false)] {
-            let filter = crate::filter::Filter {
+            let mut filter = crate::filter::Filter {
                 ids: Some(targets.clone()),
                 kinds: Some(kinds),
                 ..Default::default()
             };
+            if let Some(gid) = &scoped_group {
+                filter
+                    .tags
+                    .insert("#h".to_string(), serde_json::json!([gid]));
+            } else {
+                filter.authors = Some(vec![event.pubkey.clone()]);
+            }
             let page = if is_group {
                 self.db
                     .query_full_startup(vec![filter], GROUP_STALE_SCOPE_CAP, unix_now(), false)
@@ -4696,7 +4757,21 @@ impl Relay {
                 "startup recovery removed a NIP-29 group-state event; rebuilding the group \
                  state from the surviving events"
             );
-            self.mark_group_state_stale().await;
+            // Do not schedule the coalesced worker yet: it would capture the
+            // still-empty store as its `previous` set and use the scoped
+            // (ghostless) rebuild. Keep the state pending and drop the
+            // snapshot; `startup_group_state` then performs the full rebuild,
+            // and `finish_startup_group_recovery` releases the gate.
+            self.startup_group_recovery
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.groups_rebuild
+                .dirty
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.groups_rebuild
+                .pending
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.groups.write().await.mark_stale();
+            self.persist_groups().await;
         }
         if state_removed.role {
             log::warn!(
@@ -4704,6 +4779,41 @@ impl Relay {
                  state from the surviving events"
             );
             self.mark_roles_stale().await;
+        }
+    }
+
+    /// Releases the startup recovery gate after `startup_group_state` has
+    /// completed its authoritative full rebuild. A degraded (unrestored)
+    /// start keeps the gate and the dropped snapshot; the next start
+    /// retries.
+    pub(crate) async fn finish_startup_group_recovery(&self) {
+        if !self
+            .startup_group_recovery
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
+        if self.groups.read().await.is_unrestored() {
+            // The rebuild failed and the store is deliberately fail-closed.
+            // Keep the snapshot dropped and the pending flag set.
+            self.startup_group_recovery
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            return;
+        }
+        self.groups_rebuild
+            .dirty
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        self.groups_rebuild
+            .pending
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        if self.persist_groups_outcome().await == PersistOutcome::Failed {
+            self.groups_rebuild
+                .pending
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            log::error!(
+                "could not persist the post-recovery group snapshot; keeping it dropped \
+                 fail-closed"
+            );
         }
     }
 
@@ -6987,6 +7097,90 @@ mod tests {
                 .dirty
                 .load(std::sync::atomic::Ordering::SeqCst),
             "a resumed group-state removal must not revoke the role grants"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn recovery_done_defers_the_worker_until_the_startup_rebuild() {
+        // H01: recovery must not spawn the coalesced worker while the live
+        // store is still empty; that worker captured `previous=[]` and
+        // overwrote the startup full rebuild with a ghostless scoped one.
+        let relay = build_resumed_deletion_relay(9002).await;
+        relay.recovery_done().await;
+        assert!(
+            relay
+                .groups_rebuild
+                .pending
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
+        assert!(
+            !relay
+                .groups_rebuild
+                .running
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "the startup rebuild owns the authority; no worker may race it"
+        );
+        // Simulate the server's startup full rebuild and release the gate.
+        assert!(relay.groups.write().await.rebuild(&relay.db, None).await);
+        relay.finish_startup_group_recovery().await;
+        assert!(
+            !relay
+                .groups_rebuild
+                .pending
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
+        assert!(
+            !relay
+                .startup_group_recovery
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_runtime_rebuild_republishes_group_metadata() {
+        // M05: a runtime rebuild changes membership/settings, but the
+        // stored relay-signed 39000-39005 still described the old state.
+        let relay = build_relay_with_key(false, &"01".repeat(32)).await;
+        let now = crate::util::unix_now();
+        let secp = secp256k1::Secp256k1::new();
+        let admin = secp256k1::Keypair::from_seckey_slice(&secp, &[4u8; 32]).unwrap();
+        let create = signed_group_event(
+            &secp,
+            &admin,
+            crate::nips::nip29::CREATE_GROUP,
+            "g1",
+            vec![],
+            now,
+        );
+        assert!(matches!(
+            relay.accept_event(create, &[], None).await,
+            crate::db::PutOutcome::Stored
+        ));
+        relay
+            .groups_rebuild
+            .metadata_dirty
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        relay.republish_group_metadata_if_dirty().await;
+        assert!(
+            !relay
+                .groups_rebuild
+                .metadata_dirty
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "a successful republish clears the flag"
+        );
+        let filter: crate::filter::Filter = serde_json::from_value(serde_json::json!({
+            "kinds": [crate::nips::nip29::GROUP_META],
+            "#d": ["g1"],
+        }))
+        .unwrap();
+        let (events, _) = relay.db.query(vec![filter], 10, now).await;
+        assert!(
+            events
+                .iter()
+                .any(|event| event.pubkey == relay.relay_pubkey().unwrap()),
+            "the relay-signed 39000 must be stored"
         );
         relay.db.shutdown();
     }
@@ -10925,6 +11119,49 @@ mod tests {
         assert!(
             touch.groups && touch.roles,
             "a deletion touching both families must mark both, got {touch:?}"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn foreign_group_ids_do_not_promote_a_deletion_to_global_scope() {
+        // H05 (strict audit): the old pre-check queried the e-tag ids with
+        // no author/group scoping, so 1024 foreign group-state ids promoted
+        // one deletion to a global NIP-29 fail-closed mark. The pre-check is
+        // now author-scoped for NIP-09 (and group-scoped for 9005).
+        let relay = build_relay().await;
+        let secp = secp256k1::Secp256k1::new();
+        let author = secp256k1::Keypair::from_seckey_slice(&secp, &[7u8; 32]).unwrap();
+        let foreign = secp256k1::Keypair::from_seckey_slice(&secp, &[8u8; 32]).unwrap();
+        let now = crate::util::unix_now();
+        let own = signed_group_event(
+            &secp,
+            &author,
+            9000,
+            "own-group",
+            vec![vec!["p".into(), "aa".repeat(32)]],
+            now,
+        );
+        relay.db.put(own.clone(), now).await;
+        let mut tags = vec![vec!["e".into(), own.id.clone()]];
+        for i in 0..1100u64 {
+            let event = signed_group_event(
+                &secp,
+                &foreign,
+                9000,
+                &format!("foreign-{i}"),
+                vec![vec!["p".into(), "bb".repeat(32)]],
+                now.saturating_sub(10),
+            );
+            relay.db.put(event.clone(), now).await;
+            tags.push(vec!["e".into(), event.id]);
+        }
+        let deletion = signed_group_event(&secp, &author, 5, "own-group", tags, now);
+        let touch = relay.deletion_touches_group_state(&deletion).await;
+        assert!(touch.groups, "the author's own state event is relevant");
+        assert!(
+            !touch.groups_all,
+            "foreign ids must not promote the stale scope to every group"
         );
         relay.db.shutdown();
     }

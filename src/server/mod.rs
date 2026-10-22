@@ -665,10 +665,22 @@ async fn rebuild_group_state(relay: &Relay, groups_enabled: bool) -> Result<()> 
         .rebuild(&relay.db, relay.relay_pubkey_ref())
         .await
     {
-        return Err(anyhow::anyhow!(
-            "NIP-29 group state rebuild failed: refusing to start with an \
-             incomplete group store (missing groups would expose private content)"
-        ));
+        // A fail-closed store is safer than refusing the whole relay: an
+        // attacker who creates one oversized boundary second must not make
+        // every restart impossible. Unknown ids are private while
+        // `unrestored`, and group writes are rejected; the operator can
+        // repair the history and restart.
+        let mut groups = relay.groups.write().await;
+        *groups = crate::nips::nip29::GroupStore::default();
+        groups.mark_unrestored();
+        drop(groups);
+        log::error!(
+            "NIP-29 group state rebuild failed; starting with the group store \
+             unrestored (all group content hidden and group writes rejected) \
+             until the history is repaired and the relay restarts"
+        );
+        relay.persist_groups().await;
+        return Ok(());
     }
     // The rebuilt state has no (or stale) relay-signed metadata: publish the
     // current 39000/39001/39002/39005 for every group so clients can see
@@ -697,7 +709,7 @@ async fn startup_group_state(relay: &Relay, groups_enabled: bool) -> Result<()> 
     // store holds the restored/rebuilt state and any pending purge has
     // completed, so the republished metadata reflects the state the relay
     // is about to serve.
-    if groups_enabled {
+    if groups_enabled && !relay.groups.read().await.is_unrestored() {
         relay.heal_rotated_group_metadata().await;
     }
     // Surface the resume outcome on the metrics: after the resume the
@@ -876,6 +888,9 @@ pub async fn run_server(
     // migration only runs when the NIP is enabled.
     let groups_enabled = relay.config.read().await.nip_enabled(29);
     startup_group_state(&relay, groups_enabled).await?;
+    if groups_enabled {
+        relay.finish_startup_group_recovery().await;
+    }
     if groups_enabled && relay.has_relay_key() {
         info!(
             "NIP-29 groups enabled (relay key {})",
@@ -1721,6 +1736,11 @@ async fn stats_writer(relay: Arc<Relay>, mut shutdown: watch::Receiver<bool>) {
                         .blossom_orphan_spools_swept
                         .store(blossom.store.orphan_spools_swept(), std::sync::atomic::Ordering::Relaxed);
                 }
+                // A runtime group rebuild can change members/settings while
+                // the stored relay-signed 39000-39005 still describe the
+                // pre-removal state. Republish asynchronously; keep the
+                // flag on failure for the next tick.
+                relay.republish_group_metadata_if_dirty().await;
                 if let Ok(json) = serde_json::to_string_pretty(&relay.stats.as_json()) {
                     // The atomic write (fsync + rename) is blocking I/O:
                     // run it on the blocking pool instead of stalling an

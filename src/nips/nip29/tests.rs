@@ -3286,6 +3286,72 @@ fn replay_cannot_resurrect_a_cycle_the_live_path_dropped() {
 }
 
 #[test]
+fn replay_keeps_settings_when_a_structural_link_is_dropped() {
+    // H03 (strict audit): a cycle/declared-children structural error during
+    // replay must drop only the links, not the whole 9002. Losing `private`
+    // here made a private group public after a rebuild.
+    let mut store = GroupStore::default();
+    let now = 1_600_000_000;
+    for gid in ["g1", "g2"] {
+        store.apply(
+            &event(CREATE_GROUP, ADMIN, Some(gid), vec![]),
+            "relay",
+            now,
+            false,
+            true,
+        );
+    }
+    let link_a = event(
+        9002,
+        ADMIN,
+        Some("g1"),
+        vec![vec!["parent".into(), "g2".into()]],
+    );
+    store.apply(&link_a, "relay", now, false, true);
+    let private_but_cyclic = event(
+        9002,
+        ADMIN,
+        Some("g2"),
+        vec![vec!["parent".into(), "g1".into()], vec!["private".into()]],
+    );
+    let out = store.apply(&private_but_cyclic, "relay", now, false, true);
+    assert!(out.is_empty(), "the cyclic edit emits nothing");
+    let g2 = store.group("g2").unwrap();
+    assert_eq!(g2.parent, None, "the cycle-forming link is dropped");
+    assert!(
+        g2.settings.private,
+        "the settings must survive the dropped link"
+    );
+}
+
+#[test]
+fn a_relay_signed_9008_can_release_a_ghost() {
+    // H02: a ghost normally blocks every write, including 9008, which made
+    // a deleted 9007 permanently un-purgeable. The relay master key may
+    // issue the 9008; a client may not.
+    let mut store = GroupStore::default();
+    store.mark_ghost("g1");
+    let client = event(DELETE_GROUP, ADMIN, Some("g1"), vec![]);
+    assert!(store.validate_write(&client).is_err());
+    let relay = event(DELETE_GROUP, "relay", Some("g1"), vec![]);
+    assert!(
+        store
+            .validate_write_for_relay(&relay, Some("relay"))
+            .is_ok()
+    );
+}
+
+#[test]
+fn an_unrestored_store_rejects_group_writes() {
+    // H04: a failed startup rebuild starts degraded (all group content
+    // hidden) instead of refusing to boot. Group writes must fail too.
+    let mut store = GroupStore::default();
+    store.mark_unrestored();
+    let create = event(CREATE_GROUP, ADMIN, Some("g1"), vec![]);
+    assert!(store.validate_write(&create).is_err());
+}
+
+#[test]
 fn replay_cannot_resurrect_a_last_admin_demotion() {
     // B-1: two concurrent 9000 demotions can each pass the read-side
     // validation and then interleave; the apply's re-check drops the second,
