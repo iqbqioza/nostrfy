@@ -4332,10 +4332,17 @@ impl Relay {
                         .find(|t| t.len() >= 2 && t[0] == "d")
                         .map(|t| t[1].clone())
                     {
-                        // The value only matters for the "unchanged" check;
-                        // seeding an empty list forces the first refresh to
-                        // publish the live list for an enabled group.
-                        cache.entry(gid).or_default();
+                        // Seed the *stored* list, not an empty placeholder:
+                        // if the LiveKit room is now empty, an empty seed
+                        // would compare equal and the stale non-empty 39004
+                        // would never be republished after a restart (M01).
+                        let participants: Vec<String> = event
+                            .tags
+                            .iter()
+                            .filter(|tag| tag.len() >= 2 && tag[0] == "participant")
+                            .map(|tag| tag[1].clone())
+                            .collect();
+                        cache.insert(gid, participants);
                     }
                 }
             } else {
@@ -5319,19 +5326,29 @@ impl Relay {
         generated.reverse();
 
         for mut ev in generated {
-            if ev.kind == crate::nips::nip29::GROUP_PARTICIPANTS {
+            let participants_gid = if ev.kind == crate::nips::nip29::GROUP_PARTICIPANTS {
+                Some(
+                    ev.tags
+                        .iter()
+                        .find(|t| t.len() >= 2 && t[0] == "d")
+                        .map(|t| t[1].clone())
+                        .unwrap_or_default(),
+                )
+            } else {
+                None
+            };
+            let result = self.store_relay_event(&mut ev).await;
+            if let Some(gid) = participants_gid
+                && result.is_ok()
+            {
                 // The store rewrote the participant list (the group left
                 // LiveKit): drop the cached poll result so a re-enable
-                // republishes even when the live list is unchanged.
-                let gid = ev
-                    .tags
-                    .iter()
-                    .find(|t| t.len() >= 2 && t[0] == "d")
-                    .map(|t| t[1].clone())
-                    .unwrap_or_default();
+                // republishes even when the live list is unchanged. Do this
+                // only after a successful store: clearing it first made a
+                // failed empty-list publish invisible to the stale-list
+                // scan, leaving the old 39004 forever (L23).
                 self.livekit_participants.lock().await.remove(&gid);
             }
-            let result = self.store_relay_event(&mut ev).await;
             if result.is_err() {
                 // The in-memory group state moved on, but the stored
                 // metadata did not: without this the saved 39000-39005
@@ -10785,6 +10802,138 @@ mod tests {
             "the stored 39004 must be empty after the rebuild disabled LiveKit"
         );
         relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_restart_with_an_empty_room_clears_the_stored_participant_list() {
+        // M01: the startup seed must carry the stored list. If it seeded an
+        // empty placeholder, an empty LiveKit room would compare unchanged
+        // and the stale non-empty 39004 would survive the restart.
+        use crate::db::PutOutcome;
+
+        let relay = build_relay_with_key(false, &"01".repeat(32)).await;
+        let gid = "g1";
+        let participants = std::sync::Arc::new(std::sync::Mutex::new(vec!["aa".repeat(32)]));
+        let (endpoint, _started) =
+            mock_livekit_list_participants(std::sync::Arc::clone(&participants), 0).await;
+        {
+            let mut cfg = relay.config.write().await;
+            cfg.relay.livekit_url = endpoint;
+            cfg.relay.livekit_api_key = "key".into();
+            cfg.relay.livekit_api_secret = "secret".into();
+        }
+        let now = crate::util::unix_now();
+        let secp = secp256k1::Secp256k1::new();
+        let admin = secp256k1::Keypair::from_seckey_slice(&secp, &[4u8; 32]).unwrap();
+        let create = signed_group_event(
+            &secp,
+            &admin,
+            crate::nips::nip29::CREATE_GROUP,
+            gid,
+            vec![],
+            now,
+        );
+        assert!(matches!(
+            relay.accept_event(create, &[], None).await,
+            PutOutcome::Stored
+        ));
+        let enable = signed_group_event(
+            &secp,
+            &admin,
+            9002,
+            gid,
+            vec![vec!["livekit".to_string()]],
+            now + 1,
+        );
+        assert!(matches!(
+            relay.accept_event(enable, &[], None).await,
+            PutOutcome::Stored
+        ));
+        relay.refresh_livekit_participants(gid).await;
+        assert_eq!(
+            relay.livekit_participants.lock().await.get(gid),
+            Some(&vec!["aa".repeat(32)])
+        );
+
+        // Restart: the in-memory cache is empty, but the stored 39004 is
+        // not. The live room has since become empty.
+        participants.lock().unwrap().clear();
+        relay.livekit_participants.lock().await.clear();
+        relay
+            .livekit_cache_seeded
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        relay.poll_livekit_participants().await;
+
+        let filter: crate::filter::Filter = serde_json::from_value(serde_json::json!({
+            "kinds": [crate::nips::nip29::GROUP_PARTICIPANTS],
+            "#d": [gid],
+        }))
+        .unwrap();
+        let (events, _) = relay
+            .db
+            .query(vec![filter], 10, crate::util::unix_now())
+            .await;
+        assert_eq!(events.len(), 1);
+        assert!(
+            !events[0].tags.iter().any(|tag| tag[0] == "participant"),
+            "an empty room after restart must clear the stale stored list"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_failed_empty_list_publish_keeps_the_cache_for_the_stale_scan() {
+        // L23: the leave path used to drop the cached list before storing
+        // the empty 39004. When that store failed, the stale scan had no
+        // cache entry to notice, so the old non-empty 39004 survived.
+        use crate::db::PutOutcome;
+
+        let relay = build_relay_with_key(false, &"01".repeat(32)).await;
+        let gid = "g1";
+        let now = crate::util::unix_now();
+        let secp = secp256k1::Secp256k1::new();
+        let admin = secp256k1::Keypair::from_seckey_slice(&secp, &[4u8; 32]).unwrap();
+        let create = signed_group_event(
+            &secp,
+            &admin,
+            crate::nips::nip29::CREATE_GROUP,
+            gid,
+            vec![],
+            now,
+        );
+        assert!(matches!(
+            relay.accept_event(create, &[], None).await,
+            PutOutcome::Stored
+        ));
+        let enable = signed_group_event(
+            &secp,
+            &admin,
+            9002,
+            gid,
+            vec![vec!["livekit".to_string()]],
+            now + 1,
+        );
+        assert!(matches!(
+            relay.accept_event(enable, &[], None).await,
+            PutOutcome::Stored
+        ));
+        let old = vec!["aa".repeat(32)];
+        relay
+            .livekit_participants
+            .lock()
+            .await
+            .insert(gid.to_string(), old.clone());
+
+        // A leave without the `livekit` setting; the database is down so
+        // the generated empty 39004 cannot be committed.
+        let leave = signed_group_event(&secp, &admin, 9002, gid, vec![], now + 2);
+        relay.db.shutdown();
+        let _ = relay.apply_group_event(&leave, now + 2).await;
+        assert_eq!(
+            relay.livekit_participants.lock().await.get(gid),
+            Some(&old),
+            "a failed empty-list store must keep the stale cache entry so the poll retries"
+        );
     }
 
     #[tokio::test]
