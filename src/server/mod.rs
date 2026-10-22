@@ -946,6 +946,11 @@ pub async fn run_server(
                 as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
         ),
         (
+            "nip29_ghost_reaper",
+            Box::pin(nip29_ghost_reaper(relay.clone(), shutdown_rx.clone()))
+                as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+        ),
+        (
             "livekit_participants",
             Box::pin(livekit_participants_loop(
                 relay.clone(),
@@ -1900,6 +1905,42 @@ async fn livekit_participants_loop(relay: Arc<Relay>, mut shutdown: watch::Recei
     loop {
         tokio::select! {
             _ = ticker.tick() => relay.poll_livekit_participants().await,
+            _ = shutdown.changed() => break,
+        }
+    }
+}
+
+/// How often the background NIP-29 ghost GC runs. The create path also
+/// reclaims one unbacked ghost when it hits the group limit, so this task is
+/// for idle relays whose ghosts would otherwise occupy memory forever.
+const NIP29_GHOST_REAP_INTERVAL_SECS: u64 = 600;
+/// Maximum ghosts checked per background pass (each check is up to four
+/// database lookups): bounded work, rotating cursor.
+const NIP29_GHOST_REAP_BATCH: usize = 32;
+
+async fn nip29_ghost_reaper(relay: Arc<Relay>, mut shutdown: watch::Receiver<bool>) {
+    let mut ticker = interval(Duration::from_secs(NIP29_GHOST_REAP_INTERVAL_SECS));
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    // The first tick is immediate; consume it so startup recovery/rebuild
+    // finishes before the first database walk.
+    ticker.tick().await;
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                let enabled = relay.config.read().await.nip_enabled(29);
+                if !enabled || relay.groups.read().await.stale {
+                    continue;
+                }
+                let freed = relay
+                    .reclaim_unbacked_ghosts_bounded(
+                        NIP29_GHOST_REAP_BATCH,
+                        crate::util::unix_now(),
+                    )
+                    .await;
+                if freed > 0 {
+                    info!("reclaimed {freed} unbacked NIP-29 ghost marker(s)");
+                }
+            }
             _ = shutdown.changed() => break,
         }
     }

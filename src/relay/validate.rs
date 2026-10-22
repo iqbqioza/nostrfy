@@ -469,6 +469,29 @@ impl super::Relay {
         Precheck::Accept
     }
 
+    /// Background GC pass: tries a bounded, rotating set of ghost ids and
+    /// releases every one with no surviving history. Returns how many slots
+    /// were freed. Backed ghosts stay fail-closed.
+    pub(crate) async fn reclaim_unbacked_ghosts_bounded(&self, max: usize, now: u64) -> usize {
+        let mut candidates = self.groups.read().await.ghost_group_ids();
+        if candidates.is_empty() || max == 0 {
+            return 0;
+        }
+        candidates.sort_unstable();
+        let start = self
+            .ghost_reclaim_cursor
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            % candidates.len();
+        let mut freed = 0usize;
+        for offset in 0..candidates.len().min(max) {
+            let gid = &candidates[(start + offset) % candidates.len()];
+            if self.repair_unbacked_group_ghost(gid, now).await {
+                freed += 1;
+            }
+        }
+        freed
+    }
+
     /// Tries a bounded, rotating set of ghost ids and releases the first one
     /// with no surviving history. Returns whether a slot was freed.
     ///
@@ -2883,6 +2906,32 @@ mod tests {
             assert!(
                 !relay.groups.read().await.is_ghosted("g1"),
                 "the reclaimed ghost must leave the capacity budget"
+            );
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn background_ghost_reaper_reclaims_unbacked_markers() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_validate_relay("nostrfy-ghost-reaper-test").await;
+            {
+                let mut groups = relay.groups.write().await;
+                *groups = crate::nips::nip29::GroupStore::with_cap(8);
+                groups.mark_ghost("g1");
+                groups.mark_ghost("g2");
+                groups.mark_ghost("g3");
+            }
+            assert_eq!(
+                relay.reclaim_unbacked_ghosts_bounded(16, unix_now()).await,
+                3,
+                "all three ghosts have no surviving history"
+            );
+            let groups = relay.groups.read().await;
+            assert!(
+                groups.ghost_group_ids().is_empty(),
+                "the background pass must release the unbacked ghosts"
             );
             relay.db.shutdown();
         });
