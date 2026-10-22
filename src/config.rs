@@ -1009,11 +1009,14 @@ impl Config {
             _ => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         };
         let abs = |p: PathBuf| -> PathBuf {
-            if p.is_absolute() || p.as_os_str().is_empty() {
-                p
-            } else {
-                base.join(p)
+            if p.as_os_str().is_empty() {
+                return p;
             }
+            let joined = if p.is_absolute() { p } else { base.join(p) };
+            // Drop `.` components so a `./landing.html` string does not
+            // become `/tmp/x/./landing.html` (the string fields cannot
+            // compare component-wise like a PathBuf).
+            joined.components().collect()
         };
         self.database.path = abs(self.database.path.clone());
         self.daemon.pid_file = abs(self.daemon.pid_file.clone());
@@ -1023,6 +1026,20 @@ impl Config {
         // relative Blossom storage path must be anchored to the config
         // directory, or the blobs would land in the root filesystem.
         self.blossom.local_path = abs(self.blossom.local_path.clone());
+        // The landing page and asset directory are also read after the
+        // daemon changes its working directory: anchor non-empty relative
+        // paths to the config file directory.
+        for path in [
+            &mut self.server.landing_page_file,
+            &mut self.server.assets_dir,
+        ] {
+            let trimmed = path.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let resolved = abs(PathBuf::from(trimmed));
+            *path = resolved.to_string_lossy().into_owned();
+        }
     }
 
     /// The set of NIPs this relay claims to support (NIP-11).
@@ -1394,6 +1411,11 @@ impl Config {
         // a grant, so an older persisted snapshot can never widen a
         // non-admin caller's rights.
         for (pubkey, methods) in &self.access.method_grants {
+            if !is_pubkey_or_npub(pubkey) {
+                return Err(config_err(format!(
+                    "access.method_grants contains an invalid pubkey {pubkey:?};                      use 64 lowercase hex characters or an npub1..."
+                )));
+            }
             for method in methods {
                 if !crate::nips::nip86::GRANTABLE_METHODS.contains(&method.as_str()) {
                     log::warn!(
@@ -1981,16 +2003,23 @@ fn bare_host_has_port(host: &str) -> bool {
 /// Whether a string is a 64-hex pubkey or a parseable `npub1...`.
 /// Shared with the CLI (`nostrfy blossom allow/deny`).
 pub(crate) fn is_pubkey_or_npub(value: &str) -> bool {
-    if value.len() == 64 && hex::decode(value).map(|b| b.len() == 32).unwrap_or(false) {
-        return true;
+    normalize_pubkey(value).is_some()
+}
+
+/// Lowercase hex for a 64-hex pubkey or an `npub1...`; `None` otherwise.
+/// Shared by config validation and the grant seed so an npub/uppercase key
+/// cannot sit in the map as a silently inert entry.
+fn normalize_pubkey(value: &str) -> Option<String> {
+    if value.len() == 64 && hex::decode(value).is_ok_and(|b| b.len() == 32) {
+        return Some(value.to_ascii_lowercase());
     }
     if value.starts_with("npub1")
-        && crate::nips::nip19::parse_nip19(value)
-            .is_ok_and(|e| matches!(e, crate::nips::nip19::Nip19Entity::Pubkey(_)))
+        && let Ok(crate::nips::nip19::Nip19Entity::Pubkey(bytes)) =
+            crate::nips::nip19::parse_nip19(value)
     {
-        return true;
+        return Some(hex::encode(bytes));
     }
-    false
+    None
 }
 
 // The pubkey allow/deny lists are runtime state managed via
@@ -2434,10 +2463,31 @@ impl AccessControl {
     /// that the runtime gate refuses anyway. [`Config::validate`] warns
     /// about each dropped entry.
     pub(crate) fn retain_grantable_methods(&mut self) {
-        self.method_grants.retain(|_, methods| {
-            methods.retain(|m| crate::nips::nip86::GRANTABLE_METHODS.contains(&m.as_str()));
-            !methods.is_empty()
-        });
+        // The config may spell a grantee as an npub or uppercase hex. The
+        // runtime gate compares lowercase hex, so normalize here (validate
+        // has already rejected malformed keys) and merge duplicates.
+        let mut normalized: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for (pubkey, methods) in std::mem::take(&mut self.method_grants) {
+            let Some(pubkey) = normalize_pubkey(&pubkey) else {
+                log::warn!(
+                    "access.method_grants: dropping invalid pubkey {pubkey:?}; use 64 hex                      characters or an npub1..."
+                );
+                continue;
+            };
+            let entry = normalized.entry(pubkey).or_default();
+            for method in methods {
+                if crate::nips::nip86::GRANTABLE_METHODS.contains(&method.as_str())
+                    && !entry.iter().any(|m| m == &method)
+                {
+                    entry.push(method);
+                }
+            }
+            if entry.is_empty() {
+                normalized.retain(|_, methods| !methods.is_empty());
+            }
+        }
+        self.method_grants = normalized;
     }
 
     /// Whether `pubkey` was granted `method` through NIP-86
@@ -3730,6 +3780,8 @@ max_log_files = 2
         let mut cfg = Config::default();
         cfg.blossom.local_path = PathBuf::from("./data/images");
         cfg.database.path = PathBuf::from("./data");
+        cfg.server.landing_page_file = "./landing.html".into();
+        cfg.server.assets_dir = "./assets".into();
         let dir = std::env::temp_dir().join("nostrfy-abs-test");
         let _ = std::fs::create_dir_all(&dir);
         let cfg_path = dir.join("nostrfy.toml");
@@ -3744,6 +3796,11 @@ max_log_files = 2
             "relative blossom path resolves against the config directory"
         );
         assert_eq!(cfg.database.path, dir.join("data"));
+        assert_eq!(
+            cfg.server.landing_page_file,
+            dir.join("landing.html").to_string_lossy()
+        );
+        assert_eq!(cfg.server.assets_dir, dir.join("assets").to_string_lossy());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4962,6 +5019,44 @@ max_log_files = 2
             grants,
             vec![(pk.as_str(), "banpubkey")],
             "only the grantable method may be seeded"
+        );
+    }
+
+    #[test]
+    fn config_seed_grants_normalize_npub_and_case() {
+        // AUD-28: an npub/uppercase key in the config must be normalized to
+        // lowercase hex, not left in the map as a silently inert entry.
+        let npub = "npub180cvv07tjdrrgpa0j7j7tmnyl2yr6yr7l8j4s3evf6u64th6gkwsyjh6w6";
+        let expected = match crate::nips::nip19::parse_nip19(npub).unwrap() {
+            crate::nips::nip19::Nip19Entity::Pubkey(bytes) => hex::encode(bytes),
+            _ => panic!("npub must decode to a pubkey"),
+        };
+        let mut cfg = Config::default();
+        cfg.access
+            .method_grants
+            .insert(npub.into(), vec!["banpubkey".into(), "banpubkey".into()]);
+        cfg.access.method_grants.insert(
+            expected.to_ascii_uppercase(),
+            vec!["banpubkey".into(), "createclaim".into()],
+        );
+        assert!(cfg.validate().is_ok());
+        cfg.access.retain_grantable_methods();
+        assert_eq!(cfg.access.method_grants.len(), 1);
+        assert_eq!(
+            cfg.access.method_grants[&expected],
+            vec!["banpubkey".to_string()],
+            "npub/uppercase keys merge under canonical lowercase hex; admin-only methods drop"
+        );
+        assert!(cfg.access.grants_method(&expected, "banpubkey"));
+
+        let mut bad = Config::default();
+        bad.access
+            .method_grants
+            .insert("not-a-pubkey".into(), vec!["banpubkey".into()]);
+        let err = bad.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("invalid pubkey"),
+            "a malformed grant key must fail validation: {err}"
         );
     }
 

@@ -297,11 +297,10 @@ impl Cli {
                 // daemon child already owns the file written by `daemonize`;
                 // the guard removes the foreground file on exit and refuses
                 // to overwrite a live daemon's pid file.
-                let _pid_guard = if self.daemonized {
-                    None
-                } else {
-                    Some(PidFileGuard::create(&cfg.daemon.pid_file)?)
-                };
+                // Both the foreground process and the daemon child own the
+                // same safe guard. The daemonize crate no longer writes the
+                // file itself (it followed symlinks).
+                let _pid_guard = Some(PidFileGuard::create(&cfg.daemon.pid_file)?);
                 // Register the signal handlers before the database open and
                 // its recovery: a SIGHUP/SIGTERM received during the long
                 // startup work must be handled (buffered by the tokio
@@ -738,8 +737,11 @@ impl Cli {
             .open("/dev/null")
             .map_err(|e| config_err(format!("cannot open /dev/null: {e}")))?;
 
+        // Do not let the daemonize crate write the pid file: it follows
+        // symlinks and truncates the target. The child creates the file
+        // through `PidFileGuard` (O_EXCL/O_NOFOLLOW), exactly like the
+        // foreground path; the parent only waits for it.
         let daemon = Daemonize::new()
-            .pid_file(&cfg.daemon.pid_file)
             .working_directory("/")
             .stdout(devnull.try_clone()?)
             .stderr(devnull);
@@ -1579,12 +1581,15 @@ impl PidFileGuard {
         }
         // Atomically claim the pid file so two concurrent `start`s cannot
         // both pass the live check and split-brain the database: `create_new`
-        // fails when the file already exists. A stale file (dead pid) is
-        // removed and retried once; a live pid errors out.
+        // fails when the file already exists. O_NOFOLLOW guarantees a
+        // pre-created symlink is never followed/truncated. A live pid errors
+        // out; a stale file is removed and retried.
+        use std::os::unix::fs::OpenOptionsExt;
         for _ in 0..2 {
             match std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
+                .custom_flags(libc::O_NOFOLLOW)
                 .open(path)
             {
                 Ok(mut file) => {
@@ -1600,14 +1605,23 @@ impl PidFileGuard {
                     });
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    if let Some(pid) = running_pid(path) {
+                    // The winner may have created the file but not finished
+                    // writing its pid: give it a short window before
+                    // deciding the file is stale. Removing a just-created
+                    // file let a loser erase the winner's pid.
+                    let mut live = None;
+                    for _ in 0..10 {
+                        if let Some(pid) = running_pid(path) {
+                            live = Some(pid);
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    if let Some(pid) = live {
                         return Err(config_err(format!(
                             "already running (pid {pid}); use 'nostrfy stop' or 'nostrfy restart'"
                         )));
                     }
-                    // Stale (or unreadable) pid file: remove and retry once.
-                    // A concurrent starter winning the race leaves a live
-                    // pid behind, which the retry then reports above.
                     let _ = std::fs::remove_file(path);
                     continue;
                 }
@@ -1619,26 +1633,23 @@ impl PidFileGuard {
                 }
             }
         }
-        // The retry found another stale file again (or lost a tight race):
-        // fall back to a plain overwrite of the dead pid file.
-        if running_pid(path).is_some() {
-            let pid = running_pid(path).unwrap_or(0);
-            return Err(config_err(format!(
-                "already running (pid {pid}); use 'nostrfy stop' or 'nostrfy restart'"
-            )));
-        }
-        std::fs::write(path, format!("{}\n", std::process::id())).map_err(|e| {
-            config_err(format!("cannot write the pid file {}: {e}", path.display()))
-        })?;
-        Ok(PidFileGuard {
-            path: path.to_path_buf(),
-        })
+        Err(config_err(format!(
+            "cannot claim the pid file {}: another starter won the race; retry",
+            path.display()
+        )))
     }
 }
 
 impl Drop for PidFileGuard {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        // Only remove a file that still contains our pid: if another starter
+        // replaced it (after a stale-file race), removing it would erase the
+        // winner's pid and leave a running daemon untracked.
+        if read_pid_file(&self.path)
+            .is_some_and(|text| text.trim() == std::process::id().to_string())
+        {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -2459,12 +2470,21 @@ fn stats_stale_reason(
     None
 }
 
-fn running_pid(pid_file: &Path) -> Option<u32> {
-    let pid = std::fs::read_to_string(pid_file)
-        .ok()?
-        .trim()
-        .parse::<u32>()
+fn read_pid_file(path: &Path) -> Option<String> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
         .ok()?;
+    let mut text = String::new();
+    file.read_to_string(&mut text).ok()?;
+    Some(text)
+}
+
+fn running_pid(pid_file: &Path) -> Option<u32> {
+    let pid = read_pid_file(pid_file)?.trim().parse::<u32>().ok()?;
     // `pid_t` is a signed 32-bit integer: a larger value from a corrupted
     // or hostile pid file wraps negative, and `kill(-1, 0)` probes every
     // process — the daemon would look alive forever and `stop` could never
@@ -3813,6 +3833,42 @@ name = \"nostrfy\"\n",
             !pid_file.exists(),
             "the guard must remove the pid file when the process exits"
         );
+
+        // A guard must not remove a pid file that another starter replaced:
+        // doing so would leave the winner running but untracked.
+        {
+            let guard = PidFileGuard::create(&pid_file).unwrap();
+            std::fs::write(&pid_file, "12345\n").unwrap();
+            drop(guard);
+            assert!(
+                pid_file.exists(),
+                "a replaced pid file must not be removed by the loser"
+            );
+        }
+        std::fs::remove_file(&pid_file).unwrap();
+
+        // A pre-created symlink is never followed or truncated: the guard
+        // removes it and creates a regular file, leaving the target intact.
+        let target = dir.join("attacker-target");
+        std::fs::write(&target, "do not touch\n").unwrap();
+        std::os::unix::fs::symlink(&target, &pid_file).unwrap();
+        assert!(
+            running_pid(&pid_file).is_none(),
+            "a symlinked pid file must not be read as a live pid"
+        );
+        {
+            let _guard = PidFileGuard::create(&pid_file).unwrap();
+            assert!(
+                !std::fs::symlink_metadata(&pid_file)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                "the pid path must be a regular file after the claim"
+            );
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), "do not touch\n");
+        }
+        std::fs::remove_file(&target).unwrap();
+        let _ = std::fs::remove_file(&pid_file);
 
         // A live daemon's pid file must never be overwritten. The fake
         // process carries the expected `nostrfy` comm name.

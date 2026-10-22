@@ -9,11 +9,13 @@ Options: **Compute Engine** (VM, recommended) or **Cloud Run** (containers).
 3. **SSH in** (the console's SSH button works) and follow the generic [VPS guide](vps.md):
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/iqbqioza/nostrfy/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/iqbqioza/nostrfy/main/install.sh | sudo env INSTALL_DIR=/usr/local/bin sh
 sudo mkdir -p /etc/nostrfy
 sudo curl -fsSL -o /etc/nostrfy/nostrfy.toml \
   https://raw.githubusercontent.com/iqbqioza/nostrfy/main/deploy/nostrfy.toml
 sudo nano /etc/nostrfy/nostrfy.toml                 # set name, public_url, private_key
+sudo useradd --system --create-home --home /var/lib/nostrfy nostrfy
+sudo chown nostrfy:nostrfy /etc/nostrfy/nostrfy.toml
 sudo curl -fsSL -o /etc/systemd/system/nostrfy.service \
   https://raw.githubusercontent.com/iqbqioza/nostrfy/main/deploy/nostrfy.service
 sudo systemctl daemon-reload

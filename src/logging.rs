@@ -370,10 +370,14 @@ fn tighten_log_file(path: &Path) {
 /// mode (`0640`) keeps working.
 fn open_log_file(path: &Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
+    // O_NOFOLLOW: an attacker who can pre-create daemon.log_file as a
+    // symlink must not redirect the relay's (client IP/pubkey-bearing) log
+    // into an arbitrary file. A symlink is a hard startup error.
     let file = OpenOptions::new()
         .create(true)
         .append(true)
         .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
         .open(path)?;
     tighten_log_file(path);
     Ok(file)
@@ -1221,6 +1225,32 @@ mod tests {
             );
         }
         assert!(backup_path(&path, 1).exists(), "the retry must rotate");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_symlinked_log_path_is_refused() {
+        // AUD-26: a pre-created daemon.log_file symlink must not redirect
+        // the relay's client-IP/pubkey log into an arbitrary file.
+        let dir =
+            std::env::temp_dir().join(format!("nostrfy-log-symlink-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("target");
+        std::fs::write(&target, "keep me\n").unwrap();
+        let link = dir.join("nostrfy.log");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let err = open_log_file(&link).unwrap_err();
+        assert_eq!(
+            err.raw_os_error(),
+            Some(libc::ELOOP),
+            "O_NOFOLLOW must reject the symlink: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "keep me\n",
+            "the target must not be opened for append"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

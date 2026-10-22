@@ -653,14 +653,20 @@ pub async fn rpc_handler(
                 "changerelaydescription" => "description",
                 _ => "icon",
             };
-            {
+            let previous = {
                 let mut cfg = relay.config.write().await;
+                let previous = match method {
+                    "changerelayname" => cfg.relay.name.clone(),
+                    "changerelaydescription" => cfg.relay.description.clone(),
+                    _ => cfg.relay.icon.clone(),
+                };
                 match method {
                     "changerelayname" => cfg.relay.name = value.to_string(),
                     "changerelaydescription" => cfg.relay.description = value.to_string(),
                     _ => cfg.relay.icon = value.to_string(),
                 }
-            }
+                previous
+            };
             // Bump the config version like a SIGHUP reload does: the NIP-11
             // document caches its static part against this version, so
             // without the bump clients would see the old name/description/
@@ -675,6 +681,24 @@ pub async fn rpc_handler(
             // A failed persist must not report success (like the access
             // mutations below): the change would vanish on reload.
             if !relay.persist_relay_field(field, value).await {
+                // Roll the in-memory change back: otherwise the RPC reports
+                // failure but NIP-11 serves the unpersisted value until the
+                // next reload. Only revert if no concurrent RPC already
+                // replaced it.
+                {
+                    let mut cfg = relay.config.write().await;
+                    let current = match method {
+                        "changerelayname" => &mut cfg.relay.name,
+                        "changerelaydescription" => &mut cfg.relay.description,
+                        _ => &mut cfg.relay.icon,
+                    };
+                    if *current == value {
+                        *current = previous;
+                    }
+                }
+                relay
+                    .config_version
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 audit!(&relay, &identity, method, params);
                 return rpc_err("error: cannot persist the relay field");
             }
@@ -1915,10 +1939,14 @@ mod tests {
         let resp = rpc_call(&relay, "changerelayname", vec![json!("\u{0}")]).await;
         assert!(rpc_err_of(resp).await.contains("control"));
         let resp = rpc_call(&relay, "changerelayname", vec![json!("newname")]).await;
-        // The file-less test relay cannot persist: the in-memory change
-        // applies but the RPC reports the failure (not `true`).
+        // The file-less test relay cannot persist: the RPC reports the
+        // failure and the in-memory change is rolled back, so NIP-11 cannot
+        // advertise a value that a reload would silently revert.
         assert!(rpc_err_of(resp).await.contains("persist"));
-        assert_eq!(relay.config.read().await.relay.name, "newname");
+        assert_eq!(
+            relay.config.read().await.relay.name,
+            Config::default().relay.name
+        );
         let resp = rpc_call(&relay, "changerelaydescription", vec![json!("new desc")]).await;
         assert!(rpc_err_of(resp).await.contains("persist"));
         let resp = rpc_call(&relay, "changerelayicon", vec![json!("https://x/i.png")]).await;

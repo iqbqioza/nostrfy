@@ -36,6 +36,10 @@ LimitNOFILE=65536
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
+# NIP-86 changerelayname/description/icon persist into this file. The mount
+# must be writable, and the nostrfy user must own the file:
+#   sudo chown nostrfy:nostrfy /etc/nostrfy/nostrfy.toml
+ReadWritePaths=/etc/nostrfy
 ProtectHome=true
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 ProtectKernelTunables=true

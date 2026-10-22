@@ -58,8 +58,20 @@ data there and `chown` it to `nostrfy:nostrfy`.
 
 Fetch the hardened unit (no repository clone needed) and start it:
 
+The shipped unit executes `/usr/local/bin/nostrfy`. If you used the
+user-level install above, put the binary there (or adjust `ExecStart`):
+
+```sh
+sudo install -m 0755 "$(command -v nostrfy)" /usr/local/bin/nostrfy
+```
+
+The unit runs as `nostrfy` and enables `ReadWritePaths=/etc/nostrfy` so
+NIP-86 relay-name/description/icon changes can be persisted; give that user
+ownership of the config file:
+
 ```sh
 sudo useradd --system --create-home --home /var/lib/nostrfy nostrfy
+sudo chown nostrfy:nostrfy /etc/nostrfy/nostrfy.toml
 sudo curl -fsSL -o /etc/systemd/system/nostrfy.service \
   https://raw.githubusercontent.com/iqbqioza/nostrfy/main/deploy/nostrfy.service
 sudo systemctl daemon-reload

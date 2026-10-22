@@ -10,11 +10,13 @@ Options: **EC2** (VM, recommended), **Lightsail** (simpler VM), or **ECS/Fargate
 
 ```sh
 ssh -i your-key.pem ec2-user@<public-ip>        # Ubuntu: ubuntu@<public-ip>
-curl -fsSL https://raw.githubusercontent.com/iqbqioza/nostrfy/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/iqbqioza/nostrfy/main/install.sh | sudo env INSTALL_DIR=/usr/local/bin sh
 sudo mkdir -p /etc/nostrfy
 sudo curl -fsSL -o /etc/nostrfy/nostrfy.toml \
   https://raw.githubusercontent.com/iqbqioza/nostrfy/main/deploy/nostrfy.toml
 sudo nano /etc/nostrfy/nostrfy.toml                 # set name, public_url, private_key
+sudo useradd --system --create-home --home /var/lib/nostrfy nostrfy
+sudo chown nostrfy:nostrfy /etc/nostrfy/nostrfy.toml
 sudo curl -fsSL -o /etc/systemd/system/nostrfy.service \
   https://raw.githubusercontent.com/iqbqioza/nostrfy/main/deploy/nostrfy.service
 sudo systemctl daemon-reload
