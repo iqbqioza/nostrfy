@@ -1628,6 +1628,14 @@ impl Store {
         limit: usize,
     ) -> Result<Vec<(String, BlossomMeta)>> {
         let rtxn = self.env.read_txn()?;
+        // A missing completion marker means the one-time backfill did not
+        // finish (crash, disk-full, or a failed startup rebuild). The order
+        // index may be partial, so walk every `sha:` mapping instead of
+        // returning a short page as if it were the whole inventory. This is
+        // the slow path and only runs until a restart finishes the rebuild.
+        if self.index_meta.get(&rtxn, b"blossom_order")?.is_none() {
+            return self.list_blossom_page_legacy(&rtxn, pubkey, after_uploaded, after_sha, limit);
+        }
         let prefix = format!("{BLOSSOM_ORDER_PREFIX}{pubkey}:");
         let mut upper_buf: Vec<u8> = Vec::new();
         if let (Some(uploaded), Some(sha)) = (after_uploaded, after_sha) {
@@ -1675,6 +1683,55 @@ impl Store {
             out.push((sha.to_string(), meta));
         }
         Ok(out)
+    }
+
+    /// Complete BUD-12 page without the uploaded-order index: reads every
+    /// mapping and filters by owner. Used while the one-time backfill is
+    /// missing or incomplete, so a failed rebuild cannot hide older blobs
+    /// from `/list` (M16). The sort matches the index's descending
+    /// `(uploaded, sha256)` order.
+    fn list_blossom_page_legacy(
+        &self,
+        rtxn: &heed::RoTxn<'_>,
+        pubkey: &str,
+        after_uploaded: Option<u64>,
+        after_sha: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<(String, BlossomMeta)>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let cursor = match (after_uploaded, after_sha) {
+            (Some(uploaded), Some(sha)) => Some((uploaded, sha.to_ascii_lowercase())),
+            _ => None,
+        };
+        let mut rows: Vec<(String, BlossomMeta)> = Vec::new();
+        for item in self.blossom.prefix_iter(rtxn, b"sha:")? {
+            let (key, raw) = item?;
+            let Some(sha) = std::str::from_utf8(key)
+                .ok()
+                .and_then(|key| key.strip_prefix("sha:"))
+            else {
+                continue;
+            };
+            let Ok(meta) = serde_json::from_slice::<BlossomMeta>(raw) else {
+                continue;
+            };
+            if !meta.owners.iter().any(|owner| owner == pubkey) {
+                continue;
+            }
+            let uploaded = u64::try_from(meta.uploaded).unwrap_or(0);
+            if let Some((after_uploaded, after_sha)) = &cursor
+                && (uploaded > *after_uploaded
+                    || (uploaded == *after_uploaded && sha >= after_sha.as_str()))
+            {
+                continue;
+            }
+            rows.push((sha.to_string(), meta));
+        }
+        rows.sort_by(|a, b| b.1.uploaded.cmp(&a.1.uploaded).then_with(|| b.0.cmp(&a.0)));
+        rows.truncate(limit);
+        Ok(rows)
     }
 
     /// Whether the uploaded-order index has been built (marker key).

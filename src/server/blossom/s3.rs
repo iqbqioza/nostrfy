@@ -548,6 +548,35 @@ impl S3Client {
         if !status.is_success() {
             return Err(status_error("get", status, retry_after(&resp)));
         }
+        // A 206 body must actually be the requested span: a misbehaving
+        // proxy/backend can answer 206 with another range, and the caller
+        // would label those bytes as `start..start+len`. A 200 means the
+        // backend ignored Range; the caller serves it as a full blob.
+        if range.is_some() && status == reqwest::StatusCode::PARTIAL_CONTENT {
+            let content_range = resp
+                .headers()
+                .get(reqwest::header::CONTENT_RANGE)
+                .and_then(|value| value.to_str().ok());
+            let Some(content_range) = content_range else {
+                return Err(anyhow!("S3 ranged response is missing Content-Range"));
+            };
+            if !content_range_matches(content_range, start, len) {
+                return Err(anyhow!(
+                    "S3 ranged response does not match the requested range"
+                ));
+            }
+            if let Some(length) = resp
+                .headers()
+                .get(reqwest::header::CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok())
+                && length != len
+            {
+                return Err(anyhow!(
+                    "S3 ranged response length does not match the requested range"
+                ));
+            }
+        }
         Ok(Some(resp))
     }
 
@@ -727,6 +756,30 @@ fn sign_v4(secret_key: &str, date: &str, region: &str, string_to_sign: &str) -> 
     ))
 }
 
+/// Validates `bytes <start>-<end>/<total>` against the requested span.
+/// `*` is accepted for the total; a concrete total must include the end.
+fn content_range_matches(header: &str, start: u64, len: u64) -> bool {
+    let Some(rest) = header.strip_prefix("bytes ") else {
+        return false;
+    };
+    let Some((span, total)) = rest.split_once('/') else {
+        return false;
+    };
+    let Some((first, last)) = span.split_once('-') else {
+        return false;
+    };
+    let (Ok(first), Ok(last)) = (first.parse::<u64>(), last.parse::<u64>()) else {
+        return false;
+    };
+    if first != start || last < first || last - first + 1 != len {
+        return false;
+    }
+    match total {
+        "*" => true,
+        total => total.parse::<u64>().is_ok_and(|total| total > last),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -780,6 +833,16 @@ mod tests {
             host_of("https://abc123.r2.cloudflarestorage.com"),
             "abc123.r2.cloudflarestorage.com"
         );
+    }
+
+    #[test]
+    fn content_range_validation_rejects_a_mislabeled_span() {
+        assert!(content_range_matches("bytes 10-19/100", 10, 10));
+        assert!(content_range_matches("bytes 10-19/*", 10, 10));
+        assert!(!content_range_matches("bytes 0-9/100", 10, 10));
+        assert!(!content_range_matches("bytes 10-18/100", 10, 10));
+        assert!(!content_range_matches("bytes 10-19/19", 10, 10));
+        assert!(!content_range_matches("items 10-19/100", 10, 10));
     }
 
     #[test]

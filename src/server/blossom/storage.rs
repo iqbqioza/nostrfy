@@ -171,10 +171,11 @@ pub(crate) struct BlobStore {
     /// spellings, issuing that many S3 GETs each time. Uploads clear the
     /// entry; unmapped hashes are never cached.
     missing_objects: std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
-    /// Bumped whenever an upload/found object clears the negative cache.
-    /// A lookup that started before the heal must not re-insert its stale
-    /// "missing" result after the heal (AUD-30).
-    missing_generation: std::sync::atomic::AtomicU64,
+    /// Per-hash-shard generations bumped when an upload/found object heals
+    /// the negative cache. A global counter let a hit on blob A invalidate
+    /// an in-flight miss for blob B (the S3 scan then repeated 128 owner
+    /// lookups per request).
+    missing_generation: std::sync::Arc<Vec<std::sync::atomic::AtomicU64>>,
     /// Bytes currently reserved on the system temp filesystem for S3 spool
     /// uploads (the S3 backend has no local store counter of its own).
     s3_spool_reserved: std::sync::atomic::AtomicU64,
@@ -218,7 +219,11 @@ impl BlobStore {
                 .collect(),
             orphan_spools_swept: std::sync::atomic::AtomicU64::new(0),
             missing_objects: std::sync::Mutex::new(std::collections::HashMap::new()),
-            missing_generation: std::sync::atomic::AtomicU64::new(0),
+            missing_generation: std::sync::Arc::new(
+                (0..256)
+                    .map(|_| std::sync::atomic::AtomicU64::new(0))
+                    .collect(),
+            ),
             s3_spool_reserved: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             fail_next_mapping: std::sync::atomic::AtomicBool::new(false),
@@ -352,30 +357,39 @@ impl BlobStore {
     /// duration of an upload (a plain floor check on the system temp dir
     /// for S3, whose uploads spool there). The guard releases on drop.
     pub(crate) fn reserve_space(&self, size: u64) -> Result<SpaceReservation<'_>> {
-        match &self.storage {
-            Storage::Local(s) => {
-                s.reserve(size)?;
-            }
-            Storage::S3(_) => {
-                // S3 objects never touch the local disk, but the spool
-                // does. Account concurrent spool reservations against the
-                // temp filesystem: a plain free-space check let N uploads
-                // all pass and then fill `/tmp` together (AUD-30).
-                let previous = self
-                    .s3_spool_reserved
-                    .fetch_add(size, std::sync::atomic::Ordering::SeqCst);
-                let total = previous.saturating_add(size);
-                if self.min_free_bytes > 0
-                    && free_space_of(&std::env::temp_dir())
-                        .is_some_and(|free| free < self.min_free_bytes.saturating_add(total))
-                {
-                    self.s3_spool_reserved
-                        .fetch_sub(size, std::sync::atomic::Ordering::SeqCst);
-                    return Err(crate::error::storage_full());
-                }
-            }
+        if let Storage::Local(s) = &self.storage {
+            s.reserve(size)?;
+            return Ok(SpaceReservation {
+                store: self,
+                size,
+                temp: false,
+            });
         }
-        Ok(SpaceReservation { store: self, size })
+        self.reserve_temp_space(size)
+    }
+
+    /// Reserves spool bytes on the system temp filesystem. S3 always spools
+    /// there; the local backend also falls back there when `.spool` cannot
+    /// be created. That fallback must be accounted against `/tmp`, not the
+    /// blob filesystem whose floor was already checked by `reserve_space`.
+    pub(crate) fn reserve_temp_space(&self, size: u64) -> Result<SpaceReservation<'_>> {
+        let previous = self
+            .s3_spool_reserved
+            .fetch_add(size, std::sync::atomic::Ordering::SeqCst);
+        let total = previous.saturating_add(size);
+        if self.min_free_bytes > 0
+            && free_space_of(&std::env::temp_dir())
+                .is_some_and(|free| free < self.min_free_bytes.saturating_add(total))
+        {
+            self.s3_spool_reserved
+                .fetch_sub(size, std::sync::atomic::Ordering::SeqCst);
+            return Err(crate::error::storage_full());
+        }
+        Ok(SpaceReservation {
+            store: self,
+            size,
+            temp: true,
+        })
     }
 
     /// Commits the LMDB owner mapping. Called only after the object has
@@ -578,6 +592,18 @@ impl BlobStore {
         }
     }
 
+    fn missing_shard(sha256: &str) -> usize {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        sha256.hash(&mut hasher);
+        (hasher.finish() as usize) % 256
+    }
+
+    fn missing_generation_for(&self, sha256: &str) -> u64 {
+        self.missing_generation[Self::missing_shard(sha256)]
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Records a definitive all-owners-missing lookup, unless an upload
     /// healed the hash while the scan was running. The map is bounded:
     /// expired entries are pruned first, and a still-full map is cleared
@@ -590,11 +616,7 @@ impl BlobStore {
         // Checked under the same lock as the insert: `forget_missing`
         // bumps before taking this lock, so either the bump is visible
         // here or its remove runs after this insert.
-        if self
-            .missing_generation
-            .load(std::sync::atomic::Ordering::SeqCst)
-            != generation
-        {
+        if self.missing_generation_for(sha256) != generation {
             return;
         }
         if cache.len() >= MISSING_CACHE_MAX {
@@ -609,7 +631,7 @@ impl BlobStore {
     /// Clears the negative cache for a hash (an upload healed the object).
     /// The generation bump makes an in-flight miss observation stale.
     fn forget_missing(&self, sha256: &str) {
-        self.missing_generation
+        self.missing_generation[Self::missing_shard(sha256)]
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.missing_objects
             .lock()
@@ -647,9 +669,7 @@ impl BlobStore {
         if self.missing_cached(sha256) {
             return Ok(None);
         }
-        let missing_generation = self
-            .missing_generation
-            .load(std::sync::atomic::Ordering::SeqCst);
+        let missing_generation = self.missing_generation_for(sha256);
         let mut last_error: Option<anyhow::Error> = None;
         let mut missing = false;
         let mut refused = false;
@@ -706,9 +726,7 @@ impl BlobStore {
         if self.missing_cached(sha256) {
             return Ok(false);
         }
-        let missing_generation = self
-            .missing_generation
-            .load(std::sync::atomic::Ordering::SeqCst);
+        let missing_generation = self.missing_generation_for(sha256);
         let mut last_error: Option<anyhow::Error> = None;
         let mut missing = false;
         let mut refused = false;
@@ -1115,17 +1133,19 @@ fn legacy_npub_of(pubkey: &str) -> String {
 pub(crate) struct SpaceReservation<'a> {
     store: &'a BlobStore,
     size: u64,
+    /// Whether the reservation is against the system temp spool rather than
+    /// the primary store (S3 always, local only on `.spool` fallback).
+    temp: bool,
 }
 
 impl Drop for SpaceReservation<'_> {
     fn drop(&mut self) {
-        match &self.store.storage {
-            Storage::Local(s) => s.release(self.size),
-            Storage::S3(_) => {
-                self.store
-                    .s3_spool_reserved
-                    .fetch_sub(self.size, std::sync::atomic::Ordering::SeqCst);
-            }
+        if self.temp {
+            self.store
+                .s3_spool_reserved
+                .fetch_sub(self.size, std::sync::atomic::Ordering::SeqCst);
+        } else if let Storage::Local(s) = &self.store.storage {
+            s.release(self.size);
         }
     }
 }
@@ -2181,9 +2201,7 @@ mod tests {
         // be inserted into the negative cache after the heal.
         let (s, _db_path) = store("cache-generation").await;
         let sha = "ac".repeat(32);
-        let generation = s
-            .missing_generation
-            .load(std::sync::atomic::Ordering::SeqCst);
+        let generation = s.missing_generation_for(&sha);
         // The upload publishes the object and clears the cache while the
         // reader is still scanning.
         s.forget_missing(&sha);
@@ -2193,9 +2211,7 @@ mod tests {
             "the pre-heal generation must not re-enter the negative cache"
         );
         // A scan that starts after the heal may cache a genuine miss.
-        let generation = s
-            .missing_generation
-            .load(std::sync::atomic::Ordering::SeqCst);
+        let generation = s.missing_generation_for(&sha);
         s.remember_missing_if(&sha, generation);
         assert!(s.missing_cached(&sha));
         s.db.shutdown();

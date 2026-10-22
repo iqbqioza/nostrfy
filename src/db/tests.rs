@@ -2336,6 +2336,19 @@ fn blossom_order_index_backfills_legacy_mappings() {
     wtxn.commit().unwrap();
 
     assert!(store.blossom_order_needs_rebuild().unwrap());
+    // M16: an absent/partial order index falls back to a complete mapping
+    // walk instead of returning a short page as the whole inventory.
+    let fallback = store.list_blossom_page(&alice, None, None, 10).unwrap();
+    let fallback_shas: Vec<&str> = fallback.iter().map(|(sha, _)| sha.as_str()).collect();
+    assert_eq!(fallback_shas, vec![sha_b.as_str(), sha_a.as_str()]);
+    let fallback_cursor = store
+        .list_blossom_page(&alice, Some(200), Some(&sha_b), 10)
+        .unwrap();
+    let fallback_cursor_shas: Vec<&str> = fallback_cursor
+        .iter()
+        .map(|(sha, _)| sha.as_str())
+        .collect();
+    assert_eq!(fallback_cursor_shas, vec![sha_a.as_str()]);
     assert_eq!(store.rebuild_blossom_order().unwrap(), 3);
     assert!(!store.blossom_order_needs_rebuild().unwrap());
     // The rebuilt index serves BUD-12 paging again (newest upload first).

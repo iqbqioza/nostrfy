@@ -56,6 +56,12 @@ pub(crate) struct BlossomState {
     /// global budget. A plain mutex: the critical section is two map
     /// operations and never crosses an await.
     pub uploads_inflight: std::sync::Mutex<std::collections::HashMap<String, usize>>,
+    /// Bytes reserved by in-flight uploads per uploader pubkey. The count
+    /// cap alone still let two identities hold all four maximum-sized
+    /// permits; capping each identity at one ceiling leaves half the global
+    /// budget available to everyone else while still allowing one maximum
+    /// upload per identity (or several smaller concurrent ones).
+    pub uploads_reserved: std::sync::Mutex<std::collections::HashMap<String, u64>>,
 }
 
 /// The most upload permits one pubkey may hold at once. The global budget
@@ -69,6 +75,7 @@ const MAX_UPLOADS_PER_PUBKEY: usize = 2;
 /// returns it.
 struct UploadSlot {
     state: Arc<BlossomState>,
+    reserved: u64,
     pubkey: String,
 }
 
@@ -76,7 +83,7 @@ impl BlossomState {
     /// Claims an in-flight upload slot for `pubkey`; `None` when this
     /// identity already holds [`MAX_UPLOADS_PER_PUBKEY`] uploads. The
     /// caller answers 429 before taking a global permit or spooling a body.
-    fn try_register_upload(self: &Arc<Self>, pubkey: &str) -> Option<UploadSlot> {
+    fn try_register_upload(self: &Arc<Self>, pubkey: &str, reserved: u64) -> Option<UploadSlot> {
         let mut inflight = self
             .uploads_inflight
             .lock()
@@ -85,9 +92,21 @@ impl BlossomState {
         if *count >= MAX_UPLOADS_PER_PUBKEY {
             return None;
         }
+        {
+            let mut reserved_by_identity = self
+                .uploads_reserved
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let held = reserved_by_identity.entry(pubkey.to_string()).or_insert(0);
+            if held.saturating_add(reserved) > self.max_upload_bytes as u64 {
+                return None;
+            }
+            *held = held.saturating_add(reserved);
+        }
         *count += 1;
         Some(UploadSlot {
             state: Arc::clone(self),
+            reserved,
             pubkey: pubkey.to_string(),
         })
     }
@@ -100,6 +119,17 @@ impl Drop for UploadSlot {
             .uploads_inflight
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut reserved = self
+            .state
+            .uploads_reserved
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(held) = reserved.get_mut(&self.pubkey) {
+            *held = held.saturating_sub(self.reserved);
+            if *held == 0 {
+                reserved.remove(&self.pubkey);
+            }
+        }
         if let Some(count) = inflight.get_mut(&self.pubkey) {
             *count = count.saturating_sub(1);
             if *count == 0 {
@@ -1018,31 +1048,7 @@ async fn put_blob(relay: Arc<Relay>, headers: HeaderMap, body: Body, verb: &str)
     if state.store.check_space().is_err() {
         return error(StatusCode::INSUFFICIENT_STORAGE, "storage is full");
     }
-    // Per-identity cap: the global budget allows four maximum-sized
-    // uploads, so without this one host trickling several connections
-    // could hold every permit for the whole rate window and 429 everyone
-    // else. The slot covers the spool and the publish; it releases when
-    // this function returns (including on cancellation).
-    let Some(_upload_slot) = state.try_register_upload(&pubkey) else {
-        return error(
-            StatusCode::TOO_MANY_REQUESTS,
-            "too many uploads in progress",
-        );
-    };
     let max_upload = state.max_upload_bytes;
-    let permits = match state
-        .upload_budget
-        .clone()
-        .try_acquire_many_owned(max_upload.min(u32::MAX as usize) as u32)
-    {
-        Ok(permit) => permit,
-        Err(_) => {
-            return error(
-                StatusCode::TOO_MANY_REQUESTS,
-                "too many uploads in progress",
-            );
-        }
-    };
     // A stalled body must not pin an upload permit forever: the spool
     // aborts when no chunk arrives within the HTTP read timeout (0 means
     // the header timeout is disabled, so a bounded default keeps
@@ -1061,26 +1067,38 @@ async fn put_blob(relay: Arc<Relay>, headers: HeaderMap, body: Body, verb: &str)
             "the upload exceeds the configured size limit",
         );
     }
-    // Reserve the size the spool will actually write BEFORE spooling: the
-    // spool lives on the store's filesystem, and reserving only at
-    // `put_file` (after the body was already written) let concurrent
-    // uploads push the disk below `min_free_bytes` while the LMDB writer
-    // could still map and commit into the exhausted filesystem. A declared
-    // Content-Length reserves exactly that size (capped at the ceiling):
-    // reserving the full ceiling refused small uploads with 507 whenever
-    // free space was within `max_upload` of the floor, even though the
-    // floor check passed. A chunked body (no Content-Length) keeps the
-    // full-ceiling reservation, since its size is unknown until it ends:
-    // near the floor a chunked upload is refused rather than allowed to
-    // overshoot the reservation.
+    // Reserve the size the spool will actually write BEFORE spooling. The
+    // upload permit is acquired for the same amount (not the ceiling): a
+    // pair of small uploads must not consume four maximum-sized permits.
     let reserved = declared_len.map_or(max_upload as u64, |len| len.min(max_upload as u64));
-    let _spool_space = match state.store.reserve_space(reserved) {
-        Ok(guard) => guard,
-        Err(_) => return error(StatusCode::INSUFFICIENT_STORAGE, "storage is full"),
+    // Per-identity caps: at most two uploads, and at most one ceiling's
+    // worth of reserved bytes. The count cap alone let two free identities
+    // take all four maximum-sized permits; the byte cap leaves at least
+    // half the global budget for other uploaders while still allowing one
+    // full-size upload per identity.
+    let Some(_upload_slot) = state.try_register_upload(&pubkey, reserved) else {
+        return error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many uploads in progress",
+        );
+    };
+    let permits = match state
+        .upload_budget
+        .clone()
+        .try_acquire_many_owned(reserved.min(u32::MAX as u64) as u32)
+    {
+        Ok(permit) => permit,
+        Err(_) => {
+            return error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "too many uploads in progress",
+            );
+        }
     };
     // Spool on the blob filesystem when possible: the final store is then a
     // rename (no second full write). A missing/uncreatable directory falls
-    // back to the system temp dir.
+    // back to the system temp dir, and that fallback is reserved against
+    // `/tmp` (not the blob filesystem whose floor does not cover it).
     let drain = relay.subscribe_drain();
     let spool_dir = state.store.spool_dir();
     let spool_dir = match spool_dir.as_deref() {
@@ -1089,6 +1107,14 @@ async fn put_blob(relay: Arc<Relay>, headers: HeaderMap, body: Body, verb: &str)
             Err(_) => None,
         },
         None => None,
+    };
+    let _spool_space = match if spool_dir.is_some() {
+        state.store.reserve_space(reserved)
+    } else {
+        state.store.reserve_temp_space(reserved)
+    } {
+        Ok(guard) => guard,
+        Err(_) => return error(StatusCode::INSUFFICIENT_STORAGE, "storage is full"),
     };
     let (path, size, sha) = match spool_upload(
         body,
@@ -1242,15 +1268,22 @@ async fn spool_upload(
     let mut stream = body.into_data_stream();
     let mut hash = Sha256::new();
     let mut size = 0u64;
+    // A large declared body may not be held for the full rate window with
+    // a few bytes per idle tick. After a grace period require a modest
+    // average (16 KiB/s): enough for slow mobile links, far above a drip
+    // that would monopolize the shared permit budget.
+    const MIN_UPLOAD_AVERAGE_BYTES_PER_SEC: u64 = 16 * 1024;
+    const UPLOAD_RATE_GRACE_SECS: u64 = 10;
     // Total body budget: the rate-derived time (at least one idle window,
     // so a tiny `max_upload` does not abort immediately), capped hard. The
     // per-chunk idle timeout is capped by the same ceiling: a large
     // `http_read_timeout_secs` must not override it, or one body could pin
     // an upload permit for hours.
     let rate_budget = std::time::Duration::from_secs(
-        (max_upload / MIN_UPLOAD_RATE_BYTES_PER_SEC).clamp(1, MAX_UPLOAD_TOTAL_SECS),
+        (reserved / MIN_UPLOAD_RATE_BYTES_PER_SEC).clamp(1, MAX_UPLOAD_TOTAL_SECS),
     );
-    let total_deadline = tokio::time::Instant::now()
+    let started = tokio::time::Instant::now();
+    let total_deadline = started
         + rate_budget.max(idle_timeout.min(std::time::Duration::from_secs(MAX_UPLOAD_TOTAL_SECS)));
     loop {
         let now = tokio::time::Instant::now();
@@ -1284,6 +1317,18 @@ async fn spool_upload(
             }
         };
         size = size.saturating_add(chunk.len() as u64);
+        let elapsed = started.elapsed().as_secs();
+        if elapsed > UPLOAD_RATE_GRACE_SECS
+            && size
+                < elapsed
+                    .saturating_sub(UPLOAD_RATE_GRACE_SECS)
+                    .saturating_mul(MIN_UPLOAD_AVERAGE_BYTES_PER_SEC)
+        {
+            return Err(Box::new(error(
+                StatusCode::REQUEST_TIMEOUT,
+                "upload too slow: average rate below the minimum",
+            )));
+        }
         if size > max_upload {
             return Err(Box::new(error(
                 StatusCode::PAYLOAD_TOO_LARGE,
@@ -1727,6 +1772,7 @@ pub(crate) async fn build_state(
                     cfg.blossom.max_upload_bytes.saturating_mul(4).max(1),
                 )),
                 uploads_inflight: std::sync::Mutex::new(std::collections::HashMap::new()),
+                uploads_reserved: std::sync::Mutex::new(std::collections::HashMap::new()),
             });
             // One-time automatic migration of legacy blobs (storage files
             // that predate the LMDB mapping), in the background so the
@@ -2722,15 +2768,15 @@ mod tests {
                 Result<bytes::Bytes, std::io::Error>,
             >())
         };
-        // Pubkey A fills its per-identity share with stalled uploads.
-        let mut stalled = Vec::new();
-        for _ in 0..MAX_UPLOADS_PER_PUBKEY {
-            stalled.push(tokio::spawn(upload(
-                State(relay.clone()),
-                headers_a.clone(),
-                pending(),
-            )));
-        }
+        // Pubkey A's first stalled upload has no Content-Length, so it
+        // reserves the full ceiling and consumes the identity's whole byte
+        // budget. A second stalled upload must be refused, leaving the
+        // global budget for another identity.
+        let stalled = vec![tokio::spawn(upload(
+            State(relay.clone()),
+            headers_a.clone(),
+            pending(),
+        ))];
         let mut a_slots = 0;
         for _ in 0..200 {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -2741,13 +2787,18 @@ mod tests {
                 .get(&pk_a)
                 .copied()
                 .unwrap_or(0);
-            if a_slots >= MAX_UPLOADS_PER_PUBKEY {
+            if a_slots >= 1 {
                 break;
             }
         }
         assert_eq!(
-            a_slots, MAX_UPLOADS_PER_PUBKEY,
-            "the stalled uploads must register their identity slots"
+            a_slots, 1,
+            "the stalled upload must register its identity slot and byte budget"
+        );
+        assert_eq!(
+            state.uploads_reserved.lock().unwrap().get(&pk_a).copied(),
+            Some(state.max_upload_bytes as u64),
+            "the identity must hold exactly one ceiling of reserved bytes"
         );
         // A third upload by A is refused before it can take a permit.
         let before = state.upload_budget.available_permits();
@@ -2782,6 +2833,10 @@ mod tests {
         assert!(
             state.uploads_inflight.lock().unwrap().is_empty(),
             "cancelled uploads must release their identity slots"
+        );
+        assert!(
+            state.uploads_reserved.lock().unwrap().is_empty(),
+            "cancelled uploads must release their byte budgets"
         );
         assert_eq!(
             state.upload_budget.available_permits(),
