@@ -717,15 +717,14 @@ impl super::Relay {
         // events MUST be signed by the relay's own key ("the pubkey
         // specified in the `self` field of the relay's NIP-11 document");
         // events signed by anyone else are rejected.
-        if cfg.nip_enabled(43)
-            && matches!(
-                event.kind,
-                nip43::ROLE_DEFINITION
-                    | nip43::MEMBERSHIP_LIST
-                    | nip43::ADD_USER
-                    | nip43::REMOVE_USER
-            )
-            && Some(event.pubkey.as_str()) != self.relay_pubkey_ref()
+        // Unconditional (like NIP-42 AUTH): while NIP-43 is disabled a
+        // client-signed role-state event would still be stored, and a later
+        // enable/rebuild would replay or ignore it inconsistently. These
+        // kinds are relay metadata in every configuration.
+        if matches!(
+            event.kind,
+            nip43::ROLE_DEFINITION | nip43::MEMBERSHIP_LIST | nip43::ADD_USER | nip43::REMOVE_USER
+        ) && Some(event.pubkey.as_str()) != self.relay_pubkey_ref()
         {
             bail!("blocked: relay metadata must be published by the relay");
         }
@@ -1903,6 +1902,34 @@ mod tests {
             );
             relay.db.shutdown();
         });
+    }
+
+    #[tokio::test]
+    async fn client_signed_role_metadata_is_rejected_while_nip43_is_disabled() {
+        // AUD-17: these kinds are relay metadata in every configuration.
+        // Storing a client-signed one while NIP-43 is disabled lets a later
+        // enable/rebuild replay it inconsistently.
+        let relay = build_validate_relay("nostrfy-nip43-disabled-metadata-test").await;
+        relay.config.write().await.relay.disabled_nips = vec![43];
+        let cfg = relay.config.read().await;
+        let now = unix_now();
+        for kind in [
+            crate::nips::nip43::ROLE_DEFINITION,
+            crate::nips::nip43::MEMBERSHIP_LIST,
+            crate::nips::nip43::ADD_USER,
+            crate::nips::nip43::REMOVE_USER,
+        ] {
+            let event = signed_with_seed(7, kind, vec![]);
+            let err = relay
+                .validate_base(&cfg, &event, now, &[], None)
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("relay metadata"),
+                "kind {kind} must be rejected regardless of the NIP-43 toggle: {err}"
+            );
+        }
+        drop(cfg);
+        relay.db.shutdown();
     }
 
     #[tokio::test]

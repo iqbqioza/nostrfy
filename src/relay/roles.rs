@@ -220,7 +220,7 @@ impl super::Relay {
         // them and the edit would recreate the deleted role.
         let event = self
             .mutate_roles(
-                super::BufferedRoleMutation::Create {
+                super::BufferedRoleMutation::Edit {
                     id: id.to_string(),
                     label: label.to_string(),
                     description: description.to_string(),
@@ -228,14 +228,32 @@ impl super::Relay {
                     order,
                 },
                 |roles| {
-                    if !roles.roles.contains_key(id) {
+                    let pending = self.roles_rebuild.dirty.load(Ordering::SeqCst)
+                        || self.roles_rebuild.running.load(Ordering::SeqCst);
+                    let known = roles.roles.contains_key(id)
+                        || (pending
+                            && self
+                                .roles_rebuild
+                                .revoked_roles
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .contains(id));
+                    if !known {
                         return (None, false);
                     }
-                    roles.create(id, label, description, color, order);
-                    (
-                        Some(roles.role_event(id, &relay_pubkey, self.stamp_floor(unix_now()))),
-                        true,
-                    )
+                    let event = if roles.roles.contains_key(id) {
+                        roles.create(id, label, description, color, order);
+                        roles.role_event(id, &relay_pubkey, self.stamp_floor(unix_now()))
+                    } else {
+                        // The rebuild revoked the live store: build the
+                        // definition from a scratch store and leave the
+                        // fail-closed store empty. `Edit` replay applies it
+                        // only if the role survives the rebuild.
+                        let mut scratch = RoleStore::default();
+                        scratch.create(id, label, description, color, order);
+                        scratch.role_event(id, &relay_pubkey, self.stamp_floor(unix_now()))
+                    };
+                    (Some(event), true)
                 },
             )
             .await;
@@ -360,7 +378,17 @@ impl super::Relay {
                 },
                 |roles| {
                     let was_member = roles.assignments.contains_key(pubkey);
-                    if !roles.roles.contains_key(role) {
+                    let pending = self.roles_rebuild.dirty.load(Ordering::SeqCst)
+                        || self.roles_rebuild.running.load(Ordering::SeqCst);
+                    let known = roles.roles.contains_key(role)
+                        || (pending
+                            && self
+                                .roles_rebuild
+                                .revoked_roles
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .contains(role));
+                    if !known {
                         ((RoleChange::Unknown, was_member), false)
                     } else if roles
                         .assignments
@@ -369,6 +397,8 @@ impl super::Relay {
                     {
                         ((RoleChange::Noop, was_member), false)
                     } else {
+                        // On the revoked empty store `assign` is a no-op;
+                        // `changed=true` captures it for replay.
                         roles.assign(pubkey, role);
                         ((RoleChange::Applied, was_member), true)
                     }
@@ -402,6 +432,17 @@ impl super::Relay {
                 if !self.publish_membership(change).await {
                     return RoleChange::Failed;
                 }
+            }
+        } else if outcome == RoleChange::Noop {
+            // A previous attempt may have applied in memory but failed to
+            // publish; a plain retry reads back as Noop. Republish the
+            // current state so the retry can complete the original call.
+            if rebuild_pending {
+                if !self.publish_add_user(pubkey).await {
+                    return RoleChange::Failed;
+                }
+            } else if !self.publish_membership(None).await {
+                return RoleChange::Failed;
             }
         }
         outcome
@@ -466,6 +507,16 @@ impl super::Relay {
                 if !self.publish_membership(change).await {
                     return RoleChange::Failed;
                 }
+            }
+        } else if outcome == RoleChange::Noop {
+            // See `assign_role`: a retry of a remove that already applied in
+            // memory but failed to publish must republish the membership.
+            if rebuild_pending {
+                if !self.publish_remove_user(pubkey).await {
+                    return RoleChange::Failed;
+                }
+            } else if !self.publish_membership(None).await {
+                return RoleChange::Failed;
             }
         }
         outcome

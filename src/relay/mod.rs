@@ -827,8 +827,18 @@ const ROLES_REBUILD_BUFFER_MAX: usize = 4096;
 /// [`Relay::apply_leave_request`]).
 #[derive(Debug, Clone)]
 enum BufferedRoleMutation {
-    /// `create_role` / `edit_role` (both install the role definition).
+    /// `create_role`: install the role definition (and create it).
     Create {
+        id: String,
+        label: String,
+        description: String,
+        color: String,
+        order: Option<i64>,
+    },
+    /// `edit_role`: install the role definition only when the rebuilt store
+    /// still contains it. A missing role must not be re-created by an edit
+    /// that raced the rebuild.
+    Edit {
         id: String,
         label: String,
         description: String,
@@ -918,6 +928,17 @@ fn replay_role_mutation(store: &mut RoleStore, mutation: &BufferedRoleMutation) 
             color,
             order,
         } => store.create(id, label, description, color, *order),
+        BufferedRoleMutation::Edit {
+            id,
+            label,
+            description,
+            color,
+            order,
+        } => {
+            if store.roles.contains_key(id) {
+                store.create(id, label, description, color, *order);
+            }
+        }
         BufferedRoleMutation::Delete { id } => {
             store.delete(id);
         }
@@ -980,6 +1001,11 @@ struct RolesRebuild {
     failed_rebuilds: std::sync::atomic::AtomicU64,
     /// Mutations accepted while the scan runs (see [`RolesRebuildBuffer`]).
     buffer: tokio::sync::Mutex<RolesRebuildBuffer>,
+    /// Role ids the live store held when it was last revoked. During the
+    /// rebuild the live store is empty, so `assign_role`/`edit_role` use
+    /// this hint to distinguish "exists in the history being replayed"
+    /// from a genuinely unknown id. Cleared once a rebuild succeeds.
+    revoked_roles: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Derived-state mutations committed but not yet applied in memory
     /// (see [`DerivedMutationEpoch`]).
     derived: DerivedMutationEpoch,
@@ -1053,8 +1079,13 @@ impl RolesRebuild {
             // A removal landed while the scan ran (or during the swap): the
             // fresh store may predate it and the swap may have reinstated a
             // removed grant. Restore the fail-closed empty store and let
-            // the worker rebuild again.
+            // the worker rebuild again. Keep the buffered mutations: they
+            // were accepted during this pending window and applied to the
+            // live store, which is being discarded here; the next scan must
+            // replay them or an ACKed claim/leave would vanish.
             *store = RoleStore::default();
+            buffer.mutations = buffered;
+            buffer.overflow = false;
             self.failed_rebuilds
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return false;
@@ -1230,6 +1261,25 @@ async fn roles_rebuild_worker(
         }
     }
     state.running.store(false, Ordering::SeqCst);
+    // A clean rebuild persisted the live store with every mutation captured
+    // while `running` was set. Replaying those captures in a later rebuild
+    // would re-apply stale intent (e.g. an assignment later revoked), so
+    // drop them once no rescan is pending. If dirty is still set, keep the
+    // buffer: the next scan needs the mutations (see `finish_rebuild`).
+    if !state.dirty.load(Ordering::SeqCst) {
+        let mut buffer = state.buffer.lock().await;
+        buffer.mutations.clear();
+        buffer.overflow = false;
+        buffer.scanning = false;
+        // The successful swap restored the role ids; the revoked hint is
+        // no longer authoritative.
+        drop(buffer);
+        state
+            .revoked_roles
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+    }
     // A removal that arrived after the loop's last dirty check (while
     // `running` was still set) saw a running worker and did not spawn one:
     // re-check and reschedule. A signaled drain keeps the state dirty
@@ -1780,11 +1830,15 @@ async fn snapshot_persist_worker(
         }
         if state.roles_dirty.swap(false, Ordering::SeqCst) {
             let outcome = persist_roles_now(&db, &roles, &roles_rebuild, &persist_roles_lock).await;
-            if outcome == PersistOutcome::Failed && roles_rebuild.running.load(Ordering::SeqCst) {
-                // The rebuild owns the store: persist refused a stale
-                // snapshot. Keep the dirty flag set so this worker retries
-                // after `running` clears instead of losing a post-swap
-                // role mutation (M-1).
+            if outcome == PersistOutcome::Deferred
+                || (outcome == PersistOutcome::Failed
+                    && roles_rebuild.running.load(Ordering::SeqCst))
+            {
+                // Deferred: a derived mutation (NIP-09 deletion/vanish) was
+                // in flight; the caller already reported success, so the
+                // claim/leave must be retried once the epoch drains. Failed
+                // while the rebuild owns the store: retry after `running`
+                // clears instead of losing a post-swap mutation (M-1).
                 state.roles_dirty.store(true, Ordering::SeqCst);
             }
         }
@@ -4456,6 +4510,16 @@ impl Relay {
     /// overwrite it until the rebuild completes.
     pub(crate) async fn mark_roles_stale(&self) {
         self.roles_rebuild.dirty.store(true, Ordering::SeqCst);
+        {
+            let live = self.roles.read().await;
+            let mut revoked = self
+                .roles_rebuild
+                .revoked_roles
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            revoked.clear();
+            revoked.extend(live.roles.keys().cloned());
+        }
         *self.roles.write().await = RoleStore::default();
         schedule_roles_rebuild(
             self.db.clone(),
@@ -7141,6 +7205,164 @@ mod tests {
             !saved.claims.contains("durable"),
             "deleteclaim must persist the revocation before returning: {:?}",
             saved.claims
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_deferred_claim_persist_is_retried_until_durable() {
+        // AUD-14: a NIP-09/vanish epoch makes persist_roles_now return
+        // Deferred even though createclaim already returned success. The
+        // debounced worker must re-arm the dirty flag, or the invite code is
+        // lost on restart (a lost deleteclaim would be fail-open).
+        let key = "01".repeat(32);
+        let relay = build_role_relay(Some(&key)).await;
+        let in_flight = relay.roles_rebuild.derived.begin();
+        assert!(relay.create_claim("deferred-code").await.is_ok());
+        // Let the debounce worker observe the in-flight epoch and defer.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            relay
+                .snapshot_persist
+                .roles_dirty
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "a Deferred pass must leave the snapshot dirty for a retry"
+        );
+        drop(in_flight);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            if let crate::db::LoadRolesOutcome::Loaded(snapshot) = relay.db.load_roles().await
+                && snapshot.claims.contains("deferred-code")
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the deferred claim was never persisted"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_dirty_swap_keeps_buffered_mutations_for_the_rescan() {
+        // AUD-15: finish_rebuild takes the buffer, replays it, then detects
+        // a removal and discards the fresh store. The buffered mutations
+        // were applied to the (now discarded) live store; they must return
+        // to the buffer for the next scan instead of vanishing.
+        let key = "01".repeat(32);
+        let relay = build_role_relay(Some(&key)).await;
+        {
+            let mut buffer = relay.roles_rebuild.buffer.lock().await;
+            buffer.mutations.push(super::BufferedRoleMutation::Assign {
+                pubkey: "aa".repeat(32),
+                role: "r1".into(),
+            });
+        }
+        relay
+            .roles_rebuild
+            .dirty
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let fresh = crate::nips::nip43::RoleStore::default();
+        assert!(
+            !relay
+                .roles_rebuild
+                .finish_rebuild(&relay.roles, fresh)
+                .await,
+            "a dirty swap must be discarded"
+        );
+        let buffer = relay.roles_rebuild.buffer.lock().await;
+        assert_eq!(
+            buffer.mutations.len(),
+            1,
+            "the captured mutation must survive for the rescan"
+        );
+        drop(buffer);
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn role_mutations_during_a_pending_rebuild_recognize_existing_roles() {
+        // AUD-18: marking a rebuild revokes the live store. An assign/edit
+        // for a role that the history still contains must use the revoked
+        // hint instead of reporting "unknown"; a genuinely unknown id stays
+        // an error.
+        let key = "01".repeat(32);
+        let relay = build_role_relay(Some(&key)).await;
+        assert!(relay.create_role("r1", "R1", "", "", None).await);
+        relay.signal_drain();
+        relay.mark_roles_stale().await;
+        assert!(relay.roles.read().await.roles.is_empty());
+        let member = "aa".repeat(32);
+        assert_eq!(
+            relay.assign_role(&member, "r1").await,
+            RoleChange::Applied,
+            "an existing role must be assignable during the rebuild"
+        );
+        assert!(
+            relay.edit_role("r1", "R1b", "d", "blue", None).await,
+            "an existing role must be editable during the rebuild"
+        );
+        assert_eq!(
+            relay.assign_role(&member, "nope").await,
+            RoleChange::Unknown
+        );
+        assert!(!relay.edit_role("nope", "N", "", "", None).await);
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_duplicate_assign_or_unassign_retry_republishes_the_list() {
+        // AUD-19: the first call can apply in memory but fail to publish.
+        // A retry then sees the grant/revocation as a no-op; it must still
+        // republish the membership list so the clients converge.
+        let key = "01".repeat(32);
+        let relay = build_role_relay(Some(&key)).await;
+        assert!(relay.create_role("r1", "R1", "", "", None).await);
+        let member = "aa".repeat(32);
+        assert_eq!(relay.assign_role(&member, "r1").await, RoleChange::Applied);
+        let filter: crate::filter::Filter = serde_json::from_value(serde_json::json!({
+            "kinds": [crate::nips::nip43::MEMBERSHIP_LIST],
+        }))
+        .unwrap();
+        let (members, _) = relay
+            .db
+            .query(vec![filter.clone()], 10, crate::util::unix_now())
+            .await;
+        let id = members[0].id_bytes().unwrap();
+        assert_eq!(relay.db.remove_events_by_id(&[id]).await, Some(1));
+
+        assert_eq!(relay.assign_role(&member, "r1").await, RoleChange::Noop);
+        let (members, _) = relay
+            .db
+            .query(vec![filter.clone()], 10, crate::util::unix_now())
+            .await;
+        assert_eq!(
+            members.len(),
+            1,
+            "the no-op retry must republish the lost membership"
+        );
+
+        assert_eq!(
+            relay.unassign_role(&member, "r1").await,
+            RoleChange::Applied
+        );
+        let (members, _) = relay
+            .db
+            .query(vec![filter.clone()], 10, crate::util::unix_now())
+            .await;
+        let id = members[0].id_bytes().unwrap();
+        assert_eq!(relay.db.remove_events_by_id(&[id]).await, Some(1));
+        assert_eq!(relay.unassign_role(&member, "r1").await, RoleChange::Noop);
+        let (members, _) = relay
+            .db
+            .query(vec![filter], 10, crate::util::unix_now())
+            .await;
+        assert_eq!(
+            members.len(),
+            1,
+            "the no-op revocation retry must republish the lost list"
         );
         relay.db.shutdown();
     }
