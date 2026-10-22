@@ -61,6 +61,28 @@ pub fn deletion_addresses(event: &Event) -> Vec<Address> {
     out
 }
 
+/// Every distinct `a` target, without the live-intake cap. Migration is an
+/// explicit offline replay of a pre-cap export: silently dropping targets
+/// left addressable events and their tombstones behind. The unbounded walk
+/// is acceptable there because the operator chose the import; live intake
+/// keeps using [`deletion_addresses`] and [`deletion_addresses_exceed_cap`].
+pub fn deletion_addresses_all(event: &Event) -> Vec<Address> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for tag in &event.tags {
+        if tag.first().map(String::as_str) != Some("a") || tag.len() < 2 {
+            continue;
+        }
+        let Some(address) = parse_address(&tag[1]) else {
+            continue;
+        };
+        if seen.insert(address.clone()) {
+            out.push(address);
+        }
+    }
+    out
+}
+
 /// Whether a deletion request has more distinct `a` targets than
 /// [`MAX_DELETION_ADDRESSES`]. Checked at live intake before the event is
 /// stored, so the replay paths never silently truncate a request this
@@ -130,6 +152,11 @@ mod tests {
             "the replay path must not materialize more than the cap"
         );
         assert!(deletion_addresses_exceed_cap(&ev));
+        assert_eq!(
+            deletion_addresses_all(&ev).len(),
+            MAX_DELETION_ADDRESSES + 10,
+            "migration must process every pre-cap address instead of truncating"
+        );
 
         let exact = event(tags[..MAX_DELETION_ADDRESSES].to_vec());
         assert!(!deletion_addresses_exceed_cap(&exact));

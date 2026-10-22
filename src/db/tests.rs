@@ -2242,7 +2242,7 @@ fn store_blossom_mapping_lifecycle() {
 }
 
 #[test]
-fn gift_wrap_deletion_refuses_an_unbuilt_index() {
+fn gift_wrap_deletion_rebuilds_an_unbuilt_index() {
     use crate::db::store::Store;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
@@ -2251,15 +2251,11 @@ fn gift_wrap_deletion_refuses_an_unbuilt_index() {
     // was never backfilled.
     let store = Store::open(&cfg, Arc::new(AtomicBool::new(true)), 512).unwrap();
     let recipient = [7u8; 32];
-    // The range walk would silently miss every pre-index wrap, so the
-    // deletion must fail loudly instead (the vanish path then skips its
-    // marker and the NIP-09 path reports the failure).
-    let err = store
-        .delete_gift_wraps_to(&recipient, u64::MAX)
-        .expect_err("an unbuilt index must fail the deletion");
-    assert!(err.to_string().contains("not built"), "{err}");
-    // After the backfill the same deletion succeeds (nothing stored).
-    assert_eq!(store.rebuild_gift_wrap_index().unwrap(), 0);
+    // L25: a failed startup backfill must not disable live purges until
+    // the next restart. The writer rebuilds on demand and completes the
+    // deletion (nothing stored here, so the count is 0).
+    assert_eq!(store.delete_gift_wraps_to(&recipient, u64::MAX).unwrap(), 0);
+    assert!(!store.gift_wrap_index_needs_rebuild().unwrap());
     assert_eq!(store.delete_gift_wraps_to(&recipient, u64::MAX).unwrap(), 0);
 }
 
@@ -8531,11 +8527,10 @@ fn a_pre_flag_pending_deletion_is_resumed_and_cleared() {
 }
 
 #[test]
-fn a_failed_gift_wrap_purge_is_held_for_the_deletion_resume() {
-    // NIP-59: the wrap purge must not be a log-only side effect. When it
-    // fails (here: the recipient index is not built, so the walk cannot
-    // find the wraps), the deletion itself fails and the pending record
-    // stays — the replay must re-attempt the purge, not just the walk.
+fn a_missing_gift_wrap_index_is_rebuilt_during_deletion() {
+    // L25: a failed startup backfill must not disable NIP-09/62 wrap purges
+    // until the next restart. The writer rebuilds the missing index on
+    // demand, then the same deletion removes the wrap and clears pending.
     use crate::db::store::Store;
     let cfg = config();
     let now = 1_700_000_000u64;
@@ -8569,8 +8564,6 @@ fn a_failed_gift_wrap_purge_is_held_for_the_deletion_resume() {
         }
         wtxn.commit().unwrap();
     }
-    // Marker missing (Store::open never runs the backfill): the purge fails
-    // loudly, and so does the whole deletion.
     assert!(store.gift_wrap_index_needs_rebuild().unwrap());
     let report = store.apply_deletion_group(
         std::slice::from_ref(&post.id),
@@ -8581,37 +8574,11 @@ fn a_failed_gift_wrap_purge_is_held_for_the_deletion_resume() {
         true,
     );
     assert!(
-        report.error.is_some(),
-        "a failed wrap purge must fail the deletion, not log and pass"
+        report.error.is_none(),
+        "the on-demand rebuild must let the deletion complete: {:?}",
+        report.error
     );
-    {
-        let rtxn = store.env.read_txn().unwrap();
-        assert!(
-            store
-                .events
-                .get(&rtxn, &wrap.id_bytes().unwrap())
-                .unwrap()
-                .is_some(),
-            "the failed purge must leave the wrap in place"
-        );
-        assert_eq!(
-            store.delete_pending.len(&rtxn).unwrap(),
-            1,
-            "the failed deletion keeps its pending record"
-        );
-    }
-    // The startup recovery rebuilds the index; the resume then completes
-    // both the walk and the purge and clears the record.
-    assert_eq!(store.rebuild_gift_wrap_index().unwrap(), 1);
-    let report = store.apply_deletion_group(
-        std::slice::from_ref(&post.id),
-        &[],
-        Some(&pk),
-        now,
-        None,
-        true,
-    );
-    assert!(report.error.is_none(), "the resume must succeed");
+    assert!(!store.gift_wrap_index_needs_rebuild().unwrap());
     {
         let rtxn = store.env.read_txn().unwrap();
         assert!(
@@ -8620,7 +8587,7 @@ fn a_failed_gift_wrap_purge_is_held_for_the_deletion_resume() {
                 .get(&rtxn, &wrap.id_bytes().unwrap())
                 .unwrap()
                 .is_none(),
-            "the resume must also revoke the requester's gift wraps"
+            "the rebuilt index must find and remove the recipient's wrap"
         );
         assert_eq!(
             store.delete_pending.len(&rtxn).unwrap(),

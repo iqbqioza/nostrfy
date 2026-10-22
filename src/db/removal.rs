@@ -227,14 +227,16 @@ impl Store {
     /// deletion path, reachable from any NIP-09 deletion request) just to
     /// catch hex case variants.
     fn remove_gift_wraps_for(&self, pubkey: &[u8], until: u64, removed: &mut usize) -> Result<()> {
-        // The recipient index is backfilled once at startup; when its
-        // marker is missing (the rebuild failed or never ran) the range
-        // walk below would silently miss every pre-index wrap. Refuse
-        // loudly instead: the vanish caller then skips its marker (so a
-        // re-delivered request retries the wraps) and the NIP-09 caller
-        // reports the deletion as failed.
+        // The recipient index is backfilled once at startup. If that
+        // rebuild failed (or never ran), the range walk below would miss
+        // every pre-index wrap. Rebuild it on demand here: this is the
+        // writer thread and there is no outer write transaction, so the
+        // chunked rebuild is safe and lets a live NIP-09/62 purge recover
+        // without a restart (L25). A genuine disk/map failure still
+        // propagates, leaving the deletion pending for the next retry.
         if self.gift_wrap_index_needs_rebuild()? {
-            return Err(anyhow::anyhow!("gift-wrap recipient index is not built"));
+            log::warn!("gift-wrap recipient index is missing; rebuilding it before the purge");
+            self.rebuild_gift_wrap_index()?;
         }
         let start = tag_key(GIFT_WRAP_INDEX, pubkey, 0, &[0u8; ID_LEN]);
         let end = crate::db::store::range_end(

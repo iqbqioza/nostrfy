@@ -1182,7 +1182,11 @@ async fn replay_stored_moderation(
 /// does both after storing the request).
 async fn apply_nip09(db: &DbClient, event: &Event, stats: &mut Stats) -> Result<()> {
     let targets = nip09::deletion_targets(event);
-    let addresses = nip09::deletion_addresses(event);
+    // The live intake caps `a` targets; a strfry export can predate that
+    // cap. Applying only the first 512 left the remaining addressable
+    // events (and their tombstones) behind while reporting a completed
+    // migration (M28).
+    let addresses = nip09::deletion_addresses_all(event);
     if targets.is_empty() && addresses.is_empty() {
         // Nothing resolvable to delete: intentionally no side effects here
         // (in particular no gift-wrap purge). The live path differs: it
@@ -1540,6 +1544,39 @@ mod tests {
         let events = visible(&db, serde_json::json!({"kinds": [30001]}));
         assert_eq!(events.len(), 1, "only the version above the cut survives");
         assert_eq!(events[0].content, "newer");
+        db.shutdown();
+    }
+
+    #[test]
+    fn nip09_address_deletion_processes_every_pre_cap_address() {
+        // M28: a legacy export may contain a deletion with more than the
+        // live 512-address cap. Migration must apply all of them instead of
+        // silently truncating and reporting a complete import.
+        let db = test_db("nip09-address-over-cap");
+        let now = unix_now();
+        let mut events = Vec::new();
+        for i in 0..520 {
+            events.push(signed(
+                1,
+                30002,
+                now - 10,
+                vec![vec!["d".into(), format!("d{i}")]],
+                "",
+            ));
+        }
+        let a_tags: Vec<Vec<String>> = events
+            .iter()
+            .enumerate()
+            .map(|(i, target)| vec!["a".into(), format!("30002:{}:d{i}", target.pubkey)])
+            .collect();
+        let deletion = signed(1, nip09::DELETION_KIND, now - 5, a_tags, "");
+        events.push(deletion);
+        let stats = run_str(&db, &jsonl(&events), &options());
+        assert_eq!(stats.deletions_applied, 1);
+        assert!(
+            visible(&db, serde_json::json!({"kinds": [30002]})).is_empty(),
+            "all 520 address targets must be removed"
+        );
         db.shutdown();
     }
 
