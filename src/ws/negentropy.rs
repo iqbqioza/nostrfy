@@ -209,23 +209,31 @@ impl super::Conn {
             (cfg.nip_enabled(77), cfg.limits.max_sub_id_len)
         };
         self.max_sub_id_len = max_sub_id_len;
-        let correl_id: Option<String> = rest
+        // Keep the raw id separate from its sanitized echo: the raw id owns
+        // any existing state/queued frames and must be used as the cleanup
+        // key even when the echo is shortened to "".
+        let raw_id: Option<&str> = rest
             .first()
             .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .map(|s| neg_echo_id(s, max_sub_id_len));
+            .filter(|s| !s.is_empty());
+        let correl_id: Option<String> = raw_id.map(|s| neg_echo_id(s, max_sub_id_len));
         if !nip77_enabled {
-            if let Some(sub_id) = correl_id {
-                self.neg_err(&sub_id, "error: negentropy is not enabled on this relay");
+            if let Some(raw) = raw_id {
+                self.neg_err_with_echo(
+                    raw,
+                    correl_id.as_deref().unwrap_or(""),
+                    "error: negentropy is not enabled on this relay",
+                );
             } else {
                 self.send_notice("error: negentropy is not enabled on this relay");
             }
             return;
         }
         if rest.len() < 3 {
-            if let Some(sub_id) = correl_id {
-                self.neg_err(
-                    &sub_id,
+            if let Some(raw) = raw_id {
+                self.neg_err_with_echo(
+                    raw,
+                    correl_id.as_deref().unwrap_or(""),
                     "error: NEG-OPEN requires a subscription id, filter and message",
                 );
             } else {
@@ -244,7 +252,9 @@ impl super::Conn {
         // over-long id is not echoed back (B-2, see the correlated id
         // above): the empty id is the correlation the client gets.
         if sub_id.chars().count() > max_sub_id_len {
-            self.neg_err("", "error: NEG-OPEN subscription id too long");
+            // Clean state/queued frames under the raw id, but echo no
+            // over-long id on the wire.
+            self.neg_err_with_echo(&sub_id, "", "error: NEG-OPEN subscription id too long");
             return;
         }
         // A previous NEG-ERR can still be queued for this id even though no

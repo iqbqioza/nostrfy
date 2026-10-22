@@ -174,6 +174,15 @@ pub fn respond(items: &[Item], client_message: &[u8]) -> anyhow::Result<Vec<u8>>
     };
     for range in &ranges {
         let upper = &range.upper;
+        // Infinity is (u64::MAX, empty prefix). `prefix_gt` zero-pads an
+        // empty prefix, so it alone would allow (u64::MAX, [..]) after an
+        // infinity bound; the partition below then produced start > end and
+        // panicked. Reject anything after infinity explicitly.
+        let lower_infinity = lower.ts == u64::MAX && lower.prefix.is_empty();
+        let upper_infinity = upper.ts == u64::MAX && upper.prefix.is_empty();
+        if lower_infinity && !upper_infinity {
+            return Err(anyhow!("ranges after infinity"));
+        }
         // Ranges must be adjacent and ascending.
         if lower.ts > upper.ts || (lower.ts == upper.ts && prefix_gt(&lower.prefix, &upper.prefix))
         {
@@ -205,7 +214,10 @@ pub fn respond(items: &[Item], client_message: &[u8]) -> anyhow::Result<Vec<u8>>
                 loop {
                     let start = items.partition_point(|i| item_cmp(i, &lower) == Ordering::Less);
                     let end = items.partition_point(|i| item_cmp(i, upper) == Ordering::Less);
-                    let slice = &items[start..end];
+                    // The infinity check above makes start <= end, but keep
+                    // the slice defensive: a future ordering change must
+                    // never turn a malformed frame into a task panic.
+                    let slice = items.get(start..end).unwrap_or_default();
                     let fp = fingerprint(slice);
                     if fp == *client_fp {
                         // In sync for this range.
@@ -253,7 +265,12 @@ pub fn respond(items: &[Item], client_message: &[u8]) -> anyhow::Result<Vec<u8>>
 fn ids_in(items: &[Item], lower: &Bound, upper: &Bound) -> Vec<[u8; 32]> {
     let start = items.partition_point(|i| item_cmp(i, lower) == Ordering::Less);
     let end = items.partition_point(|i| item_cmp(i, upper) == Ordering::Less);
-    items[start..end].iter().map(|(_, id)| *id).collect()
+    items
+        .get(start..end)
+        .unwrap_or_default()
+        .iter()
+        .map(|(_, id)| *id)
+        .collect()
 }
 
 /// The bound between two adjacent items: excludes `a`, includes `b`.
@@ -302,6 +319,22 @@ mod tests {
         let mut bytes = [0u8; 32];
         bytes[31] = id;
         (ts, bytes)
+    }
+
+    #[test]
+    fn respond_rejects_a_range_after_infinity() {
+        // AUD-06: an empty prefix at u64::MAX is infinity, but the zero-
+        // padding order check used to allow (u64::MAX, [1]) after it. The
+        // partition then produced start > end and panicked on the slice.
+        let items = vec![(u64::MAX, [0u8; 32])];
+        // Range 1: infinity (skip). Range 2: (u64::MAX, [1]) id-list.
+        let message = vec![PROTOCOL_VERSION, 0, 0, 0, 0, 1, 1, 2, 0];
+        assert_eq!(
+            respond(&items, &message).unwrap_err().to_string(),
+            "ranges after infinity"
+        );
+        // A normal infinity-bound-only message still answers.
+        assert!(respond(&items, &[PROTOCOL_VERSION, 0, 0, 0]).is_ok());
     }
 
     #[test]

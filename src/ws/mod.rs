@@ -453,6 +453,11 @@ pub struct Conn {
     /// only after the post-loop event flush so already-accepted events get
     /// their OKs before the Close.
     pub(crate) close_too_big: bool,
+    /// The negotiated tungstenite frame limit is the one from upgrade
+    /// time. A SIGHUP that raises `max_ws_message_bytes` cannot change it
+    /// on a live socket, so the loop closes the connection and lets the
+    /// client reconnect under the new limit.
+    pub(crate) reconnect_required: bool,
     /// The relay-wide pending-response byte budget shared by every
     /// connection; each materialized response reserves its size against it
     /// and over-budget responses fail with a retryable CLOSED.
@@ -1159,7 +1164,14 @@ impl Conn {
             self.require_auth = cfg.relay.require_auth;
             self.out_queue_bytes = cfg.limits.max_out_queue_bytes;
             self.req_response_bytes = cfg.limits.max_req_response_bytes;
-            self.max_msg_size = cfg.limits.max_ws_message_bytes;
+            let incoming_max = cfg.limits.max_ws_message_bytes;
+            if incoming_max > self.max_msg_size {
+                // The WebSocket protocol layer already fixed its limit at
+                // upgrade time; only a reconnect can raise it. Lowering is
+                // enforced dynamically by `handle_frame`.
+                self.reconnect_required = true;
+            }
+            self.max_msg_size = incoming_max;
             self.max_sub_id_len = cfg.limits.max_sub_id_len;
             self.outbox_write_policy = cfg.server.outbox_write_policy.clone();
             self.inbox_write_policy = cfg.server.inbox_write_policy.clone();
@@ -1379,6 +1391,16 @@ where
     conn.out_bytes_total = conn.out_bytes_total.saturating_sub(rest_bytes as u64);
 }
 
+/// How often to send a keep-alive PING for an idle deadline of `idle`.
+/// It must be strictly below the deadline (the old 5 s floor meant a 1–5 s
+/// idle timeout closed a healthy connection before its first PING), while
+/// staying at most 5 s for long deadlines to avoid needless traffic.
+fn keepalive_ping_interval(idle: Duration) -> Duration {
+    (idle / 3)
+        .max(Duration::from_millis(500))
+        .min(Duration::from_secs(5))
+}
+
 pub async fn handle_connection(
     mut socket: WebSocket,
     relay: Arc<Relay>,
@@ -1475,7 +1497,7 @@ pub async fn handle_connection(
     // of a large simultaneous cohort instead of timing them all out in
     // the same instant.
     let mut ping: Option<tokio::time::Interval> = idle.map(|d| {
-        let mut interval = tokio::time::interval(Duration::from_secs((d.as_secs() / 3).max(5)));
+        let mut interval = tokio::time::interval(keepalive_ping_interval(d));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // The first tick of a fresh interval fires immediately: reset it so
         // a connect burst does not PING every connection at once.
@@ -1539,6 +1561,7 @@ pub async fn handle_connection(
         max_msg_size,
         max_sub_id_len,
         close_too_big: false,
+        reconnect_required: false,
         subs: HashMap::new(),
         sub_bytes: 0,
         neg: HashMap::new(),
@@ -1719,6 +1742,9 @@ pub async fn handle_connection(
                             conn.config_version = version;
                             conn.refresh_config_cache().await;
                         }
+                        if conn.reconnect_required {
+                            break 'connection;
+                        }
                         if conn.handle_frame(frame, conn.max_msg_size).await {
                             break;
                         }
@@ -1772,6 +1798,9 @@ pub async fn handle_connection(
                     if version != conn.config_version {
                         conn.config_version = version;
                         conn.refresh_config_cache().await;
+                    }
+                    if conn.reconnect_required {
+                        break 'connection;
                     }
                     if conn.handle_frame(frame, conn.max_msg_size).await {
                         too_large = true;
@@ -1905,6 +1934,9 @@ pub async fn handle_connection(
                             conn.config_version = version;
                             conn.refresh_config_cache().await;
                         }
+                        if conn.reconnect_required {
+                            break 'connection;
+                        }
                         // The group store lock and its Arc clone are only
                         // taken when the batch actually contains group
                         // events (rare); ordinary traffic skips the shared
@@ -1945,15 +1977,21 @@ pub async fn handle_connection(
     // the task — and its connection slot and subscription accounting —
     // indefinitely. On expiry the connection closes without the final
     // batch; its events were never queued, so nothing partial commits.
-    let _ = tokio::time::timeout(teardown_grace, conn.flush_pending_events()).await;
+    // One deadline for the whole teardown: the old code applied the full
+    // grace to the batch flush and again to the final flush, so a connection
+    // could hold its slot for 2 × graces and outlive WS_DRAIN_GRACE.
+    let teardown_deadline = std::time::Instant::now() + teardown_grace;
+    let remaining = || teardown_deadline.saturating_duration_since(std::time::Instant::now());
+    let _ = tokio::time::timeout(remaining(), conn.flush_pending_events()).await;
     conn.enqueue_close_too_big();
 
     // Final flush: deliver any queued messages (e.g. NOTICEs) before
-    // closing the connection. Bounded by `teardown_grace`: a peer that
-    // stopped reading must not park the task (and its connection slot and
-    // subscription accounting) forever, so the remaining frames are
-    // abandoned on expiry and the release below still runs.
-    flush_and_close(&mut conn, &mut sender, teardown_grace).await;
+    // closing the connection. Bounded by what is left of the single
+    // teardown deadline: a peer that stopped reading must not park the task
+    // (and its connection slot and subscription accounting) forever, so the
+    // remaining frames are abandoned on expiry and the release below still
+    // runs.
+    flush_and_close(&mut conn, &mut sender, remaining()).await;
 
     // Remove the connection from the live subscription index and the
     // delivery-queue map (the queue sender is dropped with the map entry;
@@ -2217,6 +2255,7 @@ mod tests {
             max_msg_size,
             max_sub_id_len,
             close_too_big: false,
+            reconnect_required: false,
             pending_reqs: std::collections::VecDeque::new(),
             subs: HashMap::new(),
             sub_bytes: 0,
@@ -4536,6 +4575,96 @@ mod tests {
             assert!(
                 conn.access_allows_read().await,
                 "anonymous connections still read"
+            );
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn keepalive_ping_fires_before_short_idle_deadlines() {
+        // AUD-24: the old 5 s floor meant a 1–5 s idle timeout closed a
+        // healthy connection before its first PING.
+        for secs in 1..=5 {
+            let idle = Duration::from_secs(secs);
+            let ping = super::keepalive_ping_interval(idle);
+            assert!(
+                ping < idle,
+                "the ping interval {ping:?} must beat the {idle:?} idle deadline"
+            );
+            assert!(ping >= Duration::from_millis(500));
+        }
+        assert_eq!(
+            super::keepalive_ping_interval(Duration::from_secs(300)),
+            Duration::from_secs(5),
+            "long idle deadlines keep the 5 s traffic cap"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_early_neg_open_rejection_cleans_the_raw_id_state() {
+        // AUD-23: the correlating echo is sanitized to "" when the id
+        // exceeds the configured length. The state and queued frames belong
+        // to the raw id and must be removed under that key.
+        let mut conn = build_conn().await;
+        {
+            let mut cfg = conn.relay.config.write().await;
+            cfg.limits.max_sub_id_len = 1;
+            cfg.relay.disabled_nips = vec![77];
+        }
+        let raw = "raw-id";
+        conn.neg.insert(
+            raw.into(),
+            super::negentropy::NegState {
+                items: Vec::new(),
+                last_active: std::time::Instant::now(),
+                rounds_left: 1,
+                budget: None,
+                reserved: 0,
+            },
+        );
+        let tag = super::neg_sub_fingerprint(raw);
+        conn.outgoing.push_back(super::OutFrame {
+            message: Message::Text(serde_json::json!(["NEG-MSG", raw, ""]).to_string().into()),
+            event_sub: Some(tag),
+        });
+        conn.handle_neg_open(&[json!(raw)]).await;
+        assert!(
+            !conn.neg.contains_key(raw),
+            "the raw id's NEG state must be released"
+        );
+        // The NEG-ERR itself is tagged with the raw id (so a later
+        // NEG-CLOSE can purge it); the stale NEG-MSG must be gone.
+        assert!(
+            outgoing_json(&conn)
+                .iter()
+                .all(|message| message[0] != "NEG-MSG"),
+            "queued rounds for the raw id must be purged"
+        );
+        assert!(
+            conn.outgoing
+                .iter()
+                .any(|frame| frame.event_sub == Some(tag)),
+            "the terminal NEG-ERR remains tagged with the raw id"
+        );
+        conn.relay.db.shutdown();
+    }
+
+    #[test]
+    fn a_raised_frame_limit_requires_a_reconnect() {
+        // AUD-24: tungstenite's protocol limit is fixed at upgrade. A
+        // SIGHUP raise must close the connection so the client can
+        // reconnect with the larger limit; lowering still applies live.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_relay_with("").await;
+            let mut conn = build_conn_on(relay.clone()).await;
+            let initial = conn.max_msg_size;
+            relay.config.write().await.limits.max_ws_message_bytes = initial + 1;
+            conn.refresh_config_cache().await;
+            assert_eq!(conn.max_msg_size, initial + 1);
+            assert!(
+                conn.reconnect_required,
+                "a raised protocol limit cannot apply to the live socket"
             );
             relay.db.shutdown();
         });
