@@ -975,22 +975,37 @@ impl Config {
     }
 
     pub fn write_default(path: &Path) -> Result<()> {
-        if path.exists() {
-            return Err(config_err(format!(
-                "{} already exists, refusing to overwrite",
-                path.display()
-            )));
-        }
         let cfg = Config::default();
         let toml = toml::to_string_pretty(&cfg)
             .map_err(|e| config_err(format!("cannot serialize config: {e}")))?;
-        std::fs::write(path, toml)?;
-        // The file will hold secrets later (the relay private key, S3
-        // keys, the management token): create it 0600 so the operator's
-        // later edits cannot leave a 0644 config with secrets readable
-        // by other users.
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        // `create_new` with `O_NOFOLLOW` refuses to follow a pre-created
+        // symlink (the documented `/tmp` path made the old exists+write
+        // pair a clobber primitive) and avoids the exists/open race. The
+        // file will hold secrets later (relay private key, S3 keys, the
+        // management token), so create it 0600 atomically instead of
+        // chmod-ing a world-readable file after the write.
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true).mode(0o600);
+        options.custom_flags(libc::O_NOFOLLOW);
+        let mut file = options.open(path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                config_err(format!(
+                    "{} already exists, refusing to overwrite",
+                    path.display()
+                ))
+            } else {
+                config_err(format!("cannot create {}: {e}", path.display()))
+            }
+        })?;
+        file.write_all(toml.as_bytes())
+            .map_err(|e| config_err(format!("cannot write {}: {e}", path.display())))?;
+        // Keep the exact mode even if the platform ignored `mode` (some
+        // filesystems mask it). `File::set_permissions` uses the open
+        // descriptor, so a symlink swapped in after `open` cannot redirect
+        // the chmod to another path.
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         Ok(())
     }
 
@@ -1412,9 +1427,15 @@ impl Config {
         // non-admin caller's rights.
         for (pubkey, methods) in &self.access.method_grants {
             if !is_pubkey_or_npub(pubkey) {
-                return Err(config_err(format!(
-                    "access.method_grants contains an invalid pubkey {pubkey:?};                      use 64 lowercase hex characters or an npub1..."
-                )));
+                // Compatibility with older/edited configs: an invalid
+                // *key* is dropped just like an invalid method, instead of
+                // making the whole relay refuse to start after an upgrade
+                // (the runtime gate would never grant it anyway).
+                log::warn!(
+                    "access.method_grants: {pubkey:?} is not a valid pubkey; \
+                     use 64 lowercase hex characters or an npub1... — ignoring it"
+                );
+                continue;
             }
             for method in methods {
                 if !crate::nips::nip86::GRANTABLE_METHODS.contains(&method.as_str()) {
@@ -4002,6 +4023,31 @@ max_log_files = 2
     }
 
     #[test]
+    fn write_default_does_not_follow_a_symlink() {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir()
+            .join("nostrfy-init-symlink-test")
+            .join(format!("{:x}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("target");
+        std::fs::write(&target, "do not overwrite").unwrap();
+        let link = dir.join("nostrfy.toml");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(
+            Config::write_default(&link).is_err(),
+            "a pre-created symlink must be refused, not followed"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "do not overwrite",
+            "the symlink target must stay untouched"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn write_text_atomic_preserves_target_permissions() {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -5053,10 +5099,14 @@ max_log_files = 2
         bad.access
             .method_grants
             .insert("not-a-pubkey".into(), vec!["banpubkey".into()]);
-        let err = bad.validate().unwrap_err().to_string();
         assert!(
-            err.contains("invalid pubkey"),
-            "a malformed grant key must fail validation: {err}"
+            bad.validate().is_ok(),
+            "a malformed grant key must not block startup; it is dropped"
+        );
+        bad.access.retain_grantable_methods();
+        assert!(
+            bad.access.method_grants.is_empty(),
+            "the invalid grant key must be dropped, never granted"
         );
     }
 

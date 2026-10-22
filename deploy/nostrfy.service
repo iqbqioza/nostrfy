@@ -37,8 +37,12 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
 # NIP-86 changerelayname/description/icon persist into this file. The mount
-# must be writable, and the nostrfy user must own the file:
+# must be writable, and the nostrfy user must own BOTH the directory and the
+# file: write_text_atomic creates a temp file beside the target before the
+# rename, so file-only ownership still fails with EACCES:
+#   sudo install -d -o nostrfy -g nostrfy -m 0750 /etc/nostrfy
 #   sudo chown nostrfy:nostrfy /etc/nostrfy/nostrfy.toml
+#   sudo chmod 600 /etc/nostrfy/nostrfy.toml
 ReadWritePaths=/etc/nostrfy
 ProtectHome=true
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX

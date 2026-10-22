@@ -94,4 +94,6 @@ Every option is documented in the [Configuration reference](../CONFIGURATION.md)
 - **Always-on by design**: `auto_stop_machines = false` in `fly.toml` — a relay must never be stopped during idle periods
 - The container runs the relay in **foreground mode** (`nostrfy start --foreground`); logs go to stdout/stderr and are collected by Fly
 - TLS is terminated by Fly; the relay itself serves plain WebSocket on port 8080
+- **Trusted proxy**: Fly's edge connects over the private 6PN range. The template sets `server.trusted_proxies = ["fdaa::/16", "127.0.0.1/32", "::1/128"]`; leaving it empty makes every client share the edge address, so the per-IP connection cap (64) applies relay-wide and `blockip`/rate limits hit everyone. Never add an address clients can reach directly.
+- **Shutdown grace**: `fly.toml` sets `kill_timeout = "35s"`. The relay's graceful shutdown budget is 27s; Fly's 5s default would SIGKILL while WebSockets drain and the final batch/snapshots flush.
 - **Blossom media host**: to serve the Blossom server too, set `blossom.host = "media.example.com"` in the config, add `media.example.com` as an **additional hostname** of the same Fly app (fly.toml `[[services]] http_options.allowed_http_hostnames` or `fly hostnames`), and add the `media.` TLS certificate in the Fly dashboard — the relay splits the hosts internally (like `server.api_host`)

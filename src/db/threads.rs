@@ -126,6 +126,10 @@ pub(crate) fn recv_timeout(
 /// [`spawn`].
 pub(crate) struct DbThreads {
     pub(crate) tx: mpsc::UnboundedSender<Msg>,
+    /// False once the writer thread has exited (normal shutdown, channel
+    /// close or panic). `/health` exposes this because reads can keep
+    /// working while every write silently fails.
+    pub(crate) writer_alive: Arc<std::sync::atomic::AtomicBool>,
     /// One channel per reader thread (its receiver is owned by the thread).
     pub(crate) read_txs: Vec<mpsc::UnboundedSender<Msg>>,
     pub(crate) api_read_tx: mpsc::UnboundedSender<Msg>,
@@ -620,6 +624,8 @@ pub(crate) fn spawn(
     let overloads = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let pending_msgs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let pending_events = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let writer_alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let writer_alive_thread = Arc::clone(&writer_alive);
     let pending_reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let thread_pending_msgs = Arc::clone(&pending_msgs);
     let thread_pending_events = Arc::clone(&pending_events);
@@ -750,6 +756,15 @@ pub(crate) fn spawn(
         }));
     }
     handles.push(std::thread::spawn(move || {
+        // Clear the liveness flag on every exit path, including an
+        // unwinding panic in the startup prelude.
+        struct ClearWriterAlive(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for ClearWriterAlive {
+            fn drop(&mut self) {
+                self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let _writer_alive = ClearWriterAlive(writer_alive_thread);
         // The recovery prelude runs first, before the long index rebuilds:
         // `DbClient::open` waits for `recovery_tx` (see `recovery_rx`), so
         // the server's startup state restore observes the completed
@@ -1813,6 +1828,7 @@ pub(crate) fn spawn(
     }));
     Ok(DbThreads {
         tx,
+        writer_alive,
         read_txs,
         api_read_tx,
         errors,

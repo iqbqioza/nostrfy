@@ -2621,6 +2621,7 @@ fn lock_access_state(cfg: &Config) -> Result<AccessStateLock> {
     #[cfg(unix)]
     {
         use std::os::fd::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
         let file = std::fs::OpenOptions::new()
             .create(true)
             .read(true)
@@ -2628,6 +2629,8 @@ fn lock_access_state(cfg: &Config) -> Result<AccessStateLock> {
             // The lock file's contents are never read or written: the inode
             // is what `flock` locks, so never truncate an existing file.
             .truncate(false)
+            // Never follow a pre-created symlink into another lock file.
+            .custom_flags(libc::O_NOFOLLOW)
             .open(&path)
             .map_err(|e| anyhow!("cannot open the access lock {}: {e}", path.display()))?;
         // SAFETY: `file` holds a valid descriptor for the call.
@@ -2675,11 +2678,13 @@ fn lock_upgrade(dir: &std::path::Path) -> Result<UpgradeLock> {
     #[cfg(unix)]
     {
         use std::os::fd::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
         let file = std::fs::OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
             .truncate(false)
+            .custom_flags(libc::O_NOFOLLOW)
             .open(&path)
             .map_err(|e| anyhow!("cannot open the upgrade lock {}: {e}", path.display()))?;
         // SAFETY: `file` holds a valid descriptor for the call.

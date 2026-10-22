@@ -42,11 +42,12 @@ metrics_enabled = true
 ws_paths = "root"
 inbox_write_policy = "any"
 outbox_write_policy = "any"
-# Client addresses behind Fly's proxy are not visible without the
-# X-Forwarded-For address of the edge: list Fly's private network range
-# (fdaa::/16) or leave empty to trust no proxy. Never list an address
-# clients can reach directly.
-trusted_proxies = []
+# Fly terminates TLS at its edge and connects to the machine over the
+# private 6PN network (fdaa::/16). Trust that range (plus loopback for local
+# health checks) so X-Forwarded-For, the per-IP caps, blockip and logs see the
+# real client. For another platform, replace fdaa::/16 with that platform's
+# proxy range; never list an address clients can reach directly.
+trusted_proxies = ["fdaa::/16", "127.0.0.1/32", "::1/128"]
 
 [rpc]
 management_token = ""

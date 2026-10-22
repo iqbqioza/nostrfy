@@ -18,6 +18,9 @@ services:
       - nostrfy-data:/data
       # - ./nostrfy.toml:/etc/nostrfy/nostrfy.toml:ro
     restart: unless-stopped
+    # The relay's graceful shutdown budget is 27s; Docker's default 10s
+    # would SIGKILL before the final database/snapshot flush.
+    stop_grace_period: 35s
 
 volumes:
   nostrfy-data:

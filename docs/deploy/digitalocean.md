@@ -10,12 +10,13 @@ Two options: a **Droplet** (VM, simplest) or the **App Platform** (containers).
 ```sh
 ssh root@<droplet-ip>
 curl -fsSL https://raw.githubusercontent.com/iqbqioza/nostrfy/main/install.sh | sudo env INSTALL_DIR=/usr/local/bin sh
-sudo mkdir -p /etc/nostrfy
+sudo useradd --system --create-home --home /var/lib/nostrfy nostrfy
+sudo install -d -o nostrfy -g nostrfy -m 0750 /etc/nostrfy
 sudo curl -fsSL -o /etc/nostrfy/nostrfy.toml \
   https://raw.githubusercontent.com/iqbqioza/nostrfy/main/deploy/nostrfy.toml
-sudo nano /etc/nostrfy/nostrfy.toml                 # set name, public_url, private_key
-sudo useradd --system --create-home --home /var/lib/nostrfy nostrfy
 sudo chown nostrfy:nostrfy /etc/nostrfy/nostrfy.toml
+sudo chmod 600 /etc/nostrfy/nostrfy.toml
+sudo nano /etc/nostrfy/nostrfy.toml                 # set name, public_url, private_key
 sudo curl -fsSL -o /etc/systemd/system/nostrfy.service \
   https://raw.githubusercontent.com/iqbqioza/nostrfy/main/deploy/nostrfy.service
 sudo systemctl daemon-reload
@@ -43,5 +44,5 @@ The App Platform builds from the repository `Dockerfile` (which downloads the pr
 
 ## Both options
 
-- Updates: re-run `install.sh` + `systemctl restart nostrfy` (Droplet), or push to the connected repo (App Platform).
+- Updates: `curl -fsSL https://raw.githubusercontent.com/iqbqioza/nostrfy/main/install.sh | sudo env INSTALL_DIR=/usr/local/bin sh -s -- --force` then `sudo systemctl restart nostrfy` (Droplet), or push to the connected repo (App Platform). The system-wide `INSTALL_DIR` is required; a user-level install would update `~/.local/bin` and leave the service binary untouched.
 - All configuration is documented in the [Configuration reference](../CONFIGURATION.md).

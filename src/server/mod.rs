@@ -1613,6 +1613,16 @@ async fn health_handler(State(relay): State<Arc<Relay>>) -> Response {
         )
             .into_response();
     }
+    if !relay.db.writer_alive() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "status": "unavailable",
+                "reason": "database writer thread exited",
+            })),
+        )
+            .into_response();
+    }
     (StatusCode::OK, Json(json!({ "status": "ok" }))).into_response()
 }
 
@@ -2590,11 +2600,102 @@ async fn reload_handler(
         let _ = shutdown.changed().await;
         return;
     };
+    let mut relocated_pid: Option<PathBuf> = None;
     loop {
         tokio::select! {
-            _ = hangup.recv() => handle_reload(&config_path, &relay, &db, &api_limit).await,
+            _ = hangup.recv() => {
+                if let Some(path) = handle_reload(&config_path, &relay, &db, &api_limit).await
+                    && relocated_pid.as_ref() != Some(&path)
+                    && let Some(previous) = relocated_pid.replace(path)
+                {
+                    remove_pid_file_if_ours(&previous);
+                }
+            }
             _ = shutdown.changed() => break,
         }
+    }
+    if let Some(path) = relocated_pid {
+        remove_pid_file_if_ours(&path);
+    }
+}
+
+/// Moves this process's pid marker to a new `daemon.pid_file` path. A new
+/// path that already names another live process is refused; a stale file is
+/// replaced. The old file is removed only when it still carries our pid.
+fn relocate_pid_file(old: &Path, new: &Path) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    if let Some(parent) = new.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    for attempt in 0..2 {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o644)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(new)
+        {
+            Ok(mut file) => {
+                // The file contains only a pid, not a secret: preserve the
+                // mode a normal pid file has. Use the descriptor, not the
+                // path, so a swapped symlink cannot redirect the chmod.
+                let _ = file.set_permissions(std::fs::Permissions::from_mode(0o644));
+                writeln!(file, "{}", std::process::id())?;
+                if old != new && pid_file_is_ours(old) {
+                    let _ = std::fs::remove_file(old);
+                }
+                return Ok(());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempt == 0 => {
+                if let Some(pid) = read_pid_file_for_relocation(new)
+                    && pid != std::process::id()
+                    && process_is_running(pid)
+                {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        format!("{} already tracks a live pid {pid}", new.display()),
+                    ));
+                }
+                // Stale (or our own) file: replace it.
+                std::fs::remove_file(new)?;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!("could not claim {}", new.display()),
+    ))
+}
+
+fn read_pid_file_for_relocation(path: &Path) -> Option<u32> {
+    std::fs::read_to_string(path)
+        .ok()?
+        .trim()
+        .parse::<u32>()
+        .ok()
+}
+
+fn process_is_running(pid: u32) -> bool {
+    // `kill(pid, 0)` checks existence without sending a signal. EPERM
+    // means the pid exists but belongs to another user: still live, never
+    // clobber it.
+    if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+fn pid_file_is_ours(path: &Path) -> bool {
+    read_pid_file_for_relocation(path) == Some(std::process::id())
+}
+
+fn remove_pid_file_if_ours(path: &Path) {
+    if pid_file_is_ours(path) {
+        let _ = std::fs::remove_file(path);
     }
 }
 
@@ -2609,7 +2710,8 @@ async fn handle_reload(
     relay: &Arc<Relay>,
     db: &DbClient,
     api_limit: &Arc<crate::relay::ApiLimiter>,
-) {
+) -> Option<PathBuf> {
+    let mut relocated_pid = None;
     match Config::load(config_path) {
         Ok(mut new_config) => {
             new_config.absolutize_paths(config_path);
@@ -2624,6 +2726,30 @@ async fn handle_reload(
                 // applying: `apply_reloaded_config` must never hold a config
                 // lock across `reload_db_state` (see the function doc).
                 let old = relay.config.read().await.clone();
+                if old.daemon.pid_file != new_config.daemon.pid_file {
+                    // `pid_file` is live-applied by moving the ownership
+                    // marker with the process. Keeping the old in-memory
+                    // path while the CLI reads the new file made `stop` say
+                    // "not running" and `restart` hit a port conflict (M22).
+                    match relocate_pid_file(&old.daemon.pid_file, &new_config.daemon.pid_file) {
+                        Ok(()) => {
+                            relocated_pid = Some(new_config.daemon.pid_file.clone());
+                            info!(
+                                "pid file moved from {} to {}",
+                                old.daemon.pid_file.display(),
+                                new_config.daemon.pid_file.display()
+                            );
+                        }
+                        Err(e) => {
+                            error!(
+                                "cannot move pid file from {} to {}: {e}; keeping the old path (restart required to change it)",
+                                old.daemon.pid_file.display(),
+                                new_config.daemon.pid_file.display()
+                            );
+                            new_config.daemon.pid_file = old.daemon.pid_file.clone();
+                        }
+                    }
+                }
                 apply_reloaded_config(&old, new_config, relay, db, api_limit).await;
                 info!("configuration reloaded from {}", config_path.display());
             }
@@ -2634,6 +2760,7 @@ async fn handle_reload(
     // live in the database: re-read them on every reload (a failed load
     // keeps the previous lists — see `Relay::reload_db_state`).
     relay.reload_db_state().await;
+    relocated_pid
 }
 
 /// Applies a validated, reloaded config to the live relay: live settings
@@ -2859,10 +2986,6 @@ async fn apply_reloaded_config(
             "daemon.log_file",
             old.daemon.log_file != new_config.daemon.log_file,
         ),
-        (
-            "daemon.pid_file",
-            old.daemon.pid_file != new_config.daemon.pid_file,
-        ),
     ];
     for (name, changed) in static_routes {
         if changed {
@@ -2961,7 +3084,6 @@ async fn apply_reloaded_config(
     new_config.daemon.max_log_files = old.daemon.max_log_files;
     new_config.daemon.stats_interval_secs = old.daemon.stats_interval_secs;
     new_config.daemon.log_file = old.daemon.log_file.clone();
-    new_config.daemon.pid_file = old.daemon.pid_file.clone();
     new_config.limits.live_buffer = old.limits.live_buffer;
     new_config.limits.live_batch_size = old.limits.live_batch_size;
     new_config.limits.live_batch_interval_ms = old.limits.live_batch_interval_ms;
@@ -3800,6 +3922,36 @@ mod tests {
         let path = dir.join("nostrfy.toml");
         std::fs::write(&path, toml::to_string_pretty(cfg).unwrap()).unwrap();
         (dir, path)
+    }
+
+    #[test]
+    fn pid_file_relocation_moves_the_marker_and_refuses_a_live_target() {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir()
+            .join("nostrfy-pid-relocation")
+            .join(format!("{:x}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = dir.join("old.pid");
+        let new = dir.join("new.pid");
+        std::fs::write(&old, std::process::id().to_string()).unwrap();
+        relocate_pid_file(&old, &new).unwrap();
+        assert!(!old.exists(), "the old marker is removed after the move");
+        assert_eq!(
+            std::fs::read_to_string(&new).unwrap().trim(),
+            std::process::id().to_string()
+        );
+        remove_pid_file_if_ours(&new);
+        assert!(!new.exists());
+
+        // A target that belongs to a live process must never be clobbered.
+        std::fs::write(&new, "1").unwrap();
+        std::fs::write(&old, std::process::id().to_string()).unwrap();
+        assert!(relocate_pid_file(&old, &new).is_err());
+        assert_eq!(std::fs::read_to_string(&new).unwrap().trim(), "1");
+        assert!(old.exists(), "a failed move leaves the old marker intact");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

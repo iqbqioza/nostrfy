@@ -52,5 +52,8 @@ EXPOSE 8080
 USER nostr
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD curl -fsS http://127.0.0.1:8080/health || exit 1
+# Docker's default 10s stop timeout is shorter than the relay's 27s graceful
+# shutdown budget. Give it time to drain and flush: `docker run --stop-timeout
+# 35 ...` (compose sets `stop_grace_period: 35s`; Fly sets `kill_timeout`).
 ENTRYPOINT ["docker-entrypoint.sh"]
 CMD ["nostrfy", "--config", "/etc/nostrfy/nostrfy.toml", "start", "--foreground"]

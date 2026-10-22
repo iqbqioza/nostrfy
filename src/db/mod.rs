@@ -221,6 +221,7 @@ pub(crate) fn lock_database_dir(db_path: &std::path::Path) -> std::io::Result<Db
     #[cfg(unix)]
     {
         use std::os::fd::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
         let file = std::fs::OpenOptions::new()
             .create(true)
             .read(true)
@@ -228,6 +229,9 @@ pub(crate) fn lock_database_dir(db_path: &std::path::Path) -> std::io::Result<Db
             // Never truncate: the contents are never read, the inode is
             // what `flock` locks.
             .truncate(false)
+            // A pre-created symlink must not redirect a blocking flock to
+            // an arbitrary target (or wait on someone else's file).
+            .custom_flags(libc::O_NOFOLLOW)
             .open(&path)?;
         // SAFETY: `file` holds a valid descriptor for the call.
         let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
@@ -838,6 +842,10 @@ pub struct DbClient {
     /// checks and the cross-process `access.lock` are anchored here, so the
     /// accessors do not need a round trip to the store thread.
     db_path: std::path::PathBuf,
+    /// False once the writer thread exited. Reads may still succeed, so
+    /// this is separate from `cancelled` (graceful shutdown) and is exposed
+    /// to `/health` as the writer-liveness signal.
+    writer_alive: Arc<std::sync::atomic::AtomicBool>,
     expiry: Arc<std::sync::atomic::AtomicBool>,
     /// Shutdown cancellation (shared with the store and every reader
     /// clone): set by [`Self::shutdown`] so a long chunked removal stops
@@ -1249,6 +1257,7 @@ impl DbClient {
             api_read_tx: threads.api_read_tx,
             errors: threads.errors,
             overloads: threads.overloads,
+            writer_alive: threads.writer_alive,
             db_path: cfg.path.clone(),
             expiry: threads.expiry,
             cancel,
@@ -1279,6 +1288,12 @@ impl DbClient {
     /// leaving their pending record for the next startup.
     pub fn cancelled(&self) -> bool {
         self.cancel.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Whether the writer thread is still running. A `false` value means
+    /// writes cannot complete even though reader threads may still answer.
+    pub fn writer_alive(&self) -> bool {
+        self.writer_alive.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Which derived-state families the writer's startup resume of an

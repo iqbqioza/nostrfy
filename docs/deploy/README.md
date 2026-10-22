@@ -16,22 +16,31 @@ nostrfy ships pre-built binaries for **x86_64** and **aarch64** (GitHub release 
 All the VM guides (Digital Ocean, AWS EC2, GCP, Azure, any VPS) follow the same pattern:
 
 ```sh
-# 1. Install the latest release binary (no sudo needed for the install itself)
-curl -fsSL https://raw.githubusercontent.com/iqbqioza/nostrfy/main/install.sh | sh
+# 1. Install the release system-wide (the unit runs /usr/local/bin/nostrfy)
+curl -fsSL https://raw.githubusercontent.com/iqbqioza/nostrfy/main/install.sh \
+  | sudo env INSTALL_DIR=/usr/local/bin sh
 
-# 2. Fetch the config template and edit it (no repository clone needed)
-sudo mkdir -p /etc/nostrfy
+# 2. Create the unprivileged service user and its writable config directory.
+#    The directory (not only the file) must be owned by nostrfy: NIP-86
+#    writes the config through a temp file in that directory.
+sudo useradd --system --create-home --home /var/lib/nostrfy nostrfy
+sudo install -d -o nostrfy -g nostrfy -m 0750 /etc/nostrfy
+
+# 3. Fetch the config template, lock it down, then edit it. The file holds
+#    the relay key (and possibly S3/LiveKit secrets), so keep it 0600.
 sudo curl -fsSL -o /etc/nostrfy/nostrfy.toml \
   https://raw.githubusercontent.com/iqbqioza/nostrfy/main/deploy/nostrfy.toml
+sudo chown nostrfy:nostrfy /etc/nostrfy/nostrfy.toml
+sudo chmod 600 /etc/nostrfy/nostrfy.toml
 sudo nano /etc/nostrfy/nostrfy.toml                   # set name, public_url, private_key
 
-# 3. Fetch the systemd unit and start the service
+# 4. Fetch the systemd unit and start the service
 sudo curl -fsSL -o /etc/systemd/system/nostrfy.service \
   https://raw.githubusercontent.com/iqbqioza/nostrfy/main/deploy/nostrfy.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now nostrfy
 
-# 4. Open the port (usually 8080) in the provider's firewall and verify
+# 5. Open the port (usually 8080) in the provider's firewall and verify
 curl http://localhost:8080/health
 ```
 
@@ -53,4 +62,4 @@ private_key = ""                          # run `nostrfy genkey` and paste the k
 ## Choosing between VM and containers
 
 - **VM (systemd)**: simplest, cheapest, full control. Recommended for most relay deployments.
-- **Container**: use the repository `Dockerfile` (installs the release binary via `install.sh`) on Fly.io, Digital Ocean App Platform, AWS ECS, GCP Cloud Run or Azure Container Apps — or `docker compose up -d --build` locally. Persistent storage is required for the LMDB data (`/data`).
+- **Container**: use the repository `Dockerfile` (installs the release binary via `install.sh`) on Fly.io, Digital Ocean App Platform, AWS ECS, GCP Cloud Run or Azure Container Apps — or `docker compose up -d --build` locally. Persistent storage is required for the LMDB data (`/data`). Give the container a stop grace period of at least **35 seconds** (`docker run --stop-timeout 35`, `stop_grace_period: 35s` in compose, or `kill_timeout = "35s"` on Fly): the relay's graceful shutdown budget is 27 seconds and the platform default would SIGKILL before the final flush.

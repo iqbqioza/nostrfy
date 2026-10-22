@@ -4,21 +4,29 @@ This is the generic guide for a plain Linux VPS (any provider — Hetzner, Vultr
 
 ## 1. Install the binary
 
-The `install.sh` script downloads the latest release binary for your architecture (x86_64 / aarch64), verifies its sha256 checksum and installs it into a directory on `PATH` — **no sudo needed for the install itself**:
+The `install.sh` script downloads the latest release binary for your architecture (x86_64 / aarch64) and verifies its sha256 checksum. Install it system-wide at `/usr/local/bin/nostrfy`, where the shipped systemd unit expects it:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/iqbqioza/nostrfy/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/iqbqioza/nostrfy/main/install.sh \
+  | sudo env INSTALL_DIR=/usr/local/bin sh
 nostrfy --version
 ```
 
 ## 2. Create a configuration
 
-Fetch the template (no repository clone needed) and edit it:
+Create the unprivileged service user and its writable config directory, then
+fetch the template and lock it down. The config holds the relay key (and
+possibly S3/LiveKit secrets), so keep it `0600`; the **directory** must also
+be owned by `nostrfy` because NIP-86 writes the file through a temp file in
+that directory:
 
 ```sh
-sudo mkdir -p /etc/nostrfy
+sudo useradd --system --create-home --home /var/lib/nostrfy nostrfy
+sudo install -d -o nostrfy -g nostrfy -m 0750 /etc/nostrfy
 sudo curl -fsSL -o /etc/nostrfy/nostrfy.toml \
   https://raw.githubusercontent.com/iqbqioza/nostrfy/main/deploy/nostrfy.toml
+sudo chown nostrfy:nostrfy /etc/nostrfy/nostrfy.toml
+sudo chmod 600 /etc/nostrfy/nostrfy.toml
 sudo nano /etc/nostrfy/nostrfy.toml
 ```
 
@@ -35,10 +43,15 @@ host = "0.0.0.0"                         # already set in the template
 port = 8080
 ```
 
-Generate the secret key with:
+Generate the secret key with a private temporary config (deleted immediately
+after printing the key; never leave a key-bearing file in `/tmp`):
 
 ```sh
-nostrfy --config /tmp/nostrfy-genkey.toml init && nostrfy --config /tmp/nostrfy-genkey.toml genkey
+umask 077
+tmpcfg="$(mktemp /tmp/nostrfy-genkey.XXXXXX.toml)"
+nostrfy --config "$tmpcfg" init
+nostrfy --config "$tmpcfg" genkey
+rm -f "$tmpcfg"
 ```
 
 (Or mount your own config file instead of the template — any `nostrfy.toml` works.)
@@ -58,20 +71,11 @@ data there and `chown` it to `nostrfy:nostrfy`.
 
 Fetch the hardened unit (no repository clone needed) and start it:
 
-The shipped unit executes `/usr/local/bin/nostrfy`. If you used the
-user-level install above, put the binary there (or adjust `ExecStart`):
-
-```sh
-sudo install -m 0755 "$(command -v nostrfy)" /usr/local/bin/nostrfy
-```
-
 The unit runs as `nostrfy` and enables `ReadWritePaths=/etc/nostrfy` so
-NIP-86 relay-name/description/icon changes can be persisted; give that user
-ownership of the config file:
+NIP-86 relay-name/description/icon changes can be persisted; the user must
+own both the config directory and file (they were prepared in step 2):
 
 ```sh
-sudo useradd --system --create-home --home /var/lib/nostrfy nostrfy
-sudo chown nostrfy:nostrfy /etc/nostrfy/nostrfy.toml
 sudo curl -fsSL -o /etc/systemd/system/nostrfy.service \
   https://raw.githubusercontent.com/iqbqioza/nostrfy/main/deploy/nostrfy.service
 sudo systemctl daemon-reload
@@ -230,6 +234,7 @@ sudo systemctl start nostrfy
 ```sh
 # piped installs never ask for confirmation: use --force to overwrite an
 # existing binary (or run the script from a terminal and answer y/N)
-curl -fsSL https://raw.githubusercontent.com/iqbqioza/nostrfy/main/install.sh | sh -s -- --force
+curl -fsSL https://raw.githubusercontent.com/iqbqioza/nostrfy/main/install.sh \
+  | sudo env INSTALL_DIR=/usr/local/bin sh -s -- --force
 sudo systemctl restart nostrfy
 ```

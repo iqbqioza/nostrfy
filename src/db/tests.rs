@@ -11038,3 +11038,23 @@ fn purge_expired_first_and_middle_chunk_failures_leave_a_resumable_backlog() {
     });
     db.shutdown();
 }
+
+#[test]
+fn writer_liveness_tracks_the_writer_thread() {
+    // L39: `/health` needs a writer-specific signal. Readers may keep
+    // serving after the writer exits, so `cancelled` (graceful shutdown)
+    // alone cannot distinguish a dead writer from a healthy read path.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    assert!(db.writer_alive());
+    db.shutdown();
+    assert!(!db.writer_alive());
+}

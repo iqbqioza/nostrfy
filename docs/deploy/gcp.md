@@ -10,12 +10,13 @@ Options: **Compute Engine** (VM, recommended) or **Cloud Run** (containers).
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/iqbqioza/nostrfy/main/install.sh | sudo env INSTALL_DIR=/usr/local/bin sh
-sudo mkdir -p /etc/nostrfy
+sudo useradd --system --create-home --home /var/lib/nostrfy nostrfy
+sudo install -d -o nostrfy -g nostrfy -m 0750 /etc/nostrfy
 sudo curl -fsSL -o /etc/nostrfy/nostrfy.toml \
   https://raw.githubusercontent.com/iqbqioza/nostrfy/main/deploy/nostrfy.toml
-sudo nano /etc/nostrfy/nostrfy.toml                 # set name, public_url, private_key
-sudo useradd --system --create-home --home /var/lib/nostrfy nostrfy
 sudo chown nostrfy:nostrfy /etc/nostrfy/nostrfy.toml
+sudo chmod 600 /etc/nostrfy/nostrfy.toml
+sudo nano /etc/nostrfy/nostrfy.toml                 # set name, public_url, private_key
 sudo curl -fsSL -o /etc/systemd/system/nostrfy.service \
   https://raw.githubusercontent.com/iqbqioza/nostrfy/main/deploy/nostrfy.service
 sudo systemctl daemon-reload

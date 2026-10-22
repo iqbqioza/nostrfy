@@ -12,6 +12,11 @@
 app = "nostrfy"
 primary_region = "nrt"   # change to your preferred region
 
+# Graceful shutdown drains WebSockets, flushes the final database batch and
+# writes the group/role snapshots. The relay's budget is 27s, so Fly's
+# default 5s would SIGKILL mid-drain.
+kill_timeout = "35s"
+
 [build]
 
 [mounts]
