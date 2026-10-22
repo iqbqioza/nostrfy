@@ -1241,9 +1241,11 @@ mod tests {
         let link = dir.join("nostrfy.log");
         std::os::unix::fs::symlink(&target, &link).unwrap();
         let err = open_log_file(&link).unwrap_err();
-        assert_eq!(
-            err.raw_os_error(),
-            Some(libc::ELOOP),
+        // Linux returns ELOOP for a symlink with O_NOFOLLOW; FreeBSD
+        // returns EMLINK ("Too many links"). Both are the kernel refusing
+        // to follow the final component.
+        assert!(
+            matches!(err.raw_os_error(), Some(libc::ELOOP) | Some(libc::EMLINK)),
             "O_NOFOLLOW must reject the symlink: {err}"
         );
         assert_eq!(
