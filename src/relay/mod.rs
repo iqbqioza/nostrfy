@@ -1196,7 +1196,13 @@ async fn roles_rebuild_worker(
             buffer.scanning = true;
             buffer.overflow = false;
         }
-        let mut fresh = RoleStore::default();
+        // Claims are snapshot-only; carry the revoked store's codes into the
+        // rebuilt store (removals cannot recreate them from events).
+        let preserved_claims = roles.read().await.claims.clone();
+        let mut fresh = RoleStore {
+            claims: preserved_claims,
+            ..Default::default()
+        };
         // The scan must not outlive a shutdown: abort it at its next await
         // and keep the state dirty, so the live store stays fail-closed.
         let rebuilt = tokio::select! {
@@ -1274,20 +1280,26 @@ async fn roles_rebuild_worker(
             );
         }
     }
+    // Take the buffer lock before releasing the running claim: a mutation
+    // that captured while running was set is either already in the buffer or
+    // observes the closed window after this critical section. Re-check
+    // `dirty` under the lock; a removal marked in between must keep the
+    // captures for the next scan.
+    let mut buffer = state.buffer.lock().await;
     state.running.store(false, Ordering::SeqCst);
-    // A clean rebuild persisted the live store with every mutation captured
-    // while `running` was set. Replaying those captures in a later rebuild
-    // would re-apply stale intent (e.g. an assignment later revoked), so
-    // drop them once no rescan is pending. If dirty is still set, keep the
-    // buffer: the next scan needs the mutations (see `finish_rebuild`).
     if !state.dirty.load(Ordering::SeqCst) {
-        let mut buffer = state.buffer.lock().await;
+        // A clean rebuild persisted the live store with every mutation
+        // captured while `running` was set. Replaying those captures in a
+        // later rebuild would re-apply stale intent (e.g. an assignment
+        // later revoked), so drop them once no rescan is pending.
         buffer.mutations.clear();
         buffer.overflow = false;
         buffer.scanning = false;
+    }
+    drop(buffer);
+    if !state.dirty.load(Ordering::SeqCst) {
         // The successful swap restored the role ids; the revoked hint is
         // no longer authoritative.
-        drop(buffer);
         state
             .revoked_roles
             .lock()
@@ -4671,7 +4683,7 @@ impl Relay {
     /// overwrite it until the rebuild completes.
     pub(crate) async fn mark_roles_stale(&self) {
         self.roles_rebuild.dirty.store(true, Ordering::SeqCst);
-        {
+        let claims = {
             let live = self.roles.read().await;
             let mut revoked = self
                 .roles_rebuild
@@ -4680,8 +4692,15 @@ impl Relay {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             revoked.clear();
             revoked.extend(live.roles.keys().cloned());
-        }
-        *self.roles.write().await = RoleStore::default();
+            // Invite codes have no backing events. Keep them in the revoked
+            // store so the rebuild can carry them across; otherwise an
+            // unrelated role-state event would discard every code.
+            live.claims.clone()
+        };
+        *self.roles.write().await = RoleStore {
+            claims,
+            ..Default::default()
+        };
         schedule_roles_rebuild(
             self.db.clone(),
             Arc::clone(&self.roles),
@@ -4780,6 +4799,18 @@ impl Relay {
             );
             self.mark_roles_stale().await;
         }
+    }
+
+    /// Holds a derived-state mutation claim for a DB removal performed
+    /// outside `after_put` (NIP-86 banevent / NIP-40 expiry). Snapshot
+    /// persistence returns `Deferred` while any claim is in flight.
+    pub(crate) fn begin_group_derived(&self) -> impl Drop + '_ {
+        self.groups_rebuild.derived.begin()
+    }
+
+    /// Role-side counterpart of [`Self::begin_group_derived`].
+    pub(crate) fn begin_role_derived(&self) -> impl Drop + '_ {
+        self.roles_rebuild.derived.begin()
     }
 
     /// Releases the startup recovery gate after `startup_group_state` has

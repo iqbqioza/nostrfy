@@ -230,6 +230,11 @@ impl ReplayGuard {
         pubkey: &str,
         protected: bool,
     ) -> bool {
+        // NIP-98 events may spell the same key in upper/mixed case; the
+        // per-author quota must use the canonical lowercase form or one
+        // grantee gets 64 slots per spelling and can fill the guard.
+        let pubkey = pubkey.to_ascii_lowercase();
+        let pubkey = pubkey.as_str();
         let valid_until = created_at.saturating_add(61);
         let presented = self
             .next_presentation
@@ -955,6 +960,34 @@ mod tests {
         assert!(
             !guard.accept_as("admin", 1_002, 1_002, "pk-admin", true),
             "another author's protected capture must not be evicted"
+        );
+    }
+
+    #[test]
+    fn protected_quota_is_case_insensitive() {
+        // H07: the same management key in upper/mixed case must not get a
+        // fresh 64-entry quota; otherwise case variants fill the 4096 guard
+        // and lock other managers out.
+        let guard = ReplayGuard::default();
+        let upper = "AA".repeat(32);
+        let lower = "aa".repeat(32);
+        for n in 0..ReplayGuard::MAX_PROTECTED_PER_AUTHOR {
+            assert!(guard.accept_as(&format!("g-{n}"), 1_000, 1_000, &upper, true));
+        }
+        assert_eq!(
+            guard.seen.lock().unwrap().len(),
+            ReplayGuard::MAX_PROTECTED_PER_AUTHOR,
+            "case variants must share the same per-author quota"
+        );
+        assert!(guard.accept_as("lower", 1_000, 1_000, &lower, true));
+        assert_eq!(
+            guard.seen.lock().unwrap().len(),
+            ReplayGuard::MAX_PROTECTED_PER_AUTHOR,
+            "the lowercase entry evicts the author's own oldest entry"
+        );
+        assert!(
+            !guard.accept_as("lower", 1_000, 1_000, &lower, true),
+            "the new entry stays tracked"
         );
     }
 

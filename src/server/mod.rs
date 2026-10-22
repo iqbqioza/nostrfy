@@ -741,37 +741,42 @@ async fn restore_role_state(relay: &Relay) -> Result<()> {
     if !relay.config.read().await.nip_enabled(43) {
         return Ok(());
     }
-    let needs_rebuild = match relay.db.load_roles().await {
-        crate::db::LoadRolesOutcome::Loaded(snap) => match (
-            relay.db.state_stamp().await,
-            relay.db.state_seq_role().await,
-        ) {
-            (Some(stamp), Some(seq)) => {
-                if relay.roles.write().await.restore_checked(snap, stamp, seq) {
-                    info!("NIP-43 role state restored from the database snapshot");
-                    false
-                } else {
+    let (needs_rebuild, carried_claims) = match relay.db.load_roles().await {
+        crate::db::LoadRolesOutcome::Loaded(snap) => {
+            let claims = snap.claims.clone();
+            match (
+                relay.db.state_stamp().await,
+                relay.db.state_seq_role().await,
+            ) {
+                (Some(stamp), Some(seq)) => {
+                    if relay.roles.write().await.restore_checked(snap, stamp, seq) {
+                        info!("NIP-43 role state restored from the database snapshot");
+                        (false, None)
+                    } else {
+                        error!(
+                            "the persisted NIP-43 role snapshot predates the database's state \
+                             generation (stamp {stamp}, seq {seq}); refusing to restore it and \
+                             rebuilding from the surviving events instead"
+                        );
+                        // Claims are not event-derived; keep the snapshot's
+                        // codes while rebuilding the role/membership state.
+                        (true, Some(claims))
+                    }
+                }
+                _ => {
+                    // The generation is unknown, so the snapshot's currency
+                    // cannot be established: restoring it could resurrect a
+                    // deleted grant, but its invite codes are independent.
                     error!(
-                        "the persisted NIP-43 role snapshot predates the database's state \
-                         generation (stamp {stamp}, seq {seq}); refusing to restore it and \
-                         rebuilding from the surviving events instead"
+                        "cannot read the database's state generation; refusing to restore \
+                         the persisted NIP-43 role snapshot and rebuilding from the \
+                         surviving events"
                     );
-                    true
+                    (true, Some(claims))
                 }
             }
-            _ => {
-                // The generation is unknown, so the snapshot's currency
-                // cannot be established: restoring it could resurrect a
-                // deleted grant.
-                error!(
-                    "cannot read the database's state generation; refusing to restore \
-                     the persisted NIP-43 role snapshot and rebuilding from the \
-                     surviving events"
-                );
-                true
-            }
-        },
-        crate::db::LoadRolesOutcome::Missing => true,
+        }
+        crate::db::LoadRolesOutcome::Missing => (true, None),
         crate::db::LoadRolesOutcome::Failed => {
             // An empty role store revokes every grant: refuse to start
             // rather than silently unauthorize the relay's own moderation.
@@ -782,6 +787,9 @@ async fn restore_role_state(relay: &Relay) -> Result<()> {
         }
     };
     if needs_rebuild {
+        if let Some(claims) = carried_claims {
+            relay.roles.write().await.claims = claims;
+        }
         if !relay
             .roles
             .write()
@@ -1915,6 +1923,11 @@ async fn purge_loop(relay: Arc<Relay>, mut shutdown: watch::Receiver<bool>) {
                         },
                     )
                 };
+                // Cover the commit→mark window exactly like NIP-09/vanish:
+                // a snapshot captured after the purge commits but before
+                // the mark must not certify pre-removal grants.
+                let _groups_in_flight = relay.begin_group_derived();
+                let _roles_in_flight = relay.begin_role_derived();
                 let purge = relay.db.purge_expired(now, first_seen_retention);
                 tokio::select! {
                     (removed, state_removed) = purge => {
@@ -3713,6 +3726,59 @@ mod tests {
         assert!(
             relay.roles.read().await.roles.contains_key("king"),
             "a role snapshot at the current role sequence must restore"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_stale_role_snapshot_still_contributes_its_invite_claims() {
+        // M30: claims have no backing events. A role event can advance the
+        // role sequence while the 1 s debounced snapshot is in flight; the
+        // startup must reject the stale role/membership state but keep the
+        // snapshot's independent invite codes.
+        let relay = blossom_relay().await;
+        let now = unix_now();
+        let mut role_event = crate::event::Event {
+            id: String::new(),
+            pubkey: "aa".repeat(32),
+            created_at: now,
+            kind: crate::nips::nip43::ROLE_DEFINITION,
+            tags: vec![vec!["d".into(), "mod".into()]],
+            content: String::new(),
+            sig: "00".repeat(64),
+        };
+        role_event.id = crate::nips::nip01::compute_id(&role_event);
+        assert_eq!(
+            relay.db.put(role_event, now).await,
+            crate::db::PutOutcome::Stored
+        );
+        let stamp = relay.db.state_stamp().await.expect("stamp");
+        let mut stale = crate::nips::nip43::RolesSnapshot::default();
+        stale.claims.insert("keep-me".into());
+        stale.stamp = stamp;
+        stale.seq = 0; // below the current role sequence
+        assert!(relay.db.save_roles(stale).await);
+        restore_role_state(&relay)
+            .await
+            .expect("the role rebuild must succeed");
+        assert!(
+            relay.roles.read().await.claims.contains("keep-me"),
+            "a stale snapshot's invite claims must survive the rebuild"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_revoked_role_store_keeps_its_invite_claims() {
+        // M30: mark_roles_stale replaces the live store fail-closed; the
+        // snapshot-only claims must be carried across to the rebuild.
+        let relay = blossom_relay_with_key(&"01".repeat(32)).await;
+        assert!(relay.create_claim("runtime-code").await.is_ok());
+        relay.signal_drain();
+        relay.mark_roles_stale().await;
+        assert!(
+            relay.roles.read().await.claims.contains("runtime-code"),
+            "the revoked store must retain claims for the rebuild"
         );
         relay.db.shutdown();
     }

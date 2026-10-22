@@ -120,6 +120,26 @@ const MAX_ROLE_ID_LEN: usize = 64;
 const MAX_ROLE_LABEL_LEN: usize = 200;
 const MAX_ROLE_DESC_LEN: usize = 1000;
 const MAX_ROLE_COLOR_LEN: usize = 64;
+/// Bound on a moderation reason. The reason is stored in the access blob
+/// and the relay-pubkey list, which is rewritten as a whole per mutation;
+/// accepting the full 64 KiB RPC body would make list growth quadratic.
+const MAX_REASON_LEN: usize = 512;
+/// Bound on each persisted access list. Every mutation rewrites the whole
+/// access blob, so an unbounded list is quadratic write amplification and
+/// an O(n) publish-path scan.
+const MAX_ACCESS_ENTRIES: usize = 10_000;
+
+fn check_reason(reason: &str) -> anyhow::Result<()> {
+    if reason.chars().count() > MAX_REASON_LEN {
+        return Err(anyhow!(
+            "reason exceeds the maximum of {MAX_REASON_LEN} characters"
+        ));
+    }
+    if reason.chars().any(char::is_control) {
+        return Err(anyhow!("reason must not contain control characters"));
+    }
+    Ok(())
+}
 
 fn check_role_fields(label: &str, description: &str, color: &str) -> anyhow::Result<()> {
     if label.chars().count() > MAX_ROLE_LABEL_LEN {
@@ -251,12 +271,11 @@ fn opt_param_i64(params: &[Value], index: usize, what: &str) -> Result<Option<i6
 /// log: `method` + bounded params + the authenticated identity.
 macro_rules! audit {
     ($relay:expr, $identity:expr, $method:expr, $params:expr) => {
-        $relay.audit.log(format!(
-            "{} {} by {}",
-            $method,
-            audit_params($params),
-            $identity
-        ))
+        $relay.audit.log_for(
+            format!("{}", $identity),
+            $identity.is_admin(),
+            format!("{} {} by {}", $method, audit_params($params), $identity),
+        )
     };
 }
 
@@ -266,12 +285,16 @@ macro_rules! audit {
 /// method/params/identity trail.
 macro_rules! audit_failure {
     ($relay:expr, $identity:expr, $method:expr, $params:expr) => {
-        $relay.audit.log(format!(
-            "{} {} by {} (failed)",
-            $method,
-            audit_params($params),
-            $identity
-        ))
+        $relay.audit.log_for(
+            format!("{}", $identity),
+            $identity.is_admin(),
+            format!(
+                "{} {} by {} (failed)",
+                $method,
+                audit_params($params),
+                $identity
+            ),
+        )
     };
 }
 
@@ -395,6 +418,9 @@ pub async fn rpc_handler(
                 Ok(reason) => reason,
                 Err(e) => return rpc_err(&e),
             };
+            if let Err(e) = check_reason(reason) {
+                return rpc_err(&e.to_string());
+            }
             if !is_pubkey(pubkey) {
                 return rpc_err("invalid pubkey");
             }
@@ -403,6 +429,17 @@ pub async fn rpc_handler(
             // compare case-insensitively — storing the canonical form keeps
             // the lists (and their persisted JSON) unambiguous.
             let pubkey = pubkey.to_ascii_lowercase();
+            {
+                let access = relay.access.read().await;
+                if access.blocked_pubkeys.len() >= MAX_ACCESS_ENTRIES
+                    && !access
+                        .blocked_pubkeys
+                        .iter()
+                        .any(|(p, _)| p.eq_ignore_ascii_case(&pubkey))
+                {
+                    return rpc_err("restricted: the blocked-pubkey list is full");
+                }
+            }
             {
                 let op = crate::config::AccessOp::BanPubkey {
                     pubkey: pubkey.clone(),
@@ -467,11 +504,25 @@ pub async fn rpc_handler(
                 Ok(reason) => reason,
                 Err(e) => return rpc_err(&e),
             };
+            if let Err(e) = check_reason(reason) {
+                return rpc_err(&e.to_string());
+            }
             if !is_pubkey(pubkey) {
                 return rpc_err("invalid pubkey");
             }
             // Same lowercase normalization as `banpubkey` above.
             let pubkey = pubkey.to_ascii_lowercase();
+            {
+                let access = relay.access.read().await;
+                if access.allowed_pubkeys.len() >= MAX_ACCESS_ENTRIES
+                    && !access
+                        .allowed_pubkeys
+                        .iter()
+                        .any(|(p, _)| p.eq_ignore_ascii_case(&pubkey))
+                {
+                    return rpc_err("restricted: the allowed-pubkey list is full");
+                }
+            }
             {
                 // NIP-86: allowing a pubkey also un-bans it (matching the
                 // legacy endpoint), so `banpubkey` can be reverted.
@@ -986,6 +1037,9 @@ pub async fn rpc_handler(
                 Ok(reason) => reason,
                 Err(e) => return rpc_err(&e),
             };
+            if let Err(e) = check_reason(reason) {
+                return rpc_err(&e.to_string());
+            }
             let Ok(ip) = ip.parse::<std::net::IpAddr>() else {
                 return rpc_err("invalid ip address");
             };
@@ -993,6 +1047,14 @@ pub async fn rpc_handler(
             // IPv4 block refer to the same peer (and an equivalent-spelling
             // entry is not duplicated).
             let ip = crate::util::normalize_ip(ip);
+            {
+                let access = relay.access.read().await;
+                if access.blocked_ips.entries().len() >= MAX_ACCESS_ENTRIES
+                    && !access.is_ip_blocked(ip)
+                {
+                    return rpc_err("restricted: the blocked-IP list is full");
+                }
+            }
             {
                 let op = crate::config::AccessOp::BlockIp {
                     ip,
@@ -1061,16 +1123,53 @@ pub async fn rpc_handler(
                 Ok(reason) => reason,
                 Err(e) => return rpc_err(&e),
             };
+            if let Err(e) = check_reason(reason) {
+                return rpc_err(&e.to_string());
+            }
             let Ok(id) = hex::decode(id) else {
                 return rpc_err("invalid event id");
             };
             let Ok(id): Result<[u8; 32], _> = id.try_into() else {
                 return rpc_err("invalid event id");
             };
+            // Relay-signed NIP-43 role state has no recoverable event path
+            // after a ban: the rebuild drops snapshot-only invite claims,
+            // and `unbanevent` cannot restore the removed event. Reject the
+            // ban before mutating anything. An unknown id is still accepted
+            // as a pre-ban (the caller cannot know a future role event id).
+            let filter: crate::filter::Filter = serde_json::from_value(serde_json::json!({
+                "ids": [hex::encode(id)],
+            }))
+            .expect("static filter");
+            let Some((targets, _)) = relay
+                .db
+                .query_full_startup(vec![filter], 1, crate::util::unix_now(), false)
+                .await
+            else {
+                audit_failure!(&relay, &identity, "banevent", params);
+                return rpc_err("error: cannot verify the event before banning; retry");
+            };
+            if targets.first().is_some_and(|event| {
+                matches!(
+                    event.kind,
+                    crate::nips::nip43::ROLE_DEFINITION
+                        | crate::nips::nip43::MEMBERSHIP_LIST
+                        | crate::nips::nip43::ADD_USER
+                        | crate::nips::nip43::REMOVE_USER
+                )
+            }) {
+                return rpc_err(
+                    "restricted: relay-signed role state cannot be banned; use the role RPCs",
+                );
+            }
             // NIP-86: the result is always `true` — a ban lands even
             // for an unknown (future) id, pre-banning it. Only a store
             // failure must not be reported as success (the ban would
             // silently disappear on the next restart).
+            // Keep both derived stores from certifying a snapshot between
+            // the commit and the remove/mark below.
+            let _groups_in_flight = relay.begin_group_derived();
+            let _roles_in_flight = relay.begin_role_derived();
             let outcome = relay.db.ban_event(id, reason).await;
             audit!(&relay, &identity, "banevent", params);
             let (_, state_removed) = match outcome {
@@ -2172,7 +2271,10 @@ mod tests {
         // not a `true` result (the next call runs against the dead writer).
         relay.db.shutdown();
         let resp = rpc_call(&relay, "banevent", vec![json!(id.clone())]).await;
-        assert!(rpc_err_of(resp).await.contains("persist"));
+        assert!(
+            rpc_err_of(resp).await.contains("verify"),
+            "a dead writer must fail the pre-ban role-state verification"
+        );
         let resp = rpc_call(&relay, "allowevent", vec![json!(id.clone())]).await;
         assert!(rpc_err_of(resp).await.contains("persist"));
         // A failed ban lookup must surface an error, not an empty list
@@ -2503,6 +2605,41 @@ mod tests {
             body.windows(4).any(|w| w == b"true"),
             "deleting a missing role needs no store: {body:?}"
         );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn banevent_refuses_relay_signed_role_state() {
+        // H06 (strict audit): banning a 33534/13534 destroys the event and
+        // the role rebuild drops snapshot-only invite claims. The RPC must
+        // refuse before mutating anything.
+        let relay = build_admin_relay_with_key(Some(&"cd".repeat(32))).await;
+        let resp = rpc_call(&relay, "createrole", vec![json!("mod")]).await;
+        assert!(rpc_ok_of(resp).await);
+        let resp = rpc_call(&relay, "createclaim", vec![json!("secret-code")]).await;
+        assert!(rpc_ok_of(resp).await);
+        let filter: crate::filter::Filter =
+            serde_json::from_value(json!({ "kinds": [33534] })).unwrap();
+        let (events, _) = relay
+            .db
+            .query(vec![filter], 10, crate::util::unix_now())
+            .await;
+        let role_id = events
+            .first()
+            .expect("the role event must exist")
+            .id
+            .clone();
+        let resp = rpc_call(&relay, "banevent", vec![json!(role_id)]).await;
+        assert!(
+            rpc_err_of(resp).await.contains("role state"),
+            "a relay-signed role event must not be bannable"
+        );
+        let saved = relay.db.load_roles().await.expect_loaded("roles");
+        assert!(
+            saved.claims.contains("secret-code"),
+            "the refused ban must leave invite claims intact"
+        );
+        assert!(saved.roles.contains_key("mod"));
         relay.db.shutdown();
     }
 

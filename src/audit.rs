@@ -20,6 +20,12 @@ use crate::util::unix_now;
 /// well above this; the summary line keeps the trail visible without the
 /// flood).
 const MAX_PER_WINDOW: u32 = 600;
+/// Per-identity cap: one low-privilege grantee must not consume the whole
+/// global window and starve an admin's entries.
+const MAX_PER_IDENTITY: u32 = 100;
+/// Entries reserved above the global cap for admins. A grantee flood can
+/// suppress other grantees, but not the audit record of an admin mutation.
+const ADMIN_RESERVE: u32 = 100;
 /// Window length in seconds.
 const WINDOW_SECS: u64 = 60;
 /// Recent entries kept in the ring (also the test surface).
@@ -29,6 +35,7 @@ struct AuditState {
     window_start: u64,
     count: u32,
     suppressed: u32,
+    per_identity: std::collections::HashMap<String, u32>,
     recent: VecDeque<String>,
 }
 
@@ -45,6 +52,7 @@ impl Default for AuditState {
             window_start: unix_now(),
             count: 0,
             suppressed: 0,
+            per_identity: std::collections::HashMap::new(),
             recent: VecDeque::new(),
         }
     }
@@ -55,7 +63,15 @@ impl AuditLog {
     /// the log and kept in the ring; beyond it the entry is only counted,
     /// and once per window a single summary line reports how many entries
     /// were suppressed.
+    #[cfg(test)]
     pub(crate) fn log(&self, entry: String) {
+        self.log_for("test".to_string(), false, entry);
+    }
+
+    /// Records an entry for `identity`; admins may use the reserved tail of
+    /// the window so a grantee cannot hide an admin mutation by exhausting
+    /// the global budget first.
+    pub(crate) fn log_for(&self, identity: String, admin: bool, entry: String) {
         // A poisoned mutex (a thread panicked while holding it) must not
         // take the audit log down: the state is still valid, so the
         // guard is recovered with `into_inner`.
@@ -66,18 +82,27 @@ impl AuditLog {
         // wall clock catches up, suppressing entries indefinitely).
         if now < state.window_start || now.saturating_sub(state.window_start) >= WINDOW_SECS {
             if state.suppressed > 0 {
-                log::warn!(
-                    "audit log throttled: {} management entries suppressed in the last {}s",
-                    state.suppressed,
-                    WINDOW_SECS
-                );
+                // Bypass the level/target filter: the summary is part of
+                // the audit trail, not routine logging.
+                crate::logging::write_audit_entry(format_args!(
+                    "admin audit log throttled: {} management entries suppressed in the last {}s",
+                    state.suppressed, WINDOW_SECS
+                ));
             }
             state.window_start = now;
             state.count = 0;
             state.suppressed = 0;
+            state.per_identity.clear();
         }
-        if state.count < MAX_PER_WINDOW {
+        let own = state.per_identity.get(&identity).copied().unwrap_or(0);
+        let limit = if admin {
+            MAX_PER_WINDOW.saturating_add(ADMIN_RESERVE)
+        } else {
+            MAX_PER_WINDOW
+        };
+        if own < MAX_PER_IDENTITY && state.count < limit {
             state.count += 1;
+            *state.per_identity.entry(identity).or_insert(0) += 1;
             // Bypasses the `log` level/target filters: a raised `RUST_LOG`
             // must not drop the management trail (see
             // `logging::write_audit_entry`).
@@ -132,6 +157,34 @@ mod tests {
     }
 
     #[test]
+    fn per_identity_cap_and_admin_reserve() {
+        let audit = AuditLog::default();
+        audit.clear();
+        // One grantee cannot consume more than MAX_PER_IDENTITY entries.
+        for i in 0..(MAX_PER_IDENTITY + 5) {
+            audit.log_for("grantee".into(), false, format!("op {i}"));
+        }
+        assert_eq!(
+            audit.state.lock().unwrap().suppressed,
+            5,
+            "the per-identity cap must suppress only the overflow"
+        );
+        // Fill the global window with six grantees; an admin still gets
+        // the reserved tail, so a management mutation is never hidden by a
+        // grantee flood.
+        for id in 0..6 {
+            for i in 0..MAX_PER_IDENTITY {
+                audit.log_for(format!("grantee-{id}"), false, format!("op {i}"));
+            }
+        }
+        audit.log_for("admin".into(), true, "admin mutation".into());
+        assert!(
+            audit.recent().iter().any(|entry| entry == "admin mutation"),
+            "an admin entry must survive a full grantee window"
+        );
+    }
+
+    #[test]
     fn audit_log_recovers_from_poisoned_mutex() {
         let audit = std::sync::Arc::new(AuditLog::default());
         audit.clear();
@@ -157,7 +210,9 @@ mod tests {
         // ring holds at most RING_CAP, so the budget is inferred from the
         // ring + the suppressed count on the next window roll).
         for i in 0..(MAX_PER_WINDOW + 10) {
-            audit.log(format!("op {i}"));
+            // Distinct identities exercise the global budget; the
+            // per-identity cap is covered separately.
+            audit.log_for(format!("id{i}"), false, format!("op {i}"));
         }
         assert_eq!(audit.recent().len(), RING_CAP);
         assert_eq!(

@@ -143,6 +143,16 @@ impl super::Relay {
         };
         let events = {
             let roles = self.roles.read().await;
+            // The caller re-read the rebuild flags before calling, but a
+            // removal can mark the store and revoke it between that read and
+            // this one. Publishing the revoked empty store would replace the
+            // last full 13534. Re-check under the same read guard; a retry
+            // is safe and the RPC reports failure.
+            if self.roles_rebuild.dirty.load(Ordering::SeqCst)
+                || self.roles_rebuild.running.load(Ordering::SeqCst)
+            {
+                return false;
+            }
             let mut events = vec![roles.membership_event(&relay_pubkey, now)];
             if let Some(pubkey) = pubkey {
                 events.push(if add {
