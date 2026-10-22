@@ -3046,6 +3046,12 @@ impl Relay {
                 let Ok(prefix) = hex::decode(&prefix) else {
                     continue;
                 };
+                if prefix.len() > crate::db::store::ID_LEN {
+                    // An id prefix cannot exceed 32 bytes; leaving it out
+                    // makes the per-event validation reject it as malformed
+                    // instead of feeding an oversized LMDB key.
+                    continue;
+                }
                 if !prefix.is_empty() && seen_prefixes.insert(prefix.clone()) {
                     prefixes.push(prefix);
                 }

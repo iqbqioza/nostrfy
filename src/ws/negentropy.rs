@@ -412,7 +412,15 @@ impl super::Conn {
         // recipients, and private/hidden group content from non-members,
         // exactly like the REQ path.
         let items: Vec<nip77::Item> = {
-            let groups = self.relay.groups.read().await;
+            // Only group events need the global group-store read lock. A
+            // non-group NEG filter must not stall group writes/live delivery
+            // behind the whole visibility pass (REQ/COUNT already take this
+            // lock conditionally).
+            let groups = if items.iter().any(|item| item.gid.is_some()) {
+                Some(self.relay.groups.read().await)
+            } else {
+                None
+            };
             items
                 .into_iter()
                 .filter(|item| {
@@ -454,6 +462,12 @@ impl super::Conn {
                         return false;
                     }
                     if let Some(gid) = &item.gid {
+                        let Some(groups) = groups.as_deref() else {
+                            // The condition above guarantees a lock when
+                            // any gid exists; fail closed if a future item
+                            // shape violates it.
+                            return false;
+                        };
                         if self.authed_pubkeys.is_empty() {
                             groups.visible_gid(gid, item.meta, None)
                         } else {

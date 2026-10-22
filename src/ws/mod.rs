@@ -445,6 +445,11 @@ pub struct Conn {
     /// shed oversized frames must not have to wait for every existing
     /// connection to reconnect.
     pub(crate) max_msg_size: usize,
+    /// The message size limit negotiated with tungstenite at upgrade time.
+    /// A SIGHUP raise can only take effect after a reconnect; comparing
+    /// against the current cached value would close every connection on a
+    /// lower-then-raise reload even when the socket already allows it.
+    pub(crate) protocol_max_msg_size: usize,
     /// Current `limits.max_sub_id_len` (refreshed on SIGHUP): used to
     /// sanitize NEG/AUTH ids echoed by the idle reaper, which has no async
     /// config read of its own.
@@ -1165,7 +1170,7 @@ impl Conn {
             self.out_queue_bytes = cfg.limits.max_out_queue_bytes;
             self.req_response_bytes = cfg.limits.max_req_response_bytes;
             let incoming_max = cfg.limits.max_ws_message_bytes;
-            if incoming_max > self.max_msg_size {
+            if incoming_max > self.protocol_max_msg_size {
                 // The WebSocket protocol layer already fixed its limit at
                 // upgrade time; only a reconnect can raise it. Lowering is
                 // enforced dynamically by `handle_frame`.
@@ -1559,6 +1564,7 @@ pub async fn handle_connection(
         out_queue_bytes,
         req_response_bytes,
         max_msg_size,
+        protocol_max_msg_size: max_msg_size,
         max_sub_id_len,
         close_too_big: false,
         reconnect_required: false,
@@ -2253,6 +2259,7 @@ mod tests {
             out_queue_bytes,
             req_response_bytes: 0,
             max_msg_size,
+            protocol_max_msg_size: max_msg_size,
             max_sub_id_len,
             close_too_big: false,
             reconnect_required: false,
@@ -6282,6 +6289,54 @@ mod tests {
                 "the wire echo must be the bounded empty id: {msgs:?}"
             );
             conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn a_lowered_sub_id_limit_still_releases_the_raw_req_state() {
+        // M11: the sanitized echo is not the state key. Re-REQ with an id
+        // that became over-long must remove the raw subscription, live
+        // index entry and queued frames.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let id = "r".repeat(10);
+            conn.handle_req(&[json!(id), json!({"kinds": [1]})]).await;
+            assert!(conn.subs.contains_key(&id), "the subscription is open");
+            conn.relay.config.write().await.limits.max_sub_id_len = 4;
+            conn.handle_req(&[json!(id), json!({"kinds": [1]})]).await;
+            assert!(
+                !conn.subs.contains_key(&id),
+                "the raw REQ state must be released even when the echo is sanitized"
+            );
+            let msgs = outgoing_json(&conn);
+            assert!(
+                msgs.iter().any(|m| m[0] == "CLOSED" && m[1] == json!("")),
+                "the wire echo must be the bounded empty id: {msgs:?}"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn a_lower_then_raise_reload_does_not_force_a_reconnect() {
+        // L12: compare against the upgrade-time protocol limit, not the
+        // current cached value.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_relay_with("").await;
+            let mut conn = build_conn_on(relay.clone()).await;
+            let initial = conn.protocol_max_msg_size;
+            relay.config.write().await.limits.max_ws_message_bytes = initial / 2;
+            conn.refresh_config_cache().await;
+            assert!(!conn.reconnect_required);
+            relay.config.write().await.limits.max_ws_message_bytes = initial;
+            conn.refresh_config_cache().await;
+            assert!(
+                !conn.reconnect_required,
+                "raising back to the upgrade-time limit needs no reconnect"
+            );
+            relay.db.shutdown();
         });
     }
 

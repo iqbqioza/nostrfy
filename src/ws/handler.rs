@@ -367,7 +367,7 @@ impl super::Conn {
         // bytes in the queue; the empty id is the correlation the client
         // gets (its request is refused as invalid either way).
         if sub_id.chars().count() > max_sub_id_len {
-            self.reject_req("", "invalid: subscription id too long");
+            self.reject_req_with_echo(sub_id, "", "invalid: subscription id too long");
             return;
         }
         if rest.len() < 2 {
@@ -772,9 +772,16 @@ impl super::Conn {
     /// queued (like `handle_close`), or stale EVENTs would arrive ahead of
     /// the terminal message.
     fn reject_req(&mut self, sub_id: &str, reason: &str) {
-        self.remove_req_subscription(sub_id);
-        self.purge_queued_events_for(sub_id);
-        self.send_closed(sub_id, reason);
+        self.reject_req_with_echo(sub_id, sub_id, reason);
+    }
+
+    /// Rejects a REQ while cleaning the raw id's state and echoing a
+    /// possibly sanitized id. An over-long id is echoed as `""` but its
+    /// subscription/queued frames still belong to the raw string.
+    fn reject_req_with_echo(&mut self, raw_id: &str, echo_id: &str, reason: &str) {
+        self.remove_req_subscription(raw_id);
+        self.purge_queued_events_for(raw_id);
+        self.send_closed(echo_id, reason);
     }
 
     /// Re-derives the connection's entries in the live subscription
@@ -990,9 +997,14 @@ impl super::Conn {
     /// send would eat the terminal message itself, since it carries the
     /// same id tag.
     fn reject_count(&mut self, sub_id: &str, reason: &str) {
-        self.remove_req_subscription(sub_id);
-        self.purge_queued_events_for(sub_id);
-        self.send_closed(sub_id, reason);
+        self.reject_count_with_echo(sub_id, sub_id, reason);
+    }
+
+    /// COUNT counterpart of [`Self::reject_req_with_echo`].
+    fn reject_count_with_echo(&mut self, raw_id: &str, echo_id: &str, reason: &str) {
+        self.remove_req_subscription(raw_id);
+        self.purge_queued_events_for(raw_id);
+        self.send_closed(echo_id, reason);
     }
 
     pub(crate) async fn handle_count(&mut self, rest: &[Value]) {
@@ -1027,7 +1039,7 @@ impl super::Conn {
         // bytes in the queue; the empty id is the correlation the client
         // gets.
         if sub_id.chars().count() > max_sub_id_len {
-            self.reject_count("", "invalid: subscription id too long");
+            self.reject_count_with_echo(sub_id, "", "invalid: subscription id too long");
             return;
         }
         if rest.len() < 2 {

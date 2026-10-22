@@ -419,6 +419,10 @@ impl super::Relay {
                     unknown = Some("invalid: malformed previous tag");
                     break;
                 };
+                if prefix.len() > crate::db::store::ID_LEN {
+                    unknown = Some("invalid: malformed previous tag");
+                    break;
+                }
                 if !prefix.is_empty() {
                     let exists = match known_prefixes {
                         Some(known) => known.known.contains(&prefix),

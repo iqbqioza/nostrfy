@@ -161,7 +161,9 @@ pub fn respond(items: &[Item], client_message: &[u8]) -> anyhow::Result<Vec<u8>>
     // already rejected over-long messages while reading them; this keeps
     // the implicit trailing range from pushing a maximal message over the
     // budget.
-    if ranges.len() > MAX_NEG_RANGES_PER_MSG {
+    // The parser accepts exactly MAX explicit ranges; a non-infinity final
+    // bound gets one implicit Skip appended below, so allow MAX + 1 here.
+    if ranges.len() > MAX_NEG_RANGES_PER_MSG.saturating_add(1) {
         return Err(anyhow!("too many ranges in one negentropy message"));
     }
     let mut out: Vec<u8> = Vec::new();
@@ -183,8 +185,14 @@ pub fn respond(items: &[Item], client_message: &[u8]) -> anyhow::Result<Vec<u8>>
         if lower_infinity && !upper_infinity {
             return Err(anyhow!("ranges after infinity"));
         }
-        // Ranges must be adjacent and ascending.
-        if lower.ts > upper.ts || (lower.ts == upper.ts && prefix_gt(&lower.prefix, &upper.prefix))
+        // Ranges must be adjacent and ascending. The empty prefix is only
+        // a special infinity value at u64::MAX: when the upper bound is
+        // infinity, a finite-prefix lower bound (including a non-empty
+        // prefix at the same maximal timestamp) is below it, even though
+        // `prefix_gt` zero-pads and would compare the empty prefix as
+        // smaller.
+        if lower.ts > upper.ts
+            || (lower.ts == upper.ts && !upper_infinity && prefix_gt(&lower.prefix, &upper.prefix))
         {
             return Err(anyhow!("ranges out of order"));
         }
@@ -335,6 +343,22 @@ mod tests {
         );
         // A normal infinity-bound-only message still answers.
         assert!(respond(&items, &[PROTOCOL_VERSION, 0, 0, 0]).is_ok());
+    }
+
+    #[test]
+    fn implicit_infinity_accepts_a_final_max_timestamp_prefix() {
+        // L13: a final (u64::MAX, non-empty) bound is not infinity, so the
+        // relay appends the implicit infinity range. The ordering check must
+        // accept that pair; otherwise conforming bisection messages end in
+        // NEG-ERR.
+        let message = vec![PROTOCOL_VERSION, 0, 1, 1, 0];
+        assert!(respond(&[], &message).is_ok());
+        // Exactly the parser's range cap plus the implicit tail is legal.
+        let mut capped = vec![PROTOCOL_VERSION];
+        for _ in 0..MAX_NEG_RANGES_PER_MSG {
+            capped.extend([1, 0, 0]);
+        }
+        assert!(respond(&[], &capped).is_ok());
     }
 
     #[test]

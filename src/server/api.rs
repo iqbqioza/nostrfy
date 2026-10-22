@@ -253,12 +253,36 @@ fn api_url_matches(cfg: &Config, url: &str, path: &str, query: Option<&str>) -> 
     }
     let origin = cfg.relay_identity().http_origin();
     let scheme = origin.split_once("://").map(|(s, _)| s).unwrap_or("http");
-    let mut expected = format!("{scheme}://{host}{path}");
+    // Compare the authority's *host* exactly (case/DNS-dot normalized) and
+    // ignore the port: `api_host` is a bare hostname and the externally
+    // visible port is not in the config. The proxy's Host may include a
+    // non-default port, and a client signs the URL it actually requested.
+    let Some((url_scheme, rest)) = url.split_once("://") else {
+        return false;
+    };
+    if !url_scheme.eq_ignore_ascii_case(scheme) {
+        return false;
+    }
+    let rest = rest.split('#').next().unwrap_or(rest);
+    let (authority, signed_path) = rest.split_once('/').unwrap_or((rest, ""));
+    if authority.contains('@') {
+        return false;
+    }
+    let signed_host = super::host_header_host(authority);
+    if super::normalize_host(signed_host) != super::normalize_host(host) {
+        return false;
+    }
+    let signed_target = if signed_path.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{signed_path}")
+    };
+    let mut expected = path.to_string();
     if let Some(query) = query {
         expected.push('?');
         expected.push_str(query);
     }
-    url == expected
+    signed_target == expected
 }
 
 /// Enforces `relay.require_auth` on the REST API, mirroring the WebSocket
@@ -598,6 +622,16 @@ pub async fn api_handler(
             d_tag,
             ..
         } => {
+            // A naddr addresses a replaceable/addressable event. Other
+            // kinds (e.g. kind 1) have no address; treating their empty d
+            // as a wildcard returned the whole author feed.
+            if !crate::nips::nip01::is_replaceable_kind(kind)
+                && !crate::nips::nip33::is_param_replaceable_kind(kind)
+            {
+                return param_rejection(anyhow::anyhow!(
+                    "invalid naddr kind: {kind} is not replaceable or addressable"
+                ));
+            }
             let hex_pk = hex::encode(pubkey);
             // `bound_params` already capped `params.limit` at
             // `limits.max_api_limit` when one is configured; there is no
@@ -621,6 +655,12 @@ pub async fn api_handler(
                 filter.tags.insert("#d".to_string(), json!(d_value));
             }
             filter = apply_params(filter, &params);
+            if d_value.is_empty() {
+                // An explicit `?d=` empty override must mean "no d tag",
+                // not the literal `#d:""` filter (normal replaceable events
+                // carry no d tag at all).
+                filter.tags.remove("#d");
+            }
             let no_tags = excluded_tags(&params);
             query_and_respond_dtag(
                 &relay,
@@ -999,10 +1039,15 @@ pub async fn api_kinds_handler(
     };
     let count_limit = relay.config.read().await.limits.max_count;
     let now = unix_now();
-    let filter = Filter {
-        authors: Some(vec![hex_pk.clone()]),
-        ..Default::default()
-    };
+    // The documented query parameters apply here too; ignoring them made a
+    // time-windowed request return all-time counts.
+    let filter = apply_params(
+        Filter {
+            authors: Some(vec![hex_pk.clone()]),
+            ..Default::default()
+        },
+        &params,
+    );
     let Some((events, more)) = relay.db.api_count(vec![filter], count_limit, now).await else {
         return db_unavailable();
     };
@@ -1224,10 +1269,15 @@ pub async fn api_stats_handler(
     }
     let count_limit = relay.config.read().await.limits.max_count;
     let now = unix_now();
-    let filter = Filter {
-        authors: Some(vec![hex_pk.clone()]),
-        ..Default::default()
-    };
+    // Same as `/kinds`: the documented filters must apply, not be silently
+    // dropped on the aggregate endpoints.
+    let filter = apply_params(
+        Filter {
+            authors: Some(vec![hex_pk.clone()]),
+            ..Default::default()
+        },
+        &params,
+    );
     let no_tags = excluded_tags(&params);
     let nip78 = enabled_nip78_auth_active(&relay).await;
 
@@ -1936,6 +1986,19 @@ async fn query_and_respond_dtag(
     no_tags: &[&str],
     required_dtag: Option<&str>,
 ) -> (StatusCode, Json<Value>) {
+    // `limit=0` is a legitimate NIP-01 request for no events. Returning it
+    // before the scan avoids a deep-offset request forcing a huge fetch for
+    // an empty response.
+    if max_limit == 0 {
+        return (
+            StatusCode::OK,
+            Json(json!(ApiResponse {
+                events: Vec::new(),
+                count: 0,
+                more: false,
+            })),
+        );
+    }
     // Concurrency limiter: at most `api_max_concurrent` `/api/v1` queries
     // run at once. When saturated, the request fails fast with 503 so a
     // flood of REST traffic cannot pile up behind the shared database. One
@@ -3193,6 +3256,44 @@ mod tests {
             let events = resp["events"].as_array().unwrap();
             assert_eq!(events.len(), 1);
             assert_eq!(events[0]["id"], other.id);
+
+            // M12: a non-addressable kind must not degenerate into the
+            // author's whole feed.
+            let (code, _) = api_handler(
+                State(relay.clone()),
+                Path(naddr_identifier(1, &pk, "")),
+                Query(ApiParams::default()),
+            )
+            .await;
+            assert_eq!(code, StatusCode::BAD_REQUEST);
+
+            // An explicit empty `?d=` override must still resolve the
+            // normal replaceable event (no `#d` filter).
+            let (code, Json(resp)) = api_handler(
+                State(relay.clone()),
+                Path(naddr_identifier(0, &pk, "")),
+                Query(ApiParams {
+                    d: Some(String::new()),
+                    ..Default::default()
+                }),
+            )
+            .await;
+            assert_eq!(code, StatusCode::OK);
+            assert_eq!(resp["events"].as_array().unwrap().len(), 1);
+
+            // M13: limit=0 must not fetch the deep-offset window.
+            let (code, Json(resp)) = api_query_handler(
+                State(relay.clone()),
+                Query(ApiParams {
+                    limit: Some(0),
+                    offset: Some(50_000),
+                    ..Default::default()
+                }),
+            )
+            .await;
+            assert_eq!(code, StatusCode::OK);
+            assert_eq!(resp["events"].as_array().unwrap().len(), 0);
+            assert_eq!(resp["count"], 0);
             relay.db.shutdown();
         });
     }
