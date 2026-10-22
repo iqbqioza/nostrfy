@@ -150,6 +150,13 @@ pub(crate) const GIFT_WRAP_INDEX: u8 = 0x01;
 /// authority for each index (this version is the human-visible upgrade
 /// record and the gate for future versioned steps).
 pub(crate) const DB_SCHEMA_VERSION: u32 = 1;
+/// Append-only NIP-86 access-op journal. Each mutation writes one small
+/// entry instead of rewriting the full `access` blob + pubkey list; a
+/// compaction folds the journal into the base state after this many entries
+/// (amortizing the full rewrite over many mutations).
+const ACCESS_OP_PREFIX: &[u8] = b"aop:";
+const ACCESS_OP_SEQ: &[u8] = b"aop_seq";
+const ACCESS_OP_COMPACT_AFTER: usize = 1024;
 pub(crate) const DELETED: &str = "deleted";
 pub(crate) const EXPIRY: &str = "expiry";
 pub(crate) const REPLACEABLE: &str = "replaceable";
@@ -1388,10 +1395,165 @@ impl Store {
     /// Loads the persisted access control lists, if any.
     pub(crate) fn load_access(&self) -> Result<Option<crate::config::AccessControl>> {
         let rtxn = self.env.read_txn()?;
-        let Some(raw) = self.access.get(&rtxn, b"access")? else {
-            return Ok(None);
+        self.resolve_access_state(&rtxn)
+    }
+
+    /// Base state plus the append-only access-op journal. `None` means no
+    /// base blob and no queued ops (a fresh database).
+    fn resolve_access_state(
+        &self,
+        rtxn: &heed::RoTxn<'_>,
+    ) -> Result<Option<crate::config::AccessControl>> {
+        let base = match self.access.get(rtxn, b"access")? {
+            Some(raw) => Some(serde_json::from_slice::<crate::config::AccessControl>(raw)?),
+            None => None,
         };
-        Ok(Some(serde_json::from_slice(raw)?))
+        let (deny, allow) = self.base_relay_pubkeys(rtxn)?;
+        let mut ops = Vec::new();
+        for item in self.access.prefix_iter(rtxn, ACCESS_OP_PREFIX)? {
+            let (_, raw) = item?;
+            match serde_json::from_slice::<crate::config::AccessOp>(raw) {
+                Ok(op) => ops.push(op),
+                Err(e) => log::warn!("skipping corrupt access-op journal entry: {e}"),
+            }
+        }
+        if base.is_none() && ops.is_empty() {
+            return Ok(None);
+        }
+        let mut state = base.unwrap_or_default();
+        state.blocked_pubkeys = deny;
+        state.allowed_pubkeys = allow;
+        for op in &ops {
+            crate::config::apply_access_op(&mut state, op);
+        }
+        Ok(Some(state))
+    }
+
+    /// The persisted base pubkey lists, without applying the op journal.
+    fn base_relay_pubkeys(&self, rtxn: &heed::RoTxn<'_>) -> Result<RelayPubkeyLists> {
+        match self.access.get(rtxn, b"relay_pubkeys")? {
+            Some(raw) => {
+                let value: serde_json::Value = serde_json::from_slice(raw)?;
+                Ok((
+                    serde_json::from_value(value.get("deny").cloned().unwrap_or_default())?,
+                    serde_json::from_value(value.get("allow").cloned().unwrap_or_default())?,
+                ))
+            }
+            None => Ok((Vec::new(), Vec::new())),
+        }
+    }
+
+    /// Base pubkey lists plus the journal's replay.
+    fn load_relay_pubkeys_in(&self, rtxn: &heed::RoTxn<'_>) -> Result<RelayPubkeyLists> {
+        let (mut deny, mut allow) = self.base_relay_pubkeys(rtxn)?;
+        // Apply the journal to a state carrying the base lists. Ops that
+        // only touch kinds/IPs/grants are harmless to the list result.
+        let mut ops: Vec<crate::config::AccessOp> = Vec::new();
+        for item in self.access.prefix_iter(rtxn, ACCESS_OP_PREFIX)? {
+            let (_, raw) = item?;
+            if let Ok(op) = serde_json::from_slice::<crate::config::AccessOp>(raw) {
+                ops.push(op);
+            }
+        }
+        if !ops.is_empty() {
+            let mut state = crate::config::AccessControl {
+                blocked_pubkeys: std::mem::take(&mut deny),
+                allowed_pubkeys: std::mem::take(&mut allow),
+                ..Default::default()
+            };
+            for op in &ops {
+                crate::config::apply_access_op(&mut state, op);
+            }
+            deny = state.blocked_pubkeys;
+            allow = state.allowed_pubkeys;
+        }
+        Ok((deny, allow))
+    }
+
+    /// Appends NIP-86 operations to the journal in one small transaction.
+    /// When the journal reaches [`ACCESS_OP_COMPACT_AFTER`], it is folded
+    /// into the base blob/lists and cleared in the same transaction, so
+    /// readers always see either the pre- or post-compaction state.
+    pub(crate) fn append_access_ops(&self, ops: &[crate::config::AccessOp]) -> Result<()> {
+        if ops.is_empty() {
+            return Ok(());
+        }
+        self.disk_full_error()?;
+        let mut wtxn = self.env.write_txn()?;
+        let mut seq = match self.access.get(&wtxn, ACCESS_OP_SEQ)? {
+            Some(raw) if raw.len() == 8 => {
+                u64::from_be_bytes(raw.try_into().expect("checked length"))
+            }
+            _ => 0,
+        };
+        for op in ops {
+            let key = format!("aop:{seq:020}");
+            self.access
+                .put(&mut wtxn, key.as_bytes(), &serde_json::to_vec(op)?)?;
+            seq = seq.saturating_add(1);
+        }
+        self.access
+            .put(&mut wtxn, ACCESS_OP_SEQ, &seq.to_be_bytes())?;
+        let mut journal_keys: Vec<Vec<u8>> = Vec::new();
+        for item in self.access.prefix_iter(&wtxn, ACCESS_OP_PREFIX)? {
+            journal_keys.push(item?.0.to_vec());
+        }
+        if journal_keys.len() >= ACCESS_OP_COMPACT_AFTER {
+            let mut state = match self.access.get(&wtxn, b"access")? {
+                Some(raw) => serde_json::from_slice::<crate::config::AccessControl>(raw)?,
+                None => crate::config::AccessControl::default(),
+            };
+            // Base lists only: `load_relay_pubkeys_in` would already replay
+            // the journal, and replaying it again below must not double-apply
+            // an add/remove sequence.
+            let (deny, allow) = match self.access.get(&wtxn, b"relay_pubkeys")? {
+                Some(raw) => {
+                    let value: serde_json::Value = serde_json::from_slice(raw)?;
+                    (
+                        serde_json::from_value(value.get("deny").cloned().unwrap_or_default())?,
+                        serde_json::from_value(value.get("allow").cloned().unwrap_or_default())?,
+                    )
+                }
+                None => (Vec::new(), Vec::new()),
+            };
+            state.blocked_pubkeys = deny;
+            state.allowed_pubkeys = allow;
+            let mut replay = Vec::with_capacity(journal_keys.len());
+            for key in &journal_keys {
+                if let Some(raw) = self.access.get(&wtxn, key)?
+                    && let Ok(op) = serde_json::from_slice::<crate::config::AccessOp>(raw)
+                {
+                    replay.push(op);
+                }
+            }
+            for op in &replay {
+                crate::config::apply_access_op(&mut state, op);
+            }
+            self.access
+                .put(&mut wtxn, b"access", &serde_json::to_vec(&state)?)?;
+            self.access.put(
+                &mut wtxn,
+                b"relay_pubkeys",
+                &relay_pubkeys_json(&state.blocked_pubkeys, &state.allowed_pubkeys)?,
+            )?;
+            for key in journal_keys {
+                self.access.delete(&mut wtxn, &key)?;
+            }
+        }
+        self.commit(wtxn)?;
+        Ok(())
+    }
+
+    fn clear_access_ops(&self, wtxn: &mut heed::RwTxn<'_>) -> Result<()> {
+        let keys: Vec<Vec<u8>> = self
+            .access
+            .prefix_iter(wtxn, ACCESS_OP_PREFIX)?
+            .map(|item| item.map(|(key, _)| key.to_vec()))
+            .collect::<std::result::Result<Vec<_>, heed::Error>>()?;
+        for key in keys {
+            self.access.delete(wtxn, &key)?;
+        }
+        Ok(())
     }
 
     /// Loads the persisted Blossom upload allowlist (empty when none).
@@ -1895,6 +2057,7 @@ impl Store {
         let data = relay_pubkeys_json(deny, allow)?;
         let mut wtxn = self.env.write_txn()?;
         self.access.put(&mut wtxn, b"relay_pubkeys", &data)?;
+        self.clear_access_ops(&mut wtxn)?;
         wtxn.commit()?;
         Ok(())
     }
@@ -1916,6 +2079,7 @@ impl Store {
         let mut wtxn = self.env.write_txn()?;
         self.access.put(&mut wtxn, b"access", &access_data)?;
         self.access.put(&mut wtxn, b"relay_pubkeys", &lists_data)?;
+        self.clear_access_ops(&mut wtxn)?;
         // The test-only `fail_next_commit` hook (shared with the put batch
         // path) aborts the commit, so both keys stay at their previous
         // values.
@@ -1938,13 +2102,7 @@ impl Store {
     /// Loads the persisted relay pubkey access lists ((deny, allow)).
     pub(crate) fn load_relay_pubkeys(&self) -> Result<RelayPubkeyLists> {
         let rtxn = self.env.read_txn()?;
-        let Some(raw) = self.access.get(&rtxn, b"relay_pubkeys")? else {
-            return Ok((Vec::new(), Vec::new()));
-        };
-        let value: serde_json::Value = serde_json::from_slice(raw)?;
-        let deny = serde_json::from_value(value.get("deny").cloned().unwrap_or_default())?;
-        let allow = serde_json::from_value(value.get("allow").cloned().unwrap_or_default())?;
-        Ok((deny, allow))
+        self.load_relay_pubkeys_in(&rtxn)
     }
 
     /// One-time migration for databases written before the pubkey lists

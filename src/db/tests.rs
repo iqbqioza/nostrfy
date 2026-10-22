@@ -11096,3 +11096,75 @@ fn startup_migrations_upgrade_an_old_database_and_record_the_schema_version() {
         "the version marker must survive a restart"
     );
 }
+
+#[test]
+fn access_op_journal_applies_and_compacts_without_data_loss() {
+    use crate::config::AccessOp;
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let first = "aa".repeat(32);
+        let second = "bb".repeat(32);
+        assert!(
+            db.append_access_ops(&[
+                AccessOp::BanPubkey {
+                    pubkey: first.clone(),
+                    reason: "first".into(),
+                    insensitive: true,
+                },
+                AccessOp::BanPubkey {
+                    pubkey: second.clone(),
+                    reason: "second".into(),
+                    insensitive: true,
+                },
+            ])
+            .await
+        );
+        let (deny, _) = db.load_relay_pubkeys().await.expect("journal must apply");
+        assert_eq!(deny.len(), 2);
+        assert!(deny.iter().any(|(p, _)| p == &first));
+
+        // Cross the compaction threshold: the base write must contain the
+        // whole journal, including the first two ops.
+        let batch: Vec<AccessOp> = (0..1100)
+            .map(|i| AccessOp::BanPubkey {
+                pubkey: format!("{i:064x}"),
+                reason: String::new(),
+                insensitive: true,
+            })
+            .collect();
+        assert!(db.append_access_ops(&batch).await);
+        let (deny, _) = db
+            .load_relay_pubkeys()
+            .await
+            .expect("compacted state must load");
+        assert_eq!(deny.len(), 1102);
+        assert!(deny.iter().any(|(p, _)| p == &first));
+        assert!(deny.iter().any(|(p, _)| p == &second));
+
+        // A post-compaction op still applies on top of the folded base.
+        assert!(
+            db.append_access_ops(&[AccessOp::UnbanPubkey {
+                pubkey: first.clone(),
+                insensitive: true,
+            }])
+            .await
+        );
+        let (deny, _) = db
+            .load_relay_pubkeys()
+            .await
+            .expect("post-compaction journal must load");
+        assert_eq!(deny.len(), 1101);
+        assert!(!deny.iter().any(|(p, _)| p == &first));
+    });
+    db.shutdown();
+}

@@ -612,10 +612,17 @@ enum Msg {
     /// single transaction, so the two can never be read from different
     /// generations after a crash. The reply reports whether the commit
     /// succeeded.
+    #[allow(dead_code)] // compatibility/CLI-tested full-save path
     SaveAccessAndPubkeys {
         access: crate::config::AccessControl,
         deny: Vec<(String, String)>,
         allow: Vec<(String, String)>,
+        reply: oneshot::Sender<bool>,
+    },
+    /// Appends NIP-86 access operations to the incremental journal (one
+    /// small write per mutation instead of rewriting the whole access blob).
+    AppendAccessOps {
+        ops: Vec<crate::config::AccessOp>,
         reply: oneshot::Sender<bool>,
     },
     /// Loads the persisted access control lists.
@@ -1005,6 +1012,10 @@ fn msg_bytes(msg: &Msg) -> usize {
                     .map(|(pubkey, reason)| pubkey.len() + reason.len())
                     .sum::<usize>()
         }
+        Msg::AppendAccessOps { ops, .. } => ops
+            .iter()
+            .map(|op| serde_json::to_vec(op).map_or(0, |v| v.len()))
+            .sum(),
         Msg::SaveRelayPubkeys { deny, allow, .. } => deny
             .iter()
             .chain(allow.iter())
@@ -2654,6 +2665,16 @@ impl DbClient {
     /// single transaction: a crash between two separate saves could leave
     /// the relay-level bans and the access rules from different
     /// generations. Returns whether the commit succeeded.
+    /// Appends access mutations to the incremental journal. The writer
+    /// folds the journal into the base state in the same transaction once
+    /// it grows past the compaction threshold.
+    pub async fn append_access_ops(&self, ops: &[crate::config::AccessOp]) -> bool {
+        let ops = ops.to_vec();
+        self.request_write(|reply| Msg::AppendAccessOps { ops, reply })
+            .await
+    }
+
+    #[allow(dead_code)] // compatibility/CLI-tested full-save path
     pub async fn save_access_and_pubkeys(
         &self,
         access: &crate::config::AccessControl,

@@ -2746,11 +2746,12 @@ fn load_access_state(cfg: &Config) -> Result<PersistedAccess> {
     drop(rtxn);
     crate::db::store::migrate_access_pubkeys(&env, &access_table)?;
     let rtxn = env.read_txn()?;
-    let access = match access_table.get(&rtxn, b"access")? {
-        Some(raw) => Some(serde_json::from_slice(raw)?),
-        None => None,
-    };
-    let (relay_deny, relay_allow) = match access_table.get(&rtxn, b"relay_pubkeys")? {
+    let base_access: Option<crate::config::AccessControl> =
+        match access_table.get(&rtxn, b"access")? {
+            Some(raw) => Some(serde_json::from_slice(raw)?),
+            None => None,
+        };
+    let (base_deny, base_allow) = match access_table.get(&rtxn, b"relay_pubkeys")? {
         Some(raw) => {
             let value: serde_json::Value = serde_json::from_slice(raw)?;
             let deny = serde_json::from_value(value.get("deny").cloned().unwrap_or_default())?;
@@ -2759,14 +2760,37 @@ fn load_access_state(cfg: &Config) -> Result<PersistedAccess> {
         }
         None => (Vec::new(), Vec::new()),
     };
+    // The daemon's NIP-86 mutations are appended to the op journal, not
+    // rewritten into the base blob on every call. A CLI read-modify-write
+    // must replay them before changing anything (and the save below folds
+    // them into the base so clearing the journal is safe).
+    let mut state = base_access.clone().unwrap_or_default();
+    state.blocked_pubkeys = base_deny;
+    state.allowed_pubkeys = base_allow;
+    let mut had_ops = false;
+    for item in access_table.prefix_iter(&rtxn, b"aop:")? {
+        let (_, raw) = item?;
+        match serde_json::from_slice::<crate::config::AccessOp>(raw) {
+            Ok(op) => {
+                had_ops = true;
+                crate::config::apply_access_op(&mut state, &op);
+            }
+            Err(e) => log::warn!("skipping corrupt access-op journal entry: {e}"),
+        }
+    }
+    let access = if base_access.is_some() || had_ops {
+        Some(state.clone())
+    } else {
+        None
+    };
     let blossom_allow = match access_table.get(&rtxn, b"blossom_allow")? {
         Some(raw) => serde_json::from_slice(raw)?,
         None => Vec::new(),
     };
     Ok(PersistedAccess {
         access,
-        relay_deny,
-        relay_allow,
+        relay_deny: state.blocked_pubkeys,
+        relay_allow: state.allowed_pubkeys,
         blossom_allow,
     })
 }
@@ -2797,6 +2821,16 @@ fn save_access_state(cfg: &Config, state: &PersistedAccess) -> Result<()> {
         b"blossom_allow",
         &serde_json::to_vec(&state.blossom_allow)?,
     )?;
+    // The full state written above supersedes every journal entry; leaving
+    // them would replay the daemon's already-folded mutations on the next
+    // read (and could undo this CLI change).
+    let journal: Vec<Vec<u8>> = access
+        .prefix_iter(&wtxn, b"aop:")?
+        .map(|item| item.map(|(key, _)| key.to_vec()))
+        .collect::<std::result::Result<Vec<_>, heed::Error>>()?;
+    for key in journal {
+        access.delete(&mut wtxn, &key)?;
+    }
     wtxn.commit()?;
     Ok(())
 }
@@ -3269,6 +3303,73 @@ name = \"nostrfy\"\n",
         assert_eq!(key.len(), 64);
         assert!(hex::decode(&key).is_ok());
         assert!(secp256k1::SecretKey::from_slice(&hex::decode(&key).unwrap()).is_ok());
+    }
+
+    #[test]
+    fn cli_read_replays_the_daemon_access_journal_before_saving() {
+        use crate::config::AccessOp;
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir()
+            .join("nostrfy-cli-access-journal-test")
+            .join(format!("{:x}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("nostrfy.toml");
+        let db_path = dir.join("db");
+        std::fs::write(
+            &config_path,
+            format!("[database]\npath = {:?}\n", db_path.display().to_string()),
+        )
+        .unwrap();
+        let cli = Cli {
+            config: config_path,
+            command: Command::Check,
+            daemonized: false,
+        };
+        let cfg = cli.load_config().unwrap();
+        let banned = "cd".repeat(32);
+        let db = crate::db::DbClient::open(
+            &cfg.database,
+            true,
+            std::sync::Arc::new(Default::default()),
+            0,
+            128,
+            4096,
+            262144,
+        )
+        .unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            assert!(
+                db.append_access_ops(&[AccessOp::BanPubkey {
+                    pubkey: banned.clone(),
+                    reason: "daemon".into(),
+                    insensitive: true,
+                }])
+                .await
+            );
+        });
+        db.shutdown();
+
+        // The CLI must see the journal entry before its read-modify-write,
+        // and its full save must fold/clear the journal.
+        let state = load_access_state(&cfg).unwrap();
+        assert!(
+            state.relay_deny.iter().any(|(p, _)| p == &banned),
+            "the daemon's journal ban must be visible to the CLI"
+        );
+        assert!(
+            state.access.is_some(),
+            "a journal-only state is not 'missing'"
+        );
+        save_access_state(&cfg, &state).unwrap();
+        let reloaded = load_access_state(&cfg).unwrap();
+        assert!(
+            reloaded.relay_deny.iter().any(|(p, _)| p == &banned),
+            "the CLI save must preserve the folded daemon ban"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

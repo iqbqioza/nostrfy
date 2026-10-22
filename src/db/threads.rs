@@ -1535,6 +1535,16 @@ pub(crate) fn spawn(
                                     };
                                     let _ = reply.send(ok);
                                 }
+                                Msg::AppendAccessOps { ops, reply } => {
+                                    let ok = match store.append_access_ops(&ops) {
+                                        Ok(()) => true,
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            false
+                                        }
+                                    };
+                                    let _ = reply.send(ok);
+                                }
                                 Msg::SaveAccessAndPubkeys {
                                     access,
                                     deny,

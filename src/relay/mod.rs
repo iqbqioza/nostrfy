@@ -2612,40 +2612,33 @@ impl Relay {
             return false;
         };
         let (ops, batch_seq) = self.take_access_ops();
-        // Reload the persisted state fresh (fail closed on load error):
-        // merging onto it is what keeps a concurrent CLI write.
-        let (Some(mut merged), Some((deny, allow))) = (
+        // Append each mutation to the small journal instead of rewriting the
+        // whole access blob + pubkey list. The writer folds the journal into
+        // the base state on its bounded compaction threshold.
+        if !self.db.append_access_ops(&ops).await {
+            self.unwrite_access_ops(ops);
+            return false;
+        }
+        // Reload to pick up a concurrent CLI write and the just-appended
+        // journal. The op write is already durable, so a failed read must
+        // not report the mutation as failed (the in-memory state already
+        // carries it); log and keep serving.
+        if let (Some(mut merged), Some((deny, allow))) = (
             self.db.try_load_access().await,
             self.db.try_load_relay_pubkeys().await,
-        ) else {
-            log::warn!("cannot reload the persisted access state; refusing the access write");
-            self.unwrite_access_ops(ops);
-            return false;
-        };
-        merged.blocked_pubkeys = deny;
-        merged.allowed_pubkeys = allow;
-        for op in &ops {
-            crate::config::apply_access_op(&mut merged, op);
+        ) {
+            merged.blocked_pubkeys = deny;
+            merged.allowed_pubkeys = allow;
+            // `restrict_relay` is config-owned: never let a stale persisted
+            // blob regress it.
+            merged.restrict_relay = self.config.read().await.access.restrict_relay;
+            *self.access.write().await = merged;
+        } else {
+            log::warn!(
+                "access mutations are durable but reloading the merged state failed; \
+                 keeping the in-memory state"
+            );
         }
-        // `restrict_relay` is config-owned (the reload always takes it from
-        // the config file): never let a stale persisted blob regress it.
-        merged.restrict_relay = self.config.read().await.access.restrict_relay;
-        // The pubkey lists are excluded from the `access` blob and kept in
-        // their own LMDB key so the CLI and NIP-86 share one source. The
-        // blob and both lists commit in one transaction: a crash (or a
-        // failed second write) must not leave the NIP-86 ban list ahead of
-        // the persisted access blob.
-        let deny = merged.blocked_pubkeys.clone();
-        let allow = merged.allowed_pubkeys.clone();
-        if !self
-            .db
-            .save_access_and_pubkeys(&merged, &deny, &allow)
-            .await
-        {
-            self.unwrite_access_ops(ops);
-            return false;
-        }
-        *self.access.write().await = merged;
         {
             let mut queued = self
                 .access_ops

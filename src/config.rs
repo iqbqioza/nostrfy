@@ -2176,7 +2176,7 @@ impl<'de> serde::Deserialize<'de> for BlockedIps {
 /// replaying after a failed persist (or on reload) is safe. Same-entry
 /// conflicts resolve daemon-wins: the operator just acted, and the other
 /// console observes the result on its next read.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum AccessOp {
     BanPubkey {
         pubkey: String,
