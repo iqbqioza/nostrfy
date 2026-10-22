@@ -568,6 +568,9 @@ impl Store {
                     wrote = true;
                 }
                 let rkey = replaceable_key(address.kind, &pubkey, &dtag_key_safe(&address.d));
+                #[cfg(test)]
+                self.removal_scanned
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let Some(value) = self.replaceable.get(&wtxn, &rkey)? else {
                     continue;
                 };
@@ -1266,6 +1269,21 @@ impl Store {
                     db_error(errors, &e);
                 }
                 continue;
+            }
+            // Legacy records (written before the live 512-address cap)
+            // must not run an unbounded address transaction inside the
+            // startup recovery barrier.
+            let mut request = request;
+            if request.addresses.len() > crate::nips::nip09::MAX_DELETION_ADDRESSES {
+                log::warn!(
+                    "pending deletion carries {} addresses; applying the first {} and \
+                     dropping the truncated tail",
+                    request.addresses.len(),
+                    crate::nips::nip09::MAX_DELETION_ADDRESSES
+                );
+                request
+                    .addresses
+                    .truncate(crate::nips::nip09::MAX_DELETION_ADDRESSES);
             }
             let report = self.apply_deletion_group(
                 &request.targets,

@@ -900,7 +900,10 @@ pub(crate) fn spawn(
             // every request: a panic here would hang all clients, so
             // the whole batch handling is isolated. After a panic (which
             // the code audit makes unreachable) the state is reset and
-            // the thread keeps serving.
+            // the thread keeps serving — unless the consumed batch also
+            // contained the one `Shutdown` message, which would otherwise
+            // leave the loop parked forever and the join unbounded.
+            let mut shutdown_in_batch = false;
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let mut msgs = vec![msg];
                 for _ in 0..BATCH - 1 {
@@ -909,6 +912,7 @@ pub(crate) fn spawn(
                         Err(_) => break,
                     }
                 }
+                shutdown_in_batch = msgs.iter().any(|m| matches!(m, Msg::Shutdown));
 
                 let drained_msgs: usize = msgs
                     .iter()
@@ -1800,6 +1804,9 @@ pub(crate) fn spawn(
                         ]);
                     }
                     batch = WriteBatch::default();
+                    if shutdown_in_batch {
+                        break 'outer;
+                    }
                 }
             }
         }

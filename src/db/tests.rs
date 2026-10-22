@@ -820,10 +820,9 @@ fn an_address_deletion_scans_only_its_own_slots() {
             "the owner's own version must be removed"
         );
         let touched = scanned.load(std::sync::atomic::Ordering::SeqCst);
-        assert!(
-            touched <= 2,
-            "the walk must stay inside the deleted address's own slots, but it iterated \
-             {touched} slots of the whole kind (8 belong to other authors)"
+        assert_eq!(
+            touched, 1,
+            "the direct slot lookup must touch exactly one address slot, not the whole kind"
         );
     });
 }
@@ -6613,6 +6612,51 @@ fn meta_rebuild_converges_when_a_row_cannot_be_indexed() {
     drop(rtxn);
     // A restart converges immediately: no second scan.
     assert!(!store.meta_needs_rebuild().unwrap());
+}
+
+#[test]
+fn a_dangling_by_created_key_does_not_force_a_meta_rebuild() {
+    // M06: the capped corrupt-cleanup walk can leave a dangling by_created
+    // key. Comparing event_meta against by_created made the rebuild run on
+    // every startup forever; the authoritative events table is the right
+    // reference.
+    let expiry = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let store = crate::db::store::Store::open(&config(), expiry, 128).unwrap();
+    let now = unix_now();
+    let ev = event(1, "meta", now, vec![]);
+    let id = ev.id_bytes().unwrap();
+    {
+        let mut wtxn = store.env.write_txn().unwrap();
+        store
+            .events
+            .put(&mut wtxn, &id, &serde_json::to_vec(&ev).unwrap())
+            .unwrap();
+        store
+            .by_created
+            .put(&mut wtxn, &crate::db::store::created_key(now, &id), b"")
+            .unwrap();
+        wtxn.commit().unwrap();
+    }
+    assert!(store.meta_needs_rebuild().unwrap());
+    assert_eq!(store.rebuild_event_meta().unwrap(), 1);
+    // A dangling by_created row (the event itself is gone).
+    let ghost_id = [0xAAu8; 32];
+    {
+        let mut wtxn = store.env.write_txn().unwrap();
+        store
+            .by_created
+            .put(
+                &mut wtxn,
+                &crate::db::store::created_key(now, &ghost_id),
+                b"",
+            )
+            .unwrap();
+        wtxn.commit().unwrap();
+    }
+    assert!(
+        !store.meta_needs_rebuild().unwrap(),
+        "a dangling by_created row must not trigger an endless meta rebuild"
+    );
 }
 
 #[test]

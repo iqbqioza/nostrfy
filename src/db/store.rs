@@ -973,13 +973,21 @@ impl Store {
             // database that has already been running disabled has no marker
             // and must not need a write transaction at startup (a read-only
             // or full filesystem would otherwise fail to open).
-            let marker_present = {
+            let (marker_present, resume_present) = {
                 let rtxn = env.read_txn()?;
-                index_meta.get(&rtxn, b"word_index")?.is_some()
+                (
+                    index_meta.get(&rtxn, b"word_index")?.is_some(),
+                    index_meta.get(&rtxn, b"word_rebuild")?.is_some(),
+                )
             };
-            if marker_present {
+            if marker_present || resume_present {
                 let mut wtxn = env.write_txn()?;
                 index_meta.delete(&mut wtxn, b"word_index")?;
+                // A stale cursor from an interrupted rebuild cannot be
+                // trusted after a disabled period: events stored/deleted
+                // while `by_word` was absent were not reflected. Force a
+                // fresh clear/index on the next enable.
+                index_meta.delete(&mut wtxn, b"word_rebuild")?;
                 wtxn.commit()?;
             }
             (configured_words, false)
@@ -1686,6 +1694,9 @@ impl Store {
         // and lose the owners after the cut.
         let mut last: Option<Vec<u8>> = None;
         loop {
+            if self.cancelled() {
+                anyhow::bail!("Blossom order rebuild cancelled during shutdown");
+            }
             // One bounded read + one bounded write transaction per chunk
             // (like `rebuild_event_meta`): a huge table must not pin one
             // unbounded write transaction, and a MapFull aborts only the
@@ -1739,6 +1750,9 @@ impl Store {
             if chunk.len() < CHUNK {
                 break;
             }
+        }
+        if self.cancelled() {
+            anyhow::bail!("Blossom order rebuild cancelled during shutdown");
         }
         let mut wtxn = self.env.write_txn()?;
         self.index_meta.put(&mut wtxn, b"blossom_order", b"1")?;
@@ -2970,7 +2984,11 @@ impl Store {
             return Ok(false);
         }
         let rtxn = self.env.read_txn()?;
-        let events = self.by_created.len(&rtxn)?;
+        // Compare the authoritative events table: `by_created` can keep
+        // dangling keys after the capped corrupt-cleanup walk, which made
+        // this check permanently true and re-indexed every event at every
+        // startup.
+        let events = self.events.len(&rtxn)?;
         if events == 0 {
             return Ok(false);
         }
@@ -3001,6 +3019,9 @@ impl Store {
         let mut count = 0usize;
         let mut last: Option<Vec<u8>> = None;
         loop {
+            if self.cancelled() {
+                anyhow::bail!("event metadata rebuild cancelled during shutdown");
+            }
             // Read a chunk with a read txn (parsing the headers), then
             // write it with a fresh write txn: the heed iterator borrows
             // the transaction, so the writes cannot share it.
@@ -3096,6 +3117,9 @@ impl Store {
         let mut last_key: Option<Vec<u8>> = None;
         let mut indexed = 0usize;
         loop {
+            if self.cancelled() {
+                anyhow::bail!("gift-wrap index rebuild cancelled during shutdown");
+            }
             // Collect a chunk under a read transaction, index it under a
             // separate write transaction (the heed iterator borrows its txn).
             let chunk: Vec<(Vec<u8>, u64, Vec<[u8; ID_LEN]>)> = {
@@ -3158,6 +3182,9 @@ impl Store {
             if chunk.len() < CHUNK {
                 break;
             }
+        }
+        if self.cancelled() {
+            anyhow::bail!("gift-wrap index rebuild cancelled during shutdown");
         }
         let mut wtxn = self.env.write_txn()?;
         self.index_meta.put(&mut wtxn, b"gift_wrap_index", b"1")?;

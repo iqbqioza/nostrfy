@@ -3059,6 +3059,14 @@ impl DbClient {
         self.request_read(|reply| Msg::LastPage { reply }).await
     }
 
+    /// Signals long chunked DB work (removal walks, index backfills) to
+    /// stop at its next boundary without joining the threads. Shutdown calls
+    /// this before its final snapshot/pending flushes: those flushes queue
+    /// behind the writer, so they must not wait for a full walk first.
+    pub fn cancel_work(&self) {
+        self.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
     pub fn shutdown(&self) {
         // Cancel long chunked removals first: the writer drains the
         // Shutdown message only after its current request, and without the

@@ -1928,6 +1928,7 @@ fn migrate_options(
         public_url: cfg.relay.public_url.clone(),
         relay_pubkey: relay_pubkey_of(cfg),
         max_groups: cfg.relay.max_groups,
+        max_created_at_future_secs: cfg.limits.max_created_at_future_secs,
     }
 }
 

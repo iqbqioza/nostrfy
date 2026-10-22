@@ -87,6 +87,9 @@ pub struct Options {
     pub relay_pubkey: Option<String>,
     /// The configured NIP-29 group cap, for the authorization replay.
     pub max_groups: usize,
+    /// The configured future created_at window (clamped by the hard
+    /// ceiling), used to keep the import consistent with live intake.
+    pub max_created_at_future_secs: u64,
 }
 
 /// Counters for one migration run.
@@ -349,7 +352,12 @@ pub async fn run(
         // (`created_at + span`) could overflow and panic the negentropy
         // worker. Drop such a row as invalid instead of clamping it, so the
         // migration does not silently change its meaning.
-        if event.created_at > now.saturating_add(crate::config::MAX_CREATED_AT_FUTURE_SECS) {
+        if event.created_at
+            > now.saturating_add(
+                opts.max_created_at_future_secs
+                    .min(crate::config::MAX_CREATED_AT_FUTURE_SECS),
+            )
+        {
             stats.invalid += 1;
             continue;
         }
@@ -1395,6 +1403,7 @@ mod tests {
             public_url: String::new(),
             relay_pubkey: None,
             max_groups: 0,
+            max_created_at_future_secs: 3600,
         }
     }
 
@@ -2444,6 +2453,31 @@ mod tests {
         assert!(
             visible(&db, serde_json::json!({"ids": [future.id]})).is_empty(),
             "a row outside the live future window must not be stored"
+        );
+        db.shutdown();
+    }
+
+    #[test]
+    fn a_future_export_row_respects_the_configured_window() {
+        // L05: the import used the 7-day hard ceiling even when the live
+        // relay accepted only 1 h. Both directions are pinned.
+        let db = test_db("future-window");
+        let now = unix_now();
+        let future = signed(1, 1, now + 7200, vec![], "two hours ahead");
+        let stats = run_str(&db, &jsonl(std::slice::from_ref(&future)), &options());
+        assert_eq!(stats.invalid, 1);
+        assert!(
+            visible(&db, serde_json::json!({"ids": [future.id]})).is_empty(),
+            "the default 1 h window must reject a 2 h future row"
+        );
+        let mut wide = options();
+        wide.max_created_at_future_secs = crate::config::MAX_CREATED_AT_FUTURE_SECS;
+        let future2 = signed(2, 1, now + 7200, vec![], "wide window");
+        let stats = run_str(&db, &jsonl(std::slice::from_ref(&future2)), &wide);
+        assert_eq!(stats.stored, 1);
+        assert_eq!(
+            visible(&db, serde_json::json!({"ids": [future2.id]})).len(),
+            1
         );
         db.shutdown();
     }

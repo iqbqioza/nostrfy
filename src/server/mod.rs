@@ -1112,6 +1112,10 @@ pub async fn run_server(
     {
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
+    // Stop a long removal walk before the final flushes below: they enqueue
+    // writes behind the single writer, and `db.shutdown` would only set the
+    // cancel flag after those awaits.
+    relay.db.cancel_work();
     // A deletion whose side effect was shed by a full writer may still be
     // held in memory (the durable `delete_pending` write failed at the
     // time). Retry now that the request tasks are stopped, or the process
