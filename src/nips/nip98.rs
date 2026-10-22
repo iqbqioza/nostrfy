@@ -161,8 +161,12 @@ struct Entry {
     /// Monotonic acceptance order. A flood is presented after a captured
     /// authorization, so this (unlike `created_at`) cannot be backdated.
     presented: u64,
+    /// The author, used to bound one management identity's protected
+    /// entries instead of letting it fill the whole guard.
+    pubkey: String,
     /// A management identity (admin or method grantee) authorization:
-    /// never evicted, so a flood cannot reset a captured header.
+    /// never evicted by another author, so a flood cannot reset a captured
+    /// header. Its own older entries are the only protected eviction pool.
     protected: bool,
 }
 
@@ -179,6 +183,11 @@ impl Default for ReplayGuard {
 impl ReplayGuard {
     /// Maximum authorizations tracked within one window.
     const MAX_ENTRIES: usize = 4096;
+    /// Maximum protected authorizations one management identity may hold
+    /// concurrently. Without a per-author bound one grantee could fill the
+    /// whole guard with its own protected entries and make every other
+    /// management identity fail closed until they expire (AUD-16).
+    const MAX_PROTECTED_PER_AUTHOR: usize = 64;
     /// Minimum seconds between capacity warnings.
     const WARNING_INTERVAL: u64 = 60;
 
@@ -192,31 +201,33 @@ impl ReplayGuard {
 
     /// Records `id` (valid until the event stops verifying); returns
     /// `false` when it was already used (a replay) or when the guard is full
-    /// of protected entries. Expired entries are pruned first.
+    /// of other authors' protected entries. Expired entries are pruned
+    /// first.
     ///
     /// `protected` marks an authorization of a management identity (the
     /// configured admin pubkey or a pubkey with a method grant). Protected
-    /// entries are **never** evicted: a flood of unknown identities must not
-    /// be able to remove a captured admin/grantee authorization and make it
-    /// replayable. At capacity the guard evicts the oldest unprotected
-    /// entry; if every entry is protected it refuses the new authorization
-    /// (fail closed) instead. A protected entry can only be admitted while
-    /// capacity remains, so a flood cannot lock management out by evicting
-    /// its captures.
+    /// entries are **never** evicted for another author: a flood of unknown
+    /// identities must not be able to remove a captured admin/grantee
+    /// authorization and make it replayable. A protected author is bounded
+    /// to [`Self::MAX_PROTECTED_PER_AUTHOR`] live entries; past that, the
+    /// new request evicts that author's own oldest entry. At global capacity
+    /// the guard evicts the oldest unprotected entry, or (when every entry
+    /// is protected) the requesting author's own oldest protected entry;
+    /// when the requester has none, it refuses the new authorization (fail
+    /// closed). One grantee therefore cannot fill the guard and lock every
+    /// other management identity out.
     ///
-    /// `_pubkey` is retained in the API for callers that identify the
-    /// author; protection now decides eviction, so no per-author map is
-    /// kept. `valid_until` must cover the whole
-    /// NIP-98 validity interval of the event: callers pass its `created_at`
-    /// and the guard extends past the inclusive 60-second boundary, so a
-    /// replay at the last valid second (or inside a future-dated event's
-    /// extended window) is still refused.
+    /// `pubkey` identifies the author for that per-author bound.
+    /// `valid_until` must cover the whole NIP-98 validity interval of the
+    /// event: callers pass its `created_at` and the guard extends past the
+    /// inclusive 60-second boundary, so a replay at the last valid second
+    /// (or inside a future-dated event's extended window) is still refused.
     pub(crate) fn accept_as(
         &self,
         id: &str,
         now: u64,
         created_at: u64,
-        _pubkey: &str,
+        pubkey: &str,
         protected: bool,
     ) -> bool {
         let valid_until = created_at.saturating_add(61);
@@ -232,12 +243,25 @@ impl ReplayGuard {
                 false
             } else {
                 let mut admit = true;
-                if seen.len() >= Self::MAX_ENTRIES {
+                if protected {
+                    let own = seen
+                        .values()
+                        .filter(|entry| entry.protected && entry.pubkey == pubkey)
+                        .count();
+                    if own >= Self::MAX_PROTECTED_PER_AUTHOR {
+                        // One management identity's own entries are the
+                        // only protected entries it may evict.
+                        admit = Self::evict_oldest_protected(&mut seen, pubkey);
+                    } else if seen.len() >= Self::MAX_ENTRIES {
+                        warn = true;
+                        // Prefer an unprotected victim; with none left,
+                        // evict this author's own oldest protected entry
+                        // rather than another identity's capture.
+                        admit = Self::evict_unprotected(&mut seen)
+                            || Self::evict_oldest_protected(&mut seen, pubkey);
+                    }
+                } else if seen.len() >= Self::MAX_ENTRIES {
                     warn = true;
-                    // Never evict a protected capture. If every live entry
-                    // is protected, fail closed for this request; the caller
-                    // reports 401 and the caller can retry after entries
-                    // expire.
                     admit = Self::evict_unprotected(&mut seen);
                 }
                 if admit {
@@ -246,6 +270,7 @@ impl ReplayGuard {
                         Entry {
                             expiry: valid_until,
                             presented,
+                            pubkey: pubkey.to_string(),
                             protected,
                         },
                     );
@@ -259,11 +284,30 @@ impl ReplayGuard {
         accepted
     }
 
+    /// Removes the oldest protected authorization belonging to `pubkey`
+    /// (by presentation order). Other authors' protected captures are never
+    /// victims.
+    fn evict_oldest_protected(
+        seen: &mut std::collections::HashMap<String, Entry>,
+        pubkey: &str,
+    ) -> bool {
+        let victim = seen
+            .iter()
+            .filter(|(_, entry)| entry.protected && entry.pubkey == pubkey)
+            .min_by_key(|(_, entry)| entry.presented)
+            .map(|(id, _)| id.clone());
+        if let Some(id) = victim {
+            seen.remove(&id);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Removes the oldest **unprotected** authorization (by the guard's own
     /// presentation order, not the client-signed `created_at`). Returns
-    /// false when every live entry is protected: evicting one could make a
-    /// captured admin/grantee header replayable, so the caller must refuse
-    /// the new authorization instead of evicting.
+    /// false when every live entry is protected; the protected path then
+    /// consults the requester's own entries.
     fn evict_unprotected(seen: &mut std::collections::HashMap<String, Entry>) -> bool {
         let victim = seen
             .iter()
@@ -879,6 +923,38 @@ mod tests {
         assert!(
             !guard.accept_as("admin-2", 1_002, 1_002, "pk-admin", true),
             "the newer protected entry must not be evicted"
+        );
+    }
+
+    #[test]
+    fn replay_guard_bounds_protected_entries_per_author() {
+        // AUD-16: one grantee used to be able to fill all 4096 protected
+        // slots with its own authorizations, locking every other manager
+        // out for the 60 s window. Its own entries are now the only
+        // protected eviction pool and are capped per author.
+        let guard = ReplayGuard::default();
+        let grantee = "pk-grantee";
+        for n in 0..ReplayGuard::MAX_PROTECTED_PER_AUTHOR {
+            assert!(guard.accept_as(&format!("g-{n}"), 1_000, 1_000, grantee, true));
+        }
+        // A different management identity is still admitted: the grantee
+        // never occupied more than its quota.
+        assert!(guard.accept_as("admin", 1_001, 1_001, "pk-admin", true));
+        assert!(
+            guard.seen.lock().unwrap().len() <= ReplayGuard::MAX_PROTECTED_PER_AUTHOR + 1,
+            "one author must not fill the protected pool"
+        );
+        // The grantee may keep working: its next authorization evicts its
+        // own oldest entry, not another author's capture.
+        assert!(guard.accept_as("g-new", 1_002, 1_002, grantee, true));
+        assert!(
+            !guard.accept_as("g-new", 1_002, 1_002, grantee, true),
+            "the newest entry stays tracked"
+        );
+        // The admin's entry survived the grantee's eviction.
+        assert!(
+            !guard.accept_as("admin", 1_002, 1_002, "pk-admin", true),
+            "another author's protected capture must not be evicted"
         );
     }
 

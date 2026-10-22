@@ -260,6 +260,21 @@ macro_rules! audit {
     };
 }
 
+/// Audit an authorized mutation whose in-memory change may have landed but
+/// whose relay-event publish/persist failed (AUD-31). The failure marker
+/// distinguishes it from a successful mutation while keeping the same
+/// method/params/identity trail.
+macro_rules! audit_failure {
+    ($relay:expr, $identity:expr, $method:expr, $params:expr) => {
+        $relay.audit.log(format!(
+            "{} {} by {} (failed)",
+            $method,
+            audit_params($params),
+            $identity
+        ))
+    };
+}
+
 /// NIP-86 JSON-RPC handler, mounted on `POST /` and `POST /ws`.
 /// Unix time of the last authentication-failure warning: a brute-force
 /// probe must leave a visible trace without one log line per attempt
@@ -700,6 +715,9 @@ pub async fn rpc_handler(
                 audit!(&relay, &identity, "createrole", params);
                 rpc_ok(json!(true))
             } else {
+                // The in-memory definition may already be live even though
+                // the relay event could not be stored: audit the attempt.
+                audit_failure!(&relay, &identity, "createrole", params);
                 rpc_err(
                     "restricted: NIP-43 is disabled, the relay key is missing or the event could not be stored",
                 )
@@ -735,6 +753,7 @@ pub async fn rpc_handler(
                 audit!(&relay, &identity, "editrole", params);
                 rpc_ok(json!(true))
             } else {
+                audit_failure!(&relay, &identity, "editrole", params);
                 rpc_err(
                     "restricted: role not found, NIP-43 is disabled or the relay key is not configured",
                 )
@@ -760,9 +779,12 @@ pub async fn rpc_handler(
                     audit!(&relay, &identity, "deleterole", params);
                     rpc_ok(json!(true))
                 }
-                crate::relay::roles::RoleChange::Failed => rpc_err(
-                    "restricted: NIP-43 is disabled, the relay key is missing or the event could not be stored",
-                ),
+                crate::relay::roles::RoleChange::Failed => {
+                    audit_failure!(&relay, &identity, "deleterole", params);
+                    rpc_err(
+                        "restricted: NIP-43 is disabled, the relay key is missing or the event could not be stored",
+                    )
+                }
             }
         }
         "assignrole" => {
@@ -796,9 +818,12 @@ pub async fn rpc_handler(
                 crate::relay::roles::RoleChange::Unknown => {
                     rpc_err("restricted: the role does not exist")
                 }
-                crate::relay::roles::RoleChange::Failed => rpc_err(
-                    "restricted: NIP-43 is disabled, the relay key is missing or the event could not be stored",
-                ),
+                crate::relay::roles::RoleChange::Failed => {
+                    audit_failure!(&relay, &identity, "assignrole", params);
+                    rpc_err(
+                        "restricted: NIP-43 is disabled, the relay key is missing or the event could not be stored",
+                    )
+                }
             }
         }
         "unassignrole" => {
@@ -831,9 +856,12 @@ pub async fn rpc_handler(
                     audit!(&relay, &identity, "unassignrole", params);
                     rpc_ok(json!(true))
                 }
-                crate::relay::roles::RoleChange::Failed => rpc_err(
-                    "restricted: NIP-43 is disabled, the relay key is missing or the event could not be stored",
-                ),
+                crate::relay::roles::RoleChange::Failed => {
+                    audit_failure!(&relay, &identity, "unassignrole", params);
+                    rpc_err(
+                        "restricted: NIP-43 is disabled, the relay key is missing or the event could not be stored",
+                    )
+                }
             }
         }
         "assignmethod" => {
@@ -2398,6 +2426,7 @@ mod tests {
         // (the database is gone) must report failure, not success.
         let relay = build_admin_relay_with_key(Some(&"ab".repeat(32))).await;
         relay.db.shutdown();
+        relay.audit.clear();
         let resp = rpc_call(
             &relay,
             "createrole",
@@ -2409,6 +2438,16 @@ mod tests {
             body.windows(5).any(|w| w == b"error"),
             "a failed role save must be reported: {body:?}"
         );
+        // AUD-31: the in-memory role may already be live even though the
+        // relay event could not be stored; the authorized mutation must
+        // still be audited, marked as failed.
+        let recent = relay.audit.recent();
+        assert!(
+            recent
+                .iter()
+                .any(|e| e.contains("createrole") && e.contains("(failed)")),
+            "a failed role mutation must be audited: {recent:?}"
+        );
         // The same applies to deleting an existing role: the tombstone
         // could not be stored. (Deleting a *missing* role is a no-op
         // success that needs no store access.)
@@ -2416,11 +2455,19 @@ mod tests {
         let resp = rpc_call(&relay, "createrole", vec![json!("t")]).await;
         assert!(rpc_ok_of(resp).await);
         relay.db.shutdown();
+        relay.audit.clear();
         let resp = rpc_call(&relay, "deleterole", vec![json!("t")]).await;
         let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
         assert!(
             body.windows(5).any(|w| w == b"error"),
             "a failed tombstone save must be reported: {body:?}"
+        );
+        let recent = relay.audit.recent();
+        assert!(
+            recent
+                .iter()
+                .any(|e| e.contains("deleterole") && e.contains("(failed)")),
+            "a failed role deletion must be audited: {recent:?}"
         );
         let resp = rpc_call(&relay, "deleterole", vec![json!("ghost")]).await;
         let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
