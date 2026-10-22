@@ -171,6 +171,13 @@ pub(crate) struct BlobStore {
     /// spellings, issuing that many S3 GETs each time. Uploads clear the
     /// entry; unmapped hashes are never cached.
     missing_objects: std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+    /// Bumped whenever an upload/found object clears the negative cache.
+    /// A lookup that started before the heal must not re-insert its stale
+    /// "missing" result after the heal (AUD-30).
+    missing_generation: std::sync::atomic::AtomicU64,
+    /// Bytes currently reserved on the system temp filesystem for S3 spool
+    /// uploads (the S3 backend has no local store counter of its own).
+    s3_spool_reserved: std::sync::atomic::AtomicU64,
     /// Test-only one-shot fault injection: the next owner-mapping commit is
     /// treated as a database failure so the publish-first ordering (an
     /// orphan object, never a phantom mapping) is testable without a real
@@ -211,6 +218,8 @@ impl BlobStore {
                 .collect(),
             orphan_spools_swept: std::sync::atomic::AtomicU64::new(0),
             missing_objects: std::sync::Mutex::new(std::collections::HashMap::new()),
+            missing_generation: std::sync::atomic::AtomicU64::new(0),
+            s3_spool_reserved: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             fail_next_mapping: std::sync::atomic::AtomicBool::new(false),
         })
@@ -251,7 +260,9 @@ impl BlobStore {
     pub(crate) fn reserved_bytes(&self) -> u64 {
         match &self.storage {
             Storage::Local(s) => s.reserved.load(std::sync::atomic::Ordering::Relaxed),
-            Storage::S3(_) => 0,
+            Storage::S3(_) => self
+                .s3_spool_reserved
+                .load(std::sync::atomic::Ordering::Relaxed),
         }
     }
 
@@ -347,15 +358,19 @@ impl BlobStore {
             }
             Storage::S3(_) => {
                 // S3 objects never touch the local disk, but the spool
-                // does: refuse below the floor instead of filling `/tmp`
-                // until a write fails mid-body. A plain check, no
-                // reservation accounting — concurrent uploads are already
-                // bounded by the upload budget, and an unreadable temp
-                // free space fails open like the local check.
+                // does. Account concurrent spool reservations against the
+                // temp filesystem: a plain free-space check let N uploads
+                // all pass and then fill `/tmp` together (AUD-30).
+                let previous = self
+                    .s3_spool_reserved
+                    .fetch_add(size, std::sync::atomic::Ordering::SeqCst);
+                let total = previous.saturating_add(size);
                 if self.min_free_bytes > 0
                     && free_space_of(&std::env::temp_dir())
-                        .is_some_and(|free| free < self.min_free_bytes.saturating_add(size))
+                        .is_some_and(|free| free < self.min_free_bytes.saturating_add(total))
                 {
+                    self.s3_spool_reserved
+                        .fetch_sub(size, std::sync::atomic::Ordering::SeqCst);
                     return Err(crate::error::storage_full());
                 }
             }
@@ -563,14 +578,25 @@ impl BlobStore {
         }
     }
 
-    /// Records a definitive all-owners-missing lookup. The map is bounded:
+    /// Records a definitive all-owners-missing lookup, unless an upload
+    /// healed the hash while the scan was running. The map is bounded:
     /// expired entries are pruned first, and a still-full map is cleared
     /// (the cache is an optimization, never a correctness requirement).
-    fn remember_missing(&self, sha256: &str) {
+    fn remember_missing_if(&self, sha256: &str, generation: u64) {
         let mut cache = self
             .missing_objects
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Checked under the same lock as the insert: `forget_missing`
+        // bumps before taking this lock, so either the bump is visible
+        // here or its remove runs after this insert.
+        if self
+            .missing_generation
+            .load(std::sync::atomic::Ordering::SeqCst)
+            != generation
+        {
+            return;
+        }
         if cache.len() >= MISSING_CACHE_MAX {
             cache.retain(|_, at| at.elapsed() < MISSING_CACHE_TTL);
             if cache.len() >= MISSING_CACHE_MAX {
@@ -581,7 +607,10 @@ impl BlobStore {
     }
 
     /// Clears the negative cache for a hash (an upload healed the object).
+    /// The generation bump makes an in-flight miss observation stale.
     fn forget_missing(&self, sha256: &str) {
+        self.missing_generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.missing_objects
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -618,6 +647,9 @@ impl BlobStore {
         if self.missing_cached(sha256) {
             return Ok(None);
         }
+        let missing_generation = self
+            .missing_generation
+            .load(std::sync::atomic::Ordering::SeqCst);
         let mut last_error: Option<anyhow::Error> = None;
         let mut missing = false;
         let mut refused = false;
@@ -653,7 +685,7 @@ impl BlobStore {
                     // above) means the state is unknown, so it is neither
                     // counted nor cached: a repaired copy must be visible
                     // immediately.
-                    self.remember_missing(sha256);
+                    self.remember_missing_if(sha256, missing_generation);
                     self.stats.bump(&self.stats.blossom_missing_objects, 1);
                 }
                 Ok(None)
@@ -674,6 +706,9 @@ impl BlobStore {
         if self.missing_cached(sha256) {
             return Ok(false);
         }
+        let missing_generation = self
+            .missing_generation
+            .load(std::sync::atomic::Ordering::SeqCst);
         let mut last_error: Option<anyhow::Error> = None;
         let mut missing = false;
         let mut refused = false;
@@ -699,7 +734,10 @@ impl BlobStore {
             Some(e) => Err(e),
             None => {
                 if missing && !refused {
-                    self.remember_missing(sha256);
+                    // A heal during the scan bumps the generation; the
+                    // stale all-missing observation must not re-poison the
+                    // cache after the object became reachable.
+                    self.remember_missing_if(sha256, missing_generation);
                 }
                 Ok(false)
             }
@@ -1081,8 +1119,13 @@ pub(crate) struct SpaceReservation<'a> {
 
 impl Drop for SpaceReservation<'_> {
     fn drop(&mut self) {
-        if let Storage::Local(s) = &self.store.storage {
-            s.release(self.size);
+        match &self.store.storage {
+            Storage::Local(s) => s.release(self.size),
+            Storage::S3(_) => {
+                self.store
+                    .s3_spool_reserved
+                    .fetch_sub(self.size, std::sync::atomic::Ordering::SeqCst);
+            }
         }
     }
 }
@@ -2132,6 +2175,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_heal_during_a_missing_scan_prevents_cache_repoisoning() {
+        // AUD-30: a GET that starts while the object is missing can finish
+        // after an upload heals it. The stale all-missing result must not
+        // be inserted into the negative cache after the heal.
+        let (s, _db_path) = store("cache-generation").await;
+        let sha = "ac".repeat(32);
+        let generation = s
+            .missing_generation
+            .load(std::sync::atomic::Ordering::SeqCst);
+        // The upload publishes the object and clears the cache while the
+        // reader is still scanning.
+        s.forget_missing(&sha);
+        s.remember_missing_if(&sha, generation);
+        assert!(
+            !s.missing_cached(&sha),
+            "the pre-heal generation must not re-enter the negative cache"
+        );
+        // A scan that starts after the heal may cache a genuine miss.
+        let generation = s
+            .missing_generation
+            .load(std::sync::atomic::Ordering::SeqCst);
+        s.remember_missing_if(&sha, generation);
+        assert!(s.missing_cached(&sha));
+        s.db.shutdown();
+    }
+
+    #[tokio::test]
     async fn mapped_missing_object_is_counted() {
         // A mapping can outlive its object (an out-of-band delete, or a
         // pre-publish-first build's mapping): the lookup must count the
@@ -2334,12 +2404,29 @@ mod tests {
             // Disabled floor: allowed (no network happens at construction
             // or reservation time).
             let open = s3(0).await.unwrap();
-            assert!(open.reserve_space(1 << 20).is_ok());
+            assert_eq!(open.reserved_bytes(), 0);
+            let first = open.reserve_space(10).unwrap();
+            assert_eq!(
+                open.reserved_bytes(),
+                10,
+                "S3 spool bytes must be accounted like local reservations"
+            );
+            let second = open.reserve_space(5).unwrap();
+            assert_eq!(open.reserved_bytes(), 15);
+            drop(first);
+            assert_eq!(open.reserved_bytes(), 5, "drop must release S3 spool bytes");
+            drop(second);
+            assert_eq!(open.reserved_bytes(), 0);
             // An unreachable floor: refused before any spool file exists.
             let guarded = s3(u64::MAX).await.unwrap();
             assert!(
                 guarded.reserve_space(1).is_err(),
                 "an S3 upload below the temp floor must be refused like a local one"
+            );
+            assert_eq!(
+                guarded.reserved_bytes(),
+                0,
+                "a refused reservation must roll back"
             );
             db.shutdown();
         });

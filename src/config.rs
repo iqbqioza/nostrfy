@@ -1934,6 +1934,13 @@ fn is_loopback_http_endpoint(endpoint: &str) -> bool {
     };
     // The authority ends at the first path/query/fragment delimiter.
     let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    // Userinfo is never part of a loopback host. `http://127.0.0.1:9000@evil.example`
+    // has the loopback-looking text as its userinfo and `evil.example` as
+    // the actual host, so accepting it would send SigV4 credentials in
+    // cleartext off-host.
+    if authority.contains('@') {
+        return false;
+    }
     // Strip an optional `:port` (IPv6 literals keep their brackets here).
     // Anything else after the bracket is malformed: fail closed instead
     // of treating a broken authority as loopback.
@@ -5248,6 +5255,11 @@ max_log_files = 2
             "http://localhost.evil.com/x",
             "http://[::1]evil",
             "http://[::1",
+            // The loopback text is userinfo; the real host is evil.example.
+            "http://127.0.0.1:9000@evil.example",
+            "http://user@127.0.0.1:9000",
+            "http://evil.example@127.0.0.1:9000",
+            "http://[::1]:9000@evil.example",
         ] {
             assert!(
                 s3cfg(evil).validate().is_err(),
