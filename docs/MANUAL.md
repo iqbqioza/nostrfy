@@ -170,7 +170,7 @@ If anything is wrong, it tells you exactly what. It is strongly recommended to r
 | `reject_ephemeral` | When `true`, reject NIP-01 ephemeral events (kinds 20000–29999), except the NIP-mandated kinds (`22242`, `27235`, `28934`/`28935`/`28936`, `24133`, `23194`/`23195`, `24242`, `21059`) | `false` |
 | `enabled_git` | When `true`, accept NIP-34 git events (kinds 1617–1633, 30617/30618) and advertise NIP-34. Off by default: the kinds are rejected (`blocked: NIP-34 git events are disabled`) | `false` |
 | `require_pow` | Required proof-of-work difficulty in bits (0 = none) | `0` |
-| `new_pubkey_min_age_secs` | Reject posts from accounts younger than this (spam defense, 0 = off) | `0` |
+| `new_pubkey_min_age_secs` | Reject posts from accounts younger than this (spam defense, 0 = off). First-seen entries idle for this window + 1 hour are forgotten; that returning account passes once as new | `0` |
 | `max_events_per_min_per_pubkey` | Max events a pubkey may publish per minute (0 = unlimited; NIP-43 join admissions count against the same window) | `0` |
 | `max_groups` | NIP-29 in-memory group store cap (active + deleted markers; must be ≥ 1, `0` is rejected) | `1000` |
 | `require_auth` | Require NIP-42 auth for everything (subscriptions and publishing; REST API reads require NIP-98) | `false` |

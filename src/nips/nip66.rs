@@ -111,7 +111,10 @@ pub(crate) fn relay_discovery_event(
     // NIP-66's `R` keys cover auth, writes, pow and payment: the write
     // requirement must match the NIP-11 `restricted_writes` predicate — a
     // kind allow/deny list restricts writes just like the pubkey allowlist.
-    if access.restrict_relay || !access.allowed_kinds.is_empty() || !access.blocked_kinds.is_empty()
+    if access.restrict_relay
+        || !access.allowed_kinds.is_empty()
+        || !access.blocked_kinds.is_empty()
+        || cfg.relay.reject_ephemeral
     {
         tags.push(vec!["R".into(), "writes".into()]);
     } else {
@@ -257,5 +260,29 @@ mod tests {
         assert_eq!(normalized_url(&cfg), "ws://relay.example.com/path");
         cfg.relay.public_url = "wss://[::1]:443/".into();
         assert_eq!(normalized_url(&cfg), "wss://[::1]/");
+    }
+    #[test]
+    fn reject_ephemeral_is_advertised_as_restricted_writes() {
+        // L01: NIP-11 calls reject_ephemeral "restricted_writes"; the NIP-66
+        // discovery R tag must not contradict it.
+        let mut cfg = Config::default();
+        cfg.relay.reject_ephemeral = true;
+        let ev = relay_discovery_event(
+            &cfg,
+            &AccessControl::default(),
+            &"bb".repeat(32),
+            &Stats::new(),
+            1_700_000_000,
+        );
+        let reqs: Vec<&str> = ev
+            .tags
+            .iter()
+            .filter(|t| t[0] == "R")
+            .map(|t| t[1].as_str())
+            .collect();
+        assert!(
+            reqs.contains(&"writes"),
+            "reject_ephemeral restricts writes"
+        );
     }
 }

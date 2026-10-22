@@ -202,14 +202,14 @@ Pagination is computed over the **visible** sequence (see [Visibility Rules](#6-
 
 ## 6. Visibility Rules
 
-The API applies the same per-event visibility rules as an **anonymous** WebSocket connection, and `relay.require_auth` gates it like one: every request must then carry a NIP-98 `Authorization: Nostr <base64 kind:27235 event>` whose `u` tag is the exact request URL (path and query; with `server.api_host` set, that host's URL) and whose `method` tag is `GET`; the event must be fresh (60 seconds) and each authorization is accepted once. Anonymous requests are refused with `401 {"error":"auth-required: this relay requires NIP-98 authorization"}`. An authorized caller still sees the anonymous-visibility event set — the API has no identity-scoped reads. The following events are withheld:
+The API applies the **most restrictive anonymous** per-event visibility set, and `relay.require_auth` gates it like an anonymous WebSocket: every request must then carry a NIP-98 `Authorization: Nostr <base64 kind:27235 event>` whose `u` tag is the exact request URL (path and query; with `server.api_host` set, that host's URL) and whose `method` tag is `GET`; the event must be fresh (60 seconds) and each authorization is accepted once. Anonymous requests are refused with `401 {"error":"auth-required: this relay requires NIP-98 authorization"}`. An authorized caller still sees the same anonymous-visibility event set — the API has no identity-scoped reads. The following events are withheld:
 
-- **NIP-70 protected events** from other authors (carrying a `-` tag; the relay's own protected metadata stays visible)
-- **NIP-59 gift wraps** (kind 1059)
+- **NIP-70 protected events** from other authors (carrying a `-` tag; the relay's own protected metadata stays visible). This is stricter than an authenticated WebSocket connection, where any completed AUTH may read protected events: a NIP-98 `Authorization` only unlocks the REST endpoint, it does not grant identity-scoped reads.
+- **NIP-59 gift wraps** (kind 1059). WS reveals a wrap to its authenticated recipient when NIP-42 is enabled (and serves all wraps when NIP-42 is disabled); REST always hides them because it has no recipient identity.
 - **NIP-78 application-specific events** (kinds 78/30078, owner-only while `relay.enabled_nip78_auth` is set)
 - **NIP-29 private/hidden group content** (visible only to members)
 
-These events are excluded before pagination, so they do not consume `limit` slots or corrupt the `offset` sequence.
+These events are excluded before pagination, so they do not consume `limit` slots or corrupt the `offset` sequence. Fetch them over an authenticated WebSocket subscription if you need identity-scoped visibility.
 
 ---
 

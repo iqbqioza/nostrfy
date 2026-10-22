@@ -202,6 +202,15 @@ impl super::Relay {
         {
             return Precheck::Vanish;
         }
+        // NIP-62 says a relay MUST honor a vanish request regardless of the
+        // user's status. Keep the general `require_auth` gate after vanish
+        // detection: an unauthenticated client must still be able to vanish
+        // (its signature was already verified above).
+        if cfg.nip_enabled(42) && cfg.relay.require_auth && authed.is_empty() {
+            return Precheck::Reject(
+                "auth-required: this relay requires authentication".to_string(),
+            );
+        }
         // Access control: blocked/allowlisted pubkeys and kinds. The relay's
         // own pubkey and the admin pubkey (`relay.pubkey`) are exempt:
         // the operator must be able to publish command events even when
@@ -594,6 +603,13 @@ impl super::Relay {
         if event.kind == 13 && !event.tags.is_empty() {
             bail!("invalid: kind 13 seals must not have tags");
         }
+        // NIP-09 disabled: never store a kind:5 request. It would be
+        // acknowledged as a normal event while its deletion side effect is
+        // skipped, and a later enable/restart cannot resurrect it (the
+        // client sees a success that will never happen). Reject explicitly.
+        if event.kind == nip09::DELETION_KIND && !cfg.nip_enabled(9) {
+            bail!("blocked: NIP-09 deletion requests are disabled");
+        }
         // NIP-09: a deletion request is defined as having a list of one or
         // more `e` or `a` tags. A kind-5 event with no targets has no
         // effect and would only accumulate as meaningless history, so it is
@@ -769,10 +785,6 @@ impl super::Relay {
             && nip70::is_protected(&embedded)
         {
             bail!("restricted: repost of a protected event");
-        }
-
-        if cfg.nip_enabled(42) && cfg.relay.require_auth && authed.is_empty() {
-            bail!("auth-required: this relay requires authentication");
         }
 
         // NIP-70: "The default behavior of a relay MUST be to reject any
@@ -2792,6 +2804,138 @@ mod tests {
             assert!(
                 matches!(out, super::Precheck::Reject(_)),
                 "a blocked pubkey's regular events stay blocked"
+            );
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn require_auth_still_allows_a_vanish_request() {
+        // M19: NIP-62 says a relay MUST honor vanish "regardless of the
+        // user's status". The general require_auth gate must not run before
+        // vanish detection.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut cfg = Config::default();
+            cfg.database.map_size = 16 * 1024 * 1024;
+            cfg.database.max_map_size = 64 * 1024 * 1024;
+            cfg.database.path = std::env::temp_dir().join("nostrfy-vanish-require-auth-test");
+            cfg.relay.require_auth = true;
+            let _ = std::fs::remove_dir_all(&cfg.database.path);
+            let db = crate::db::DbClient::open(
+                &cfg.database,
+                true,
+                Arc::new(Default::default()),
+                0,
+                128,
+                4096,
+                262144,
+            )
+            .unwrap();
+            let config = Arc::new(RwLock::new(cfg));
+            let relay = Relay::new(
+                config,
+                db,
+                crate::stats::Stats::new(),
+                "",
+                crate::relay::LiveBusConfig {
+                    buffer: 1024,
+                    batch_interval_ms: 10,
+                    batch_size: 64,
+                },
+            )
+            .await;
+            let relay = Arc::new(relay);
+            let vanish = signed(62, vec![vec!["relay".into(), "127.0.0.1:8080".into()]]);
+            let cfg = relay.config.read().await;
+            let out = relay
+                .precheck(
+                    &cfg,
+                    &AccessControl::default(),
+                    &vanish,
+                    unix_now(),
+                    &[],
+                    None,
+                    None,
+                )
+                .await;
+            assert!(
+                matches!(out, super::Precheck::Vanish),
+                "an unauthenticated vanish must bypass require_auth"
+            );
+            // A regular event still needs AUTH.
+            let note = signed(1, vec![]);
+            let out = relay
+                .precheck(
+                    &cfg,
+                    &AccessControl::default(),
+                    &note,
+                    unix_now(),
+                    &[],
+                    None,
+                    None,
+                )
+                .await;
+            assert!(
+                matches!(out, super::Precheck::Reject(m) if m.contains("auth-required")),
+                "require_auth must still gate ordinary events"
+            );
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn a_disabled_nip09_rejects_deletion_requests() {
+        // M18: storing kind:5 while NIP-09 is disabled acknowledged a
+        // deletion whose side effect was skipped forever. Reject explicitly.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut cfg = Config::default();
+            cfg.database.map_size = 16 * 1024 * 1024;
+            cfg.database.max_map_size = 64 * 1024 * 1024;
+            cfg.database.path = std::env::temp_dir().join("nostrfy-nip09-disabled-test");
+            cfg.relay.disabled_nips.push(9);
+            let _ = std::fs::remove_dir_all(&cfg.database.path);
+            let db = crate::db::DbClient::open(
+                &cfg.database,
+                true,
+                Arc::new(Default::default()),
+                0,
+                128,
+                4096,
+                262144,
+            )
+            .unwrap();
+            let config = Arc::new(RwLock::new(cfg));
+            let relay = Relay::new(
+                config,
+                db,
+                crate::stats::Stats::new(),
+                "",
+                crate::relay::LiveBusConfig {
+                    buffer: 1024,
+                    batch_interval_ms: 10,
+                    batch_size: 64,
+                },
+            )
+            .await;
+            let relay = Arc::new(relay);
+            let deletion = signed(5, vec![vec!["e".into(), "aa".repeat(32)]]);
+            let cfg = relay.config.read().await;
+            let out = relay
+                .precheck(
+                    &cfg,
+                    &AccessControl::default(),
+                    &deletion,
+                    unix_now(),
+                    &[],
+                    None,
+                    None,
+                )
+                .await;
+            assert!(
+                matches!(out, super::Precheck::Reject(m) if m.contains("NIP-09")),
+                "a disabled NIP-09 must reject kind:5 rather than acknowledge a no-op"
             );
             relay.db.shutdown();
         });
