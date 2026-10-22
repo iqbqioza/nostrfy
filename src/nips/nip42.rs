@@ -4,7 +4,7 @@
 //! `["AUTH", <event>]` where the event is kind 22242 signed with the client
 //! key, carrying `relay` and `challenge` tags.
 
-use getrandom::getrandom;
+use getrandom::fill;
 use secp256k1::Secp256k1;
 use serde_json::{Value, json};
 
@@ -25,7 +25,7 @@ pub fn generate_challenge() -> Option<String> {
     // event replay across connections. Callers refuse the connection
     // instead (fail-closed).
     let mut bytes = [0u8; 16];
-    getrandom(&mut bytes).ok()?;
+    fill(&mut bytes).ok()?;
     if bytes == [0u8; 16] {
         return None;
     }

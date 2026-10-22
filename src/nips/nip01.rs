@@ -70,7 +70,7 @@ pub fn sign(event: &mut Event, keypair: &Keypair, secp: &Secp256k1<secp256k1::Al
     event.id = compute_id(event);
     let id: [u8; ID_BYTES] = event.id_bytes().ok_or_else(|| anyhow!("invalid id"))?;
     let mut aux = [0u8; 32];
-    getrandom::getrandom(&mut aux).map_err(|_| anyhow!("rng failure"))?;
+    getrandom::fill(&mut aux).map_err(|_| anyhow!("rng failure"))?;
     event.sig = secp
         .sign_schnorr_with_aux_rand(&id, keypair, &aux)
         .to_string();

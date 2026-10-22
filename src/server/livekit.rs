@@ -149,7 +149,7 @@ async fn group_allows(relay: &Relay, group: &str, pubkey: &str) -> bool {
 }
 fn issue_livekit_token(cfg: &Config, group: &str, pubkey: &str) -> Result<String> {
     let mut suffix = [0u8; 4];
-    getrandom::getrandom(&mut suffix).map_err(|e| anyhow!("rng failure: {e}"))?;
+    getrandom::fill(&mut suffix).map_err(|e| anyhow!("rng failure: {e}"))?;
     let identity = format!("{pubkey}{}", hex::encode(suffix));
     let now = unix_now();
     let claims = json!({

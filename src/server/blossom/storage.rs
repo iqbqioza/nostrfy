@@ -1016,7 +1016,7 @@ pub(crate) fn spool_process_token() -> &'static str {
     static TOKEN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     TOKEN.get_or_init(|| {
         let mut bytes = [0u8; 8];
-        if getrandom::getrandom(&mut bytes).is_ok() {
+        if getrandom::fill(&mut bytes).is_ok() {
             return format!("{:016x}", u64::from_ne_bytes(bytes));
         }
         // No RNG: the wall-clock start time still separates ordinary

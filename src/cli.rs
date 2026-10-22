@@ -2265,7 +2265,7 @@ fn latest_tag_from_json(body: &[u8]) -> Result<String> {
 fn generate_secret_key_hex() -> Result<String> {
     for _ in 0..8 {
         let mut bytes = [0u8; 32];
-        getrandom::getrandom(&mut bytes)
+        getrandom::fill(&mut bytes)
             .map_err(|e| anyhow!(format!("cannot read random bytes: {e}")))?;
         if let Ok(secret) = secp256k1::SecretKey::from_slice(&bytes) {
             return Ok(hex::encode(secret.secret_bytes()));
@@ -2710,7 +2710,7 @@ fn lock_upgrade(dir: &std::path::Path) -> Result<UpgradeLock> {
 /// across pid namespaces sharing a binary volume).
 fn upgrade_tmp_path(dir: &std::path::Path) -> std::path::PathBuf {
     let mut rand = [0u8; 8];
-    if getrandom::getrandom(&mut rand).is_err() {
+    if getrandom::fill(&mut rand).is_err() {
         rand = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| {
