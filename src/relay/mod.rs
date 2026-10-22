@@ -258,6 +258,19 @@ impl Drop for LiveKitRefreshGuard<'_> {
     }
 }
 
+/// Queued access-control operations plus their monotonic sequence. A
+/// persist snapshots `ops` and `seq` under the same lock: `persisted` then
+/// advances to that sequence, so callers whose ops were in the batch return
+/// without rewriting the full access state again. Concurrent NIP-86
+/// mutations therefore coalesce into one write instead of one full-list
+/// rewrite each (M27).
+#[derive(Default)]
+struct PendingAccessOps {
+    ops: Vec<crate::config::AccessOp>,
+    seq: u64,
+    persisted: u64,
+}
+
 pub struct Relay {
     pub config: Arc<RwLock<Config>>,
     /// The live access state. Runtime mutations must pair an apply with
@@ -326,7 +339,7 @@ pub struct Relay {
     /// replayed (not drained) by `reload_db_state`. A plain `Mutex` (never
     /// held across an await) is enough: both drain sites already hold
     /// `persist_access_lock`.
-    access_ops: std::sync::Mutex<Vec<crate::config::AccessOp>>,
+    access_ops: std::sync::Mutex<PendingAccessOps>,
     /// Deletion requests whose side effect could not be applied because the
     /// writer shed the message (the queue was full), held until a write
     /// succeeds and they can be recorded in [`DELETE_PENDING`] for the
@@ -2183,7 +2196,11 @@ impl Relay {
             api_limit: ApiLimiter::new(api_max_concurrent),
             publish_rate: std::sync::Mutex::new(PublishRate::default()),
             persist_access_lock: tokio::sync::Mutex::new(()),
-            access_ops: std::sync::Mutex::new(seed_ops),
+            access_ops: std::sync::Mutex::new(PendingAccessOps {
+                seq: seed_ops.len() as u64,
+                ops: seed_ops,
+                persisted: 0,
+            }),
             pending_removals: std::sync::Mutex::new(Vec::new()),
             pending_removals_limit: std::sync::atomic::AtomicUsize::new(
                 Self::DEFAULT_PENDING_REMOVALS_LIMIT,
@@ -2500,14 +2517,15 @@ impl Relay {
             .access_ops
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        queued.extend(ops);
+        queued.seq = queued.seq.saturating_add(ops.len() as u64);
+        queued.ops.extend(ops);
         // No cap: dropping queued intent would lose bans (fail-open). The
         // queue drains on every successful persist and only grows while
         // the database is failing, when the relay is broken anyway.
-        if queued.len() > 1024 {
+        if queued.ops.len() > 1024 {
             log::warn!(
                 "access op log holds {} unpersisted mutations; the database is not accepting writes",
-                queued.len()
+                queued.ops.len()
             );
         }
     }
@@ -2515,13 +2533,12 @@ impl Relay {
     /// Drains the queued daemon access ops (see [`Self::push_access_ops`]).
     /// Used by `persist_access`; the queue is restored on failure so a
     /// later persist retries the same intent.
-    fn take_access_ops(&self) -> Vec<crate::config::AccessOp> {
-        std::mem::take(
-            &mut *self
-                .access_ops
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()),
-        )
+    fn take_access_ops(&self) -> (Vec<crate::config::AccessOp>, u64) {
+        let mut queued = self
+            .access_ops
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (std::mem::take(&mut queued.ops), queued.seq)
     }
 
     /// Restores drained ops after a failed write, preserving order (the
@@ -2531,8 +2548,8 @@ impl Relay {
             .access_ops
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        ops.append(&mut *queued);
-        *queued = ops;
+        ops.append(&mut queued.ops);
+        queued.ops = ops;
     }
 
     /// Persists the access state (see [`Self::push_access_ops`]): reloads
@@ -2555,15 +2572,41 @@ impl Relay {
     /// the ordering cannot deadlock. When the lock cannot be taken the
     /// write is refused (`false`) instead of proceeding unserialized.
     pub async fn persist_access(&self) -> bool {
+        let target = self
+            .access_ops
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .seq;
+        if self
+            .access_ops
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .persisted
+            >= target
+        {
+            // Another persist already committed this caller's ops.
+            return true;
+        }
         let db_path = self.config.read().await.database.path.clone();
         let _guard = self.persist_access_lock.lock().await;
+        // A concurrent persist may have committed our ops while we waited
+        // for the single-flight lock.
+        {
+            let queued = self
+                .access_ops
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if queued.persisted >= target {
+                return true;
+            }
+        }
         // The cross-process lock is taken *before* the reload so the CLI
         // cannot slip a read-modify-write between the capture and the write.
         let Some(_state_lock) = crate::db::lock_access_state_async(db_path).await else {
             log::warn!("cannot take the access state lock; refusing the access write");
             return false;
         };
-        let ops = self.take_access_ops();
+        let (ops, batch_seq) = self.take_access_ops();
         // Reload the persisted state fresh (fail closed on load error):
         // merging onto it is what keeps a concurrent CLI write.
         let (Some(mut merged), Some((deny, allow))) = (
@@ -2598,6 +2641,13 @@ impl Relay {
             return false;
         }
         *self.access.write().await = merged;
+        {
+            let mut queued = self
+                .access_ops
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            queued.persisted = queued.persisted.max(batch_seq);
+        }
         true
     }
 
@@ -2646,6 +2696,7 @@ impl Relay {
                         .access_ops
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .ops
                         .clone();
                     let mut access = self.access.write().await;
                     access.blocked_pubkeys = deny;
@@ -6168,6 +6219,13 @@ mod tests {
         // not proceed (otherwise the CLI's read-modify-write could be
         // interleaved with the daemon's stale snapshot).
         let relay = build_relay().await;
+        // A queued op makes the persist do real work (an already-persisted
+        // sequence correctly returns without taking the lock).
+        relay.push_access_ops(vec![crate::config::AccessOp::BanPubkey {
+            pubkey: "aa".repeat(32),
+            reason: String::new(),
+            insensitive: true,
+        }]);
         let db_path = relay.config.read().await.database.path.clone();
         let held = crate::db::lock_access_state(&db_path).expect("the lock file opens");
         let persist = {
