@@ -119,7 +119,7 @@ pub fn verify(event: &Event, secp: &Secp256k1<secp256k1::All>) -> bool {
     let Ok(sig) = hex::decode(sig) else {
         return false;
     };
-    if sig.len() != 64 {
+    if delegator_pk.len() != 32 || sig.len() != 64 {
         return false;
     }
     // NIP-26: the token is a signature over the *delegatee's* pubkey, i.e.
@@ -128,12 +128,13 @@ pub fn verify(event: &Event, secp: &Secp256k1<secp256k1::All>) -> bool {
     let mut hasher = Sha256::new();
     hasher.update(payload.as_bytes());
     let message: [u8; 32] = hasher.finalize().into();
-    let Ok(pk) = secp256k1::XOnlyPublicKey::from_slice(&delegator_pk) else {
+    let Ok(pk) = secp256k1::XOnlyPublicKey::from_byte_array(
+        delegator_pk.try_into().expect("length checked"),
+    ) else {
         return false;
     };
-    let Ok(sig) = secp256k1::schnorr::Signature::from_slice(&sig) else {
-        return false;
-    };
+    let sig =
+        secp256k1::schnorr::Signature::from_byte_array(sig.try_into().expect("length checked"));
     secp.verify_schnorr(&sig, &message, &pk).is_ok()
         && conditions_allow(conditions, event.kind, event.created_at)
 }
@@ -220,12 +221,13 @@ mod tests {
         let mut hasher = Sha256::new();
         hasher.update(payload.as_bytes());
         let message: [u8; 32] = hasher.finalize().into();
-        let delegator_key = secp256k1::Keypair::from_seckey_slice(
-            &secp,
-            &hex::decode("ee35e8bb71131c02c1d7e73231daa48e9953d329a4b701f7133c8f46dd21139c")
-                .unwrap(),
-        )
-        .unwrap();
+        let delegator_secret: [u8; 32] =
+            hex::decode("ee35e8bb71131c02c1d7e73231daa48e9953d329a4b701f7133c8f46dd21139c")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let delegator_key =
+            secp256k1::Keypair::from_seckey_byte_array(&secp, delegator_secret).unwrap();
         let token = secp
             .sign_schnorr_no_aux_rand(&message, &delegator_key)
             .to_string();

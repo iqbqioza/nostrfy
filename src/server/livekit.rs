@@ -545,7 +545,7 @@ mod tests {
         secp: &secp256k1::Secp256k1<secp256k1::All>,
         group: &str,
     ) -> Event {
-        let keypair = Keypair::from_seckey_slice(secp, &[7u8; 32]).unwrap();
+        let keypair = Keypair::from_seckey_byte_array(secp, [7u8; 32]).unwrap();
         let pubkey = XOnlyPublicKey::from_keypair(&keypair).0.to_string();
         let authority = {
             let cfg = relay.config.read().await;
@@ -753,7 +753,7 @@ mod tests {
     #[tokio::test]
     async fn known_closed_group_mints_for_member() {
         let relay = build_relay().await;
-        let keypair = Keypair::from_seckey_slice(relay.secp(), &[7u8; 32]).unwrap();
+        let keypair = Keypair::from_seckey_byte_array(relay.secp(), [7u8; 32]).unwrap();
         let pubkey = XOnlyPublicKey::from_keypair(&keypair).0.to_string();
         let mut g = crate::nips::nip29::Group::default();
         g.settings.private = true;
@@ -775,7 +775,7 @@ mod tests {
         // would hand a removed member a room token. The WS and API read
         // paths fail closed the same way.
         let relay = build_relay().await;
-        let keypair = Keypair::from_seckey_slice(relay.secp(), &[7u8; 32]).unwrap();
+        let keypair = Keypair::from_seckey_byte_array(relay.secp(), [7u8; 32]).unwrap();
         let pubkey = XOnlyPublicKey::from_keypair(&keypair).0.to_string();
         let mut g = crate::nips::nip29::Group::default();
         g.settings.private = true;
@@ -890,7 +890,7 @@ mod tests {
             },
         );
         let secp = relay.secp().clone();
-        let keypair = Keypair::from_seckey_slice(&secp, &[7u8; 32]).unwrap();
+        let keypair = Keypair::from_seckey_byte_array(&secp, [7u8; 32]).unwrap();
         let mut ev = signed_token_auth(&relay, &secp, "open").await;
         ev.pubkey = ev.pubkey.to_ascii_uppercase();
         assert!(

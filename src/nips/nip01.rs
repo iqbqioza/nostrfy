@@ -58,8 +58,14 @@ pub fn verify(event: &Event, secp: &Secp256k1<secp256k1::All>) -> Result<()> {
         return Err(anyhow!("invalid event id"));
     }
     let id_bytes: [u8; ID_BYTES] = event.id_bytes().ok_or_else(|| anyhow!("invalid id hex"))?;
-    let pk = XOnlyPublicKey::from_slice(&hex::decode(&event.pubkey)?)?;
-    let sig = Signature::from_slice(&hex::decode(&event.sig)?)?;
+    let pk_bytes: [u8; PK_BYTES] = hex::decode(&event.pubkey)?
+        .try_into()
+        .map_err(|_| anyhow!("invalid pubkey length"))?;
+    let pk = XOnlyPublicKey::from_byte_array(pk_bytes)?;
+    let sig_bytes: [u8; SIG_BYTES] = hex::decode(&event.sig)?
+        .try_into()
+        .map_err(|_| anyhow!("invalid signature length"))?;
+    let sig = Signature::from_byte_array(sig_bytes);
     secp.verify_schnorr(&sig, &id_bytes, &pk)?;
     Ok(())
 }
@@ -174,7 +180,7 @@ mod tests {
     #[test]
     fn signature_verification_roundtrip() {
         let secp = Secp256k1::new();
-        let keypair = Keypair::from_seckey_slice(&secp, &[7u8; 32]).unwrap();
+        let keypair = Keypair::from_seckey_byte_array(&secp, [7u8; 32]).unwrap();
         let pubkey = XOnlyPublicKey::from_keypair(&keypair).0.to_string();
         let mut event = Event {
             id: String::new(),
@@ -201,7 +207,7 @@ mod tests {
         assert!(verify(&bad_sig, &secp).is_err());
 
         // A signature from a different key fails.
-        let other = Keypair::from_seckey_slice(&secp, &[9u8; 32]).unwrap();
+        let other = Keypair::from_seckey_byte_array(&secp, [9u8; 32]).unwrap();
         let mut forged = event.clone();
         sign(&mut forged, &other, &secp).unwrap();
         forged.pubkey = event.pubkey.clone();

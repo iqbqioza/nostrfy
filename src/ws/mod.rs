@@ -2140,7 +2140,7 @@ mod tests {
         created: u64,
         tags: Vec<Vec<String>>,
     ) -> Event {
-        let keypair = Keypair::from_seckey_slice(secp, &[1u8; 32]).unwrap();
+        let keypair = Keypair::from_seckey_byte_array(secp, [1u8; 32]).unwrap();
         let pubkey = XOnlyPublicKey::from_keypair(&keypair).0.to_string();
         let mut ev = Event {
             id: String::new(),
@@ -2163,7 +2163,7 @@ mod tests {
         created: u64,
         tags: Vec<Vec<String>>,
     ) -> Event {
-        let keypair = Keypair::from_seckey_slice(secp, &[seed; 32]).unwrap();
+        let keypair = Keypair::from_seckey_byte_array(secp, [seed; 32]).unwrap();
         let pubkey = XOnlyPublicKey::from_keypair(&keypair).0.to_string();
         let mut ev = Event {
             id: String::new(),
@@ -2179,7 +2179,7 @@ mod tests {
     }
 
     fn signed_auth(secp: &Secp256k1<secp256k1::All>, challenge: &str, created: u64) -> Event {
-        let keypair = Keypair::from_seckey_slice(secp, &[2u8; 32]).unwrap();
+        let keypair = Keypair::from_seckey_byte_array(secp, [2u8; 32]).unwrap();
         let pubkey = XOnlyPublicKey::from_keypair(&keypair).0.to_string();
         let mut ev = Event {
             id: String::new(),
@@ -2209,7 +2209,7 @@ mod tests {
         created: u64,
         tags: Vec<Vec<String>>,
     ) -> Event {
-        let keypair = Keypair::from_seckey_slice(secp, &[seed; 32]).unwrap();
+        let keypair = Keypair::from_seckey_byte_array(secp, [seed; 32]).unwrap();
         let pubkey = XOnlyPublicKey::from_keypair(&keypair).0.to_string();
         let mut ev = Event {
             id: String::new(),
@@ -2232,7 +2232,7 @@ mod tests {
         challenge: &str,
         created: u64,
     ) -> Event {
-        let keypair = Keypair::from_seckey_slice(secp, &[seed; 32]).unwrap();
+        let keypair = Keypair::from_seckey_byte_array(secp, [seed; 32]).unwrap();
         let pubkey = XOnlyPublicKey::from_keypair(&keypair).0.to_string();
         let mut ev = Event {
             id: String::new(),
@@ -2691,12 +2691,12 @@ mod tests {
             let now = unix_now();
             let secp = conn.relay.secp();
             let alice_pk = XOnlyPublicKey::from_keypair(
-                &Keypair::from_seckey_slice(secp, &[1u8; 32]).unwrap(),
+                &Keypair::from_seckey_byte_array(secp, [1u8; 32]).unwrap(),
             )
             .0
             .to_string();
             let bob_pk = XOnlyPublicKey::from_keypair(
-                &Keypair::from_seckey_slice(secp, &[2u8; 32]).unwrap(),
+                &Keypair::from_seckey_byte_array(secp, [2u8; 32]).unwrap(),
             )
             .0
             .to_string();
@@ -3108,7 +3108,8 @@ mod tests {
     /// Hex pubkey of a secret key (hex), for tests that act as the admin.
     fn pubkey_of_secret(secp: &Secp256k1<secp256k1::All>, secret_hex: &str) -> String {
         let secret = hex::decode(secret_hex).unwrap();
-        let keypair = Keypair::from_seckey_slice(secp, &secret).unwrap();
+        let keypair =
+            Keypair::from_seckey_byte_array(secp, secret.as_slice().try_into().unwrap()).unwrap();
         XOnlyPublicKey::from_keypair(&keypair).0.to_string()
     }
 
@@ -3121,7 +3122,8 @@ mod tests {
         created: u64,
     ) -> Event {
         let secret = hex::decode(secret_hex).unwrap();
-        let keypair = Keypair::from_seckey_slice(secp, &secret).unwrap();
+        let keypair =
+            Keypair::from_seckey_byte_array(secp, secret.as_slice().try_into().unwrap()).unwrap();
         let pubkey = XOnlyPublicKey::from_keypair(&keypair).0.to_string();
         let mut ev = Event {
             id: String::new(),
@@ -3267,7 +3269,7 @@ mod tests {
             let relay = build_relay_with("").await;
             // The author of `signed_note` (seed 1) is the allowed pubkey.
             let author = {
-                let keypair = Keypair::from_seckey_slice(relay.secp(), &[1u8; 32]).unwrap();
+                let keypair = Keypair::from_seckey_byte_array(relay.secp(), [1u8; 32]).unwrap();
                 XOnlyPublicKey::from_keypair(&keypair).0.to_string()
             };
             {
@@ -4064,7 +4066,7 @@ mod tests {
                 .secp()
                 .sign_schnorr_no_aux_rand(
                     &id,
-                    &Keypair::from_seckey_slice(conn.relay.secp(), &[1u8; 32]).unwrap(),
+                    &Keypair::from_seckey_byte_array(conn.relay.secp(), [1u8; 32]).unwrap(),
                 )
                 .to_string();
             conn.queue_event_value(ev.clone()).await;
@@ -4092,7 +4094,7 @@ mod tests {
                     .secp()
                     .sign_schnorr_no_aux_rand(
                         &id,
-                        &Keypair::from_seckey_slice(conn.relay.secp(), &[1u8; 32]).unwrap(),
+                        &Keypair::from_seckey_byte_array(conn.relay.secp(), [1u8; 32]).unwrap(),
                     )
                     .to_string();
                 e
@@ -4107,7 +4109,7 @@ mod tests {
                     .secp()
                     .sign_schnorr_no_aux_rand(
                         &id,
-                        &Keypair::from_seckey_slice(conn.relay.secp(), &[1u8; 32]).unwrap(),
+                        &Keypair::from_seckey_byte_array(conn.relay.secp(), [1u8; 32]).unwrap(),
                     )
                     .to_string();
                 e
@@ -4182,7 +4184,7 @@ mod tests {
             );
             deletion.kind = 5;
             deletion.id = compute_id(&deletion);
-            let keypair = Keypair::from_seckey_slice(conn.relay.secp(), &[1u8; 32]).unwrap();
+            let keypair = Keypair::from_seckey_byte_array(conn.relay.secp(), [1u8; 32]).unwrap();
             sign(&mut deletion, &keypair, conn.relay.secp()).unwrap();
             conn.queue_event_value(deletion).await;
             conn.flush_pending_events_for_teardown(std::time::Duration::ZERO)
@@ -8756,7 +8758,7 @@ mod tests {
             let mut auth = signed_auth(conn.relay.secp(), "test-challenge", now);
             auth.pubkey = auth.pubkey.to_ascii_uppercase();
             auth.id = crate::nips::nip01::compute_id(&auth);
-            let keypair = Keypair::from_seckey_slice(conn.relay.secp(), &[2u8; 32]).unwrap();
+            let keypair = Keypair::from_seckey_byte_array(conn.relay.secp(), [2u8; 32]).unwrap();
             let id = auth.id_bytes().unwrap();
             auth.sig = conn
                 .relay

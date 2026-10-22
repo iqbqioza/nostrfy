@@ -70,7 +70,7 @@ fn frame(json: &str) -> WsMessage {
 
 async fn ingest(url: &str, n: usize) {
     let secp = Secp256k1::new();
-    let keypair = Keypair::from_seckey_slice(&secp, &[7u8; 32]).unwrap();
+    let keypair = Keypair::from_seckey_byte_array(&secp, [7u8; 32]).unwrap();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -145,7 +145,7 @@ async fn ingest(url: &str, n: usize) {
 
 async fn fanout(url: &str, subscribers: usize, publishes: usize) {
     let secp = Secp256k1::new();
-    let keypair = Keypair::from_seckey_slice(&secp, &[7u8; 32]).unwrap();
+    let keypair = Keypair::from_seckey_byte_array(&secp, [7u8; 32]).unwrap();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -236,7 +236,7 @@ async fn fanout(url: &str, subscribers: usize, publishes: usize) {
 
 async fn req(url: &str, n: usize) {
     let secp = Secp256k1::new();
-    let keypair = Keypair::from_seckey_slice(&secp, &[7u8; 32]).unwrap();
+    let keypair = Keypair::from_seckey_byte_array(&secp, [7u8; 32]).unwrap();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -325,7 +325,7 @@ async fn search(url: &str, term: &str) {
 /// connection's ceiling.
 async fn parallel_ingest(url: &str, conns: usize, n: usize) {
     let secp = Secp256k1::new();
-    let keypair = Keypair::from_seckey_slice(&secp, &[7u8; 32]).unwrap();
+    let keypair = Keypair::from_seckey_byte_array(&secp, [7u8; 32]).unwrap();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()

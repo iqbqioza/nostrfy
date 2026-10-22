@@ -987,7 +987,7 @@ mod tests {
             use std::sync::atomic::{AtomicBool, Ordering};
 
             let secp = Arc::new(Secp256k1::new());
-            let keypair = Keypair::from_seckey_slice(&secp, &[9u8; 32]).unwrap();
+            let keypair = Keypair::from_seckey_byte_array(&secp, [9u8; 32]).unwrap();
             let pubkey = XOnlyPublicKey::from_keypair(&keypair).0.to_string();
             // Enough events to take the fan-out branch (over
             // MIN_PARALLEL_VERIFY); the exact count only has to be non-zero,
@@ -1079,7 +1079,7 @@ mod tests {
 
     fn signed_with_seed(seed: u8, kind: u64, tags: Vec<Vec<String>>) -> Event {
         let secp = Secp256k1::new();
-        let keypair = Keypair::from_seckey_slice(&secp, &[seed; 32]).unwrap();
+        let keypair = Keypair::from_seckey_byte_array(&secp, [seed; 32]).unwrap();
         let pubkey = XOnlyPublicKey::from_keypair(&keypair).0.to_string();
         let mut ev = Event {
             id: String::new(),
@@ -1827,7 +1827,7 @@ mod tests {
             let mut future = signed(1, vec![]);
             future.created_at = now + 10_000;
             let secp = Secp256k1::new();
-            let keypair = Keypair::from_seckey_slice(&secp, &[3u8; 32]).unwrap();
+            let keypair = Keypair::from_seckey_byte_array(&secp, [3u8; 32]).unwrap();
             future.id = crate::nips::nip01::compute_id(&future);
             let id = future.id_bytes().unwrap();
             future.sig = secp.sign_schnorr_no_aux_rand(&id, &keypair).to_string();
@@ -2386,7 +2386,7 @@ mod tests {
             let now = unix_now();
             let secp = Secp256k1::new();
             let h = |kind: u64, tags: Vec<Vec<String>>| {
-                let keypair = Keypair::from_seckey_slice(&secp, &[5u8; 32]).unwrap();
+                let keypair = Keypair::from_seckey_byte_array(&secp, [5u8; 32]).unwrap();
                 let pubkey = XOnlyPublicKey::from_keypair(&keypair).0.to_string();
                 let mut e = Event {
                     id: String::new(),
@@ -2496,7 +2496,7 @@ mod tests {
             let mut leave = h(crate::nips::nip43::LEAVE, vec![vec!["-".into()]]);
             leave.created_at = now - 1000;
             leave.id = crate::nips::nip01::compute_id(&leave);
-            let kp = Keypair::from_seckey_slice(&secp2, &[5u8; 32]).unwrap();
+            let kp = Keypair::from_seckey_byte_array(&secp2, [5u8; 32]).unwrap();
             let id = leave.id_bytes().unwrap();
             leave.sig = secp2.sign_schnorr_no_aux_rand(&id, &kp).to_string();
             let out = relay
@@ -2517,7 +2517,7 @@ mod tests {
             let mut repost = h(6, vec![]);
             repost.content = serde_json::to_string(&protected).unwrap();
             repost.id = crate::nips::nip01::compute_id(&repost);
-            let kp = Keypair::from_seckey_slice(&secp, &[5u8; 32]).unwrap();
+            let kp = Keypair::from_seckey_byte_array(&secp, [5u8; 32]).unwrap();
             let id = repost.id_bytes().unwrap();
             repost.sig = secp.sign_schnorr_no_aux_rand(&id, &kp).to_string();
             let out = relay
@@ -2556,7 +2556,7 @@ mod tests {
             let mut ev = signed(1, vec![]);
             ev.kind = 78;
             ev.id = crate::nips::nip01::compute_id(&ev);
-            let kp = Keypair::from_seckey_slice(&secp, &[3u8; 32]).unwrap();
+            let kp = Keypair::from_seckey_byte_array(&secp, [3u8; 32]).unwrap();
             let id = ev.id_bytes().unwrap();
             ev.sig = secp.sign_schnorr_no_aux_rand(&id, &kp).to_string();
             let out = relay2
@@ -2632,7 +2632,7 @@ mod tests {
             let now = unix_now();
             let secp = Secp256k1::new();
             let h = |kind: u64, tags: Vec<Vec<String>>| {
-                let keypair = Keypair::from_seckey_slice(&secp, &[6u8; 32]).unwrap();
+                let keypair = Keypair::from_seckey_byte_array(&secp, [6u8; 32]).unwrap();
                 let pubkey = XOnlyPublicKey::from_keypair(&keypair).0.to_string();
                 let mut e = Event {
                     id: String::new(),
@@ -2740,7 +2740,7 @@ mod tests {
             let mut old = gh(1, vec![]);
             old.created_at = now - 100;
             old.id = crate::nips::nip01::compute_id(&old);
-            let kp = Keypair::from_seckey_slice(&secp, &[6u8; 32]).unwrap();
+            let kp = Keypair::from_seckey_byte_array(&secp, [6u8; 32]).unwrap();
             let id = old.id_bytes().unwrap();
             old.sig = secp.sign_schnorr_no_aux_rand(&id, &kp).to_string();
             let out = relay2

@@ -1413,7 +1413,7 @@ mod tests {
 
     fn keypair(seed: u8) -> Keypair {
         let secp = Secp256k1::new();
-        Keypair::from_seckey_slice(&secp, &[seed; 32]).unwrap()
+        Keypair::from_seckey_byte_array(&secp, [seed; 32]).unwrap()
     }
 
     fn signed(seed: u8, kind: u64, created: u64, tags: Vec<Vec<String>>, content: &str) -> Event {

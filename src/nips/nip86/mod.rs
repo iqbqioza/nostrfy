@@ -1825,7 +1825,7 @@ mod tests {
         static SALT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let salt = SALT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let secp = secp256k1::Secp256k1::new();
-        let keypair = secp256k1::Keypair::from_seckey_slice(&secp, seckey).unwrap();
+        let keypair = secp256k1::Keypair::from_seckey_byte_array(&secp, *seckey).unwrap();
         let pubkey = secp256k1::XOnlyPublicKey::from_keypair(&keypair)
             .0
             .to_string();
@@ -2214,7 +2214,7 @@ mod tests {
         // a never-banned id is a no-op success. Only a genuine store
         // failure surfaces an error.
         let secp = secp256k1::Secp256k1::new();
-        let keypair = secp256k1::Keypair::from_seckey_slice(&secp, &[13u8; 32]).unwrap();
+        let keypair = secp256k1::Keypair::from_seckey_byte_array(&secp, [13u8; 32]).unwrap();
         let mut banned_event = crate::event::Event {
             id: String::new(),
             pubkey: secp256k1::XOnlyPublicKey::from_keypair(&keypair)
@@ -3039,7 +3039,7 @@ mod tests {
         assert_eq!(listed, json!(["welcome-1"]));
         // A join with the code is admitted (OK true, welcome).
         let secp = secp256k1::Secp256k1::new();
-        let keypair = secp256k1::Keypair::from_seckey_slice(&secp, &[21u8; 32]).unwrap();
+        let keypair = secp256k1::Keypair::from_seckey_byte_array(&secp, [21u8; 32]).unwrap();
         let pubkey = secp256k1::XOnlyPublicKey::from_keypair(&keypair)
             .0
             .to_string();
@@ -3080,7 +3080,7 @@ mod tests {
             "a member rejoining gets the duplicate verdict"
         );
         // A bogus code is refused with the spec's wording.
-        let other = secp256k1::Keypair::from_seckey_slice(&secp, &[22u8; 32]).unwrap();
+        let other = secp256k1::Keypair::from_seckey_byte_array(&secp, [22u8; 32]).unwrap();
         let other_pk = secp256k1::XOnlyPublicKey::from_keypair(&other)
             .0
             .to_string();

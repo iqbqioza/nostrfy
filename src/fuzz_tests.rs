@@ -176,8 +176,10 @@ mod tests {
                 event.pubkey = rng.hex(64);
                 event.sig = rng.hex(128);
                 event.id = crate::nips::nip01::compute_id(&event);
-                if secp256k1::XOnlyPublicKey::from_slice(&hex::decode(&event.pubkey).unwrap())
-                    .is_ok()
+                if secp256k1::XOnlyPublicKey::from_byte_array(
+                    hex::decode(&event.pubkey).unwrap().try_into().unwrap(),
+                )
+                .is_ok()
                 {
                     reached_signature += 1;
                 }

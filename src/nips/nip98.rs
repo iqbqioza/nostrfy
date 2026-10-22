@@ -390,7 +390,7 @@ mod tests {
 
     fn signed_event(method: Option<&str>, url: &str, created: u64) -> Event {
         let secp = Secp256k1::new();
-        let keypair = Keypair::from_seckey_slice(&secp, &[5u8; 32]).unwrap();
+        let keypair = Keypair::from_seckey_byte_array(&secp, [5u8; 32]).unwrap();
         let pubkey = XOnlyPublicKey::from_keypair(&keypair).0.to_string();
         let mut tags = vec![vec![URL_TAG.into(), url.into()]];
         if let Some(m) = method {
@@ -502,7 +502,7 @@ mod tests {
         // Re-sign after adding the tag (the id commits to the tags).
         ev.id = compute_id(&ev);
         let id = ev.id_bytes().unwrap();
-        let keypair = Keypair::from_seckey_slice(&secp, &[5u8; 32]).unwrap();
+        let keypair = Keypair::from_seckey_byte_array(&secp, [5u8; 32]).unwrap();
         ev.sig = secp.sign_schnorr_no_aux_rand(&id, &keypair).to_string();
         let encoded = encode(&ev);
         rt.block_on(async {

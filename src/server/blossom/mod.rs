@@ -1952,7 +1952,7 @@ mod tests {
         x: Option<&str>,
         server: Option<&str>,
     ) -> Event {
-        let keypair = Keypair::from_seckey_slice(secp, seckey).unwrap();
+        let keypair = Keypair::from_seckey_byte_array(secp, *seckey).unwrap();
         let pubkey = XOnlyPublicKey::from_keypair(&keypair).0.to_string();
         let mut tags: Vec<Vec<String>> = vec![vec!["t".into(), verb.into()]];
         if let Some(exp) = expiration {
@@ -3050,7 +3050,7 @@ mod tests {
         ev.tags.push(vec!["server".into(), host.into()]);
         ev.id = crate::nips::nip01::compute_id(&ev);
         let id = ev.id_bytes().unwrap();
-        let keypair = Keypair::from_seckey_slice(&secp, &[9u8; 32]).unwrap();
+        let keypair = Keypair::from_seckey_byte_array(&secp, [9u8; 32]).unwrap();
         ev.sig = secp.sign_schnorr_no_aux_rand(&id, &keypair).to_string();
         assert_eq!(
             validate_auth_event(&secp, &ev, host, "upload", Some(&sha), now),
@@ -3193,7 +3193,7 @@ mod tests {
             ev.tags.push(vec!["expiration".into(), extra.into()]);
             ev.id = crate::nips::nip01::compute_id(&ev);
             let id = ev.id_bytes().unwrap();
-            let keypair = Keypair::from_seckey_slice(&secp, &[9u8; 32]).unwrap();
+            let keypair = Keypair::from_seckey_byte_array(&secp, [9u8; 32]).unwrap();
             ev.sig = secp.sign_schnorr_no_aux_rand(&id, &keypair).to_string();
             ev
         };
@@ -3244,7 +3244,7 @@ mod tests {
         ev.pubkey = ev.pubkey.to_ascii_uppercase();
         ev.id = crate::nips::nip01::compute_id(&ev);
         let id = ev.id_bytes().unwrap();
-        let keypair = Keypair::from_seckey_slice(&secp, &[9u8; 32]).unwrap();
+        let keypair = Keypair::from_seckey_byte_array(&secp, [9u8; 32]).unwrap();
         ev.sig = secp
             .sign_schnorr_no_aux_rand(&id, &keypair)
             .to_string()

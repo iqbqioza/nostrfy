@@ -4621,7 +4621,7 @@ mod tests {
     async fn nip98_get_header_for(origin: &str, path: &str, salt: u64) -> String {
         use base64::Engine as _;
         let secp = secp256k1::Secp256k1::new();
-        let keypair = secp256k1::Keypair::from_seckey_slice(&secp, &[9u8; 32]).unwrap();
+        let keypair = secp256k1::Keypair::from_seckey_byte_array(&secp, [9u8; 32]).unwrap();
         let pubkey = secp256k1::XOnlyPublicKey::from_keypair(&keypair)
             .0
             .to_string();

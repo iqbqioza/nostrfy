@@ -2262,7 +2262,7 @@ mod tests {
         created: u64,
         tags: Vec<Vec<String>>,
     ) -> Event {
-        let keypair = Keypair::from_seckey_slice(secp, &[1u8; 32]).unwrap();
+        let keypair = Keypair::from_seckey_byte_array(secp, [1u8; 32]).unwrap();
         let pubkey = XOnlyPublicKey::from_keypair(&keypair).0.to_string();
         let mut ev = Event {
             id: String::new(),
@@ -3087,7 +3087,7 @@ mod tests {
             let relay = build_relay().await;
             let secp = relay.secp();
             let pk = XOnlyPublicKey::from_keypair(
-                &Keypair::from_seckey_slice(secp, &[1u8; 32]).unwrap(),
+                &Keypair::from_seckey_byte_array(secp, [1u8; 32]).unwrap(),
             )
             .0
             .to_string();
@@ -3244,7 +3244,7 @@ mod tests {
             let relay = build_relay().await;
             let secp = relay.secp();
             let pk = XOnlyPublicKey::from_keypair(
-                &Keypair::from_seckey_slice(secp, &[1u8; 32]).unwrap(),
+                &Keypair::from_seckey_byte_array(secp, [1u8; 32]).unwrap(),
             )
             .0
             .to_string();
@@ -3353,7 +3353,7 @@ mod tests {
             let relay = build_relay().await;
             let secp = relay.secp();
             let pk = XOnlyPublicKey::from_keypair(
-                &Keypair::from_seckey_slice(secp, &[1u8; 32]).unwrap(),
+                &Keypair::from_seckey_byte_array(secp, [1u8; 32]).unwrap(),
             )
             .0
             .to_string();
@@ -3468,7 +3468,7 @@ mod tests {
             let relay = build_relay().await;
             let secp = relay.secp();
             let pk = XOnlyPublicKey::from_keypair(
-                &Keypair::from_seckey_slice(secp, &[1u8; 32]).unwrap(),
+                &Keypair::from_seckey_byte_array(secp, [1u8; 32]).unwrap(),
             )
             .0
             .to_string();
@@ -3508,7 +3508,7 @@ mod tests {
             let relay = build_relay().await;
             let secp = relay.secp();
             let pk = XOnlyPublicKey::from_keypair(
-                &Keypair::from_seckey_slice(secp, &[1u8; 32]).unwrap(),
+                &Keypair::from_seckey_byte_array(secp, [1u8; 32]).unwrap(),
             )
             .0
             .to_string();
@@ -3658,7 +3658,7 @@ mod tests {
             let relay = build_relay().await;
             let secp = relay.secp();
             let pk = XOnlyPublicKey::from_keypair(
-                &Keypair::from_seckey_slice(secp, &[1u8; 32]).unwrap(),
+                &Keypair::from_seckey_byte_array(secp, [1u8; 32]).unwrap(),
             )
             .0
             .to_string();
@@ -3783,7 +3783,7 @@ mod tests {
             let relay = build_relay().await;
             let secp = relay.secp();
             let pk = XOnlyPublicKey::from_keypair(
-                &Keypair::from_seckey_slice(secp, &[1u8; 32]).unwrap(),
+                &Keypair::from_seckey_byte_array(secp, [1u8; 32]).unwrap(),
             )
             .0
             .to_string();

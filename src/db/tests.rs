@@ -10477,8 +10477,8 @@ fn delegated_address_tombstone_survives_a_mid_walk_crash() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let now = 1_700_000_000u64;
     let secp = Secp256k1::new();
-    let delegator_kp = Keypair::from_seckey_slice(&secp, &[11u8; 32]).unwrap();
-    let delegatee_kp = Keypair::from_seckey_slice(&secp, &[12u8; 32]).unwrap();
+    let delegator_kp = Keypair::from_seckey_byte_array(&secp, [11u8; 32]).unwrap();
+    let delegatee_kp = Keypair::from_seckey_byte_array(&secp, [12u8; 32]).unwrap();
     let delegator = hex::encode(delegator_kp.x_only_public_key().0.serialize());
     let delegatee = hex::encode(delegatee_kp.x_only_public_key().0.serialize());
     let conditions = "kind=30001";
