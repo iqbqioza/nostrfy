@@ -11025,3 +11025,74 @@ fn writer_liveness_tracks_the_writer_thread() {
     db.shutdown();
     assert!(!db.writer_alive());
 }
+
+#[test]
+fn startup_migrations_upgrade_an_old_database_and_record_the_schema_version() {
+    // Simulate a database written by the previous binary: an event is
+    // present but the new schema marker is absent. Opening the current
+    // client must run the automatic startup backfills, keep the old data,
+    // and write the version marker for the next restart.
+    use crate::db::store::{DB_SCHEMA_VERSION, Store};
+    let cfg = config();
+    let old = event(1, "old database event", 1_700_000_000, vec![]);
+    {
+        let store = Store::open(
+            &cfg,
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            128,
+        )
+        .unwrap();
+        assert_eq!(store.schema_version().unwrap(), None);
+        let mut wtxn = store.env.write_txn().unwrap();
+        assert_eq!(
+            store.put_event_in(&mut wtxn, &old, 1_700_000_001).unwrap(),
+            PutOutcome::Stored
+        );
+        wtxn.commit().unwrap();
+    }
+
+    let db = DbClient::open(
+        &cfg,
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let filter: Filter = serde_json::from_value(serde_json::json!({"ids": [old.id]})).unwrap();
+        let (events, _) = db.query(vec![filter], 10, 1_700_000_002).await;
+        assert_eq!(events.len(), 1, "the previous version's data must survive");
+        // The startup backfills run after the open barrier; poll the
+        // completed marker instead of racing the writer with shutdown.
+        let mut version = None;
+        for _ in 0..200 {
+            version = db.schema_version().await;
+            if version == Some(DB_SCHEMA_VERSION) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            version,
+            Some(DB_SCHEMA_VERSION),
+            "the completed automatic migration must be recorded"
+        );
+    });
+    db.shutdown();
+
+    let store = Store::open(
+        &cfg,
+        Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        128,
+    )
+    .unwrap();
+    assert_eq!(
+        store.schema_version().unwrap(),
+        Some(DB_SCHEMA_VERSION),
+        "the version marker must survive a restart"
+    );
+}

@@ -774,6 +774,11 @@ enum Msg {
     StateStamp {
         reply: oneshot::Sender<Option<u64>>,
     },
+    /// The completed automatic-migration schema version (`None` on an old
+    /// database or a read failure).
+    SchemaVersion {
+        reply: oneshot::Sender<Option<u32>>,
+    },
     /// The derived-state sequence (see `Store::state_seq`). `None` when the
     /// read failed: the caller fails closed instead of treating a missing
     /// sequence as free to overwrite.
@@ -3003,6 +3008,15 @@ impl DbClient {
     /// when the database could not answer: the caller fails closed.
     pub async fn state_stamp(&self) -> Option<u64> {
         self.request_read_startup(|reply| Msg::StateStamp { reply })
+            .await
+            .flatten()
+    }
+
+    /// The completed automatic-migration schema version. `None` while an
+    /// old database's startup backfills are still running (or on failure);
+    /// poll it after startup in tests and diagnostics.
+    pub async fn schema_version(&self) -> Option<u32> {
+        self.request_read_startup(|reply| Msg::SchemaVersion { reply })
             .await
             .flatten()
     }

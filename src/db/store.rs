@@ -142,6 +142,14 @@ pub(crate) const INDEX_META: &str = "index_meta";
 /// [`BY_TAG`]. Real tag names are ASCII alphanumeric ([`indexable_tag`]), so
 /// `0x01` cannot collide with an actual tag.
 pub(crate) const GIFT_WRAP_INDEX: u8 = 0x01;
+
+/// Current on-disk layout version. Bump this when a startup migration adds
+/// a new one-time backfill; the marker is written only after the writer's
+/// startup checks completed without an error, so a failed migration retries
+/// on the next restart. The individual backfill markers remain the
+/// authority for each index (this version is the human-visible upgrade
+/// record and the gate for future versioned steps).
+pub(crate) const DB_SCHEMA_VERSION: u32 = 1;
 pub(crate) const DELETED: &str = "deleted";
 pub(crate) const EXPIRY: &str = "expiry";
 pub(crate) const REPLACEABLE: &str = "replaceable";
@@ -3149,6 +3157,34 @@ impl Store {
             }
         }
         Ok(count)
+    }
+
+    /// The on-disk layout version recorded by the writer after its startup
+    /// migrations. `None` is an old database (or a fresh one) and triggers
+    /// the normal automatic backfills.
+    pub(crate) fn schema_version(&self) -> Result<Option<u32>> {
+        let rtxn = self.env.read_txn()?;
+        let Some(raw) = self.index_meta.get(&rtxn, b"schema_version")? else {
+            return Ok(None);
+        };
+        if raw.len() != 4 {
+            anyhow::bail!("corrupt database schema version marker");
+        }
+        Ok(Some(u32::from_be_bytes(
+            raw.try_into().expect("checked length"),
+        )))
+    }
+
+    /// Records a completed startup migration once every backfill/check
+    /// succeeded. A failure leaves the old marker so the next restart
+    /// retries the automatic migration.
+    pub(crate) fn mark_schema_version(&self, version: u32) -> Result<()> {
+        self.disk_full_error()?;
+        let mut wtxn = self.env.write_txn()?;
+        self.index_meta
+            .put(&mut wtxn, b"schema_version", &version.to_be_bytes())?;
+        wtxn.commit()?;
+        Ok(())
     }
 
     /// Whether the NIP-59 recipient index still needs its one-time backfill.

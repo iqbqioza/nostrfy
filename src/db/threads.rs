@@ -10,7 +10,7 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
 use super::store::WriteBatch;
-use super::store::{Store, flush_everything};
+use super::store::{DB_SCHEMA_VERSION, Store, flush_everything};
 use super::{
     LoadAccessOutcome, LoadGroupsOutcome, LoadRolesOutcome, Msg, PutOutcome, db_error, msg_bytes,
 };
@@ -563,6 +563,17 @@ fn handle_read_msg(store: &Store, errors: &Arc<std::sync::atomic::AtomicU64>, ms
             let _ = reply.send(stamp);
             false
         }
+        Msg::SchemaVersion { reply } => {
+            let version = match store.schema_version() {
+                Ok(version) => version,
+                Err(e) => {
+                    db_error(errors, &e);
+                    None
+                }
+            };
+            let _ = reply.send(version);
+            false
+        }
         Msg::StateSeq { reply } => {
             let seq = match store.state_seq() {
                 Ok(seq) => Some(seq),
@@ -765,6 +776,10 @@ pub(crate) fn spawn(
             }
         }
         let _writer_alive = ClearWriterAlive(writer_alive_thread);
+        // Errors before the startup migrations (normally zero); a migration
+        // failure bumps this counter and prevents the schema marker below
+        // from claiming the upgrade completed.
+        let startup_error_base = thread_errors.load(std::sync::atomic::Ordering::Relaxed);
         // The recovery prelude runs first, before the long index rebuilds:
         // `DbClient::open` waits for `recovery_tx` (see `recovery_rx`), so
         // the server's startup state restore observes the completed
@@ -863,6 +878,46 @@ pub(crate) fn spawn(
                 Err(e) => db_error(&thread_errors, &e),
             },
             Ok(false) => {}
+            Err(e) => db_error(&thread_errors, &e),
+        }
+        // Record the completed layout version after every automatic
+        // one-time backfill above. This is the upgrade marker for operators
+        // upgrading an old database in place: a failed migration leaves the
+        // old marker so the same checks retry on the next restart.
+        match store.schema_version() {
+            Ok(Some(version)) if version == DB_SCHEMA_VERSION => {
+                log::debug!("database schema version {version} is current");
+            }
+            Ok(Some(version)) if version > DB_SCHEMA_VERSION => {
+                log::warn!(
+                    "database schema version {version} is newer than this binary ({DB_SCHEMA_VERSION}); \
+                     running with best-effort compatibility"
+                );
+            }
+            Ok(previous) => {
+                let previous = previous.unwrap_or(0);
+                if store.cancelled() {
+                    log::warn!(
+                        "database migration from schema {previous} to {DB_SCHEMA_VERSION} was \
+                         interrupted by shutdown; the next start resumes it"
+                    );
+                } else if thread_errors.load(std::sync::atomic::Ordering::Relaxed)
+                    != startup_error_base
+                {
+                    log::warn!(
+                        "database migration from schema {previous} to {DB_SCHEMA_VERSION} did not \
+                         complete; the next start retries it"
+                    );
+                } else {
+                    match store.mark_schema_version(DB_SCHEMA_VERSION) {
+                        Ok(()) => log::info!(
+                            "automatic database migration completed: schema {previous} -> \
+                             {DB_SCHEMA_VERSION}"
+                        ),
+                        Err(e) => db_error(&thread_errors, &e),
+                    }
+                }
+            }
             Err(e) => db_error(&thread_errors, &e),
         }
         // Puts are applied in batches sharing one write transaction so
@@ -1670,6 +1725,16 @@ pub(crate) fn spawn(
                                         }
                                     };
                                     let _ = reply.send(stamp);
+                                }
+                                Msg::SchemaVersion { reply } => {
+                                    let version = match store.schema_version() {
+                                        Ok(version) => version,
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            None
+                                        }
+                                    };
+                                    let _ = reply.send(version);
                                 }
                                 Msg::StateSeq { reply } => {
                                     let seq = match store.state_seq() {

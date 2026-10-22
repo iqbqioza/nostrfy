@@ -856,6 +856,12 @@ pub async fn run_server(
     };
     let config = Arc::new(tokio::sync::RwLock::new(config));
     let stats = Stats::new();
+    // A readable upgrade breadcrumb (and use of the schema-version read):
+    // old databases get the completion log from the writer's migration
+    // prelude; subsequent starts can report the recorded version here.
+    if let Some(version) = db.schema_version().await {
+        info!("database schema version {version}");
+    }
     let mut relay = Arc::new(Relay::new(config, db, stats, &private_key, live).await);
     match Arc::get_mut(&mut relay) {
         Some(relay) => relay.start_live_bus(),

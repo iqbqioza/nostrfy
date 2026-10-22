@@ -448,6 +448,7 @@ Set this whenever a reverse proxy (nginx, Caddy, a cloud load balancer, Cloudfla
   - access pubkey lists moved into their dedicated key (legacy `access` blob → `relay_pubkeys`),
   - the Blossom sha→owner mapping rebuilt from legacy files (marker key, skipped on later restarts).
 - The startup log reports `database ready at ... (23 tables, map ... MiB)` — 22 base tables plus the NIP-50 word index (22 tables when `database.search_index = false`) — and the migration checks.
+- The writer records a completed **schema version** after every startup backfill/check. An old database logs `automatic database migration completed: schema 0 -> 1` (subsequent starts report `database schema version 1`). The marker is written only when no migration error occurred; a failed/incomplete pass leaves it unset and the next restart retries automatically. This is non-destructive: existing data and older tables are opened in place.
 
 ---
 
