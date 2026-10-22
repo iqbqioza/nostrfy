@@ -385,6 +385,10 @@ pub struct Relay {
     /// [`Self::poll_livekit_participants`]): the `kind:39004` event is only
     /// re-published when the list changes.
     livekit_participants: tokio::sync::Mutex<std::collections::HashMap<String, Vec<String>>>,
+    /// Whether the startup stale-list scan has seeded the participant cache
+    /// from stored 39004 events (so a restart after a rebuild that disabled
+    /// LiveKit still clears the stale list).
+    livekit_cache_seeded: std::sync::atomic::AtomicBool,
     /// Striped per-group locks serializing a LiveKit participant refresh
     /// with the group apply that clears its `39004` (a `9002` leaving
     /// LiveKit). Without the lock, a refresh that passed
@@ -2164,6 +2168,7 @@ impl Relay {
             command_events: std::sync::Mutex::new(std::collections::HashSet::new()),
             nip11_cache: std::sync::Mutex::new(None),
             livekit_participants: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            livekit_cache_seeded: std::sync::atomic::AtomicBool::new(false),
             livekit_locks: (0..LIVEKIT_LOCK_COUNT)
                 .map(|_| tokio::sync::Mutex::new(()))
                 .collect(),
@@ -4219,20 +4224,115 @@ impl Relay {
     /// per interval and no events). A failed fetch skips the group instead
     /// of publishing an empty (wrong) list.
     pub(crate) async fn poll_livekit_participants(&self) {
+        // A rebuild can disable LiveKit without going through the 9002
+        // apply path (e.g. a NIP-09 deletion of the enabling event). The
+        // stored 39004 then remains; clear it for groups that still exist
+        // but are no longer LiveKit-enabled. This also drops the cached
+        // list for deleted groups and for groups a later re-enable must
+        // republish from scratch.
+        self.clear_stale_livekit_lists().await;
         if self.livekit_api_config().await.is_none() {
             return;
         }
         let gids = self.livekit_group_ids().await;
-        // Drop cached lists for groups that left LiveKit (or were deleted):
-        // their stored 39004 was cleared or purged, and a re-enable must
-        // republish even when the live list is unchanged.
-        let live: std::collections::HashSet<&str> = gids.iter().map(String::as_str).collect();
-        self.livekit_participants
-            .lock()
-            .await
-            .retain(|gid, _| live.contains(gid.as_str()));
         for gid in gids {
             self.refresh_livekit_participants(&gid).await;
+        }
+    }
+
+    /// Clears cached participant lists for groups that are no longer
+    /// LiveKit-enabled, and publishes an empty `39004` for groups that
+    /// still exist. A deleted group's metadata must not be resurrected;
+    /// its cache entry is simply dropped.
+    async fn clear_stale_livekit_lists(&self) {
+        let Some(relay_pubkey) = self.relay_pubkey() else {
+            return;
+        };
+        if !self.config.read().await.nip_enabled(29) {
+            return;
+        }
+        // A restart starts with an empty cache, but the database may still
+        // hold a 39004 for a group whose rebuilt state no longer enables
+        // LiveKit. Seed the cache from the stored lists once, so the stale
+        // detection below can see and clear them. A failed scan retries on
+        // the next poll.
+        if !self
+            .livekit_cache_seeded
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            let filter: crate::filter::Filter = serde_json::from_value(serde_json::json!({
+                "kinds": [crate::nips::nip29::GROUP_PARTICIPANTS],
+            }))
+            .expect("static filter");
+            if let Some((events, _)) = self
+                .db
+                .query_full_startup(vec![filter], 10_000, unix_now(), false)
+                .await
+            {
+                let mut cache = self.livekit_participants.lock().await;
+                for event in events {
+                    if let Some(gid) = event
+                        .tags
+                        .iter()
+                        .find(|t| t.len() >= 2 && t[0] == "d")
+                        .map(|t| t[1].clone())
+                    {
+                        // The value only matters for the "unchanged" check;
+                        // seeding an empty list forces the first refresh to
+                        // publish the live list for an enabled group.
+                        cache.entry(gid).or_default();
+                    }
+                }
+            } else {
+                self.livekit_cache_seeded
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let (live, existing) = {
+            let groups = self.groups.read().await;
+            let live: std::collections::HashSet<String> = groups
+                .groups
+                .iter()
+                .filter(|(_, group)| group.settings.livekit)
+                .map(|(gid, _)| gid.clone())
+                .collect();
+            let existing: std::collections::HashSet<String> =
+                groups.groups.keys().cloned().collect();
+            (live, existing)
+        };
+        let stale: Vec<String> = {
+            let cache = self.livekit_participants.lock().await;
+            cache
+                .keys()
+                .filter(|gid| !live.contains(*gid))
+                .cloned()
+                .collect()
+        };
+        for gid in stale {
+            // Serialize with the group apply / refresh decisions. If the
+            // group was re-enabled meanwhile, drop the old cache entry so
+            // the next refresh republishes the current list.
+            let _livekit_guard = self.livekit_lock(&gid).lock().await;
+            if self.is_livekit_group(&gid).await {
+                self.livekit_participants.lock().await.remove(&gid);
+                continue;
+            }
+            if existing.contains(&gid) {
+                let now = self.stamp_floor(unix_now());
+                let mut event = crate::nips::nip29::events::build_participants_event(
+                    &gid,
+                    &[],
+                    &relay_pubkey,
+                    now,
+                );
+                if self.store_relay_event(&mut event).await.is_ok() {
+                    self.livekit_participants.lock().await.remove(&gid);
+                }
+                // On failure keep the cache entry: the next poll retries
+                // the empty-list publish.
+            } else {
+                self.livekit_participants.lock().await.remove(&gid);
+            }
         }
     }
 
@@ -4876,6 +4976,9 @@ impl Relay {
         if buffer.scanning {
             buffer.retry = true;
         }
+        // AUD-25: a re-created group with the same id must republish its
+        // 39004 even when LiveKit returns the same participant list.
+        self.livekit_participants.lock().await.remove(gid);
         self.groups.write().await.mark_ghost(gid);
     }
 
@@ -10367,6 +10470,145 @@ mod tests {
             Some(&vec!["aa".repeat(32)]),
             "a failed publish must not be recorded as the current list"
         );
+    }
+
+    #[tokio::test]
+    async fn a_rebuild_that_disables_livekit_clears_the_stale_participant_list() {
+        // AUD-25: a NIP-09 deletion can remove the 9002 that enabled
+        // LiveKit; the rebuild then disables it without going through the
+        // leave path, leaving the old 39004 stored. The poll (including the
+        // first one after a restart, when the in-memory cache is empty) must
+        // publish an empty list for the still-existing group.
+        use crate::db::PutOutcome;
+
+        let relay = build_relay_with_key(false, &"01".repeat(32)).await;
+        let gid = "g1";
+        let participants = std::sync::Arc::new(std::sync::Mutex::new(vec!["aa".repeat(32)]));
+        let (endpoint, _started) =
+            mock_livekit_list_participants(std::sync::Arc::clone(&participants), 0).await;
+        {
+            let mut cfg = relay.config.write().await;
+            cfg.relay.livekit_url = endpoint;
+            cfg.relay.livekit_api_key = "key".into();
+            cfg.relay.livekit_api_secret = "secret".into();
+        }
+        let now = crate::util::unix_now();
+        let secp = secp256k1::Secp256k1::new();
+        let admin = secp256k1::Keypair::from_seckey_slice(&secp, &[4u8; 32]).unwrap();
+        let create = signed_group_event(
+            &secp,
+            &admin,
+            crate::nips::nip29::CREATE_GROUP,
+            gid,
+            vec![],
+            now,
+        );
+        assert!(matches!(
+            relay.accept_event(create, &[], None).await,
+            PutOutcome::Stored
+        ));
+        let enable = signed_group_event(
+            &secp,
+            &admin,
+            9002,
+            gid,
+            vec![vec!["livekit".to_string()]],
+            now + 1,
+        );
+        assert!(matches!(
+            relay.accept_event(enable, &[], None).await,
+            PutOutcome::Stored
+        ));
+        relay.refresh_livekit_participants(gid).await;
+        assert_eq!(
+            relay.livekit_participants.lock().await.get(gid),
+            Some(&vec!["aa".repeat(32)])
+        );
+        // Simulate a restart after a rebuild that disabled LiveKit: the
+        // in-memory cache is empty, the stored 39004 is not.
+        {
+            let mut groups = relay.groups.write().await;
+            groups.groups.get_mut(gid).unwrap().settings.livekit = false;
+        }
+        relay.livekit_participants.lock().await.clear();
+        relay
+            .livekit_cache_seeded
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        relay.poll_livekit_participants().await;
+        assert!(
+            relay.livekit_participants.lock().await.get(gid).is_none(),
+            "the stale cache entry must be dropped"
+        );
+        let filter: crate::filter::Filter = serde_json::from_value(serde_json::json!({
+            "kinds": [crate::nips::nip29::GROUP_PARTICIPANTS],
+            "#d": [gid],
+        }))
+        .unwrap();
+        let (events, _) = relay
+            .db
+            .query(vec![filter], 10, crate::util::unix_now())
+            .await;
+        assert_eq!(events.len(), 1, "the replaceable list must be cleared");
+        assert!(
+            !events[0].tags.iter().any(|tag| tag[0] == "participant"),
+            "the stored 39004 must be empty after the rebuild disabled LiveKit"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_9008_purge_drops_the_participant_cache_for_recreation() {
+        // AUD-25: the cached list survives a 9008; a re-created group with
+        // the same participants then skips the 39004 publish because the
+        // list looks unchanged. The purge path must drop the entry.
+        use crate::db::PutOutcome;
+
+        let relay = build_relay_with_key(false, &"01".repeat(32)).await;
+        let gid = "g1";
+        let participants = std::sync::Arc::new(std::sync::Mutex::new(vec!["aa".repeat(32)]));
+        let (endpoint, _started) =
+            mock_livekit_list_participants(std::sync::Arc::clone(&participants), 0).await;
+        {
+            let mut cfg = relay.config.write().await;
+            cfg.relay.livekit_url = endpoint;
+            cfg.relay.livekit_api_key = "key".into();
+            cfg.relay.livekit_api_secret = "secret".into();
+        }
+        let now = crate::util::unix_now();
+        let secp = secp256k1::Secp256k1::new();
+        let admin = secp256k1::Keypair::from_seckey_slice(&secp, &[4u8; 32]).unwrap();
+        let create = signed_group_event(
+            &secp,
+            &admin,
+            crate::nips::nip29::CREATE_GROUP,
+            gid,
+            vec![],
+            now,
+        );
+        assert!(matches!(
+            relay.accept_event(create, &[], None).await,
+            PutOutcome::Stored
+        ));
+        let enable = signed_group_event(
+            &secp,
+            &admin,
+            9002,
+            gid,
+            vec![vec!["livekit".to_string()]],
+            now + 1,
+        );
+        assert!(matches!(
+            relay.accept_event(enable, &[], None).await,
+            PutOutcome::Stored
+        ));
+        relay.refresh_livekit_participants(gid).await;
+        assert!(relay.livekit_participants.lock().await.contains_key(gid));
+        relay.ghost_deleted_group(gid).await;
+        assert!(
+            relay.livekit_participants.lock().await.get(gid).is_none(),
+            "a 9008 must clear the cached list so a re-create republishes it"
+        );
+        relay.db.shutdown();
     }
 
     #[tokio::test]
