@@ -450,10 +450,17 @@ pub struct Conn {
     /// against the current cached value would close every connection on a
     /// lower-then-raise reload even when the socket already allows it.
     pub(crate) protocol_max_msg_size: usize,
+    /// The tungstenite write-buffer bound negotiated at upgrade time (it
+    /// scales with `max_neg_items`, so raising that limit also needs a
+    /// reconnect).
+    pub(crate) protocol_max_write: usize,
     /// Current `limits.max_sub_id_len` (refreshed on SIGHUP): used to
     /// sanitize NEG/AUTH ids echoed by the idle reaper, which has no async
     /// config read of its own.
     pub(crate) max_sub_id_len: usize,
+    /// Current `limits.ws_idle_timeout_secs` (refreshed on SIGHUP). The
+    /// connection loop rebuilds its sleep/PING schedule when this changes.
+    pub(crate) idle_timeout_secs: u64,
     /// A protocol-level oversized-frame close (1009) is pending: queued
     /// only after the post-loop event flush so already-accepted events get
     /// their OKs before the Close.
@@ -1176,8 +1183,16 @@ impl Conn {
                 // enforced dynamically by `handle_frame`.
                 self.reconnect_required = true;
             }
+            if cfg.ws_max_write_buffer_bytes() > self.protocol_max_write {
+                // tungstenite's max_write_buffer_size was also fixed at
+                // upgrade time. `max_neg_items` feeds this ceiling, so
+                // raising it without a reconnect would let a large
+                // negotiated NEG response grow past the configured bound.
+                self.reconnect_required = true;
+            }
             self.max_msg_size = incoming_max;
             self.max_sub_id_len = cfg.limits.max_sub_id_len;
+            self.idle_timeout_secs = cfg.limits.ws_idle_timeout_secs;
             self.outbox_write_policy = cfg.server.outbox_write_policy.clone();
             self.inbox_write_policy = cfg.server.inbox_write_policy.clone();
         }
@@ -1455,10 +1470,11 @@ pub async fn handle_connection(
         giftwrap_restricted,
         nip78_restricted,
         require_auth,
-        idle_timeout,
+        mut idle_timeout,
         max_sub_id_len,
         outbox_write_policy,
         inbox_write_policy,
+        protocol_max_write,
     ) = {
         let cfg = relay.config.read().await;
         (
@@ -1473,6 +1489,7 @@ pub async fn handle_connection(
             cfg.limits.max_sub_id_len,
             cfg.server.outbox_write_policy.clone(),
             cfg.server.inbox_write_policy.clone(),
+            cfg.ws_max_write_buffer_bytes(),
         )
     };
     let relay_pubkey = relay.relay_pubkey();
@@ -1483,7 +1500,7 @@ pub async fn handle_connection(
     // are reaped. The deadline is measured from the *last inbound frame*, not
     // from the loop restart, so the keep-alive PING and live deliveries never
     // reset it (otherwise dead peers would never be reaped).
-    let idle: Option<Duration> = if idle_timeout > 0 {
+    let mut idle: Option<Duration> = if idle_timeout > 0 {
         Some(Duration::from_secs(idle_timeout))
     } else {
         None
@@ -1492,7 +1509,7 @@ pub async fn handle_connection(
     // that stopped reading must not park the task (and its connection slot,
     // live-index entry and subscription accounting) forever. It is never
     // longer than the operator's own idle deadline.
-    let teardown_grace = idle.map_or(Duration::from_secs(2), |d| d.min(Duration::from_secs(5)));
+    let mut teardown_grace = idle.map_or(Duration::from_secs(2), |d| d.min(Duration::from_secs(5)));
     let mut last_activity = std::time::Instant::now();
     // A single persistent idle deadline (reset in place on every inbound
     // frame): the per-iteration `timeout(remaining)` of the old loop
@@ -1519,6 +1536,7 @@ pub async fn handle_connection(
     // WebSocket task is detached from the HTTP connection, so the server's
     // HTTP-level drain cannot reach it).
     let mut drain_rx = relay.subscribe_drain();
+    let mut config_rx = relay.subscribe_config();
     // A `watch` receiver treats the value present at subscription time as
     // already seen: when the drain was signaled before this connection
     // subscribed (a connection accepted during shutdown), `changed()` never
@@ -1565,7 +1583,9 @@ pub async fn handle_connection(
         req_response_bytes,
         max_msg_size,
         protocol_max_msg_size: max_msg_size,
+        protocol_max_write,
         max_sub_id_len,
+        idle_timeout_secs: idle_timeout,
         close_too_big: false,
         reconnect_required: false,
         subs: HashMap::new(),
@@ -1651,6 +1671,28 @@ pub async fn handle_connection(
         // for a slow reader. Refresh before the pump so a pending stored
         // page cannot be delivered under the old `require_auth` policy.
         conn.refresh_config_if_stale().await;
+        if conn.idle_timeout_secs != idle_timeout {
+            // L14: apply a SIGHUP idle-timeout change to existing
+            // connections, not only to newly accepted ones.
+            idle_timeout = conn.idle_timeout_secs;
+            idle = if idle_timeout > 0 {
+                Some(Duration::from_secs(idle_timeout))
+            } else {
+                None
+            };
+            teardown_grace = idle.map_or(Duration::from_secs(2), |d| d.min(Duration::from_secs(5)));
+            ping = idle.map(|d| {
+                let mut interval = tokio::time::interval(keepalive_ping_interval(d));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                interval.reset();
+                interval
+            });
+            idle_sleep = idle.map(|d| {
+                Box::pin(tokio::time::sleep_until(
+                    tokio::time::Instant::from_std(last_activity) + d + idle_jitter,
+                ))
+            });
+        }
         // Pump the queued REQ responses through the capped outgoing queue
         // in bounded chunks (see `pump_pending_reqs`).
         conn.pump_pending_reqs();
@@ -1869,6 +1911,19 @@ pub async fn handle_connection(
                 conn.refresh_config_if_stale().await;
                 conn.pump_pending_reqs();
             }
+            changed = config_rx.changed() => {
+                if changed.is_err() {
+                    break 'connection;
+                }
+                // A SIGHUP may have changed the idle timeout (or any cached
+                // flag). Rebuild the local sleep/PING schedule at the top of
+                // the loop so a fully idle connection is affected too.
+                conn.refresh_config_if_stale().await;
+                if conn.reconnect_required {
+                    break 'connection;
+                }
+                continue 'connection;
+            }
             _ = ping_fut => {
                 // Keep-alive: a healthy client answers with a PONG (an
                 // inbound frame, which resets the idle timeout), so an idle
@@ -1978,17 +2033,15 @@ pub async fn handle_connection(
     // Events received but not yet batched are accepted before closing, so
     // a client that disconnects without waiting for its OKs does not lose
     // them. The live broadcast of these events still reaches subscribers.
-    // Bounded by the teardown grace like the close below: with the DB
-    // timeout disabled (or a wedged writer) this wait would otherwise park
-    // the task — and its connection slot and subscription accounting —
-    // indefinitely. On expiry the connection closes without the final
-    // batch; its events were never queued, so nothing partial commits.
-    // One deadline for the whole teardown: the old code applied the full
-    // grace to the batch flush and again to the final flush, so a connection
-    // could hold its slot for 2 × graces and outlive WS_DRAIN_GRACE.
+    // The batch runs in a detached task: the teardown deadline only stops
+    // the connection from waiting, it does not cancel the commit or its
+    // `after_put` side effects (H09). One deadline for the whole teardown:
+    // the old code applied the full grace to the batch flush and again to
+    // the final flush, so a connection could hold its slot for 2 × graces
+    // and outlive WS_DRAIN_GRACE.
     let teardown_deadline = std::time::Instant::now() + teardown_grace;
     let remaining = || teardown_deadline.saturating_duration_since(std::time::Instant::now());
-    let _ = tokio::time::timeout(remaining(), conn.flush_pending_events()).await;
+    conn.flush_pending_events_for_teardown(remaining()).await;
     conn.enqueue_close_too_big();
 
     // Final flush: deliver any queued messages (e.g. NOTICEs) before
@@ -2240,7 +2293,14 @@ mod tests {
                     overflow: overflow_tx,
                 },
             );
-        let max_sub_id_len = relay.config.read().await.limits.max_sub_id_len;
+        let (max_sub_id_len, protocol_max_write, idle_timeout_secs) = {
+            let cfg = relay.config.read().await;
+            (
+                cfg.limits.max_sub_id_len,
+                cfg.ws_max_write_buffer_bytes(),
+                cfg.limits.ws_idle_timeout_secs,
+            )
+        };
         Conn {
             pending_budget: pending_response_budget(&relay),
             neg_budget: neg_budget(&relay),
@@ -2260,7 +2320,9 @@ mod tests {
             req_response_bytes: 0,
             max_msg_size,
             protocol_max_msg_size: max_msg_size,
+            protocol_max_write,
             max_sub_id_len,
+            idle_timeout_secs,
             close_too_big: false,
             reconnect_required: false,
             pending_reqs: std::collections::VecDeque::new(),
@@ -4093,6 +4155,67 @@ mod tests {
             let by_id = |id: &str| oks.iter().find(|m| m[1] == id).copied().unwrap();
             assert_eq!(by_id(&valid.id)[2], true);
             assert_eq!(by_id(&invalid.id)[2], false);
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn an_expired_teardown_batch_still_commits_its_side_effects() {
+        // H09: the old teardown timeout dropped the accept future after the
+        // writer commit, so the NIP-09/29/43 side effects never ran. The
+        // batch is now detached and the connection deadline only stops
+        // waiting for it.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let now = unix_now();
+            let target = signed_note(conn.relay.secp(), "teardown target", now, vec![]);
+            conn.queue_event_value(target.clone()).await;
+            conn.flush_pending_events().await;
+
+            // The deletion's side effect is the NIP-09 removal in after_put.
+            let mut deletion = signed_note(
+                conn.relay.secp(),
+                "",
+                now + 1,
+                vec![vec!["e".to_string(), target.id.clone()]],
+            );
+            deletion.kind = 5;
+            deletion.id = compute_id(&deletion);
+            let keypair = Keypair::from_seckey_slice(conn.relay.secp(), &[1u8; 32]).unwrap();
+            sign(&mut deletion, &keypair, conn.relay.secp()).unwrap();
+            conn.queue_event_value(deletion).await;
+            conn.flush_pending_events_for_teardown(std::time::Duration::ZERO)
+                .await;
+
+            let filter = crate::filter::Filter {
+                ids: Some(vec![target.id.clone()]),
+                ..Default::default()
+            };
+            let mut deleted = false;
+            for _ in 0..200 {
+                if conn.relay.teardown_tasks_active() == 0 {
+                    let (events, _) = conn
+                        .relay
+                        .db
+                        .query(vec![filter.clone()], 10, unix_now())
+                        .await;
+                    deleted = events.is_empty();
+                    if deleted {
+                        break;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert_eq!(
+                conn.relay.teardown_tasks_active(),
+                0,
+                "the detached batch must release its tracking count"
+            );
+            assert!(
+                deleted,
+                "the timed-out teardown batch must still run the NIP-09 removal"
+            );
             conn.relay.db.shutdown();
         });
     }
@@ -6336,6 +6459,23 @@ mod tests {
                 !conn.reconnect_required,
                 "raising back to the upgrade-time limit needs no reconnect"
             );
+            // The write-buffer ceiling scales with max_neg_items; a raise
+            // above the upgrade-time bound also needs a fresh socket.
+            let initial_neg = relay.config.read().await.limits.max_neg_items;
+            relay.config.write().await.limits.max_neg_items = initial_neg / 2;
+            conn.refresh_config_cache().await;
+            assert!(!conn.reconnect_required);
+            relay.config.write().await.limits.max_neg_items = initial_neg.saturating_add(1);
+            conn.refresh_config_cache().await;
+            assert!(
+                conn.reconnect_required,
+                "raising max_neg_items above the protocol write bound needs a reconnect"
+            );
+            // L14: the loop reads this cached value and rebuilds its idle
+            // sleep/PING schedule when it changes.
+            relay.config.write().await.limits.ws_idle_timeout_secs = 7;
+            conn.refresh_config_cache().await;
+            assert_eq!(conn.idle_timeout_secs, 7);
             relay.db.shutdown();
         });
     }

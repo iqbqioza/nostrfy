@@ -49,6 +49,12 @@ pub struct ApiParams {
     /// parameters (`authors=a&authors=b`).
     pub authors: Vec<String>,
     pub kinds: Vec<u64>,
+    /// Whether the key appeared at all. An empty `?authors=`/`?kinds=` is
+    /// an explicit empty set (match nothing), not an absent filter: the
+    /// old `Vec::is_empty()` check made it unconstrained and returned the
+    /// whole relay.
+    pub authors_present: bool,
+    pub kinds_present: bool,
     /// Daily and hourly counts: the date to report. `year` (default: the
     /// current year), `month` 1-12 (default: the current month) and `day`
     /// (default: today) — daily reports every day of the month, zero-filled
@@ -106,10 +112,12 @@ impl<'de> Deserialize<'de> for ApiParams {
                         "month" => params.month = Some(map.next_value()?),
                         "day" => params.day = Some(map.next_value()?),
                         "authors" => {
+                            params.authors_present = true;
                             let value: StringList = map.next_value()?;
                             params.authors.extend(value.0);
                         }
                         "kinds" => {
+                            params.kinds_present = true;
                             let value: U64List = map.next_value()?;
                             params.kinds.extend(value.0);
                         }
@@ -458,10 +466,10 @@ async fn enabled_nip78_auth_active(relay: &Arc<Relay>) -> bool {
 fn apply_params(mut filter: Filter, params: &ApiParams) -> Filter {
     // Path-derived constraints (the author/kind in `/npub.../kind`) must
     // win: a query parameter may only fill a field the path left unset.
-    if filter.authors.is_none() && !params.authors.is_empty() {
+    if filter.authors.is_none() && (params.authors_present || !params.authors.is_empty()) {
         filter.authors = Some(params.authors.clone());
     }
-    if filter.kinds.is_none() && !params.kinds.is_empty() {
+    if filter.kinds.is_none() && (params.kinds_present || !params.kinds.is_empty()) {
         filter.kinds = Some(params.kinds.clone());
     }
     if let Some(since) = params.since {
@@ -1152,13 +1160,16 @@ pub async fn api_daily_handler(
             );
         };
         let day_start = start + day * 86400;
-        let filter = Filter {
-            authors: Some(vec![hex_pk.clone()]),
-            kinds: Some(vec![kind]),
-            since: Some(day_start),
-            until: Some(day_start + 86400 - 1),
-            ..Default::default()
-        };
+        let filter = apply_params(
+            Filter {
+                authors: Some(vec![hex_pk.clone()]),
+                kinds: Some(vec![kind]),
+                since: Some(day_start),
+                until: Some(day_start + 86400 - 1),
+                ..Default::default()
+            },
+            &params,
+        );
         let Some((events, more)) = relay.db.api_count(vec![filter], count_limit, now).await else {
             return db_unavailable();
         };
@@ -1487,13 +1498,16 @@ pub async fn api_hourly_handler(
             );
         };
         let h_start = day_start + h * 3600;
-        let filter = Filter {
-            authors: Some(vec![hex_pk.clone()]),
-            kinds: Some(vec![kind]),
-            since: Some(h_start),
-            until: Some(h_start + 3600 - 1),
-            ..Default::default()
-        };
+        let filter = apply_params(
+            Filter {
+                authors: Some(vec![hex_pk.clone()]),
+                kinds: Some(vec![kind]),
+                since: Some(h_start),
+                until: Some(h_start + 3600 - 1),
+                ..Default::default()
+            },
+            &params,
+        );
         let Some((events, more)) = relay.db.api_count(vec![filter], count_limit, now).await else {
             return db_unavailable();
         };
@@ -2207,6 +2221,19 @@ mod tests {
         assert_eq!(p.limit, Some(10));
         assert_eq!(p.since, Some(5));
         assert_eq!(p.no_e, Some(true));
+        // L03: an explicit empty list is an empty set, not an absent
+        // filter. The presence flags must survive deserialization so
+        // `apply_params` cannot turn it into the whole relay.
+        let p = from_query("authors=&kinds=");
+        assert!(p.authors_present && p.authors.is_empty());
+        assert!(p.kinds_present && p.kinds.is_empty());
+        let filter = apply_params(Filter::default(), &p);
+        assert_eq!(filter.authors, Some(Vec::new()));
+        assert_eq!(filter.kinds, Some(Vec::new()));
+        // An absent key stays unconstrained.
+        let filter = apply_params(Filter::default(), &from_query("limit=1"));
+        assert_eq!(filter.authors, None);
+        assert_eq!(filter.kinds, None);
         // Invalid values stay rejected.
         let uri = axum::http::Uri::from_static("/x?kinds=1,x");
         assert!(axum::extract::Query::<ApiParams>::try_from_uri(&uri).is_err());
@@ -3092,6 +3119,27 @@ mod tests {
             assert_eq!(code, StatusCode::OK);
             let events = resp["events"].as_array().unwrap();
             assert_eq!(events.len(), 2, "both kind-1 notes");
+            // L03: an explicit empty `?authors=`/`?kinds=` matches nothing;
+            // it must not silently widen to every event on the relay.
+            let (_, Json(resp)) = api_query_handler(
+                State(relay.clone()),
+                Query(ApiParams {
+                    authors_present: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
+            assert_eq!(resp["events"].as_array().unwrap().len(), 0);
+            assert_eq!(resp["count"], 0);
+            let (_, Json(resp)) = api_count_handler(
+                State(relay.clone()),
+                Query(ApiParams {
+                    kinds_present: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
+            assert_eq!(resp["count"], 0);
 
             // /count: total.
             let (_, Json(resp)) = api_count_handler(

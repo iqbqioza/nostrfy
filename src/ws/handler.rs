@@ -283,15 +283,63 @@ impl super::Conn {
 
     /// Accepts the queued events in one database batch and sends the OKs.
     pub(crate) async fn flush_pending_events(&mut self) {
+        let Some(outcomes) = self.accept_pending_events().await else {
+            return;
+        };
+        self.apply_batch_outcomes(outcomes);
+    }
+
+    /// Accepts the queued batch at teardown. The task is detached from this
+    /// connection's deadline: if the writer is slow, the connection closes
+    /// after `grace`, but the commit and its `after_put` side effects keep
+    /// running (tracked by `Relay::teardown_tasks`) instead of being dropped
+    /// after the commit (H09). OKs are sent only when the batch finishes
+    /// within the grace; a timed-out peer is closing anyway.
+    pub(crate) async fn flush_pending_events_for_teardown(&mut self, grace: std::time::Duration) {
         if self.pending_events.is_empty() {
             return;
         }
         let events = std::mem::take(&mut self.pending_events);
         self.pending_bytes = 0;
-        let outcomes = self
-            .relay
-            .accept_events_batch(events, &self.authed_pubkeys)
-            .await;
+        let relay = std::sync::Arc::clone(&self.relay);
+        let authed = self.authed_pubkeys.clone();
+        relay.begin_teardown_batch();
+        let mut task = tokio::spawn(async move {
+            struct TeardownGuard(std::sync::Arc<crate::relay::Relay>);
+            impl Drop for TeardownGuard {
+                fn drop(&mut self) {
+                    self.0.end_teardown_batch();
+                }
+            }
+            let _guard = TeardownGuard(std::sync::Arc::clone(&relay));
+            relay.accept_events_batch(events, &authed).await
+        });
+        match tokio::time::timeout(grace, &mut task).await {
+            Ok(Ok(outcomes)) => self.apply_batch_outcomes(outcomes),
+            Ok(Err(e)) => log::error!("websocket teardown batch task failed: {e}"),
+            Err(_) => {
+                // Dropping the JoinHandle detaches the task instead of
+                // aborting it; `teardown_tasks` keeps the server's database
+                // shutdown from racing its final side effects.
+                log::debug!("websocket teardown batch still running after the grace");
+            }
+        }
+    }
+
+    async fn accept_pending_events(&mut self) -> Option<Vec<(String, crate::db::PutOutcome)>> {
+        if self.pending_events.is_empty() {
+            return None;
+        }
+        let events = std::mem::take(&mut self.pending_events);
+        self.pending_bytes = 0;
+        Some(
+            self.relay
+                .accept_events_batch(events, &self.authed_pubkeys)
+                .await,
+        )
+    }
+
+    pub(crate) fn apply_batch_outcomes(&mut self, outcomes: Vec<(String, crate::db::PutOutcome)>) {
         for (id, outcome) in outcomes {
             // B-2: only an id-shaped echo can be the client's correlation,
             // and a rejected event may carry an oversized `id` that must

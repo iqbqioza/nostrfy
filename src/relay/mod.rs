@@ -373,12 +373,23 @@ pub struct Relay {
     /// NIP-42 flags against this version and refresh them only when it
     /// changes, so the hot live path never takes the shared config lock.
     pub config_version: std::sync::atomic::AtomicU64,
+    /// Wake channel for config-version changes. Connections select on it so
+    /// a SIGHUP that changes `ws_idle_timeout_secs` reaches even a fully
+    /// idle socket (L14); the atomic alone is only observed on the next
+    /// inbound frame/PING/live batch.
+    config_tx: tokio::sync::watch::Sender<u64>,
     /// Graceful-shutdown signal for the WebSocket connection loops: on
     /// shutdown the loops wake, flush their pending event batches (so the
     /// accepted events and their OKs are not lost to the process exit) and
     /// close. The sender lives here because the upgraded WebSocket tasks
     /// are detached from the HTTP connection they came from.
     drain_tx: tokio::sync::watch::Sender<bool>,
+    /// Pending final WebSocket batches whose connection task timed out but
+    /// whose commit/side effects are still running detached. The server
+    /// waits for this counter (bounded by `WS_DRAIN_GRACE`) before stopping
+    /// the database, so a timed-out teardown cannot lose a committed
+    /// deletion/broadcast side effect (H09).
+    pub(crate) teardown_tasks: std::sync::atomic::AtomicUsize,
     /// The relay's own keypair (from `relay.private_key`), used to sign
     /// NIP-29 and NIP-43 relay-generated events.
     key: Option<Keypair>,
@@ -2183,7 +2194,9 @@ impl Relay {
             persist_relay_field_lock: tokio::sync::Mutex::new(()),
             ip_blocks_tx: tokio::sync::watch::channel(0).0,
             config_version: AtomicU64::new(0),
+            config_tx: tokio::sync::watch::channel(0).0,
             drain_tx: tokio::sync::watch::channel(false).0,
+            teardown_tasks: std::sync::atomic::AtomicUsize::new(0),
             key,
             relay_pubkey,
             secp,
@@ -2227,6 +2240,40 @@ impl Relay {
     /// A receiver for a connection loop to observe [`Self::signal_drain`].
     pub fn subscribe_drain(&self) -> tokio::sync::watch::Receiver<bool> {
         self.drain_tx.subscribe()
+    }
+
+    /// Publishes a config-version bump to every connection. Returns the new
+    /// version (also stored in [`Self::config_version`] for the hot paths
+    /// that cannot await).
+    pub(crate) fn bump_config_version(&self) -> u64 {
+        let version = self
+            .config_version
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(1);
+        self.config_tx.send_replace(version);
+        version
+    }
+
+    pub(crate) fn subscribe_config(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.config_tx.subscribe()
+    }
+
+    /// Registers a detached final batch whose side effects must finish
+    /// before the database stops.
+    pub(crate) fn begin_teardown_batch(&self) {
+        self.teardown_tasks
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Releases a detached final batch (also on panic via its guard).
+    pub(crate) fn end_teardown_batch(&self) {
+        self.teardown_tasks
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub(crate) fn teardown_tasks_active(&self) -> usize {
+        self.teardown_tasks
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Completes the debounced snapshot persists during shutdown.

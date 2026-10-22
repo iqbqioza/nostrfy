@@ -1103,11 +1103,12 @@ pub async fn run_server(
     // `ws::handler`) plus a margin for the final flush and close.
     // `SHUTDOWN_BUDGET` covers this phase for the `nostrfy stop` timeout.
     let ws_deadline = std::time::Instant::now() + WS_DRAIN_GRACE;
-    while relay
+    while (relay
         .stats
         .connections_active
         .load(std::sync::atomic::Ordering::Relaxed)
         > 0
+        || relay.teardown_tasks_active() > 0)
         && std::time::Instant::now() < ws_deadline
     {
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
@@ -3102,9 +3103,7 @@ async fn apply_reloaded_config(
     // Bump the config version: connections refresh
     // their cached NIP-40/NIP-42 flags on the next
     // live batch (see `Conn::config_version`).
-    relay
-        .config_version
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    relay.bump_config_version();
 }
 
 #[cfg(test)]
