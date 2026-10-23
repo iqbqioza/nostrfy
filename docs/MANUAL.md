@@ -564,20 +564,7 @@ curl -X POST http://127.0.0.1:8080/ \
 | A3 | Payment targets (kind 10133, replaceable). `draft` with no integer identifier — served but **not** advertised in `supported_nips` (which only holds integers) |
 
 NIP-91 filters require every distinct value of an `&` tag constraint.
-For example, `{"&t":["meme","cat"],"#t":["meme","cat","black","white"]}`
-requires both `meme` and `cat`, plus either `black` or `white`. Values already
-required by `&t` are ignored in `#t`; if all OR values overlap, the OR field
-adds no requirement. Include the AND values in `#t` for compatibility with
-relays that do not support the proposal, then apply an AND check locally.
-
-REQ, COUNT and NEG-OPEN share these semantics. Only `tag[1]` is compared,
-case-sensitively; duplicate values impose one requirement. Empty AND arrays
-match nothing (as do empty OR arrays). The relay also accepts a single string
-as a one-value constraint. The existing 512-value filter budget covers raw
-AND and OR entries combined, including duplicates and compatibility copies.
-When NIP-91 is disabled, `&` fields are ignored and `#` fields retain ordinary
-OR behavior. NIP-45 HLL offsets continue to use the original first `#` field;
-AND-only filters do not produce HLL sketches. No database migration is needed.
+For example, `{"&t":["meme","cat"],"#t":["meme","cat","black","white"]}` requires both `meme` and `cat`, plus either `black` or `white`. Values already required by `&t` are ignored in `#t`; if all OR values overlap, the OR field adds no requirement. Include the AND values in `#t` for compatibility with relays that do not support the proposal, then apply an AND check locally. REQ, COUNT and NEG-OPEN share these semantics. Only `tag[1]` is compared, case-sensitively; duplicate values impose one requirement. Empty AND arrays match nothing (as do empty OR arrays). The relay also accepts a single string as a one-value constraint. The existing 512-value filter budget covers raw AND and OR entries combined, including duplicates and compatibility copies. When NIP-91 is disabled, `&` fields are ignored and `#` fields retain ordinary OR behavior. NIP-45 HLL offsets continue to use the original first `#` field; AND-only filters do not produce HLL sketches. No database migration is needed.
 
 Blossom (BUD-01/02) is not a NIP and is **not** advertised in the NIP-11 document: it is served as a separate file server on the `[blossom]` hostname (see [Section 11](#11-blossom-file-server-media-hosting)), with its own kind-24242 upload authorization.
 
