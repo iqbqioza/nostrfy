@@ -5153,8 +5153,9 @@ fn neg_items_carry_visibility_flags() {
             Some("g1"),
             "group id captured"
         );
-        assert!(
-            !by_id(&grouped.id).meta,
+        assert_ne!(
+            by_id(&grouped.id).kind,
+            39000,
             "regular group events are not metadata"
         );
         assert!(

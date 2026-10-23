@@ -51,6 +51,10 @@ pub const DELETE_GROUP: u64 = 9008;
 /// member is refused with the spec's `duplicate:` prefix.
 pub const JOIN: u64 = 9021;
 pub const LEAVE: u64 = 9022;
+/// NIP-29 `create-invite`: carries bearer invite codes. The codes are
+/// member/admin-only (a non-member who can read them can join a `closed`
+/// group), so visibility special-cases this kind.
+pub const CREATE_INVITE: u64 = 9009;
 
 const H: &str = "h";
 const D: &str = "d";
@@ -149,7 +153,13 @@ pub fn malformed_member_tags(event: &Event) -> impl Iterator<Item = &str> {
 /// join requests (9021) and leave requests (9022). These MUST carry an `h`
 /// tag naming the group they act on.
 pub fn is_group_action(event: &Event) -> bool {
-    (MOD_MIN..=MOD_MAX).contains(&event.kind) || event.kind == JOIN || event.kind == LEAVE
+    is_group_action_kind(event.kind)
+}
+
+/// Kind-only form of [`is_group_action`], for visibility checks that no
+/// longer have the full event.
+pub fn is_group_action_kind(kind: u64) -> bool {
+    (MOD_MIN..=MOD_MAX).contains(&kind) || kind == JOIN || kind == LEAVE
 }
 
 /// Whether the event is a group event at all: user and moderation events
@@ -260,6 +270,11 @@ impl Group {
     }
 }
 
+/// Groups up to this many members always get a fresh 39002.
+const MEMBERS_EAGER_MAX: usize = 1000;
+/// Larger groups get a fresh 39002 at most once per this many seconds.
+const MEMBERS_INTERVAL_SECS: u64 = 60;
+
 #[derive(Debug, Default)]
 pub struct GroupStore {
     pub groups: HashMap<String, Group>,
@@ -275,6 +290,10 @@ pub struct GroupStore {
     /// NIP-29 marks the member list optional, and a 10k-member group would
     /// otherwise build, sign and store a 10k-tag event on every JOIN/LEAVE.
     members_published_at: HashMap<String, u64>,
+    /// Groups whose 39002 was throttled since the last publish. The stats
+    /// tick drains these once their interval elapses, so a dropped update is
+    /// never permanent. Transient: a restart republishes all metadata.
+    members_dirty: HashSet<String>,
     /// Cap on the store size (active groups + deleted markers): bounds the
     /// in-memory state even when an attacker churns group ids. 0 =
     /// unlimited.
@@ -409,6 +428,7 @@ impl GroupStore {
         self.groups = snap.groups;
         self.deleted = snap.deleted;
         self.ghost = snap.ghost;
+        self.members_dirty.clear();
         // The snapshot is authoritative: unknown ids are genuinely unknown
         // again (see the `unrestored` field).
         self.unrestored = false;
@@ -1190,6 +1210,7 @@ impl GroupStore {
                             // settings above still apply (M-7).
                             let mut seen = HashSet::new();
                             let declared: Vec<String> = tag_values(event, "child")
+                                .filter(|child| !child.is_empty())
                                 .filter(|child| !denials.children.contains(*child))
                                 .map(str::to_string)
                                 .filter(|c| seen.insert(c.clone()))
@@ -1506,6 +1527,28 @@ impl GroupStore {
                     }
                     self.groups.insert(gid.to_string(), group);
                     self.total_members = self.total_members.saturating_add(1);
+                    // A placeholder can be declared by several parents. Only
+                    // the deterministic adopter keeps the child; drop the
+                    // stale entry from every other parent and republish its
+                    // 39000 so the stored tree cannot name a second parent
+                    // (which would make the child appear twice).
+                    let adopted = adopted_parent.clone();
+                    for (other_id, other) in self.groups.iter_mut() {
+                        if Some(other_id.as_str()) == adopted.as_deref() {
+                            continue;
+                        }
+                        if let Some(pos) = other.children.iter().position(|c| c == gid) {
+                            other.children.remove(pos);
+                            if emit {
+                                out.push(build_meta_event(
+                                    other_id,
+                                    Some(other),
+                                    relay_pubkey,
+                                    now,
+                                ));
+                            }
+                        }
+                    }
                     if emit && let Some(parent) = &adopted_parent {
                         // The adopting parent's stored metadata must name
                         // the now-existing child: its stored 39000 may have
@@ -1635,8 +1678,7 @@ impl GroupStore {
         let Some(gid) = group_id_any(event) else {
             return true;
         };
-        let is_meta = (GROUP_META..=GROUP_PINS).contains(&event.kind);
-        self.visible_gid(gid, is_meta, authed)
+        self.visible_kind(gid, event.kind, authed)
     }
 
     /// Whether `event` belongs to a membership-gated group (`private`
@@ -1663,9 +1705,11 @@ impl GroupStore {
             return false;
         }
         let is_meta = (GROUP_META..=GROUP_PINS).contains(&event.kind);
-        self.groups
-            .get(gid)
-            .is_some_and(|g| (g.settings.private && !is_meta) || (g.settings.hidden && is_meta))
+        self.groups.get(gid).is_some_and(|g| {
+            (g.settings.private && !is_meta)
+                || (g.settings.hidden && (is_meta || is_group_action_kind(event.kind)))
+                || event.kind == CREATE_INVITE
+        })
     }
 
     /// Group ids that must stay hidden across a rebuild: the live groups
@@ -1703,21 +1747,25 @@ impl GroupStore {
     }
 
     /// Removes `pubkey` from every group's member map (a vanish) and keeps
-    /// the global member counter in sync. Returns whether any membership
-    /// was removed.
-    pub fn remove_member_everywhere(&mut self, pubkey: &str) -> bool {
-        let mut removed = 0usize;
-        for group in self.groups.values_mut() {
+    /// the global member counter in sync. Returns the affected group ids so
+    /// the caller can republish their rosters and relay-signed 9000 mirrors;
+    /// an empty result means no membership was removed.
+    pub fn remove_member_everywhere(&mut self, pubkey: &str) -> Vec<String> {
+        let mut affected = Vec::new();
+        for (gid, group) in self.groups.iter_mut() {
             if group.members.remove(pubkey).is_some() {
-                removed += 1;
+                affected.push(gid.clone());
             }
         }
-        if removed > 0 {
-            self.total_members = self.total_members.saturating_sub(removed);
-            true
-        } else {
-            false
+        if !affected.is_empty() {
+            self.total_members = self.total_members.saturating_sub(affected.len());
+            for gid in &affected {
+                // Force the next membership publish to emit a fresh 39002
+                // even for a throttled large group.
+                self.members_published_at.remove(gid);
+            }
         }
+        affected
     }
 
     /// Re-seeds the hidden markers captured before a rebuild and ghosts
@@ -1760,8 +1808,19 @@ impl GroupStore {
 
     /// Whether the content of a group may be served to `authed`. `is_meta`
     /// distinguishes relay-generated metadata events (kinds 39000-39005),
-    /// which `hidden` groups additionally withhold from non-members.
+    /// which `hidden` groups additionally withhold from non-members. Callers
+    /// that know the event kind should use [`Self::visible_kind`] so
+    /// moderation events and invite codes are gated too.
+    #[cfg(test)]
     pub fn visible_gid(&self, gid: &str, is_meta: bool, authed: Option<&str>) -> bool {
+        self.visible_kind(gid, if is_meta { GROUP_META } else { 1 }, authed)
+    }
+
+    /// Kind-aware visibility: `hidden` withholds relay metadata and group
+    /// actions (moderation/join/leave) from non-members, and invite codes
+    /// (9009) are always member-only so a non-member cannot read the bearer
+    /// code that admits them to a `closed` group.
+    pub fn visible_kind(&self, gid: &str, kind: u64, authed: Option<&str>) -> bool {
         // While the store is known stale (a group-state event was removed
         // and the rebuild has not re-derived the answer), every group
         // decision fails closed: serving an event because its (possibly
@@ -1791,23 +1850,26 @@ impl GroupStore {
             return !self.unrestored;
         };
         let member = authed.is_some_and(|pk| group.is_member(pk));
+        let is_meta = (GROUP_META..=GROUP_PINS).contains(&kind);
         // NIP-29: `private` restricts the group MESSAGES to members; the
         // metadata stays readable (it is not the private content). `hidden`
-        // additionally hides the relay-generated metadata from non-members.
+        // additionally hides the group metadata and the moderation actions
+        // that carry it (9002 edits etc.) from non-members. Invite codes are
+        // bearer tokens for a `closed` group: a non-member who can read one
+        // can join, so they are always member-only.
         if group.settings.private && !member && !is_meta {
             return false;
         }
-        if group.settings.hidden && is_meta && !member {
+        if group.settings.hidden && !member && (is_meta || is_group_action_kind(kind)) {
+            return false;
+        }
+        if kind == CREATE_INVITE && !member {
             return false;
         }
         true
     }
 
     fn membership_events(&mut self, gid: &str, relay_pubkey: &str, now: u64) -> Vec<Event> {
-        /// Groups up to this many members always get a fresh 39002.
-        const MEMBERS_EAGER_MAX: usize = 1000;
-        /// Larger groups get it at most once per this many seconds.
-        const MEMBERS_INTERVAL_SECS: u64 = 60;
         let mut out = vec![
             build_admins_event(gid, self.groups.get(gid), relay_pubkey, now),
             // NIP-29's `39003` (the roles in use): small and cheap, so it
@@ -1822,12 +1884,48 @@ impl GroupStore {
                 .is_none_or(|last| now.saturating_sub(*last) >= MEMBERS_INTERVAL_SECS);
         if due {
             self.members_published_at.insert(gid.to_string(), now);
+            self.members_dirty.remove(gid);
             out.push(build_members_event(
                 gid,
                 self.groups.get(gid),
                 relay_pubkey,
                 now,
             ));
+        } else {
+            // Remember that this update was throttled: the stats tick retries
+            // it once the interval elapses, so a large group's roster cannot
+            // stay permanently stale.
+            self.members_dirty.insert(gid.to_string());
+        }
+        out
+    }
+
+    /// Emits the deferred 39002 for groups whose update was throttled and
+    /// whose interval has now elapsed. Called from the stats tick.
+    pub(crate) fn due_membership_events(&mut self, relay_pubkey: &str, now: u64) -> Vec<Event> {
+        let gids: Vec<String> = self.members_dirty.iter().cloned().collect();
+        let mut out = Vec::new();
+        for gid in gids {
+            if !self.groups.contains_key(&gid) {
+                self.members_dirty.remove(&gid);
+                continue;
+            }
+            let members = self.groups.get(&gid).map(|g| g.members.len()).unwrap_or(0);
+            let due = members <= MEMBERS_EAGER_MAX
+                || self
+                    .members_published_at
+                    .get(&gid)
+                    .is_none_or(|last| now.saturating_sub(*last) >= MEMBERS_INTERVAL_SECS);
+            if due {
+                self.members_dirty.remove(&gid);
+                self.members_published_at.insert(gid.clone(), now);
+                out.push(build_members_event(
+                    &gid,
+                    self.groups.get(&gid),
+                    relay_pubkey,
+                    now,
+                ));
+            }
         }
         out
     }
@@ -2194,17 +2292,17 @@ impl GroupStore {
             if self.deleted.contains(&gid) && !seen_h_gids.contains(&gid) {
                 continue;
             }
-            // The ghost set is a fail-closed memory structure. Do not let a
-            // history full of attacker-chosen h tags grow it past the group
-            // budget: an incomplete rebuild must refuse to become
-            // authoritative rather than silently leave surplus ids public
-            // or consume unbounded memory.
-            if self.max_groups > 0 && self.groups.len() + self.ghost.len() >= self.max_groups {
-                log::error!(
-                    "NIP-29 rebuild found more unknown h-tagged group ids than                      relay.max_groups ({}) allows; refusing an incomplete ghost set",
+            // The ghost set is a fail-closed memory structure, not a live
+            // group budget (H02). It grows with the surviving h-tagged
+            // history; refusing the rebuild once it reaches max_groups would
+            // turn a single orphan h-id into an unrestored store that hides
+            // every group. Keep inserting so the orphan history stays
+            // withheld, and warn at the crossing point.
+            if self.max_groups > 0 && self.ghost.len() == self.max_groups {
+                log::warn!(
+                    "NIP-29 rebuild ghost set reached relay.max_groups ({}); continuing in fail-closed mode",
                     self.max_groups
                 );
-                return false;
             }
             self.ghost.insert(gid);
         }
@@ -2348,6 +2446,11 @@ fn validate_edit_metadata(
     // the edit is rejected outright instead.
     if tag_values(event, "parent").count() > 1 {
         bail!("restricted: at most one parent tag is allowed");
+    }
+    // An empty child id is not a group id: accepting it would leave a junk
+    // entry in 39000 that no group can ever occupy or remove.
+    if tag_values(event, "child").any(str::is_empty) {
+        bail!("restricted: child id must not be empty");
     }
     // A group cannot be its own child, and one 9002 must not make a
     // group both the parent and the child of this one (that would create

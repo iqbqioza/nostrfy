@@ -1298,6 +1298,202 @@ fn private_groups_hide_messages_but_not_metadata() {
     );
 }
 
+#[test]
+fn hidden_groups_hide_moderation_actions_from_non_members() {
+    let mut store = seeded();
+    let outsider = "d".repeat(64);
+    let hide = event(9002, ADMIN, Some("g1"), vec![vec!["hidden".into()]]);
+    store.apply(&hide, "", 1, false, false);
+    assert!(
+        !store.visible_to(&hide, Some(&outsider)),
+        "a hidden group's moderation metadata is member-only"
+    );
+    assert!(store.visible_to(&hide, Some(ADMIN)));
+    let msg = event(1, ADMIN, Some("g1"), vec![]);
+    assert!(
+        store.visible_to(&msg, Some(&outsider)),
+        "ordinary hidden-group messages stay readable"
+    );
+}
+
+#[test]
+fn closed_group_invite_codes_are_member_only() {
+    let mut store = seeded();
+    let outsider = "d".repeat(64);
+    store.apply(
+        &event(9002, ADMIN, Some("g1"), vec![vec!["closed".into()]]),
+        "",
+        1,
+        false,
+        false,
+    );
+    let invite = event(
+        9009,
+        ADMIN,
+        Some("g1"),
+        vec![vec!["code".into(), "secret".into()]],
+    );
+    store.apply(&invite, "", 1, false, false);
+    assert!(
+        !store.visible_to(&invite, Some(&outsider)),
+        "a non-member must not read the code that admits them to a closed group"
+    );
+    assert!(store.visible_to(&invite, Some(ADMIN)));
+    assert!(store.visible_to(&invite, Some(OTHER)));
+}
+
+#[test]
+fn throttled_member_lists_are_republished_later() {
+    let mut store = seeded();
+    let now = 1_700_000_000;
+    {
+        let group = store.groups.get_mut("g1").unwrap();
+        for i in 0..1001 {
+            group
+                .members
+                .insert(format!("{i:064x}"), std::collections::HashSet::new());
+        }
+    }
+    store.members_published_at.insert("g1".into(), now);
+    let out = store.membership_events("g1", "relay", now + 1);
+    assert!(
+        !out.iter().any(|e| e.kind == GROUP_MEMBERS),
+        "a large group's 39002 is throttled"
+    );
+    assert!(store.members_dirty.contains("g1"));
+    let due = store.due_membership_events("relay", now + 61);
+    assert!(
+        due.iter().any(|e| e.kind == GROUP_MEMBERS),
+        "the deferred 39002 must be emitted once the interval elapses"
+    );
+    assert!(!store.members_dirty.contains("g1"));
+}
+
+#[test]
+fn create_adoption_keeps_only_one_parent() {
+    let mut store = GroupStore::with_cap(10);
+    let now = 1_600_000_000;
+    for gid in ["g1", "g2"] {
+        store.apply(
+            &event(CREATE_GROUP, ADMIN, Some(gid), vec![]),
+            "relay",
+            now,
+            false,
+            false,
+        );
+    }
+    for gid in ["g1", "g2"] {
+        store.apply(
+            &event(
+                9002,
+                ADMIN,
+                Some(gid),
+                vec![vec!["child".into(), "g3".into()]],
+            ),
+            "relay",
+            now,
+            false,
+            false,
+        );
+    }
+    let out = store.apply(
+        &event(CREATE_GROUP, ADMIN, Some("g3"), vec![]),
+        "relay",
+        now,
+        true,
+        false,
+    );
+    assert_eq!(store.group("g3").unwrap().parent.as_deref(), Some("g1"));
+    assert!(
+        store
+            .group("g1")
+            .unwrap()
+            .children
+            .contains(&"g3".to_string())
+    );
+    assert!(
+        !store
+            .group("g2")
+            .unwrap()
+            .children
+            .contains(&"g3".to_string()),
+        "the non-adopting parent's stale child link must be dropped"
+    );
+    assert!(
+        out.iter().any(|e| e.kind == GROUP_META
+            && e.tags
+                .iter()
+                .any(|t| t.len() >= 2 && t[0] == "d" && t[1] == "g2")),
+        "the non-adopting parent's metadata must be republished"
+    );
+}
+
+#[test]
+fn empty_child_tag_is_rejected() {
+    let store = seeded();
+    let edit = event(
+        9002,
+        ADMIN,
+        Some("g1"),
+        vec![vec!["child".into(), String::new()]],
+    );
+    assert!(
+        store
+            .validate_write(&edit)
+            .unwrap_err()
+            .to_string()
+            .contains("child"),
+        "an empty child id must not enter the group tree"
+    );
+}
+
+#[test]
+fn rebuild_does_not_fail_when_the_ghost_set_exceeds_the_cap() {
+    use crate::db::DbClient;
+    use crate::nips::nip01;
+    use std::sync::Arc;
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = std::env::temp_dir()
+        .join("nostrfy-nip29-ghost-cap")
+        .join(format!("{:x}-{id}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&path);
+    let cfg = crate::config::DatabaseConfig {
+        path,
+        map_size: 16 * 1024 * 1024,
+        max_map_size: 32 * 1024 * 1024,
+        ..Default::default()
+    };
+    let db = DbClient::open(
+        &cfg,
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let now = 1_700_000_000;
+        let mut create = event(CREATE_GROUP, ADMIN, Some("g1"), vec![]);
+        create.id = nip01::compute_id(&create);
+        assert_eq!(db.put(create, now).await, crate::db::PutOutcome::Stored);
+        let mut orphan = event(1, ADMIN, Some("g2"), vec![]);
+        orphan.id = nip01::compute_id(&orphan);
+        assert_eq!(db.put(orphan, now).await, crate::db::PutOutcome::Stored);
+        let mut store = GroupStore::with_cap(1);
+        assert!(
+            store.rebuild(&db, None).await,
+            "an extra orphan h-id must not turn the whole rebuild into unrestored"
+        );
+        assert!(store.group("g1").is_some());
+        assert!(store.is_ghosted("g2"));
+    });
+    db.shutdown();
+}
+
 /// The same-second tie-break the rebuild replay applies when the true
 /// arrival order is unknowable, pinned event pair by event pair.
 ///

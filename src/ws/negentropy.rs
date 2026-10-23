@@ -469,11 +469,11 @@ impl super::Conn {
                             return false;
                         };
                         if self.authed_pubkeys.is_empty() {
-                            groups.visible_gid(gid, item.meta, None)
+                            groups.visible_kind(gid, item.kind, None)
                         } else {
                             self.authed_pubkeys
                                 .iter()
-                                .any(|pk| groups.visible_gid(gid, item.meta, Some(pk)))
+                                .any(|pk| groups.visible_kind(gid, item.kind, Some(pk)))
                         }
                     } else {
                         true

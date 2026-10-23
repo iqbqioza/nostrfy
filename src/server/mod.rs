@@ -1660,6 +1660,9 @@ async fn stats_writer(relay: Arc<Relay>, mut shutdown: watch::Receiver<bool>) {
                 // would otherwise leave its suppressed count unlogged until
                 // the next NIP-86 call. Flush it on the stats interval.
                 relay.audit.flush_suppressed();
+                // A large group's 39002 is throttled; retry it once its
+                // interval elapsed so a dropped update is delayed, not lost.
+                relay.republish_due_group_members().await;
                 let path = relay.config.read().await.daemon.stats_file.clone();
                 relay
                     .stats

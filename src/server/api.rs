@@ -1691,7 +1691,7 @@ fn aggregate_visible(
     // NIP-29: private/hidden group content is withheld from non-members.
     // The store is absent when the sample holds no group item.
     if let Some(gid) = &item.gid
-        && !groups.is_some_and(|groups| groups.visible_gid(gid, item.meta, None))
+        && !groups.is_some_and(|groups| groups.visible_kind(gid, item.kind, None))
     {
         return false;
     }

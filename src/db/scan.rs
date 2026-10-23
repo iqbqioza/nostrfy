@@ -41,7 +41,6 @@ pub(crate) struct NegItem {
     /// gate is on.
     pub app_specific: bool,
     pub gid: Option<String>,
-    pub meta: bool,
     /// p-tag recipients of a NIP-59 gift wrap (kind 1059), `None` for every
     /// other kind. Kept so the connection layer can serve wraps only to
     /// their recipients without loading the full events back.
@@ -520,14 +519,7 @@ impl ScanCollector for ItemCollector {
             self.boundary = Some(event.created_at);
         }
         let protected = crate::nips::nip70::is_protected(&event);
-        let (gid, meta) = match crate::nips::nip29::group_id_any(&event) {
-            Some(gid) => {
-                let meta = (crate::nips::nip29::GROUP_META..=crate::nips::nip29::GROUP_PINS)
-                    .contains(&event.kind);
-                (Some(gid.to_string()), meta)
-            }
-            None => (None, false),
-        };
+        let gid = crate::nips::nip29::group_id_any(&event).map(str::to_string);
         let wrap_recipients = if event.kind == crate::nips::nip62::GIFT_WRAP_KIND {
             Some(
                 event
@@ -548,7 +540,6 @@ impl ScanCollector for ItemCollector {
             protected,
             app_specific: crate::nips::nip78::is_app_specific(&event),
             gid,
-            meta,
             wrap_recipients,
         };
         self.bytes = self.bytes.saturating_add(neg_item_size_estimate(&item));
@@ -565,14 +556,7 @@ impl ScanCollector for ItemCollector {
             self.boundary = Some(event.created_at());
         }
         let protected = crate::nips::nip70::tags_protected(event.tags());
-        let (gid, meta) = match crate::nips::nip29::group_id_any_light(event) {
-            Some(gid) => {
-                let meta = (crate::nips::nip29::GROUP_META..=crate::nips::nip29::GROUP_PINS)
-                    .contains(&event.kind());
-                (Some(gid.to_string()), meta)
-            }
-            None => (None, false),
-        };
+        let gid = crate::nips::nip29::group_id_any_light(event).map(str::to_string);
         let wrap_recipients = if event.kind() == crate::nips::nip62::GIFT_WRAP_KIND {
             Some(
                 event
@@ -593,7 +577,6 @@ impl ScanCollector for ItemCollector {
             protected,
             app_specific: crate::nips::nip78::is_app_specific_kind(event.kind()),
             gid,
-            meta,
             wrap_recipients,
         };
         self.bytes = self.bytes.saturating_add(neg_item_size_estimate(&item));
@@ -1959,12 +1942,12 @@ mod tests {
         meta.tags = vec![vec!["d".into(), "g".into()]];
         assert!(c.push(meta, [0x22u8; 32], 8));
         assert_eq!(c.items[1].gid.as_deref(), Some("g"));
-        assert!(c.items[1].meta);
+        assert!((GROUP_META..=GROUP_PINS).contains(&c.items[1].kind));
         let mut pin = ev("p", 1);
         pin.kind = GROUP_PINS;
         pin.tags = vec![vec!["d".into(), "g".into()]];
         assert!(c.push(pin, [0x33u8; 32], 8));
-        assert!(c.items[2].meta);
+        assert!((GROUP_META..=GROUP_PINS).contains(&c.items[2].kind));
         let mut app = ev("x", 1);
         app.kind = crate::nips::nip78::APP_SPECIFIC_KIND;
         assert!(c.push(app, [0x44u8; 32], 8));

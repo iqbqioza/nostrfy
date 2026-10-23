@@ -3891,6 +3891,26 @@ impl Relay {
     /// must not let a caller drop other copies of the metadata: the heal
     /// keeps a former key's events until this one has stored the current
     /// key's (see [`Self::heal_rotated_group_metadata`]).
+    /// Emits the member lists (39002) that `membership_events` throttled for
+    /// a large group once their interval has elapsed. The stats tick calls
+    /// this, so a dropped update is delayed, never lost.
+    pub(crate) async fn republish_due_group_members(&self) {
+        let Some(relay_pubkey) = self.relay_pubkey() else {
+            return;
+        };
+        let now = self.stamp_floor(unix_now());
+        let events = self
+            .groups
+            .write()
+            .await
+            .due_membership_events(&relay_pubkey, now);
+        for mut event in events {
+            if self.store_relay_event(&mut event).await.is_err() {
+                log::warn!("could not republish a throttled NIP-29 member list");
+            }
+        }
+    }
+
     /// Republishes the relay-signed NIP-29 metadata when a runtime rebuild
     /// changed the derived state. A failed pass leaves the flag set for the
     /// next stats tick.
@@ -5064,7 +5084,7 @@ impl Relay {
         let pubkey_hex = hex::encode(pubkey);
         let nip29_enabled = self.config.read().await.nip_enabled(29);
         let nip43_enabled = self.config.read().await.nip_enabled(43);
-        let mut changed_member = false;
+        let mut affected_gids: Vec<String> = Vec::new();
         let mut role_changed = false;
         // The removal commits in the database before the in-memory derived
         // state is updated: hold the in-flight claims until the per-store
@@ -5097,14 +5117,14 @@ impl Relay {
             // from the database (an admin's surviving 9000 may re-add the
             // pubkey after the scan's vanished-set snapshot), so an
             // in-flight rebuild discards its scan.
-            changed_member = {
+            {
                 let mut buffer = self.groups_rebuild.buffer.lock().await;
                 if buffer.scanning {
                     buffer.retry = true;
                 }
                 let mut groups = self.groups.write().await;
-                groups.remove_member_everywhere(&pubkey_hex)
-            };
+                affected_gids = groups.remove_member_everywhere(&pubkey_hex);
+            }
         }
         // NIP-43 role assignments hold pubkeys too: a vanished author must
         // not keep its roles.
@@ -5150,8 +5170,16 @@ impl Relay {
             // invite code.
             self.mark_roles_stale().await;
         }
+        if nip29_enabled && !state_removed.group && !affected_gids.is_empty() {
+            self.repair_vanished_member_rosters(&pubkey_hex, &affected_gids)
+                .await;
+        }
         drop(groups_in_flight);
-        if nip29_enabled && !state_removed.group && changed_member && !self.persist_groups().await {
+        if nip29_enabled
+            && !state_removed.group
+            && !affected_gids.is_empty()
+            && !self.persist_groups().await
+        {
             log::error!(
                 "could not persist the group state after a vanish; it will be \
                  rebuilt on the next restart"
@@ -5162,6 +5190,34 @@ impl Relay {
             self.schedule_roles_persist();
         }
         true
+    }
+
+    /// Makes the stored history and roster agree after a vanish dropped the
+    /// pubkey from group memberships. The JOIN mirror is a relay-signed 9000,
+    /// so the vanish (which only removes the vanished author's events) cannot
+    /// delete it; append a relay-signed 9001 for each affected group and
+    /// republish 39001/39002/39003. `remove_member_everywhere` cleared the
+    /// per-group publish timestamp, so the 39002 is emitted even for a large
+    /// throttled group.
+    async fn repair_vanished_member_rosters(&self, pubkey: &str, gids: &[String]) {
+        let Some(relay_pubkey) = self.relay_pubkey() else {
+            // Without the relay key there is no relay-signed 9000 mirror or
+            // metadata to repair; the in-memory member removal still stands.
+            return;
+        };
+        let stamp = self.stamp_floor(unix_now());
+        for gid in gids {
+            let mut event =
+                crate::nips::nip29::events::build_remove_user(gid, pubkey, &relay_pubkey, stamp);
+            if self.store_relay_event(&mut event).await.is_err() {
+                log::error!("could not store the relay-signed 9001 for a vanished member in {gid}");
+            }
+        }
+        if !self.publish_group_metadata().await {
+            self.groups_rebuild
+                .metadata_dirty
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 
     /// Captures a group event for replay while a rebuild scan runs, then
@@ -9966,6 +10022,102 @@ mod tests {
             );
             relay.db.shutdown();
         });
+    }
+
+    #[tokio::test]
+    async fn vanish_republishes_the_roster_without_the_vanished_member() {
+        // M07: a vanish that only drops an admin-added member must also fix
+        // the stored history. The JOIN mirror is a relay-signed 9000, which
+        // the vanish cannot remove, so a relay-signed 9001 is appended and
+        // the 39001/39002/39003 metadata is regenerated.
+        let relay = build_relay_with_key(false, &"11".repeat(32)).await;
+        let admin = secp256k1::Keypair::from_secret_bytes([7u8; 32]).unwrap();
+        let member_kp = secp256k1::Keypair::from_secret_bytes([8u8; 32]).unwrap();
+        let member = secp256k1::XOnlyPublicKey::from_keypair(&member_kp)
+            .0
+            .to_string();
+        let now = crate::util::unix_now();
+        let create = signed_group_event(&admin, 9007, "g1", vec![], now);
+        assert!(matches!(
+            relay.accept_events_batch(vec![create], &[]).await[0].1,
+            crate::db::PutOutcome::Stored
+        ));
+        let relay_kp = relay.key.as_ref().unwrap();
+        let put = signed_group_event(
+            relay_kp,
+            9000,
+            "g1",
+            vec![vec!["p".into(), member.clone()]],
+            now.saturating_add(1),
+        );
+        assert!(matches!(
+            relay.accept_events_batch(vec![put], &[]).await[0].1,
+            crate::db::PutOutcome::Stored
+        ));
+        assert!(relay.publish_group_metadata().await);
+        let members_filter = || {
+            serde_json::from_value::<crate::filter::Filter>(
+                serde_json::json!({"kinds": [39002], "#d": ["g1"]}),
+            )
+            .unwrap()
+        };
+        let (before, _) = relay
+            .db
+            .query(vec![members_filter()], 20, now.saturating_add(10))
+            .await;
+        let latest_before = before.iter().max_by_key(|e| e.created_at).unwrap();
+        assert!(
+            latest_before
+                .tags
+                .iter()
+                .any(|t| t.len() >= 2 && t[0] == "p" && t[1] == member)
+        );
+
+        let mut vanish = crate::event::Event {
+            id: String::new(),
+            pubkey: member.clone(),
+            created_at: now.saturating_add(2),
+            kind: crate::nips::nip62::VANISH_KIND,
+            tags: vec![vec!["relay".into(), "ws://127.0.0.1:8080".into()]],
+            content: String::new(),
+            sig: String::new(),
+        };
+        vanish.id = crate::nips::nip01::compute_id(&vanish);
+        let raw = vanish.id_bytes().unwrap();
+        vanish.sig = secp256k1::schnorr::sign_no_aux_rand(&raw, &member_kp).to_string();
+        assert!(matches!(
+            relay.accept_events_batch(vec![vanish], &[]).await[0].1,
+            crate::db::PutOutcome::Stored
+        ));
+
+        let remove_filter = || {
+            serde_json::from_value::<crate::filter::Filter>(
+                serde_json::json!({"kinds": [9001], "#h": ["g1"], "#p": [member]}),
+            )
+            .unwrap()
+        };
+        let (removes, _) = relay
+            .db
+            .query(vec![remove_filter()], 10, now.saturating_add(10))
+            .await;
+        assert!(
+            !removes.is_empty(),
+            "the relay-signed 9001 must make the vanish durable across restarts"
+        );
+
+        let (after, _) = relay
+            .db
+            .query(vec![members_filter()], 20, now.saturating_add(10))
+            .await;
+        let latest_after = after.iter().max_by_key(|e| e.created_at).unwrap();
+        assert!(
+            !latest_after
+                .tags
+                .iter()
+                .any(|t| t.len() >= 2 && t[0] == "p" && t[1] == member),
+            "the republished roster must not name the vanished member"
+        );
+        relay.db.shutdown();
     }
 
     #[test]
