@@ -583,6 +583,46 @@ fn tombstone_churn_does_not_lock_out_creates() {
 }
 
 #[test]
+fn ghosts_do_not_consume_the_live_group_cap() {
+    // H02: a backed ghost is a historical fail-closed marker, not a live
+    // group. It must not block a new create (the old combined budget let a
+    // create+delete churn lock out every later group id).
+    let mut store = GroupStore::with_cap(1);
+    store.mark_ghost("ghost-1");
+    assert!(
+        !store.create_capacity_reached(),
+        "a ghost must not consume the live group budget"
+    );
+    let g1 = event(CREATE_GROUP, ADMIN, Some("g1"), vec![]);
+    assert!(store.validate_write(&g1).is_ok());
+    store.apply(&g1, "", 1, false, false);
+    assert!(store.group("g1").is_some());
+    assert!(store.is_ghosted("ghost-1"), "the ghost stays fail-closed");
+    // The live cap still applies once a real group exists.
+    let g2 = event(CREATE_GROUP, ADMIN, Some("g2"), vec![]);
+    assert_eq!(
+        store.validate_write(&g2).unwrap_err().to_string(),
+        "restricted: group limit reached"
+    );
+}
+
+#[test]
+fn many_ghosts_do_not_retain_tombstones() {
+    // Tombstones are bounded by the live budget, not by the ghost set.
+    let mut store = GroupStore::with_cap(1);
+    for i in 0..4 {
+        store.mark_ghost(&format!("ghost-{i}"));
+    }
+    store.deleted.insert("deleted-1".to_string());
+    store.mark_ghost("ghost-4");
+    assert!(
+        store.deleted.is_empty(),
+        "tombstones must still be reclaimed when ghosts exceed the cap"
+    );
+    assert_eq!(store.ghost.len(), 5);
+}
+
+#[test]
 fn unlimited_group_cap_allows_any() {
     let mut store = GroupStore::default();
     for i in 0..100 {

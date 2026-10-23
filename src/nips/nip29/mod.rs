@@ -468,22 +468,26 @@ impl GroupStore {
             && self.total_members.saturating_add(fresh) > self.max_total_members
     }
 
-    /// Whether another *live* group may be created. The deleted tombstones
-    /// are reclaimable (see [`Self::reclaim_tombstones`]), so they do not
-    /// block a create; the ghost markers are not — their history may
-    /// survive — so they still count.
+    /// Whether another *live* group may be created. Deleted tombstones are
+    /// reclaimable (see [`Self::reclaim_tombstones`]); ghost markers are
+    /// historical fail-closed ids whose stored history may survive, not live
+    /// groups. Counting ghosts here let a create+delete churn of backed
+    /// ghosts lock out every new group id forever, so they no longer consume
+    /// the live budget. Their set is bounded by the h-tagged history that
+    /// produced them (each ghost requires stored events), and the reaper
+    /// releases the ones with no surviving history.
     fn at_capacity(&self) -> bool {
-        self.max_groups > 0 && self.groups.len() + self.ghost.len() >= self.max_groups
+        self.max_groups > 0 && self.groups.len() >= self.max_groups
     }
 
-    /// Whether a create currently hits the combined live+ghost budget. The
-    /// relay uses this to try reclaiming an unbacked ghost before refusing
-    /// the create (H02).
+    /// Whether a create currently hits the live group budget. Test-only:
+    /// production uses [`Self::at_capacity`] directly.
+    #[cfg(test)]
     pub(crate) fn create_capacity_reached(&self) -> bool {
         self.at_capacity()
     }
 
-    /// Makes room for `room` new entries within `max_groups`, dropping
+    /// Makes room for `room` new live groups within `max_groups`, dropping
     /// tombstones as needed. The in-memory delete markers are a fast path
     /// only: the database's purge marker and the purged events remain
     /// authoritative, and a tombstone's only unique effect is the friendlier
@@ -492,16 +496,17 @@ impl GroupStore {
     /// anonymous create+delete churn over `max_groups` distinct ids
     /// exhausted the budget with tombstones and permanently rejected every
     /// later create (only a `max_groups` change recovered). Ghosts are never
-    /// dropped: their surviving history must stay withheld.
+    /// dropped: their surviving history must stay withheld, and they do not
+    /// occupy the live budget (see [`Self::at_capacity`]).
     fn reclaim_tombstones(&mut self, room: usize) {
         if self.max_groups == 0 {
             return;
         }
         let budget = self.max_groups.saturating_sub(room);
-        while self.groups.len() + self.deleted.len() + self.ghost.len() > budget {
+        while self.groups.len() + self.deleted.len() > budget {
             let Some(victim) = self.deleted.iter().next().cloned() else {
-                // Live groups and ghosts alone exceed the budget: the
-                // create/ghost insert is refused by `at_capacity` instead.
+                // Live groups alone exceed the budget: the create is
+                // refused by `at_capacity` instead.
                 break;
             };
             self.deleted.remove(&victim);
