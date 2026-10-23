@@ -2615,9 +2615,28 @@ impl Relay {
             merged.blocked_pubkeys = deny;
             merged.allowed_pubkeys = allow;
             // `restrict_relay` is config-owned: never let a stale persisted
-            // blob regress it.
-            merged.restrict_relay = self.config.read().await.access.restrict_relay;
-            *self.access.write().await = merged;
+            // blob regress it. Read it before the access write lock (the
+            // accept paths take config before access, so the reverse order
+            // would set up a lock cycle).
+            let restrict_relay = self.config.read().await.access.restrict_relay;
+            // Replay the ops queued after this batch was captured while
+            // holding the same write lock every producer uses to apply and
+            // enqueue (see `push_access_ops` call sites). A producer cannot
+            // slip between the snapshot and the assignment, so its
+            // in-memory mutation is never wiped by the reload; its own
+            // persist will append it later.
+            let mut access = self.access.write().await;
+            let queued_ops: Vec<crate::config::AccessOp> = self
+                .access_ops
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .ops
+                .clone();
+            for op in &queued_ops {
+                crate::config::apply_access_op(&mut merged, op);
+            }
+            merged.restrict_relay = restrict_relay;
+            *access = merged;
         } else {
             log::warn!(
                 "access mutations are durable but reloading the merged state failed; \
@@ -6298,6 +6317,79 @@ mod tests {
             relay.access.read().await.blocked_pubkeys.len() == 2,
             "both bans must be enforced live"
         );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn persist_access_replays_ops_queued_after_its_capture() {
+        // N86-06: persist reloads the database after capturing its own op
+        // batch. Without replaying the ops queued meanwhile, assigning the
+        // reloaded state would wipe a mutation that a producer applied
+        // while persist waited for the access write lock.
+        let relay = build_relay().await;
+        let first = "aa".repeat(32);
+        let second = "bb".repeat(32);
+        // Hold the live access write lock: producers apply and queue while
+        // holding it, and persist needs it to swap in the reloaded state.
+        let mut access = relay.access.write().await;
+        let first_op = crate::config::AccessOp::BanPubkey {
+            pubkey: first.clone(),
+            reason: String::new(),
+            insensitive: true,
+        };
+        crate::config::apply_access_op(&mut access, &first_op);
+        relay.push_access_ops(vec![first_op]);
+        let persist = {
+            let relay = relay.clone();
+            tokio::spawn(async move { relay.persist_access().await })
+        };
+        // Wait until the first op reached the journal: persist has captured
+        // it and is now waiting for the access write lock we hold.
+        let mut captured = false;
+        for _ in 0..200 {
+            if let Some((deny, _)) = relay.db.try_load_relay_pubkeys().await
+                && deny.iter().any(|(p, _)| p == &first)
+            {
+                captured = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(captured, "the captured batch must reach the journal");
+        // A producer runs while persist is waiting for the lock.
+        let second_op = crate::config::AccessOp::BanPubkey {
+            pubkey: second.clone(),
+            reason: String::new(),
+            insensitive: true,
+        };
+        crate::config::apply_access_op(&mut access, &second_op);
+        relay.push_access_ops(vec![second_op]);
+        drop(access);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), persist)
+                .await
+                .expect("persist must finish")
+                .expect("persist must not panic")
+        );
+        {
+            let live = relay.access.read().await;
+            assert!(
+                live.blocked_pubkeys.iter().any(|(p, _)| p == &first),
+                "the captured op must survive"
+            );
+            assert!(
+                live.blocked_pubkeys.iter().any(|(p, _)| p == &second),
+                "the op queued after capture must not be wiped by the reload"
+            );
+        }
+        // The second op is still queued; its own persist appends it.
+        assert!(relay.persist_access().await);
+        let (deny, _) = relay
+            .db
+            .try_load_relay_pubkeys()
+            .await
+            .expect("the journal must load");
+        assert!(deny.iter().any(|(p, _)| p == &second));
         relay.db.shutdown();
     }
 

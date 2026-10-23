@@ -1656,6 +1656,10 @@ async fn stats_writer(relay: Arc<Relay>, mut shutdown: watch::Receiver<bool>) {
     loop {
         tokio::select! {
             _ = ticker.tick() => {
+                // A grantee flood that stopped just before the window roll
+                // would otherwise leave its suppressed count unlogged until
+                // the next NIP-86 call. Flush it on the stats interval.
+                relay.audit.flush_suppressed();
                 let path = relay.config.read().await.daemon.stats_file.clone();
                 relay
                     .stats

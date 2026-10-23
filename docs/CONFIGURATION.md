@@ -533,6 +533,8 @@ Remove the address from `access.blocked_ips` in the config too when it is listed
 
 All CLI access mutations (`nostrfy relay allow/deny`, `nostrfy blossom allow/deny`, `nostrfy access unblockip`) serialize their read-modify-write with an advisory `flock` on `<database.path>/access.lock` and commit their changes in one LMDB transaction. The lock file is a marker only (its contents are never read) and can be left in place. For the cross-process guarantee — a daemon ban and a CLI mutation cannot overwrite each other — the daemon's NIP-86 access persistence must take the same lock around its own write (the CLI holds it for the whole read-modify-write). NIP-86 appends each mutation to a small LMDB journal instead of rewriting the full access blob/list; the writer folds the journal into the base state and clears it after 1024 entries. The CLI replays the journal before its read-modify-write and folds/clears it in the same transaction.
 
+> **Downgrade warning**: v0.1.25 writes NIP-86 access mutations to the `aop:` journal and folds it into the base blob every 1024 entries. v0.1.24 and older do not read that journal, so downgrading can make recent bans, IP blocks and method grants fail open until the next upgrade. A v0.1.24 full save also does not clear the journal, so re-upgrading can replay entries written before the downgrade. Do not downgrade without folding the journal first; staying on v0.1.25 or newer is the safe path.
+
 ### Behavior notes
 
 - The kinds/IP lists are seeded at startup and then **managed at runtime** through NIP-86. Runtime changes are persisted in the database and survive restarts; once runtime state exists, it takes precedence over the config section.
