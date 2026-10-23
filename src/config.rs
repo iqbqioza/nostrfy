@@ -1308,7 +1308,7 @@ impl Config {
             if bytes.len() != 32 {
                 return Err(config_err("relay.private_key must be 32 bytes"));
             }
-            secp256k1::SecretKey::from_byte_array(bytes.try_into().expect("length checked"))
+            secp256k1::SecretKey::from_secret_bytes(bytes.try_into().expect("length checked"))
                 .map_err(|_| config_err("relay.private_key is not a valid secp256k1 secret key"))?;
         }
 

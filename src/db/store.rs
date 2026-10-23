@@ -4101,5 +4101,5 @@ pub(crate) fn delegated_by(event: &Event, delegator: &str) -> bool {
         .iter()
         .find(|t| t.len() == 4 && t[0] == "delegation")
         .is_some_and(|t| t[1].eq_ignore_ascii_case(delegator));
-    names_delegator && crate::nips::nip26::verify(event, &secp256k1::Secp256k1::new())
+    names_delegator && crate::nips::nip26::verify(event)
 }

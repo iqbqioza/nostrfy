@@ -1002,13 +1002,7 @@ impl super::Conn {
         let id = echo_event_id(&event.id).to_string();
         let accepted = {
             let cfg = self.relay.config.read().await;
-            nip42::verify(
-                &event,
-                &self.challenge,
-                self.relay.secp(),
-                unix_now(),
-                &cfg.relay_identity(),
-            )
+            nip42::verify(&event, &self.challenge, unix_now(), &cfg.relay_identity())
         };
         if accepted {
             // NIP-42: all authenticated pubkeys are treated as authenticated.

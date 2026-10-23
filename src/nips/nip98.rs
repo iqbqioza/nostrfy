@@ -5,7 +5,6 @@
 //! management API and the NIP-29 LiveKit token endpoint.
 
 use base64::Engine;
-use secp256k1::Secp256k1;
 
 use crate::event::Event;
 use crate::nips::nip01;
@@ -51,7 +50,6 @@ pub fn strip_nostr_scheme(value: &str) -> Option<&str> {
 pub fn verify(
     encoded: &str,
     expected_pubkey: Option<&str>,
-    secp: &Secp256k1<secp256k1::All>,
     require_payload: bool,
     expected_payload_hash: Option<&str>,
     method: &str,
@@ -98,7 +96,7 @@ pub fn verify(
             return None;
         }
     }
-    if nip01::verify(&event, secp).is_err() {
+    if nip01::verify(&event).is_err() {
         return None;
     }
     Some(Verified {
@@ -389,8 +387,7 @@ mod tests {
     use secp256k1::{Keypair, XOnlyPublicKey};
 
     fn signed_event(method: Option<&str>, url: &str, created: u64) -> Event {
-        let secp = Secp256k1::new();
-        let keypair = Keypair::from_seckey_byte_array(&secp, [5u8; 32]).unwrap();
+        let keypair = Keypair::from_secret_bytes([5u8; 32]).unwrap();
         let pubkey = XOnlyPublicKey::from_keypair(&keypair).0.to_string();
         let mut tags = vec![vec![URL_TAG.into(), url.into()]];
         if let Some(m) = method {
@@ -407,7 +404,7 @@ mod tests {
         };
         ev.id = compute_id(&ev);
         let id = ev.id_bytes().unwrap();
-        ev.sig = secp.sign_schnorr_no_aux_rand(&id, &keypair).to_string();
+        ev.sig = secp256k1::schnorr::sign_no_aux_rand(&id, &keypair).to_string();
         ev
     }
 
@@ -424,11 +421,10 @@ mod tests {
         // Client libraries emit the auth event in either Base64 form; the
         // Blossom endpoints accept both, so NIP-98 verification must too
         // (otherwise NIP-86 and LiveKit 401 legitimate clients).
-        let secp = Secp256k1::new();
         let now = unix_now();
         let ev = signed_event(Some("POST"), "https://relay.example.com/", now);
         let check = |encoded: &str| {
-            verify(encoded, None, &secp, false, None, "POST", |u| {
+            verify(encoded, None, false, None, "POST", |u| {
                 u == "https://relay.example.com/"
             })
             .is_some()
@@ -464,26 +460,25 @@ mod tests {
     #[test]
     fn method_tag_must_match() {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let secp = Secp256k1::new();
         let now = unix_now();
         rt.block_on(async {
             // Correct method and url: accepted.
             let ev = signed_event(Some("POST"), "https://relay.example.com/", now);
             assert!(
-                verify(&encode(&ev), None, &secp, false, None, "POST", |u| u
+                verify(&encode(&ev), None, false, None, "POST", |u| u
                     == "https://relay.example.com/",)
                 .is_some()
             );
             // Wrong method: rejected (NIP-98 requirement 4).
             assert!(
-                verify(&encode(&ev), None, &secp, false, None, "GET", |u| u
+                verify(&encode(&ev), None, false, None, "GET", |u| u
                     == "https://relay.example.com/",)
                 .is_none()
             );
             // Missing method tag: rejected.
             let bare = signed_event(None, "https://relay.example.com/", now);
             assert!(
-                verify(&encode(&bare), None, &secp, false, None, "POST", |u| u
+                verify(&encode(&bare), None, false, None, "POST", |u| u
                     == "https://relay.example.com/",)
                 .is_none()
             );
@@ -493,7 +488,6 @@ mod tests {
     #[test]
     fn payload_tag_must_match_body_hash() {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let secp = Secp256k1::new();
         let now = unix_now();
         let body = br#"{"method":"banpubkey","params":[]}"#;
         let want = payload_sha256_hex(body);
@@ -502,35 +496,28 @@ mod tests {
         // Re-sign after adding the tag (the id commits to the tags).
         ev.id = compute_id(&ev);
         let id = ev.id_bytes().unwrap();
-        let keypair = Keypair::from_seckey_byte_array(&secp, [5u8; 32]).unwrap();
-        ev.sig = secp.sign_schnorr_no_aux_rand(&id, &keypair).to_string();
+        let keypair = Keypair::from_secret_bytes([5u8; 32]).unwrap();
+        ev.sig = secp256k1::schnorr::sign_no_aux_rand(&id, &keypair).to_string();
         let encoded = encode(&ev);
         rt.block_on(async {
             // Matching hash: accepted.
             assert!(
-                verify(&encoded, None, &secp, true, Some(&want), "POST", |u| u
+                verify(&encoded, None, true, Some(&want), "POST", |u| u
                     == "https://relay.example.com/",)
                 .is_some()
             );
             // A captured authorization replayed against another body: rejected.
             let other = payload_sha256_hex(br#"{"method":"allowpubkey","params":[]}"#);
             assert!(
-                verify(&encoded, None, &secp, true, Some(&other), "POST", |u| u
+                verify(&encoded, None, true, Some(&other), "POST", |u| u
                     == "https://relay.example.com/",)
                 .is_none()
             );
             // Missing tag when required: rejected.
             let bare = signed_event(Some("POST"), "https://relay.example.com/", now);
             assert!(
-                verify(
-                    &encode(&bare),
-                    None,
-                    &secp,
-                    true,
-                    Some(&want),
-                    "POST",
-                    |u| u == "https://relay.example.com/",
-                )
+                verify(&encode(&bare), None, true, Some(&want), "POST", |u| u
+                    == "https://relay.example.com/",)
                 .is_none()
             );
         });

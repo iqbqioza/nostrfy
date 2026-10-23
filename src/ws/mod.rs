@@ -2115,7 +2115,7 @@ mod tests {
         let other = axum::Error::new(tungstenite::Error::ConnectionClosed);
         assert!(!is_capacity_error(&other));
     }
-    use secp256k1::{Keypair, Secp256k1, XOnlyPublicKey};
+    use secp256k1::{Keypair, XOnlyPublicKey};
     use serde_json::Value;
     use tokio::sync::RwLock;
 
@@ -2134,13 +2134,8 @@ mod tests {
         path
     }
 
-    fn signed_note(
-        secp: &Secp256k1<secp256k1::All>,
-        content: &str,
-        created: u64,
-        tags: Vec<Vec<String>>,
-    ) -> Event {
-        let keypair = Keypair::from_seckey_byte_array(secp, [1u8; 32]).unwrap();
+    fn signed_note(content: &str, created: u64, tags: Vec<Vec<String>>) -> Event {
+        let keypair = Keypair::from_secret_bytes([1u8; 32]).unwrap();
         let pubkey = XOnlyPublicKey::from_keypair(&keypair).0.to_string();
         let mut ev = Event {
             id: String::new(),
@@ -2151,19 +2146,13 @@ mod tests {
             content: content.into(),
             sig: String::new(),
         };
-        sign(&mut ev, &keypair, secp).unwrap();
+        sign(&mut ev, &keypair).unwrap();
         ev
     }
 
     /// Like [`signed_note`] but with a distinct author per seed byte.
-    fn signed_note_seeded(
-        secp: &Secp256k1<secp256k1::All>,
-        seed: u8,
-        content: &str,
-        created: u64,
-        tags: Vec<Vec<String>>,
-    ) -> Event {
-        let keypair = Keypair::from_seckey_byte_array(secp, [seed; 32]).unwrap();
+    fn signed_note_seeded(seed: u8, content: &str, created: u64, tags: Vec<Vec<String>>) -> Event {
+        let keypair = Keypair::from_secret_bytes([seed; 32]).unwrap();
         let pubkey = XOnlyPublicKey::from_keypair(&keypair).0.to_string();
         let mut ev = Event {
             id: String::new(),
@@ -2174,12 +2163,12 @@ mod tests {
             content: content.into(),
             sig: String::new(),
         };
-        sign(&mut ev, &keypair, secp).unwrap();
+        sign(&mut ev, &keypair).unwrap();
         ev
     }
 
-    fn signed_auth(secp: &Secp256k1<secp256k1::All>, challenge: &str, created: u64) -> Event {
-        let keypair = Keypair::from_seckey_byte_array(secp, [2u8; 32]).unwrap();
+    fn signed_auth(challenge: &str, created: u64) -> Event {
+        let keypair = Keypair::from_secret_bytes([2u8; 32]).unwrap();
         let pubkey = XOnlyPublicKey::from_keypair(&keypair).0.to_string();
         let mut ev = Event {
             id: String::new(),
@@ -2195,21 +2184,20 @@ mod tests {
         };
         ev.id = compute_id(&ev);
         let id = ev.id_bytes().unwrap();
-        ev.sig = secp.sign_schnorr_no_aux_rand(&id, &keypair).to_string();
+        ev.sig = secp256k1::schnorr::sign_no_aux_rand(&id, &keypair).to_string();
         ev
     }
 
     /// Like [`signed_note_seeded`] but with an arbitrary kind and a valid
     /// signature over that kind (kind mutations after signing break the sig).
     fn signed_kind_note_seeded(
-        secp: &Secp256k1<secp256k1::All>,
         seed: u8,
         kind: u64,
         content: &str,
         created: u64,
         tags: Vec<Vec<String>>,
     ) -> Event {
-        let keypair = Keypair::from_seckey_byte_array(secp, [seed; 32]).unwrap();
+        let keypair = Keypair::from_secret_bytes([seed; 32]).unwrap();
         let pubkey = XOnlyPublicKey::from_keypair(&keypair).0.to_string();
         let mut ev = Event {
             id: String::new(),
@@ -2220,19 +2208,14 @@ mod tests {
             content: content.into(),
             sig: String::new(),
         };
-        sign(&mut ev, &keypair, secp).unwrap();
+        sign(&mut ev, &keypair).unwrap();
         ev
     }
 
     /// AUTH event signed with a specific key seed (owner of the events it
     /// must reveal). Seed 2 matches [`signed_auth`]/[`signed_note_seeded`].
-    fn signed_auth_seeded(
-        secp: &Secp256k1<secp256k1::All>,
-        seed: u8,
-        challenge: &str,
-        created: u64,
-    ) -> Event {
-        let keypair = Keypair::from_seckey_byte_array(secp, [seed; 32]).unwrap();
+    fn signed_auth_seeded(seed: u8, challenge: &str, created: u64) -> Event {
+        let keypair = Keypair::from_secret_bytes([seed; 32]).unwrap();
         let pubkey = XOnlyPublicKey::from_keypair(&keypair).0.to_string();
         let mut ev = Event {
             id: String::new(),
@@ -2248,7 +2231,7 @@ mod tests {
         };
         ev.id = compute_id(&ev);
         let id = ev.id_bytes().unwrap();
-        ev.sig = secp.sign_schnorr_no_aux_rand(&id, &keypair).to_string();
+        ev.sig = secp256k1::schnorr::sign_no_aux_rand(&id, &keypair).to_string();
         ev
     }
 
@@ -2438,8 +2421,8 @@ mod tests {
         rt.block_on(async {
             let mut conn = build_conn().await;
             let now = unix_now();
-            let e1 = signed_note(conn.relay.secp(), "hello", now, vec![]);
-            let e2 = signed_note(conn.relay.secp(), "world", now - 1, vec![]);
+            let e1 = signed_note("hello", now, vec![]);
+            let e2 = signed_note("world", now - 1, vec![]);
             conn.relay.db.put(e1.clone(), now).await;
             conn.relay.db.put(e2.clone(), now).await;
             conn.handle_req(&[json!("sub"), json!({"kinds": [1]})])
@@ -2470,7 +2453,6 @@ mod tests {
             let now = unix_now();
             for i in 0..10 {
                 let ev = signed_note(
-                    conn.relay.secp(),
                     &format!("e{i}-{}", "z".repeat(1_000)),
                     now - i as u64,
                     vec![],
@@ -2516,7 +2498,6 @@ mod tests {
             let now = unix_now();
             for i in 0..10 {
                 let ev = signed_note(
-                    conn.relay.secp(),
                     &format!("e{i}-{}", "z".repeat(1_000)),
                     now - i as u64,
                     vec![],
@@ -2568,7 +2549,7 @@ mod tests {
         rt.block_on(async {
             let mut conn = build_conn().await;
             let now = unix_now();
-            let e1 = signed_note(conn.relay.secp(), "hello", now, vec![]);
+            let e1 = signed_note("hello", now, vec![]);
             conn.relay.db.put(e1.clone(), now).await;
             // Killing the DB reader makes the REQ query fail deterministically
             // (`query_req_result` returns None), exactly like a timed-out or
@@ -2600,7 +2581,7 @@ mod tests {
             );
             // A live event published afterwards must not reach the closed
             // sub (deliver_live reads `self.subs`).
-            let e2 = signed_note(conn.relay.secp(), "late", now + 1, vec![]);
+            let e2 = signed_note("late", now + 1, vec![]);
             conn.deliver_live(&e2, &serde_json::to_string(&e2).unwrap_or_default(), None);
             assert!(
                 !outgoing_json(&conn)
@@ -2617,8 +2598,8 @@ mod tests {
         rt.block_on(async {
             let mut conn = build_conn().await;
             let now = unix_now();
-            let normal = signed_note(conn.relay.secp(), "public", now, vec![]);
-            let protected = signed_note(conn.relay.secp(), "secret", now, vec![vec!["-".into()]]);
+            let normal = signed_note("public", now, vec![]);
+            let protected = signed_note("secret", now, vec![vec!["-".into()]]);
             conn.relay.db.put(normal.clone(), now).await;
             conn.relay.db.put(protected.clone(), now).await;
             conn.handle_req(&[json!("sub"), json!({"kinds": [1]})])
@@ -2655,12 +2636,12 @@ mod tests {
                 .clone()
                 .expect("the keyed test relay must have a pubkey");
             // The relay's own relay-signed event: `-`-tagged by spec.
-            let mut relay_signed = signed_note(conn.relay.secp(), "relay state", now, vec![]);
+            let mut relay_signed = signed_note("relay state", now, vec![]);
             relay_signed.pubkey = relay_pk;
             relay_signed.tags = vec![vec!["-".into()]];
             relay_signed.id = crate::nips::nip01::compute_id(&relay_signed);
             // A foreign protected event: still hidden.
-            let foreign = signed_note(conn.relay.secp(), "secret", now, vec![vec!["-".into()]]);
+            let foreign = signed_note("secret", now, vec![vec!["-".into()]]);
             conn.relay.db.put(relay_signed.clone(), now).await;
             conn.relay.db.put(foreign.clone(), now).await;
             conn.handle_req(&[json!("sub"), json!({"kinds": [1]})])
@@ -2689,27 +2670,22 @@ mod tests {
         rt.block_on(async {
             let mut conn = build_conn().await;
             let now = unix_now();
-            let secp = conn.relay.secp();
-            let alice_pk = XOnlyPublicKey::from_keypair(
-                &Keypair::from_seckey_byte_array(secp, [1u8; 32]).unwrap(),
-            )
-            .0
-            .to_string();
-            let bob_pk = XOnlyPublicKey::from_keypair(
-                &Keypair::from_seckey_byte_array(secp, [2u8; 32]).unwrap(),
-            )
-            .0
-            .to_string();
-            let alice_plain = signed_note_seeded(secp, 1, "alice plain", now, vec![]);
+            let alice_pk =
+                XOnlyPublicKey::from_keypair(&Keypair::from_secret_bytes([1u8; 32]).unwrap())
+                    .0
+                    .to_string();
+            let bob_pk =
+                XOnlyPublicKey::from_keypair(&Keypair::from_secret_bytes([2u8; 32]).unwrap())
+                    .0
+                    .to_string();
+            let alice_plain = signed_note_seeded(1, "alice plain", now, vec![]);
             let alice_to_bob = signed_note_seeded(
-                secp,
                 1,
                 "alice to bob",
                 now - 1,
                 vec![vec!["p".into(), bob_pk.clone()]],
             );
             let bob_to_alice = signed_note_seeded(
-                secp,
                 2,
                 "bob to alice",
                 now - 2,
@@ -2776,10 +2752,10 @@ mod tests {
         rt.block_on(async {
             let mut conn = build_conn().await;
             let now = unix_now();
-            let protected = signed_note(conn.relay.secp(), "secret", now, vec![vec!["-".into()]]);
+            let protected = signed_note("secret", now, vec![vec!["-".into()]]);
             conn.relay.db.put(protected.clone(), now).await;
             // AUTH with a valid event for this connection's challenge.
-            let auth = signed_auth(conn.relay.secp(), "test-challenge", now);
+            let auth = signed_auth("test-challenge", now);
             conn.handle_auth(&[serde_json::to_value(&auth).unwrap()])
                 .await;
             assert!(conn.is_authed());
@@ -2811,7 +2787,7 @@ mod tests {
                 w.relay.disabled_nips.push(42);
             }
             let now = unix_now();
-            let auth = signed_auth(conn.relay.secp(), "test-challenge", now);
+            let auth = signed_auth("test-challenge", now);
             conn.handle_auth(&[serde_json::to_value(&auth).unwrap()])
                 .await;
             let msgs = outgoing_json(&conn);
@@ -2862,14 +2838,11 @@ mod tests {
             let now = unix_now();
             conn.relay
                 .db
-                .put(signed_note(conn.relay.secp(), "public", now, vec![]), now)
+                .put(signed_note("public", now, vec![]), now)
                 .await;
             conn.relay
                 .db
-                .put(
-                    signed_note(conn.relay.secp(), "secret", now, vec![vec!["-".into()]]),
-                    now,
-                )
+                .put(signed_note("secret", now, vec![vec!["-".into()]]), now)
                 .await;
             conn.handle_count(&[json!("c"), json!({"kinds": [1]})])
                 .await;
@@ -2897,7 +2870,7 @@ mod tests {
             let mut conn = build_conn().await;
             let now = unix_now();
             for i in 0..3 {
-                let ev = signed_note(conn.relay.secp(), &format!("e{i}"), now - i, vec![]);
+                let ev = signed_note(&format!("e{i}"), now - i, vec![]);
                 conn.relay.db.put(ev, now).await;
             }
             conn.handle_count(&[json!("c"), json!({"kinds": [1], "limit": 0})])
@@ -2925,7 +2898,7 @@ mod tests {
         rt.block_on(async {
             let mut conn = build_conn().await;
             let now = unix_now();
-            let ev = signed_note(conn.relay.secp(), "present", now, vec![]);
+            let ev = signed_note("present", now, vec![]);
             conn.relay.db.put(ev, now).await;
             conn.relay.db.shutdown();
             conn.handle_count(&[json!("c"), json!({"kinds": [1]})])
@@ -2958,11 +2931,10 @@ mod tests {
             let relay = build_relay_with("").await;
             let mut conn = build_conn_on(relay.clone()).await;
             let now = unix_now();
-            let normal = signed_note(relay.secp(), "public", now, vec![]);
+            let normal = signed_note("public", now, vec![]);
             // NIP-78 app-specific event authored by the seed-2 key (the key
             // that `signed_auth` authenticates as).
             let mut app = signed_note_seeded(
-                relay.secp(),
                 2,
                 "app-specific",
                 now,
@@ -2989,7 +2961,7 @@ mod tests {
 
             // The owner sees its own app-specific event.
             let mut owner = build_conn_on(relay.clone()).await;
-            let auth = signed_auth(relay.secp(), "test-challenge", now);
+            let auth = signed_auth("test-challenge", now);
             owner
                 .handle_auth(&[serde_json::to_value(&auth).unwrap()])
                 .await;
@@ -3007,7 +2979,7 @@ mod tests {
 
             // A third party authenticated with a different key does not.
             let mut other = build_conn_on(relay).await;
-            let auth = signed_auth_seeded(other.relay.secp(), 3, "test-challenge", now);
+            let auth = signed_auth_seeded(3, "test-challenge", now);
             other
                 .handle_auth(&[serde_json::to_value(&auth).unwrap()])
                 .await;
@@ -3035,9 +3007,9 @@ mod tests {
             let now = unix_now();
             conn.relay
                 .db
-                .put(signed_note(conn.relay.secp(), "public", now, vec![]), now)
+                .put(signed_note("public", now, vec![]), now)
                 .await;
-            let mut app = signed_note(conn.relay.secp(), "app", now, vec![]);
+            let mut app = signed_note("app", now, vec![]);
             app.kind = 30078;
             app.id = crate::nips::nip01::compute_id(&app);
             conn.relay.db.put(app, now).await;
@@ -3065,7 +3037,7 @@ mod tests {
             let mut conn = build_conn_on(relay.clone()).await;
             let now = unix_now();
             for kind in [78, 30078] {
-                let mut ev = signed_note(relay.secp(), "app", now, vec![]);
+                let mut ev = signed_note("app", now, vec![]);
                 ev.kind = kind;
                 ev.id = crate::nips::nip01::compute_id(&ev);
                 conn.queue_event_value(ev.clone()).await;
@@ -3080,12 +3052,11 @@ mod tests {
 
             // The AUTH'd author can publish its own app-specific event.
             let mut owner = build_conn_on(relay).await;
-            let auth = signed_auth(owner.relay.secp(), "test-challenge", now);
+            let auth = signed_auth("test-challenge", now);
             owner
                 .handle_auth(&[serde_json::to_value(&auth).unwrap()])
                 .await;
             let app = signed_kind_note_seeded(
-                owner.relay.secp(),
                 2,
                 78,
                 "owner-app",
@@ -3106,24 +3077,17 @@ mod tests {
     }
 
     /// Hex pubkey of a secret key (hex), for tests that act as the admin.
-    fn pubkey_of_secret(secp: &Secp256k1<secp256k1::All>, secret_hex: &str) -> String {
+    fn pubkey_of_secret(secret_hex: &str) -> String {
         let secret = hex::decode(secret_hex).unwrap();
-        let keypair =
-            Keypair::from_seckey_byte_array(secp, secret.as_slice().try_into().unwrap()).unwrap();
+        let keypair = Keypair::from_secret_bytes(secret.as_slice().try_into().unwrap()).unwrap();
         XOnlyPublicKey::from_keypair(&keypair).0.to_string()
     }
 
     /// A kind:1 event signed with an explicit secret key (hex), so a test
     /// can publish "as the admin" (relay.pubkey holder).
-    fn signed_command_event(
-        secp: &Secp256k1<secp256k1::All>,
-        secret_hex: &str,
-        content: &str,
-        created: u64,
-    ) -> Event {
+    fn signed_command_event(secret_hex: &str, content: &str, created: u64) -> Event {
         let secret = hex::decode(secret_hex).unwrap();
-        let keypair =
-            Keypair::from_seckey_byte_array(secp, secret.as_slice().try_into().unwrap()).unwrap();
+        let keypair = Keypair::from_secret_bytes(secret.as_slice().try_into().unwrap()).unwrap();
         let pubkey = XOnlyPublicKey::from_keypair(&keypair).0.to_string();
         let mut ev = Event {
             id: String::new(),
@@ -3134,7 +3098,7 @@ mod tests {
             content: content.into(),
             sig: String::new(),
         };
-        sign(&mut ev, &keypair, secp).unwrap();
+        sign(&mut ev, &keypair).unwrap();
         ev
     }
 
@@ -3164,7 +3128,6 @@ mod tests {
             // Create the group, close it, issue the invite, and join
             // with the code.
             let create = signed_kind_note_seeded(
-                relay.secp(),
                 1,
                 crate::nips::nip29::CREATE_GROUP,
                 "",
@@ -3172,7 +3135,6 @@ mod tests {
                 vec![vec!["h".into(), "g1".into()]],
             );
             let close = signed_kind_note_seeded(
-                relay.secp(),
                 1,
                 9002,
                 "",
@@ -3180,7 +3142,6 @@ mod tests {
                 vec![vec!["h".into(), "g1".into()], vec!["closed".into()]],
             );
             let invite = signed_kind_note_seeded(
-                relay.secp(),
                 1,
                 9009,
                 "",
@@ -3191,7 +3152,6 @@ mod tests {
                 ],
             );
             let join = signed_kind_note_seeded(
-                relay.secp(),
                 2,
                 crate::nips::nip29::JOIN,
                 "",
@@ -3214,7 +3174,6 @@ mod tests {
 
             // Revoke the invite by deleting its 9009.
             let deletion = signed_kind_note_seeded(
-                relay.secp(),
                 1,
                 crate::nips::nip09::DELETION_KIND,
                 "",
@@ -3233,7 +3192,6 @@ mod tests {
             // A different pubkey joining with the revoked code is refused,
             // even though the in-memory invite set still holds the code.
             let join2 = signed_kind_note_seeded(
-                relay.secp(),
                 3,
                 crate::nips::nip29::JOIN,
                 "",
@@ -3269,7 +3227,7 @@ mod tests {
             let relay = build_relay_with("").await;
             // The author of `signed_note` (seed 1) is the allowed pubkey.
             let author = {
-                let keypair = Keypair::from_seckey_byte_array(relay.secp(), [1u8; 32]).unwrap();
+                let keypair = Keypair::from_secret_bytes([1u8; 32]).unwrap();
                 XOnlyPublicKey::from_keypair(&keypair).0.to_string()
             };
             {
@@ -3280,7 +3238,7 @@ mod tests {
 
             // The allowed author publishes.
             let mut author_conn = build_conn_on(relay.clone()).await;
-            let note = signed_note(relay.secp(), "issue-61 note", unix_now(), vec![]);
+            let note = signed_note("issue-61 note", unix_now(), vec![]);
             author_conn.queue_event_value(note.clone()).await;
             author_conn.flush_pending_events().await;
             assert!(
@@ -3319,7 +3277,7 @@ mod tests {
                 "a non-listed pubkey can read the allowed author's post"
             );
             // ...but cannot publish (the write restriction stays).
-            let outsider_note = signed_note_seeded(relay.secp(), 2, "outsider", unix_now(), vec![]);
+            let outsider_note = signed_note_seeded(2, "outsider", unix_now(), vec![]);
             outsider.queue_event_value(outsider_note.clone()).await;
             outsider.flush_pending_events().await;
             assert!(
@@ -3339,7 +3297,7 @@ mod tests {
         rt.block_on(async {
             let secret = "aa".repeat(32);
             let relay = build_relay_with(&secret).await;
-            relay.config.write().await.relay.pubkey = pubkey_of_secret(relay.secp(), &secret);
+            relay.config.write().await.relay.pubkey = pubkey_of_secret(&secret);
             relay.config.write().await.relay.enabled_command_events = true;
             let mut conn = build_conn_on(relay.clone()).await;
             let now = unix_now();
@@ -3347,12 +3305,7 @@ mod tests {
 
             // relay allow: the access list changes immediately and the
             // change is persisted for the CLI/restart.
-            let cmd = signed_command_event(
-                relay.secp(),
-                &secret,
-                &format!("/relay allow {target}"),
-                now,
-            );
+            let cmd = signed_command_event(&secret, &format!("/relay allow {target}"), now);
             conn.queue_event_value(cmd.clone()).await;
             conn.flush_pending_events().await;
             assert!(
@@ -3387,7 +3340,7 @@ mod tests {
                     .all(|t| t.first().map(String::as_str) != Some("-")),
                 "the reply must be public, not NIP-70 protected"
             );
-            let admin = pubkey_of_secret(relay.secp(), &secret);
+            let admin = pubkey_of_secret(&secret);
             assert!(
                 replies[0]
                     .tags
@@ -3411,12 +3364,8 @@ mod tests {
 
             // relay deny: moves the pubkey from allow to deny (the `nostr:`
             // URI prefix is accepted on the operand).
-            let cmd = signed_command_event(
-                relay.secp(),
-                &secret,
-                &format!("/relay deny nostr:{target}"),
-                now + 1,
-            );
+            let cmd =
+                signed_command_event(&secret, &format!("/relay deny nostr:{target}"), now + 1);
             conn.queue_event_value(cmd.clone()).await;
             conn.flush_pending_events().await;
             assert!(
@@ -3442,12 +3391,7 @@ mod tests {
 
             // blossom allow/deny edits the upload allowlist, persisted.
             let uploader = "cc".repeat(32);
-            let cmd = signed_command_event(
-                relay.secp(),
-                &secret,
-                &format!("/blossom allow {uploader}"),
-                now + 2,
-            );
+            let cmd = signed_command_event(&secret, &format!("/blossom allow {uploader}"), now + 2);
             conn.queue_event_value(cmd.clone()).await;
             conn.flush_pending_events().await;
             assert!(
@@ -3468,12 +3412,7 @@ mod tests {
                     .contains(&uploader),
                 "the blossom allowlist must be persisted"
             );
-            let cmd = signed_command_event(
-                relay.secp(),
-                &secret,
-                &format!("/blossom deny {uploader}"),
-                now + 3,
-            );
+            let cmd = signed_command_event(&secret, &format!("/blossom deny {uploader}"), now + 3);
             conn.queue_event_value(cmd.clone()).await;
             conn.flush_pending_events().await;
             assert!(
@@ -3482,7 +3421,7 @@ mod tests {
             );
 
             // An invalid operand gets an error reply, lists unchanged.
-            let cmd = signed_command_event(relay.secp(), &secret, "/relay allow zzz", now + 4);
+            let cmd = signed_command_event(&secret, "/relay allow zzz", now + 4);
             conn.queue_event_value(cmd.clone()).await;
             conn.flush_pending_events().await;
             let replies = stored_replies(&relay, &cmd.id, now + 4).await;
@@ -3513,18 +3452,13 @@ mod tests {
         rt.block_on(async {
             let secret = "aa".repeat(32);
             let relay = build_relay_with(&secret).await; // flag defaults to false
-            relay.config.write().await.relay.pubkey = pubkey_of_secret(relay.secp(), &secret);
+            relay.config.write().await.relay.pubkey = pubkey_of_secret(&secret);
             let mut conn = build_conn_on(relay.clone()).await;
             let now = unix_now();
             let target = "bb".repeat(32);
 
             // Flag off: the note is stored, but nothing is executed.
-            let cmd = signed_command_event(
-                relay.secp(),
-                &secret,
-                &format!("/relay allow {target}"),
-                now,
-            );
+            let cmd = signed_command_event(&secret, &format!("/relay allow {target}"), now);
             conn.queue_event_value(cmd.clone()).await;
             conn.flush_pending_events().await;
             assert!(
@@ -3535,12 +3469,7 @@ mod tests {
 
             // A different author cannot run commands even with the flag on.
             relay.config.write().await.relay.enabled_command_events = true;
-            let impostor = signed_note(
-                relay.secp(),
-                &format!("/relay allow {target}"),
-                now + 1,
-                vec![],
-            );
+            let impostor = signed_note(&format!("/relay allow {target}"), now + 1, vec![]);
             conn.queue_event_value(impostor.clone()).await;
             conn.flush_pending_events().await;
             assert!(
@@ -3566,7 +3495,7 @@ mod tests {
         rt.block_on(async {
             let secret = "aa".repeat(32);
             let relay = build_relay_with(&secret).await;
-            relay.config.write().await.relay.pubkey = pubkey_of_secret(relay.secp(), &secret);
+            relay.config.write().await.relay.pubkey = pubkey_of_secret(&secret);
             relay.config.write().await.relay.enabled_command_events = true;
             let mut operator = build_conn_on(relay.clone()).await;
             let victim = "cc".repeat(32);
@@ -3586,8 +3515,7 @@ mod tests {
             );
 
             // ...the operator runs /relay deny...
-            let cmd =
-                signed_command_event(relay.secp(), &secret, &format!("/relay deny {victim}"), now);
+            let cmd = signed_command_event(&secret, &format!("/relay deny {victim}"), now);
             operator.queue_event_value(cmd.clone()).await;
             operator.flush_pending_events().await;
             assert!(
@@ -3630,7 +3558,7 @@ mod tests {
                 "the COUNT is refused with restricted"
             );
             victim_conn.outgoing.clear();
-            let ev = signed_note(relay.secp(), "live", now + 1, vec![]);
+            let ev = signed_note("live", now + 1, vec![]);
             victim_conn.deliver_live(&ev, &serde_json::to_string(&ev).unwrap_or_default(), None);
             assert!(
                 !outgoing_json(&victim_conn).iter().any(|m| m[0] == "EVENT"),
@@ -3725,7 +3653,7 @@ mod tests {
         rt.block_on(async {
             let secret = "aa".repeat(32);
             let relay = build_relay_with(&secret).await;
-            relay.config.write().await.relay.pubkey = pubkey_of_secret(relay.secp(), &secret);
+            relay.config.write().await.relay.pubkey = pubkey_of_secret(&secret);
             relay.config.write().await.relay.enabled_command_events = true;
             {
                 let mut access = relay.access.write().await;
@@ -3736,12 +3664,7 @@ mod tests {
             let now = unix_now();
             let target = "bb".repeat(32);
 
-            let cmd = signed_command_event(
-                relay.secp(),
-                &secret,
-                &format!("/relay allow {target}"),
-                now,
-            );
+            let cmd = signed_command_event(&secret, &format!("/relay allow {target}"), now);
             conn.queue_event_value(cmd.clone()).await;
             conn.flush_pending_events().await;
             assert!(
@@ -3785,7 +3708,7 @@ mod tests {
                 .await;
             assert!(conn.live.is_some(), "REQ must subscribe to live events");
 
-            let ev = signed_kind_note_seeded(relay.secp(), 2, 30078, "live-app", now, vec![]);
+            let ev = signed_kind_note_seeded(2, 30078, "live-app", now, vec![]);
             assert!(relay.broadcast(ev.clone()).await.is_ok());
             let received = tokio::time::timeout(
                 std::time::Duration::from_secs(2),
@@ -3807,7 +3730,7 @@ mod tests {
 
             // The authenticated owner receives its own live app-specific event.
             let mut owner = build_conn_on(relay.clone()).await;
-            let auth = signed_auth(owner.relay.secp(), "test-challenge", now);
+            let auth = signed_auth("test-challenge", now);
             owner
                 .handle_auth(&[serde_json::to_value(&auth).unwrap()])
                 .await;
@@ -3854,7 +3777,6 @@ mod tests {
                 .insert("s".into(), (vec![Filter::default()], 0, "\"s\"".into()));
 
             let expired = signed_kind_note_seeded(
-                conn.relay.secp(),
                 1,
                 20001,
                 "expired",
@@ -3878,7 +3800,6 @@ mod tests {
             );
 
             let alive = signed_kind_note_seeded(
-                conn.relay.secp(),
                 1,
                 20001,
                 "alive",
@@ -3911,15 +3832,9 @@ mod tests {
             // /inbox with the default "any" policy: a p tag is required.
             let mut conn = build_conn().await;
             conn.path = "/inbox".into();
-            let secp = conn.relay.secp();
-            let addressed = signed_note_seeded(
-                secp,
-                1,
-                "addressed",
-                now,
-                vec![vec!["p".into(), some_pk.clone()]],
-            );
-            let plain = signed_note_seeded(secp, 1, "plain", now - 1, vec![]);
+            let addressed =
+                signed_note_seeded(1, "addressed", now, vec![vec!["p".into(), some_pk.clone()]]);
+            let plain = signed_note_seeded(1, "plain", now - 1, vec![]);
             conn.queue_event_value(addressed.clone()).await;
             conn.queue_event_value(plain.clone()).await;
             conn.flush_pending_events().await;
@@ -3952,16 +3867,9 @@ mod tests {
             conn.relay.config.write().await.server.inbox_write_policy = "relay".into();
             conn.refresh_config_cache().await;
             let relay_pk = conn.relay.relay_pubkey().unwrap();
-            let secp = conn.relay.secp();
-            let to_relay =
-                signed_note_seeded(secp, 1, "to relay", now, vec![vec!["p".into(), relay_pk]]);
-            let to_other = signed_note_seeded(
-                secp,
-                1,
-                "to other",
-                now - 1,
-                vec![vec!["p".into(), some_pk]],
-            );
+            let to_relay = signed_note_seeded(1, "to relay", now, vec![vec!["p".into(), relay_pk]]);
+            let to_other =
+                signed_note_seeded(1, "to other", now - 1, vec![vec!["p".into(), some_pk]]);
             conn.queue_event_value(to_relay.clone()).await;
             conn.queue_event_value(to_other.clone()).await;
             conn.flush_pending_events().await;
@@ -3980,9 +3888,8 @@ mod tests {
             // authenticated user's own.
             let mut conn = build_conn().await;
             conn.path = "/outbox".into();
-            let secp = conn.relay.secp().clone();
-            let mine = signed_note_seeded(&secp, 2, "mine", now, vec![]);
-            let others = signed_note_seeded(&secp, 1, "theirs", now - 1, vec![]);
+            let mine = signed_note_seeded(2, "mine", now, vec![]);
+            let others = signed_note_seeded(1, "theirs", now - 1, vec![]);
             conn.queue_event_value(mine.clone()).await;
             conn.flush_pending_events().await;
             let msgs = outgoing_json(&conn);
@@ -3993,7 +3900,7 @@ mod tests {
             );
             // Authenticate as the key-2 author and retry.
             conn.outgoing.clear();
-            let auth = signed_auth(&secp, "test-challenge", now);
+            let auth = signed_auth("test-challenge", now);
             conn.handle_auth(&[serde_json::to_value(&auth).unwrap()])
                 .await;
             assert!(conn.is_authed());
@@ -4021,9 +3928,8 @@ mod tests {
             conn.relay.config.write().await.server.outbox_write_policy = "relay".into();
             conn.refresh_config_cache().await;
             let relay_pk = conn.relay.relay_pubkey().unwrap();
-            let secp = conn.relay.secp().clone();
-            let relay_event = signed_note_seeded(&secp, 7, "relay event", now, vec![]);
-            let user_event = signed_note_seeded(&secp, 1, "user event", now - 1, vec![]);
+            let relay_event = signed_note_seeded(7, "relay event", now, vec![]);
+            let user_event = signed_note_seeded(1, "user event", now - 1, vec![]);
             assert_eq!(relay_event.pubkey, relay_pk, "seed 7 is the relay key");
             conn.queue_event_value(relay_event.clone()).await;
             conn.queue_event_value(user_event.clone()).await;
@@ -4056,19 +3962,16 @@ mod tests {
             let now = unix_now();
             // Default config: ephemeral forwarded (accepted, not stored).
             let mut conn = build_conn().await;
-            let ephemeral = signed_note_seeded(conn.relay.secp(), 1, "ephemeral", now, vec![]);
+            let ephemeral = signed_note_seeded(1, "ephemeral", now, vec![]);
             let mut ev = ephemeral.clone();
             ev.kind = 20000;
             ev.id = crate::nips::nip01::compute_id(&ev);
             let id = ev.id_bytes().unwrap();
-            ev.sig = conn
-                .relay
-                .secp()
-                .sign_schnorr_no_aux_rand(
-                    &id,
-                    &Keypair::from_seckey_byte_array(conn.relay.secp(), [1u8; 32]).unwrap(),
-                )
-                .to_string();
+            ev.sig = secp256k1::schnorr::sign_no_aux_rand(
+                &id,
+                &Keypair::from_secret_bytes([1u8; 32]).unwrap(),
+            )
+            .to_string();
             conn.queue_event_value(ev.clone()).await;
             conn.flush_pending_events().await;
             let msgs = outgoing_json(&conn);
@@ -4085,33 +3988,27 @@ mod tests {
             let mut conn = build_conn().await;
             conn.relay.config.write().await.relay.reject_ephemeral = true;
             let ephemeral2 = {
-                let mut e = signed_note_seeded(conn.relay.secp(), 1, "ephemeral2", now, vec![]);
+                let mut e = signed_note_seeded(1, "ephemeral2", now, vec![]);
                 e.kind = 25000;
                 e.id = crate::nips::nip01::compute_id(&e);
                 let id = e.id_bytes().unwrap();
-                e.sig = conn
-                    .relay
-                    .secp()
-                    .sign_schnorr_no_aux_rand(
-                        &id,
-                        &Keypair::from_seckey_byte_array(conn.relay.secp(), [1u8; 32]).unwrap(),
-                    )
-                    .to_string();
+                e.sig = secp256k1::schnorr::sign_no_aux_rand(
+                    &id,
+                    &Keypair::from_secret_bytes([1u8; 32]).unwrap(),
+                )
+                .to_string();
                 e
             };
             let exempt = {
-                let mut e = signed_note_seeded(conn.relay.secp(), 1, "exempt", now, vec![]);
+                let mut e = signed_note_seeded(1, "exempt", now, vec![]);
                 e.kind = 27235; // NIP-98 HTTP auth — must stay allowed
                 e.id = crate::nips::nip01::compute_id(&e);
                 let id = e.id_bytes().unwrap();
-                e.sig = conn
-                    .relay
-                    .secp()
-                    .sign_schnorr_no_aux_rand(
-                        &id,
-                        &Keypair::from_seckey_byte_array(conn.relay.secp(), [1u8; 32]).unwrap(),
-                    )
-                    .to_string();
+                e.sig = secp256k1::schnorr::sign_no_aux_rand(
+                    &id,
+                    &Keypair::from_secret_bytes([1u8; 32]).unwrap(),
+                )
+                .to_string();
                 e
             };
             conn.queue_event_value(ephemeral2.clone()).await;
@@ -4145,8 +4042,8 @@ mod tests {
         rt.block_on(async {
             let mut conn = build_conn().await;
             let now = unix_now();
-            let valid = signed_note(conn.relay.secp(), "ok", now, vec![]);
-            let mut invalid = signed_note(conn.relay.secp(), "bad", now, vec![]);
+            let valid = signed_note("ok", now, vec![]);
+            let mut invalid = signed_note("bad", now, vec![]);
             invalid.sig = "00".repeat(64);
             conn.queue_event_value(valid.clone()).await;
             conn.queue_event_value(invalid.clone()).await;
@@ -4171,21 +4068,17 @@ mod tests {
         rt.block_on(async {
             let mut conn = build_conn().await;
             let now = unix_now();
-            let target = signed_note(conn.relay.secp(), "teardown target", now, vec![]);
+            let target = signed_note("teardown target", now, vec![]);
             conn.queue_event_value(target.clone()).await;
             conn.flush_pending_events().await;
 
             // The deletion's side effect is the NIP-09 removal in after_put.
-            let mut deletion = signed_note(
-                conn.relay.secp(),
-                "",
-                now + 1,
-                vec![vec!["e".to_string(), target.id.clone()]],
-            );
+            let mut deletion =
+                signed_note("", now + 1, vec![vec!["e".to_string(), target.id.clone()]]);
             deletion.kind = 5;
             deletion.id = compute_id(&deletion);
-            let keypair = Keypair::from_seckey_byte_array(conn.relay.secp(), [1u8; 32]).unwrap();
-            sign(&mut deletion, &keypair, conn.relay.secp()).unwrap();
+            let keypair = Keypair::from_secret_bytes([1u8; 32]).unwrap();
+            sign(&mut deletion, &keypair).unwrap();
             conn.queue_event_value(deletion).await;
             conn.flush_pending_events_for_teardown(std::time::Duration::ZERO)
                 .await;
@@ -4390,7 +4283,7 @@ mod tests {
 
             // No live delivery for the closed id.
             let now = unix_now();
-            let ev = signed_note(conn.relay.secp(), "live", now, vec![]);
+            let ev = signed_note("live", now, vec![]);
             conn.deliver_live(&ev, &serde_json::to_string(&ev).unwrap_or_default(), None);
             assert!(
                 !outgoing_json(&conn)
@@ -4517,7 +4410,7 @@ mod tests {
             let mut conn = build_conn().await;
             conn.relay.config.write().await.relay.send_auth_challenge = false;
             let now = unix_now();
-            let mut event = signed_note(conn.relay.secp(), "secret", now, vec![]);
+            let mut event = signed_note("secret", now, vec![]);
             event.tags = vec![vec!["-".into()]];
             event.id = crate::nips::nip01::compute_id(&event);
             conn.relay.db.put(event, now).await;
@@ -4552,7 +4445,7 @@ mod tests {
         rt.block_on(async {
             let mut conn = build_conn().await;
             let now = unix_now();
-            let ev = signed_note(conn.relay.secp(), "stored", now, vec![]);
+            let ev = signed_note("stored", now, vec![]);
             conn.relay.db.put(ev, now).await;
             conn.handle_req(&[json!("sub"), json!({"kinds": [1]})])
                 .await;
@@ -4631,7 +4524,7 @@ mod tests {
                 .await
                 .blocked_pubkeys
                 .push((authed, String::new()));
-            let ev = signed_kind_note_seeded(relay.secp(), 3, 1, "live", now, vec![]);
+            let ev = signed_kind_note_seeded(3, 1, "live", now, vec![]);
             conn.deliver_live(&ev, &serde_json::to_string(&ev).unwrap_or_default(), None);
             let msgs = outgoing_json(&conn);
             assert!(
@@ -4660,7 +4553,7 @@ mod tests {
             // stream; the refresh propagates the flip to the connection.
             conn.relay.config.write().await.relay.require_auth = true;
             conn.refresh_config_cache().await;
-            let ev = signed_kind_note_seeded(relay.secp(), 4, 1, "live", now, vec![]);
+            let ev = signed_kind_note_seeded(4, 1, "live", now, vec![]);
             conn.deliver_live(&ev, &serde_json::to_string(&ev).unwrap_or_default(), None);
             let msgs = outgoing_json(&conn);
             assert!(
@@ -4873,7 +4766,7 @@ mod tests {
             // The sub id JSON is cached at REQ time.
             let cached = conn.subs.get("sub").map(|(_, _, j)| j.clone()).unwrap();
             assert_eq!(cached, "\"sub\"");
-            let mut ev = signed_note(conn.relay.secp(), "shared-json", now, vec![]);
+            let mut ev = signed_note("shared-json", now, vec![]);
             ev.kind = 30002;
             ev.id = crate::nips::nip01::compute_id(&ev);
             // Deliver with a pre-serialized JSON (as the bus provides):
@@ -4940,7 +4833,7 @@ mod tests {
                 .await;
             // Both connections are in the index (their kinds), but a
             // kind-30001 event's candidate set contains only conn_a.
-            let mut ev = signed_note(conn_a.relay.secp(), "candidate-check", now, vec![]);
+            let mut ev = signed_note("candidate-check", now, vec![]);
             ev.kind = 30001;
             ev.id = crate::nips::nip01::compute_id(&ev);
             assert!(conn_a.relay.broadcast(ev.clone()).await.is_ok());
@@ -5037,7 +4930,7 @@ mod tests {
             // EOSE-sent state.
             conn.pump_pending_reqs();
 
-            let mut ev = signed_note(conn.relay.secp(), "live-check", now, vec![]);
+            let mut ev = signed_note("live-check", now, vec![]);
             ev.kind = 30001;
             ev.id = crate::nips::nip01::compute_id(&ev);
             // The relay broadcast path: queue, bus task, receiver, deliver.
@@ -5372,7 +5265,7 @@ mod tests {
             let mut conn = build_conn().await;
             let now = unix_now();
             for i in 0..5 {
-                let e = signed_note(conn.relay.secp(), &format!("e{i}"), now - i, vec![]);
+                let e = signed_note(&format!("e{i}"), now - i, vec![]);
                 let out = conn.relay.db.put(e.clone(), now).await;
                 assert_eq!(out, crate::db::PutOutcome::Stored, "event {i} stored");
             }
@@ -5417,7 +5310,7 @@ mod tests {
                 let mut w = conn.relay.config.write().await;
                 w.limits.max_neg_items = 10;
             }
-            let mut protected = signed_note(conn.relay.secp(), "secret", now, vec![]);
+            let mut protected = signed_note("secret", now, vec![]);
             protected.tags = vec![vec!["-".into()]];
             protected.id = crate::nips::nip01::compute_id(&protected);
             conn.relay.db.put(protected, now).await;
@@ -5641,7 +5534,7 @@ mod tests {
         rt.block_on(async {
             let mut conn = build_conn().await;
             let now = unix_now();
-            let mut ev = signed_note(conn.relay.secp(), "loose", now, vec![]);
+            let mut ev = signed_note("loose", now, vec![]);
             ev.tags = vec![vec!["-".into(), "extra".into()]];
             ev.id = crate::nips::nip01::compute_id(&ev);
             conn.relay.db.put(ev.clone(), now).await;
@@ -5671,7 +5564,7 @@ mod tests {
             // small max_neg_items the query returns more records than the
             // cap and the NIP-77 "too big" NEG-ERR fires.
             for i in 0..5 {
-                let e = signed_note(conn.relay.secp(), &format!("needle {i}"), now - i, vec![]);
+                let e = signed_note(&format!("needle {i}"), now - i, vec![]);
                 conn.relay.db.put(e.clone(), now).await;
             }
             {
@@ -5696,11 +5589,10 @@ mod tests {
             // NIP-78 / NIP-59 / NIP-29 item filtering: a kind-78 event, a
             // gift wrap for another recipient and a private group event are
             // withheld from an anonymous peer (the response is empty).
-            let secp = conn.relay.secp();
-            let mut app = signed_note(secp, "app data", now, vec![]);
+            let mut app = signed_note("app data", now, vec![]);
             app.kind = crate::nips::nip78::APP_SPECIFIC_KIND;
             conn.relay.db.put(app, now).await;
-            let mut wrap = signed_note(secp, "secret dm", now, vec![]);
+            let mut wrap = signed_note("secret dm", now, vec![]);
             wrap.kind = crate::nips::nip62::GIFT_WRAP_KIND;
             wrap.tags = vec![vec!["p".into(), "cc".repeat(32)]];
             conn.relay.db.put(wrap, now).await;
@@ -5824,7 +5716,7 @@ mod tests {
             // "too big" if it ran.
             conn.relay.config.write().await.limits.max_neg_items = 1;
             for i in 0..3 {
-                let ev = signed_note(conn.relay.secp(), &format!("e{i}"), now - i, vec![]);
+                let ev = signed_note(&format!("e{i}"), now - i, vec![]);
                 conn.relay.db.put(ev, now).await;
             }
             conn.neg_opens_total = super::negentropy::MAX_NEG_OPENS;
@@ -5999,7 +5891,7 @@ mod tests {
             // Store more matching events than the cap, then replace "s":
             // the over-cap NEG-ERR closes the id (NIP-77).
             for i in 0..3 {
-                let ev = signed_note(conn.relay.secp(), &format!("e{i}"), now - i, vec![]);
+                let ev = signed_note(&format!("e{i}"), now - i, vec![]);
                 conn.relay.db.put(ev, now).await;
             }
             conn.handle_neg_open(&[json!("s"), json!({"kinds": [1]}), json!("61000000")])
@@ -6028,10 +5920,10 @@ mod tests {
         rt.block_on(async {
             let mut conn = build_conn().await;
             let now = unix_now();
-            let hidden = signed_note(conn.relay.secp(), "secret", now, vec![vec!["-".into()]]);
-            let v1 = signed_note(conn.relay.secp(), "v1", now - 1, vec![]);
-            let v2 = signed_note(conn.relay.secp(), "v2", now - 2, vec![]);
-            let v3 = signed_note(conn.relay.secp(), "v3", now - 3, vec![]);
+            let hidden = signed_note("secret", now, vec![vec!["-".into()]]);
+            let v1 = signed_note("v1", now - 1, vec![]);
+            let v2 = signed_note("v2", now - 2, vec![]);
+            let v3 = signed_note("v3", now - 3, vec![]);
             for e in [&hidden, &v1, &v2, &v3] {
                 conn.relay.db.put(e.clone(), now).await;
             }
@@ -6065,8 +5957,7 @@ mod tests {
             let now = unix_now();
             for second in [now, now - 1, now - 2] {
                 for i in 0..2 {
-                    let e =
-                        signed_note(conn.relay.secp(), &format!("{second}-{i}"), second, vec![]);
+                    let e = signed_note(&format!("{second}-{i}"), second, vec![]);
                     conn.relay.db.put(e, now).await;
                 }
             }
@@ -6128,11 +6019,11 @@ mod tests {
             let mut conn = build_conn().await;
             let now = unix_now();
             for i in 0..50 {
-                let e = signed_note(conn.relay.secp(), &format!("flood-{i}"), now, vec![]);
+                let e = signed_note(&format!("flood-{i}"), now, vec![]);
                 conn.relay.db.put(e, now).await;
             }
             for i in 0..2 {
-                let e = signed_note(conn.relay.secp(), &format!("old-{i}"), now - 1, vec![]);
+                let e = signed_note(&format!("old-{i}"), now - 1, vec![]);
                 conn.relay.db.put(e, now).await;
             }
             conn.handle_req(&[json!("sub"), json!({"kinds": [1], "limit": 1})])
@@ -6169,9 +6060,9 @@ mod tests {
         rt.block_on(async {
             let mut conn = build_conn().await;
             let now = unix_now();
-            let v1 = signed_note(conn.relay.secp(), "v1", now, vec![]);
-            let v2 = signed_note(conn.relay.secp(), "v2", now, vec![]);
-            let v3 = signed_note(conn.relay.secp(), "v3", now - 1, vec![]);
+            let v1 = signed_note("v1", now, vec![]);
+            let v2 = signed_note("v2", now, vec![]);
+            let v3 = signed_note("v3", now - 1, vec![]);
             for e in [&v1, &v2, &v3] {
                 conn.relay.db.put(e.clone(), now).await;
             }
@@ -6235,11 +6126,11 @@ mod tests {
             let mut conn = build_conn().await;
             let now = unix_now();
             for content in ["new-0", "new-1", "new-2"] {
-                let e = signed_note(conn.relay.secp(), content, now, vec![]);
+                let e = signed_note(content, now, vec![]);
                 conn.relay.db.put(e, now).await;
             }
             for content in ["old-0", "old-1", "old-2"] {
-                let e = signed_note(conn.relay.secp(), content, now - 1, vec![]);
+                let e = signed_note(content, now - 1, vec![]);
                 conn.relay.db.put(e, now).await;
             }
             conn.handle_req(&[
@@ -6295,11 +6186,11 @@ mod tests {
             let mut conn = build_conn().await;
             let now = unix_now();
             for i in 0..12 {
-                let e = signed_note(conn.relay.secp(), &format!("new-{i}"), now, vec![]);
+                let e = signed_note(&format!("new-{i}"), now, vec![]);
                 conn.relay.db.put(e, now).await;
             }
             for i in 0..8 {
-                let e = signed_note(conn.relay.secp(), &format!("old-{i}"), now - 1, vec![]);
+                let e = signed_note(&format!("old-{i}"), now - 1, vec![]);
                 conn.relay.db.put(e, now).await;
             }
             // The scan over-fetches up to `limit * 2` (12 + 8 = 20), so the
@@ -6552,11 +6443,11 @@ mod tests {
             // Far more matching events at `now` than the page can carry,
             // plus a few older events that make progress observable.
             for i in 0..60 {
-                let ev = signed_note(conn.relay.secp(), &format!("flood-{i}"), now, vec![]);
+                let ev = signed_note(&format!("flood-{i}"), now, vec![]);
                 conn.relay.db.put(ev, now).await;
             }
             for i in 1..=5u64 {
-                let ev = signed_note(conn.relay.secp(), &format!("older-{i}"), now - i, vec![]);
+                let ev = signed_note(&format!("older-{i}"), now - i, vec![]);
                 conn.relay.db.put(ev, now).await;
             }
             let mut until = now;
@@ -6610,7 +6501,7 @@ mod tests {
             let mut conn = build_conn().await;
             let now = unix_now();
             for i in 0..60 {
-                let ev = signed_note(conn.relay.secp(), &format!("flood-{i}"), now, vec![]);
+                let ev = signed_note(&format!("flood-{i}"), now, vec![]);
                 conn.relay.db.put(ev, now).await;
             }
             conn.handle_req(&[json!("sub"), json!({"kinds": [1], "limit": 5})])
@@ -6658,7 +6549,7 @@ mod tests {
         rt.block_on(async {
             let mut conn = build_conn().await;
             let now = unix_now();
-            let ev = signed_note(conn.relay.secp(), "stored", now, vec![]);
+            let ev = signed_note("stored", now, vec![]);
             conn.relay.db.put(ev, now).await;
             conn.handle_req(&[json!("sub"), json!({"kinds": [1]})])
                 .await;
@@ -6696,7 +6587,7 @@ mod tests {
             let mut conn = build_conn().await;
             let now = unix_now();
             for i in 0..5 {
-                let ev = signed_note(conn.relay.secp(), &format!("topic {i}"), now, vec![]);
+                let ev = signed_note(&format!("topic {i}"), now, vec![]);
                 conn.relay.db.put(ev, now).await;
             }
             conn.handle_req(&[json!("sub"), json!({"search": "topic", "limit": 3})])
@@ -6732,8 +6623,7 @@ mod tests {
             let mut conn = build_conn().await;
             let now = unix_now();
             for (i, protected) in [(0, true), (1, true), (2, false), (3, false)] {
-                let mut event =
-                    signed_note(conn.relay.secp(), &format!("topic {i}"), now - i, vec![]);
+                let mut event = signed_note(&format!("topic {i}"), now - i, vec![]);
                 if protected {
                     event.tags = vec![vec!["-".into()]];
                     event.id = crate::nips::nip01::compute_id(&event);
@@ -6777,12 +6667,7 @@ mod tests {
             let big = "x".repeat(10_000);
             let mut ids = Vec::new();
             for i in 0..5 {
-                let ev = signed_note(
-                    conn.relay.secp(),
-                    &format!("big-{i}-{big}"),
-                    now - i,
-                    vec![],
-                );
+                let ev = signed_note(&format!("big-{i}-{big}"), now - i, vec![]);
                 conn.relay.db.put(ev.clone(), now).await;
                 ids.push(ev.id.clone());
             }
@@ -6845,7 +6730,6 @@ mod tests {
             let mut events = std::collections::VecDeque::new();
             for i in 0..3 {
                 events.push_back(signed_note(
-                    conn.relay.secp(),
                     &format!("stored-{i}-{}", "x".repeat(2_000)),
                     now - i,
                     vec![],
@@ -6866,7 +6750,7 @@ mod tests {
             });
             // A live event for the same subscription arrives mid-response:
             // it must be held for the post-EOSE stream.
-            let live = signed_note(conn.relay.secp(), "live", now, vec![]);
+            let live = signed_note("live", now, vec![]);
             let live_json = serde_json::to_string(&live).unwrap();
             conn.deliver_live(&live, &live_json, None);
             assert!(
@@ -7156,12 +7040,7 @@ mod tests {
             let now = unix_now();
             let mut events = std::collections::VecDeque::new();
             for i in 0..3 {
-                let ev = signed_note(
-                    conn.relay.secp(),
-                    &format!("big-{i}-{}", "y".repeat(2_000)),
-                    now - i,
-                    vec![],
-                );
+                let ev = signed_note(&format!("big-{i}-{}", "y".repeat(2_000)), now - i, vec![]);
                 events.push_back(ev);
             }
             conn.subs
@@ -7202,12 +7081,7 @@ mod tests {
             );
             // An event larger than the whole budget closes immediately.
             let mut events = std::collections::VecDeque::new();
-            events.push_back(signed_note(
-                conn.relay.secp(),
-                &"z".repeat(10_000),
-                now,
-                vec![],
-            ));
+            events.push_back(signed_note(&"z".repeat(10_000), now, vec![]));
             conn.subs
                 .insert("s2".into(), (Vec::new(), 0, "\"s2\"".into()));
             conn.enqueue_pending_req(PendingReq {
@@ -7250,7 +7124,6 @@ mod tests {
             let mut big = std::collections::VecDeque::new();
             for i in 0..3 {
                 big.push_back(signed_note(
-                    conn.relay.secp(),
                     &format!("big-{i}-{}", "y".repeat(2_000)),
                     now - i,
                     vec![],
@@ -7272,7 +7145,7 @@ mod tests {
             conn.subs
                 .insert("b".into(), (Vec::new(), 0, "\"b\"".into()));
             let mut small = std::collections::VecDeque::new();
-            small.push_back(signed_note(conn.relay.secp(), "small", now, vec![]));
+            small.push_back(signed_note("small", now, vec![]));
             conn.enqueue_pending_req(PendingReq {
                 sub_id: "b".into(),
                 events: small,
@@ -7322,7 +7195,7 @@ mod tests {
         rt.block_on(async {
             let mut conn = build_conn().await;
             let now = unix_now();
-            let event = signed_note(conn.relay.secp(), "burst", now, vec![]);
+            let event = signed_note("burst", now, vec![]);
             conn.relay.db.put(event.clone(), now).await;
             let subs = MAX_PENDING_REQS + 3;
             for i in 0..subs {
@@ -7382,12 +7255,7 @@ mod tests {
                 conn.subs
                     .insert(format!("s{i}"), (Vec::new(), 0, String::new()));
                 let mut events = std::collections::VecDeque::new();
-                events.push_back(signed_note(
-                    conn.relay.secp(),
-                    &format!("e{i}"),
-                    now - i,
-                    vec![],
-                ));
+                events.push_back(signed_note(&format!("e{i}"), now - i, vec![]));
                 conn.enqueue_pending_req(PendingReq {
                     sub_id: format!("s{i}"),
                     events,
@@ -7927,7 +7795,7 @@ mod tests {
                 reserved: 0,
             });
 
-            let event = signed_note(conn.relay.secp(), "overflow", unix_now(), vec![]);
+            let event = signed_note("overflow", unix_now(), vec![]);
             let json = serde_json::to_string(&event).unwrap();
             conn.deliver_live(&event, &json, None);
             conn.close_for_live_overflow();
@@ -7981,7 +7849,7 @@ mod tests {
             conn.req_response_bytes = 100;
             // One live frame larger than the ceiling must overflow the
             // pending backlog instead of accumulating without bound.
-            let event = signed_note(conn.relay.secp(), &"x".repeat(300), unix_now(), vec![]);
+            let event = signed_note(&"x".repeat(300), unix_now(), vec![]);
             let json = serde_json::to_string(&event).unwrap();
             conn.deliver_live(&event, &json, None);
             assert!(
@@ -8010,7 +7878,7 @@ mod tests {
             conn.send(Message::Text("x".into()));
             assert_eq!(conn.outgoing.len(), 1);
 
-            let event = signed_note(conn.relay.secp(), "live", unix_now(), vec![]);
+            let event = signed_note("live", unix_now(), vec![]);
             let json = serde_json::to_string(&event).unwrap();
             conn.deliver_live(&event, &json, None);
 
@@ -8091,8 +7959,8 @@ mod tests {
             let relay = build_relay_with("").await;
             let mut conn = build_conn_on(relay.clone()).await;
             let now = unix_now();
-            let normal = signed_note(relay.secp(), "public", now, vec![]);
-            let protected = signed_note(relay.secp(), "secret", now, vec![vec!["-".into()]]);
+            let normal = signed_note("public", now, vec![]);
+            let protected = signed_note("secret", now, vec![vec!["-".into()]]);
             relay.db.put(normal.clone(), now).await;
             relay.db.put(protected.clone(), now).await;
 
@@ -8123,7 +7991,7 @@ mod tests {
             // The authenticated owner fetches the whole subscription: no
             // auth hint, no extra challenge.
             let mut owner = build_conn_on(relay).await;
-            let auth = signed_auth(owner.relay.secp(), "test-challenge", now);
+            let auth = signed_auth("test-challenge", now);
             owner
                 .handle_auth(&[serde_json::to_value(&auth).unwrap()])
                 .await;
@@ -8157,7 +8025,7 @@ mod tests {
             let mut conn = build_conn().await;
             let now = unix_now();
             let mut events = std::collections::VecDeque::new();
-            events.push_back(signed_note(conn.relay.secp(), "e0", now, vec![]));
+            events.push_back(signed_note("e0", now, vec![]));
             // A response whose subscription was CLOSEd in the meantime is
             // dropped by the pump without events or EOSE.
             conn.enqueue_pending_req(PendingReq {
@@ -8187,7 +8055,7 @@ mod tests {
             conn.subs
                 .insert("s".into(), (Vec::new(), 0, "\"s\"".into()));
             let mut first = std::collections::VecDeque::new();
-            first.push_back(signed_note(conn.relay.secp(), "old", now, vec![]));
+            first.push_back(signed_note("old", now, vec![]));
             conn.enqueue_pending_req(PendingReq {
                 sub_id: "s".into(),
                 events: first,
@@ -8202,7 +8070,7 @@ mod tests {
                 reserved: 0,
             });
             let mut second = std::collections::VecDeque::new();
-            second.push_back(signed_note(conn.relay.secp(), "new", now - 1, vec![]));
+            second.push_back(signed_note("new", now - 1, vec![]));
             conn.enqueue_pending_req(PendingReq {
                 sub_id: "s".into(),
                 events: second,
@@ -8251,12 +8119,7 @@ mod tests {
             let now = unix_now();
             let mut events = std::collections::VecDeque::new();
             for i in 0..OUT_QUEUE_LIMIT {
-                events.push_back(signed_note(
-                    conn.relay.secp(),
-                    &format!("tiny-{i}"),
-                    now - i as u64,
-                    vec![],
-                ));
+                events.push_back(signed_note(&format!("tiny-{i}"), now - i as u64, vec![]));
             }
             conn.enqueue_pending_req(PendingReq {
                 sub_id: "s".into(),
@@ -8302,7 +8165,7 @@ mod tests {
             let max_msg = 1 << 20;
             assert!(!conn.pending_batch_full(max_msg));
             // Bytes: one full-size frame trips the bound.
-            let ev = signed_note(conn.relay.secp(), "big", now, vec![]);
+            let ev = signed_note("big", now, vec![]);
             conn.queue_event_sized(ev, max_msg).await;
             assert_eq!(conn.pending_bytes, max_msg);
             assert!(conn.pending_batch_full(max_msg), "the byte bound must trip");
@@ -8312,19 +8175,14 @@ mod tests {
             assert!(!conn.pending_batch_full(max_msg));
             // Count: EVENT_BATCH small events trip the bound.
             for i in 0..EVENT_BATCH - 1 {
-                let ev = signed_note(
-                    conn.relay.secp(),
-                    &format!("small-{i}"),
-                    now - i as u64,
-                    vec![],
-                );
+                let ev = signed_note(&format!("small-{i}"), now - i as u64, vec![]);
                 conn.queue_event_sized(ev, 64).await;
             }
             assert!(
                 !conn.pending_batch_full(max_msg),
                 "below the count bound the batch stays open"
             );
-            let ev = signed_note(conn.relay.secp(), "last", now, vec![]);
+            let ev = signed_note("last", now, vec![]);
             conn.queue_event_sized(ev, 64).await;
             assert!(
                 conn.pending_batch_full(max_msg),
@@ -8368,7 +8226,7 @@ mod tests {
                     .sub_index
                     .read()
                     .unwrap_or_else(|p| p.into_inner())
-                    .candidates(&signed_note(conn.relay.secp(), "after", unix_now(), vec![]))
+                    .candidates(&signed_note("after", unix_now(), vec![]))
                     .is_empty(),
                 "a closed subscription must not receive live events"
             );
@@ -8388,7 +8246,7 @@ mod tests {
             let mut conn = build_conn().await;
             let now = unix_now();
             for content in ["a", "b"] {
-                let e = signed_note(conn.relay.secp(), content, now, vec![]);
+                let e = signed_note(content, now, vec![]);
                 assert_eq!(
                     conn.relay.db.put(e, now).await,
                     crate::db::PutOutcome::Stored
@@ -8429,7 +8287,7 @@ mod tests {
             let mut conn = build_conn().await;
             let now = unix_now();
             for content in ["a", "b"] {
-                let e = signed_note(conn.relay.secp(), content, now, vec![]);
+                let e = signed_note(content, now, vec![]);
                 assert_eq!(
                     conn.relay.db.put(e, now).await,
                     crate::db::PutOutcome::Stored
@@ -8755,16 +8613,12 @@ mod tests {
         rt.block_on(async {
             let mut conn = build_conn().await;
             let now = unix_now();
-            let mut auth = signed_auth(conn.relay.secp(), "test-challenge", now);
+            let mut auth = signed_auth("test-challenge", now);
             auth.pubkey = auth.pubkey.to_ascii_uppercase();
             auth.id = crate::nips::nip01::compute_id(&auth);
-            let keypair = Keypair::from_seckey_byte_array(conn.relay.secp(), [2u8; 32]).unwrap();
+            let keypair = Keypair::from_secret_bytes([2u8; 32]).unwrap();
             let id = auth.id_bytes().unwrap();
-            auth.sig = conn
-                .relay
-                .secp()
-                .sign_schnorr_no_aux_rand(&id, &keypair)
-                .to_string();
+            auth.sig = secp256k1::schnorr::sign_no_aux_rand(&id, &keypair).to_string();
             conn.handle_auth(&[serde_json::to_value(&auth).unwrap()])
                 .await;
             let msgs = outgoing_json(&conn);
@@ -8818,7 +8672,7 @@ mod tests {
             let mut conn = build_conn().await;
             let now = unix_now();
             conn.authed_pubkeys = (0..64u64).map(|i| format!("{i:064x}")).collect();
-            let auth = signed_auth(conn.relay.secp(), "test-challenge", now);
+            let auth = signed_auth("test-challenge", now);
             conn.handle_auth(&[serde_json::to_value(&auth).unwrap()])
                 .await;
             let msgs = outgoing_json(&conn);
@@ -8855,7 +8709,7 @@ mod tests {
         rt.block_on(async {
             let mut conn = build_conn().await;
             let now = unix_now();
-            let bare = signed_note(conn.relay.secp(), "delete nothing", now, vec![]);
+            let bare = signed_note("delete nothing", now, vec![]);
             let mut bare = bare;
             bare.kind = 5;
             bare.id = crate::nips::nip01::compute_id(&bare);
@@ -8896,7 +8750,7 @@ mod tests {
                     .sub_index
                     .read()
                     .unwrap_or_else(|p| p.into_inner())
-                    .candidates(&signed_note(conn.relay.secp(), "x", now, vec![]))
+                    .candidates(&signed_note("x", now, vec![]))
                     .is_empty(),
                 "no subscriptions after CLOSE"
             );
@@ -8907,7 +8761,7 @@ mod tests {
                 conn.live.is_some(),
                 "live receiver survives a CLOSE + REQ cycle"
             );
-            let ev = signed_note(conn.relay.secp(), "resubscribed", now, vec![]);
+            let ev = signed_note("resubscribed", now, vec![]);
             let ev_id = ev.id.clone();
             assert!(conn.relay.broadcast(ev).await.is_ok());
             let received = tokio::time::timeout(
@@ -9075,7 +8929,6 @@ mod tests {
                 let mut events = std::collections::VecDeque::new();
                 for i in 0..2 {
                     events.push_back(signed_note(
-                        conn.relay.secp(),
                         &format!("{sub}-{i}-{}", "z".repeat(1_000)),
                         now - i,
                         vec![],
@@ -9144,12 +8997,7 @@ mod tests {
             let mut live = std::collections::VecDeque::new();
             let mut live_bytes = 0usize;
             for i in 0..10 {
-                let ev = signed_note(
-                    conn.relay.secp(),
-                    &format!("live-{i}-{}", "z".repeat(1_000)),
-                    now - i,
-                    vec![],
-                );
+                let ev = signed_note(&format!("live-{i}-{}", "z".repeat(1_000)), now - i, vec![]);
                 let frame = format!("[\"EVENT\",\"s\",{}]", serde_json::to_string(&ev).unwrap());
                 live_bytes += frame.len();
                 live.push_back(frame);
@@ -9220,7 +9068,7 @@ mod tests {
             let mut conn = build_conn().await;
             let now = unix_now();
             for i in 0..2 {
-                let ev = signed_note(conn.relay.secp(), &format!("e{i}"), now - i as u64, vec![]);
+                let ev = signed_note(&format!("e{i}"), now - i as u64, vec![]);
                 conn.relay.db.put(ev, now).await;
             }
             let budget = Arc::clone(&conn.pending_budget);
@@ -9559,7 +9407,7 @@ mod tests {
             let now = unix_now();
             let mut ids = Vec::new();
             for i in 0..2 {
-                let ev = signed_note(conn.relay.secp(), &format!("e{i}"), now - i as u64, vec![]);
+                let ev = signed_note(&format!("e{i}"), now - i as u64, vec![]);
                 conn.relay.db.put(ev.clone(), now).await;
                 ids.push(ev.id);
             }
@@ -9669,7 +9517,7 @@ mod tests {
             let mut conn = build_conn().await;
             let now = unix_now();
             for seed in 1..=17u8 {
-                let auth = signed_auth_seeded(conn.relay.secp(), seed, "test-challenge", now);
+                let auth = signed_auth_seeded(seed, "test-challenge", now);
                 conn.handle_auth(&[serde_json::to_value(&auth).unwrap()])
                     .await;
                 let ok = outgoing_json(&conn)
@@ -9726,30 +9574,10 @@ mod tests {
         rt.block_on(async {
             let mut conn = build_conn().await;
             let now = unix_now();
-            let a1 = signed_note(
-                conn.relay.secp(),
-                "a1",
-                now,
-                vec![vec!["t".into(), "a".into()]],
-            );
-            let a2 = signed_note(
-                conn.relay.secp(),
-                "a2",
-                now - 1,
-                vec![vec!["t".into(), "a".into()]],
-            );
-            let b1 = signed_note(
-                conn.relay.secp(),
-                "b1",
-                now - 2,
-                vec![vec!["t".into(), "b".into()]],
-            );
-            let b2 = signed_note(
-                conn.relay.secp(),
-                "b2",
-                now - 3,
-                vec![vec!["t".into(), "b".into()]],
-            );
+            let a1 = signed_note("a1", now, vec![vec!["t".into(), "a".into()]]);
+            let a2 = signed_note("a2", now - 1, vec![vec!["t".into(), "a".into()]]);
+            let b1 = signed_note("b1", now - 2, vec![vec!["t".into(), "b".into()]]);
+            let b2 = signed_note("b2", now - 3, vec![vec!["t".into(), "b".into()]]);
             for e in [&a1, &a2, &b1, &b2] {
                 conn.relay.db.put(e.clone(), now).await;
             }
@@ -10094,7 +9922,7 @@ mod tests {
             assert!(saw_eose, "the subscription must be answered with EOSE");
 
             // Publish an EVENT and wait for its OK.
-            let event = signed_note(relay.secp(), "e2e hello", unix_now(), vec![]);
+            let event = signed_note("e2e hello", unix_now(), vec![]);
             futures_util::SinkExt::send(
                 &mut ws,
                 tokio_tungstenite::tungstenite::Message::Text(
@@ -10208,7 +10036,6 @@ mod tests {
                 .map(|i| {
                     (
                         signed_note(
-                            relay.secp(),
                             &format!("reset-{i}-{}", "x".repeat(3_500)),
                             now - i as u64,
                             vec![],
@@ -10302,7 +10129,7 @@ mod tests {
             let stored: Vec<(Event, u64)> = (0..3)
                 .map(|i| {
                     (
-                        signed_note(relay.secp(), &format!("half-{i}"), now - i as u64, vec![]),
+                        signed_note(&format!("half-{i}"), now - i as u64, vec![]),
                         now,
                     )
                 })
@@ -10356,7 +10183,7 @@ mod tests {
 
             // A fresh connection must still be served.
             let mut fresh = connect_ws(addr, None).await;
-            let event = signed_note(relay.secp(), "after half-close", now, vec![]);
+            let event = signed_note("after half-close", now, vec![]);
             futures_util::SinkExt::send(
                 &mut fresh,
                 tokio_tungstenite::tungstenite::Message::Text(
@@ -10408,7 +10235,6 @@ mod tests {
                 .map(|i| {
                     (
                         signed_note(
-                            relay.secp(),
                             &format!("slow-{i}-{}", "y".repeat(300)),
                             now - i as u64,
                             vec![],
@@ -10527,7 +10353,6 @@ mod tests {
                 .map(|i| {
                     (
                         signed_kind_note_seeded(
-                            relay.secp(),
                             9,
                             9999,
                             &format!("big-{i}-{}", "z".repeat(600)),
@@ -10599,7 +10424,7 @@ mod tests {
             // in the database) but not read before the drain.
             let mut publisher = connect_ws(addr, None).await;
             let live: Vec<Event> = (0..5)
-                .map(|i| signed_note_seeded(relay.secp(), 1, &format!("live-{i}"), now, vec![]))
+                .map(|i| signed_note_seeded(1, &format!("live-{i}"), now, vec![]))
                 .collect();
             let ids: Vec<String> = live.iter().map(|event| event.id.clone()).collect();
             for event in &live {
@@ -10688,7 +10513,7 @@ mod tests {
             })
             .await;
             let (addr, server) = spawn_ws_server(Arc::clone(&relay)).await;
-            let probe = signed_note(relay.secp(), "keepalive", unix_now(), vec![]);
+            let probe = signed_note("keepalive", unix_now(), vec![]);
 
             let mut alive = connect_ws(addr, None).await;
             let mut dead = connect_ws(addr, None).await;

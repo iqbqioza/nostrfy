@@ -105,7 +105,7 @@ impl super::Relay {
         let Some(keypair) = &self.key else {
             return Err(());
         };
-        if nip01::sign(event, keypair, self.secp.as_ref()).is_err() {
+        if nip01::sign(event, keypair).is_err() {
             return Err(());
         }
         let now = unix_now();

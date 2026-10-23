@@ -1511,12 +1511,10 @@ impl Cli {
         // Print the relay's pubkey too: it is safe to share and useful for
         // advertising the relay's `self` identity (NIP-11).
         let key_bytes: [u8; 32] = hex::decode(&key).unwrap().try_into().unwrap();
-        let pubkey = match secp256k1::SecretKey::from_byte_array(key_bytes) {
+        let pubkey = match secp256k1::SecretKey::from_secret_bytes(key_bytes) {
             Ok(secret) => {
-                let secp = secp256k1::Secp256k1::new();
-                let keypair =
-                    secp256k1::Keypair::from_seckey_byte_array(&secp, secret.secret_bytes())
-                        .map(|k| secp256k1::XOnlyPublicKey::from_keypair(&k).0.to_string());
+                let keypair = secp256k1::Keypair::from_secret_bytes(secret.to_secret_bytes())
+                    .map(|k| secp256k1::XOnlyPublicKey::from_keypair(&k).0.to_string());
                 keypair.unwrap_or_default()
             }
             Err(_) => String::new(),
@@ -1897,9 +1895,8 @@ fn print_line(text: &str) {
 /// the NIP-29 authorization checks. `None` when no (valid) key is set.
 fn relay_pubkey_of(cfg: &Config) -> Option<String> {
     let bytes: [u8; 32] = hex::decode(&cfg.relay.private_key).ok()?.try_into().ok()?;
-    let secret = secp256k1::SecretKey::from_byte_array(bytes).ok()?;
-    let secp = secp256k1::Secp256k1::new();
-    let keypair = secp256k1::Keypair::from_seckey_byte_array(&secp, secret.secret_bytes()).ok()?;
+    let secret = secp256k1::SecretKey::from_secret_bytes(bytes).ok()?;
+    let keypair = secp256k1::Keypair::from_secret_bytes(secret.to_secret_bytes()).ok()?;
     Some(
         secp256k1::XOnlyPublicKey::from_keypair(&keypair)
             .0
@@ -2269,8 +2266,8 @@ fn generate_secret_key_hex() -> Result<String> {
         let mut bytes = [0u8; 32];
         getrandom::fill(&mut bytes)
             .map_err(|e| anyhow!(format!("cannot read random bytes: {e}")))?;
-        if let Ok(secret) = secp256k1::SecretKey::from_byte_array(bytes) {
-            return Ok(hex::encode(secret.secret_bytes()));
+        if let Ok(secret) = secp256k1::SecretKey::from_secret_bytes(bytes) {
+            return Ok(hex::encode(secret.to_secret_bytes()));
         }
     }
     Err(anyhow!("failed to generate a valid secret key"))
@@ -3305,7 +3302,7 @@ name = \"nostrfy\"\n",
         assert_eq!(key.len(), 64);
         assert!(hex::decode(&key).is_ok());
         assert!(
-            secp256k1::SecretKey::from_byte_array(hex::decode(&key).unwrap().try_into().unwrap())
+            secp256k1::SecretKey::from_secret_bytes(hex::decode(&key).unwrap().try_into().unwrap())
                 .is_ok()
         );
     }

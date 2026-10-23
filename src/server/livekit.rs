@@ -76,15 +76,14 @@ pub(crate) async fn livekit_token(
     // raw (percent-encoded) request path is compared — decoding the
     // `{group}` parameter would never match an id that needs encoding.
     let expected_path = uri.path().to_string();
-    let authed =
-        crate::nips::nip98::verify(&encoded, None, relay.secp(), false, None, "GET", |url| {
-            crate::nips::nip98::matches_request_url(
-                url,
-                &cfg.relay_identity(),
-                &expected_path,
-                uri.query(),
-            )
-        });
+    let authed = crate::nips::nip98::verify(&encoded, None, false, None, "GET", |url| {
+        crate::nips::nip98::matches_request_url(
+            url,
+            &cfg.relay_identity(),
+            &expected_path,
+            uri.query(),
+        )
+    });
     match authed {
         Some(verified)
             if relay.nip98_replay.accept(
@@ -540,12 +539,8 @@ mod tests {
 
     /// A NIP-98 HTTP auth event for the token endpoint of `group`, tagged
     /// with the relay's own identity (authority + exact path).
-    async fn signed_token_auth(
-        relay: &Relay,
-        secp: &secp256k1::Secp256k1<secp256k1::All>,
-        group: &str,
-    ) -> Event {
-        let keypair = Keypair::from_seckey_byte_array(secp, [7u8; 32]).unwrap();
+    async fn signed_token_auth(relay: &Relay, group: &str) -> Event {
+        let keypair = Keypair::from_secret_bytes([7u8; 32]).unwrap();
         let pubkey = XOnlyPublicKey::from_keypair(&keypair).0.to_string();
         let authority = {
             let cfg = relay.config.read().await;
@@ -568,7 +563,7 @@ mod tests {
         };
         ev.id = compute_id(&ev);
         let id = ev.id_bytes().unwrap();
-        ev.sig = secp.sign_schnorr_no_aux_rand(&id, &keypair).to_string();
+        ev.sig = secp256k1::schnorr::sign_no_aux_rand(&id, &keypair).to_string();
         ev
     }
 
@@ -607,8 +602,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_group_refuses_token() {
         let relay = build_relay().await;
-        let secp = relay.secp().clone();
-        let ev = signed_token_auth(&relay, &secp, "ghost-group").await;
+        let ev = signed_token_auth(&relay, "ghost-group").await;
         let (status, _, _) = token_status(&relay, "ghost-group", &ev).await;
         assert_eq!(
             status,
@@ -634,8 +628,7 @@ mod tests {
             let mut cfg = relay.config.write().await;
             cfg.relay.livekit_url = String::new();
         }
-        let secp = relay.secp().clone();
-        let ev = signed_token_auth(&relay, &secp, "open").await;
+        let ev = signed_token_auth(&relay, "open").await;
         let (status, _, _) = token_status(&relay, "open", &ev).await;
         assert_eq!(
             status,
@@ -659,8 +652,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let secp = relay.secp().clone();
-        let ev = signed_token_auth(&relay, &secp, "open").await;
+        let ev = signed_token_auth(&relay, "open").await;
         let (status, _, body) = token_status(&relay, "open", &ev).await;
         assert_eq!(status, StatusCode::OK, "an open group admits anyone");
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -690,8 +682,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let secp = relay.secp().clone();
-        let ev = signed_token_auth(&relay, &secp, "webhook").await;
+        let ev = signed_token_auth(&relay, "webhook").await;
         let mut headers = HeaderMap::new();
         headers.insert(
             axum::http::header::AUTHORIZATION,
@@ -721,8 +712,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let secp = relay.secp().clone();
-        let ev = signed_token_auth(&relay, &secp, "nolive").await;
+        let ev = signed_token_auth(&relay, "nolive").await;
         let (status, _, _) = token_status(&relay, "nolive", &ev).await;
         assert_eq!(
             status,
@@ -739,8 +729,7 @@ mod tests {
         g.settings.private = true;
         g.settings.livekit = true;
         relay.groups.write().await.groups.insert("closed".into(), g);
-        let secp = relay.secp().clone();
-        let ev = signed_token_auth(&relay, &secp, "closed").await;
+        let ev = signed_token_auth(&relay, "closed").await;
         let (status, _, _) = token_status(&relay, "closed", &ev).await;
         assert_eq!(
             status,
@@ -753,15 +742,14 @@ mod tests {
     #[tokio::test]
     async fn known_closed_group_mints_for_member() {
         let relay = build_relay().await;
-        let keypair = Keypair::from_seckey_byte_array(relay.secp(), [7u8; 32]).unwrap();
+        let keypair = Keypair::from_secret_bytes([7u8; 32]).unwrap();
         let pubkey = XOnlyPublicKey::from_keypair(&keypair).0.to_string();
         let mut g = crate::nips::nip29::Group::default();
         g.settings.private = true;
         g.settings.livekit = true;
         g.members.insert(pubkey.clone(), Default::default());
         relay.groups.write().await.groups.insert("closed".into(), g);
-        let secp = relay.secp().clone();
-        let ev = signed_token_auth(&relay, &secp, "closed").await;
+        let ev = signed_token_auth(&relay, "closed").await;
         let (status, _, body) = token_status(&relay, "closed", &ev).await;
         assert_eq!(status, StatusCode::OK, "a member may mint a token");
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -775,7 +763,7 @@ mod tests {
         // would hand a removed member a room token. The WS and API read
         // paths fail closed the same way.
         let relay = build_relay().await;
-        let keypair = Keypair::from_seckey_byte_array(relay.secp(), [7u8; 32]).unwrap();
+        let keypair = Keypair::from_secret_bytes([7u8; 32]).unwrap();
         let pubkey = XOnlyPublicKey::from_keypair(&keypair).0.to_string();
         let mut g = crate::nips::nip29::Group::default();
         g.settings.private = true;
@@ -827,8 +815,7 @@ mod tests {
         // The gate reads the runtime access state (a SIGHUP reload copies
         // the config flag there); set it the way the reload would.
         relay.access.write().await.restrict_relay = true;
-        let secp = relay.secp().clone();
-        let ev = signed_token_auth(&relay, &secp, "open").await;
+        let ev = signed_token_auth(&relay, "open").await;
         let (status, _, _) = token_status(&relay, "open", &ev).await;
         assert_eq!(
             status,
@@ -852,8 +839,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let secp = relay.secp().clone();
-        let ev = signed_token_auth(&relay, &secp, "open").await;
+        let ev = signed_token_auth(&relay, "open").await;
         relay
             .access
             .write()
@@ -889,9 +875,8 @@ mod tests {
                 ..Default::default()
             },
         );
-        let secp = relay.secp().clone();
-        let keypair = Keypair::from_seckey_byte_array(&secp, [7u8; 32]).unwrap();
-        let mut ev = signed_token_auth(&relay, &secp, "open").await;
+        let keypair = Keypair::from_secret_bytes([7u8; 32]).unwrap();
+        let mut ev = signed_token_auth(&relay, "open").await;
         ev.pubkey = ev.pubkey.to_ascii_uppercase();
         assert!(
             ev.pubkey.chars().any(|c| c.is_ascii_uppercase()),
@@ -899,7 +884,7 @@ mod tests {
         );
         ev.id = compute_id(&ev);
         let id = ev.id_bytes().unwrap();
-        ev.sig = secp.sign_schnorr_no_aux_rand(&id, &keypair).to_string();
+        ev.sig = secp256k1::schnorr::sign_no_aux_rand(&id, &keypair).to_string();
         let (status, _, body) = token_status(&relay, "open", &ev).await;
         assert_eq!(status, StatusCode::OK);
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -924,11 +909,11 @@ mod tests {
         g.members
             .insert(ev.pubkey.to_ascii_lowercase(), Default::default());
         relay.groups.write().await.groups.insert("closed".into(), g);
-        let mut ev2 = signed_token_auth(&relay, &secp, "closed").await;
+        let mut ev2 = signed_token_auth(&relay, "closed").await;
         ev2.pubkey = ev2.pubkey.to_ascii_uppercase();
         ev2.id = compute_id(&ev2);
         let id2 = ev2.id_bytes().unwrap();
-        ev2.sig = secp.sign_schnorr_no_aux_rand(&id2, &keypair).to_string();
+        ev2.sig = secp256k1::schnorr::sign_no_aux_rand(&id2, &keypair).to_string();
         let (status, _, _) = token_status(&relay, "closed", &ev2).await;
         assert_eq!(
             status,

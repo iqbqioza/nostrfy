@@ -333,7 +333,6 @@ pub async fn api_auth_middleware(relay: Arc<Relay>, request: Request, next: Next
                 nip98::verify(
                     encoded,
                     None,
-                    relay.secp(),
                     false,
                     None,
                     request.method().as_str(),
@@ -2196,7 +2195,7 @@ async fn query_and_respond_dtag(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use secp256k1::{Keypair, Secp256k1, XOnlyPublicKey};
+    use secp256k1::{Keypair, XOnlyPublicKey};
     use tokio::sync::RwLock;
 
     #[test]
@@ -2246,23 +2245,12 @@ mod tests {
     use crate::relay::LiveBusConfig;
     use crate::stats::Stats;
 
-    fn signed_note(
-        secp: &Secp256k1<secp256k1::All>,
-        content: &str,
-        created: u64,
-        tags: Vec<Vec<String>>,
-    ) -> Event {
-        signed_kind_note(secp, 1, content, created, tags)
+    fn signed_note(content: &str, created: u64, tags: Vec<Vec<String>>) -> Event {
+        signed_kind_note(1, content, created, tags)
     }
 
-    fn signed_kind_note(
-        secp: &Secp256k1<secp256k1::All>,
-        kind: u64,
-        content: &str,
-        created: u64,
-        tags: Vec<Vec<String>>,
-    ) -> Event {
-        let keypair = Keypair::from_seckey_byte_array(secp, [1u8; 32]).unwrap();
+    fn signed_kind_note(kind: u64, content: &str, created: u64, tags: Vec<Vec<String>>) -> Event {
+        let keypair = Keypair::from_secret_bytes([1u8; 32]).unwrap();
         let pubkey = XOnlyPublicKey::from_keypair(&keypair).0.to_string();
         let mut ev = Event {
             id: String::new(),
@@ -2273,7 +2261,7 @@ mod tests {
             content: content.into(),
             sig: String::new(),
         };
-        sign(&mut ev, &keypair, secp).unwrap();
+        sign(&mut ev, &keypair).unwrap();
         ev
     }
 
@@ -2477,8 +2465,7 @@ mod tests {
 
     #[test]
     fn api_visible_filters_apply() {
-        let secp = Secp256k1::new();
-        let plain = signed_note(&secp, "plain", 1, vec![]);
+        let plain = signed_note("plain", 1, vec![]);
         let mut protected = plain.clone();
         protected.tags = vec![vec!["-".into()]];
         let mut wrap = plain.clone();
@@ -2629,10 +2616,10 @@ mod tests {
         rt.block_on(async {
             let relay = build_relay().await;
             let now = unix_now();
-            let v1 = signed_note(relay.secp(), "v1", now, vec![]);
-            let hidden = signed_note(relay.secp(), "hidden", now - 1, vec![vec!["-".into()]]);
-            let v2 = signed_note(relay.secp(), "v2", now - 2, vec![]);
-            let v3 = signed_note(relay.secp(), "v3", now - 3, vec![]);
+            let v1 = signed_note("v1", now, vec![]);
+            let hidden = signed_note("hidden", now - 1, vec![vec!["-".into()]]);
+            let v2 = signed_note("v2", now - 2, vec![]);
+            let v3 = signed_note("v3", now - 3, vec![]);
             for e in [&v1, &hidden, &v2, &v3] {
                 assert_eq!(
                     relay.db.put(e.clone(), now).await,
@@ -2714,7 +2701,7 @@ mod tests {
             let now = unix_now();
             let fat = "x".repeat(300);
             for i in 0..5 {
-                let e = signed_note(relay.secp(), &fat, now - i, vec![]);
+                let e = signed_note(&fat, now - i, vec![]);
                 assert_eq!(
                     relay.db.put(e, now).await,
                     crate::db::PutOutcome::Stored,
@@ -2785,7 +2772,7 @@ mod tests {
             let now = unix_now();
             let mut first_pk = String::new();
             for i in 0..3 {
-                let e = signed_note(relay.secp(), &format!("n{i}"), now, vec![]);
+                let e = signed_note(&format!("n{i}"), now, vec![]);
                 if i == 0 {
                     first_pk = e.pubkey.clone();
                 }
@@ -2832,7 +2819,7 @@ mod tests {
             let now = unix_now();
             let mut first_pk = String::new();
             for i in 0..3 {
-                let e = signed_note(relay.secp(), &format!("m{i}"), now - i as u64, vec![]);
+                let e = signed_note(&format!("m{i}"), now - i as u64, vec![]);
                 if i == 0 {
                     first_pk = e.pubkey.clone();
                 }
@@ -2866,7 +2853,7 @@ mod tests {
         rt.block_on(async {
             let relay = build_relay().await;
             let now = unix_now();
-            let e = signed_note(relay.secp(), "n", now, vec![]);
+            let e = signed_note("n", now, vec![]);
             let pk = e.pubkey.clone();
             assert_eq!(relay.db.put(e, now).await, crate::db::PutOutcome::Stored);
             // Hold every concurrency slot for the test duration.
@@ -2898,14 +2885,14 @@ mod tests {
         rt.block_on(async {
             let relay = build_relay().await;
             let now = unix_now();
-            let pub_ev = signed_note(relay.secp(), "public", now - 1000, vec![]);
+            let pub_ev = signed_note("public", now - 1000, vec![]);
             let pubkey = pub_ev.pubkey.clone();
             assert_eq!(
                 relay.db.put(pub_ev, now).await,
                 crate::db::PutOutcome::Stored
             );
             for i in 0..70 {
-                let mut w = signed_note(relay.secp(), &format!("w{i}"), now - i, vec![]);
+                let mut w = signed_note(&format!("w{i}"), now - i, vec![]);
                 // Gift wrap to someone else: invisible to anonymous API.
                 w.kind = 1059;
                 w.tags = vec![vec!["p".into(), "bb".repeat(32)]];
@@ -2957,7 +2944,7 @@ mod tests {
         rt.block_on(async {
             let relay = build_relay().await;
             let now = unix_now();
-            let mut hidden = signed_note(relay.secp(), "old secret", now - 400 * 86400, vec![]);
+            let mut hidden = signed_note("old secret", now - 400 * 86400, vec![]);
             hidden.tags = vec![vec!["-".into()]];
             hidden.id = crate::nips::nip01::compute_id(&hidden);
             let pubkey = hidden.pubkey.clone();
@@ -2965,7 +2952,7 @@ mod tests {
                 relay.db.put(hidden, now).await,
                 crate::db::PutOutcome::Stored
             );
-            let visible = signed_note(relay.secp(), "new public", now, vec![]);
+            let visible = signed_note("new public", now, vec![]);
             assert_eq!(
                 relay.db.put(visible, now).await,
                 crate::db::PutOutcome::Stored
@@ -2998,7 +2985,7 @@ mod tests {
             let (y, m) = month_of(base);
             let start = month_start(y, m);
             let pk = {
-                let ev = signed_note(relay.secp(), "before", start + 86400, vec![]);
+                let ev = signed_note("before", start + 86400, vec![]);
                 let pk = ev.pubkey.clone();
                 assert_eq!(
                     relay.db.put(ev, unix_now()).await,
@@ -3010,7 +2997,7 @@ mod tests {
                 ("inside", start + 10 * 86400),
                 ("after", start + 20 * 86400),
             ] {
-                let ev = signed_note(relay.secp(), content, at, vec![]);
+                let ev = signed_note(content, at, vec![]);
                 assert_eq!(
                     relay.db.put(ev, unix_now()).await,
                     crate::db::PutOutcome::Stored
@@ -3045,11 +3032,10 @@ mod tests {
         rt.block_on(async {
             let relay = build_relay().await;
             let now = unix_now();
-            let visible = signed_note(relay.secp(), "public", now, vec![]);
+            let visible = signed_note("public", now, vec![]);
             let pk = visible.pubkey.clone();
             for i in 0..1025u64 {
-                let mut hidden =
-                    signed_note(relay.secp(), &format!("h{i}"), now - 5000 + i, vec![]);
+                let mut hidden = signed_note(&format!("h{i}"), now - 5000 + i, vec![]);
                 hidden.tags = vec![vec!["-".into()]];
                 hidden.id = crate::nips::nip01::compute_id(&hidden);
                 assert_eq!(
@@ -3085,20 +3071,17 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let relay = build_relay().await;
-            let secp = relay.secp();
-            let pk = XOnlyPublicKey::from_keypair(
-                &Keypair::from_seckey_byte_array(secp, [1u8; 32]).unwrap(),
-            )
-            .0
-            .to_string();
+            let pk = XOnlyPublicKey::from_keypair(&Keypair::from_secret_bytes([1u8; 32]).unwrap())
+                .0
+                .to_string();
             let npub = crate::nips::nip19::bech32_encode("npub", &hex::decode(&pk).unwrap())
                 .expect("npub encoding");
             let aug1 = 1_785_542_400u64;
 
-            let profile = signed_kind_note(relay.secp(), 0, "{\"name\":\"t\"}", aug1 + 1, vec![]);
-            let note1 = signed_note(relay.secp(), "n1", aug1 + 2, vec![]);
-            let note2 = signed_note(relay.secp(), "n2", aug1 + 3, vec![]);
-            let reaction = signed_kind_note(relay.secp(), 7, "+", aug1 + 4, vec![]);
+            let profile = signed_kind_note(0, "{\"name\":\"t\"}", aug1 + 1, vec![]);
+            let note1 = signed_note("n1", aug1 + 2, vec![]);
+            let note2 = signed_note("n2", aug1 + 3, vec![]);
+            let reaction = signed_kind_note(7, "+", aug1 + 4, vec![]);
             for e in [&profile, &note1, &note2, &reaction] {
                 assert_eq!(
                     relay.db.put(e.clone(), aug1 + 4).await,
@@ -3242,23 +3225,14 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let relay = build_relay().await;
-            let secp = relay.secp();
-            let pk = XOnlyPublicKey::from_keypair(
-                &Keypair::from_seckey_byte_array(secp, [1u8; 32]).unwrap(),
-            )
-            .0
-            .to_string();
+            let pk = XOnlyPublicKey::from_keypair(&Keypair::from_secret_bytes([1u8; 32]).unwrap())
+                .0
+                .to_string();
             let now = unix_now().saturating_sub(10);
-            let profile = signed_kind_note(secp, 0, "{\"name\":\"t\"}", now, vec![]);
-            let empty = signed_kind_note(
-                secp,
-                30023,
-                "empty-d",
-                now + 1,
-                vec![vec!["d".into(), "".into()]],
-            );
+            let profile = signed_kind_note(0, "{\"name\":\"t\"}", now, vec![]);
+            let empty =
+                signed_kind_note(30023, "empty-d", now + 1, vec![vec!["d".into(), "".into()]]);
             let other = signed_kind_note(
-                secp,
                 30023,
                 "other-d",
                 now + 2,
@@ -3351,14 +3325,11 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let relay = build_relay().await;
-            let secp = relay.secp();
-            let pk = XOnlyPublicKey::from_keypair(
-                &Keypair::from_seckey_byte_array(secp, [1u8; 32]).unwrap(),
-            )
-            .0
-            .to_string();
+            let pk = XOnlyPublicKey::from_keypair(&Keypair::from_secret_bytes([1u8; 32]).unwrap())
+                .0
+                .to_string();
             let now = unix_now();
-            let note = signed_note(relay.secp(), "hex-author", now, vec![]);
+            let note = signed_note("hex-author", now, vec![]);
             assert_eq!(
                 relay.db.put(note.clone(), now).await,
                 crate::db::PutOutcome::Stored
@@ -3466,16 +3437,13 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let relay = build_relay().await;
-            let secp = relay.secp();
-            let pk = XOnlyPublicKey::from_keypair(
-                &Keypair::from_seckey_byte_array(secp, [1u8; 32]).unwrap(),
-            )
-            .0
-            .to_string();
+            let pk = XOnlyPublicKey::from_keypair(&Keypair::from_secret_bytes([1u8; 32]).unwrap())
+                .0
+                .to_string();
             let npub = crate::nips::nip19::bech32_encode("npub", &hex::decode(&pk).unwrap())
                 .expect("npub encoding");
             let feb1 = 1_706_745_600u64; // 2024-02-01
-            let leap_day = signed_note(relay.secp(), "leap day", feb1 + 28 * 86400 + 100, vec![]);
+            let leap_day = signed_note("leap day", feb1 + 28 * 86400 + 100, vec![]);
             assert_eq!(
                 relay.db.put(leap_day.clone(), feb1 + 28 * 86400).await,
                 crate::db::PutOutcome::Stored
@@ -3506,36 +3474,18 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let relay = build_relay().await;
-            let secp = relay.secp();
-            let pk = XOnlyPublicKey::from_keypair(
-                &Keypair::from_seckey_byte_array(secp, [1u8; 32]).unwrap(),
-            )
-            .0
-            .to_string();
+            let pk = XOnlyPublicKey::from_keypair(&Keypair::from_secret_bytes([1u8; 32]).unwrap())
+                .0
+                .to_string();
             let npub = crate::nips::nip19::bech32_encode("npub", &hex::decode(&pk).unwrap())
                 .expect("npub encoding");
             let aug1 = 1_785_542_400u64;
 
-            let follows = signed_kind_note(
-                relay.secp(),
-                3,
-                "",
-                aug1 + 1,
-                vec![vec!["p".into(), "cc".repeat(32)]],
-            );
-            let root = signed_note(relay.secp(), "root", aug1 + 2, vec![]);
-            let reply = signed_note(
-                relay.secp(),
-                "reply",
-                aug1 + 3,
-                vec![vec!["e".into(), root.id.clone()]],
-            );
-            let quote = signed_note(
-                relay.secp(),
-                "quote",
-                aug1 + 4,
-                vec![vec!["q".into(), root.id.clone()]],
-            );
+            let follows =
+                signed_kind_note(3, "", aug1 + 1, vec![vec!["p".into(), "cc".repeat(32)]]);
+            let root = signed_note("root", aug1 + 2, vec![]);
+            let reply = signed_note("reply", aug1 + 3, vec![vec!["e".into(), root.id.clone()]]);
+            let quote = signed_note("quote", aug1 + 4, vec![vec!["q".into(), root.id.clone()]]);
             for e in [&follows, &root, &reply, &quote] {
                 assert_eq!(
                     relay.db.put(e.clone(), aug1 + 4).await,
@@ -3656,24 +3606,20 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let relay = build_relay().await;
-            let secp = relay.secp();
-            let pk = XOnlyPublicKey::from_keypair(
-                &Keypair::from_seckey_byte_array(secp, [1u8; 32]).unwrap(),
-            )
-            .0
-            .to_string();
+            let pk = XOnlyPublicKey::from_keypair(&Keypair::from_secret_bytes([1u8; 32]).unwrap())
+                .0
+                .to_string();
             let npub = crate::nips::nip19::bech32_encode("npub", &hex::decode(&pk).unwrap())
                 .expect("npub encoding");
             let now = unix_now();
 
             let relays = signed_kind_note(
-                relay.secp(),
                 10002,
                 "",
                 now,
                 vec![vec!["r".into(), "wss://relay.example.com".into()]],
             );
-            let note = signed_note(relay.secp(), "top author", now - 1, vec![]);
+            let note = signed_note("top author", now - 1, vec![]);
             for e in [&relays, &note] {
                 assert_eq!(
                     relay.db.put(e.clone(), now).await,
@@ -3716,13 +3662,13 @@ mod tests {
         rt.block_on(async {
             let relay = build_relay().await;
             let now = unix_now();
-            let visible = signed_note(relay.secp(), "visible", now, vec![]);
+            let visible = signed_note("visible", now, vec![]);
             // NIP-70 protected event: hidden from anonymous readers.
-            let mut protected = signed_note(relay.secp(), "secret", now - 1, vec![]);
+            let mut protected = signed_note("secret", now - 1, vec![]);
             protected.tags = vec![vec![crate::nips::nip70::PROTECTED_TAG.into()]];
             protected.id = crate::nips::nip01::compute_id(&protected);
             // NIP-59 gift wrap: hidden from anonymous readers.
-            let mut wrap = signed_note(relay.secp(), "wrap", now - 2, vec![]);
+            let mut wrap = signed_note("wrap", now - 2, vec![]);
             wrap.kind = crate::nips::nip62::GIFT_WRAP_KIND;
             wrap.tags = vec![vec!["p".into(), "aa".repeat(32)]];
             wrap.id = crate::nips::nip01::compute_id(&wrap);
@@ -3781,20 +3727,17 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let relay = build_relay().await;
-            let secp = relay.secp();
-            let pk = XOnlyPublicKey::from_keypair(
-                &Keypair::from_seckey_byte_array(secp, [1u8; 32]).unwrap(),
-            )
-            .0
-            .to_string();
+            let pk = XOnlyPublicKey::from_keypair(&Keypair::from_secret_bytes([1u8; 32]).unwrap())
+                .0
+                .to_string();
             let npub = crate::nips::nip19::bech32_encode("npub", &hex::decode(&pk).unwrap())
                 .expect("npub encoding");
 
             // Two events in August 2026, one in September.
             let aug1 = 1_785_542_400u64;
-            let e1 = signed_note(relay.secp(), "aug-1", aug1 + 100, vec![]);
-            let e2 = signed_note(relay.secp(), "aug-2", aug1 + 200, vec![]);
-            let e3 = signed_note(relay.secp(), "sep-1", aug1 + 31 * 86400 + 100, vec![]);
+            let e1 = signed_note("aug-1", aug1 + 100, vec![]);
+            let e2 = signed_note("aug-2", aug1 + 200, vec![]);
+            let e3 = signed_note("sep-1", aug1 + 31 * 86400 + 100, vec![]);
             for e in [&e1, &e2, &e3] {
                 assert_eq!(
                     relay.db.put(e.clone(), aug1 + 31 * 86400).await,
@@ -3892,19 +3835,9 @@ mod tests {
         rt.block_on(async {
             let relay = build_relay().await;
             let now = unix_now();
-            let plain = signed_note(relay.secp(), "top-level", now, vec![]);
-            let mention = signed_note(
-                relay.secp(),
-                "mention",
-                now - 1,
-                vec![vec!["p".into(), "aa".repeat(32)]],
-            );
-            let reply = signed_note(
-                relay.secp(),
-                "reply",
-                now - 2,
-                vec![vec!["e".into(), "bb".repeat(32)]],
-            );
+            let plain = signed_note("top-level", now, vec![]);
+            let mention = signed_note("mention", now - 1, vec![vec!["p".into(), "aa".repeat(32)]]);
+            let reply = signed_note("reply", now - 2, vec![vec!["e".into(), "bb".repeat(32)]]);
             for e in [&plain, &mention, &reply] {
                 assert_eq!(
                     relay.db.put(e.clone(), now).await,
@@ -3968,20 +3901,11 @@ mod tests {
         rt.block_on(async {
             let relay = build_relay().await;
             let now = unix_now();
-            relay
-                .db
-                .put(signed_note(relay.secp(), "public", now, vec![]), now)
-                .await;
+            relay.db.put(signed_note("public", now, vec![]), now).await;
             relay
                 .db
                 .put(
-                    signed_kind_note(
-                        relay.secp(),
-                        30078,
-                        "app",
-                        now,
-                        vec![vec!["d".into(), "profile".into()]],
-                    ),
+                    signed_kind_note(30078, "app", now, vec![vec!["d".into(), "profile".into()]]),
                     now,
                 )
                 .await;

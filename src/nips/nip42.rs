@@ -5,7 +5,6 @@
 //! key, carrying `relay` and `challenge` tags.
 
 use getrandom::fill;
-use secp256k1::Secp256k1;
 use serde_json::{Value, json};
 
 use crate::event::Event;
@@ -39,14 +38,13 @@ pub fn generate_challenge() -> Option<String> {
 pub fn verify(
     event: &Event,
     challenge: &str,
-    secp: &Secp256k1<secp256k1::All>,
     now: u64,
     identity: &crate::nips::nip62::RelayIdentity<'_>,
 ) -> bool {
     if event.kind != AUTH_KIND {
         return false;
     }
-    if nip01::verify(event, secp).is_err() {
+    if nip01::verify(event).is_err() {
         return false;
     }
     if event.created_at.abs_diff(now) > 600 {
@@ -100,8 +98,7 @@ mod tests {
     /// Builds an auth event with a valid signature so the relay-tag check is
     /// exercised in isolation.
     fn signed_event(created: u64, tags: Vec<Vec<String>>) -> Event {
-        let secp = Secp256k1::new();
-        let keypair = Keypair::from_seckey_byte_array(&secp, [1u8; 32]).unwrap();
+        let keypair = Keypair::from_secret_bytes([1u8; 32]).unwrap();
         let pubkey = XOnlyPublicKey::from_keypair(&keypair).0.to_string();
         let mut ev = Event {
             id: String::new(),
@@ -114,7 +111,7 @@ mod tests {
         };
         ev.id = compute_id(&ev);
         let id = ev.id_bytes().unwrap();
-        ev.sig = secp.sign_schnorr_no_aux_rand(&id, &keypair).to_string();
+        ev.sig = secp256k1::schnorr::sign_no_aux_rand(&id, &keypair).to_string();
         ev
     }
 
@@ -129,7 +126,6 @@ mod tests {
 
     #[test]
     fn requires_matching_challenge() {
-        let secp = Secp256k1::new();
         let ev = event(
             1_700_000_000,
             vec![
@@ -140,7 +136,6 @@ mod tests {
         assert!(!verify(
             &ev,
             "right",
-            &secp,
             1_700_000_000,
             &RelayIdentity::new("localhost", 8080, "")
         ));
@@ -148,7 +143,6 @@ mod tests {
 
     #[test]
     fn wrong_kind_rejected() {
-        let secp = Secp256k1::new();
         let mut ev = event(
             1_700_000_000,
             vec![
@@ -160,7 +154,6 @@ mod tests {
         assert!(!verify(
             &ev,
             "abc",
-            &secp,
             1_700_000_000,
             &RelayIdentity::new("localhost", 8080, "")
         ));
@@ -168,7 +161,6 @@ mod tests {
 
     #[test]
     fn relay_tag_must_match_our_url() {
-        let secp = Secp256k1::new();
         let now = 1_700_000_000;
         // A wrong host is rejected even with a valid signature.
         let ev = signed_event(
@@ -181,7 +173,6 @@ mod tests {
         assert!(!verify(
             &ev,
             "abc",
-            &secp,
             now,
             &RelayIdentity::new("localhost", 8080, "")
         ));
@@ -196,7 +187,6 @@ mod tests {
         assert!(!verify(
             &ev,
             "abc",
-            &secp,
             now,
             &RelayIdentity::new("localhost", 8080, "")
         ));
@@ -211,7 +201,6 @@ mod tests {
         assert!(verify(
             &ev,
             "abc",
-            &secp,
             now,
             &RelayIdentity::new("localhost", 8080, "")
         ));
@@ -226,7 +215,6 @@ mod tests {
         assert!(verify(
             &ev,
             "abc",
-            &secp,
             now,
             &RelayIdentity::new("127.0.0.1", 8080, "wss://public.example.net")
         ));
@@ -235,7 +223,6 @@ mod tests {
     #[test]
     fn all_relays_does_not_authenticate() {
         // `ALL_RELAYS` is a NIP-62 vanish scope, not a relay URL.
-        let secp = Secp256k1::new();
         let now = 1_700_000_000;
         let ev = signed_event(
             now,
@@ -245,13 +232,7 @@ mod tests {
             ],
         );
         assert!(
-            !verify(
-                &ev,
-                "abc",
-                &secp,
-                now,
-                &RelayIdentity::new("localhost", 8080, "")
-            ),
+            !verify(&ev, "abc", now, &RelayIdentity::new("localhost", 8080, "")),
             "ALL_RELAYS must not satisfy the NIP-42 relay tag"
         );
     }

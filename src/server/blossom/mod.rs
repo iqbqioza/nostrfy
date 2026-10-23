@@ -337,7 +337,6 @@ fn event_tags<'a>(event: &'a crate::event::Event, name: &'a str) -> impl Iterato
 /// optional `server` tag naming our host and — when the endpoint implies a
 /// blob hash — a mandatory matching `x` tag. Returns the pubkey.
 fn validate_auth_event(
-    secp: &secp256k1::Secp256k1<secp256k1::All>,
     event: &crate::event::Event,
     host: &str,
     verb: &str,
@@ -359,7 +358,7 @@ fn validate_auth_event(
     {
         return None;
     }
-    if crate::nips::nip01::verify(event, secp).is_err() {
+    if crate::nips::nip01::verify(event).is_err() {
         return None;
     }
     // BUD-11: `created_at` must not lie in the future — with a small
@@ -444,7 +443,7 @@ async fn verify_auth_meta(
     event: &crate::event::Event,
     verb: &str,
 ) -> Option<String> {
-    let pubkey = validate_auth_event(relay.secp(), event, &state.host, verb, None, unix_now())?;
+    let pubkey = validate_auth_event(event, &state.host, verb, None, unix_now())?;
     // The relay's access policy applies to authenticated Blossom actions
     // too, not only to WebSocket publishing: NIP-86 `banpubkey` (always)
     // and the `restrict_relay` allowlist (when enabled) must gate
@@ -1829,7 +1828,7 @@ pub(crate) fn host_is_blossom(blossom_host: &str, host_header: Option<&str>) -> 
 mod tests {
     use super::*;
     use crate::event::Event;
-    use secp256k1::{Keypair, Secp256k1, XOnlyPublicKey};
+    use secp256k1::{Keypair, XOnlyPublicKey};
 
     #[tokio::test]
     async fn build_state_fails_closed_when_storage_init_fails() {
@@ -1931,20 +1930,18 @@ mod tests {
     }
 
     fn auth_event(
-        secp: &Secp256k1<secp256k1::All>,
         created: u64,
         verb: &str,
         expiration: Option<u64>,
         x: Option<&str>,
         server: Option<&str>,
     ) -> Event {
-        auth_event_with_key(secp, &[9u8; 32], created, verb, expiration, x, server)
+        auth_event_with_key(&[9u8; 32], created, verb, expiration, x, server)
     }
 
     /// Like [`auth_event`], but signed with `seckey`: tests that need two
     /// distinct uploader identities.
     fn auth_event_with_key(
-        secp: &Secp256k1<secp256k1::All>,
         seckey: &[u8; 32],
         created: u64,
         verb: &str,
@@ -1952,7 +1949,7 @@ mod tests {
         x: Option<&str>,
         server: Option<&str>,
     ) -> Event {
-        let keypair = Keypair::from_seckey_byte_array(secp, *seckey).unwrap();
+        let keypair = Keypair::from_secret_bytes(*seckey).unwrap();
         let pubkey = XOnlyPublicKey::from_keypair(&keypair).0.to_string();
         let mut tags: Vec<Vec<String>> = vec![vec!["t".into(), verb.into()]];
         if let Some(exp) = expiration {
@@ -1975,36 +1972,31 @@ mod tests {
         };
         ev.id = crate::nips::nip01::compute_id(&ev);
         let id = ev.id_bytes().unwrap();
-        ev.sig = secp.sign_schnorr_no_aux_rand(&id, &keypair).to_string();
+        ev.sig = secp256k1::schnorr::sign_no_aux_rand(&id, &keypair).to_string();
         ev
     }
 
     /// A valid Blossom `Authorization: Nostr <token>` header for `verb`,
     /// returning the header map and the author's hex pubkey.
-    fn auth_headers(secp: &Secp256k1<secp256k1::All>, verb: &str) -> (HeaderMap, String) {
-        auth_headers_scoped(secp, verb, None)
+    fn auth_headers(verb: &str) -> (HeaderMap, String) {
+        auth_headers_scoped(verb, None)
     }
 
     /// Like [`auth_headers`], but the token carries the body-scoped `x` tag
     /// required by upload/delete endpoints (BUD-11).
-    fn auth_headers_scoped(
-        secp: &Secp256k1<secp256k1::All>,
-        verb: &str,
-        sha: Option<&str>,
-    ) -> (HeaderMap, String) {
-        auth_headers_scoped_with_key(secp, &[9u8; 32], verb, sha)
+    fn auth_headers_scoped(verb: &str, sha: Option<&str>) -> (HeaderMap, String) {
+        auth_headers_scoped_with_key(&[9u8; 32], verb, sha)
     }
 
     /// Like [`auth_headers_scoped`], but signed with `seckey` (a second
     /// uploader identity for the per-pubkey upload-cap tests).
     fn auth_headers_scoped_with_key(
-        secp: &Secp256k1<secp256k1::All>,
         seckey: &[u8; 32],
         verb: &str,
         sha: Option<&str>,
     ) -> (HeaderMap, String) {
         let now = unix_now();
-        let ev = auth_event_with_key(secp, seckey, now, verb, Some(now + 600), sha, None);
+        let ev = auth_event_with_key(seckey, now, verb, Some(now + 600), sha, None);
         let token = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(serde_json::to_vec(&ev).unwrap());
         let mut headers = HeaderMap::new();
@@ -2276,14 +2268,7 @@ mod tests {
         let relay = build_blossom_relay(u64::MAX).await;
         let sha = sha256_hex(b"x");
         let now = unix_now();
-        let ev = auth_event(
-            relay.secp(),
-            now,
-            "upload",
-            Some(now + 300),
-            Some(&sha),
-            None,
-        );
+        let ev = auth_event(now, "upload", Some(now + 300), Some(&sha), None);
         let token = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(serde_json::to_vec(&ev).unwrap());
         let mut headers = HeaderMap::new();
@@ -2312,14 +2297,7 @@ mod tests {
         let data = b"hello blossom";
         let sha = sha256_hex(data);
         let now = unix_now();
-        let ev = auth_event(
-            relay.secp(),
-            now,
-            "upload",
-            Some(now + 300),
-            Some(&sha),
-            None,
-        );
+        let ev = auth_event(now, "upload", Some(now + 300), Some(&sha), None);
         let token = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(serde_json::to_vec(&ev).unwrap());
         let mut headers = HeaderMap::new();
@@ -2372,7 +2350,7 @@ mod tests {
         let data = b"tiny blossom upload";
         let sha = sha256_hex(data);
         // The BUD-06 preflight with the same declared size says 200...
-        let (mut headers, _) = auth_headers_scoped(relay.secp(), "upload", Some(&sha));
+        let (mut headers, _) = auth_headers_scoped("upload", Some(&sha));
         headers.insert("x-sha-256", sha.parse().unwrap());
         headers.insert("x-content-length", data.len().to_string().parse().unwrap());
         let resp = head_preflight(relay.clone(), headers, "upload").await;
@@ -2382,7 +2360,7 @@ mod tests {
             "a declared size within the headroom must preflight as OK"
         );
         // ...and the PUT reserves the declared size, not the ceiling.
-        let (mut headers, _) = auth_headers_scoped(relay.secp(), "upload", Some(&sha));
+        let (mut headers, _) = auth_headers_scoped("upload", Some(&sha));
         headers.insert(
             axum::http::header::CONTENT_LENGTH,
             data.len().to_string().parse().unwrap(),
@@ -2409,12 +2387,12 @@ mod tests {
             .await
             .expect("blossom state")
             .max_upload_bytes as u64;
-        let (mut headers, _) = auth_headers_scoped(relay.secp(), "upload", Some(&sha));
+        let (mut headers, _) = auth_headers_scoped("upload", Some(&sha));
         headers.insert("x-sha-256", sha.parse().unwrap());
         headers.insert("x-content-length", ceiling.to_string().parse().unwrap());
         let resp = head_preflight(relay.clone(), headers, "upload").await;
         assert_eq!(resp.status(), StatusCode::INSUFFICIENT_STORAGE);
-        let (mut headers, _) = auth_headers_scoped(relay.secp(), "upload", Some(&sha));
+        let (mut headers, _) = auth_headers_scoped("upload", Some(&sha));
         headers.insert(
             axum::http::header::CONTENT_LENGTH,
             ceiling.to_string().parse().unwrap(),
@@ -2435,7 +2413,7 @@ mod tests {
         // near the floor it is refused rather than allowed to overshoot the
         // reservation (BUD-06 has no no-length preflight; its declared size
         // can never promise more than this case).
-        let (headers, _) = auth_headers_scoped(relay.secp(), "upload", Some(&sha));
+        let (headers, _) = auth_headers_scoped("upload", Some(&sha));
         let resp = upload(
             State(relay.clone()),
             headers,
@@ -2464,7 +2442,7 @@ mod tests {
                     .await
             );
         }
-        let (mut headers, _) = auth_headers_scoped(relay.secp(), "upload", Some(&sha));
+        let (mut headers, _) = auth_headers_scoped("upload", Some(&sha));
         headers.insert(
             axum::http::header::CONTENT_TYPE,
             "text/plain".parse().unwrap(),
@@ -2490,7 +2468,7 @@ mod tests {
         // token's author must refuse it (like a WS publish), and the
         // operator keys stay exempt.
         let relay = build_blossom_relay(0).await;
-        let (headers, pk) = auth_headers(relay.secp(), "list");
+        let (headers, pk) = auth_headers("list");
         let empty = || axum::extract::Query(std::collections::HashMap::new());
         {
             let mut access = relay.access.write().await;
@@ -2582,7 +2560,7 @@ mod tests {
         let resp = head_blob(State(relay.clone()), HeaderMap::new(), AxPath(sha.clone())).await;
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
 
-        let (headers, _) = auth_headers_scoped(relay.secp(), "delete", Some(&sha));
+        let (headers, _) = auth_headers_scoped("delete", Some(&sha));
         let resp = delete_blob(State(relay.clone()), headers, AxPath(sha.clone())).await;
         assert_eq!(
             resp.status(),
@@ -2590,7 +2568,7 @@ mod tests {
             "a failed ownership check must not answer 403"
         );
 
-        let (headers, pk) = auth_headers(relay.secp(), "list");
+        let (headers, pk) = auth_headers("list");
         let resp = list(
             State(relay.clone()),
             headers,
@@ -2638,14 +2616,7 @@ mod tests {
         let data = b"hello";
         let sha = sha256_hex(data);
         let now = unix_now();
-        let ev = auth_event(
-            relay.secp(),
-            now,
-            "upload",
-            Some(now + 300),
-            Some(&sha),
-            None,
-        );
+        let ev = auth_event(now, "upload", Some(now + 300), Some(&sha), None);
         let token = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(serde_json::to_vec(&ev).unwrap());
         let mut headers = HeaderMap::new();
@@ -2695,7 +2666,7 @@ mod tests {
         let sha = sha256_hex(data);
 
         // Success: a declared size that matches the body.
-        let (mut headers, _) = auth_headers_scoped(relay.secp(), "upload", Some(&sha));
+        let (mut headers, _) = auth_headers_scoped("upload", Some(&sha));
         headers.insert(
             axum::http::header::CONTENT_LENGTH,
             data.len().to_string().parse().unwrap(),
@@ -2718,7 +2689,7 @@ mod tests {
         );
 
         // Size error: the body overruns its declared Content-Length (413).
-        let (mut headers, _) = auth_headers_scoped(relay.secp(), "upload", Some(&sha));
+        let (mut headers, _) = auth_headers_scoped("upload", Some(&sha));
         headers.insert(axum::http::header::CONTENT_LENGTH, "1".parse().unwrap());
         let resp = upload(
             State(relay.clone()),
@@ -2734,7 +2705,7 @@ mod tests {
         );
 
         // Timeout: one chunk, then a stalled stream (408).
-        let (headers, _) = auth_headers_scoped(relay.secp(), "upload", Some(&sha));
+        let (headers, _) = auth_headers_scoped("upload", Some(&sha));
         let stream = futures_util::stream::once(async {
             Ok::<_, std::io::Error>(bytes::Bytes::from_static(data))
         })
@@ -2762,7 +2733,7 @@ mod tests {
         let state = state_of(&relay).await.expect("blossom state");
         let data = b"another uploader's blob";
         let sha = sha256_hex(data);
-        let (headers_a, pk_a) = auth_headers_scoped(relay.secp(), "upload", Some(&sha));
+        let (headers_a, pk_a) = auth_headers_scoped("upload", Some(&sha));
         let pending = || {
             Body::from_stream(futures_util::stream::pending::<
                 Result<bytes::Bytes, std::io::Error>,
@@ -2810,8 +2781,7 @@ mod tests {
             "a refused upload must not take a global permit"
         );
         // Another identity still uploads: A cannot hold the whole budget.
-        let (headers_b, _) =
-            auth_headers_scoped_with_key(relay.secp(), &[7u8; 32], "upload", Some(&sha));
+        let (headers_b, _) = auth_headers_scoped_with_key(&[7u8; 32], "upload", Some(&sha));
         let resp = upload(
             State(relay.clone()),
             headers_b,
@@ -2859,7 +2829,7 @@ mod tests {
         let state = state_of(&relay).await.expect("blossom state");
         let data = b"cancelled blob";
         let sha = sha256_hex(data);
-        let (headers, pk) = auth_headers_scoped(relay.secp(), "upload", Some(&sha));
+        let (headers, pk) = auth_headers_scoped("upload", Some(&sha));
         let handle = tokio::spawn(upload(
             State(relay.clone()),
             headers,
@@ -2956,57 +2926,41 @@ mod tests {
 
     #[test]
     fn auth_event_validation_follows_bud11() {
-        let secp = Secp256k1::new();
         let now = unix_now();
         let sha = "a".repeat(64);
         let host = "media.example.com";
         // A fully-specified upload token validates.
-        let ev = auth_event(
-            &secp,
-            now,
-            "upload",
-            Some(now + 300),
-            Some(&sha),
-            Some(host),
-        );
+        let ev = auth_event(now, "upload", Some(now + 300), Some(&sha), Some(host));
         assert_eq!(
-            validate_auth_event(&secp, &ev, host, "upload", Some(&sha), now),
+            validate_auth_event(&ev, host, "upload", Some(&sha), now),
             Some(ev.pubkey.clone())
         );
         // BUD-11: the `expiration` tag is mandatory.
-        let ev = auth_event(&secp, now, "upload", None, Some(&sha), Some(host));
+        let ev = auth_event(now, "upload", None, Some(&sha), Some(host));
         assert_eq!(
-            validate_auth_event(&secp, &ev, host, "upload", Some(&sha), now),
+            validate_auth_event(&ev, host, "upload", Some(&sha), now),
             None,
             "a token without an expiration tag must be rejected"
         );
         // An expired or unparseable expiration is rejected.
-        let ev = auth_event(&secp, now, "upload", Some(now - 1), Some(&sha), Some(host));
+        let ev = auth_event(now, "upload", Some(now - 1), Some(&sha), Some(host));
         assert_eq!(
-            validate_auth_event(&secp, &ev, host, "upload", Some(&sha), now),
+            validate_auth_event(&ev, host, "upload", Some(&sha), now),
             None
         );
-        let ev = auth_event(&secp, now, "upload", Some(0), Some(&sha), Some(host));
+        let ev = auth_event(now, "upload", Some(0), Some(&sha), Some(host));
         assert_eq!(
-            validate_auth_event(&secp, &ev, host, "upload", Some(&sha), now),
+            validate_auth_event(&ev, host, "upload", Some(&sha), now),
             None
         );
         // The `t` verb must match the endpoint.
-        let ev = auth_event(
-            &secp,
-            now,
-            "delete",
-            Some(now + 300),
-            Some(&sha),
-            Some(host),
-        );
+        let ev = auth_event(now, "delete", Some(now + 300), Some(&sha), Some(host));
         assert_eq!(
-            validate_auth_event(&secp, &ev, host, "upload", Some(&sha), now),
+            validate_auth_event(&ev, host, "upload", Some(&sha), now),
             None
         );
         // A `server` tag naming another host is rejected.
         let ev = auth_event(
-            &secp,
             now,
             "upload",
             Some(now + 300),
@@ -3014,7 +2968,7 @@ mod tests {
             Some("evil.example.com"),
         );
         assert_eq!(
-            validate_auth_event(&secp, &ev, host, "upload", Some(&sha), now),
+            validate_auth_event(&ev, host, "upload", Some(&sha), now),
             None
         );
         // The old normalizer stripped everything before `:`/`/`, so a tag
@@ -3022,23 +2976,15 @@ mod tests {
         // matched here even though the real host is `evil.example`. The
         // value is not a bare domain, so it must not match.
         let spoofed = format!("{host}:443@evil.example.com");
-        let ev = auth_event(
-            &secp,
-            now,
-            "upload",
-            Some(now + 300),
-            Some(&sha),
-            Some(&spoofed),
-        );
+        let ev = auth_event(now, "upload", Some(now + 300), Some(&sha), Some(&spoofed));
         assert_eq!(
-            validate_auth_event(&secp, &ev, host, "upload", Some(&sha), now),
+            validate_auth_event(&ev, host, "upload", Some(&sha), now),
             None,
             "a userinfo-spoofed server tag must not match our host"
         );
         // BUD-11: multiple `server` tags are accepted when our domain
         // appears in at least one of them.
         let mut ev = auth_event(
-            &secp,
             now,
             "upload",
             Some(now + 300),
@@ -3050,22 +2996,21 @@ mod tests {
         ev.tags.push(vec!["server".into(), host.into()]);
         ev.id = crate::nips::nip01::compute_id(&ev);
         let id = ev.id_bytes().unwrap();
-        let keypair = Keypair::from_seckey_byte_array(&secp, [9u8; 32]).unwrap();
-        ev.sig = secp.sign_schnorr_no_aux_rand(&id, &keypair).to_string();
+        let keypair = Keypair::from_secret_bytes([9u8; 32]).unwrap();
+        ev.sig = secp256k1::schnorr::sign_no_aux_rand(&id, &keypair).to_string();
         assert_eq!(
-            validate_auth_event(&secp, &ev, host, "upload", Some(&sha), now),
+            validate_auth_event(&ev, host, "upload", Some(&sha), now),
             Some(ev.pubkey.clone()),
             "a token listing several servers must be accepted when ours is among them"
         );
         // BUD-11: an upload token must carry an `x` tag matching the blob.
-        let ev = auth_event(&secp, now, "upload", Some(now + 300), None, Some(host));
+        let ev = auth_event(now, "upload", Some(now + 300), None, Some(host));
         assert_eq!(
-            validate_auth_event(&secp, &ev, host, "upload", Some(&sha), now),
+            validate_auth_event(&ev, host, "upload", Some(&sha), now),
             None,
             "an upload token without an x tag must be rejected"
         );
         let ev = auth_event(
-            &secp,
             now,
             "upload",
             Some(now + 300),
@@ -3073,71 +3018,43 @@ mod tests {
             Some(host),
         );
         assert_eq!(
-            validate_auth_event(&secp, &ev, host, "upload", Some(&sha), now),
+            validate_auth_event(&ev, host, "upload", Some(&sha), now),
             None,
             "an x tag for a different blob must be rejected"
         );
         // BUD-11: `created_at` must be in the past — a token stamped well
         // in the past stays valid as long as `expiration` has not passed
         // (pre-signed tokens are spec-conformant).
-        let ev = auth_event(
-            &secp,
-            now - 601,
-            "upload",
-            Some(now + 300),
-            Some(&sha),
-            Some(host),
-        );
+        let ev = auth_event(now - 601, "upload", Some(now + 300), Some(&sha), Some(host));
         assert_eq!(
-            validate_auth_event(&secp, &ev, host, "upload", Some(&sha), now),
+            validate_auth_event(&ev, host, "upload", Some(&sha), now),
             Some(ev.pubkey.clone()),
             "a past-stamped token with a future expiration is valid"
         );
         // A future `created_at` is rejected.
-        let ev = auth_event(
-            &secp,
-            now + 601,
-            "upload",
-            Some(now + 300),
-            Some(&sha),
-            Some(host),
-        );
+        let ev = auth_event(now + 601, "upload", Some(now + 300), Some(&sha), Some(host));
         assert_eq!(
-            validate_auth_event(&secp, &ev, host, "upload", Some(&sha), now),
+            validate_auth_event(&ev, host, "upload", Some(&sha), now),
             None
         );
         // A wrong event kind is rejected.
-        let mut ev = auth_event(
-            &secp,
-            now,
-            "upload",
-            Some(now + 300),
-            Some(&sha),
-            Some(host),
-        );
+        let mut ev = auth_event(now, "upload", Some(now + 300), Some(&sha), Some(host));
         ev.kind = 22242;
         assert_eq!(
-            validate_auth_event(&secp, &ev, host, "upload", Some(&sha), now),
+            validate_auth_event(&ev, host, "upload", Some(&sha), now),
             None
         );
         // A delete token without an `x` tag is rejected (implied hash).
-        let ev = auth_event(&secp, now, "delete", Some(now + 300), None, Some(host));
+        let ev = auth_event(now, "delete", Some(now + 300), None, Some(host));
         assert_eq!(
-            validate_auth_event(&secp, &ev, host, "delete", Some(&sha), now),
+            validate_auth_event(&ev, host, "delete", Some(&sha), now),
             None
         );
         // An unsigned (invalid signature) token is rejected.
-        let mut ev = auth_event(
-            &secp,
-            now,
-            "upload",
-            Some(now + 300),
-            Some(&sha),
-            Some(host),
-        );
+        let mut ev = auth_event(now, "upload", Some(now + 300), Some(&sha), Some(host));
         ev.sig = "f".repeat(128);
         assert_eq!(
-            validate_auth_event(&secp, &ev, host, "upload", Some(&sha), now),
+            validate_auth_event(&ev, host, "upload", Some(&sha), now),
             None
         );
     }
@@ -3147,33 +3064,18 @@ mod tests {
         // Validity is bounded by `expiration`, so a `created_at` seconds
         // in the future only keeps skewed clients working — without the
         // leeway every request from a clock-ahead client fails with 401.
-        let secp = Secp256k1::new();
         let now = unix_now();
         let sha = "a".repeat(64);
         let host = "media.example.com";
-        let ev = auth_event(
-            &secp,
-            now + 30,
-            "upload",
-            Some(now + 300),
-            Some(&sha),
-            Some(host),
-        );
+        let ev = auth_event(now + 30, "upload", Some(now + 300), Some(&sha), Some(host));
         assert_eq!(
-            validate_auth_event(&secp, &ev, host, "upload", Some(&sha), now),
+            validate_auth_event(&ev, host, "upload", Some(&sha), now),
             Some(ev.pubkey.clone()),
             "a token seconds in the future must be accepted within the skew window"
         );
-        let ev = auth_event(
-            &secp,
-            now + 61,
-            "upload",
-            Some(now + 300),
-            Some(&sha),
-            Some(host),
-        );
+        let ev = auth_event(now + 61, "upload", Some(now + 300), Some(&sha), Some(host));
         assert_eq!(
-            validate_auth_event(&secp, &ev, host, "upload", Some(&sha), now),
+            validate_auth_event(&ev, host, "upload", Some(&sha), now),
             None,
             "a token past the skew window must still be rejected"
         );
@@ -3184,38 +3086,37 @@ mod tests {
         // Every `expiration` tag must parse and the earliest one bounds
         // the token: honoring only the first would let a later, looser
         // tag extend an intercepted token's life.
-        let secp = Secp256k1::new();
         let now = unix_now();
         let sha = "a".repeat(64);
         let host = "media.example.com";
         let with_extra_expiration = |first: u64, extra: &str| {
-            let mut ev = auth_event(&secp, now, "upload", Some(first), Some(&sha), Some(host));
+            let mut ev = auth_event(now, "upload", Some(first), Some(&sha), Some(host));
             ev.tags.push(vec!["expiration".into(), extra.into()]);
             ev.id = crate::nips::nip01::compute_id(&ev);
             let id = ev.id_bytes().unwrap();
-            let keypair = Keypair::from_seckey_byte_array(&secp, [9u8; 32]).unwrap();
-            ev.sig = secp.sign_schnorr_no_aux_rand(&id, &keypair).to_string();
+            let keypair = Keypair::from_secret_bytes([9u8; 32]).unwrap();
+            ev.sig = secp256k1::schnorr::sign_no_aux_rand(&id, &keypair).to_string();
             ev
         };
         // A later first tag with an earlier second tag: the earlier one
         // still bounds (accepted while it is in the future).
         let ev = with_extra_expiration(now + 600, &(now + 300).to_string());
         assert_eq!(
-            validate_auth_event(&secp, &ev, host, "upload", Some(&sha), now),
+            validate_auth_event(&ev, host, "upload", Some(&sha), now),
             Some(ev.pubkey.clone())
         );
         // A past tag anywhere rejects, even behind a future first tag
         // (the old first-only check accepted this token).
         let ev = with_extra_expiration(now + 600, &(now - 10).to_string());
         assert_eq!(
-            validate_auth_event(&secp, &ev, host, "upload", Some(&sha), now),
+            validate_auth_event(&ev, host, "upload", Some(&sha), now),
             None,
             "a past expiration tag must reject even behind a future first tag"
         );
         // An unparseable tag rejects, even behind a valid first tag.
         let ev = with_extra_expiration(now + 600, "soon");
         assert_eq!(
-            validate_auth_event(&secp, &ev, host, "upload", Some(&sha), now),
+            validate_auth_event(&ev, host, "upload", Some(&sha), now),
             None,
             "an unparseable expiration tag must reject"
         );
@@ -3227,34 +3128,25 @@ mod tests {
         // cryptographically but could never list or delete the uploads it
         // authored, so pubkey/id/sig must all be lowercase (mirroring
         // src/relay/validate.rs).
-        let secp = Secp256k1::new();
         let now = unix_now();
         let sha = "a".repeat(64);
         let host = "media.example.com";
-        let mut ev = auth_event(
-            &secp,
-            now,
-            "upload",
-            Some(now + 300),
-            Some(&sha),
-            Some(host),
-        );
+        let mut ev = auth_event(now, "upload", Some(now + 300), Some(&sha), Some(host));
         // Uppercase all three fields consistently and re-sign, so the
         // token is valid apart from its case: it must still be rejected.
         ev.pubkey = ev.pubkey.to_ascii_uppercase();
         ev.id = crate::nips::nip01::compute_id(&ev);
         let id = ev.id_bytes().unwrap();
-        let keypair = Keypair::from_seckey_byte_array(&secp, [9u8; 32]).unwrap();
-        ev.sig = secp
-            .sign_schnorr_no_aux_rand(&id, &keypair)
+        let keypair = Keypair::from_secret_bytes([9u8; 32]).unwrap();
+        ev.sig = secp256k1::schnorr::sign_no_aux_rand(&id, &keypair)
             .to_string()
             .to_ascii_uppercase();
         assert!(
-            crate::nips::nip01::verify(&ev, &secp).is_ok(),
+            crate::nips::nip01::verify(&ev).is_ok(),
             "the uppercase token must be cryptographically valid, or the test proves nothing"
         );
         assert_eq!(
-            validate_auth_event(&secp, &ev, host, "upload", Some(&sha), now),
+            validate_auth_event(&ev, host, "upload", Some(&sha), now),
             None,
             "uppercase-hex pubkey/id/sig must be rejected"
         );
@@ -3286,7 +3178,6 @@ mod tests {
         // alphabet: a padded base64url token must decode like the spec's
         // unpadded form and the padded standard variant (previously it
         // failed both engines and answered 401).
-        let secp = Secp256k1::new();
         // Find a deterministic fixture whose padded base64url form carries
         // both padding and url-safe characters: only then does this test
         // discriminate the padded url-safe engine from the unpadded and
@@ -3298,7 +3189,6 @@ mod tests {
         for content in ["\u{7ff}", "\u{ffff}", "\u{20ac}", "\u{1f389}"] {
             for repeats in 1..=16 {
                 let mut ev = auth_event_with_key(
-                    &secp,
                     &[9u8; 32],
                     1_700_000_000,
                     "list",
@@ -3695,7 +3585,7 @@ mod tests {
         // `?limit=` is capped at 1000 with a default of 100: a heavy
         // uploader cannot force a single unbounded JSON page.
         let relay = build_blossom_relay(0).await;
-        let (headers, pk) = auth_headers(relay.secp(), "list");
+        let (headers, pk) = auth_headers("list");
         let state = state_of(&relay).await.expect("blossom state");
         let mut shas = Vec::new();
         for i in 0..5 {
@@ -3818,7 +3708,7 @@ mod tests {
         .await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         // A valid token for a *different* pubkey: 403.
-        let (headers, pk) = auth_headers(relay.secp(), "list");
+        let (headers, pk) = auth_headers("list");
         assert_ne!(pk, other);
         let resp = list(
             State(relay.clone()),
@@ -3830,7 +3720,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
         // The owner's token works, including an uppercase spelling of the
         // same pubkey (hex is case-insensitive).
-        let (headers, pk) = auth_headers(relay.secp(), "list");
+        let (headers, pk) = auth_headers("list");
         let resp = list(
             State(relay.clone()),
             headers,
@@ -3847,7 +3737,7 @@ mod tests {
         // NIP-86 `banpubkey` must deny authenticated Blossom actions too,
         // not only WebSocket publishing/reading.
         let relay = build_blossom_relay(0).await;
-        let (headers, pk) = auth_headers(relay.secp(), "list");
+        let (headers, pk) = auth_headers("list");
         relay
             .access
             .write()
@@ -3874,7 +3764,7 @@ mod tests {
         // A well-formed but unknown cursor must not restart at page one
         // (a stale cursor would loop duplicates forever).
         let relay = build_blossom_relay(0).await;
-        let (headers, pk) = auth_headers(relay.secp(), "list");
+        let (headers, pk) = auth_headers("list");
         let state = state_of(&relay).await.expect("blossom state");
         let sha = sha256_hex(b"one blob");
         state

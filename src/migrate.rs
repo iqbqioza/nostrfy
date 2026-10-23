@@ -42,7 +42,6 @@ use std::io::BufRead;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
-use secp256k1::Secp256k1;
 
 use crate::db::{DbClient, PutOutcome};
 use crate::event::Event;
@@ -246,7 +245,6 @@ pub async fn run(
     opts: &Options,
     mut on_progress: impl FnMut(&Stats),
 ) -> Result<Stats> {
-    let secp = Secp256k1::new();
     let identity = nip62::RelayIdentity::new(&opts.host, opts.port, &opts.public_url);
     let now = unix_now();
     let mut stats = Stats::default();
@@ -330,7 +328,7 @@ pub async fn run(
                 .max_created_at
                 .map_or(event.created_at, |max| max.max(event.created_at)),
         );
-        if opts.verify && nip01::verify(&event, &secp).is_err() {
+        if opts.verify && nip01::verify(&event).is_err() {
             stats.bad_signature += 1;
             continue;
         }
@@ -342,7 +340,7 @@ pub async fn run(
         // `--no-verify`: that switch trusts the *event* signatures, while
         // the token is the delegator's own authorization. Events without a
         // delegation tag pass.
-        if !nip26::verify(&event, &secp) {
+        if !nip26::verify(&event) {
             stats.bad_delegation += 1;
             continue;
         }
@@ -1412,12 +1410,10 @@ mod tests {
     }
 
     fn keypair(seed: u8) -> Keypair {
-        let secp = Secp256k1::new();
-        Keypair::from_seckey_byte_array(&secp, [seed; 32]).unwrap()
+        Keypair::from_secret_bytes([seed; 32]).unwrap()
     }
 
     fn signed(seed: u8, kind: u64, created: u64, tags: Vec<Vec<String>>, content: &str) -> Event {
-        let secp = Secp256k1::new();
         let mut event = Event {
             id: String::new(),
             pubkey: keypair(seed).x_only_public_key().0.to_string(),
@@ -1427,7 +1423,7 @@ mod tests {
             content: content.to_string(),
             sig: String::new(),
         };
-        nip01::sign(&mut event, &keypair(seed), &secp).unwrap();
+        nip01::sign(&mut event, &keypair(seed)).unwrap();
         event
     }
 
@@ -1631,9 +1627,7 @@ mod tests {
             let mut hasher = Sha256::new();
             hasher.update(format!("nostr:delegation:{delegatee}:{conditions}").as_bytes());
             let message: [u8; 32] = hasher.finalize().into();
-            Secp256k1::new()
-                .sign_schnorr_no_aux_rand(&message, delegator_key)
-                .to_string()
+            secp256k1::schnorr::sign_no_aux_rand(&message, delegator_key).to_string()
         };
         // Forged: the token is signed by a third key, so it does not
         // authorize this delegator.

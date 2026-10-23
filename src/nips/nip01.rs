@@ -4,7 +4,7 @@
 //! signature verification, plus the regular replaceable event range.
 
 use secp256k1::schnorr::Signature;
-use secp256k1::{Keypair, Secp256k1, XOnlyPublicKey};
+use secp256k1::{Keypair, XOnlyPublicKey};
 use sha2::{Digest, Sha256};
 
 use anyhow::anyhow;
@@ -47,7 +47,7 @@ pub fn compute_id(event: &Event) -> String {
 }
 
 /// Verifies the event id and the Schnorr signature.
-pub fn verify(event: &Event, secp: &Secp256k1<secp256k1::All>) -> Result<()> {
+pub fn verify(event: &Event) -> Result<()> {
     if event.id.len() != ID_BYTES * 2
         || event.pubkey.len() != PK_BYTES * 2
         || event.sig.len() != SIG_BYTES * 2
@@ -66,20 +66,18 @@ pub fn verify(event: &Event, secp: &Secp256k1<secp256k1::All>) -> Result<()> {
         .try_into()
         .map_err(|_| anyhow!("invalid signature length"))?;
     let sig = Signature::from_byte_array(sig_bytes);
-    secp.verify_schnorr(&sig, &id_bytes, &pk)?;
+    secp256k1::schnorr::verify(&sig, &id_bytes, &pk)?;
     Ok(())
 }
 
 /// Signs an event with the given keypair: computes the id and the Schnorr
 /// signature. Used by the relay for NIP-29 relay-generated events.
-pub fn sign(event: &mut Event, keypair: &Keypair, secp: &Secp256k1<secp256k1::All>) -> Result<()> {
+pub fn sign(event: &mut Event, keypair: &Keypair) -> Result<()> {
     event.id = compute_id(event);
     let id: [u8; ID_BYTES] = event.id_bytes().ok_or_else(|| anyhow!("invalid id"))?;
     let mut aux = [0u8; 32];
     getrandom::fill(&mut aux).map_err(|_| anyhow!("rng failure"))?;
-    event.sig = secp
-        .sign_schnorr_with_aux_rand(&id, keypair, &aux)
-        .to_string();
+    event.sig = secp256k1::schnorr::sign_with_aux_rand(&id, keypair, &aux).to_string();
     Ok(())
 }
 
@@ -170,17 +168,12 @@ mod tests {
             ev.id,
             "nostrfy's canonical id must match nak's"
         );
-        let secp = Secp256k1::new();
-        assert!(
-            verify(&ev, &secp).is_ok(),
-            "an event signed by nak must verify"
-        );
+        assert!(verify(&ev).is_ok(), "an event signed by nak must verify");
     }
 
     #[test]
     fn signature_verification_roundtrip() {
-        let secp = Secp256k1::new();
-        let keypair = Keypair::from_seckey_byte_array(&secp, [7u8; 32]).unwrap();
+        let keypair = Keypair::from_secret_bytes([7u8; 32]).unwrap();
         let pubkey = XOnlyPublicKey::from_keypair(&keypair).0.to_string();
         let mut event = Event {
             id: String::new(),
@@ -191,27 +184,27 @@ mod tests {
             content: "signed message".into(),
             sig: String::new(),
         };
-        sign(&mut event, &keypair, &secp).unwrap();
+        sign(&mut event, &keypair).unwrap();
         assert_eq!(event.id.len(), 64);
         assert_eq!(event.sig.len(), 128);
-        assert!(verify(&event, &secp).is_ok());
+        assert!(verify(&event).is_ok());
 
         // Tampering with the content invalidates the id.
         let mut tampered = event.clone();
         tampered.content = "tampered".into();
-        assert!(verify(&tampered, &secp).is_err());
+        assert!(verify(&tampered).is_err());
 
         // Tampering with the signature is caught by schnorr verification.
         let mut bad_sig = event.clone();
         bad_sig.sig = "1".repeat(128);
-        assert!(verify(&bad_sig, &secp).is_err());
+        assert!(verify(&bad_sig).is_err());
 
         // A signature from a different key fails.
-        let other = Keypair::from_seckey_byte_array(&secp, [9u8; 32]).unwrap();
+        let other = Keypair::from_secret_bytes([9u8; 32]).unwrap();
         let mut forged = event.clone();
-        sign(&mut forged, &other, &secp).unwrap();
+        sign(&mut forged, &other).unwrap();
         forged.pubkey = event.pubkey.clone();
-        assert!(verify(&forged, &secp).is_err());
+        assert!(verify(&forged).is_err());
     }
 }
 
@@ -276,12 +269,11 @@ mod control_tests {
         let id = compute_id(&event);
         let mut signed = event;
         signed.id = id;
-        let secp = secp256k1::Secp256k1::new();
         // The id check runs first: reaching the signature check means the
         // canonical id computed by this crate matches the one signed by
         // the client, so a canonicalization bug would fail here with an
         // id error instead.
-        let err = verify(&signed, &secp).unwrap_err();
+        let err = verify(&signed).unwrap_err();
         // The id check runs first and returns its own error string: if the
         // canonical id did not match, the verify would report the id (not
         // the signature). The fake signature must be the reported failure.

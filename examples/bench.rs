@@ -23,20 +23,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
-use secp256k1::{Keypair, Secp256k1, XOnlyPublicKey};
+use secp256k1::{Keypair, XOnlyPublicKey};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
-fn sign_event(
-    secp: &Secp256k1<secp256k1::All>,
-    keypair: &Keypair,
-    kind: u64,
-    content: &str,
-    created_at: u64,
-) -> String {
+fn sign_event(keypair: &Keypair, kind: u64, content: &str, created_at: u64) -> String {
     // The event's pubkey must match the signing key (a mismatch would
     // make the relay reject every event as a signature failure).
     let pubkey = XOnlyPublicKey::from_keypair(keypair).0;
@@ -44,7 +38,7 @@ fn sign_event(
     let payload = json!([0, pubkey_hex, created_at, kind, [], content]);
     let serialized = serde_json::to_vec(&payload).expect("serialize");
     let id: [u8; 32] = Sha256::digest(&serialized).into();
-    let sig = secp.sign_schnorr_no_aux_rand(&id, keypair);
+    let sig = secp256k1::schnorr::sign_no_aux_rand(&id, keypair);
     let event = json!({
         "id": hex::encode(id),
         "pubkey": pubkey_hex,
@@ -69,8 +63,7 @@ fn frame(json: &str) -> WsMessage {
 }
 
 async fn ingest(url: &str, n: usize) {
-    let secp = Secp256k1::new();
-    let keypair = Keypair::from_seckey_byte_array(&secp, [7u8; 32]).unwrap();
+    let keypair = Keypair::from_secret_bytes([7u8; 32]).unwrap();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -115,7 +108,7 @@ async fn ingest(url: &str, n: usize) {
             // timestamps force every index into the worst-case random
             // insert pattern and exaggerate the DB-size cost).
             let created = now - (sent % 1000) as u64;
-            let ev = sign_event(&secp, &keypair, 1, &format!("bench {sent}"), created);
+            let ev = sign_event(&keypair, 1, &format!("bench {sent}"), created);
             sink.send(frame(&format!(r#"["EVENT",{ev}]"#)))
                 .await
                 .expect("send");
@@ -144,8 +137,7 @@ async fn ingest(url: &str, n: usize) {
 }
 
 async fn fanout(url: &str, subscribers: usize, publishes: usize) {
-    let secp = Secp256k1::new();
-    let keypair = Keypair::from_seckey_byte_array(&secp, [7u8; 32]).unwrap();
+    let keypair = Keypair::from_secret_bytes([7u8; 32]).unwrap();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -207,7 +199,7 @@ async fn fanout(url: &str, subscribers: usize, publishes: usize) {
     let live_created = now + 60;
     let t0 = Instant::now();
     for i in 0..publishes {
-        let ev = sign_event(&secp, &keypair, 1, &format!("fanout {i}"), live_created);
+        let ev = sign_event(&keypair, 1, &format!("fanout {i}"), live_created);
         pub_sink
             .send(frame(&format!(r#"["EVENT",{ev}]"#)))
             .await
@@ -235,8 +227,7 @@ async fn fanout(url: &str, subscribers: usize, publishes: usize) {
 }
 
 async fn req(url: &str, n: usize) {
-    let secp = Secp256k1::new();
-    let keypair = Keypair::from_seckey_byte_array(&secp, [7u8; 32]).unwrap();
+    let keypair = Keypair::from_secret_bytes([7u8; 32]).unwrap();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -253,7 +244,7 @@ async fn req(url: &str, n: usize) {
         }
     });
     for i in 0..n {
-        let ev = sign_event(&secp, &keypair, 1, &format!("req {i}"), now - i as u64);
+        let ev = sign_event(&keypair, 1, &format!("req {i}"), now - i as u64);
         sink.send(frame(&format!(r#"["EVENT",{ev}]"#)))
             .await
             .expect("send");
@@ -324,17 +315,14 @@ async fn search(url: &str, term: &str) {
 /// writer thread merges their batches, so the aggregate can exceed one
 /// connection's ceiling.
 async fn parallel_ingest(url: &str, conns: usize, n: usize) {
-    let secp = Secp256k1::new();
-    let keypair = Keypair::from_seckey_byte_array(&secp, [7u8; 32]).unwrap();
+    let keypair = Keypair::from_secret_bytes([7u8; 32]).unwrap();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    let secp = Arc::new(secp);
     let mut handles = Vec::with_capacity(conns);
     for c in 0..conns {
         let url = url.to_string();
-        let secp = Arc::clone(&secp);
         handles.push(tokio::spawn(async move {
             let ws = connect(&url).await;
             let (mut sink, mut stream) = ws.split();
@@ -355,7 +343,7 @@ async fn parallel_ingest(url: &str, conns: usize, n: usize) {
             let mut sent = 0;
             while sent < n {
                 for _ in 0..BURST.min(n - sent) {
-                    let ev = sign_event(&secp, &keypair, 1, &format!("p{c} {sent}"), now);
+                    let ev = sign_event(&keypair, 1, &format!("p{c} {sent}"), now);
                     sink.send(frame(&format!(r#"["EVENT",{ev}]"#)))
                         .await
                         .expect("send");

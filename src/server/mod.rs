@@ -4620,8 +4620,7 @@ mod tests {
     /// Signs a NIP-98 `GET` authorization for `origin + path`.
     async fn nip98_get_header_for(origin: &str, path: &str, salt: u64) -> String {
         use base64::Engine as _;
-        let secp = secp256k1::Secp256k1::new();
-        let keypair = secp256k1::Keypair::from_seckey_byte_array(&secp, [9u8; 32]).unwrap();
+        let keypair = secp256k1::Keypair::from_secret_bytes([9u8; 32]).unwrap();
         let pubkey = secp256k1::XOnlyPublicKey::from_keypair(&keypair)
             .0
             .to_string();
@@ -4642,7 +4641,7 @@ mod tests {
         };
         ev.id = crate::nips::nip01::compute_id(&ev);
         let id = ev.id_bytes().unwrap();
-        ev.sig = secp.sign_schnorr_no_aux_rand(&id, &keypair).to_string();
+        ev.sig = secp256k1::schnorr::sign_no_aux_rand(&id, &keypair).to_string();
         format!(
             "Nostr {}",
             base64::engine::general_purpose::STANDARD.encode(serde_json::to_string(&ev).unwrap())

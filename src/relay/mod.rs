@@ -25,7 +25,7 @@ mod validate;
 
 use std::sync::Arc;
 
-use secp256k1::{Keypair, Secp256k1, XOnlyPublicKey};
+use secp256k1::{Keypair, XOnlyPublicKey};
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, AtomicUsize, Ordering};
 use tokio::sync::RwLock;
@@ -431,11 +431,6 @@ pub struct Relay {
     /// Coalesces webhook/poll refreshes per group (see
     /// [`LiveKitRefreshState`]).
     livekit_refresh: std::sync::Mutex<LiveKitRefreshState>,
-    /// Shared signature-verification context. It is an `Arc` because the
-    /// accept path hands it to `spawn_blocking` verification tasks; the
-    /// precomputed tables are far too large to rebuild per batch, and
-    /// cloning them per task would defeat the point.
-    secp: Arc<Secp256k1<secp256k1::All>>,
     /// Path of the config file, set at startup so NIP-86 runtime changes
     /// (relay name/description/icon) can be persisted to disk; without
     /// persistence a SIGHUP config reload would silently revert them.
@@ -2036,14 +2031,12 @@ impl Relay {
         let (live_tx, live_rx) = mpsc::channel(live_bus.buffer.max(16));
         let live_batch_interval_ms = live_bus.batch_interval_ms.clamp(1, 1000);
         let live_batch_size = live_bus.batch_size.max(1);
-        let secp = Arc::new(Secp256k1::new());
         let key = if private_key_hex.is_empty() {
             None
         } else {
             match hex::decode(private_key_hex) {
                 Ok(bytes) if bytes.len() == 32 => {
-                    Keypair::from_seckey_byte_array(&secp, bytes.as_slice().try_into().unwrap())
-                        .ok()
+                    Keypair::from_secret_bytes(bytes.as_slice().try_into().unwrap()).ok()
                 }
                 _ => {
                     log::warn!("invalid relay.private_key: ignoring");
@@ -2224,7 +2217,6 @@ impl Relay {
             teardown_tasks: std::sync::atomic::AtomicUsize::new(0),
             key,
             relay_pubkey,
-            secp,
             config_path: Arc::new(tokio::sync::RwLock::new(None)),
             stamps: StampClock::new_with_last(stamp_last),
             blossom: Arc::new(tokio::sync::RwLock::new(None)),
@@ -2494,16 +2486,6 @@ impl Relay {
     /// paths only compare against it and must not clone the string.
     pub fn relay_pubkey_ref(&self) -> Option<&str> {
         self.relay_pubkey.as_deref()
-    }
-
-    pub fn secp(&self) -> &Secp256k1<secp256k1::All> {
-        self.secp.as_ref()
-    }
-
-    /// Shared handle to the verification context for the `spawn_blocking`
-    /// signature checks on the accept path (see [`Self::secp`]).
-    pub(crate) fn secp_shared(&self) -> Arc<Secp256k1<secp256k1::All>> {
-        Arc::clone(&self.secp)
     }
 
     /// Persists the current access control lists to the database so NIP-86
@@ -3227,11 +3209,7 @@ impl Relay {
         // so the verification can run off the runtime worker, then reclaimed
         // unchanged for the loop below.
         let batch: Arc<Box<[Event]>> = Arc::new(events.into_boxed_slice());
-        let verified = crate::relay::validate::verify_signatures_parallel(
-            Arc::clone(&batch),
-            self.secp_shared(),
-        )
-        .await;
+        let verified = crate::relay::validate::verify_signatures_parallel(Arc::clone(&batch)).await;
         let events = crate::relay::validate::reclaim_events(batch);
         let mut out: Vec<(String, PutOutcome)> = Vec::with_capacity(events.len());
         let mut run: Vec<Event> = Vec::new();
@@ -3363,11 +3341,8 @@ impl Relay {
         let verified: &[bool] = match verified {
             Some(verdicts) => verdicts,
             None => {
-                computed = crate::relay::validate::verify_signatures_parallel(
-                    Arc::clone(&batch),
-                    self.secp_shared(),
-                )
-                .await;
+                computed =
+                    crate::relay::validate::verify_signatures_parallel(Arc::clone(&batch)).await;
                 &computed
             }
         };
@@ -5762,8 +5737,7 @@ mod tests {
             Ok(relay) => relay,
             Err(_) => panic!("test relay must have a single owner"),
         };
-        let secp = secp256k1::Secp256k1::new();
-        let keypair = secp256k1::Keypair::from_seckey_byte_array(&secp, [9u8; 32]).unwrap();
+        let keypair = secp256k1::Keypair::from_secret_bytes([9u8; 32]).unwrap();
         let pubkey = secp256k1::XOnlyPublicKey::from_keypair(&keypair)
             .0
             .to_string();
@@ -5777,9 +5751,8 @@ mod tests {
             sig: String::new(),
         };
         event.id = crate::nips::nip01::compute_id(&event);
-        event.sig = secp
-            .sign_schnorr_no_aux_rand(&event.id_bytes().unwrap(), &keypair)
-            .to_string();
+        event.sig =
+            secp256k1::schnorr::sign_no_aux_rand(&event.id_bytes().unwrap(), &keypair).to_string();
         relay.live_rx.take();
 
         let outcome = relay.accept_event(event.clone(), &[], None).await;
@@ -6429,8 +6402,7 @@ mod tests {
 
         // NIP-09: only the author may delete, so the relay signs with its own
         // key.
-        let secp = secp256k1::Secp256k1::new();
-        let relay_key = secp256k1::Keypair::from_seckey_byte_array(&secp, [1u8; 32]).unwrap();
+        let relay_key = secp256k1::Keypair::from_secret_bytes([1u8; 32]).unwrap();
         let mut deletion = crate::event::Event {
             id: String::new(),
             pubkey: secp256k1::XOnlyPublicKey::from_keypair(&relay_key)
@@ -6443,9 +6415,9 @@ mod tests {
             sig: String::new(),
         };
         deletion.id = crate::nips::nip01::compute_id(&deletion);
-        deletion.sig = secp
-            .sign_schnorr_no_aux_rand(&deletion.id_bytes().unwrap(), &relay_key)
-            .to_string();
+        deletion.sig =
+            secp256k1::schnorr::sign_no_aux_rand(&deletion.id_bytes().unwrap(), &relay_key)
+                .to_string();
         assert!(matches!(
             relay.accept_event(deletion, &[], None).await,
             crate::db::PutOutcome::Stored
@@ -6488,8 +6460,7 @@ mod tests {
         relay.config.write().await.relay.enabled_nips = vec![9, 29];
 
         let now = crate::util::unix_now();
-        let secp = secp256k1::Secp256k1::new();
-        let seed = |n: u8| secp256k1::Keypair::from_seckey_byte_array(&secp, [n; 32]).unwrap();
+        let seed = |n: u8| secp256k1::Keypair::from_secret_bytes([n; 32]).unwrap();
         let sign = |kp: &secp256k1::Keypair, kind: u64, created_at: u64, tags: Vec<Vec<String>>| {
             let mut e = crate::event::Event {
                 id: String::new(),
@@ -6502,7 +6473,7 @@ mod tests {
             };
             e.id = crate::nips::nip01::compute_id(&e);
             let id = e.id_bytes().unwrap();
-            e.sig = secp.sign_schnorr_no_aux_rand(&id, kp).to_string();
+            e.sig = secp256k1::schnorr::sign_no_aux_rand(&id, kp).to_string();
             e
         };
         let g1 = |tags: Vec<Vec<String>>| {
@@ -6632,8 +6603,7 @@ mod tests {
         relay.config.write().await.relay.enabled_nips = vec![9, 29];
 
         let now = crate::util::unix_now();
-        let secp = secp256k1::Secp256k1::new();
-        let seed = |n: u8| secp256k1::Keypair::from_seckey_byte_array(&secp, [n; 32]).unwrap();
+        let seed = |n: u8| secp256k1::Keypair::from_secret_bytes([n; 32]).unwrap();
         let sign = |kp: &secp256k1::Keypair, kind: u64, created_at: u64, tags: Vec<Vec<String>>| {
             let mut e = crate::event::Event {
                 id: String::new(),
@@ -6646,7 +6616,7 @@ mod tests {
             };
             e.id = crate::nips::nip01::compute_id(&e);
             let id = e.id_bytes().unwrap();
-            e.sig = secp.sign_schnorr_no_aux_rand(&id, kp).to_string();
+            e.sig = secp256k1::schnorr::sign_no_aux_rand(&id, kp).to_string();
             e
         };
         let g1 = |tags: Vec<Vec<String>>| {
@@ -6812,16 +6782,9 @@ mod tests {
         rt.block_on(async {
             let relay = build_relay().await;
             let now = crate::util::unix_now();
-            let secp = secp256k1::Secp256k1::new();
-            let admin = secp256k1::Keypair::from_seckey_byte_array(&secp, [4u8; 32]).unwrap();
-            let create = signed_group_event(
-                &secp,
-                &admin,
-                crate::nips::nip29::CREATE_GROUP,
-                "g1",
-                vec![],
-                now,
-            );
+            let admin = secp256k1::Keypair::from_secret_bytes([4u8; 32]).unwrap();
+            let create =
+                signed_group_event(&admin, crate::nips::nip29::CREATE_GROUP, "g1", vec![], now);
             assert!(matches!(
                 relay.accept_event(create.clone(), &[], None).await,
                 crate::db::PutOutcome::Stored
@@ -6880,16 +6843,9 @@ mod tests {
         // The event's put commits, but its in-memory apply has not run yet:
         // claim the epoch the way `accept_event_verified` does.
         let now = crate::util::unix_now();
-        let secp = secp256k1::Secp256k1::new();
-        let admin = secp256k1::Keypair::from_seckey_byte_array(&secp, [4u8; 32]).unwrap();
-        let create = signed_group_event(
-            &secp,
-            &admin,
-            crate::nips::nip29::CREATE_GROUP,
-            "g1",
-            vec![],
-            now,
-        );
+        let admin = secp256k1::Keypair::from_secret_bytes([4u8; 32]).unwrap();
+        let create =
+            signed_group_event(&admin, crate::nips::nip29::CREATE_GROUP, "g1", vec![], now);
         assert!(matches!(
             relay.db.put(create, now).await,
             crate::db::PutOutcome::Stored
@@ -6934,16 +6890,9 @@ mod tests {
         let relay = build_relay().await;
         let database = relay.config.read().await.database.clone();
         let now = crate::util::unix_now();
-        let secp = secp256k1::Secp256k1::new();
-        let admin = secp256k1::Keypair::from_seckey_byte_array(&secp, [4u8; 32]).unwrap();
-        let create = signed_group_event(
-            &secp,
-            &admin,
-            crate::nips::nip29::CREATE_GROUP,
-            "g1",
-            vec![],
-            now,
-        );
+        let admin = secp256k1::Keypair::from_secret_bytes([4u8; 32]).unwrap();
+        let create =
+            signed_group_event(&admin, crate::nips::nip29::CREATE_GROUP, "g1", vec![], now);
         assert!(matches!(
             relay.db.put(create.clone(), now).await,
             crate::db::PutOutcome::Stored
@@ -7094,9 +7043,8 @@ mod tests {
         assert_eq!(relay.assign_role(&member, "mod").await, RoleChange::Applied);
 
         let now = crate::util::unix_now();
-        let secp = secp256k1::Secp256k1::new();
-        let author = secp256k1::Keypair::from_seckey_byte_array(&secp, [21u8; 32]).unwrap();
-        let edit = signed_group_event(&secp, &author, 9002, "g-state", vec![], now);
+        let author = secp256k1::Keypair::from_secret_bytes([21u8; 32]).unwrap();
+        let edit = signed_group_event(&author, 9002, "g-state", vec![], now);
         assert_eq!(
             relay.db.put(edit.clone(), now).await,
             crate::db::PutOutcome::Stored
@@ -7115,7 +7063,7 @@ mod tests {
         };
         deletion.id = crate::nips::nip01::compute_id(&deletion);
         let raw = deletion.id_bytes().unwrap();
-        deletion.sig = secp.sign_schnorr_no_aux_rand(&raw, &author).to_string();
+        deletion.sig = secp256k1::schnorr::sign_no_aux_rand(&raw, &author).to_string();
         assert!(matches!(
             relay.accept_event(deletion, &[], None).await,
             crate::db::PutOutcome::Stored
@@ -7304,16 +7252,9 @@ mod tests {
         // stored relay-signed 39000-39005 still described the old state.
         let relay = build_relay_with_key(false, &"01".repeat(32)).await;
         let now = crate::util::unix_now();
-        let secp = secp256k1::Secp256k1::new();
-        let admin = secp256k1::Keypair::from_seckey_byte_array(&secp, [4u8; 32]).unwrap();
-        let create = signed_group_event(
-            &secp,
-            &admin,
-            crate::nips::nip29::CREATE_GROUP,
-            "g1",
-            vec![],
-            now,
-        );
+        let admin = secp256k1::Keypair::from_secret_bytes([4u8; 32]).unwrap();
+        let create =
+            signed_group_event(&admin, crate::nips::nip29::CREATE_GROUP, "g1", vec![], now);
         assert!(matches!(
             relay.accept_event(create, &[], None).await,
             crate::db::PutOutcome::Stored
@@ -8035,8 +7976,7 @@ mod tests {
             let mut cfg = relay.config.write().await;
             cfg.relay.new_pubkey_min_age_secs = 100;
         }
-        let secp = secp256k1::Secp256k1::new();
-        let keypair = secp256k1::Keypair::from_seckey_byte_array(&secp, [7u8; 32]).unwrap();
+        let keypair = secp256k1::Keypair::from_secret_bytes([7u8; 32]).unwrap();
         let pubkey = secp256k1::XOnlyPublicKey::from_keypair(&keypair)
             .0
             .to_string();
@@ -8051,7 +7991,7 @@ mod tests {
         };
         ev.id = crate::nips::nip01::compute_id(&ev);
         let id = ev.id_bytes().unwrap();
-        ev.sig = secp.sign_schnorr_no_aux_rand(&id, &keypair).to_string();
+        ev.sig = secp256k1::schnorr::sign_no_aux_rand(&id, &keypair).to_string();
         // A pubkey recorded ten seconds ago is still inside the 100-second
         // gate: its event is rejected as too new.
         relay
@@ -8068,7 +8008,7 @@ mod tests {
         );
         // A pubkey with no recorded first-seen (its very first event) is
         // allowed: the event establishes the account's arrival time.
-        let other_keypair = secp256k1::Keypair::from_seckey_byte_array(&secp, [8u8; 32]).unwrap();
+        let other_keypair = secp256k1::Keypair::from_secret_bytes([8u8; 32]).unwrap();
         let other_pubkey = secp256k1::XOnlyPublicKey::from_keypair(&other_keypair)
             .0
             .to_string();
@@ -8083,9 +8023,7 @@ mod tests {
         };
         ev2.id = crate::nips::nip01::compute_id(&ev2);
         let id = ev2.id_bytes().unwrap();
-        ev2.sig = secp
-            .sign_schnorr_no_aux_rand(&id, &other_keypair)
-            .to_string();
+        ev2.sig = secp256k1::schnorr::sign_no_aux_rand(&id, &other_keypair).to_string();
         let outcome = relay.accept_event(ev2, &[], None).await;
         assert!(
             matches!(outcome, crate::db::PutOutcome::Stored),
@@ -8095,7 +8033,7 @@ mod tests {
         // reap keyed on the clock alone would forget the account and re-gate
         // its next event (A-4). A purge whose retention only covers the
         // refresh must keep the entry, with the original clock intact.
-        let mature_keypair = secp256k1::Keypair::from_seckey_byte_array(&secp, [9u8; 32]).unwrap();
+        let mature_keypair = secp256k1::Keypair::from_secret_bytes([9u8; 32]).unwrap();
         let mature_pubkey = secp256k1::XOnlyPublicKey::from_keypair(&mature_keypair)
             .0
             .to_string();
@@ -8116,9 +8054,7 @@ mod tests {
         };
         ev3.id = crate::nips::nip01::compute_id(&ev3);
         let id = ev3.id_bytes().unwrap();
-        ev3.sig = secp
-            .sign_schnorr_no_aux_rand(&id, &mature_keypair)
-            .to_string();
+        ev3.sig = secp256k1::schnorr::sign_no_aux_rand(&id, &mature_keypair).to_string();
         let outcome = relay.accept_event(ev3, &[], None).await;
         assert!(
             matches!(outcome, crate::db::PutOutcome::Stored),
@@ -8246,8 +8182,7 @@ mod tests {
         rt.block_on(async {
             let relay = build_relay().await;
             let now = crate::util::unix_now();
-            let secp = secp256k1::Secp256k1::new();
-            let keypair = secp256k1::Keypair::from_seckey_byte_array(&secp, [3u8; 32]).unwrap();
+            let keypair = secp256k1::Keypair::from_secret_bytes([3u8; 32]).unwrap();
             let pubkey = secp256k1::XOnlyPublicKey::from_keypair(&keypair).0.to_string();
             let mut ev = crate::event::Event {
                 id: String::new(),
@@ -8260,7 +8195,7 @@ mod tests {
             };
             ev.id = crate::nips::nip01::compute_id(&ev);
             let id = ev.id_bytes().unwrap();
-            ev.sig = secp.sign_schnorr_no_aux_rand(&id, &keypair).to_string();
+            ev.sig = secp256k1::schnorr::sign_no_aux_rand(&id, &keypair).to_string();
             let results = relay.accept_events_batch(vec![ev], &[]).await;
             assert_eq!(results.len(), 1);
             assert!(
@@ -8336,8 +8271,7 @@ mod tests {
             use crate::db::PutOutcome;
             let relay = build_faulty_relay(true, false).await;
             let now = crate::util::unix_now();
-            let secp = secp256k1::Secp256k1::new();
-            let keypair = secp256k1::Keypair::from_seckey_byte_array(&secp, [3u8; 32]).unwrap();
+            let keypair = secp256k1::Keypair::from_secret_bytes([3u8; 32]).unwrap();
             let pubkey = secp256k1::XOnlyPublicKey::from_keypair(&keypair)
                 .0
                 .to_string();
@@ -8354,7 +8288,7 @@ mod tests {
             };
             old.id = crate::nips::nip01::compute_id(&old);
             let raw = old.id_bytes().unwrap();
-            old.sig = secp.sign_schnorr_no_aux_rand(&raw, &keypair).to_string();
+            old.sig = secp256k1::schnorr::sign_no_aux_rand(&raw, &keypair).to_string();
             assert_eq!(relay.db.put(old.clone(), now).await, PutOutcome::Stored);
 
             let mut vanish = crate::event::Event {
@@ -8368,7 +8302,7 @@ mod tests {
             };
             vanish.id = crate::nips::nip01::compute_id(&vanish);
             let raw = vanish.id_bytes().unwrap();
-            vanish.sig = secp.sign_schnorr_no_aux_rand(&raw, &keypair).to_string();
+            vanish.sig = secp256k1::schnorr::sign_no_aux_rand(&raw, &keypair).to_string();
 
             let outcome = relay.accept_event(vanish, &[], None).await;
             assert!(
@@ -8403,8 +8337,7 @@ mod tests {
         rt.block_on(async {
             let relay = build_faulty_relay(true, false).await;
             let now = crate::util::unix_now();
-            let secp = secp256k1::Secp256k1::new();
-            let keypair = secp256k1::Keypair::from_seckey_byte_array(&secp, [5u8; 32]).unwrap();
+            let keypair = secp256k1::Keypair::from_secret_bytes([5u8; 32]).unwrap();
             let pubkey = secp256k1::XOnlyPublicKey::from_keypair(&keypair)
                 .0
                 .to_string();
@@ -8419,7 +8352,7 @@ mod tests {
             };
             vanish.id = crate::nips::nip01::compute_id(&vanish);
             let raw = vanish.id_bytes().unwrap();
-            vanish.sig = secp.sign_schnorr_no_aux_rand(&raw, &keypair).to_string();
+            vanish.sig = secp256k1::schnorr::sign_no_aux_rand(&raw, &keypair).to_string();
             let results = relay.accept_events_batch(vec![vanish], &[]).await;
             assert_eq!(results.len(), 1);
             assert!(
@@ -8444,8 +8377,7 @@ mod tests {
             use crate::db::PutOutcome;
             let relay = build_faulty_relay(false, true).await;
             let now = crate::util::unix_now();
-            let secp = secp256k1::Secp256k1::new();
-            let author = secp256k1::Keypair::from_seckey_byte_array(&secp, [6u8; 32]).unwrap();
+            let author = secp256k1::Keypair::from_secret_bytes([6u8; 32]).unwrap();
             let author_pk = secp256k1::XOnlyPublicKey::from_keypair(&author)
                 .0
                 .to_string();
@@ -8461,7 +8393,7 @@ mod tests {
             };
             edit.id = crate::nips::nip01::compute_id(&edit);
             let raw = edit.id_bytes().unwrap();
-            edit.sig = secp.sign_schnorr_no_aux_rand(&raw, &author).to_string();
+            edit.sig = secp256k1::schnorr::sign_no_aux_rand(&raw, &author).to_string();
             assert_eq!(relay.db.put(edit.clone(), now).await, PutOutcome::Stored);
 
             let mut deletion = crate::event::Event {
@@ -8475,7 +8407,7 @@ mod tests {
             };
             deletion.id = crate::nips::nip01::compute_id(&deletion);
             let raw = deletion.id_bytes().unwrap();
-            deletion.sig = secp.sign_schnorr_no_aux_rand(&raw, &author).to_string();
+            deletion.sig = secp256k1::schnorr::sign_no_aux_rand(&raw, &author).to_string();
 
             let outcome = relay.accept_event(deletion.clone(), &[], None).await;
             assert!(
@@ -8563,8 +8495,7 @@ mod tests {
             .pending_removals_limit
             .store(1, std::sync::atomic::Ordering::Relaxed);
         let now = crate::util::unix_now();
-        let secp = secp256k1::Secp256k1::new();
-        let author = secp256k1::Keypair::from_seckey_byte_array(&secp, [9u8; 32]).unwrap();
+        let author = secp256k1::Keypair::from_secret_bytes([9u8; 32]).unwrap();
         let author_pk = secp256k1::XOnlyPublicKey::from_keypair(&author)
             .0
             .to_string();
@@ -8579,7 +8510,7 @@ mod tests {
         };
         target.id = crate::nips::nip01::compute_id(&target);
         let raw = target.id_bytes().unwrap();
-        target.sig = secp.sign_schnorr_no_aux_rand(&raw, &author).to_string();
+        target.sig = secp256k1::schnorr::sign_no_aux_rand(&raw, &author).to_string();
         assert_eq!(relay.db.put(target.clone(), now).await, PutOutcome::Stored);
 
         let mut deletion = crate::event::Event {
@@ -8593,7 +8524,7 @@ mod tests {
         };
         deletion.id = crate::nips::nip01::compute_id(&deletion);
         let raw = deletion.id_bytes().unwrap();
-        deletion.sig = secp.sign_schnorr_no_aux_rand(&raw, &author).to_string();
+        deletion.sig = secp256k1::schnorr::sign_no_aux_rand(&raw, &author).to_string();
 
         // Hold it by hand: this is the state the writer-shed path leaves
         // behind, and it must be flushed into the durable table.
@@ -8669,8 +8600,7 @@ mod tests {
         rt.block_on(async {
             let relay = build_relay().await;
             let now = crate::util::unix_now();
-            let secp = secp256k1::Secp256k1::new();
-            let keypair = secp256k1::Keypair::from_seckey_byte_array(&secp, [4u8; 32]).unwrap();
+            let keypair = secp256k1::Keypair::from_secret_bytes([4u8; 32]).unwrap();
             let pubkey = secp256k1::XOnlyPublicKey::from_keypair(&keypair)
                 .0
                 .to_string();
@@ -8686,7 +8616,7 @@ mod tests {
                 };
                 e.id = crate::nips::nip01::compute_id(&e);
                 let id = e.id_bytes().unwrap();
-                e.sig = secp.sign_schnorr_no_aux_rand(&id, &keypair).to_string();
+                e.sig = secp256k1::schnorr::sign_no_aux_rand(&id, &keypair).to_string();
                 e
             };
             // A stored group message (direct DB put: the purge is the target).
@@ -8745,8 +8675,7 @@ mod tests {
         rt.block_on(async {
             let relay = build_relay_with_key(false, &"02".repeat(32)).await;
             let now = crate::util::unix_now();
-            let secp = secp256k1::Secp256k1::new();
-            let keypair = secp256k1::Keypair::from_seckey_byte_array(&secp, [7u8; 32]).unwrap();
+            let keypair = secp256k1::Keypair::from_secret_bytes([7u8; 32]).unwrap();
             let pubkey = secp256k1::XOnlyPublicKey::from_keypair(&keypair)
                 .0
                 .to_string();
@@ -8762,7 +8691,7 @@ mod tests {
                 };
                 e.id = crate::nips::nip01::compute_id(&e);
                 let id = e.id_bytes().unwrap();
-                e.sig = secp.sign_schnorr_no_aux_rand(&id, &keypair).to_string();
+                e.sig = secp256k1::schnorr::sign_no_aux_rand(&id, &keypair).to_string();
                 e
             };
             let create = signed(crate::nips::nip29::CREATE_GROUP, "", now - 5);
@@ -8857,8 +8786,7 @@ mod tests {
             let relay = build_role_relay(Some(&key)).await;
             relay.config.write().await.relay.enabled_nips.push(29);
             let now = crate::util::unix_now();
-            let secp = secp256k1::Secp256k1::new();
-            let keypair = secp256k1::Keypair::from_seckey_byte_array(&secp, [4u8; 32]).unwrap();
+            let keypair = secp256k1::Keypair::from_secret_bytes([4u8; 32]).unwrap();
             let pubkey = secp256k1::XOnlyPublicKey::from_keypair(&keypair)
                 .0
                 .to_string();
@@ -8876,7 +8804,7 @@ mod tests {
                 };
                 e.id = crate::nips::nip01::compute_id(&e);
                 let id = e.id_bytes().unwrap();
-                e.sig = secp.sign_schnorr_no_aux_rand(&id, &keypair).to_string();
+                e.sig = secp256k1::schnorr::sign_no_aux_rand(&id, &keypair).to_string();
                 e
             };
             // Create A (the adopting group), X (the old parent) and both
@@ -9037,9 +8965,7 @@ mod tests {
                 262144,
             )
             .unwrap();
-            let secp = secp256k1::Secp256k1::new();
-            let keypair =
-                secp256k1::Keypair::from_seckey_byte_array(&secp, [11u8; 32]).expect("test key");
+            let keypair = secp256k1::Keypair::from_secret_bytes([11u8; 32]).expect("test key");
             let pubkey = secp256k1::XOnlyPublicKey::from_keypair(&keypair)
                 .0
                 .to_string();
@@ -9056,7 +8982,7 @@ mod tests {
             };
             ev.id = crate::nips::nip01::compute_id(&ev);
             let raw = ev.id_bytes().expect("test id");
-            ev.sig = secp.sign_schnorr_no_aux_rand(&raw, &keypair).to_string();
+            ev.sig = secp256k1::schnorr::sign_no_aux_rand(&raw, &keypair).to_string();
             assert!(matches!(
                 db.put(ev, stamped).await,
                 crate::db::PutOutcome::Stored
@@ -9111,9 +9037,7 @@ mod tests {
                 262144,
             )
             .unwrap();
-            let secp = secp256k1::Secp256k1::new();
-            let keypair =
-                secp256k1::Keypair::from_seckey_byte_array(&secp, [11u8; 32]).expect("test key");
+            let keypair = secp256k1::Keypair::from_secret_bytes([11u8; 32]).expect("test key");
             let pubkey = secp256k1::XOnlyPublicKey::from_keypair(&keypair)
                 .0
                 .to_string();
@@ -9133,7 +9057,7 @@ mod tests {
             };
             ev.id = crate::nips::nip01::compute_id(&ev);
             let raw = ev.id_bytes().expect("test id");
-            ev.sig = secp.sign_schnorr_no_aux_rand(&raw, &keypair).to_string();
+            ev.sig = secp256k1::schnorr::sign_no_aux_rand(&raw, &keypair).to_string();
             assert!(matches!(
                 db.put(ev, stamped).await,
                 crate::db::PutOutcome::Stored
@@ -9226,17 +9150,13 @@ mod tests {
     #[ignore]
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn bench_ingest_events_per_sec() {
-        fn bench_signed(
-            secp: &secp256k1::Secp256k1<secp256k1::All>,
-            i: usize,
-            now: u64,
-        ) -> crate::event::Event {
+        fn bench_signed(i: usize, now: u64) -> crate::event::Event {
             // `i` spans the run counter, so no two runs reuse (pubkey, id)s.
             // The low bytes vary so every seckey < the curve order n.
             let mut seckey = [0u8; 32];
             seckey[31] = ((i % 250) as u8) + 1;
             seckey[30] = (i / 250) as u8;
-            let keypair = secp256k1::Keypair::from_seckey_byte_array(secp, seckey).unwrap();
+            let keypair = secp256k1::Keypair::from_secret_bytes(seckey).unwrap();
             let pubkey = secp256k1::XOnlyPublicKey::from_keypair(&keypair)
                 .0
                 .to_string();
@@ -9250,14 +9170,13 @@ mod tests {
                 sig: String::new(),
             };
             ev.id = crate::nips::nip01::compute_id(&ev);
-            let sig = secp.sign_schnorr_no_aux_rand(&ev.id_bytes().unwrap(), &keypair);
+            let sig = secp256k1::schnorr::sign_no_aux_rand(&ev.id_bytes().unwrap(), &keypair);
             ev.sig = sig.to_string();
             ev
         }
 
         let relay = build_relay().await;
         let fsync_off_relay = build_relay_cfg(true).await;
-        let secp = relay.secp(); // shares the relay's precomputed context
 
         // Signature-verify cost alone (the dominant per-event CPU work), one
         // batch through the parallel path vs the sequential inline path. The
@@ -9266,14 +9185,12 @@ mod tests {
         {
             const N: usize = 8000;
             let now = crate::util::unix_now();
-            let big: Vec<crate::event::Event> =
-                (0..N).map(|i| bench_signed(secp, i, now)).collect();
+            let big: Vec<crate::event::Event> = (0..N).map(|i| bench_signed(i, now)).collect();
             let t0 = std::time::Instant::now();
             for batch in big.chunks(1000) {
-                let v = crate::relay::validate::verify_signatures_parallel(
-                    Arc::new(batch.to_vec().into_boxed_slice()),
-                    relay.secp_shared(),
-                )
+                let v = crate::relay::validate::verify_signatures_parallel(Arc::new(
+                    batch.to_vec().into_boxed_slice(),
+                ))
                 .await;
                 assert!(v.iter().all(|b| *b));
             }
@@ -9282,7 +9199,7 @@ mod tests {
             for batch in big.chunks(1000) {
                 let v: Vec<bool> = batch
                     .iter()
-                    .map(|e| crate::nips::nip01::verify(e, secp).is_ok())
+                    .map(|e| crate::nips::nip01::verify(e).is_ok())
                     .collect();
                 assert!(v.iter().all(|b| *b));
             }
@@ -9300,9 +9217,8 @@ mod tests {
         let mut run = 0usize;
         for (set, total) in [("flood batch", 1000usize), ("stream batch", 5000usize)] {
             let now = crate::util::unix_now();
-            let pre: Vec<crate::event::Event> = (0..total)
-                .map(|i| bench_signed(secp, run + i, now))
-                .collect();
+            let pre: Vec<crate::event::Event> =
+                (0..total).map(|i| bench_signed(run + i, now)).collect();
             run += total;
             for (name, target) in [("durable", &relay), ("fsync-off", &fsync_off_relay)] {
                 let t0 = std::time::Instant::now();
@@ -9336,9 +9252,7 @@ mod tests {
 
             let relay = build_relay().await;
             let now = crate::util::unix_now();
-            let secp = secp256k1::Secp256k1::new();
-            let kp =
-                |seed: u8| secp256k1::Keypair::from_seckey_byte_array(&secp, [seed; 32]).unwrap();
+            let kp = |seed: u8| secp256k1::Keypair::from_secret_bytes([seed; 32]).unwrap();
             let signed = |seed: u8, kind: u64, content: &str, tags: Vec<Vec<String>>| {
                 let keypair = kp(seed);
                 let mut e = crate::event::Event {
@@ -9354,7 +9268,7 @@ mod tests {
                 };
                 e.id = crate::nips::nip01::compute_id(&e);
                 let id = e.id_bytes().unwrap();
-                e.sig = secp.sign_schnorr_no_aux_rand(&id, &keypair).to_string();
+                e.sig = secp256k1::schnorr::sign_no_aux_rand(&id, &keypair).to_string();
                 e
             };
             let h = |tags: Vec<Vec<String>>| {
@@ -9416,8 +9330,7 @@ mod tests {
 
             let relay = build_relay().await;
             let now = crate::util::unix_now();
-            let secp = secp256k1::Secp256k1::new();
-            let keypair = secp256k1::Keypair::from_seckey_byte_array(&secp, [7u8; 32]).unwrap();
+            let keypair = secp256k1::Keypair::from_secret_bytes([7u8; 32]).unwrap();
             let signed = |kind: u64, content: &str, tags: Vec<Vec<String>>| {
                 let mut e = crate::event::Event {
                     id: String::new(),
@@ -9432,7 +9345,7 @@ mod tests {
                 };
                 e.id = crate::nips::nip01::compute_id(&e);
                 let id = e.id_bytes().unwrap();
-                e.sig = secp.sign_schnorr_no_aux_rand(&id, &keypair).to_string();
+                e.sig = secp256k1::schnorr::sign_no_aux_rand(&id, &keypair).to_string();
                 e
             };
             let h = |tags: Vec<Vec<String>>| {
@@ -9484,8 +9397,7 @@ mod tests {
 
             let relay = build_relay().await;
             let now = crate::util::unix_now();
-            let secp = secp256k1::Secp256k1::new();
-            let keypair = secp256k1::Keypair::from_seckey_byte_array(&secp, [7u8; 32]).unwrap();
+            let keypair = secp256k1::Keypair::from_secret_bytes([7u8; 32]).unwrap();
             let signed = |kind: u64, content: &str, tags: Vec<Vec<String>>| {
                 let mut e = crate::event::Event {
                     id: String::new(),
@@ -9500,7 +9412,7 @@ mod tests {
                 };
                 e.id = crate::nips::nip01::compute_id(&e);
                 let id = e.id_bytes().unwrap();
-                e.sig = secp.sign_schnorr_no_aux_rand(&id, &keypair).to_string();
+                e.sig = secp256k1::schnorr::sign_no_aux_rand(&id, &keypair).to_string();
                 e
             };
             let h = |tags: Vec<Vec<String>>| {
@@ -9552,9 +9464,7 @@ mod tests {
 
             let relay = build_relay().await;
             let now = crate::util::unix_now();
-            let secp = secp256k1::Secp256k1::new();
-            let kp =
-                |seed: u8| secp256k1::Keypair::from_seckey_byte_array(&secp, [seed; 32]).unwrap();
+            let kp = |seed: u8| secp256k1::Keypair::from_secret_bytes([seed; 32]).unwrap();
             let member = secp256k1::XOnlyPublicKey::from_keypair(&kp(8))
                 .0
                 .to_string();
@@ -9573,7 +9483,7 @@ mod tests {
                 };
                 e.id = crate::nips::nip01::compute_id(&e);
                 let id = e.id_bytes().unwrap();
-                e.sig = secp.sign_schnorr_no_aux_rand(&id, &keypair).to_string();
+                e.sig = secp256k1::schnorr::sign_no_aux_rand(&id, &keypair).to_string();
                 e
             };
             let h = |tags: Vec<Vec<String>>| {
@@ -9676,10 +9586,8 @@ mod tests {
 
             let relay = build_relay().await;
             let now = crate::util::unix_now();
-            let secp = secp256k1::Secp256k1::new();
             let sign = |seed: u8, gid: &str| {
-                let keypair =
-                    secp256k1::Keypair::from_seckey_byte_array(&secp, [seed; 32]).unwrap();
+                let keypair = secp256k1::Keypair::from_secret_bytes([seed; 32]).unwrap();
                 let mut e = crate::event::Event {
                     id: String::new(),
                     pubkey: secp256k1::XOnlyPublicKey::from_keypair(&keypair)
@@ -9693,7 +9601,7 @@ mod tests {
                 };
                 e.id = crate::nips::nip01::compute_id(&e);
                 let id = e.id_bytes().unwrap();
-                e.sig = secp.sign_schnorr_no_aux_rand(&id, &keypair).to_string();
+                e.sig = secp256k1::schnorr::sign_no_aux_rand(&id, &keypair).to_string();
                 e
             };
             let gids = ["g0", "g1", "g2", "g3", "g4"];
@@ -9805,8 +9713,7 @@ mod tests {
             assert!(relay.roles.read().await.claims.contains("keep-me"));
 
             let now = crate::util::unix_now();
-            let secp = secp256k1::Secp256k1::new();
-            let keypair = secp256k1::Keypair::from_seckey_byte_array(&secp, [7u8; 32]).unwrap();
+            let keypair = secp256k1::Keypair::from_secret_bytes([7u8; 32]).unwrap();
             let sign = |kind: u64, tags: Vec<Vec<String>>| {
                 let mut e = crate::event::Event {
                     id: String::new(),
@@ -9821,7 +9728,7 @@ mod tests {
                 };
                 e.id = crate::nips::nip01::compute_id(&e);
                 let id = e.id_bytes().unwrap();
-                e.sig = secp.sign_schnorr_no_aux_rand(&id, &keypair).to_string();
+                e.sig = secp256k1::schnorr::sign_no_aux_rand(&id, &keypair).to_string();
                 e
             };
             let create = sign(
@@ -9883,9 +9790,7 @@ mod tests {
 
             let relay = build_relay_with_key(false, &"11".repeat(32)).await;
             let now = crate::util::unix_now();
-            let secp = secp256k1::Secp256k1::new();
-            let keypair =
-                |seed: u8| secp256k1::Keypair::from_seckey_byte_array(&secp, [seed; 32]).unwrap();
+            let keypair = |seed: u8| secp256k1::Keypair::from_secret_bytes([seed; 32]).unwrap();
             let admin = keypair(21);
             let member = keypair(22);
             let member_pk = secp256k1::XOnlyPublicKey::from_keypair(&member)
@@ -9904,7 +9809,7 @@ mod tests {
                     };
                     e.id = crate::nips::nip01::compute_id(&e);
                     let id = e.id_bytes().unwrap();
-                    e.sig = secp.sign_schnorr_no_aux_rand(&id, kp).to_string();
+                    e.sig = secp256k1::schnorr::sign_no_aux_rand(&id, kp).to_string();
                     e
                 };
             let create = sign(
@@ -9971,9 +9876,7 @@ mod tests {
 
             let relay = build_relay_with_key(false, &"11".repeat(32)).await;
             let now = crate::util::unix_now();
-            let secp = secp256k1::Secp256k1::new();
-            let keypair =
-                |seed: u8| secp256k1::Keypair::from_seckey_byte_array(&secp, [seed; 32]).unwrap();
+            let keypair = |seed: u8| secp256k1::Keypair::from_secret_bytes([seed; 32]).unwrap();
             let anon = keypair(31);
             let other = keypair(32);
             let sign = |kp: &secp256k1::Keypair, kind: u64, tags: Vec<Vec<String>>| {
@@ -9988,7 +9891,7 @@ mod tests {
                 };
                 e.id = crate::nips::nip01::compute_id(&e);
                 let id = e.id_bytes().unwrap();
-                e.sig = secp.sign_schnorr_no_aux_rand(&id, kp).to_string();
+                e.sig = secp256k1::schnorr::sign_no_aux_rand(&id, kp).to_string();
                 e
             };
             // The attacker's two groups plus an unrelated one.
@@ -10197,8 +10100,8 @@ mod tests {
             let relay = build_relay_with_key(false, &hex::encode([21u8; 32])).await;
             // The relay signs the membership snapshot, so the join can only
             // be admitted with a relay key configured.
-            let secret = secp256k1::SecretKey::from_byte_array([21u8; 32]).unwrap();
-            let keypair = secp256k1::Keypair::from_seckey_byte_array(relay.secp(), secret.secret_bytes())
+            let secret = secp256k1::SecretKey::from_secret_bytes([21u8; 32]).unwrap();
+            let keypair = secp256k1::Keypair::from_secret_bytes(secret.to_secret_bytes())
                 .unwrap();
             let pubkey = secp256k1::XOnlyPublicKey::from_keypair(&keypair)
                 .0
@@ -10219,9 +10122,7 @@ mod tests {
                 };
                 e.id = crate::nips::nip01::compute_id(&e);
                 let id = e.id_bytes().unwrap();
-                e.sig = relay
-                    .secp()
-                    .sign_schnorr_no_aux_rand(&id, &keypair)
+                e.sig = secp256k1::schnorr::sign_no_aux_rand(&id, &keypair)
                     .to_string();
                 e
             };
@@ -10345,10 +10246,8 @@ mod tests {
             use crate::db::PutOutcome;
 
             let relay = build_relay_with_key(false, &hex::encode([23u8; 32])).await;
-            let secret = secp256k1::SecretKey::from_byte_array([24u8; 32]).unwrap();
-            let keypair =
-                secp256k1::Keypair::from_seckey_byte_array(relay.secp(), secret.secret_bytes())
-                    .unwrap();
+            let secret = secp256k1::SecretKey::from_secret_bytes([24u8; 32]).unwrap();
+            let keypair = secp256k1::Keypair::from_secret_bytes(secret.to_secret_bytes()).unwrap();
             let pubkey = secp256k1::XOnlyPublicKey::from_keypair(&keypair)
                 .0
                 .to_string();
@@ -10366,10 +10265,7 @@ mod tests {
                 };
                 e.id = crate::nips::nip01::compute_id(&e);
                 let id = e.id_bytes().unwrap();
-                e.sig = relay
-                    .secp()
-                    .sign_schnorr_no_aux_rand(&id, &keypair)
-                    .to_string();
+                e.sig = secp256k1::schnorr::sign_no_aux_rand(&id, &keypair).to_string();
                 e
             };
             // A stale join is refused before the code is considered.
@@ -10418,10 +10314,8 @@ mod tests {
                     roles.assignments.insert(format!("{i:064x}"), Vec::new());
                 }
             }
-            let secret = secp256k1::SecretKey::from_byte_array([32u8; 32]).unwrap();
-            let keypair =
-                secp256k1::Keypair::from_seckey_byte_array(relay.secp(), secret.secret_bytes())
-                    .unwrap();
+            let secret = secp256k1::SecretKey::from_secret_bytes([32u8; 32]).unwrap();
+            let keypair = secp256k1::Keypair::from_secret_bytes(secret.to_secret_bytes()).unwrap();
             let pubkey = secp256k1::XOnlyPublicKey::from_keypair(&keypair)
                 .0
                 .to_string();
@@ -10438,10 +10332,7 @@ mod tests {
                 };
                 e.id = crate::nips::nip01::compute_id(&e);
                 let id = e.id_bytes().unwrap();
-                e.sig = relay
-                    .secp()
-                    .sign_schnorr_no_aux_rand(&id, &keypair)
-                    .to_string();
+                e.sig = secp256k1::schnorr::sign_no_aux_rand(&id, &keypair).to_string();
                 e
             };
             let outcome = relay.accept_event(join.clone(), &[], None).await;
@@ -10521,10 +10412,8 @@ mod tests {
                 .relay
                 .max_events_per_min_per_pubkey = 1;
             relay.roles.write().await.add_claim("RATECODE");
-            let secret = secp256k1::SecretKey::from_byte_array([34u8; 32]).unwrap();
-            let keypair =
-                secp256k1::Keypair::from_seckey_byte_array(relay.secp(), secret.secret_bytes())
-                    .unwrap();
+            let secret = secp256k1::SecretKey::from_secret_bytes([34u8; 32]).unwrap();
+            let keypair = secp256k1::Keypair::from_secret_bytes(secret.to_secret_bytes()).unwrap();
             let pubkey = secp256k1::XOnlyPublicKey::from_keypair(&keypair)
                 .0
                 .to_string();
@@ -10541,10 +10430,7 @@ mod tests {
                 };
                 e.id = crate::nips::nip01::compute_id(&e);
                 let id = e.id_bytes().unwrap();
-                e.sig = relay
-                    .secp()
-                    .sign_schnorr_no_aux_rand(&id, &keypair)
-                    .to_string();
+                e.sig = secp256k1::schnorr::sign_no_aux_rand(&id, &keypair).to_string();
                 e
             };
             let first = relay.accept_event(join.clone(), &[], None).await;
@@ -10613,8 +10499,7 @@ mod tests {
 
             let relay = build_relay().await;
             let now = crate::util::unix_now();
-            let secp = secp256k1::Secp256k1::new();
-            let keypair = secp256k1::Keypair::from_seckey_byte_array(&secp, [4u8; 32]).unwrap();
+            let keypair = secp256k1::Keypair::from_secret_bytes([4u8; 32]).unwrap();
             let pubkey = secp256k1::XOnlyPublicKey::from_keypair(&keypair)
                 .0
                 .to_string();
@@ -10630,14 +10515,14 @@ mod tests {
                 };
                 e.id = crate::nips::nip01::compute_id(&e);
                 let id = e.id_bytes().unwrap();
-                e.sig = secp.sign_schnorr_no_aux_rand(&id, &keypair).to_string();
+                e.sig = secp256k1::schnorr::sign_no_aux_rand(&id, &keypair).to_string();
                 e
             };
             let mut create = signed(crate::nips::nip29::CREATE_GROUP, Vec::new());
             create.tags.push(vec!["h".into(), "g1".into()]);
             create.id = crate::nips::nip01::compute_id(&create);
             let id = create.id_bytes().unwrap();
-            create.sig = secp.sign_schnorr_no_aux_rand(&id, &keypair).to_string();
+            create.sig = secp256k1::schnorr::sign_no_aux_rand(&id, &keypair).to_string();
             assert!(matches!(
                 relay.accept_event(create, &[], None).await,
                 PutOutcome::Stored
@@ -10646,7 +10531,7 @@ mod tests {
             edit.tags.push(vec!["h".into(), "g1".into()]);
             edit.id = crate::nips::nip01::compute_id(&edit);
             let id = edit.id_bytes().unwrap();
-            edit.sig = secp.sign_schnorr_no_aux_rand(&id, &keypair).to_string();
+            edit.sig = secp256k1::schnorr::sign_no_aux_rand(&id, &keypair).to_string();
             let edit_id = edit.id.clone();
             assert!(matches!(
                 relay.accept_event(edit, &[], None).await,
@@ -10776,16 +10661,8 @@ mod tests {
             cfg.relay.livekit_api_secret = "secret".into();
         }
         let now = crate::util::unix_now();
-        let secp = secp256k1::Secp256k1::new();
-        let admin = secp256k1::Keypair::from_seckey_byte_array(&secp, [4u8; 32]).unwrap();
-        let create = signed_group_event(
-            &secp,
-            &admin,
-            crate::nips::nip29::CREATE_GROUP,
-            gid,
-            vec![],
-            now,
-        );
+        let admin = secp256k1::Keypair::from_secret_bytes([4u8; 32]).unwrap();
+        let create = signed_group_event(&admin, crate::nips::nip29::CREATE_GROUP, gid, vec![], now);
         assert!(matches!(
             relay.accept_event(create, &[], None).await,
             PutOutcome::Stored
@@ -10793,7 +10670,6 @@ mod tests {
         // A create installs default settings; LiveKit is enabled by a
         // metadata edit (the same path an operator uses).
         let enable = signed_group_event(
-            &secp,
             &admin,
             9002,
             gid,
@@ -10850,22 +10726,13 @@ mod tests {
             cfg.relay.livekit_api_secret = "secret".into();
         }
         let now = crate::util::unix_now();
-        let secp = secp256k1::Secp256k1::new();
-        let admin = secp256k1::Keypair::from_seckey_byte_array(&secp, [4u8; 32]).unwrap();
-        let create = signed_group_event(
-            &secp,
-            &admin,
-            crate::nips::nip29::CREATE_GROUP,
-            gid,
-            vec![],
-            now,
-        );
+        let admin = secp256k1::Keypair::from_secret_bytes([4u8; 32]).unwrap();
+        let create = signed_group_event(&admin, crate::nips::nip29::CREATE_GROUP, gid, vec![], now);
         assert!(matches!(
             relay.accept_event(create, &[], None).await,
             PutOutcome::Stored
         ));
         let enable = signed_group_event(
-            &secp,
             &admin,
             9002,
             gid,
@@ -10932,22 +10799,13 @@ mod tests {
             cfg.relay.livekit_api_secret = "secret".into();
         }
         let now = crate::util::unix_now();
-        let secp = secp256k1::Secp256k1::new();
-        let admin = secp256k1::Keypair::from_seckey_byte_array(&secp, [4u8; 32]).unwrap();
-        let create = signed_group_event(
-            &secp,
-            &admin,
-            crate::nips::nip29::CREATE_GROUP,
-            gid,
-            vec![],
-            now,
-        );
+        let admin = secp256k1::Keypair::from_secret_bytes([4u8; 32]).unwrap();
+        let create = signed_group_event(&admin, crate::nips::nip29::CREATE_GROUP, gid, vec![], now);
         assert!(matches!(
             relay.accept_event(create, &[], None).await,
             PutOutcome::Stored
         ));
         let enable = signed_group_event(
-            &secp,
             &admin,
             9002,
             gid,
@@ -11000,22 +10858,13 @@ mod tests {
         let relay = build_relay_with_key(false, &"01".repeat(32)).await;
         let gid = "g1";
         let now = crate::util::unix_now();
-        let secp = secp256k1::Secp256k1::new();
-        let admin = secp256k1::Keypair::from_seckey_byte_array(&secp, [4u8; 32]).unwrap();
-        let create = signed_group_event(
-            &secp,
-            &admin,
-            crate::nips::nip29::CREATE_GROUP,
-            gid,
-            vec![],
-            now,
-        );
+        let admin = secp256k1::Keypair::from_secret_bytes([4u8; 32]).unwrap();
+        let create = signed_group_event(&admin, crate::nips::nip29::CREATE_GROUP, gid, vec![], now);
         assert!(matches!(
             relay.accept_event(create, &[], None).await,
             PutOutcome::Stored
         ));
         let enable = signed_group_event(
-            &secp,
             &admin,
             9002,
             gid,
@@ -11035,7 +10884,7 @@ mod tests {
 
         // A leave without the `livekit` setting; the database is down so
         // the generated empty 39004 cannot be committed.
-        let leave = signed_group_event(&secp, &admin, 9002, gid, vec![], now + 2);
+        let leave = signed_group_event(&admin, 9002, gid, vec![], now + 2);
         relay.db.shutdown();
         let _ = relay.apply_group_event(&leave, now + 2).await;
         assert_eq!(
@@ -11064,22 +10913,13 @@ mod tests {
             cfg.relay.livekit_api_secret = "secret".into();
         }
         let now = crate::util::unix_now();
-        let secp = secp256k1::Secp256k1::new();
-        let admin = secp256k1::Keypair::from_seckey_byte_array(&secp, [4u8; 32]).unwrap();
-        let create = signed_group_event(
-            &secp,
-            &admin,
-            crate::nips::nip29::CREATE_GROUP,
-            gid,
-            vec![],
-            now,
-        );
+        let admin = secp256k1::Keypair::from_secret_bytes([4u8; 32]).unwrap();
+        let create = signed_group_event(&admin, crate::nips::nip29::CREATE_GROUP, gid, vec![], now);
         assert!(matches!(
             relay.accept_event(create, &[], None).await,
             PutOutcome::Stored
         ));
         let enable = signed_group_event(
-            &secp,
             &admin,
             9002,
             gid,
@@ -11119,22 +10959,13 @@ mod tests {
             cfg.relay.livekit_api_secret = "secret".into();
         }
         let now = crate::util::unix_now();
-        let secp = secp256k1::Secp256k1::new();
-        let admin = secp256k1::Keypair::from_seckey_byte_array(&secp, [4u8; 32]).unwrap();
-        let create = signed_group_event(
-            &secp,
-            &admin,
-            crate::nips::nip29::CREATE_GROUP,
-            gid,
-            vec![],
-            now,
-        );
+        let admin = secp256k1::Keypair::from_secret_bytes([4u8; 32]).unwrap();
+        let create = signed_group_event(&admin, crate::nips::nip29::CREATE_GROUP, gid, vec![], now);
         assert!(matches!(
             relay.accept_event(create, &[], None).await,
             PutOutcome::Stored
         ));
         let enable = signed_group_event(
-            &secp,
             &admin,
             9002,
             gid,
@@ -11180,16 +11011,8 @@ mod tests {
         let relay = build_relay_with_key(false, &"01".repeat(32)).await;
         let gid = "g1";
         let now = crate::util::unix_now();
-        let secp = secp256k1::Secp256k1::new();
-        let admin = secp256k1::Keypair::from_seckey_byte_array(&secp, [4u8; 32]).unwrap();
-        let create = signed_group_event(
-            &secp,
-            &admin,
-            crate::nips::nip29::CREATE_GROUP,
-            gid,
-            vec![],
-            now,
-        );
+        let admin = secp256k1::Keypair::from_secret_bytes([4u8; 32]).unwrap();
+        let create = signed_group_event(&admin, crate::nips::nip29::CREATE_GROUP, gid, vec![], now);
         assert!(matches!(
             relay.accept_event(create, &[], None).await,
             PutOutcome::Stored
@@ -11236,7 +11059,6 @@ mod tests {
 
     /// A NIP-01-signed group event for the rebuild tests.
     fn signed_group_event(
-        secp: &secp256k1::Secp256k1<secp256k1::All>,
         keypair: &secp256k1::Keypair,
         kind: u64,
         gid: &str,
@@ -11257,7 +11079,7 @@ mod tests {
         e.tags.append(&mut tags);
         e.id = crate::nips::nip01::compute_id(&e);
         let id = e.id_bytes().unwrap();
-        e.sig = secp.sign_schnorr_no_aux_rand(&id, keypair).to_string();
+        e.sig = secp256k1::schnorr::sign_no_aux_rand(&id, keypair).to_string();
         e
     }
 
@@ -11376,8 +11198,7 @@ mod tests {
         // id) and miss the other store, leaving deleted role grants live.
         // The relevance check is per family, so one event per side suffices.
         let relay = build_relay().await;
-        let secp = secp256k1::Secp256k1::new();
-        let keypair = secp256k1::Keypair::from_seckey_byte_array(&secp, [7u8; 32]).unwrap();
+        let keypair = secp256k1::Keypair::from_secret_bytes([7u8; 32]).unwrap();
         let now = crate::util::unix_now();
         let mut target_ids = Vec::new();
         // The role event is older than the 64 group events: a single capped
@@ -11385,7 +11206,6 @@ mod tests {
         // could not mark the role store.
         for i in 0..64u64 {
             let event = signed_group_event(
-                &secp,
                 &keypair,
                 9000,
                 "g1",
@@ -11396,7 +11216,6 @@ mod tests {
             relay.db.put(event, now).await;
         }
         let role = signed_group_event(
-            &secp,
             &keypair,
             crate::nips::nip43::ROLE_DEFINITION,
             "g1",
@@ -11409,7 +11228,7 @@ mod tests {
         for id in &target_ids {
             tags.push(vec!["e".into(), id.clone()]);
         }
-        let deletion = signed_group_event(&secp, &keypair, 5, "g1", tags, now);
+        let deletion = signed_group_event(&keypair, 5, "g1", tags, now);
         let touch = relay.deletion_touches_group_state(&deletion).await;
         assert!(
             touch.groups && touch.roles,
@@ -11425,12 +11244,10 @@ mod tests {
         // one deletion to a global NIP-29 fail-closed mark. The pre-check is
         // now author-scoped for NIP-09 (and group-scoped for 9005).
         let relay = build_relay().await;
-        let secp = secp256k1::Secp256k1::new();
-        let author = secp256k1::Keypair::from_seckey_byte_array(&secp, [7u8; 32]).unwrap();
-        let foreign = secp256k1::Keypair::from_seckey_byte_array(&secp, [8u8; 32]).unwrap();
+        let author = secp256k1::Keypair::from_secret_bytes([7u8; 32]).unwrap();
+        let foreign = secp256k1::Keypair::from_secret_bytes([8u8; 32]).unwrap();
         let now = crate::util::unix_now();
         let own = signed_group_event(
-            &secp,
             &author,
             9000,
             "own-group",
@@ -11441,7 +11258,6 @@ mod tests {
         let mut tags = vec![vec!["e".into(), own.id.clone()]];
         for i in 0..1100u64 {
             let event = signed_group_event(
-                &secp,
                 &foreign,
                 9000,
                 &format!("foreign-{i}"),
@@ -11451,7 +11267,7 @@ mod tests {
             relay.db.put(event.clone(), now).await;
             tags.push(vec!["e".into(), event.id]);
         }
-        let deletion = signed_group_event(&secp, &author, 5, "own-group", tags, now);
+        let deletion = signed_group_event(&author, 5, "own-group", tags, now);
         let touch = relay.deletion_touches_group_state(&deletion).await;
         assert!(touch.groups, "the author's own state event is relevant");
         assert!(
@@ -11470,10 +11286,8 @@ mod tests {
         // forever. The worker re-seeds the captured tombstones.
         let relay = build_relay().await;
         let now = crate::util::unix_now();
-        let secp = secp256k1::Secp256k1::new();
-        let admin = secp256k1::Keypair::from_seckey_byte_array(&secp, [4u8; 32]).unwrap();
+        let admin = secp256k1::Keypair::from_secret_bytes([4u8; 32]).unwrap();
         let create = signed_group_event(
-            &secp,
             &admin,
             crate::nips::nip29::CREATE_GROUP,
             "g1",
@@ -11484,14 +11298,8 @@ mod tests {
             relay.accept_event(create, &[], None).await,
             crate::db::PutOutcome::Stored
         ));
-        let delete = signed_group_event(
-            &secp,
-            &admin,
-            crate::nips::nip29::DELETE_GROUP,
-            "g1",
-            vec![],
-            now,
-        );
+        let delete =
+            signed_group_event(&admin, crate::nips::nip29::DELETE_GROUP, "g1", vec![], now);
         assert!(matches!(
             relay.accept_event(delete, &[], None).await,
             crate::db::PutOutcome::Stored
@@ -11504,7 +11312,6 @@ mod tests {
             "the rebuild must finish"
         );
         let recreate = signed_group_event(
-            &secp,
             &admin,
             crate::nips::nip29::CREATE_GROUP,
             "g1",
@@ -11592,25 +11399,17 @@ mod tests {
             "the seeded pending purge must be visible at startup"
         );
 
-        let secp = secp256k1::Secp256k1::new();
-        let admin = secp256k1::Keypair::from_seckey_byte_array(&secp, [4u8; 32]).unwrap();
+        let admin = secp256k1::Keypair::from_secret_bytes([4u8; 32]).unwrap();
         let create = signed_group_event(
-            &secp,
             &admin,
             crate::nips::nip29::CREATE_GROUP,
             "g1",
             vec![],
             now.saturating_sub(10),
         );
-        let message = signed_group_event(&secp, &admin, 1, "g1", vec![], now.saturating_sub(10));
-        let delete = signed_group_event(
-            &secp,
-            &admin,
-            crate::nips::nip29::DELETE_GROUP,
-            "g1",
-            vec![],
-            now,
-        );
+        let message = signed_group_event(&admin, 1, "g1", vec![], now.saturating_sub(10));
+        let delete =
+            signed_group_event(&admin, crate::nips::nip29::DELETE_GROUP, "g1", vec![], now);
         for event in [&create, &message, &delete] {
             assert_eq!(relay.db.put(event.clone(), now).await, PutOutcome::Stored);
         }
@@ -11671,7 +11470,6 @@ mod tests {
         );
 
         let recreate = signed_group_event(
-            &secp,
             &admin,
             crate::nips::nip29::CREATE_GROUP,
             "g1",
@@ -11966,10 +11764,8 @@ mod tests {
         let expiry = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
         let store = Store::open(&cfg.database, std::sync::Arc::clone(&expiry), 128)
             .expect("the scratch store opens");
-        let secp = secp256k1::Secp256k1::new();
-        let admin = secp256k1::Keypair::from_seckey_byte_array(&secp, [4u8; 32]).unwrap();
+        let admin = secp256k1::Keypair::from_secret_bytes([4u8; 32]).unwrap();
         let create = signed_group_event(
-            &secp,
             &admin,
             crate::nips::nip29::CREATE_GROUP,
             "g1",
@@ -11977,24 +11773,17 @@ mod tests {
             now.saturating_sub(10),
         );
         let create_id: [u8; 32] = create.id_bytes().expect("a valid id");
-        let message = signed_group_event(&secp, &admin, 1, "g1", vec![], now.saturating_sub(10));
-        let delete = signed_group_event(
-            &secp,
-            &admin,
-            crate::nips::nip29::DELETE_GROUP,
-            "g1",
-            vec![],
-            now,
-        );
+        let message = signed_group_event(&admin, 1, "g1", vec![], now.saturating_sub(10));
+        let delete =
+            signed_group_event(&admin, crate::nips::nip29::DELETE_GROUP, "g1", vec![], now);
         let recreate = signed_group_event(
-            &secp,
             &admin,
             crate::nips::nip29::CREATE_GROUP,
             "g1",
             vec![],
             now.saturating_add(1),
         );
-        let new_post = signed_group_event(&secp, &admin, 1, "g1", vec![], now.saturating_add(2));
+        let new_post = signed_group_event(&admin, 1, "g1", vec![], now.saturating_add(2));
         {
             // The events were imported before the purge started: store them
             // first, then seed what a bounded `purge_group_until`'s first
@@ -12105,26 +11894,18 @@ mod tests {
         // the in-memory membership is rebuilt from the survivors.
         let relay = build_relay().await;
         let now = crate::util::unix_now();
-        let secp = secp256k1::Secp256k1::new();
-        let admin = secp256k1::Keypair::from_seckey_byte_array(&secp, [4u8; 32]).unwrap();
-        let member_pair = secp256k1::Keypair::from_seckey_byte_array(&secp, [8u8; 32]).unwrap();
+        let admin = secp256k1::Keypair::from_secret_bytes([4u8; 32]).unwrap();
+        let member_pair = secp256k1::Keypair::from_secret_bytes([8u8; 32]).unwrap();
         let member = secp256k1::XOnlyPublicKey::from_keypair(&member_pair)
             .0
             .to_string();
-        let create = signed_group_event(
-            &secp,
-            &admin,
-            crate::nips::nip29::CREATE_GROUP,
-            "g1",
-            vec![],
-            now,
-        );
+        let create =
+            signed_group_event(&admin, crate::nips::nip29::CREATE_GROUP, "g1", vec![], now);
         assert!(matches!(
             relay.accept_event(create, &[], None).await,
             crate::db::PutOutcome::Stored
         ));
         let grant = signed_group_event(
-            &secp,
             &admin,
             9000,
             "g1",
@@ -12145,14 +11926,7 @@ mod tests {
                 .unwrap()
                 .is_member(&member)
         );
-        let delete = signed_group_event(
-            &secp,
-            &admin,
-            9005,
-            "g1",
-            vec![vec!["e".into(), grant_id]],
-            now,
-        );
+        let delete = signed_group_event(&admin, 9005, "g1", vec![vec!["e".into(), grant_id]], now);
         assert!(matches!(
             relay.accept_event(delete, &[], None).await,
             crate::db::PutOutcome::Stored
@@ -12272,20 +12046,13 @@ mod tests {
         rt.block_on(async {
             let relay = build_relay().await;
             let now = crate::util::unix_now();
-            let secp = secp256k1::Secp256k1::new();
-            let admin = secp256k1::Keypair::from_seckey_byte_array(&secp, [4u8; 32]).unwrap();
-            let member_pair = secp256k1::Keypair::from_seckey_byte_array(&secp, [8u8; 32]).unwrap();
+            let admin = secp256k1::Keypair::from_secret_bytes([4u8; 32]).unwrap();
+            let member_pair = secp256k1::Keypair::from_secret_bytes([8u8; 32]).unwrap();
             let member = secp256k1::XOnlyPublicKey::from_keypair(&member_pair)
                 .0
                 .to_string();
-            let create = signed_group_event(
-                &secp,
-                &admin,
-                crate::nips::nip29::CREATE_GROUP,
-                "g1",
-                vec![],
-                now,
-            );
+            let create =
+                signed_group_event(&admin, crate::nips::nip29::CREATE_GROUP, "g1", vec![], now);
             relay
                 .groups
                 .write()
@@ -12300,7 +12067,6 @@ mod tests {
                 buffer.retry = false;
             }
             let grant = signed_group_event(
-                &secp,
                 &admin,
                 9000,
                 "g1",
@@ -12353,20 +12119,13 @@ mod tests {
         rt.block_on(async {
             let relay = build_relay().await;
             let now = crate::util::unix_now();
-            let secp = secp256k1::Secp256k1::new();
-            let admin = secp256k1::Keypair::from_seckey_byte_array(&secp, [4u8; 32]).unwrap();
-            let member_pair = secp256k1::Keypair::from_seckey_byte_array(&secp, [8u8; 32]).unwrap();
+            let admin = secp256k1::Keypair::from_secret_bytes([4u8; 32]).unwrap();
+            let member_pair = secp256k1::Keypair::from_secret_bytes([8u8; 32]).unwrap();
             let member = secp256k1::XOnlyPublicKey::from_keypair(&member_pair)
                 .0
                 .to_string();
-            let create = signed_group_event(
-                &secp,
-                &admin,
-                crate::nips::nip29::CREATE_GROUP,
-                "g1",
-                vec![],
-                now,
-            );
+            let create =
+                signed_group_event(&admin, crate::nips::nip29::CREATE_GROUP, "g1", vec![], now);
             relay
                 .groups
                 .write()
@@ -12386,7 +12145,6 @@ mod tests {
                 }
             }
             let grant = signed_group_event(
-                &secp,
                 &admin,
                 9000,
                 "g1",

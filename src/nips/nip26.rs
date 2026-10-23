@@ -11,7 +11,6 @@
 //! unknown, so that would be a deliberate protocol extension, not a
 //! compatibility fix.
 
-use secp256k1::Secp256k1;
 use sha2::{Digest, Sha256};
 
 use crate::event::Event;
@@ -109,7 +108,7 @@ pub fn conditions_allow(conditions: &str, kind: u64, created_at: u64) -> bool {
 
 /// Verifies a delegation tag when present. Events without a delegation tag
 /// are always accepted (they are signed by their own key).
-pub fn verify(event: &Event, secp: &Secp256k1<secp256k1::All>) -> bool {
+pub fn verify(event: &Event) -> bool {
     let Some([delegator, conditions, sig]) = delegation(event) else {
         return true;
     };
@@ -135,7 +134,7 @@ pub fn verify(event: &Event, secp: &Secp256k1<secp256k1::All>) -> bool {
     };
     let sig =
         secp256k1::schnorr::Signature::from_byte_array(sig.try_into().expect("length checked"));
-    secp.verify_schnorr(&sig, &message, &pk).is_ok()
+    secp256k1::schnorr::verify(&sig, &message, &pk).is_ok()
         && conditions_allow(conditions, event.kind, event.created_at)
 }
 
@@ -201,8 +200,7 @@ mod tests {
             content: String::new(),
             sig: "c".repeat(128),
         };
-        let secp = Secp256k1::new();
-        assert!(verify(&ev, &secp));
+        assert!(verify(&ev));
     }
 
     #[test]
@@ -210,7 +208,6 @@ mod tests {
         // The NIP-26 spec example: delegator 8e0d3d3e... grants the
         // delegatee 477318cf... permission with
         // "kind=1&created_at>1674834236&created_at<1677426236".
-        let secp = Secp256k1::new();
         let delegator =
             "8e0d3d3eb2881ec137a11debe736a9086715a8c8beeeda615780064d68bc25dd".to_string();
         let delegatee =
@@ -226,11 +223,8 @@ mod tests {
                 .unwrap()
                 .try_into()
                 .unwrap();
-        let delegator_key =
-            secp256k1::Keypair::from_seckey_byte_array(&secp, delegator_secret).unwrap();
-        let token = secp
-            .sign_schnorr_no_aux_rand(&message, &delegator_key)
-            .to_string();
+        let delegator_key = secp256k1::Keypair::from_secret_bytes(delegator_secret).unwrap();
+        let token = secp256k1::schnorr::sign_no_aux_rand(&message, &delegator_key).to_string();
 
         let ev = Event {
             id: String::new(),
@@ -246,7 +240,7 @@ mod tests {
             content: "Hello, world!".into(),
             sig: String::new(),
         };
-        assert!(verify(&ev, &secp));
+        assert!(verify(&ev));
 
         // A token signed over the delegator's own pubkey (the previous,
         // incorrect behavior) must fail.
@@ -255,11 +249,10 @@ mod tests {
             let mut hasher = Sha256::new();
             hasher.update(payload.as_bytes());
             let message: [u8; 32] = hasher.finalize().into();
-            secp.sign_schnorr_no_aux_rand(&message, &delegator_key)
-                .to_string()
+            secp256k1::schnorr::sign_no_aux_rand(&message, &delegator_key).to_string()
         };
         let mut bad_ev = ev.clone();
         bad_ev.tags[0][3] = bad_token;
-        assert!(!verify(&bad_ev, &secp));
+        assert!(!verify(&bad_ev));
     }
 }

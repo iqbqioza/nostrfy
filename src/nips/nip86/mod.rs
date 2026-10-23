@@ -1560,7 +1560,6 @@ async fn rpc_authenticated(
         && let Some(verified) = nip98::verify(
             encoded,
             Some(&cfg.rpc.admin_pubkey),
-            relay.secp(),
             true,
             Some(&payload),
             "POST",
@@ -1583,15 +1582,9 @@ async fn rpc_authenticated(
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(nip98::strip_nostr_scheme)
-        && let Some(verified) = nip98::verify(
-            encoded,
-            None,
-            relay.secp(),
-            true,
-            Some(&payload),
-            "POST",
-            |url| nip98::matches_request_url(url, &cfg.relay_identity(), uri.path(), uri.query()),
-        )
+        && let Some(verified) = nip98::verify(encoded, None, true, Some(&payload), "POST", |url| {
+            nip98::matches_request_url(url, &cfg.relay_identity(), uri.path(), uri.query())
+        })
     {
         let access = relay.access.read().await;
         // A management identity's authorization is protected from the
@@ -1824,8 +1817,7 @@ mod tests {
         use base64::Engine as _;
         static SALT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let salt = SALT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let secp = secp256k1::Secp256k1::new();
-        let keypair = secp256k1::Keypair::from_seckey_byte_array(&secp, *seckey).unwrap();
+        let keypair = secp256k1::Keypair::from_secret_bytes(*seckey).unwrap();
         let pubkey = secp256k1::XOnlyPublicKey::from_keypair(&keypair)
             .0
             .to_string();
@@ -1856,7 +1848,7 @@ mod tests {
         };
         ev.id = crate::nips::nip01::compute_id(&ev);
         let id = ev.id_bytes().unwrap();
-        ev.sig = secp.sign_schnorr_no_aux_rand(&id, &keypair).to_string();
+        ev.sig = secp256k1::schnorr::sign_no_aux_rand(&id, &keypair).to_string();
         let encoded =
             base64::engine::general_purpose::STANDARD.encode(serde_json::to_string(&ev).unwrap());
         let mut headers = HeaderMap::new();
@@ -2213,8 +2205,7 @@ mod tests {
         // pre-bans it (future publications are refused), and unbanning
         // a never-banned id is a no-op success. Only a genuine store
         // failure surfaces an error.
-        let secp = secp256k1::Secp256k1::new();
-        let keypair = secp256k1::Keypair::from_seckey_byte_array(&secp, [13u8; 32]).unwrap();
+        let keypair = secp256k1::Keypair::from_secret_bytes([13u8; 32]).unwrap();
         let mut banned_event = crate::event::Event {
             id: String::new(),
             pubkey: secp256k1::XOnlyPublicKey::from_keypair(&keypair)
@@ -2229,7 +2220,7 @@ mod tests {
         banned_event.id = crate::nips::nip01::compute_id(&banned_event);
         let id = banned_event.id.clone();
         let raw = banned_event.id_bytes().unwrap();
-        banned_event.sig = secp.sign_schnorr_no_aux_rand(&raw, &keypair).to_string();
+        banned_event.sig = secp256k1::schnorr::sign_no_aux_rand(&raw, &keypair).to_string();
         assert_eq!(
             relay.db.put(banned_event, crate::util::unix_now()).await,
             crate::db::PutOutcome::Stored
@@ -3038,8 +3029,7 @@ mod tests {
         let listed = rpc_result_of(rpc_call(&relay, "listclaims", vec![]).await).await;
         assert_eq!(listed, json!(["welcome-1"]));
         // A join with the code is admitted (OK true, welcome).
-        let secp = secp256k1::Secp256k1::new();
-        let keypair = secp256k1::Keypair::from_seckey_byte_array(&secp, [21u8; 32]).unwrap();
+        let keypair = secp256k1::Keypair::from_secret_bytes([21u8; 32]).unwrap();
         let pubkey = secp256k1::XOnlyPublicKey::from_keypair(&keypair)
             .0
             .to_string();
@@ -3055,7 +3045,7 @@ mod tests {
         let mut ev = join();
         ev.id = crate::nips::nip01::compute_id(&ev);
         let id = ev.id_bytes().unwrap();
-        ev.sig = secp.sign_schnorr_no_aux_rand(&id, &keypair).to_string();
+        ev.sig = secp256k1::schnorr::sign_no_aux_rand(&id, &keypair).to_string();
         assert!(
             matches!(
                 relay.accept_event(ev, std::slice::from_ref(&pubkey), None).await,
@@ -3071,7 +3061,7 @@ mod tests {
         let mut ev = join();
         ev.id = crate::nips::nip01::compute_id(&ev);
         let id = ev.id_bytes().unwrap();
-        ev.sig = secp.sign_schnorr_no_aux_rand(&id, &keypair).to_string();
+        ev.sig = secp256k1::schnorr::sign_no_aux_rand(&id, &keypair).to_string();
         assert!(
             matches!(
                 relay.accept_event(ev, std::slice::from_ref(&pubkey), None).await,
@@ -3080,7 +3070,7 @@ mod tests {
             "a member rejoining gets the duplicate verdict"
         );
         // A bogus code is refused with the spec's wording.
-        let other = secp256k1::Keypair::from_seckey_byte_array(&secp, [22u8; 32]).unwrap();
+        let other = secp256k1::Keypair::from_secret_bytes([22u8; 32]).unwrap();
         let other_pk = secp256k1::XOnlyPublicKey::from_keypair(&other)
             .0
             .to_string();
@@ -3095,7 +3085,7 @@ mod tests {
         };
         ev.id = crate::nips::nip01::compute_id(&ev);
         let id = ev.id_bytes().unwrap();
-        ev.sig = secp.sign_schnorr_no_aux_rand(&id, &other).to_string();
+        ev.sig = secp256k1::schnorr::sign_no_aux_rand(&id, &other).to_string();
         assert!(
             matches!(
                 relay.accept_event(ev, std::slice::from_ref(&other_pk), None).await,

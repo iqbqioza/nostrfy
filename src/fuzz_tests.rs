@@ -167,7 +167,6 @@ mod tests {
         // gate of the accept path): random field contents must fail closed
         // with an error, never panic. Half the events get a consistent id
         // so the Schnorr verification itself runs on random signatures.
-        let secp = secp256k1::Secp256k1::new();
         let mut rng = Rng::new(0x5eed_0007);
         let mut reached_signature = 0usize;
         for _ in 0..600 {
@@ -185,7 +184,7 @@ mod tests {
                 }
             }
             assert!(
-                crate::nips::nip01::verify(&event, &secp).is_err(),
+                crate::nips::nip01::verify(&event).is_err(),
                 "random events must never verify"
             );
         }

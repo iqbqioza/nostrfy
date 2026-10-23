@@ -10470,23 +10470,20 @@ fn delegated_address_tombstone_survives_a_mid_walk_crash() {
     // versions) still blocks re-publication of old versions. Unmatched
     // delegations still leave no tombstone. Backward compatible: no pending
     // format change, the tombstone key/value are unchanged.
-    use secp256k1::{Keypair, Secp256k1};
+    use secp256k1::Keypair;
     use sha2::{Digest, Sha256};
     let cfg = config();
     let (db, faults) = open_with_faults(&cfg);
     let rt = tokio::runtime::Runtime::new().unwrap();
     let now = 1_700_000_000u64;
-    let secp = Secp256k1::new();
-    let delegator_kp = Keypair::from_seckey_byte_array(&secp, [11u8; 32]).unwrap();
-    let delegatee_kp = Keypair::from_seckey_byte_array(&secp, [12u8; 32]).unwrap();
-    let delegator = hex::encode(delegator_kp.x_only_public_key().0.serialize());
-    let delegatee = hex::encode(delegatee_kp.x_only_public_key().0.serialize());
+    let delegator_kp = Keypair::from_secret_bytes([11u8; 32]).unwrap();
+    let delegatee_kp = Keypair::from_secret_bytes([12u8; 32]).unwrap();
+    let delegator = hex::encode(delegator_kp.x_only_public_key().0.to_byte_array());
+    let delegatee = hex::encode(delegatee_kp.x_only_public_key().0.to_byte_array());
     let conditions = "kind=30001";
     let payload = format!("nostr:delegation:{delegatee}:{conditions}");
     let message: [u8; 32] = Sha256::digest(payload.as_bytes()).into();
-    let token = secp
-        .sign_schnorr_no_aux_rand(&message, &delegator_kp)
-        .to_string();
+    let token = secp256k1::schnorr::sign_no_aux_rand(&message, &delegator_kp).to_string();
     let mut ev = authored_event(
         30001,
         &delegatee,

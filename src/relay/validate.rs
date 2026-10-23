@@ -72,9 +72,6 @@ const MAX_PARALLEL_VERIFY_THREADS: usize = 8;
 /// worker would cap ingestion throughput at one core. Small batches fall back
 /// to the inline sequential verify (the same call, same verdicts).
 ///
-/// `Secp256k1<All>` is `Send + Sync` (the precomputed context is immutable),
-/// so the shared context can verify on several threads at once.
-///
 /// **Off the reactor, on a reused pool.** This is pure CPU work, so it runs on
 /// `spawn_blocking` and never on a runtime worker: the workers drive every
 /// WebSocket connection, and a worker parked in a signature check cannot read
@@ -88,10 +85,7 @@ const MAX_PARALLEL_VERIFY_THREADS: usize = 8;
 /// of borrowed, which is what makes it `'static` for the blocking tasks; the
 /// caller recovers the `Vec` with [`Self::reclaim_events`] once every task has
 /// been awaited, so no event is cloned.
-pub(crate) async fn verify_signatures_parallel(
-    events: Arc<Box<[Event]>>,
-    secp: Arc<secp256k1::Secp256k1<secp256k1::All>>,
-) -> Vec<bool> {
+pub(crate) async fn verify_signatures_parallel(events: Arc<Box<[Event]>>) -> Vec<bool> {
     let total = events.len();
     // ONE blocking task per batch, not one per chunk. The intra-batch fan-out
     // stays where it belongs — on the scoped threads inside the blocking
@@ -100,7 +94,7 @@ pub(crate) async fn verify_signatures_parallel(
     // concurrent publishers that is what grows tokio's blocking pool (one
     // thread per concurrent task, up to its 512-thread ceiling) instead of
     // reusing a couple of threads per in-flight batch.
-    tokio::task::spawn_blocking(move || verify_chunks(&events, &secp))
+    tokio::task::spawn_blocking(move || verify_chunks(&events))
         .await
         .unwrap_or_else(|e| {
             // The task never ran (runtime shutting down): fail closed rather
@@ -112,34 +106,28 @@ pub(crate) async fn verify_signatures_parallel(
 
 /// Verifies every signature, fanning out over the machine's cores for a large
 /// batch and staying sequential for a small one. Runs on a blocking thread.
-fn verify_chunks(events: &[Event], secp: &secp256k1::Secp256k1<secp256k1::All>) -> Vec<bool> {
+fn verify_chunks(events: &[Event]) -> Vec<bool> {
     let cpus = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
     let threads = cpus.min(MAX_PARALLEL_VERIFY_THREADS);
     if events.len() < MIN_PARALLEL_VERIFY || threads < 2 {
-        return events
-            .iter()
-            .map(|e| nip01::verify(e, secp).is_ok())
-            .collect();
+        return events.iter().map(|e| nip01::verify(e).is_ok()).collect();
     }
     let per = events.len().div_ceil(threads);
     let chunk_lens: Vec<usize> = events.chunks(per).map(<[Event]>::len).collect();
     std::thread::scope(|s| {
         let handles: Vec<_> = events
             .chunks(per)
-            .map(|chunk| s.spawn(move || verify_chunk(chunk, secp)))
+            .map(|chunk| s.spawn(move || verify_chunk(chunk)))
             .collect();
         join_verdicts(handles, &chunk_lens)
     })
 }
 
 /// Verifies one chunk, returning one verdict per event.
-fn verify_chunk(events: &[Event], secp: &secp256k1::Secp256k1<secp256k1::All>) -> Vec<bool> {
-    events
-        .iter()
-        .map(|e| nip01::verify(e, secp).is_ok())
-        .collect()
+fn verify_chunk(events: &[Event]) -> Vec<bool> {
+    events.iter().map(|e| nip01::verify(e).is_ok()).collect()
 }
 
 /// Joins the per-chunk verification threads, preserving the
@@ -756,7 +744,7 @@ impl super::Relay {
         match verified {
             Some(true) => {}
             Some(false) => bail!("invalid: signature verification failed"),
-            None => nip01::verify(event, self.secp())
+            None => nip01::verify(event)
                 .map_err(|_| anyhow!("invalid: signature verification failed"))?,
         }
         // NIP-01: hex fields are lowercase by convention. An uppercase-hex
@@ -780,7 +768,7 @@ impl super::Relay {
         // a forged `delegation` tag index the event under an arbitrary
         // delegator's pubkey (author-feed impersonation). `verify` checks the
         // first well-formed delegation tag, the only one the read paths use.
-        if !nip26::verify(event, self.secp()) {
+        if !nip26::verify(event) {
             bail!("invalid: delegation failed");
         }
 
@@ -940,7 +928,7 @@ mod tests {
     use crate::config::{AccessControl, Config};
     use crate::event::Event;
     use crate::util::unix_now;
-    use secp256k1::{Keypair, Secp256k1, XOnlyPublicKey};
+    use secp256k1::{Keypair, XOnlyPublicKey};
     use std::sync::Arc;
     use tokio::sync::RwLock;
 
@@ -986,8 +974,7 @@ mod tests {
         rt.block_on(async {
             use std::sync::atomic::{AtomicBool, Ordering};
 
-            let secp = Arc::new(Secp256k1::new());
-            let keypair = Keypair::from_seckey_byte_array(&secp, [9u8; 32]).unwrap();
+            let keypair = Keypair::from_secret_bytes([9u8; 32]).unwrap();
             let pubkey = XOnlyPublicKey::from_keypair(&keypair).0.to_string();
             // Enough events to take the fan-out branch (over
             // MIN_PARALLEL_VERIFY); the exact count only has to be non-zero,
@@ -1006,7 +993,7 @@ mod tests {
                 };
                 e.id = crate::nips::nip01::compute_id(&e);
                 let id = e.id_bytes().unwrap();
-                e.sig = secp.sign_schnorr_no_aux_rand(&id, &keypair).to_string();
+                e.sig = secp256k1::schnorr::sign_no_aux_rand(&id, &keypair).to_string();
                 events.push(e);
             }
 
@@ -1019,7 +1006,7 @@ mod tests {
             });
 
             let verdicts =
-                super::verify_signatures_parallel(Arc::new(events.into_boxed_slice()), secp).await;
+                super::verify_signatures_parallel(Arc::new(events.into_boxed_slice())).await;
 
             assert!(
                 progressed.load(Ordering::SeqCst),
@@ -1078,8 +1065,7 @@ mod tests {
     }
 
     fn signed_with_seed(seed: u8, kind: u64, tags: Vec<Vec<String>>) -> Event {
-        let secp = Secp256k1::new();
-        let keypair = Keypair::from_seckey_byte_array(&secp, [seed; 32]).unwrap();
+        let keypair = Keypair::from_secret_bytes([seed; 32]).unwrap();
         let pubkey = XOnlyPublicKey::from_keypair(&keypair).0.to_string();
         let mut ev = Event {
             id: String::new(),
@@ -1092,7 +1078,7 @@ mod tests {
         };
         ev.id = crate::nips::nip01::compute_id(&ev);
         let id = ev.id_bytes().unwrap();
-        ev.sig = secp.sign_schnorr_no_aux_rand(&id, &keypair).to_string();
+        ev.sig = secp256k1::schnorr::sign_no_aux_rand(&id, &keypair).to_string();
         ev
     }
 
@@ -1826,11 +1812,10 @@ mod tests {
             // `invalid:` prefix (the spec's example), not `mute:`.
             let mut future = signed(1, vec![]);
             future.created_at = now + 10_000;
-            let secp = Secp256k1::new();
-            let keypair = Keypair::from_seckey_byte_array(&secp, [3u8; 32]).unwrap();
+            let keypair = Keypair::from_secret_bytes([3u8; 32]).unwrap();
             future.id = crate::nips::nip01::compute_id(&future);
             let id = future.id_bytes().unwrap();
-            future.sig = secp.sign_schnorr_no_aux_rand(&id, &keypair).to_string();
+            future.sig = secp256k1::schnorr::sign_no_aux_rand(&id, &keypair).to_string();
             let err = relay
                 .validate_base(&cfg, &future, now, &[], None)
                 .unwrap_err();
@@ -2384,9 +2369,8 @@ mod tests {
             let cfg = relay.config.read().await;
             let access = AccessControl::default();
             let now = unix_now();
-            let secp = Secp256k1::new();
             let h = |kind: u64, tags: Vec<Vec<String>>| {
-                let keypair = Keypair::from_seckey_byte_array(&secp, [5u8; 32]).unwrap();
+                let keypair = Keypair::from_secret_bytes([5u8; 32]).unwrap();
                 let pubkey = XOnlyPublicKey::from_keypair(&keypair).0.to_string();
                 let mut e = Event {
                     id: String::new(),
@@ -2399,7 +2383,7 @@ mod tests {
                 };
                 e.id = crate::nips::nip01::compute_id(&e);
                 let id = e.id_bytes().unwrap();
-                e.sig = secp.sign_schnorr_no_aux_rand(&id, &keypair).to_string();
+                e.sig = secp256k1::schnorr::sign_no_aux_rand(&id, &keypair).to_string();
                 e
             };
             let gh = |kind: u64, tags: Vec<Vec<String>>| {
@@ -2492,13 +2476,12 @@ mod tests {
             assert!(matches!(out, super::Precheck::Reject(m) if m.contains("relay")));
 
             // A NIP-43 leave request that is too old is rejected.
-            let secp2 = Secp256k1::new();
             let mut leave = h(crate::nips::nip43::LEAVE, vec![vec!["-".into()]]);
             leave.created_at = now - 1000;
             leave.id = crate::nips::nip01::compute_id(&leave);
-            let kp = Keypair::from_seckey_byte_array(&secp2, [5u8; 32]).unwrap();
+            let kp = Keypair::from_secret_bytes([5u8; 32]).unwrap();
             let id = leave.id_bytes().unwrap();
-            leave.sig = secp2.sign_schnorr_no_aux_rand(&id, &kp).to_string();
+            leave.sig = secp256k1::schnorr::sign_no_aux_rand(&id, &kp).to_string();
             let out = relay
                 .precheck(&cfg, &access, &leave, now, &[], None, None)
                 .await;
@@ -2517,9 +2500,9 @@ mod tests {
             let mut repost = h(6, vec![]);
             repost.content = serde_json::to_string(&protected).unwrap();
             repost.id = crate::nips::nip01::compute_id(&repost);
-            let kp = Keypair::from_seckey_byte_array(&secp, [5u8; 32]).unwrap();
+            let kp = Keypair::from_secret_bytes([5u8; 32]).unwrap();
             let id = repost.id_bytes().unwrap();
-            repost.sig = secp.sign_schnorr_no_aux_rand(&id, &kp).to_string();
+            repost.sig = secp256k1::schnorr::sign_no_aux_rand(&id, &kp).to_string();
             let out = relay
                 .precheck(&cfg, &access, &repost, now, &[], None, None)
                 .await;
@@ -2556,9 +2539,9 @@ mod tests {
             let mut ev = signed(1, vec![]);
             ev.kind = 78;
             ev.id = crate::nips::nip01::compute_id(&ev);
-            let kp = Keypair::from_seckey_byte_array(&secp, [3u8; 32]).unwrap();
+            let kp = Keypair::from_secret_bytes([3u8; 32]).unwrap();
             let id = ev.id_bytes().unwrap();
-            ev.sig = secp.sign_schnorr_no_aux_rand(&id, &kp).to_string();
+            ev.sig = secp256k1::schnorr::sign_no_aux_rand(&id, &kp).to_string();
             let out = relay2
                 .precheck(&cfg2r, &access2, &ev, now, &[], None, None)
                 .await;
@@ -2598,19 +2581,17 @@ mod tests {
             for seed in 1..=20u8 {
                 events.push(signed_with_seed(seed, 1, vec![]));
             }
-            let verdicts = crate::relay::validate::verify_signatures_parallel(
-                Arc::new(events.clone().into_boxed_slice()),
-                relay.secp_shared(),
-            )
+            let verdicts = crate::relay::validate::verify_signatures_parallel(Arc::new(
+                events.clone().into_boxed_slice(),
+            ))
             .await;
             assert_eq!(verdicts.len(), 20);
             assert!(verdicts.iter().all(|v| *v));
             let mut bad = events.clone();
             bad[3].sig = "00".repeat(64);
-            let verdicts = crate::relay::validate::verify_signatures_parallel(
-                Arc::new(bad.into_boxed_slice()),
-                relay.secp_shared(),
-            )
+            let verdicts = crate::relay::validate::verify_signatures_parallel(Arc::new(
+                bad.into_boxed_slice(),
+            ))
             .await;
             assert!(!verdicts[3]);
             assert!(verdicts[0]);
@@ -2630,9 +2611,8 @@ mod tests {
             let cfg = relay.config.read().await;
             let access = AccessControl::default();
             let now = unix_now();
-            let secp = Secp256k1::new();
             let h = |kind: u64, tags: Vec<Vec<String>>| {
-                let keypair = Keypair::from_seckey_byte_array(&secp, [6u8; 32]).unwrap();
+                let keypair = Keypair::from_secret_bytes([6u8; 32]).unwrap();
                 let pubkey = XOnlyPublicKey::from_keypair(&keypair).0.to_string();
                 let mut e = Event {
                     id: String::new(),
@@ -2645,7 +2625,7 @@ mod tests {
                 };
                 e.id = crate::nips::nip01::compute_id(&e);
                 let id = e.id_bytes().unwrap();
-                e.sig = secp.sign_schnorr_no_aux_rand(&id, &keypair).to_string();
+                e.sig = secp256k1::schnorr::sign_no_aux_rand(&id, &keypair).to_string();
                 e
             };
             let gh = |kind: u64, tags: Vec<Vec<String>>| {
@@ -2740,9 +2720,9 @@ mod tests {
             let mut old = gh(1, vec![]);
             old.created_at = now - 100;
             old.id = crate::nips::nip01::compute_id(&old);
-            let kp = Keypair::from_seckey_byte_array(&secp, [6u8; 32]).unwrap();
+            let kp = Keypair::from_secret_bytes([6u8; 32]).unwrap();
             let id = old.id_bytes().unwrap();
-            old.sig = secp.sign_schnorr_no_aux_rand(&id, &kp).to_string();
+            old.sig = secp256k1::schnorr::sign_no_aux_rand(&id, &kp).to_string();
             let out = relay2
                 .precheck(&cfg2r, &access2, &old, now, &[], None, None)
                 .await;
