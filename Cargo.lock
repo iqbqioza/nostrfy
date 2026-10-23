@@ -1157,7 +1157,7 @@ dependencies = [
  "tokio-tungstenite 0.30.0",
  "toml",
  "tower",
- "tungstenite 0.29.0",
+ "tungstenite 0.30.0",
  "ureq",
 ]
 
