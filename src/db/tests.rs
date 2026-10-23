@@ -11165,3 +11165,79 @@ fn access_op_journal_applies_and_compacts_without_data_loss() {
     });
     db.shutdown();
 }
+
+#[test]
+fn nip91_history_count_and_negentropy_agree() {
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let mut events = Vec::new();
+        for (i, tags) in [
+            vec!["meme"],
+            vec!["cat"],
+            vec!["meme", "cat"],
+            vec!["meme", "cat", "black"],
+            vec!["meme", "cat", "white"],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let e = event(
+                1,
+                &format!("and-{i}"),
+                now - i as u64,
+                tags.into_iter()
+                    .map(|v| vec!["t".into(), v.into()])
+                    .collect(),
+            );
+            assert_eq!(db.put(e.clone(), now).await, PutOutcome::Stored);
+            events.push(e);
+        }
+        for (raw, expected) in [
+            (serde_json::json!({"&t": ["meme", "cat"]}), vec![2, 3, 4]),
+            (
+                serde_json::json!({"&t": ["meme", "cat"], "#t": ["meme", "cat", "black"]}),
+                vec![3],
+            ),
+            (
+                serde_json::json!({"#t": ["meme", "cat"], "&t": ["meme", "cat"]}),
+                vec![2, 3, 4],
+            ),
+            (serde_json::json!({"&t": []}), vec![]),
+            (
+                serde_json::json!({"&t": ["cat", "cat"], "until": now - 2, "limit": 1}),
+                vec![2],
+            ),
+        ] {
+            let f: Filter = serde_json::from_value(raw.clone()).unwrap();
+            let (found, more) = db.query(vec![f.clone()], 100, now).await;
+            assert_eq!(more, f.limit.is_some(), "{raw}");
+            let ids: Vec<_> = found.iter().map(|e| e.id.as_str()).collect();
+            let expected_ids: Vec<_> = expected.iter().map(|&i| events[i].id.as_str()).collect();
+            assert_eq!(ids, expected_ids, "{raw}");
+            if f.limit.is_none() {
+                let (count, approximate) =
+                    db.count_result(vec![f.clone()], 100, now).await.unwrap();
+                assert_eq!(count as usize, expected.len(), "{raw}");
+                assert!(!approximate);
+                let (items, more) = db.neg_items_reported(f, 100, now).await.unwrap();
+                assert!(!more);
+                let mut ids: Vec<_> = items.iter().map(|i| hex::encode(i.id)).collect();
+                ids.sort();
+                let mut expected: Vec<_> = expected_ids.into_iter().map(str::to_owned).collect();
+                expected.sort();
+                assert_eq!(ids, expected, "{raw}");
+            }
+        }
+    });
+    db.shutdown();
+}

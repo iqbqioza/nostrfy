@@ -27,7 +27,7 @@ pub const DEFAULT_CONFIG: &str = "nostrfy.toml";
 /// advertised for clients that check it.
 pub const RELAY_NIPS: &[u16] = &[
     1, 9, 11, 13, 17, 22, 26, 29, 32, 33, 34, 40, 42, 43, 45, 46, 47, 50, 57, 59, 62, 65, 66, 67,
-    70, 77, 78, 84, 85, 86, 87, 88, 94, 98,
+    70, 77, 78, 84, 85, 86, 87, 88, 91, 94, 98,
 ];
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -3220,6 +3220,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn nip91_advertisement_respects_configuration() {
+        let mut cfg = Config::default();
+        let access = AccessControl::default();
+        assert!(cfg.effective_supported_nips(&access).contains(&91));
+        cfg.relay.disabled_nips.push(91);
+        assert!(!cfg.nip_enabled(91));
+        assert!(!cfg.effective_supported_nips(&access).contains(&91));
+        cfg.relay.enabled_nips = vec![1, 91];
+        assert!(cfg.nip_enabled(91));
+        assert!(cfg.effective_supported_nips(&access).contains(&91));
+    }
+
+    #[test]
     fn known_keys_cover_every_serialized_field() {
         // The `warn_unknown_fields` list must cover every serializable
         // config field, or `nostrfy check` (and every start) warns about
@@ -4182,7 +4195,7 @@ max_log_files = 2
         // Relay-side NIPs are advertised.
         for n in [
             1, 9, 11, 13, 17, 22, 26, 29, 32, 33, 40, 42, 43, 45, 46, 47, 50, 57, 59, 62, 65, 66,
-            67, 70, 77, 78, 84, 85, 86, 87, 88, 94, 98,
+            67, 70, 77, 78, 84, 85, 86, 87, 88, 91, 94, 98,
         ] {
             assert!(nips.contains(&n), "NIP-{n} must be advertised");
         }

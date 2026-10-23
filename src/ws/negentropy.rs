@@ -269,6 +269,9 @@ impl super::Conn {
         }
         let filter: Filter = match serde_json::from_value::<Filter>(raw) {
             Ok(mut filter) => {
+                if !self.relay.config.read().await.nip_enabled(91) {
+                    filter.disable_and_tags();
+                }
                 // Negentropy needs every matching record, not a capped page.
                 filter.limit = None;
                 // NIP-50 disabled: strip the search like REQ/COUNT/API do,
