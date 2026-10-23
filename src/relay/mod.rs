@@ -4570,17 +4570,30 @@ impl Relay {
             }
         }
         let mut touch = StateTouch::default();
-        for address in nip09::deletion_addresses(event) {
+        // `kind:9005` deletes only `e` targets inside its own group; it has
+        // no addressable-target semantics, so an `a` tag there must not
+        // contribute to the stale scope.
+        let addresses = if event.kind == 9005 {
+            Vec::new()
+        } else {
+            nip09::deletion_addresses(event)
+        };
+        for address in addresses {
             let (groups, roles) = classify(address.kind);
-            touch.groups |= groups;
-            touch.roles |= roles;
-            // An address names a kind, not an event, so the group it would
-            // affect cannot be resolved: keep the fail-closed-for-everything
-            // fallback. In practice the group action kinds an address can
-            // name (9000-9022) are not replaceable, so no stored event ever
-            // matches them and the walk removes nothing; the flag is carried
-            // so a future replaceable group kind cannot silently narrow.
-            touch.groups_all |= groups;
+            // An `a` target can only remove a replaceable/addressable event.
+            // The NIP-29 action kinds (9000-9022) are not replaceable, so
+            // counting their `a` tags as group evidence would let a scoped
+            // deletion promote itself to every group. Keep the fallback only
+            // for a future addressable group kind.
+            let addressable = crate::nips::nip01::is_replaceable_kind(address.kind)
+                || crate::nips::nip33::is_param_replaceable_kind(address.kind);
+            if groups && addressable {
+                touch.groups = true;
+                touch.groups_all = true;
+            }
+            if roles && addressable {
+                touch.roles = true;
+            }
         }
         // Only full 64-hex ids can be removed by the walk; prefixes are
         // accepted by `Filter.ids` but `apply_deletion_walk` ignores them.
@@ -4653,12 +4666,12 @@ impl Relay {
                         }
                         // Cap the resolved scope so one deletion request
                         // cannot turn the rebuild scoping into an unbounded
-                        // allocation: past the cap the request fails closed
-                        // for every group rather than silently under-scoping
-                        // (the attacker pays for its own stored events to
-                        // reach the cap, and the extra rebuild is bounded
-                        // by the standard interval).
-                        if more || events.len() >= GROUP_STALE_SCOPE_CAP {
+                        // allocation. Only an incomplete page (`more`) means
+                        // some group ids cannot be resolved and the request
+                        // must fail closed for every group. A complete page
+                        // with exactly the cap's worth of ids is authoritative,
+                        // so the mark stays scoped to those groups.
+                        if more {
                             touch.groups = true;
                             touch.groups_all = true;
                         }
@@ -5595,6 +5608,7 @@ impl PendingBatch {
 mod tests {
     use super::BufferedGroupEvent;
     use super::BufferedRoleMutation;
+    use super::GROUP_STALE_SCOPE_CAP;
     use super::GROUPS_REBUILD_BUFFER_MAX;
     use super::LiveQueue;
     use super::ROLES_REBUILD_BUFFER_MAX;
@@ -11274,6 +11288,109 @@ mod tests {
             !touch.groups_all,
             "foreign ids must not promote the stale scope to every group"
         );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn an_address_tag_cannot_promote_a_scoped_group_deletion() {
+        // H01: group action kinds (9000-9022) are not replaceable, so an
+        // `a` target can never remove one. Counting it as group evidence
+        // promoted a deletion of the author's own state event to a
+        // relay-wide stale mark.
+        let relay = build_relay().await;
+        let author = secp256k1::Keypair::from_secret_bytes([7u8; 32]).unwrap();
+        let now = crate::util::unix_now();
+        let own = signed_group_event(
+            &author,
+            9002,
+            "g1",
+            vec![vec!["name".into(), "old".into()], vec!["private".into()]],
+            now.saturating_sub(1),
+        );
+        relay.db.put(own.clone(), now).await;
+        let deletion = signed_group_event(
+            &author,
+            5,
+            "g1",
+            vec![
+                vec!["e".into(), own.id.clone()],
+                vec!["a".into(), format!("9000:{}:x", "aa".repeat(32))],
+            ],
+            now,
+        );
+        let touch = relay.deletion_touches_group_state(&deletion).await;
+        assert!(touch.groups, "the deleted state event is in g1");
+        assert!(
+            !touch.groups_all,
+            "a non-addressable group kind must not force the global scope"
+        );
+        assert_eq!(touch.group_ids, vec!["g1".to_string()]);
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_9005_address_tag_is_not_group_scope_evidence() {
+        // 9005 deletes only its own group's `e` targets; an `a` tag there is
+        // not addressable-target evidence and must not widen the scope.
+        let relay = build_relay().await;
+        let author = secp256k1::Keypair::from_secret_bytes([7u8; 32]).unwrap();
+        let now = crate::util::unix_now();
+        let own = signed_group_event(
+            &author,
+            9002,
+            "g1",
+            vec![vec!["name".into(), "old".into()]],
+            now.saturating_sub(1),
+        );
+        relay.db.put(own.clone(), now).await;
+        let deletion = signed_group_event(
+            &author,
+            9005,
+            "g1",
+            vec![
+                vec!["e".into(), own.id.clone()],
+                vec!["a".into(), format!("9000:{}:x", "aa".repeat(32))],
+            ],
+            now,
+        );
+        let touch = relay.deletion_touches_group_state(&deletion).await;
+        assert!(touch.groups);
+        assert!(
+            !touch.groups_all,
+            "a 9005 `a` tag must not widen the stale scope"
+        );
+        assert_eq!(touch.group_ids, vec!["g1".to_string()]);
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_full_scope_page_at_the_cap_stays_group_scoped() {
+        // M06: a complete page of exactly the cap's worth of ids is
+        // authoritative; only `more` (an incomplete page) needs the global
+        // fail-closed mark.
+        let relay = build_relay().await;
+        let author = secp256k1::Keypair::from_secret_bytes([7u8; 32]).unwrap();
+        let now = crate::util::unix_now();
+        let mut tags = Vec::with_capacity(GROUP_STALE_SCOPE_CAP);
+        for i in 0..GROUP_STALE_SCOPE_CAP {
+            let event = signed_group_event(
+                &author,
+                9000,
+                "g1",
+                vec![vec!["p".into(), format!("m{i:04}")]],
+                now.saturating_sub(10),
+            );
+            relay.db.put(event.clone(), now).await;
+            tags.push(vec!["e".into(), event.id]);
+        }
+        let deletion = signed_group_event(&author, 5, "g1", tags, now);
+        let touch = relay.deletion_touches_group_state(&deletion).await;
+        assert!(touch.groups);
+        assert!(
+            !touch.groups_all,
+            "a complete capped page must stay scoped to its group"
+        );
+        assert_eq!(touch.group_ids, vec!["g1".to_string()]);
         relay.db.shutdown();
     }
 
