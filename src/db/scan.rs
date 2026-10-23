@@ -1106,6 +1106,9 @@ impl Store {
             limit,
             ascending,
         } = *scan;
+        if filter.tag_plan().is_impossible() {
+            return Ok(false);
+        }
         let seen = &mut *collect.seen;
         let out = &mut *collect.out;
         let ctx = ScanContext {
@@ -1360,60 +1363,48 @@ impl Store {
             return Ok(false);
         }
 
-        // Only `#`-prefixed keys are tag constraints (NIP-01); an unknown
-        // non-`#` key (e.g. a typo like `"kind"`) is ignored by the scan
-        // just like it is by the final in-memory match, so it cannot turn
-        // the filter into an impossible query.
-        if let Some((name, values)) = filter.tags.iter().find(|(n, _)| n.starts_with('#')) {
-            let tag_name = name.strip_prefix('#').unwrap_or(name);
-            if tag_name.len() == 1 {
-                let name_byte = tag_name.as_bytes()[0];
-                // Only ASCII-alphanumeric single-letter names are indexed
-                // (put skips the rest), and a value longer than the index-key
-                // limit is never indexed either. Anything the index cannot
-                // represent falls through to the time-range scan below, where
-                // the in-memory `Filter::matches` applies (so stored results
-                // agree with live delivery).
-                let mut ranges: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-                let mut fully_indexed = name_byte.is_ascii_alphanumeric();
-                let mut has_value = false;
-                for value in crate::filter::tag_values(values) {
-                    has_value = true;
-                    // A value beyond the index-key limit was never indexed
-                    // (put skips it): a range boundary past LMDB's key limit
-                    // would error the whole query anyway.
-                    if value.len() > TAG_INDEX_VALUE_MAX {
-                        fully_indexed = false;
-                        continue;
-                    }
-                    ranges.push(tag_range(name_byte, value.as_bytes(), since, until));
+        // Use one necessary normalized tag constraint as a candidate source;
+        // the shared matcher enforces all AND values and residual OR groups.
+        if let Some((tag_name, values)) = filter.tag_plan().scan_constraint()
+            && tag_name.len() == 1
+        {
+            let name_byte = tag_name.as_bytes()[0];
+            // Only ASCII-alphanumeric single-letter names are indexed
+            // (put skips the rest), and a value longer than the index-key
+            // limit is never indexed either. Anything the index cannot
+            // represent falls through to the time-range scan below, where
+            // the in-memory `Filter::matches` applies (so stored results
+            // agree with live delivery).
+            let mut ranges: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+            let mut fully_indexed = name_byte.is_ascii_alphanumeric();
+            let mut has_value = false;
+            for value in values {
+                has_value = true;
+                // A value beyond the index-key limit was never indexed
+                // (put skips it): a range boundary past LMDB's key limit
+                // would error the whole query anyway.
+                if value.len() > TAG_INDEX_VALUE_MAX {
+                    fully_indexed = false;
+                    continue;
                 }
-                if fully_indexed {
-                    if !has_value {
-                        // A tag attribute with no string values (e.g. a
-                        // numeric `{"#a": 123}`) matches nothing: the final
-                        // in-memory match requires every attribute.
-                        return Ok(false);
-                    }
-                    if !self.walk_merged(
-                        rtxn,
-                        self.by_tag,
-                        &ranges,
-                        ascending,
-                        &mut consider,
-                        more,
-                    )? {
-                        return Ok(true);
-                    }
-                    // Exhausted: every range entry was considered.
+                ranges.push(tag_range(name_byte, value.as_bytes(), since, until));
+            }
+            if fully_indexed {
+                if !has_value {
+                    // A tag attribute with no string values (e.g. a
+                    // numeric `{"#a": 123}`) matches nothing: the final
+                    // in-memory match requires every attribute.
                     return Ok(false);
                 }
+                if !self.walk_merged(rtxn, self.by_tag, &ranges, ascending, &mut consider, more)? {
+                    return Ok(true);
+                }
+                // Exhausted: every range entry was considered.
+                return Ok(false);
             }
-            // Multi-letter or non-alphanumeric tag names, and values too long
-            // to index, are not in the tag index: fall through to the
-            // time-range scan, where the final in-memory match enforces the
-            // tag filter.
         }
+        // Multi-letter or non-alphanumeric tag names, and values too long
+        // to index, fall through to the kind/time scan and final matcher.
 
         if let Some(kinds) = &filter.kinds {
             let mut ranges: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(kinds.len());

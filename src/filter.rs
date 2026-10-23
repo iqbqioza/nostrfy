@@ -56,54 +56,74 @@ impl EventFields for Event {
     }
 }
 
-/// A precomputed index over a filter's `#`-prefixed tag constraints: the
-/// value set of each constraint, so matching an event is
-/// `O(event tags + filter values)` instead of the quadratic
-/// `O(filter values × event tags)` of a per-value linear scan. An
-/// unauthenticated REQ may carry `MAX_FILTER_TAG_VALUES` (512) values and
-/// a stored event up to `max_tags` (2000) tags, which measured ~0.85 s of
-/// reader CPU per frame with the linear scan; the plan turns that into one
-/// pass over the event's tags.
+/// Shared NIP-01/NIP-91 tag requirements. OR values share a satisfaction
+/// bit; every distinct AND value has its own bit. Event tags are walked once.
 #[derive(Debug, Default)]
 pub struct TagMatchPlan {
-    /// The value set of each `#name` constraint, in first-seen order.
     constraints: Vec<(String, std::collections::HashSet<String>)>,
-    /// Constraint index by tag name (without the leading `#`); one entry
-    /// per constraint (the tag map's keys are unique).
-    by_name: std::collections::HashMap<String, usize>,
-    /// A constraint with no values (`[]`, or a non-string attribute) can
-    /// never be satisfied — the same result the linear scan's `any` over
-    /// an empty iterator produces — so the whole filter matches nothing.
+    by_name: std::collections::HashMap<String, std::collections::HashMap<String, usize>>,
     impossible: bool,
 }
 
 impl TagMatchPlan {
-    /// Builds the plan from a filter's tag attribute map. Unknown
-    /// (non-`#`) keys are ignored, like [`Filter::matches`]. A `#` key with
-    /// an empty tag name matches nothing on every path: the live index
-    /// never wakes empty-name subscriptions (it only looks up non-empty
-    /// tag names), so history must not find them either.
     fn new(tags: &serde_json::Map<String, Value>) -> Self {
-        let mut plan = TagMatchPlan::default();
-        for (name, value) in tags {
-            let Some(tag_name) = name.strip_prefix('#') else {
+        let mut plan = Self::default();
+        for (name, raw) in tags {
+            let Some(tag_name) = name.strip_prefix('&').or_else(|| name.strip_prefix('#')) else {
                 continue;
             };
-            if tag_name.is_empty() {
+            let mut values: std::collections::HashSet<String> =
+                tag_values(raw).map(str::to_string).collect();
+            // Empty constraints fail closed, consistently with existing OR filters.
+            if tag_name.is_empty() || values.is_empty() {
                 plan.impossible = true;
                 return plan;
             }
-            let values: std::collections::HashSet<String> =
-                tag_values(value).map(str::to_string).collect();
-            if values.is_empty() {
-                plan.impossible = true;
-                return plan;
+            if name.starts_with('#') {
+                if let Some(and) = tags.get(&format!("&{tag_name}")) {
+                    for value in tag_values(and) {
+                        values.remove(value);
+                    }
+                    // A compatibility OR entirely covered by AND adds no requirement.
+                    if values.is_empty() {
+                        continue;
+                    }
+                }
+                plan.add_constraint(tag_name, values);
+            } else {
+                for value in values {
+                    plan.add_constraint(tag_name, std::iter::once(value).collect());
+                }
             }
-            plan.by_name
-                .insert(tag_name.to_string(), plan.constraints.len());
-            plan.constraints.push((tag_name.to_string(), values));
         }
         plan
+    }
+
+    fn add_constraint(&mut self, name: &str, values: std::collections::HashSet<String>) {
+        let index = self.constraints.len();
+        let by_value = self.by_name.entry(name.to_string()).or_default();
+        for value in &values {
+            by_value.insert(value.clone(), index);
+        }
+        self.constraints.push((name.to_string(), values));
+    }
+
+    pub(crate) fn is_impossible(&self) -> bool {
+        self.impossible
+    }
+
+    /// Candidate scan ranges from one necessary constraint. The smallest value set is
+    /// preferred, with deterministic ties, so AND queries need only one range.
+    pub(crate) fn scan_constraint(&self) -> Option<(&str, &std::collections::HashSet<String>)> {
+        self.constraints
+            .iter()
+            .min_by(|(a, av), (b, bv)| {
+                av.len()
+                    .cmp(&bv.len())
+                    .then_with(|| a.cmp(b))
+                    .then_with(|| av.iter().min().cmp(&bv.iter().min()))
+            })
+            .map(|(name, values)| (name.as_str(), values))
     }
 
     /// Whether an event satisfies every tag constraint of the filter.
@@ -132,12 +152,14 @@ impl TagMatchPlan {
             if tag.len() < 2 {
                 continue;
             }
-            let Some(&index) = self.by_name.get(tag[0].as_str()) else {
+            let Some(&index) = self
+                .by_name
+                .get(tag[0].as_str())
+                .and_then(|values| values.get(tag[1].as_str()))
+            else {
                 continue;
             };
-            let (_, values) = &self.constraints[index];
-            if satisfied[index / 64] & (1 << (index % 64)) == 0 && values.contains(tag[1].as_str())
-            {
+            if satisfied[index / 64] & (1 << (index % 64)) == 0 {
                 satisfied[index / 64] |= 1 << (index % 64);
                 remaining -= 1;
                 if remaining == 0 {
@@ -151,6 +173,9 @@ impl TagMatchPlan {
     /// The pre-plan matcher: `O(values × event tags)`, used only for
     /// unvalidated filters beyond the tracked-constraint bound.
     fn matches_linear<E: EventFields>(&self, ev: &E) -> bool {
+        if self.impossible {
+            return false;
+        }
         self.constraints.iter().all(|(name, values)| {
             ev.tags()
                 .iter()
@@ -176,7 +201,7 @@ pub struct Filter {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub search: Option<String>,
     #[serde(flatten)]
-    /// Tag constraints (`#`-prefixed keys) plus any unknown filter fields.
+    /// Tag constraints (`#` OR and `&` AND) plus unknown filter fields.
     /// A `serde_json::Map` preserves the client's JSON attribute order
     /// (`preserve_order`), which NIP-45's HLL offset derivation needs: it
     /// is defined over the *first* tag attribute in the filter.
@@ -221,7 +246,7 @@ impl Filter {
                 let values = self
                     .tags
                     .iter()
-                    .filter(|(name, _)| name.starts_with('#'))
+                    .filter(|(name, _)| is_tag_constraint(name))
                     .map(|(_, value)| tag_values(value).take(MAX_FILTER_TAG_VALUES + 1).count())
                     .fold(0usize, usize::saturating_add);
                 values > MAX_FILTER_TAG_VALUES
@@ -351,7 +376,7 @@ impl Filter {
                 return false;
             }
         }
-        // NIP-01: tag constraints are `#`-prefixed; any other key is an
+        // NIP-01/NIP-91: tag constraints use `#` or `&`; any other key is an
         // unknown filter field and is ignored (a typo like `"kind"` must
         // not silently turn the whole filter into an impossible query).
         // Tag values compare exactly (case-sensitive), unlike
@@ -361,27 +386,39 @@ impl Filter {
         plan.matches(ev)
     }
 
+    /// Ignore the draft operator when NIP-91 is disabled, retaining the
+    /// client's compatibility OR fields and original attribute order.
+    pub(crate) fn disable_and_tags(&mut self) {
+        self.tags.retain(|name, _| !name.starts_with('&'));
+        self.tag_plan = Default::default();
+    }
+
     pub fn has_search(&self) -> bool {
         self.search.as_deref().is_some_and(|s| !s.trim().is_empty())
     }
 
-    /// Whether any `#`-prefixed tag constraint carries a value that is
+    /// Whether any tag constraint carries a value that is
     /// neither a string nor an array of strings. NIP-01 only defines those
     /// two forms; anything else would silently match nothing (the live
     /// match and the scan both skip non-string values), so such a filter
     /// is rejected at parse time instead.
     pub(crate) fn invalid_tag_values(&self) -> bool {
-        // Only `#`-prefixed keys are tag constraints (NIP-01); any other
+        // Only `#`/`&`-prefixed keys are tag constraints; any other
         // key is an unknown filter field and is ignored, so its value type
         // must not reject the filter.
         self.tags.iter().any(|(name, v)| {
-            name.starts_with('#')
+            is_tag_constraint(name)
                 && !v.is_string()
                 && !v
                     .as_array()
                     .is_some_and(|a| a.iter().all(serde_json::Value::is_string))
         })
     }
+}
+
+/// Recognized tag operators; unrelated extension fields remain ignored.
+pub(crate) fn is_tag_constraint(name: &str) -> bool {
+    name.starts_with('#') || name.starts_with('&')
 }
 
 /// The string values of a filter tag attribute (a single string or an
@@ -722,6 +759,114 @@ mod tests {
         let unknown: Filter =
             serde_json::from_value(serde_json::json!({"unknown": ["aa"]})).unwrap();
         assert!(unknown.matches(&e), "unknown non-tag keys are ignored");
+    }
+
+    #[test]
+    fn nip91_and_tag_semantics() {
+        let event = ev(
+            1,
+            vec![
+                vec!["t".into(), "meme".into()],
+                vec!["t".into(), "cat".into()],
+                vec!["t".into(), "black".into()],
+            ],
+        );
+        for (raw, expected) in [
+            (json!({"&t": ["meme", "cat"]}), true),
+            (
+                json!({"&t": ["meme", "cat"], "#t": ["meme", "cat", "white"]}),
+                false,
+            ),
+            (
+                json!({"#t": ["meme", "cat", "black", "white"], "&t": ["meme", "cat"]}),
+                true,
+            ),
+            (json!({"&t": ["meme", "cat"], "#t": ["meme", "cat"]}), true),
+            (json!({"&t": ["meme", "meme"]}), true),
+            (json!({"&t": ["Meme"]}), false),
+            (json!({"&t": []}), false),
+            (json!({"&t": ["cat"], "#t": []}), false),
+            (json!({"&": ["cat"]}), false),
+            (json!({"&t": ["cat"], "&p": ["alice"]}), false),
+            (json!({"&t": "cat"}), true),
+        ] {
+            let filter: Filter = serde_json::from_value(raw.clone()).unwrap();
+            assert_eq!(filter.matches(&event), expected, "{raw}");
+            assert_eq!(filter.tag_plan().matches_linear(&event), expected, "{raw}");
+            assert_eq!(serde_json::to_value(&filter).unwrap(), raw);
+        }
+        let repeated = ev(
+            1,
+            vec![
+                vec!["t".into(), "meme".into(), "cat".into()],
+                vec!["t".into(), "meme".into()],
+            ],
+        );
+        let filter: Filter = serde_json::from_value(json!({"&t": ["meme", "cat"]})).unwrap();
+        assert!(!filter.matches(&repeated));
+    }
+
+    #[test]
+    fn nip91_exhaustive_overlap_matches_reference() {
+        let universe = ["a", "b", "c"];
+        for present in 0..8 {
+            let event = ev(
+                1,
+                universe
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| present & (1 << i) != 0)
+                    .map(|(_, value)| vec!["t".into(), value.to_string()])
+                    .collect(),
+            );
+            for and in 1..8 {
+                for or in 1..8 {
+                    let values = |mask: usize| {
+                        universe
+                            .iter()
+                            .enumerate()
+                            .filter(|(i, _)| mask & (1 << i) != 0)
+                            .map(|(_, value)| *value)
+                            .collect::<Vec<_>>()
+                    };
+                    let filter: Filter =
+                        serde_json::from_value(json!({"&t": values(and), "#t": values(or)}))
+                            .unwrap();
+                    let residual = or & !and;
+                    let expected =
+                        present & and == and && (residual == 0 || present & residual != 0);
+                    assert_eq!(
+                        filter.matches(&event),
+                        expected,
+                        "present={present} and={and} or={or}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn nip91_validation_limits_and_disabled_mode() {
+        let mut filter: Filter =
+            serde_json::from_value(json!({"&t": ["cat"], "#t": ["meme"]})).unwrap();
+        assert!(!filter.matches(&ev(1, vec![vec!["t".into(), "meme".into()]])));
+        filter.disable_and_tags();
+        assert!(filter.matches(&ev(1, vec![vec!["t".into(), "meme".into()]])));
+        for raw in [json!({"&t": 42}), json!({"&t": ["cat", null]})] {
+            let filter: Filter = serde_json::from_value(raw).unwrap();
+            assert!(filter.invalid_tag_values());
+        }
+        let filter: Filter = serde_json::from_value(
+            json!({"&t": vec!["cat"; MAX_FILTER_TAG_VALUES], "#p": ["alice"]}),
+        )
+        .unwrap();
+        assert!(
+            filter.too_many_members(),
+            "count raw AND and OR entries together"
+        );
+        let filter: Filter =
+            serde_json::from_value(json!({"&t": vec!["cat"; MAX_FILTER_TAG_VALUES]})).unwrap();
+        assert!(!filter.too_many_members());
     }
 
     #[test]

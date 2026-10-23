@@ -127,6 +127,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn nip91_keeps_original_or_offset_and_omits_and_only_hll() {
+        let or: Filter =
+            serde_json::from_value(serde_json::json!({"#t": ["cat", "black"]})).unwrap();
+        let mixed: Filter =
+            serde_json::from_value(serde_json::json!({"&t": ["cat"], "#t": ["cat", "black"]}))
+                .unwrap();
+        assert_eq!(hll_offset(&or), hll_offset(&mixed));
+        let and_only: Filter = serde_json::from_value(serde_json::json!({"&t": ["cat"]})).unwrap();
+        assert!(hll(&[and_only], &[]).is_none());
+    }
+
+    #[test]
     fn message_format() {
         assert_eq!(
             count_response("sub", &[], &[][..], false),

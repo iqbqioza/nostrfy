@@ -77,9 +77,13 @@ impl FilterComponents {
         let tags: Vec<(String, String)> = filter
             .tags
             .iter()
-            .filter(|(name, _)| name.starts_with('#'))
+            .filter(|(name, _)| crate::filter::is_tag_constraint(name))
             .flat_map(|(name, value)| {
-                let tag_name = name.strip_prefix('#').unwrap_or(name).to_string();
+                let tag_name = name
+                    .strip_prefix('#')
+                    .or_else(|| name.strip_prefix('&'))
+                    .unwrap_or(name)
+                    .to_string();
                 crate::filter::tag_values(value).map(move |v| (tag_name.clone(), v.to_string()))
             })
             .collect();
@@ -270,6 +274,29 @@ mod tests {
             content: String::new(),
             sig: "0".repeat(128),
         }
+    }
+
+    #[test]
+    fn nip91_live_candidates_include_and_only_filters() {
+        let filter: crate::filter::Filter =
+            serde_json::from_value(serde_json::json!({"&t": ["meme", "cat"]})).unwrap();
+        let mut index = SubscriptionIndex::default();
+        index.register(91, vec![FilterComponents::of(&filter)]);
+        let matched = ev(
+            1,
+            vec![
+                vec!["t".into(), "meme".into()],
+                vec!["t".into(), "cat".into()],
+            ],
+        );
+        assert!(index.candidates(&matched).contains(&91));
+        assert!(filter.matches(&matched));
+        assert!(!index.candidates(&ev(1, vec![])).contains(&91));
+        let partial = ev(1, vec![vec!["t".into(), "cat".into()]]);
+        assert!(index.candidates(&partial).contains(&91));
+        assert!(!filter.matches(&partial));
+        index.unregister(91);
+        assert!(index.candidates(&matched).is_empty());
     }
 
     #[test]
