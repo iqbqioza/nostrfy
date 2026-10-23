@@ -1177,6 +1177,10 @@ pub async fn rpc_handler(
                 Ok(outcome) => outcome,
                 Err(e) => {
                     log::error!("banevent store failure: {e}");
+                    let message = e.to_string();
+                    if message.starts_with("restricted:") {
+                        return rpc_err(&message);
+                    }
                     return rpc_err("error: cannot persist the event ban");
                 }
             };
@@ -1208,13 +1212,16 @@ pub async fn rpc_handler(
             let Some(id) = params.first().and_then(Value::as_str) else {
                 return rpc_err("invalid params");
             };
-            // The optional reason slot is validated like its siblings
-            // (a non-string there is a client bug), though unbanning
-            // carries no reason.
+            // The optional reason is stored on the allow marker, so it
+            // follows the same bounds as `banevent` (length and control
+            // characters).
             let reason = match opt_param_str(params, 1, "reason") {
                 Ok(reason) => reason,
                 Err(e) => return rpc_err(&e),
             };
+            if let Err(e) = check_reason(reason) {
+                return rpc_err(&e.to_string());
+            }
             let Ok(id) = hex::decode(id) else {
                 return rpc_err("invalid event id");
             };
@@ -1230,6 +1237,10 @@ pub async fn rpc_handler(
             audit!(&relay, &identity, "allowevent", params);
             if let Err(e) = outcome {
                 log::error!("allowevent store failure: {e}");
+                let message = e.to_string();
+                if message.starts_with("restricted:") {
+                    return rpc_err(&message);
+                }
                 return rpc_err("error: cannot persist the event allow");
             }
             rpc_ok(json!(true))
@@ -2238,6 +2249,16 @@ mod tests {
         assert!(rpc_err_of(resp).await.contains("params"));
         let resp = rpc_call(&relay, "allowevent", vec![json!("zz")]).await;
         assert!(rpc_err_of(resp).await.contains("event id"));
+        let resp = rpc_call(
+            &relay,
+            "allowevent",
+            vec![json!(id.clone()), json!("r".repeat(MAX_REASON_LEN + 1))],
+        )
+        .await;
+        assert!(
+            rpc_err_of(resp).await.contains("reason exceeds"),
+            "allowevent must validate the reason like banevent"
+        );
         let resp = rpc_call(&relay, "allowevent", vec![json!(id.clone())]).await;
         assert!(rpc_ok_of(resp).await);
         // Pre-ban: an unknown (future) id is banned, not an error.

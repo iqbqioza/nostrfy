@@ -23,6 +23,21 @@ use crate::nips::nip09;
 /// so entries the caller leaves in place cannot loop forever.
 const REMOVAL_CHUNK: usize = 4096;
 
+/// Upper bound on the NIP-86 event ban/allow marker lists. Without it a
+/// grantee with `banevent`/`allowevent` could grow either list (and the
+/// `list*events` responses) without limit; the pubkey/IP lists already use
+/// the same 10,000-entry ceiling.
+const MAX_EVENT_MARKERS: usize = 10_000;
+
+/// Refuses a new event marker once the list is full. Updating the reason of
+/// an existing marker stays allowed at the cap (it does not grow the list).
+fn ensure_event_marker_room(existing: bool, len: u64) -> Result<()> {
+    if !existing && len >= MAX_EVENT_MARKERS as u64 {
+        return Err(anyhow::anyhow!("restricted: the event marker list is full"));
+    }
+    Ok(())
+}
+
 /// How many deleter pubkeys one absent-target tombstone keeps. Bounds the
 /// marker value when many deletion requests name the same missing id.
 /// Past the bound the extra deleter is dropped on the live path (keeping
@@ -702,6 +717,10 @@ impl Store {
     pub(crate) fn apply_ban(&self, id: &[u8], reason: &str) -> Result<(bool, StateRemoved)> {
         self.disk_full_error()?;
         let mut wtxn = self.env.write_txn()?;
+        ensure_event_marker_room(
+            self.banned.get(&wtxn, id)?.is_some(),
+            self.banned.len(&wtxn)?,
+        )?;
         self.banned.put(&mut wtxn, id, reason.as_bytes())?;
         // NIP-86: a ban removes the event from the allow list, in the
         // same transaction so the two markers can never disagree.
@@ -746,6 +765,10 @@ impl Store {
     pub(crate) fn apply_allow(&self, id: &[u8], reason: &str) -> Result<bool> {
         self.disk_full_error()?;
         let mut wtxn = self.env.write_txn()?;
+        ensure_event_marker_room(
+            self.allowed.get(&wtxn, id)?.is_some(),
+            self.allowed.len(&wtxn)?,
+        )?;
         self.allowed.put(&mut wtxn, id, reason.as_bytes())?;
         let unbanned = self.banned.delete(&mut wtxn, id)?;
         wtxn.commit()?;
@@ -1695,5 +1718,23 @@ impl Store {
             last = last_scanned;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod marker_tests {
+    use super::*;
+
+    #[test]
+    fn event_marker_lists_are_bounded() {
+        assert!(ensure_event_marker_room(false, MAX_EVENT_MARKERS as u64 - 1).is_ok());
+        assert!(
+            ensure_event_marker_room(false, MAX_EVENT_MARKERS as u64).is_err(),
+            "a new marker at the cap must be refused"
+        );
+        assert!(
+            ensure_event_marker_room(true, MAX_EVENT_MARKERS as u64).is_ok(),
+            "updating an existing marker's reason must stay allowed at the cap"
+        );
     }
 }

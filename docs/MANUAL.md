@@ -508,8 +508,8 @@ curl -X POST http://127.0.0.1:8080/ \
 | `listmethodassignees` | `[]` | List method grants (`[{pubkey, methods}]`) |
 | `blockip` / `unblockip` | `["ip", "reason (optional)"]` | Block / unblock an IP (**blocking also drops existing connections**) |
 | `listblockedips` | `[]` | List blocked IPs |
-| `banevent` | `["event id", "reason (optional)"]` | Ban an event (banning an unknown id pre-bans it; also removes it from the allow list) |
-| `allowevent` | `["event id", "reason (optional)"]` | Add an event to the allow list (also lifts the ban; allowing an unknown id pre-allows it) |
+| `banevent` | `["event id", "reason (optional)"]` | Ban an event (banning an unknown id pre-bans it; also removes it from the allow list; each list is capped at 10,000 entries) |
+| `allowevent` | `["event id", "reason (optional)"]` | Add an event to the allow list (also lifts the ban; allowing an unknown id pre-allows it; the reason follows the same 512-character bound as `banevent`) |
 | `unallowevent` / `unbanevent` | `["event id"]` | Remove an event from the allow / ban list (a missing entry succeeds) |
 | `listbannedevents` | `[]` | List banned events (a failed lookup surfaces an error, never an empty list) |
 | `listallowedevents` | `[]` | List allowed events |
