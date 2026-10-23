@@ -54,8 +54,10 @@ VOLUME ["/data"]
 EXPOSE 8080
 USER nostr
 # Liveness, not write-path health: a full disk must not restart the relay.
+# The /health fallback keeps images built with a pre-/live release binary
+# healthy during an upgrade window.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD curl -fsS http://127.0.0.1:8080/live || exit 1
+    CMD curl -fsS http://127.0.0.1:8080/live || curl -fsS http://127.0.0.1:8080/health || exit 1
 # Docker's default 10s stop timeout is shorter than the relay's 27s graceful
 # shutdown budget. Give it time to drain and flush: `docker run --stop-timeout
 # 35 ...` (compose sets `stop_grace_period: 35s`; Fly sets `kill_timeout`).
