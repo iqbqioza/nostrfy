@@ -2119,6 +2119,23 @@ impl BlockedIps {
         }
     }
 
+    /// Replaces the reason of the entry for `ip` (already normalized),
+    /// whatever spelling it was stored with. A re-registration with a new
+    /// reason must not silently keep the old one.
+    pub fn set_reason(&mut self, ip: std::net::IpAddr, reason: String) {
+        let ip = crate::util::normalize_ip(ip);
+        for (entry, existing) in &mut self.entries {
+            if entry
+                .parse::<std::net::IpAddr>()
+                .map(crate::util::normalize_ip)
+                .is_ok_and(|parsed| parsed == ip)
+            {
+                *existing = reason;
+                return;
+            }
+        }
+    }
+
     /// Removes every entry that refers to `ip` (already normalized),
     /// whatever spelling it was stored with.
     pub fn remove(&mut self, ip: std::net::IpAddr) {
@@ -2278,11 +2295,16 @@ pub fn apply_access_op(state: &mut AccessControl, op: &AccessOp) {
             state
                 .blocked_pubkeys
                 .retain(|(p, _)| !pubkey_eq(*insensitive, p, pubkey));
-            if !state
+            if let Some(entry) = state
                 .allowed_pubkeys
-                .iter()
-                .any(|(p, _)| pubkey_eq(*insensitive, p, pubkey))
+                .iter_mut()
+                .find(|(p, _)| pubkey_eq(*insensitive, p, pubkey))
             {
+                // Re-allowing an existing entry updates its reason, matching
+                // `BanPubkey`; silently keeping the old reason made a
+                // re-registration with a new reason look applied.
+                entry.1 = reason.clone();
+            } else {
                 state.allowed_pubkeys.push((pubkey.clone(), reason.clone()));
             }
         }
@@ -2313,7 +2335,9 @@ pub fn apply_access_op(state: &mut AccessControl, op: &AccessOp) {
             state.allowed_kinds.retain(|k| k != kind);
         }
         AccessOp::BlockIp { ip, reason } => {
-            if !state.is_ip_blocked(*ip) {
+            if state.is_ip_blocked(*ip) {
+                state.blocked_ips.set_reason(*ip, reason.clone());
+            } else {
                 state.blocked_ips.push(ip.to_string(), reason.clone());
             }
         }
@@ -4942,6 +4966,54 @@ max_log_files = 2
             !state.allows_pubkey("a"),
             "an unban must not restore allow-list membership the ban removed"
         );
+    }
+
+    #[test]
+    fn allow_and_block_ip_update_existing_reasons() {
+        let mut state = AccessControl::default();
+        apply_access_op(
+            &mut state,
+            &AccessOp::AllowPubkey {
+                pubkey: "a".into(),
+                reason: "first".into(),
+                insensitive: true,
+            },
+        );
+        apply_access_op(
+            &mut state,
+            &AccessOp::AllowPubkey {
+                pubkey: "A".into(),
+                reason: "second".into(),
+                insensitive: true,
+            },
+        );
+        assert_eq!(
+            state.allowed_pubkeys.len(),
+            1,
+            "an equivalent spelling must not duplicate the entry"
+        );
+        assert_eq!(state.allowed_pubkeys[0].1, "second");
+
+        apply_access_op(
+            &mut state,
+            &AccessOp::BlockIp {
+                ip: "127.0.0.1".parse().unwrap(),
+                reason: "first".into(),
+            },
+        );
+        apply_access_op(
+            &mut state,
+            &AccessOp::BlockIp {
+                ip: "::ffff:127.0.0.1".parse().unwrap(),
+                reason: "second".into(),
+            },
+        );
+        assert_eq!(
+            state.blocked_ips.entries().len(),
+            1,
+            "an equivalent address must not duplicate the entry"
+        );
+        assert_eq!(state.blocked_ips.entries()[0].1, "second");
     }
 
     #[test]

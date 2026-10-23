@@ -465,6 +465,12 @@ pub async fn rpc_handler(
             let Some(pubkey) = params.first().and_then(Value::as_str) else {
                 return rpc_err("invalid params");
             };
+            // The optional reason is not stored for an unban, but a
+            // non-string in that position is a client bug and must not be
+            // silently ignored.
+            if let Err(e) = opt_param_str(params, 1, "reason") {
+                return rpc_err(&e);
+            }
             // Same validation as `banpubkey`: an unban must name a pubkey
             // (any string used to return a success reply).
             if !is_pubkey(pubkey) {
@@ -557,6 +563,9 @@ pub async fn rpc_handler(
             let Some(pubkey) = params.first().and_then(Value::as_str) else {
                 return rpc_err("invalid params");
             };
+            if let Err(e) = opt_param_str(params, 1, "reason") {
+                return rpc_err(&e);
+            }
             // Same validation as `allowpubkey`.
             if !is_pubkey(pubkey) {
                 return rpc_err("invalid pubkey");
@@ -593,6 +602,15 @@ pub async fn rpc_handler(
                 return rpc_err("invalid params");
             };
             {
+                let access = relay.access.read().await;
+                if !access.allowed_kinds.is_empty()
+                    && !access.allowed_kinds.contains(&kind)
+                    && access.allowed_kinds.len() >= MAX_ACCESS_ENTRIES
+                {
+                    return rpc_err("restricted: the allowed-kind list is full");
+                }
+            }
+            {
                 // NIP-86: allowing a kind also un-blocks it (matching the
                 // legacy endpoint), so `disallowkind` can be reverted. The
                 // conditional allow mirrors the call-site rule below: an
@@ -626,6 +644,14 @@ pub async fn rpc_handler(
             let Some(kind) = params.first().and_then(Value::as_u64) else {
                 return rpc_err("invalid params");
             };
+            {
+                let access = relay.access.read().await;
+                if !access.blocked_kinds.contains(&kind)
+                    && access.blocked_kinds.len() >= MAX_ACCESS_ENTRIES
+                {
+                    return rpc_err("restricted: the blocked-kind list is full");
+                }
+            }
             {
                 // A blocked kind must never be listed as allowed: drop it
                 // from the config allowlist (`listallowedkinds` reports that
@@ -751,7 +777,7 @@ pub async fn rpc_handler(
                 relay
                     .config_version
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                audit!(&relay, &identity, method, params);
+                audit_failure!(&relay, &identity, method, params);
                 return rpc_err("error: cannot persist the relay field");
             }
             audit!(&relay, &identity, method, params);
@@ -1172,10 +1198,13 @@ pub async fn rpc_handler(
             let _groups_in_flight = relay.begin_group_derived();
             let _roles_in_flight = relay.begin_role_derived();
             let outcome = relay.db.ban_event(id, reason).await;
-            audit!(&relay, &identity, "banevent", params);
             let (_, state_removed) = match outcome {
-                Ok(outcome) => outcome,
+                Ok(outcome) => {
+                    audit!(&relay, &identity, "banevent", params);
+                    outcome
+                }
                 Err(e) => {
+                    audit_failure!(&relay, &identity, "banevent", params);
                     log::error!("banevent store failure: {e}");
                     let message = e.to_string();
                     if message.starts_with("restricted:") {
@@ -1234,8 +1263,8 @@ pub async fn rpc_handler(
             // like banning pre-bans. Only a store failure surfaces an
             // error.
             let outcome = relay.db.allow_event(id, reason).await;
-            audit!(&relay, &identity, "allowevent", params);
             if let Err(e) = outcome {
+                audit_failure!(&relay, &identity, "allowevent", params);
                 log::error!("allowevent store failure: {e}");
                 let message = e.to_string();
                 if message.starts_with("restricted:") {
@@ -1243,6 +1272,7 @@ pub async fn rpc_handler(
                 }
                 return rpc_err("error: cannot persist the event allow");
             }
+            audit!(&relay, &identity, "allowevent", params);
             rpc_ok(json!(true))
         }
         "unallowevent" => {
@@ -1259,11 +1289,12 @@ pub async fn rpc_handler(
             // marker is a no-op success. Only a store failure surfaces
             // an error.
             let outcome = relay.db.unallow_event(id).await;
-            audit!(&relay, &identity, "unallowevent", params);
             if let Err(e) = outcome {
+                audit_failure!(&relay, &identity, "unallowevent", params);
                 log::error!("unallowevent store failure: {e}");
                 return rpc_err("error: cannot persist the event unallow");
             }
+            audit!(&relay, &identity, "unallowevent", params);
             rpc_ok(json!(true))
         }
         "unbanevent" => {
@@ -1280,11 +1311,12 @@ pub async fn rpc_handler(
             // never-banned id is a no-op success. Only a store failure
             // surfaces an error.
             let outcome = relay.db.unban_event(id).await;
-            audit!(&relay, &identity, "unbanevent", params);
             if let Err(e) = outcome {
+                audit_failure!(&relay, &identity, "unbanevent", params);
                 log::error!("unbanevent store failure: {e}");
                 return rpc_err("error: cannot persist the event unban");
             }
+            audit!(&relay, &identity, "unbanevent", params);
             rpc_ok(json!(true))
         }
         "listbannedevents" => {
@@ -2298,6 +2330,12 @@ mod tests {
         let recent = relay.audit.recent();
         assert!(recent.iter().any(|entry| entry.starts_with("banevent")));
         assert!(recent.iter().any(|entry| entry.starts_with("allowevent")));
+        assert!(
+            recent
+                .iter()
+                .any(|entry| entry.starts_with("allowevent") && entry.ends_with("(failed)")),
+            "a failed store must be audited as failed, not as a successful mutation"
+        );
         let resp = rpc_call(&relay, "listbannedevents", vec![]).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let resp = rpc_call(&relay, "listeventsneedingmoderation", vec![]).await;
@@ -3253,7 +3291,7 @@ mod tests {
         // A non-string reason must fail instead of being silently dropped
         // (absent/null still means no reason).
         let relay = build_admin_relay().await;
-        for method in ["banpubkey", "allowpubkey"] {
+        for method in ["banpubkey", "allowpubkey", "unbanpubkey", "unallowpubkey"] {
             let resp = rpc_call(&relay, method, vec![json!("aa".repeat(32)), json!(7)]).await;
             assert!(
                 rpc_err_of(resp).await.contains("reason must be a string"),
@@ -3264,6 +3302,33 @@ mod tests {
         }
         let resp = rpc_call(&relay, "blockip", vec![json!("127.0.0.1"), json!(true)]).await;
         assert!(rpc_err_of(resp).await.contains("reason must be a string"));
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn kind_lists_are_bounded() {
+        let relay = build_admin_relay().await;
+        relay.access.write().await.blocked_kinds = (0..MAX_ACCESS_ENTRIES as u64).collect();
+        let resp = rpc_call(
+            &relay,
+            "disallowkind",
+            vec![json!(MAX_ACCESS_ENTRIES as u64)],
+        )
+        .await;
+        assert!(
+            rpc_err_of(resp).await.contains("blocked-kind list is full"),
+            "a new kind at the blocked-kind cap must be refused"
+        );
+        // Re-blocking an existing kind does not grow the list.
+        let resp = rpc_call(&relay, "disallowkind", vec![json!(0)]).await;
+        assert!(rpc_ok_of(resp).await);
+
+        relay.access.write().await.allowed_kinds = (0..MAX_ACCESS_ENTRIES as u64).collect();
+        let resp = rpc_call(&relay, "allowkind", vec![json!(MAX_ACCESS_ENTRIES as u64)]).await;
+        assert!(
+            rpc_err_of(resp).await.contains("allowed-kind list is full"),
+            "a new kind at the allowed-kind cap must be refused"
+        );
         relay.db.shutdown();
     }
 
