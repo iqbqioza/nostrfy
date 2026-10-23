@@ -85,8 +85,11 @@ const SUPPORTED_METHODS: &[&str] = &[
 /// `supportedmethods` is implicitly available to every authenticated
 /// caller (it shows their own subset), so it is not a grant target.
 /// Everything else — permission management itself, role and
-/// invite-claim management, and the relay identity — stays admin-only,
-/// so a grantee can never escalate.
+/// invite-claim management, the relay identity, and IP blocking — stays
+/// admin-only, so a grantee can never escalate or lock out the management
+/// surface. (`blockip` refuses every route from the address, including
+/// `/health` and the NIP-86 endpoint, so delegating it would let a grantee
+/// turn off the relay's administration.)
 pub(crate) const GRANTABLE_METHODS: &[&str] = &[
     "banpubkey",
     "unbanpubkey",
@@ -97,8 +100,6 @@ pub(crate) const GRANTABLE_METHODS: &[&str] = &[
     "allowkind",
     "disallowkind",
     "listallowedkinds",
-    "blockip",
-    "unblockip",
     "listblockedips",
     "banevent",
     "allowevent",
@@ -2779,6 +2780,16 @@ mod tests {
         )
         .await;
         assert!(rpc_err_of(resp).await.contains("invalid method"));
+        // IP blocking refuses every route from the address, including the
+        // management API: delegating it would let a grantee lock out the
+        // relay's administration.
+        for method in ["blockip", "unblockip"] {
+            let resp = rpc_call(&relay, "assignmethod", vec![json!(agent_pk), json!(method)]).await;
+            assert!(
+                rpc_err_of(resp).await.contains("invalid method"),
+                "{method} must stay admin-only"
+            );
+        }
         let resp = rpc_call(&relay, "assignmethod", vec![json!("zz"), json!("banevent")]).await;
         assert!(rpc_err_of(resp).await.contains("pubkey"));
         // Grant + idempotent re-grant: the PR's `[true, message]` shape.
@@ -2944,6 +2955,8 @@ mod tests {
             let grants = access.method_grants.entry(agent_pk.clone()).or_default();
             grants.push("assignmethod".into());
             grants.push("createrole".into());
+            grants.push("blockip".into());
+            grants.push("unblockip".into());
             grants.push("listbannedevents".into());
         }
         let (_, resp) = nip98_call(
@@ -2964,13 +2977,20 @@ mod tests {
             StatusCode::UNAUTHORIZED,
             "an admin-only grant must not reach the method either"
         );
+        let (_, resp) = nip98_call(&relay, &agent, "blockip", vec![json!("127.0.0.1")]).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "a stale blockip grant must not lock out the relay"
+        );
         let (_, resp) = nip98_call(&relay, &agent, "supportedmethods", vec![]).await;
         let list = rpc_result_of(resp).await;
         let list = list.as_array().unwrap();
         assert!(
-            !list
-                .iter()
-                .any(|m| m == "assignmethod" || m == "createrole"),
+            !list.iter().any(|m| m == "assignmethod"
+                || m == "createrole"
+                || m == "blockip"
+                || m == "unblockip"),
             "discovery must filter non-grantable grants: {list:?}"
         );
         assert!(
