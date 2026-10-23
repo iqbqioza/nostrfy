@@ -56,10 +56,12 @@ Every deployment uses the same `nostrfy.toml` options — the [Configuration ref
 [relay]
 name = "My Relay"
 public_url = "wss://relay.example.com"   # required for NIP-42 AUTH / NIP-62 / NIP-98
-private_key = ""                          # run `nostrfy genkey` and paste the key
+private_key = ""                          # keep empty; inject NOSTRFY_RELAY_PRIVATE_KEY at runtime
 ```
+
+For containers, never bake secrets into the image: set `NOSTRFY_RELAY_PRIVATE_KEY` (and the other `NOSTRFY_*` secret names) through the platform's secret store, or mount a config file. The image/config template only carries non-secret settings.
 
 ## Choosing between VM and containers
 
 - **VM (systemd)**: simplest, cheapest, full control. Recommended for most relay deployments.
-- **Container**: use the repository `Dockerfile` (installs the release binary via `install.sh`) on Fly.io, Digital Ocean App Platform, AWS ECS, GCP Cloud Run or Azure Container Apps — or `docker compose up -d --build` locally. Persistent storage is required for the LMDB data (`/data`). Give the container a stop grace period of at least **35 seconds** (`docker run --stop-timeout 35`, `stop_grace_period: 35s` in compose, or `kill_timeout = "35s"` on Fly): the relay's graceful shutdown budget is 27 seconds and the platform default would SIGKILL before the final flush.
+- **Container**: use the repository `Dockerfile` (installs the release binary from the pinned in-repo `install.sh`) on Fly.io, Digital Ocean App Platform, AWS ECS, GCP Cloud Run or Azure Container Apps — or `docker compose up -d --build` locally. Persistent storage is required for the LMDB data (`/data`), and it must be a **local block device** (Fly volume, EBS, persistent disk, managed disk). Do **not** put LMDB on NFS/EFS/Filestore/GCS FUSE/Azure Files: LMDB needs POSIX byte-range locks and `mmap`, and a shared network filesystem can corrupt the database or silently split the writer. Give the container a stop grace period of at least **35 seconds** (`docker run --stop-timeout 35`, `stop_grace_period: 35s` in compose, or `kill_timeout = "35s"` on Fly): the relay's graceful shutdown budget is 27 seconds and the platform default would SIGKILL before the final flush.

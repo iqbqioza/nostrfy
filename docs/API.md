@@ -94,6 +94,8 @@ When `server.api_host` is configured (e.g. `api.example.com`), the API and the W
 
 Without `api_host`, the API is served on every host, next to the WebSocket endpoint.
 
+`/live` is host-agnostic: it is served on every host so Docker/Fly/Kubernetes liveness probes keep working when `api_host` is set.
+
 > **Note**: Only `GET` is supported. WebSocket upgrade requests to `/api/v1` are rejected with `403 Forbidden` — or `401` first when `relay.require_auth` is set and the request carries no NIP-98 authorization (the auth layer runs before the upgrade rejection).
 
 ---

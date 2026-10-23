@@ -41,7 +41,8 @@ Container Apps builds from the repository `Dockerfile` (which downloads the pre-
 1. **Create a Container App** from the GitHub repo (or push the image to ACR).
 2. **Port**: set the container port to `8080`.
 3. **Memory**: at least 1 GB.
-4. **Persistent storage**: mount an **Azure Storage file share** at `/data` for the LMDB data.
+4. **Persistent storage**: LMDB needs a **local block device** (a VM managed disk). An Azure Storage file share is a network filesystem and does not provide the POSIX locking/`mmap` behavior LMDB requires; it can corrupt the database or split the writer. For production, run on a VM with a managed disk (the recommended option above).
 5. **TLS**: Container Apps provides `https://` on the app URL — set `relay.public_url = "wss://<app>.<region>.azurecontainerapps.io"` (or a custom domain).
+6. **Secrets**: inject `NOSTRFY_RELAY_PRIVATE_KEY` (and the other `NOSTRFY_*` names) from Key Vault / Container Apps secrets. Never put the key in the baked `deploy/nostrfy.container.toml`.
 
-> **Note**: set **min replicas = 1** — a relay must never scale to zero. The baked `deploy/nostrfy.container.toml` can be replaced by mounting your own `nostrfy.toml` at `/etc/nostrfy/nostrfy.toml`.
+> **Note**: set **min replicas = 1** — a relay must never scale to zero. A non-secret custom config can be mounted at `/etc/nostrfy/nostrfy.toml`.

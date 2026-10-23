@@ -4,8 +4,13 @@
 # /etc/nostrfy/nostrfy.toml) to set:
 #   - the relay name and description
 #   - `public_url`  (required for NIP-42/62/98)
-#   - `private_key` (required for NIP-29 groups)
 # All values below are the built-in defaults; adjust as needed.
+#
+# NEVER put secrets in this file: it is baked into the image layer, its build
+# cache and any registry that stores the image. Inject the relay key (and the
+# other `NOSTRFY_*` secrets) at runtime, e.g. `fly secrets set
+# NOSTRFY_RELAY_PRIVATE_KEY=...`, Docker/the orchestrator's secret store, or a
+# mounted config file. `private_key` below must stay empty.
 
 [relay]
 name = "nostrfy"

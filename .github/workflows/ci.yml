@@ -116,3 +116,29 @@ jobs:
           ./target/release/nostrfy --version
           ./target/release/nostrfy --config /tmp/nostrfy-test.toml init
           ./target/release/nostrfy --config /tmp/nostrfy-test.toml check
+
+  docker:
+    name: Docker image
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -t nostrfy-ci .
+
+      - name: Smoke test
+        run: |
+          trap 'docker rm -f nostrfy-ci >/dev/null 2>&1 || true' EXIT
+          docker run -d --name nostrfy-ci -p 18080:8080 \
+            -e NOSTRFY_RELAY_PRIVATE_KEY=1111111111111111111111111111111111111111111111111111111111111111 \
+            nostrfy-ci
+          for _ in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:18080/live >/dev/null; then
+              curl -fsS http://127.0.0.1:18080/live
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs nostrfy-ci || true
+          exit 1

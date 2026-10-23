@@ -335,6 +335,7 @@ async fn build_router(
     };
     let mut app = Router::new()
         .route("/health", get(health_handler))
+        .route("/live", get(live_handler))
         .route("/relay/stats", get(stats_handler))
         .nest("/api/v1", api_routes);
     // In `inbox-outbox` mode the root is not a WebSocket endpoint: it only
@@ -559,6 +560,11 @@ fn host_route_allowed(
     path: &str,
     method: &axum::http::Method,
 ) -> bool {
+    // Liveness is host-agnostic: platform probes (Docker, Fly, Kubernetes)
+    // may send any Host header, and `api_host` must not turn them unhealthy.
+    if path == "/live" {
+        return true;
+    }
     let is_api = !api_host.is_empty() && host == api_host;
     let is_blossom = !blossom_host.is_empty() && host == blossom_host;
     let is_relay = !is_api && !is_blossom;
@@ -1592,6 +1598,14 @@ async fn ws_handler(State(relay): State<Arc<Relay>>, request: Request) -> Respon
         }
         Err(rejection) => rejection.into_response(),
     }
+}
+
+/// `GET /live`: process liveness only. It never touches the database, so a
+/// full disk / exhausted LMDB map (which `/health` reports as 503) does not
+/// make a platform restart the relay; reads and live delivery are still
+/// serving. Docker/Kubernetes/Fly should probe this endpoint.
+async fn live_handler() -> Response {
+    (StatusCode::OK, Json(json!({ "status": "ok" }))).into_response()
 }
 
 /// `GET /health`: liveness plus a write-path check.
@@ -6448,6 +6462,17 @@ mod tests {
     #[test]
     fn host_route_allocation_matrix() {
         let sha = "ab".repeat(32);
+        // Liveness is host-agnostic: platform probes may use the API,
+        // Blossom, or relay hostname and must never be routed to 404.
+        for host in ["relay.example.com", "api.test", "media.test"] {
+            assert!(host_route_allowed(
+                "api.test",
+                "media.test",
+                host,
+                "/live",
+                &axum::http::Method::GET
+            ));
+        }
         // blossom only (api_host unset): relay paths stay reachable.
         assert!(host_route_allowed(
             "",
