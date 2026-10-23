@@ -39,7 +39,8 @@ Cloud Run builds from the repository `Dockerfile` (which downloads the pre-built
 1. **Create a service from the GitHub repo** (or push the image to Artifact Registry).
 2. **Port**: set the container port to `8080`.
 3. **Allocate memory**: at least 512 MB (LMDB + the async runtime).
-4. **Persistent storage**: attach a **Cloud Run volume (filestore/gcsfuse)** at `/data` — LMDB needs a filesystem, so a GCS FUSE mount at `/data` works for persistence.
+4. **Persistent storage**: LMDB needs a **local block device** (a Compute Engine persistent disk). Cloud Run's Filestore/GCS FUSE mounts are network filesystems; they do not provide the POSIX locking/`mmap` behavior LMDB requires and can corrupt the database. For production, run on Compute Engine with a persistent disk (the recommended option above). If you must use a container, mount a block-backed volume, not GCS FUSE.
 5. **TLS**: Cloud Run provides `https://` automatically — set `relay.public_url = "wss://<service>.a.run.app"` (or your custom domain).
+6. **Secrets**: inject `NOSTRFY_RELAY_PRIVATE_KEY` (and the other `NOSTRFY_*` names) with Secret Manager / the service's secret environment. Never put the key in the baked `deploy/nostrfy.container.toml`.
 
-> **Note**: Cloud Run scales to zero by default — for a relay, set **min instances = 1** so it never goes cold. The `deploy/nostrfy.container.toml` baked into the image can be replaced by mounting your own `nostrfy.toml` at `/etc/nostrfy/nostrfy.toml`.
+> **Note**: Cloud Run scales to zero by default — for a relay, set **min instances = 1** so it never goes cold. A non-secret custom config can be mounted at `/etc/nostrfy/nostrfy.toml`.

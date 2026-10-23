@@ -1,8 +1,8 @@
 # nostrfy — generic container image (Docker, Podman, Fly.io, any OCI runtime)
 #
-# The binary is NOT compiled here: it is installed with install.sh from the
-# GitHub release assets built by the Release workflow (the script detects
-# the architecture and verifies the sha256 checksum).
+# The binary is NOT compiled here: install.sh (copied from this repository,
+# so the build does not execute an unpinned script fetched from main) detects
+# the architecture and verifies the release asset's sha256 checksum.
 #
 #   docker build -t nostrfy .
 #   docker run -d --name nostrfy -p 8080:8080 -v nostrfy-data:/data nostrfy
@@ -31,13 +31,15 @@ RUN apt-get update \
 # sha256). For Apache-2.0 compliance the license texts and NOTICE published
 # as release assets travel in the image (the image redistributes the binary,
 # so it must carry them).
+COPY install.sh /tmp/install.sh
 RUN if [ -n "${NOSTRFY_VERSION}" ]; then \
       BASE="https://github.com/iqbqioza/nostrfy/releases/download/${NOSTRFY_VERSION}"; \
     else \
       BASE="https://github.com/iqbqioza/nostrfy/releases/latest/download"; \
     fi \
     && export VERSION="${NOSTRFY_VERSION}" INSTALL_DIR=/usr/local/bin \
-    && curl -fsSL https://raw.githubusercontent.com/iqbqioza/nostrfy/main/install.sh | sh \
+    && sh /tmp/install.sh \
+    && rm -f /tmp/install.sh \
     && mkdir -p /usr/share/licenses/nostrfy \
     && curl -fsSL "${BASE}/LICENSE-MIT" -o /usr/share/licenses/nostrfy/LICENSE-MIT \
     && curl -fsSL "${BASE}/LICENSE-APACHE" -o /usr/share/licenses/nostrfy/LICENSE-APACHE \
@@ -46,12 +48,16 @@ RUN if [ -n "${NOSTRFY_VERSION}" ]; then \
 COPY deploy/nostrfy.container.toml /etc/nostrfy/nostrfy.toml
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN mkdir -p /data /etc/nostrfy \
-    && chown -R nostr:nostr /data /etc/nostrfy
+    && chown -R nostr:nostr /data /etc/nostrfy \
+    && chmod 600 /etc/nostrfy/nostrfy.toml
 VOLUME ["/data"]
 EXPOSE 8080
 USER nostr
+# Liveness, not write-path health: a full disk must not restart the relay.
+# The /health fallback keeps images built with a pre-/live release binary
+# healthy during an upgrade window.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD curl -fsS http://127.0.0.1:8080/health || exit 1
+    CMD curl -fsS http://127.0.0.1:8080/live || curl -fsS http://127.0.0.1:8080/health || exit 1
 # Docker's default 10s stop timeout is shorter than the relay's 27s graceful
 # shutdown budget. Give it time to drain and flush: `docker run --stop-timeout
 # 35 ...` (compose sets `stop_grace_period: 35s`; Fly sets `kill_timeout`).

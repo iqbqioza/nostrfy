@@ -3,9 +3,9 @@
 # Quick start (see docs/DEPLOYMENT.md for the full guide):
 #   1. fly launch --no-deploy --name <app-name>
 #   2. fly volumes create data --size 1 --region <region>
-#   3. set the relay name / public_url / private_key in
-#      deploy/nostrfy.container.toml (baked into the image)
-#   4. fly deploy
+#   3. set the relay name / public_url in deploy/nostrfy.container.toml
+#   4. fly secrets set NOSTRFY_RELAY_PRIVATE_KEY=...   (never bake it)
+#   5. fly deploy
 #
 # app = the app name (required, must be unique on Fly). Set it with
 #       `fly launch --name <name>` or edit this line.
@@ -32,12 +32,14 @@ kill_timeout = "35s"
   auto_start_machines = true
   min_machines_running = 1
 
-  [http_service.checks]
-    [http_service.checks.health]
-      path = "/health"
-      interval = "30s"
-      timeout = "5s"
-      grace_period = "15s"
+  # Liveness only: /health returns 503 while the database refuses writes
+  # (full disk/map) even though the relay still serves reads; using it here
+  # would restart a healthy relay.
+  [[http_service.checks]]
+    path = "/live"
+    interval = "30s"
+    timeout = "5s"
+    grace_period = "15s"
 
 [metrics]
   # Scraped by Fly from the same listener that serves /metrics (8080):

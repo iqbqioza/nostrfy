@@ -39,7 +39,7 @@ The App Platform builds from the repository `Dockerfile` (which downloads the pr
 1. **Connect your GitHub repo** and create an app from it.
 2. **Port**: set the HTTP port to `8080` (the relay listens there).
 3. **Persistent disk**: mount a volume at `/data` (LMDB data lives there — without it, data is lost on every deploy).
-4. **Env**: the `deploy/nostrfy.container.toml` baked into the image can be replaced by mounting your own config at `/etc/nostrfy/nostrfy.toml` (create a fork that copies it, or use a Dockerfile `COPY` in your own repo).
+4. **Env**: inject `NOSTRFY_RELAY_PRIVATE_KEY` (and the other `NOSTRFY_*` names) as App Platform secrets. Never put the key in the baked `deploy/nostrfy.container.toml`; a non-secret custom config can be mounted at `/etc/nostrfy/nostrfy.toml`.
 5. **TLS**: App Platform provides `https://` automatically for the app domain — set `relay.public_url` accordingly.
 
 ## Both options

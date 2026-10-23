@@ -39,18 +39,29 @@ fly volumes create data --size 1 --region <region>
 
 ### 3. Configure the relay
 
-Edit `deploy/nostrfy.container.toml` before deploying:
+Edit `deploy/nostrfy.container.toml` before deploying. **Never put the relay key in this file**: it is baked into the image layer, its build cache and the registry.
 
 ```toml
 [relay]
 name = "My Relay"                              # shown in clients via NIP-11
 description = "A friendly relay for everyone"
-private_key = "..."                            # required for NIP-29 groups
+private_key = ""                               # MUST stay empty; inject it below
 public_url = "wss://<your-app-name>.fly.dev"   # required for NIP-42/62/98
 ```
 
-- `private_key`: generate locally with `nostrfy genkey` (against a temporary config) and paste the key, or generate one with any Nostr tool
+Generate the key locally, then store it as a Fly secret (the value is injected at runtime by `NOSTRFY_RELAY_PRIVATE_KEY`):
+
+```sh
+tmpdir="$(mktemp -d)"
+nostrfy --config "$tmpdir/nostrfy.toml" init
+nostrfy --config "$tmpdir/nostrfy.toml" genkey
+# copy the printed key once:
+fly secrets set NOSTRFY_RELAY_PRIVATE_KEY=<printed-key>
+rm -rf "$tmpdir"
+```
+
 - `public_url` **must** match your app name — without it, NIP-42 AUTH, NIP-62 vanish and the NIP-86 management API will not work
+- `fly secrets set NOSTRFY_RPC_MANAGEMENT_TOKEN=...` / `NOSTRFY_LIVEKIT_API_SECRET=...` / `NOSTRFY_BLOSSOM_S3_SECRET_KEY=...` work the same way
 - Everything else can stay at the defaults
 
 ### 4. Deploy
@@ -59,7 +70,7 @@ public_url = "wss://<your-app-name>.fly.dev"   # required for NIP-42/62/98
 fly deploy
 ```
 
-Fly builds the image (a few minutes — the binary download is fast, the image is small), creates a machine and runs the health check against `/health`.
+Fly builds the image (a few minutes — the binary download is fast, the image is small), creates a machine and runs the liveness check against `/live`.
 
 ## Verify
 
@@ -75,19 +86,19 @@ curl https://<your-app-name>.fly.dev/
 
 ## Scaling and updates
 
-- **Update the relay**: edit `deploy/nostrfy.container.toml` and `fly deploy` again — the image installs the **latest** GitHub release binary, so an update is a simple redeploy
+- **Update the relay**: edit `deploy/nostrfy.container.toml` for non-secret settings and `fly deploy` again — the image installs the **latest** GitHub release binary, so an update is a simple redeploy. Secrets stay in `fly secrets`.
 - **Pin a version**: `docker build --build-arg NOSTRFY_VERSION=v0.1.3 ...`
-- **Scale**: the relay is a single machine by default. `fly machines clone <id>` creates a second machine; both share the volume (Fly volumes support multiple machines in the same region)
+- **Scale**: the relay is a **single machine per database**. LMDB is single-writer; do not clone the machine to share a volume (`fly machines clone` would fail to lock the database or, on a filesystem without working locks, corrupt the derived state). Run one machine per volume; for read scale use a separate relay/database.
 - **Metrics**: Fly collects the `/metrics` endpoint (see `[metrics]` in `fly.toml`) and shows it in the Fly dashboard under Metrics
 
 ## Customizing the configuration
 
-The image reads `/etc/nostrfy/nostrfy.toml`, baked from `deploy/nostrfy.container.toml`. Two ways to customize:
+The image reads `/etc/nostrfy/nostrfy.toml`, baked from `deploy/nostrfy.container.toml`. Customize it in one of two ways:
 
-1. **Edit `deploy/nostrfy.container.toml` in the repository** and redeploy (simplest)
-2. **Mount your own config**: build a fork of the image that copies your config file over `/etc/nostrfy/nostrfy.toml`
+1. **Edit `deploy/nostrfy.container.toml` in the repository** for non-secret settings (name, description, public_url, limits) and redeploy
+2. **Mount your own config** if you need a fully custom file; keep it outside the image and mount it at `/etc/nostrfy/nostrfy.toml`
 
-Every option is documented in the [Configuration reference](../CONFIGURATION.md).
+Secrets do **not** belong in either file. Use `fly secrets set NOSTRFY_RELAY_PRIVATE_KEY=...` (and the other `NOSTRFY_*` names) or a mounted secret store. Every option is documented in the [Configuration reference](../CONFIGURATION.md).
 
 ## Notes
 

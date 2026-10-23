@@ -160,14 +160,16 @@ If anything is wrong, it tells you exactly what. It is strongly recommended to r
 | `contact` | Administrator contact (URL or email) | empty |
 | `icon` | Relay icon image URL | empty |
 | `post_policy` | URL describing the posting policy | empty |
-| `private_key` | The relay's own secret key. **Required for NIP-29 groups** | empty |
+| `private_key` | The relay's own secret key. **Required for NIP-29 groups**; containers should leave it empty and inject `NOSTRFY_RELAY_PRIVATE_KEY` | empty |
 | `public_url` | The relay's public URL (e.g. `wss://relay.example.com`). **Set this for NIP-42 auth and friends to work correctly** | empty |
-| `livekit_url` | LiveKit server URL (for audio/video rooms) | empty |
+| `livekit_url` | LiveKit server URL (`wss://`; loopback `ws://` only) | empty |
 | `livekit_api_key` / `livekit_api_secret` | LiveKit API key and secret | empty |
 | `livekit_participants_interval_secs` | Seconds between LiveKit participant-list refreshes (the `39004` event) | `15` |
 | `enabled_nips` | Explicit allowlist of NIP numbers (empty = all enabled) | empty |
 | `disabled_nips` | List of NIP numbers to disable | empty |
 | `reject_ephemeral` | When `true`, reject NIP-01 ephemeral events (kinds 20000–29999), except the NIP-mandated kinds (`22242`, `27235`, `28934`/`28935`/`28936`, `24133`, `23194`/`23195`, `24242`, `21059`) | `false` |
+
+For container deployments, keep secrets out of the config file: `NOSTRFY_RELAY_PRIVATE_KEY`, `NOSTRFY_RPC_MANAGEMENT_TOKEN`, `NOSTRFY_LIVEKIT_API_SECRET`, `NOSTRFY_BLOSSOM_S3_ACCESS_KEY` and `NOSTRFY_BLOSSOM_S3_SECRET_KEY` override the corresponding file fields at runtime (empty values are ignored).
 | `enabled_git` | When `true`, accept NIP-34 git events (kinds 1617–1633, 30617/30618) and advertise NIP-34. Off by default: the kinds are rejected (`blocked: NIP-34 git events are disabled`) | `false` |
 | `require_pow` | Required proof-of-work difficulty in bits (0 = none) | `0` |
 | `new_pubkey_min_age_secs` | Reject posts from accounts younger than this (spam defense, 0 = off). First-seen entries idle for this window + 1 hour are forgotten; that returning account passes once as new | `0` |
@@ -329,14 +331,14 @@ responsive under abuse:
 ./target/release/nostrfy --config nostrfy.toml restart
 ```
 
-### Health check
+### Health and liveness checks
 
 ```bash
-curl http://127.0.0.1:8080/health
-# => {"status":"ok"}
+curl http://127.0.0.1:8080/live    # liveness: 200 while the process serves
+curl http://127.0.0.1:8080/health  # readiness/write path
 ```
 
-`200` means the process is serving and the database is accepting writes. `503` means the relay is **up but refusing writes** — the database disk or LMDB map is full, or the database writer is gone — and the body names the reason; reads and live delivery keep working, and the status returns to `200` automatically once space is available. Use `503` for write-path alerting only, not as a liveness/restart probe.
+`/live` never touches the database: use it for Docker/Kubernetes/Fly restart probes. `/health` returns `200` while the database accepts writes; `503` means the relay is **up but refusing writes** — the database disk or LMDB map is full, or the database writer is gone — and the body names the reason. Reads and live delivery keep working, and `/health` returns to `200` automatically once space is available. Use `/health` for write-path alerting only, not as a liveness/restart probe.
 
 ### NIP-11 information document
 
@@ -637,7 +639,7 @@ Groups can be hierarchical (`parent` / `child` tags). Cycles are rejected automa
 
 With a LiveKit server configured, groups can have audio/video chat rooms.
 
-1. Set `relay.livekit_url`, `relay.livekit_api_key`, and `relay.livekit_api_secret`
+1. Set `relay.livekit_url` (must be `wss://`; plain `ws://` is accepted only for loopback), `relay.livekit_api_key`, and `relay.livekit_api_secret`. Containers should inject the secret as `NOSTRFY_LIVEKIT_API_SECRET`.
 2. Add the `livekit` tag to the group's metadata (via an admin's 9002 edit)
 3. Clients fetch a JWT from `/.well-known/nip29/livekit/<group-id>` with NIP-98 auth (a pubkey banned with NIP-86 `banpubkey` is refused)
 4. The relay publishes a `kind:39004` participant list per livekit group, refreshed every `relay.livekit_participants_interval_secs` (default 15) and immediately when LiveKit sends webhooks to `/.well-known/nip29/livekit/webhook` — point the LiveKit server's `webhook.urls` at it and let `webhook.api_key` match `relay.livekit_api_key` (the relay verifies the signed payload; missed events are reconciled by the poll). Leaving the group's LiveKit mode clears the list
