@@ -557,6 +557,11 @@ pub async fn rpc_handler(
             if !persisted {
                 return rpc_err("error: cannot persist the access control state");
             }
+            // The allowlist is the NIP-43 roster when the relay is closed;
+            // republish 13534 so Buzz-style clients see the new member.
+            if relay.config.read().await.nip_enabled(43) {
+                let _ = relay.publish_membership(None).await;
+            }
             rpc_ok(json!(true))
         }
         "unallowpubkey" => {
@@ -585,6 +590,9 @@ pub async fn rpc_handler(
             audit!(&relay, &identity, "unallowpubkey", params);
             if !persisted {
                 return rpc_err("error: cannot persist the access control state");
+            }
+            if relay.config.read().await.nip_enabled(43) {
+                let _ = relay.publish_membership(None).await;
             }
             rpc_ok(json!(true))
         }

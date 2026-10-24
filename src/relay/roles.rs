@@ -96,12 +96,36 @@ impl super::Relay {
         result
     }
 
+    /// Signs a query-time relay event (a NIP-CW window or thread overlay)
+    /// without storing it. Returns false when the relay has no signing key.
+    pub(crate) fn sign_relay_event(&self, event: &mut Event) -> bool {
+        let Some(keypair) = &self.key else {
+            return false;
+        };
+        nip01::sign(event, keypair).is_ok()
+    }
+
     /// Signs, stores and broadcasts a relay-generated event. The event must
     /// already carry a strictly monotonic [`StampClock`] stamp (all builders
     /// stamp through `stamp_floor`); a stored version can never outrank the
     /// newest state because the stamps reflect the order in which the state
     /// was applied, not the order in which the events are stored.
     pub(crate) async fn store_relay_event(&self, event: &mut Event) -> Result<bool, ()> {
+        // Buzz-only relay events are side effects of group membership
+        // changes. With the Buzz layer disabled, do not publish them: the
+        // group operation itself must still succeed, so report success
+        // without touching the database.
+        if !self.config.read().await.relay.enabled_buzz
+            && matches!(
+                event.kind,
+                crate::nips::nip29::SYSTEM_MESSAGE
+                    | crate::nips::nip29::MEMBER_ADDED
+                    | crate::nips::nip29::MEMBER_REMOVED
+                    | 30622
+            )
+        {
+            return Ok(true);
+        }
         let Some(keypair) = &self.key else {
             return Err(());
         };
@@ -129,6 +153,58 @@ impl super::Relay {
         self.store_relay_event(&mut event).await.is_ok()
     }
 
+    /// The pubkeys a `restrict_relay` allowlist admits, as NIP-43 member
+    /// entries. An open relay has no enforced membership, so the list is
+    /// empty and NIP-43 is not advertised (see `effective_supported_nips`).
+    pub(crate) async fn allowlisted_members(&self) -> Vec<String> {
+        let access = self.access.read().await;
+        if !access.restrict_relay {
+            return Vec::new();
+        }
+        access
+            .allowed_pubkeys
+            .iter()
+            .map(|(pubkey, _)| pubkey.to_ascii_lowercase())
+            .collect()
+    }
+
+    /// The relay's administrator identities, published as NIP-43 `owner`
+    /// entries: the advertised NIP-11 `pubkey` (`relay.pubkey`) and the
+    /// NIP-86 admin (`rpc.admin_pubkey`). Buzz's community-members panel
+    /// reads roles from `kind:13534`, so without these the operator appears
+    /// absent or, worse, as a plain member. The relay's signing key
+    /// (`relay.private_key`, NIP-11 `self`) is deliberately not included:
+    /// it is the relay's event signer, not an administrator identity, and
+    /// listing it would put a key no one controls in the member roster.
+    /// Deduplicated and sorted for a deterministic event.
+    pub(crate) async fn relay_owner_members(&self) -> Vec<String> {
+        let cfg = self.config.read().await;
+        let mut owners: Vec<String> = [cfg.relay.pubkey.trim(), cfg.rpc.admin_pubkey.trim()]
+            .into_iter()
+            .filter(|pk| !pk.is_empty())
+            .map(str::to_ascii_lowercase)
+            .collect();
+        drop(cfg);
+        owners.sort();
+        owners.dedup();
+        owners
+    }
+
+    /// Publishes the empty NIP-IA archived-identities snapshot
+    /// (`kind:13535`). nostrfy has no archive store yet, but NIP-IA-aware
+    /// clients (Buzz) query this snapshot as their archive-state check; a
+    /// missing snapshot is reported as "archived identities could not be
+    /// checked". The event is replaceable, so a fresh empty snapshot on every
+    /// startup is harmless.
+    pub(crate) async fn publish_archive_snapshot(&self) -> bool {
+        let Some(relay_pubkey) = self.relay_pubkey() else {
+            return false;
+        };
+        let now = self.stamp_floor(unix_now());
+        let mut event = crate::nips::nip_ia::empty_snapshot(&relay_pubkey, now);
+        self.store_relay_event(&mut event).await.is_ok()
+    }
+
     /// Publishes the current membership list and an add/remove user event.
     pub(crate) async fn publish_membership(&self, change: Option<(bool, String)>) -> bool {
         let Some(relay_pubkey) = self.relay_pubkey() else {
@@ -141,6 +217,11 @@ impl super::Relay {
             Some((add, pubkey)) => (add, Some(pubkey)),
             None => (false, None),
         };
+        // The allowlist is part of the relay's closed-community roster; read
+        // it (and the relay's own owner identities) before the role lock so
+        // the guards are never nested.
+        let extra_members = self.allowlisted_members().await;
+        let owners = self.relay_owner_members().await;
         let events = {
             let roles = self.roles.read().await;
             // The caller re-read the rebuild flags before calling, but a
@@ -153,7 +234,8 @@ impl super::Relay {
             {
                 return false;
             }
-            let mut events = vec![roles.membership_event(&relay_pubkey, now)];
+            let mut events =
+                vec![roles.membership_event(&relay_pubkey, now, &extra_members, &owners)];
             if let Some(pubkey) = pubkey {
                 events.push(if add {
                     roles.add_user_event(&pubkey, &relay_pubkey, now)

@@ -55,6 +55,7 @@ Deploying to Fly.io, AWS, GCP, Azure, Digital Ocean, or any VPS? See the [deploy
 - **Never go down** — overload protection, dedicated reader threads, panic containment, and strict resource bounds ([architecture](docs/MANUAL.md#14-large-scale-deployments)).
 - **Spec-complete** — all relay-side NIPs ([support table](docs/MANUAL.md#8-supported-nips)), plus NIP-94 file metadata and a built-in Blossom media server ([guide](docs/MANUAL.md#11-blossom-file-server-media-hosting)).
 - **REST API** at `/api/v1` on its own reader thread ([reference](docs/API.md)).
+- **Buzz-compatible HTTP bridge** (`/info`, `/query`, `/events`, `/count`) plus NIP-CL channel metadata and NIP-CW windows, so the [Buzz desktop app](docs/BUZZ-COMPATIBILITY.md) can use the relay as a community (opt-in with `relay.enabled_buzz = true`).
 - **Everything configurable** via `nostrfy.toml`, validated by `nostrfy check` ([reference](docs/CONFIGURATION.md)).
 
 ## Documentation

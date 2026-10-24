@@ -1314,6 +1314,12 @@ impl super::Conn {
         if !self.gift_wrap_visible(event) || !self.nip78_visible(event) {
             return true;
         }
+        // Buzz membership notices are addressed to one pubkey; they are
+        // stored globally, so their read gate is the `p` tag rather than
+        // the group store.
+        if self.p_gated_hidden(event) {
+            return true;
+        }
         // NIP-29: content of a `private` group (or `hidden` metadata) is
         // served to authenticated members. Deleted/ghost/unknown groups are
         // not AUTH-revealable — their content stays gone for everyone. The
@@ -1353,6 +1359,26 @@ impl super::Conn {
             || !crate::nips::nip78::is_app_specific(event)
             || self.authed_pubkeys.iter().any(|pk| pk == &event.pubkey)
     }
+    /// Whether a Buzz membership notice is addressed to this connection.
+    /// A notice is stored community-globally and carries its recipient in a
+    /// `p` tag; an `ids` filter must not bypass that gate.
+    fn notice_visible(&self, event: &Event) -> bool {
+        event.tags.iter().any(|t| {
+            t.len() >= 2
+                && t[0] == "p"
+                && self
+                    .authed_pubkeys
+                    .iter()
+                    .any(|pk| pk.eq_ignore_ascii_case(&t[1]))
+        })
+    }
+
+    /// Per-pubkey state (membership notices, DM visibility snapshots) is
+    /// read-gated by its `p` tag even when a filter names the event id.
+    fn p_gated_hidden(&self, event: &Event) -> bool {
+        matches!(event.kind, 44100 | 44101 | 30622) && !self.notice_visible(event)
+    }
+
     /// Whether a stored or live event may be served on this connection
     /// (NIP-70 protected, NIP-59 gift-wrap recipient and NIP-29 group
     /// access checks). `groups` is `None` when the batch contains no group
@@ -1369,6 +1395,9 @@ impl super::Conn {
             return false;
         }
         if !self.nip78_visible(event) {
+            return false;
+        }
+        if self.p_gated_hidden(event) {
             return false;
         }
         let Some(groups) = groups else {
