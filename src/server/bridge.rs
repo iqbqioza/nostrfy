@@ -118,6 +118,7 @@ fn bridge_url_matches(
 ///
 /// Always requires the `payload` tag with the SHA-256 of the exact request
 /// body: a captured header must not authorize a different filter or event.
+#[allow(clippy::result_large_err)]
 async fn authenticate(
     relay: &Arc<Relay>,
     cfg: &crate::config::Config,
@@ -428,6 +429,7 @@ fn encode_events(events: &[Event], max_bytes: u64) -> Result<Vec<Value>, Respons
 /// scan and then re-applies the client's limits after visibility and the
 /// composite `before_id` cursor, so hidden rows and dense same-second bursts
 /// do not silently shorten a page.
+#[allow(clippy::result_large_err)]
 pub(crate) async fn execute_filters(
     relay: &Arc<Relay>,
     cfg: &crate::config::Config,

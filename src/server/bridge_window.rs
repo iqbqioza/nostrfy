@@ -42,6 +42,7 @@ const THREAD_CONTENT_KINDS: &[u64] = &[9, 40002, 45001, 45003];
 
 /// Executes a mixed `/query` request: window filters, legacy thread filters
 /// and ordinary NIP-01 filters, concatenated in request order.
+#[allow(clippy::result_large_err)]
 pub(crate) async fn query_all(
     relay: &Arc<Relay>,
     cfg: &crate::config::Config,
@@ -167,6 +168,7 @@ fn raw_limit(raw: &Value, default: usize, max: usize) -> usize {
 }
 
 /// Channel-mode window (NIP-CW §Channel-mode).
+#[allow(clippy::result_large_err)]
 async fn channel_window(
     relay: &Arc<Relay>,
     cfg: &crate::config::Config,
@@ -314,6 +316,7 @@ async fn channel_window(
 }
 
 /// Fetches the two-hop aux closure for a set of rows.
+#[allow(clippy::result_large_err)]
 async fn fetch_aux(
     relay: &Arc<Relay>,
     cfg: &crate::config::Config,
@@ -372,6 +375,7 @@ async fn fetch_aux(
 }
 
 /// One relay-signed `kind:39005` per row that has at least one direct reply.
+#[allow(clippy::result_large_err)]
 async fn thread_summaries(
     relay: &Arc<Relay>,
     cfg: &crate::config::Config,
@@ -509,6 +513,7 @@ fn sign_overlay(
 }
 
 /// Legacy thread subtree path: `#e` root plus `depth_limit`.
+#[allow(clippy::result_large_err)]
 async fn thread_window(
     relay: &Arc<Relay>,
     cfg: &crate::config::Config,
