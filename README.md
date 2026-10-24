@@ -86,3 +86,9 @@ Deploying to Fly.io, AWS, GCP, Azure, Digital Ocean, or any VPS? See the [deploy
 ## License
 
 Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option. Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## Contributors
+
+<a align="center" href="https://github.com/iqbqioza/nostrfy/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=iqbqioza/nostrfy" />
+</a>
