@@ -6,6 +6,13 @@ set -eu
 
 CONFIG="/etc/nostrfy/nostrfy.toml"
 
+# A relay key in this file may be baked into the image layer (and its build
+# cache/registry). Runtime secrets belong in NOSTRFY_RELAY_PRIVATE_KEY or a
+# mounted config, never in the image.
+if [ -s "${CONFIG}" ] && grep -Eq '^[[:space:]]*private_key[[:space:]]*=[[:space:]]*"[^"]+"' "${CONFIG}"; then
+    echo "warning: ${CONFIG} contains a private_key; if this file is baked into the image, the key is in the image layer. Use NOSTRFY_RELAY_PRIVATE_KEY or mount a runtime secret instead." >&2
+fi
+
 if [ ! -s "${CONFIG}" ]; then
     echo "no config at ${CONFIG}: writing defaults with 'nostrfy init'" >&2
     nostrfy --config "${CONFIG}" init

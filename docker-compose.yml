@@ -2,7 +2,7 @@
 # http://localhost:8080 (plain WS; terminate TLS in front for wss://).
 #
 #   docker compose up -d --build
-#   curl http://localhost:8080/health
+#   curl http://localhost:8080/live
 #
 # Data persists in the `nostrfy-data` volume. To use your own config,
 # uncomment the config mount below (the file must exist first).

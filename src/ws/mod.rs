@@ -2442,6 +2442,91 @@ mod tests {
     }
 
     #[test]
+    fn nip91_req_count_and_disabled_compatibility() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let mut conn = build_conn().await;
+            let now = unix_now();
+            for (i, tags) in [
+                vec!["meme"],
+                vec!["meme", "cat"],
+                vec!["meme", "cat", "black"],
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let e = signed_note(
+                    &format!("nip91-{i}"),
+                    now - i as u64,
+                    tags.into_iter()
+                        .map(|v| vec!["t".into(), v.into()])
+                        .collect(),
+                );
+                conn.relay.db.put(e, now).await;
+            }
+            let raw = json!({"&t": ["meme", "cat"], "#t": ["meme", "cat", "black"]});
+            conn.handle_req(&[json!("and"), raw.clone()]).await;
+            conn.pump_pending_reqs();
+            assert_eq!(
+                outgoing_json(&conn)
+                    .iter()
+                    .filter(|m| m[0] == "EVENT" && m[1] == "and")
+                    .count(),
+                1
+            );
+            conn.handle_count(&[json!("count-and"), raw.clone()]).await;
+            assert!(
+                outgoing_json(&conn)
+                    .iter()
+                    .any(|m| m[0] == "COUNT" && m[1] == "count-and" && m[2]["count"] == 1)
+            );
+            for (label, tags) in [
+                ("partial", vec!["meme", "cat"]),
+                ("full", vec!["meme", "cat", "black"]),
+            ] {
+                let live = signed_note(
+                    label,
+                    now,
+                    tags.into_iter()
+                        .map(|v| vec!["t".into(), v.into()])
+                        .collect(),
+                );
+                conn.deliver_live(&live, &serde_json::to_string(&live).unwrap(), None);
+            }
+            assert_eq!(
+                outgoing_json(&conn)
+                    .iter()
+                    .filter(|m| m[0] == "EVENT" && m[1] == "and")
+                    .count(),
+                2,
+                "only the full live match should follow the historical result"
+            );
+            conn.handle_neg_open(&[json!("neg-and"), raw.clone(), json!("61000000")])
+                .await;
+            assert_eq!(conn.neg.get("neg-and").unwrap().items.len(), 1);
+            conn.relay.config.write().await.relay.disabled_nips.push(91);
+            conn.handle_req(&[json!("or"), raw.clone()]).await;
+            conn.pump_pending_reqs();
+            assert_eq!(
+                outgoing_json(&conn)
+                    .iter()
+                    .filter(|m| m[0] == "EVENT" && m[1] == "or")
+                    .count(),
+                3
+            );
+            conn.handle_neg_open(&[json!("neg-or"), raw.clone(), json!("61000000")])
+                .await;
+            assert_eq!(conn.neg.get("neg-or").unwrap().items.len(), 3);
+            conn.handle_count(&[json!("count-or"), raw]).await;
+            assert!(
+                outgoing_json(&conn)
+                    .iter()
+                    .any(|m| m[0] == "COUNT" && m[1] == "count-or" && m[2]["count"] == 3)
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
     fn req_response_is_bounded_by_the_byte_budget() {
         // A slow reader must not pin the whole scan result per pending
         // response: the materialized prefix is truncated to the response

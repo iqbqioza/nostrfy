@@ -400,6 +400,7 @@ impl super::Conn {
             cfg.limits.max_limit,
         );
         let search_enabled = cfg.nip_enabled(50);
+        let and_enabled = cfg.nip_enabled(91);
         let require_auth = cfg.relay.require_auth;
         let sub_bytes_limit = cfg.limits.max_sub_bytes;
         let eose_hint = cfg.nip_enabled(67);
@@ -446,7 +447,12 @@ impl super::Conn {
                 return;
             }
             match serde_json::from_value::<Filter>(f) {
-                Ok(filter) => filters.push(filter),
+                Ok(mut filter) => {
+                    if !and_enabled {
+                        filter.disable_and_tags();
+                    }
+                    filters.push(filter);
+                }
                 Err(_) => {
                     self.reject_req(sub_id, "invalid: invalid filter");
                     return;
@@ -1064,7 +1070,15 @@ impl super::Conn {
         }
         // One config snapshot for the whole handler: the count path used to
         // take the shared read lock five times per COUNT frame.
-        let (max_sub_id_len, nip45, require_auth, max_filters, max_count, search_enabled) = {
+        let (
+            max_sub_id_len,
+            nip45,
+            require_auth,
+            max_filters,
+            max_count,
+            search_enabled,
+            and_enabled,
+        ) = {
             let cfg = self.relay.config.read().await;
             (
                 cfg.limits.max_sub_id_len,
@@ -1073,6 +1087,7 @@ impl super::Conn {
                 cfg.limits.max_filters,
                 cfg.limits.max_count,
                 cfg.nip_enabled(50),
+                cfg.nip_enabled(91),
             )
         };
         // NIP-01 bounds the id in *chars*, like the REQ path above. The
@@ -1122,7 +1137,12 @@ impl super::Conn {
                 return;
             }
             match serde_json::from_value::<Filter>(f) {
-                Ok(filter) => filters.push(filter),
+                Ok(mut filter) => {
+                    if !and_enabled {
+                        filter.disable_and_tags();
+                    }
+                    filters.push(filter);
+                }
                 Err(_) => {
                     self.reject_count(sub_id, "invalid: invalid filter");
                     return;

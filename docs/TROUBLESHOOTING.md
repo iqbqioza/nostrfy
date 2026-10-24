@@ -137,11 +137,11 @@ enabled_nips = [1, 50]   # lists are wrapped in [ ]
 **Fix**:
 
 ```bash
-# Is the relay up?
-curl http://127.0.0.1:8080/health
+# Is the relay up? (`/live` is liveness only; `/health` also checks writes)
+curl http://127.0.0.1:8080/live
 
 # From outside (using the server's IP/port)
-curl http://YOUR_SERVER_IP:8080/health
+curl http://YOUR_SERVER_IP:8080/live
 
 # Check the firewall (example: ufw)
 sudo ufw status
@@ -461,7 +461,8 @@ The `/metrics` endpoint (Prometheus text format; `metrics_enabled = true`) and t
 
 | Metric | Alert on | Why |
 | --- | --- | --- |
-| `up` / `/health` status | process down or `/health` = `503` | `503` means the database refuses writes (disk full, map full, writer gone); the relay keeps serving reads but is losing publishes |
+| `up` / `/live` | process down (`/live` not 200) | liveness probe; `/live` never touches the database |
+| `/health` status | `503` | the database refuses writes (disk full, map full, writer gone); the relay keeps serving reads but is losing publishes |
 | `nostrfy_db_errors` | any increase over a scrape interval | database faults (I/O errors, map full, dropped commits) |
 | `nostrfy_db_overloaded` | sustained increase | fail-fast admissions from a full queue: the relay is shedding load on purpose; scale up or raise `database.max_db_queue_*` |
 | `nostrfy_db_pending_msgs` / `nostrfy_db_pending_bytes` | near the configured caps for minutes | the writer cannot keep up; the next step is overload shedding |

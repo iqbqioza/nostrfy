@@ -41,9 +41,9 @@ Lightsail instances work exactly like the EC2 guide — the **networking tab** h
 The repository `Dockerfile` downloads the pre-built release binary at build time:
 
 1. Push the image to ECR: `docker buildx build --platform linux/amd64,linux/arm64 -t <account>.dkr.ecr.<region>.amazonaws.com/nostrfy .`
-2. Create an ECS service (Fargate, 1 task) with a **mounted EFS volume at `/data`** (LMDB persistence — without it, data is lost on redeploys).
+2. Create an ECS service (1 task) with an **EBS-backed volume at `/data`** (LMDB persistence — without it, data is lost on redeploys). **Do not use EFS for `/data`**: LMDB needs a local block device with POSIX locks and `mmap`; a network filesystem can corrupt the database or split the writer. Fargate does not provide EBS, so use the EC2 launch type with an EBS volume (or run the relay on EC2 directly).
 3. Expose port `8080`; front it with an ALB + ACM certificate for TLS.
-4. The baked `deploy/nostrfy.container.toml` config can be overridden by mounting your own `nostrfy.toml` at `/etc/nostrfy/nostrfy.toml` (e.g. a fork that copies it into the image).
+4. Inject secrets at runtime with the task definition's secret support / `NOSTRFY_RELAY_PRIVATE_KEY` (and the other `NOSTRFY_*` names). Never put them in `deploy/nostrfy.container.toml`: it is baked into the image. A custom non-secret config can be mounted at `/etc/nostrfy/nostrfy.toml`.
 
 ## Elastic IP
 

@@ -48,11 +48,13 @@ after printing the key; never leave a key-bearing file in `/tmp`):
 
 ```sh
 umask 077
-tmpcfg="$(mktemp /tmp/nostrfy-genkey.XXXXXX.toml)"
-nostrfy --config "$tmpcfg" init
-nostrfy --config "$tmpcfg" genkey
-rm -f "$tmpcfg"
+tmpdir="$(mktemp -d)"
+nostrfy --config "$tmpdir/nostrfy.toml" init
+nostrfy --config "$tmpdir/nostrfy.toml" genkey
+rm -rf "$tmpdir"
 ```
+
+`mktemp` creates the file/directory; `nostrfy init` refuses to overwrite an existing file, so use a temporary directory (or remove a pre-created file) rather than `mktemp` on the config path itself.
 
 (Or mount your own config file instead of the template — any `nostrfy.toml` works.)
 

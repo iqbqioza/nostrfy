@@ -114,11 +114,11 @@ Every key is optional; a missing key uses the default shown below.
 
 **`post_policy`** — A URL where you describe your posting policy. Omitted when empty.
 
-**`private_key`** — The relay's own secret key (64 hex chars). It signs **relay-generated events**: NIP-29 group metadata (39000-39005), NIP-43 role/membership events. Without it, NIP-29 groups still accept moderation events but produce **no 39001/39002 snapshots**, and NIP-43 is unavailable (a warning is logged). Generate with `nostrfy genkey`; keep it secret. Read once at startup — changing it requires a `restart`. A restart with a changed key **heals the stored group metadata**: the previous key's relay-signed events cannot be replaced (addressable replacement is per author) and clients that verify the relay signature against the NIP-11 `self` pubkey reject them, so the startup republishes every group's metadata under the current key and removes the previous key's events. The group state itself is restored as-is — it does not depend on the key, and replaying the previous key's moderation events as plain client events could drop master-authorized effects. The config file is created at `0600` by `nostrfy init` (and `nostrfy genkey` enforces it after writing the key). A hand-written config is **checked at load**: if it contains secret values (`relay.private_key`, `rpc.management_token`, `relay.livekit_api_secret` or the S3 keys) and is readable by group/other, the relay logs a warning with the file's mode and the `chmod 600 <path>` fix instead of failing startup.
+**`private_key`** — The relay's own secret key (64 hex chars). **In containers, leave this empty and inject `NOSTRFY_RELAY_PRIVATE_KEY` at runtime** (see [Secrets via environment](#secrets-via-environment)); a key written here is baked into the image layer. It signs **relay-generated events**: NIP-29 group metadata (39000-39005), NIP-43 role/membership events. Without it, NIP-29 groups still accept moderation events but produce **no 39001/39002 snapshots**, and NIP-43 is unavailable (a warning is logged). Generate with `nostrfy genkey`; keep it secret. Read once at startup — changing it requires a `restart`. A restart with a changed key **heals the stored group metadata**: the previous key's relay-signed events cannot be replaced (addressable replacement is per author) and clients that verify the relay signature against the NIP-11 `self` pubkey reject them, so the startup republishes every group's metadata under the current key and removes the previous key's events. The group state itself is restored as-is — it does not depend on the key, and replaying the previous key's moderation events as plain client events could drop master-authorized effects. The config file is created at `0600` by `nostrfy init` (and `nostrfy genkey` enforces it after writing the key). A hand-written config is **checked at load**: if it contains secret values (`relay.private_key`, `rpc.management_token`, `relay.livekit_api_secret` or the S3 keys) and is readable by group/other, the relay logs a warning with the file's mode and the `chmod 600 <path>` fix instead of failing startup.
 
 **`public_url`** — The relay's public address, e.g. `wss://relay.example.com`. Used to validate URL-bearing tags from clients: NIP-42 AUTH (`relay` tag), NIP-62 vanish (`relay` tag), NIP-98 admin auth (`u` tag). When empty, the relay falls back to `host:port`, which never matches a real client URL when binding `0.0.0.0`/`127.0.0.1` (a warning is logged). **Always set this.**
 
-**`livekit_url`** — The LiveKit server URL used for NIP-29 audio/video rooms. Together with the API credentials it enables `/.well-known/nip29/livekit`. Fixed at startup — requires a `restart`.
+**`livekit_url`** — The LiveKit server URL used for NIP-29 audio/video rooms. Together with the API credentials it enables `/.well-known/nip29/livekit`. Must be `wss://`; plain `ws://` is accepted only for a loopback host (the room-admin JWT travels in a bearer header). Fixed at startup — requires a `restart`.
 
 **`livekit_api_key`** — The LiveKit API key; appears as the `iss` claim of issued JWTs.
 
@@ -128,7 +128,7 @@ Every key is optional; a missing key uses the default shown below.
 
 **`enabled_nips`** — An explicit allowlist of NIP numbers. When non-empty, **only** these NIPs are advertised (NIP-11) and their relay-side behavior is active; `disabled_nips` is ignored. Requires a `restart` to change.
 
-**`disabled_nips`** — Removes specific NIPs from the default set. For example `[50]` disables search (REQ/COUNT/API `search` is then ignored), and `[9]` rejects new kind:5 deletion requests with `blocked: NIP-09 deletion requests are disabled` instead of storing a request whose deletion side effect would never run. Requires a `restart` to change. Only relay-side NIPs are relevant: [1, 9, 11, 13, 17, 22, 26, 29, 32, 33, 34, 40, 42, 43, 45, 46, 47, 50, 57, 59, 62, 65, 66, 67, 70, 77, 78, 84, 85, 86, 87, 88, 94, 98] (NIP-28 is client-side: listing it changes nothing, and it is never advertised; NIP-A3 is a `draft` without an integer identifier, so it cannot appear in `supported_nips`; NIP-34 git events additionally require `relay.enabled_git`).
+**`disabled_nips`** — Removes specific NIPs from the default set. For example `[91]` disables draft AND tag filters (`&` fields are ignored, retaining compatibility `#` fields), `[50]` disables search (REQ/COUNT/API `search` is then ignored), and `[9]` rejects new kind:5 deletion requests with `blocked: NIP-09 deletion requests are disabled` instead of storing a request whose deletion side effect would never run. Requires a `restart` to change. Only relay-side NIPs are relevant: [1, 9, 11, 13, 17, 22, 26, 29, 32, 33, 34, 40, 42, 43, 45, 46, 47, 50, 57, 59, 62, 65, 66, 67, 70, 77, 78, 84, 85, 86, 87, 88, 91, 94, 98] (NIP-28 is client-side: listing it changes nothing, and it is never advertised; NIP-A3 is a `draft` without an integer identifier, so it cannot appear in `supported_nips`; NIP-34 git events additionally require `relay.enabled_git`).
 
 **`reject_ephemeral`** — When `true`, NIP-01 ephemeral events (kinds `20000-29999`) are rejected at publish time with `blocked: ephemeral events not allowed`. Exempt kinds that NIPs require to be relayed are still forwarded: `22242` (NIP-42 AUTH), `27235` (NIP-98 HTTP auth), `28934`/`28935`/`28936` (NIP-43 JOIN/Invite/LEAVE), `24133` (NIP-46 Nostr Connect), `23194`/`23195` (NIP-47 wallet request/response), `24242` (BUD-02 Blossom), `21059` (NIP-59 ephemeral gift wrap). Takes effect immediately on `SIGHUP` reload and on the next publish.
 
@@ -205,7 +205,7 @@ The changes take effect immediately and are persisted (same lists as `nostrfy re
 
 **`port`** — The TCP port, 1-65535; 80 requires root. This one port serves the WebSocket relay, the NIP-11 document, the REST API and the NIP-86 RPC together.
 
-**`api_host`** — A hostname (e.g. `api.example.com`) dedicated to the REST API. Requests whose Host header matches it are served only `/api/v1`, `/health` and `/metrics`; every other host gets `404` for those paths, and the API host gets `404` for the relay endpoints. This lets you serve the API and the relay on the same port behind one reverse proxy. Host matching ignores case, `:port` suffixes and IPv6 brackets. Empty = the API is available on every host. The split is a routing boundary only: a client that can reach the port directly can send any `Host` header, so expose the port through a proxy (or firewall it) when the API must not be publicly reachable. Fixed at startup — requires a `restart`.
+**`api_host`** — A hostname (e.g. `api.example.com`) dedicated to the REST API. Requests whose Host header matches it are served only `/api/v1`, `/health` and `/metrics`; every other host gets `404` for those paths, and the API host gets `404` for the relay endpoints. `/live` is host-agnostic (platform liveness probes may use any Host). This lets you serve the API and the relay on the same port behind one reverse proxy. Host matching ignores case, `:port` suffixes and IPv6 brackets. Empty = the API is available on every host. The split is a routing boundary only: a client that can reach the port directly can send any `Host` header, so expose the port through a proxy (or firewall it) when the API must not be publicly reachable. Fixed at startup — requires a `restart`.
 
 **`ws_paths`** — Which paths serve the WebSocket endpoint and the NIP-11 document: `root` serves `/` only (the default; the legacy `/ws` and `/ws/` paths are removed); `inbox-outbox` serves only `/inbox` and `/outbox`; `all` serves the root and the inbox/outbox paths. The inbox/outbox paths give the relay distinct endpoints for the inbox/outbox routing model (e.g. `wss://relay.example.com/inbox` and `wss://relay.example.com/outbox`). In `inbox-outbox` mode the root path returns 404 on every host except a configured Blossom host, where it answers the Blossom server-info document. Fixed at startup — requires a `restart`.
 
@@ -402,7 +402,7 @@ Set this whenever a reverse proxy (nginx, Caddy, a cloud load balancer, Cloudfla
 
 ### Key details
 
-**`path`** — The directory holding the LMDB database files. Relative paths are resolved against the config file's directory, so they stay valid after the daemon changes its working directory. Do not point two relay instances at the same directory.
+**`path`** — The directory holding the LMDB database files. Relative paths are resolved against the config file's directory, so they stay valid after the daemon changes its working directory. Do not point two relay instances at the same directory. It **must be a local block device**: LMDB relies on POSIX byte-range locks and `mmap`, so NFS/EFS/Filestore/GCS FUSE/Azure Files (and similar network filesystems) can corrupt the database or silently split the writer.
 
 **`max_dbs`** — LMDB's maximum number of named databases. The relay uses 23 when `search_index = true` (22 base tables plus the word index) and 22 otherwise; values below 23 are raised to 23 so every table can always be created.
 
@@ -536,6 +536,20 @@ Remove the address from `access.blocked_ips` in the config too when it is listed
 All CLI access mutations (`nostrfy relay allow/deny`, `nostrfy blossom allow/deny`, `nostrfy access unblockip`) serialize their read-modify-write with an advisory `flock` on `<database.path>/access.lock` and commit their changes in one LMDB transaction. The lock file is a marker only (its contents are never read) and can be left in place. For the cross-process guarantee — a daemon ban and a CLI mutation cannot overwrite each other — the daemon's NIP-86 access persistence must take the same lock around its own write (the CLI holds it for the whole read-modify-write). NIP-86 appends each mutation to a small LMDB journal instead of rewriting the full access blob/list; the writer folds the journal into the base state and clears it after 1024 entries. The CLI replays the journal before its read-modify-write and folds/clears it in the same transaction.
 
 > **Downgrade warning**: v0.1.25 writes NIP-86 access mutations to the `aop:` journal and folds it into the base blob every 1024 entries. v0.1.24 and older do not read that journal, so downgrading can make recent bans, IP blocks and method grants fail open until the next upgrade. A v0.1.24 full save also does not clear the journal, so re-upgrading can replay entries written before the downgrade. Do not downgrade without folding the journal first; staying on v0.1.25 or newer is the safe path.
+
+### Secrets via environment
+
+Container platforms should inject secrets at runtime instead of writing them into `nostrfy.toml`/the image. `Config::load` applies these variables after the file is parsed; a non-empty value overrides the file, an empty value is ignored:
+
+| Variable | Overrides |
+| --- | --- |
+| `NOSTRFY_RELAY_PRIVATE_KEY` | `relay.private_key` |
+| `NOSTRFY_RPC_MANAGEMENT_TOKEN` | `rpc.management_token` |
+| `NOSTRFY_LIVEKIT_API_SECRET` | `relay.livekit_api_secret` |
+| `NOSTRFY_BLOSSOM_S3_ACCESS_KEY` | `blossom.s3_access_key` |
+| `NOSTRFY_BLOSSOM_S3_SECRET_KEY` | `blossom.s3_secret_key` |
+
+Keep the corresponding file fields empty so the image/config template carries no secret. The values are never written back to the config file.
 
 ### Behavior notes
 

@@ -27,7 +27,7 @@ pub const DEFAULT_CONFIG: &str = "nostrfy.toml";
 /// advertised for clients that check it.
 pub const RELAY_NIPS: &[u16] = &[
     1, 9, 11, 13, 17, 22, 26, 29, 32, 33, 34, 40, 42, 43, 45, 46, 47, 50, 57, 59, 62, 65, 66, 67,
-    70, 77, 78, 84, 85, 86, 87, 88, 94, 98,
+    70, 77, 78, 84, 85, 86, 87, 88, 91, 94, 98,
 ];
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -948,7 +948,42 @@ impl Config {
         if let Some(warning) = Self::loose_config_permissions_warning(path, &cfg) {
             log::warn!("{warning}");
         }
+        // Container platforms inject secrets at runtime (Fly secrets, Docker
+        // secrets, Kubernetes, cloud secret managers). Apply them after the
+        // file checks so the file-permission warning describes the file, not
+        // secrets that never touch it.
+        cfg.apply_secret_env_overrides(|key| std::env::var(key).ok());
         Ok(cfg)
+    }
+
+    /// Applies the `NOSTRFY_*` secret environment variables over the config
+    /// file. Empty values are ignored (they do not clear a file value). The
+    /// environment wins so the image/config can stay secret-free; docs list
+    /// the supported names.
+    fn apply_secret_env_overrides<E>(&mut self, mut get: E)
+    where
+        E: FnMut(&str) -> Option<String>,
+    {
+        fn take(get: &mut impl FnMut(&str) -> Option<String>, key: &str) -> Option<String> {
+            get(key)
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        }
+        if let Some(v) = take(&mut get, "NOSTRFY_RELAY_PRIVATE_KEY") {
+            self.relay.private_key = v;
+        }
+        if let Some(v) = take(&mut get, "NOSTRFY_RPC_MANAGEMENT_TOKEN") {
+            self.rpc.management_token = v;
+        }
+        if let Some(v) = take(&mut get, "NOSTRFY_LIVEKIT_API_SECRET") {
+            self.relay.livekit_api_secret = v;
+        }
+        if let Some(v) = take(&mut get, "NOSTRFY_BLOSSOM_S3_ACCESS_KEY") {
+            self.blossom.s3_access_key = v;
+        }
+        if let Some(v) = take(&mut get, "NOSTRFY_BLOSSOM_S3_SECRET_KEY") {
+            self.blossom.s3_secret_key = v;
+        }
     }
 
     /// The warning for a config file that carries secrets but is readable
@@ -1747,14 +1782,20 @@ impl Config {
                  LiveKit rooms are disabled (capability unadvertised, tokens 404)"
             );
         }
-        if !self.relay.livekit_url.trim().is_empty()
-            && !self.relay.livekit_url.starts_with("wss://")
-        {
-            log::warn!(
-                "relay.livekit_url should be a wss:// URL (got {:?}): clients expect a \
-                 LiveKit WebSocket endpoint",
-                self.relay.livekit_url
-            );
+        if !self.relay.livekit_url.trim().is_empty() {
+            let url = self.relay.livekit_url.trim().to_ascii_lowercase();
+            // The roomAdmin JWT travels as a bearer token on the Room
+            // Service API. Plain ws:// is only acceptable for a local
+            // LiveKit on loopback; a non-loopback relay must use wss://.
+            let loopback_ws = url
+                .strip_prefix("ws://")
+                .is_some_and(|rest| is_loopback_http_endpoint(&format!("http://{rest}")));
+            if !url.starts_with("wss://") && !loopback_ws {
+                return Err(config_err(
+                    "relay.livekit_url must use wss:// (plain ws:// is only allowed for \
+                     loopback hosts); the room admin token travels in a bearer header",
+                ));
+            }
         }
 
         // Absurdly large bounds are almost always typos, and they
@@ -3246,6 +3287,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn nip91_advertisement_respects_configuration() {
+        let mut cfg = Config::default();
+        let access = AccessControl::default();
+        assert!(cfg.effective_supported_nips(&access).contains(&91));
+        cfg.relay.disabled_nips.push(91);
+        assert!(!cfg.nip_enabled(91));
+        assert!(!cfg.effective_supported_nips(&access).contains(&91));
+        cfg.relay.enabled_nips = vec![1, 91];
+        assert!(cfg.nip_enabled(91));
+        assert!(cfg.effective_supported_nips(&access).contains(&91));
+    }
+
+    #[test]
     fn known_keys_cover_every_serialized_field() {
         // The `warn_unknown_fields` list must cover every serializable
         // config field, or `nostrfy check` (and every start) warns about
@@ -4208,7 +4262,7 @@ max_log_files = 2
         // Relay-side NIPs are advertised.
         for n in [
             1, 9, 11, 13, 17, 22, 26, 29, 32, 33, 40, 42, 45, 46, 47, 50, 57, 59, 62, 65, 66, 67,
-            70, 77, 78, 84, 85, 86, 87, 88, 94, 98,
+            70, 77, 78, 84, 85, 86, 87, 88, 91, 94, 98,
         ] {
             assert!(nips.contains(&n), "NIP-{n} must be advertised");
         }
@@ -4589,6 +4643,39 @@ max_log_files = 2
         assert!(
             !Config::default().relay.enabled_buzz,
             "the Buzz compatibility layer must be opt-in"
+        );
+    }
+
+    #[test]
+    fn secret_env_overrides_win_and_ignore_empty_values() {
+        let mut cfg = Config::default();
+        cfg.relay.private_key = "aa".repeat(32);
+        cfg.rpc.management_token = "from-file".into();
+        cfg.apply_secret_env_overrides(|key| match key {
+            "NOSTRFY_RELAY_PRIVATE_KEY" => Some(format!("  {}  ", "bb".repeat(32))),
+            "NOSTRFY_RPC_MANAGEMENT_TOKEN" => Some("   ".into()),
+            _ => None,
+        });
+        assert_eq!(cfg.relay.private_key, "bb".repeat(32));
+        assert_eq!(
+            cfg.rpc.management_token, "from-file",
+            "an empty env value must not clear the file value"
+        );
+    }
+
+    #[test]
+    fn livekit_url_requires_tls_off_loopback() {
+        let mut cfg = Config::default();
+        cfg.relay.livekit_api_key = "key".into();
+        cfg.relay.livekit_api_secret = "secret".into();
+        cfg.relay.livekit_url = "wss://livekit.example.com".into();
+        assert!(cfg.validate().is_ok());
+        cfg.relay.livekit_url = "ws://127.0.0.1:7880".into();
+        assert!(cfg.validate().is_ok(), "loopback plain ws stays usable");
+        cfg.relay.livekit_url = "ws://livekit.example.com".into();
+        assert!(
+            cfg.validate().unwrap_err().to_string().contains("wss://"),
+            "a non-loopback ws:// URL must be rejected"
         );
     }
 
