@@ -371,6 +371,33 @@ fn param_rejection(e: anyhow::Error) -> (StatusCode, Json<Value>) {
     error_response(StatusCode::BAD_REQUEST, &e.to_string())
 }
 
+/// Bounds the filter members independently of pagination. Aggregate
+/// endpoints (`/kinds`, `/stats`, `/daily`, `/hourly`, `/monthly`) do not
+/// use `limit`/`offset`, but they still build a scan filter from the query
+/// parameters: without this check a request could put an unbounded
+/// `kinds`/`authors` list into every one of their scans.
+fn bound_filter_members(params: &ApiParams, cfg: &Config) -> anyhow::Result<()> {
+    let limits = &cfg.limits;
+    if limits.max_api_search_bytes > 0
+        && let Some(ref search) = params.search
+        && search.len() > limits.max_api_search_bytes
+    {
+        return Err(anyhow!(
+            "search exceeds the maximum of {} bytes",
+            limits.max_api_search_bytes
+        ));
+    }
+    if params.authors.len() > crate::filter::MAX_FILTER_MEMBERS
+        || params.kinds.len() > crate::filter::MAX_FILTER_MEMBERS
+    {
+        return Err(anyhow!(
+            "authors and kinds are limited to {} entries each",
+            crate::filter::MAX_FILTER_MEMBERS
+        ));
+    }
+    Ok(())
+}
+
 /// Bounds the API query parameters so a single request cannot trigger an
 /// arbitrarily large database scan: `limit` is capped, `offset` is capped,
 /// and over-long `search` terms are rejected.
@@ -391,24 +418,7 @@ fn bound_params(params: &mut ApiParams, cfg: &Config) -> anyhow::Result<()> {
             limits.max_api_offset
         ));
     }
-    if limits.max_api_search_bytes > 0
-        && let Some(ref search) = params.search
-        && search.len() > limits.max_api_search_bytes
-    {
-        return Err(anyhow!(
-            "search exceeds the maximum of {} bytes",
-            limits.max_api_search_bytes
-        ));
-    }
-    if params.authors.len() > crate::filter::MAX_FILTER_MEMBERS
-        || params.kinds.len() > crate::filter::MAX_FILTER_MEMBERS
-    {
-        return Err(anyhow!(
-            "authors and kinds are limited to {} entries each",
-            crate::filter::MAX_FILTER_MEMBERS
-        ));
-    }
-    Ok(())
+    bound_filter_members(params, cfg)
 }
 
 /// The tag names excluded by the `no_p`/`no_e`/`no_t`/`no_d` parameters
@@ -491,6 +501,18 @@ fn apply_params(mut filter: Filter, params: &ApiParams) -> Filter {
     }
     if let Some(ref d) = params.d {
         filter.tags.insert("#d".to_string(), json!(d));
+    }
+    filter
+}
+
+/// Builds the filter for a REST scan and applies the NIP-50 gate in one
+/// place: when the capability is disabled, `search` must be stripped before
+/// the database sees it (a content scan would otherwise remain reachable
+/// over HTTP even though the WebSocket path refuses it).
+fn api_filter(base: Filter, params: &ApiParams, search_enabled: bool) -> Filter {
+    let mut filter = apply_params(base, params);
+    if !search_enabled {
+        filter.search = None;
     }
     filter
 }
@@ -750,6 +772,12 @@ pub async fn api_monthly_handler(
         Ok(pk) => pk,
         Err(e) => return error_response(StatusCode::BAD_REQUEST, &e.to_string()),
     };
+    {
+        let cfg = relay.config.read().await;
+        if let Err(e) = bound_filter_members(&params, &cfg) {
+            return param_rejection(e);
+        }
+    }
 
     // Bounded month range: without `since` the range spans the whole period
     // (from the earliest stored event of this author and kind); an explicit
@@ -983,12 +1011,12 @@ pub async fn api_count_handler(
             Json(json!({ "error": "server is busy, try again shortly" })),
         );
     };
-    let count_limit = relay.config.read().await.limits.max_count;
+    let (count_limit, search_enabled) = {
+        let cfg = relay.config.read().await;
+        (cfg.limits.max_count, cfg.nip_enabled(50))
+    };
     let now = unix_now();
-    let mut filter = apply_params(Filter::default(), &params);
-    if !relay.config.read().await.nip_enabled(50) {
-        filter.search = None;
-    }
+    let filter = api_filter(Filter::default(), &params, search_enabled);
     // The absence filters apply like the /query path (a `no_p` count must
     // agree with the visible rows of a `no_p` query).
     let no_tags = excluded_tags(&params);
@@ -1037,6 +1065,13 @@ pub async fn api_kinds_handler(
         Ok(pk) => pk,
         Err(e) => return error_response(StatusCode::BAD_REQUEST, &e.to_string()),
     };
+    let (count_limit, search_enabled) = {
+        let cfg = relay.config.read().await;
+        if let Err(e) = bound_filter_members(&params, &cfg) {
+            return param_rejection(e);
+        }
+        (cfg.limits.max_count, cfg.nip_enabled(50))
+    };
 
     let Some(_permit) = relay.api_limit.try_acquire() else {
         return (
@@ -1044,16 +1079,16 @@ pub async fn api_kinds_handler(
             Json(json!({ "error": "server is busy, try again shortly" })),
         );
     };
-    let count_limit = relay.config.read().await.limits.max_count;
     let now = unix_now();
     // The documented query parameters apply here too; ignoring them made a
     // time-windowed request return all-time counts.
-    let filter = apply_params(
+    let filter = api_filter(
         Filter {
             authors: Some(vec![hex_pk.clone()]),
             ..Default::default()
         },
         &params,
+        search_enabled,
     );
     let Some((events, more)) = relay.db.api_count(vec![filter], count_limit, now).await else {
         return db_unavailable();
@@ -1112,6 +1147,13 @@ pub async fn api_daily_handler(
         Ok(pk) => pk,
         Err(e) => return error_response(StatusCode::BAD_REQUEST, &e.to_string()),
     };
+    let (count_limit, search_enabled) = {
+        let cfg = relay.config.read().await;
+        if let Err(e) = bound_filter_members(&params, &cfg) {
+            return param_rejection(e);
+        }
+        (cfg.limits.max_count, cfg.nip_enabled(50))
+    };
     // `since`/`until` are accepted by `/query` and `/monthly` but silently
     // ignored here: reject them instead of returning a misleading result.
     if params.since.is_some() || params.until.is_some() {
@@ -1143,7 +1185,6 @@ pub async fn api_daily_handler(
     let end = month_start_of_next(year, month);
     let days_in_month = (end - start) / 86400;
 
-    let count_limit = relay.config.read().await.limits.max_count;
     let no_tags = excluded_tags(&params);
     let nip78 = enabled_nip78_auth_active(&relay).await;
 
@@ -1159,7 +1200,7 @@ pub async fn api_daily_handler(
             );
         };
         let day_start = start + day * 86400;
-        let filter = apply_params(
+        let filter = api_filter(
             Filter {
                 authors: Some(vec![hex_pk.clone()]),
                 kinds: Some(vec![kind]),
@@ -1168,6 +1209,7 @@ pub async fn api_daily_handler(
                 ..Default::default()
             },
             &params,
+            search_enabled,
         );
         let Some((events, more)) = relay.db.api_count(vec![filter], count_limit, now).await else {
             return db_unavailable();
@@ -1262,6 +1304,13 @@ pub async fn api_stats_handler(
         Ok(pk) => pk,
         Err(e) => return error_response(StatusCode::BAD_REQUEST, &e.to_string()),
     };
+    let (count_limit, search_enabled) = {
+        let cfg = relay.config.read().await;
+        if let Err(e) = bound_filter_members(&params, &cfg) {
+            return param_rejection(e);
+        }
+        (cfg.limits.max_count, cfg.nip_enabled(50))
+    };
     // Permits are taken per scan round-trip — never across the whole
     // handler — so one slow `stats` cannot pin a slot through 9 scans.
     macro_rules! permit {
@@ -1277,16 +1326,16 @@ pub async fn api_stats_handler(
             }
         };
     }
-    let count_limit = relay.config.read().await.limits.max_count;
     let now = unix_now();
     // Same as `/kinds`: the documented filters must apply, not be silently
     // dropped on the aggregate endpoints.
-    let filter = apply_params(
+    let filter = api_filter(
         Filter {
             authors: Some(vec![hex_pk.clone()]),
             ..Default::default()
         },
         &params,
+        search_enabled,
     );
     let no_tags = excluded_tags(&params);
     let nip78 = enabled_nip78_auth_active(&relay).await;
@@ -1355,12 +1404,20 @@ pub async fn api_stats_handler(
             }) else {
                 return db_unavailable();
             };
-            let stats_groups = relay.groups.read().await;
+            // The group store is only consulted when one of the two
+            // windows actually contains a group event; ordinary traffic
+            // must not serialize on the global group lock four times.
+            let stats_has_groups = first.iter().chain(last.iter()).any(nip29::is_group_event);
+            let stats_groups = if stats_has_groups {
+                Some(relay.groups.read().await)
+            } else {
+                None
+            };
             if first_visible.is_none() {
                 first_visible = first.into_iter().find(|e| {
                     api_visible(
                         e,
-                        Some(&stats_groups),
+                        stats_groups.as_deref(),
                         &no_tags,
                         nip78,
                         relay.relay_pubkey.as_deref(),
@@ -1371,7 +1428,7 @@ pub async fn api_stats_handler(
                 last_visible = last.into_iter().find(|e| {
                     api_visible(
                         e,
-                        Some(&stats_groups),
+                        stats_groups.as_deref(),
                         &no_tags,
                         nip78,
                         relay.relay_pubkey.as_deref(),
@@ -1431,6 +1488,13 @@ pub async fn api_hourly_handler(
         Ok(pk) => pk,
         Err(e) => return error_response(StatusCode::BAD_REQUEST, &e.to_string()),
     };
+    let (count_limit, search_enabled) = {
+        let cfg = relay.config.read().await;
+        if let Err(e) = bound_filter_members(&params, &cfg) {
+            return param_rejection(e);
+        }
+        (cfg.limits.max_count, cfg.nip_enabled(50))
+    };
     // `since`/`until` are accepted by `/query` and `/monthly` but silently
     // ignored here: reject them instead of returning a misleading result.
     if params.since.is_some() || params.until.is_some() {
@@ -1481,7 +1545,6 @@ pub async fn api_hourly_handler(
     }
     let day_start = month_start(year, month) + (day as u64 - 1) * 86400;
 
-    let count_limit = relay.config.read().await.limits.max_count;
     let no_tags = excluded_tags(&params);
     let nip78 = enabled_nip78_auth_active(&relay).await;
 
@@ -1497,7 +1560,7 @@ pub async fn api_hourly_handler(
             );
         };
         let h_start = day_start + h * 3600;
-        let filter = apply_params(
+        let filter = api_filter(
             Filter {
                 authors: Some(vec![hex_pk.clone()]),
                 kinds: Some(vec![kind]),
@@ -1506,6 +1569,7 @@ pub async fn api_hourly_handler(
                 ..Default::default()
             },
             &params,
+            search_enabled,
         );
         let Some((events, more)) = relay.db.api_count(vec![filter], count_limit, now).await else {
             return db_unavailable();
@@ -2373,6 +2437,227 @@ mod tests {
         };
         bound_params(&mut p, &cfg2).unwrap();
         assert_eq!(p.limit, Some(10_000));
+    }
+
+    #[test]
+    fn aggregate_endpoints_reject_oversized_filter_members() {
+        // M03: `/kinds` and `/stats` used to bypass `bound_params`; the
+        // same gap existed on the daily/hourly/monthly paths (they build
+        // their own filters from the query parameters).
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_relay().await;
+            let pk = XOnlyPublicKey::from_keypair(&Keypair::from_secret_bytes([1u8; 32]).unwrap())
+                .0
+                .to_string();
+            let npub = crate::nips::nip19::bech32_encode("npub", &hex::decode(&pk).unwrap())
+                .expect("npub encoding");
+            let too_many = ApiParams {
+                kinds: (0..=512).collect(),
+                ..Default::default()
+            };
+            let (code, _) = api_kinds_handler(
+                State(relay.clone()),
+                Path(npub.clone()),
+                Query(ApiParams {
+                    kinds: too_many.kinds.clone(),
+                    ..Default::default()
+                }),
+            )
+            .await;
+            assert_eq!(code, StatusCode::BAD_REQUEST, "/kinds");
+            let (code, _) = api_stats_handler(
+                State(relay.clone()),
+                Path(npub.clone()),
+                Query(ApiParams {
+                    kinds: too_many.kinds.clone(),
+                    ..Default::default()
+                }),
+            )
+            .await;
+            assert_eq!(code, StatusCode::BAD_REQUEST, "/stats");
+            for (name, code) in [
+                (
+                    "daily",
+                    api_daily_handler(
+                        State(relay.clone()),
+                        Path((npub.clone(), 1)),
+                        Query(ApiParams {
+                            kinds: too_many.kinds.clone(),
+                            ..Default::default()
+                        }),
+                    )
+                    .await
+                    .0,
+                ),
+                (
+                    "hourly",
+                    api_hourly_handler(
+                        State(relay.clone()),
+                        Path((npub.clone(), 1)),
+                        Query(ApiParams {
+                            kinds: too_many.kinds.clone(),
+                            ..Default::default()
+                        }),
+                    )
+                    .await
+                    .0,
+                ),
+                (
+                    "monthly",
+                    api_monthly_handler(
+                        State(relay.clone()),
+                        Path((npub.clone(), 1)),
+                        Query(ApiParams {
+                            kinds: too_many.kinds.clone(),
+                            ..Default::default()
+                        }),
+                    )
+                    .await
+                    .0,
+                ),
+            ] {
+                assert_eq!(code, StatusCode::BAD_REQUEST, "/{name}");
+            }
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn search_gate_and_byte_limit_apply_to_aggregate_endpoints() {
+        // M04: NIP-50 disabled must strip `search` on `/kinds`, `/stats`,
+        // `/daily` and `/hourly` (they used `apply_params` directly). An
+        // over-long search is rejected by the shared member bound.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_relay().await;
+            let now = unix_now();
+            let note = signed_note("ordinary content", now, vec![]);
+            assert_eq!(relay.db.put(note, now).await, crate::db::PutOutcome::Stored);
+            let pk = XOnlyPublicKey::from_keypair(&Keypair::from_secret_bytes([1u8; 32]).unwrap())
+                .0
+                .to_string();
+            let npub = crate::nips::nip19::bech32_encode("npub", &hex::decode(&pk).unwrap())
+                .expect("npub encoding");
+            {
+                let mut cfg = relay.config.write().await;
+                cfg.relay.disabled_nips.push(50);
+                cfg.limits.max_api_search_bytes = 16;
+            }
+            let search = ApiParams {
+                search: Some("does-not-match".into()),
+                ..Default::default()
+            };
+            let (code, Json(kinds)) = api_kinds_handler(
+                State(relay.clone()),
+                Path(npub.clone()),
+                Query(ApiParams {
+                    search: search.search.clone(),
+                    ..Default::default()
+                }),
+            )
+            .await;
+            assert_eq!(code, StatusCode::OK);
+            assert!(
+                !kinds["kinds"].as_array().unwrap().is_empty(),
+                "search must be stripped when NIP-50 is disabled: {kinds}"
+            );
+            let (code, Json(stats)) = api_stats_handler(
+                State(relay.clone()),
+                Path(npub.clone()),
+                Query(ApiParams {
+                    search: search.search.clone(),
+                    ..Default::default()
+                }),
+            )
+            .await;
+            assert_eq!(code, StatusCode::OK);
+            assert_eq!(stats["total"], 1);
+            let (code, Json(daily)) = api_daily_handler(
+                State(relay.clone()),
+                Path((npub.clone(), 1)),
+                Query(ApiParams {
+                    search: search.search.clone(),
+                    ..Default::default()
+                }),
+            )
+            .await;
+            assert_eq!(code, StatusCode::OK);
+            assert_eq!(daily["total"], 1);
+            let (code, Json(hourly)) = api_hourly_handler(
+                State(relay.clone()),
+                Path((npub.clone(), 1)),
+                Query(ApiParams {
+                    search: search.search.clone(),
+                    ..Default::default()
+                }),
+            )
+            .await;
+            assert_eq!(code, StatusCode::OK);
+            assert_eq!(hourly["total"], 1);
+
+            let long_search = ApiParams {
+                search: Some("x".repeat(17)),
+                ..Default::default()
+            };
+            for (name, code) in [
+                (
+                    "kinds",
+                    api_kinds_handler(
+                        State(relay.clone()),
+                        Path(npub.clone()),
+                        Query(ApiParams {
+                            search: long_search.search.clone(),
+                            ..Default::default()
+                        }),
+                    )
+                    .await
+                    .0,
+                ),
+                (
+                    "stats",
+                    api_stats_handler(
+                        State(relay.clone()),
+                        Path(npub.clone()),
+                        Query(ApiParams {
+                            search: long_search.search.clone(),
+                            ..Default::default()
+                        }),
+                    )
+                    .await
+                    .0,
+                ),
+                (
+                    "daily",
+                    api_daily_handler(
+                        State(relay.clone()),
+                        Path((npub.clone(), 1)),
+                        Query(ApiParams {
+                            search: long_search.search.clone(),
+                            ..Default::default()
+                        }),
+                    )
+                    .await
+                    .0,
+                ),
+                (
+                    "hourly",
+                    api_hourly_handler(
+                        State(relay.clone()),
+                        Path((npub.clone(), 1)),
+                        Query(ApiParams {
+                            search: long_search.search.clone(),
+                            ..Default::default()
+                        }),
+                    )
+                    .await
+                    .0,
+                ),
+            ] {
+                assert_eq!(code, StatusCode::BAD_REQUEST, "/{name}");
+            }
+            relay.db.shutdown();
+        });
     }
 
     #[test]

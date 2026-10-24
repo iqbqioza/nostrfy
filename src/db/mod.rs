@@ -854,6 +854,10 @@ pub struct DbClient {
     /// checks and the cross-process `access.lock` are anchored here, so the
     /// accessors do not need a round trip to the store thread.
     db_path: std::path::PathBuf,
+    /// Shared with the store: set when an LMDB commit fails with `MapFull`
+    /// and the fixed map cannot grow. The writer stays alive, but readiness
+    /// and the storage-full gauge must report the write refusal.
+    map_full: Arc<std::sync::atomic::AtomicBool>,
     /// False once the writer thread exited. Reads may still succeed, so
     /// this is separate from `cancelled` (graceful shutdown) and is exposed
     /// to `/health` as the writer-liveness signal.
@@ -1245,6 +1249,8 @@ impl DbClient {
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
         store.set_cancel(Arc::clone(&cancel));
         let reader_threads = cfg.reader_threads.clamp(1, 64);
+        // Capture the flag before the store moves into the writer thread.
+        let map_full = Arc::clone(&store.map_full);
         let threads = threads::spawn(
             store,
             expiry,
@@ -1275,6 +1281,7 @@ impl DbClient {
             overloads: threads.overloads,
             writer_alive: threads.writer_alive,
             db_path: cfg.path.clone(),
+            map_full,
             expiry: threads.expiry,
             cancel,
             resumed_deletion_state_removed: threads.resumed_deletion_state_removed,
@@ -2517,11 +2524,21 @@ impl DbClient {
         store::path_free_space(&self.db_path)
     }
 
-    /// Whether the database filesystem is below the write margin the put
-    /// path refuses to commit under (a full disk fails the commit).
-    /// `false` when the free space cannot be probed.
+    /// Whether the database refuses writes because the filesystem is below
+    /// the write margin, or because an LMDB commit hit the fixed map
+    /// ceiling (`MapFull`). `false` when the free space cannot be probed
+    /// and the map has not filled.
     pub fn disk_full(&self) -> bool {
-        self.free_disk_bytes().is_some_and(store::disk_below_margin)
+        self.map_full.load(std::sync::atomic::Ordering::Relaxed)
+            || self.free_disk_bytes().is_some_and(store::disk_below_margin)
+    }
+
+    /// Test-only: simulate the permanent `MapFull` state without filling a
+    /// real 16 MiB test map.
+    #[cfg(test)]
+    pub(crate) fn force_map_full(&self) {
+        self.map_full
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Bans an event id (NIP-86 banevent): removes it from storage and

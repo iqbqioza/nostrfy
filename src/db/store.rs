@@ -556,23 +556,33 @@ pub(crate) fn apply_put_batch(
         // Test-only fault injection: treat the next commit as a full map so
         // the rollback path below is exercised without filling a real
         // environment (the map floor is 16 MiB). The open transaction is
-        // dropped (aborted) with the returned batch.
+        // dropped (aborted) with the returned batch. The simulated failure
+        // must not latch the real `map_full` flag: these tests continue
+        // writing on the same store after checking the rollback.
         #[cfg(test)]
-        let commit = if store
+        let simulated_map_full = store
             .fail_next_commit
-            .swap(false, std::sync::atomic::Ordering::SeqCst)
-        {
+            .swap(false, std::sync::atomic::Ordering::SeqCst);
+        #[cfg(not(test))]
+        let simulated_map_full = false;
+        let commit = if simulated_map_full {
             Err(heed::Error::Mdb(heed::MdbError::MapFull))
         } else {
             txn.commit()
         };
-        #[cfg(not(test))]
-        let commit = txn.commit();
         match commit {
             Ok(()) => {
                 return outcomes;
             }
             Err(heed::Error::Mdb(heed::MdbError::MapFull)) => {
+                if !simulated_map_full {
+                    // The map is fixed at `map_max_size`: this refusal is
+                    // permanent until a restart with a larger map, so
+                    // readiness and the storage gauge must see it.
+                    store
+                        .map_full
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                }
                 if !store.grow_map() {
                     // The map cannot grow further: the batch cannot be
                     // committed, so every reply is revoked. Count the
@@ -756,6 +766,11 @@ pub(crate) struct Store {
     /// Ceiling for the memory map (bytes): the map is opened at this size
     /// and never resized at runtime.
     pub(crate) map_max_size: u64,
+    /// Set once a commit fails with `MapFull` and the map cannot grow.
+    /// `/health`, the `db_disk_full` gauge and the write guards must treat
+    /// this as a storage-full condition: the writer is alive, but every
+    /// further commit will fail until a restart with a larger map.
+    pub(crate) map_full: Arc<std::sync::atomic::AtomicBool>,
     /// Short-lived cache of NIP-50 document frequencies (term -> (df,
     /// expires_at)). Each miss walks up to `DF_SAMPLE` index entries, and
     /// a popular query repeats over many requests; the scores tolerate a
@@ -1046,6 +1061,7 @@ impl Store {
             indexed_words: std::sync::atomic::AtomicUsize::new(indexed_words),
             word_index_ready: Arc::new(std::sync::atomic::AtomicBool::new(word_index_ready)),
             map_max_size,
+            map_full: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             df_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             df_cache_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(test)]
@@ -1083,6 +1099,11 @@ impl Store {
     /// Returns `false` (the map cannot grow), so a commit that fills the
     /// map fails with `MapFull` and the caller revokes the batch.
     pub(crate) fn grow_map(&self) -> bool {
+        // The map is fixed at `map_max_size`; a MapFull is therefore a
+        // persistent write refusal, not a transient allocation failure.
+        // The caller marks `map_full` (except for the test-only simulated
+        // failure above) so `/health` and the storage gauge stop reporting
+        // a healthy writer while every commit is failing.
         log::error!(
             "database map is full ({} bytes, map_max_size)",
             self.map_max_size
@@ -1095,6 +1116,9 @@ impl Store {
     /// `disk_full_override` reports full without touching a real
     /// filesystem, so the failure mode is injectable on any machine.
     pub(crate) fn disk_full(&self) -> bool {
+        if self.map_full.load(std::sync::atomic::Ordering::Relaxed) {
+            return true;
+        }
         #[cfg(test)]
         if self
             .disk_full_override
@@ -1195,6 +1219,7 @@ impl Store {
             ),
             word_index_ready: Arc::clone(&self.word_index_ready),
             map_max_size: self.map_max_size,
+            map_full: Arc::clone(&self.map_full),
             df_cache: Arc::clone(&self.df_cache),
             df_cache_generation: Arc::clone(&self.df_cache_generation),
             // The fault hooks are shared: a test keeps a clone (arming it

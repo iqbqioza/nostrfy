@@ -87,14 +87,14 @@ Author identifiers (`{npub1...}`) may also be given as a **64-hex pubkey** (case
 
 When `server.api_host` is configured (e.g. `api.example.com`), the API and the WebSocket relay are split by the **Host header**:
 
-| Host header | `/api/v1`, `/health`, `/metrics` | WebSocket relay & NIP-11 |
-| --- | --- | --- |
-| `api.example.com` | served | `404` |
-| any other host | `404` | served — the paths are selected by `server.ws_paths`: `/` by default, `/inbox` and `/outbox` in `inbox-outbox` mode, or all of them |
+| Host header | `/api/v1`, `/metrics` | `/health`, `/live` | WebSocket relay & NIP-11 |
+| --- | --- | --- | --- |
+| `api.example.com` | served | served | `404` |
+| any other host | `404` | served | served — the paths are selected by `server.ws_paths`: `/` by default, `/inbox` and `/outbox` in `inbox-outbox` mode, or all of them |
 
 Without `api_host`, the API is served on every host, next to the WebSocket endpoint.
 
-`/live` is host-agnostic: it is served on every host so Docker/Fly/Kubernetes liveness probes keep working when `api_host` is set.
+`/live` and `/health` are host-agnostic: they are served on every host so Docker/Fly/Kubernetes liveness/readiness probes keep working when `api_host` is set. `/api/v1` and `/metrics` remain isolated to the API host.
 
 > **Note**: Only `GET` is supported. WebSocket upgrade requests to `/api/v1` are rejected with `403 Forbidden` — or `401` first when `relay.require_auth` is set and the request carries no NIP-98 authorization (the auth layer runs before the upgrade rejection).
 
