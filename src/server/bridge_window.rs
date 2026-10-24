@@ -1,0 +1,645 @@
+//! NIP-CW channel and thread windows for the Buzz HTTP bridge.
+//!
+//! Buzz's timeline does not page raw NIP-01 rows: it asks for top-level
+//! channel rows with a composite `(created_at, id)` cursor and expects one
+//! relay-signed `kind:39006` bounds event per served page. Threads use the
+//! older `#e` + `depth_limit` path. Both are query-time read models: the
+//! rows are ordinary stored events, the overlays are signed but never
+//! stored.
+
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
+use axum::Json;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use serde_json::{Value, json};
+
+use crate::event::Event;
+use crate::filter::Filter;
+use crate::nips::nip29;
+use crate::relay::Relay;
+use crate::util::unix_now;
+
+use super::bridge::{bad_request, bridge_visible};
+
+const WINDOW_DEFAULT_LIMIT: usize = 50;
+const WINDOW_MAX_LIMIT: usize = 200;
+const WINDOW_FETCH_MIN: usize = 200;
+const WINDOW_FETCH_MAX: usize = 2_000;
+const THREAD_DEFAULT_LIMIT: usize = 100;
+const THREAD_MAX_LIMIT: usize = 500;
+const THREAD_DEPTH_DEFAULT: u32 = 64;
+const THREAD_DEPTH_MAX: u32 = 100;
+const AUX_LIMIT: usize = 1_000;
+
+/// NIP-CW's thread-summary kind. The same integer is NIP-29's group-pins
+/// event; Buzz never asks for pins in a window, so the two never mix.
+const THREAD_SUMMARY: u64 = 39005;
+const AUX_KINDS: &[u64] = &[5, 7, 9005, 40003];
+const AUX_DELETE_KINDS: &[u64] = &[5, 9005];
+const THREAD_CONTENT_KINDS: &[u64] = &[9, 40002, 45001, 45003];
+
+/// Executes a mixed `/query` request: window filters, legacy thread filters
+/// and ordinary NIP-01 filters, concatenated in request order.
+#[allow(clippy::result_large_err)]
+pub(crate) async fn query_all(
+    relay: &Arc<Relay>,
+    cfg: &crate::config::Config,
+    authed: &str,
+    raw_filters: &[Value],
+) -> Result<Vec<Event>, Response> {
+    let mut out = Vec::new();
+    let mut ordinary = Vec::new();
+    for raw in raw_filters {
+        if raw.get("top_level").and_then(Value::as_bool) == Some(true) {
+            out.extend(channel_window(relay, cfg, authed, raw).await?);
+        } else if raw.get("depth_limit").is_some() {
+            out.extend(thread_window(relay, cfg, authed, raw).await?);
+        } else {
+            ordinary.push(raw.clone());
+        }
+    }
+    if !ordinary.is_empty() {
+        out.extend(super::bridge::execute_filters(relay, cfg, authed, &ordinary).await?);
+    }
+    Ok(out)
+}
+
+fn is_hex_64(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// A NIP-10 marked reply target. Only the `reply` marker counts; positional
+/// or `root`-only e-tags are not replies (NIP-CW).
+fn reply_parent(event: &Event) -> Option<&str> {
+    event
+        .tags
+        .iter()
+        .find(|t| {
+            t.len() >= 4
+                && t[0] == "e"
+                && t[3] == "reply"
+                && is_hex_64(t.get(1).map_or("", String::as_str))
+        })
+        .map(|t| t[1].as_str())
+}
+
+fn is_broadcast(event: &Event) -> bool {
+    event
+        .tags
+        .iter()
+        .any(|t| t.len() >= 2 && t[0] == "broadcast" && t[1] == "1")
+}
+
+/// Top-level classification for a channel window.
+///
+/// Without a persisted depth index this treats every broadcast reply as
+/// depth 1. That is the only form Buzz emits; a deeper reply that carries
+/// `broadcast` would also surface, which is a display-only deviation from
+/// NIP-CW, never an access-control issue.
+fn is_top_level(event: &Event) -> bool {
+    reply_parent(event).is_none() || is_broadcast(event)
+}
+
+fn sort_desc_id_asc(events: &mut [Event]) {
+    events.sort_by(|a, b| {
+        b.created_at
+            .cmp(&a.created_at)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+}
+
+fn sort_asc_id_asc(events: &mut [Event]) {
+    events.sort_by(|a, b| {
+        a.created_at
+            .cmp(&b.created_at)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+}
+
+fn cursor_after(event: &Event, until: u64, before_id: &str) -> bool {
+    event.created_at < until || (event.created_at == until && event.id.as_str() > before_id)
+}
+
+#[allow(clippy::result_large_err)]
+fn channel_id(raw: &Value) -> Result<String, Response> {
+    let Some(values) = raw.get("#h").and_then(Value::as_array) else {
+        return Err(bad_request("window requires exactly one #h channel"));
+    };
+    if values.len() != 1 {
+        return Err(bad_request("window requires exactly one #h channel"));
+    }
+    values[0]
+        .as_str()
+        .map(str::to_string)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| bad_request("window requires exactly one #h channel"))
+}
+
+#[allow(clippy::result_large_err)]
+fn before_id(raw: &Value) -> Result<Option<String>, Response> {
+    let Some(value) = raw.get("before_id") else {
+        return Ok(None);
+    };
+    match value.as_str() {
+        Some(id) if is_hex_64(id) => Ok(Some(id.to_ascii_lowercase())),
+        _ => Err(bad_request("before_id must be a 64-hex event id")),
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn parse_cursor(raw: &Value) -> Result<Option<(u64, String)>, Response> {
+    let before = before_id(raw)?;
+    let until = raw.get("until").and_then(Value::as_u64);
+    match (until, before) {
+        (Some(until), Some(id)) => Ok(Some((until, id))),
+        (None, None) => Ok(None),
+        _ => Err(bad_request("until and before_id must be provided together")),
+    }
+}
+
+fn raw_limit(raw: &Value, default: usize, max: usize) -> usize {
+    raw.get("limit")
+        .and_then(Value::as_u64)
+        .map(|value| value as usize)
+        .unwrap_or(default)
+        .clamp(1, max)
+}
+
+/// Channel-mode window (NIP-CW §Channel-mode).
+#[allow(clippy::result_large_err)]
+async fn channel_window(
+    relay: &Arc<Relay>,
+    cfg: &crate::config::Config,
+    authed: &str,
+    raw: &Value,
+) -> Result<Vec<Event>, Response> {
+    let channel = channel_id(raw)?;
+    let cursor = parse_cursor(raw)?;
+    let limit = raw_limit(raw, WINDOW_DEFAULT_LIMIT, WINDOW_MAX_LIMIT);
+    let include_aux = raw.get("include_aux").and_then(Value::as_bool) == Some(true);
+    let include_summaries = raw.get("include_summaries").and_then(Value::as_bool) == Some(true);
+
+    {
+        let groups = relay.groups.read().await;
+        let Some(_group) = groups.groups.get(&channel) else {
+            // An unknown channel is indistinguishable from an inaccessible
+            // one: no rows and no overlays.
+            return Ok(Vec::new());
+        };
+        if !groups.visible_kind(&channel, 9, Some(authed)) {
+            return Ok(Vec::new());
+        }
+    }
+
+    let base_filter: Filter = serde_json::from_value(raw.clone())
+        .map_err(|e| bad_request(&format!("invalid window filter: {e}")))?;
+    let fetch = limit
+        .saturating_mul(8)
+        .saturating_add(64)
+        .clamp(WINDOW_FETCH_MIN, WINDOW_FETCH_MAX);
+    let nip78_restricted = cfg.nip_enabled(78) && cfg.relay.enabled_nip78_auth;
+
+    let mut rows: Vec<Event> = Vec::with_capacity(limit);
+    let mut page_cursor = cursor.clone();
+    let mut last_scanned: Option<(u64, String)> = None;
+    let mut has_more = false;
+    let mut rounds = 0usize;
+    loop {
+        rounds += 1;
+        let mut filter = base_filter.clone();
+        if let Some((until, _)) = &page_cursor {
+            filter.until = Some(*until);
+        }
+        filter.limit = Some(fetch);
+        let Some((mut candidates, db_more)) = relay
+            .db
+            .api_query(vec![filter], fetch, unix_now(), false)
+            .await
+        else {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": "database is overloaded, try again shortly" })),
+            )
+                .into_response());
+        };
+        sort_desc_id_asc(&mut candidates);
+
+        let groups = relay.groups.read().await;
+        let mut examined_this_round = 0usize;
+        let mut eligible_this_round = 0usize;
+        for event in candidates {
+            if let Some((until, before)) = &page_cursor
+                && !cursor_after(&event, *until, before)
+            {
+                continue;
+            }
+            examined_this_round += 1;
+            last_scanned = Some((event.created_at, event.id.clone()));
+            if !bridge_visible(
+                &event,
+                authed,
+                Some(&groups),
+                nip78_restricted,
+                relay.relay_pubkey_ref(),
+            ) {
+                continue;
+            }
+            if is_top_level(&event) {
+                eligible_this_round += 1;
+                if rows.len() < limit {
+                    rows.push(event);
+                }
+            }
+        }
+        drop(groups);
+
+        if eligible_this_round > limit || (rows.len() == limit && db_more) {
+            has_more = true;
+            break;
+        }
+        if rows.len() == limit && !db_more {
+            // An exact-multiple final page: no extra row exists, so this is
+            // exhaustion even though the page is full.
+            has_more = false;
+            break;
+        }
+        if !db_more || examined_this_round == 0 {
+            // The scan is exhausted (or cannot make progress without
+            // re-reading the same rows). A full page with db_more still set
+            // means the next page exists even though this scan found no
+            // extra row.
+            has_more = db_more && rows.len() == limit;
+            break;
+        }
+        if rounds >= 4 {
+            // The bounded over-fetch stopped early. There may still be older
+            // rows, so hand the client a cursor rather than claiming
+            // exhaustion; an empty page can progress via the last scanned
+            // candidate.
+            has_more = last_scanned.is_some();
+            break;
+        }
+        // Advance strictly past the last candidate of this round. The next
+        // query uses `until` inclusively; the post-filter keeps the scan
+        // exact under same-second bursts.
+        page_cursor = last_scanned.clone();
+        if page_cursor.is_none() {
+            break;
+        }
+    }
+
+    let next_cursor = if has_more {
+        rows.last()
+            .map(|event| (event.created_at, event.id.clone()))
+            .or(last_scanned)
+    } else {
+        None
+    };
+    let has_more = next_cursor.is_some();
+
+    let mut out = rows.clone();
+    if include_aux && !rows.is_empty() {
+        let row_ids: Vec<String> = rows.iter().map(|event| event.id.clone()).collect();
+        let aux = fetch_aux(relay, cfg, authed, &row_ids).await?;
+        out.extend(aux);
+    }
+    if include_summaries && !rows.is_empty() {
+        let summaries = thread_summaries(relay, cfg, authed, &channel, &rows).await?;
+        out.extend(summaries);
+    }
+    if let Some(bounds) = window_bounds(relay, &channel, cursor.as_ref(), has_more, next_cursor) {
+        out.push(bounds);
+    }
+    Ok(out)
+}
+
+/// Fetches the two-hop aux closure for a set of rows.
+#[allow(clippy::result_large_err)]
+async fn fetch_aux(
+    relay: &Arc<Relay>,
+    cfg: &crate::config::Config,
+    authed: &str,
+    row_ids: &[String],
+) -> Result<Vec<Event>, Response> {
+    let nip78_restricted = cfg.nip_enabled(78) && cfg.relay.enabled_nip78_auth;
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    let mut hop = row_ids.to_vec();
+    for kinds in [AUX_KINDS, AUX_DELETE_KINDS] {
+        if hop.is_empty() {
+            break;
+        }
+        let mut next = Vec::new();
+        for chunk in hop.chunks(crate::filter::MAX_FILTER_MEMBERS) {
+            let mut filter = Filter {
+                kinds: Some(kinds.to_vec()),
+                limit: Some(AUX_LIMIT),
+                ..Filter::default()
+            };
+            filter.tags.insert("#e".to_string(), json!(chunk));
+            let Some((events, _)) = relay
+                .db
+                .api_query(vec![filter], AUX_LIMIT, unix_now(), false)
+                .await
+            else {
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({ "error": "database is overloaded, try again shortly" })),
+                )
+                    .into_response());
+            };
+            let groups = relay.groups.read().await;
+            for event in events {
+                if !seen.insert(event.id.clone()) {
+                    continue;
+                }
+                if !bridge_visible(
+                    &event,
+                    authed,
+                    Some(&groups),
+                    nip78_restricted,
+                    relay.relay_pubkey_ref(),
+                ) {
+                    continue;
+                }
+                next.push(event.id.clone());
+                out.push(event);
+            }
+            drop(groups);
+        }
+        hop = next;
+    }
+    Ok(out)
+}
+
+/// One relay-signed `kind:39005` per row that has at least one direct reply.
+#[allow(clippy::result_large_err)]
+async fn thread_summaries(
+    relay: &Arc<Relay>,
+    cfg: &crate::config::Config,
+    authed: &str,
+    channel: &str,
+    rows: &[Event],
+) -> Result<Vec<Event>, Response> {
+    let row_ids: Vec<String> = rows.iter().map(|event| event.id.clone()).collect();
+    let mut filter = Filter {
+        kinds: Some(THREAD_CONTENT_KINDS.to_vec()),
+        limit: Some(AUX_LIMIT),
+        ..Filter::default()
+    };
+    filter.tags.insert("#e".to_string(), json!(row_ids.clone()));
+    filter.tags.insert("#h".to_string(), json!([channel]));
+    let Some((events, _)) = relay
+        .db
+        .api_query(vec![filter], AUX_LIMIT, unix_now(), false)
+        .await
+    else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "database is overloaded, try again shortly" })),
+        )
+            .into_response());
+    };
+    let nip78_restricted = cfg.nip_enabled(78) && cfg.relay.enabled_nip78_auth;
+    let groups = relay.groups.read().await;
+    let row_set: HashSet<&str> = rows.iter().map(|event| event.id.as_str()).collect();
+    let mut per_row: HashMap<String, (usize, u64, Vec<String>)> = HashMap::new();
+    for event in events {
+        if !bridge_visible(
+            &event,
+            authed,
+            Some(&groups),
+            nip78_restricted,
+            relay.relay_pubkey_ref(),
+        ) {
+            continue;
+        }
+        let parent = event
+            .tags
+            .iter()
+            .filter(|t| t.len() >= 2 && t[0] == "e")
+            .map(|t| t[1].as_str())
+            .find(|id| row_set.contains(id));
+        let Some(parent) = parent else {
+            continue;
+        };
+        let entry = per_row
+            .entry(parent.to_string())
+            .or_insert((0, event.created_at, Vec::new()));
+        entry.0 += 1;
+        entry.1 = entry.1.max(event.created_at);
+        if entry.2.len() < 10 && !entry.2.iter().any(|pk| pk == &event.pubkey) {
+            entry.2.push(event.pubkey.clone());
+        }
+    }
+    drop(groups);
+
+    let mut out = Vec::new();
+    for row in rows {
+        let Some((reply_count, last_reply_at, participants)) = per_row.get(&row.id) else {
+            continue;
+        };
+        let content = json!({
+            "reply_count": reply_count,
+            "descendant_count": reply_count,
+            "last_reply_at": last_reply_at,
+            "participants": participants,
+        });
+        if let Some(event) = sign_overlay(
+            relay,
+            THREAD_SUMMARY,
+            vec![
+                vec!["e".to_string(), row.id.clone()],
+                vec!["d".to_string(), row.id.clone()],
+                vec!["h".to_string(), channel.to_string()],
+            ],
+            content.to_string(),
+        ) {
+            out.push(event);
+        }
+    }
+    Ok(out)
+}
+
+/// The single `kind:39006` bounds overlay for a served window.
+fn window_bounds(
+    relay: &Arc<Relay>,
+    channel: &str,
+    cursor: Option<&(u64, String)>,
+    has_more: bool,
+    next_cursor: Option<(u64, String)>,
+) -> Option<Event> {
+    let suffix = match cursor {
+        Some((until, before)) => format!("{until}:{before}"),
+        None => "head".to_string(),
+    };
+    let content = json!({
+        "has_more": has_more,
+        "next_cursor": next_cursor.map(|(created_at, id)| json!({
+            "created_at": created_at,
+            "id": id,
+        })),
+    });
+    sign_overlay(
+        relay,
+        nip29::WINDOW_BOUNDS,
+        vec![
+            vec!["d".to_string(), format!("{channel}:{suffix}")],
+            vec!["h".to_string(), channel.to_string()],
+        ],
+        content.to_string(),
+    )
+}
+
+fn sign_overlay(
+    relay: &Relay,
+    kind: u64,
+    tags: Vec<Vec<String>>,
+    content: String,
+) -> Option<Event> {
+    let pubkey = relay.relay_pubkey()?;
+    let mut event = Event {
+        id: String::new(),
+        pubkey,
+        created_at: unix_now(),
+        kind,
+        tags,
+        content,
+        sig: String::new(),
+    };
+    relay.sign_relay_event(&mut event).then_some(event)
+}
+
+/// Legacy thread subtree path: `#e` root plus `depth_limit`.
+#[allow(clippy::result_large_err)]
+async fn thread_window(
+    relay: &Arc<Relay>,
+    cfg: &crate::config::Config,
+    authed: &str,
+    raw: &Value,
+) -> Result<Vec<Event>, Response> {
+    let Some(root) = raw
+        .get("#e")
+        .and_then(Value::as_array)
+        .filter(|values| values.len() == 1)
+        .and_then(|values| values[0].as_str())
+        .filter(|id| is_hex_64(id))
+    else {
+        return Err(bad_request("thread requires exactly one #e root"));
+    };
+    let channel = raw
+        .get("#h")
+        .and_then(Value::as_array)
+        .filter(|values| values.len() == 1)
+        .and_then(|values| values[0].as_str())
+        .filter(|id| !id.is_empty());
+    if let Some(channel) = channel {
+        let groups = relay.groups.read().await;
+        let Some(_group) = groups.groups.get(channel) else {
+            return Ok(Vec::new());
+        };
+        if !groups.visible_kind(channel, 9, Some(authed)) {
+            return Ok(Vec::new());
+        }
+    }
+
+    let depth_limit = raw
+        .get("depth_limit")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .unwrap_or(THREAD_DEPTH_DEFAULT)
+        .min(THREAD_DEPTH_MAX);
+    let limit = raw_limit(raw, THREAD_DEFAULT_LIMIT, THREAD_MAX_LIMIT);
+    let include_aux = raw.get("include_aux").and_then(Value::as_bool) == Some(true);
+    let cursor = thread_cursor(raw);
+
+    let mut seen = HashSet::new();
+    seen.insert(root.to_string());
+    let mut frontier = vec![root.to_string()];
+    let mut replies = Vec::new();
+    let nip78_restricted = cfg.nip_enabled(78) && cfg.relay.enabled_nip78_auth;
+    for _ in 0..depth_limit {
+        if frontier.is_empty() {
+            break;
+        }
+        let mut next = Vec::new();
+        for chunk in frontier.chunks(crate::filter::MAX_FILTER_MEMBERS) {
+            let mut filter = Filter {
+                kinds: raw
+                    .get("kinds")
+                    .and_then(|value| serde_json::from_value(value.clone()).ok()),
+                limit: Some(AUX_LIMIT),
+                ..Filter::default()
+            };
+            filter.tags.insert("#e".to_string(), json!(chunk));
+            if let Some(channel) = channel {
+                filter.tags.insert("#h".to_string(), json!([channel]));
+            }
+            let Some((events, _)) = relay
+                .db
+                .api_query(vec![filter], AUX_LIMIT, unix_now(), false)
+                .await
+            else {
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({ "error": "database is overloaded, try again shortly" })),
+                )
+                    .into_response());
+            };
+            let groups = relay.groups.read().await;
+            for event in events {
+                if !seen.insert(event.id.clone()) {
+                    continue;
+                }
+                if !bridge_visible(
+                    &event,
+                    authed,
+                    Some(&groups),
+                    nip78_restricted,
+                    relay.relay_pubkey_ref(),
+                ) {
+                    continue;
+                }
+                next.push(event.id.clone());
+                replies.push(event);
+            }
+            drop(groups);
+        }
+        frontier = next;
+        if replies.len() > THREAD_MAX_LIMIT.saturating_mul(4) {
+            // Bound the subtree walk: the client can page from the returned
+            // cursor instead of making one request materialize a huge tree.
+            break;
+        }
+    }
+    sort_asc_id_asc(&mut replies);
+
+    if let Some((created_at, id)) = cursor {
+        replies.retain(|event| {
+            event.created_at > created_at
+                || (event.created_at == created_at && event.id.as_str() > id.as_str())
+        });
+    }
+    replies.truncate(limit);
+
+    let mut out = replies.clone();
+    if include_aux && !replies.is_empty() {
+        let ids: Vec<String> = replies.iter().map(|event| event.id.clone()).collect();
+        out.extend(fetch_aux(relay, cfg, authed, &ids).await?);
+    }
+    Ok(out)
+}
+
+fn thread_cursor(raw: &Value) -> Option<(u64, String)> {
+    let created_at = raw.get("thread_cursor").and_then(Value::as_i64)?;
+    if created_at < 0 {
+        return None;
+    }
+    let id = raw.get("thread_cursor_id")?.as_str()?.to_ascii_lowercase();
+    if !is_hex_64(&id) {
+        return None;
+    }
+    Some((created_at as u64, id))
+}

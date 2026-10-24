@@ -18,6 +18,7 @@
 //! a partial, deleted identity remain visible.
 
 mod commands;
+mod dm;
 mod index;
 pub(crate) use index::{FilterComponents, SubscriptionIndex};
 pub(crate) mod roles;
@@ -2830,6 +2831,15 @@ impl Relay {
         known_prefixes: Option<&crate::relay::validate::KnownPrevious<'_>>,
         verified: Option<bool>,
     ) -> PutOutcome {
+        // Buzz DM commands are relay-handled: they mutate derived group
+        // state and answer with a command response, but must not be stored
+        // as ordinary events.
+        if event.kind == crate::nips::nip29::DM_OPEN {
+            return self.handle_dm_open(&event, authed).await;
+        }
+        if event.kind == crate::nips::nip29::DM_HIDE {
+            return self.handle_dm_hide(&event, authed).await;
+        }
         let now = unix_now();
         let cfg = self.config.read().await;
         let access = self.access.read().await;
@@ -3209,6 +3219,8 @@ impl Relay {
             // its guards before admitting, exactly like the vanish branch
             // below.
             || event.kind == nip43::JOIN
+            || event.kind == crate::nips::nip29::DM_OPEN
+            || event.kind == crate::nips::nip29::DM_HIDE
             || nip62::is_vanish(event)
             || (event.kind == 1 && self.relay_pubkey.as_deref() == Some(event.pubkey.as_str()))
     }
@@ -4026,9 +4038,12 @@ impl Relay {
             return false;
         };
         let now = self.stamp_floor(unix_now());
+        let extra_members = self.allowlisted_members().await;
+        let owners = self.relay_owner_members().await;
         let events = {
             let roles = self.roles.read().await;
-            let mut events = vec![roles.membership_event(&relay_pubkey, now)];
+            let mut events =
+                vec![roles.membership_event(&relay_pubkey, now, &extra_members, &owners)];
             for id in roles.roles.keys() {
                 events.push(roles.role_event(id, &relay_pubkey, now));
             }

@@ -1283,7 +1283,15 @@ fn private_groups_hide_messages_but_not_metadata() {
     }
 
     // hidden: metadata gated, messages readable.
-    let edit = event(9002, ADMIN, Some("g1"), vec![vec!["hidden".into()]]);
+    let edit = event(
+        9002,
+        ADMIN,
+        Some("g1"),
+        vec![
+            vec!["hidden".into()],
+            vec!["visibility".into(), "open".into()],
+        ],
+    );
     store.apply(&edit, "", 1, false, false);
     let meta = store.apply(&msg, "", 1, true, false);
     for m in &meta {
@@ -1805,7 +1813,10 @@ fn rebuild_keeps_join_membership() {
         let mut store = GroupStore::default();
         assert!(store.rebuild(&db, None).await, "the rebuild must complete");
         let g = store.group("g1").expect("group rebuilt");
-        assert!(g.is_admin(ADMIN), "creator is admin after rebuild");
+        assert!(
+            g.is_admin(ADMIN),
+            "creator is an admin (owner) after rebuild"
+        );
         assert!(g.is_member(OTHER), "JOIN membership survives rebuild");
     });
 }
@@ -3692,8 +3703,8 @@ fn roles_event_lists_the_roles_in_use() {
             .filter(|t| t[0] == "role")
             .map(|t| t[1].as_str())
             .collect::<Vec<_>>(),
-        vec!["admin", "mod"],
-        "the creator's admin role and the assigned role must be listed"
+        vec!["mod", "owner"],
+        "the creator's owner role and the assigned role must be listed"
     );
     // Two members sharing a role list it once.
     let out = store.apply(
@@ -3739,8 +3750,8 @@ fn roles_event_lists_the_roles_in_use() {
             .filter(|t| t[0] == "role")
             .map(|t| t[1].as_str())
             .collect::<Vec<_>>(),
-        vec!["admin"],
-        "only the creator's admin role is left: {:?}",
+        vec!["owner"],
+        "only the creator's owner role is left: {:?}",
         roles.tags
     );
 }
@@ -3776,7 +3787,10 @@ fn leaving_livekit_clears_the_participants_event() {
             9002,
             ADMIN,
             Some("g1"),
-            vec![vec!["name".into(), "g1".into()]],
+            vec![
+                vec!["livekit".into(), "false".into()],
+                vec!["name".into(), "g1".into()],
+            ],
         ),
         "relay",
         now,
@@ -4323,5 +4337,114 @@ fn invite_code_validation_dedupes_duplicates() {
     assert!(
         store.validate_write(&dup).is_ok(),
         "duplicate fresh codes must count once"
+    );
+}
+
+#[test]
+fn buzz_join_role_guest_blocks_posting_and_member_topic_edits() {
+    let mut store = GroupStore::default();
+    let now = 1_600_000_000;
+    store.apply(
+        &event(
+            CREATE_GROUP,
+            ADMIN,
+            Some("g1"),
+            vec![
+                vec!["join_role".into(), "guest".into()],
+                vec!["visibility".into(), "open".into()],
+            ],
+        ),
+        "relay",
+        now,
+        true,
+        false,
+    );
+    let join = event(JOIN, USER, Some("g1"), vec![]);
+    assert!(store.validate_write(&join).is_ok());
+    store.apply(&join, "relay", now + 1, true, false);
+    let group = store.group("g1").unwrap();
+    assert!(group.is_member(USER));
+    assert!(group.is_guest(USER), "join_role=guest must mark the joiner");
+
+    let post = event(9, USER, Some("g1"), vec![]);
+    assert!(
+        store.validate_write(&post).is_err(),
+        "a guest must not post"
+    );
+    let topic = event(
+        9002,
+        USER,
+        Some("g1"),
+        vec![vec!["topic".into(), "hi".into()]],
+    );
+    assert!(
+        store.validate_write(&topic).is_err(),
+        "a guest must not change the topic"
+    );
+
+    // A member promotable with Buzz's separate role tag.
+    let promote = event(
+        9000,
+        ADMIN,
+        Some("g1"),
+        vec![
+            vec!["p".into(), USER.into()],
+            vec!["role".into(), "member".into()],
+        ],
+    );
+    assert!(store.validate_write(&promote).is_ok());
+    store.apply(&promote, "relay", now + 2, true, false);
+    assert!(!store.group("g1").unwrap().is_guest(USER));
+    assert!(store.validate_write(&post).is_ok());
+    let topic = event(
+        9002,
+        USER,
+        Some("g1"),
+        vec![vec!["topic".into(), "hi".into()]],
+    );
+    assert!(
+        store.validate_write(&topic).is_ok(),
+        "a member may change topic/purpose"
+    );
+    store.apply(&topic, "relay", now + 3, true, false);
+    assert_eq!(
+        store.group("g1").unwrap().settings.topic.as_deref(),
+        Some("hi")
+    );
+
+    // Buzz's role=admin maps to a privileged NIP-29 role.
+    let make_admin = event(
+        9000,
+        ADMIN,
+        Some("g1"),
+        vec![
+            vec!["p".into(), USER.into()],
+            vec!["role".into(), "admin".into()],
+        ],
+    );
+    store.apply(&make_admin, "relay", now + 4, true, false);
+    assert!(store.group("g1").unwrap().is_admin(USER));
+}
+
+#[test]
+fn channel_creator_owns_the_channel() {
+    let mut store = GroupStore::default();
+    store.apply(
+        &event(CREATE_GROUP, ADMIN, Some("g1"), vec![]),
+        "relay",
+        1_600_000_000,
+        true,
+        false,
+    );
+    let group = store.group("g1").expect("group created");
+    let roles = group.members.get(ADMIN).expect("creator is a member");
+    assert_eq!(roles.len(), 1);
+    assert!(
+        roles.contains("owner"),
+        "the creator must be the channel owner: {roles:?}"
+    );
+    assert!(
+        !roles.contains("admin"),
+        "the old admin default must not survive: {roles:?}"
     );
 }

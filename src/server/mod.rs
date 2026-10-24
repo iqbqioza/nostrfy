@@ -4,6 +4,8 @@
 
 mod api;
 pub(crate) mod blossom;
+mod bridge;
+mod bridge_window;
 mod landing;
 pub(crate) mod livekit;
 
@@ -20,7 +22,7 @@ use axum::extract::{Request, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use log::{error, info, warn};
 use serde_json::json;
 use tokio::net::TcpListener;
@@ -333,10 +335,34 @@ async fn build_router(
                 .then(|| Duration::from_secs(cfg.limits.http_read_timeout_secs)),
         )
     };
+    let (bridge_body_limit, buzz_enabled) = {
+        let cfg = relay.config.read().await;
+        (cfg.limits.max_ws_message_bytes, cfg.relay.enabled_buzz)
+    };
     let mut app = Router::new()
         .route("/health", get(health_handler))
         .route("/live", get(live_handler))
-        .route("/relay/stats", get(stats_handler))
+        .route("/relay/stats", get(stats_handler));
+    if buzz_enabled {
+        // Buzz's HTTP bridge: NIP-11 at /info, one-shot reads at /query and
+        // writes at /events (NIP-98 authenticated). These live on the relay
+        // origin because the desktop derives its HTTP base URL from the
+        // WebSocket URL. Without `relay.enabled_buzz` the routes are not
+        // registered at all, so a Buzz client sees a plain 404.
+        app = app
+            .route("/info", get(bridge::info))
+            .route("/query", post(bridge::query))
+            .route("/count", post(bridge::count))
+            .route("/events", post(bridge::events));
+    }
+    app = app
+        .layer(axum::extract::DefaultBodyLimit::max(bridge_body_limit))
+        // The bridge reads request bodies (filters and signed events): a
+        // trickling POST must not pin a connection past the configured HTTP
+        // deadline.
+        .layer(axum::middleware::from_fn(move |request, next| async move {
+            body_read_timeout_middleware(request, next, body_read_timeout, bridge_body_limit).await
+        }))
         .nest("/api/v1", api_routes);
     // In `inbox-outbox` mode the root is not a WebSocket endpoint: it only
     // answers the Blossom server-info document on the Blossom host (every
@@ -578,7 +604,13 @@ fn host_route_allowed(
     // reach the management API).
     let root_read = matches!(*method, axum::http::Method::GET | axum::http::Method::HEAD);
     let blossom_path = blossom::is_blossom_path(path) || (is_blossom && path == "/" && root_read);
-    (is_api && api_path) || (is_blossom && blossom_path) || (is_relay && !api_path && !blossom_path)
+    // Buzz uploads and renders media on the relay origin. Those two paths
+    // are served by the same Blossom router, so let them through the relay
+    // branch of the split while the dedicated media host keeps its full set.
+    let relay_media = is_relay && blossom::is_relay_media_alias(path, method);
+    (is_api && api_path)
+        || (is_blossom && blossom_path)
+        || (is_relay && !api_path && (!blossom_path || relay_media))
 }
 
 /// Restores the persisted NIP-29 group state at startup, comparing the
@@ -826,6 +858,20 @@ async fn restore_role_state(relay: &Relay) -> Result<()> {
     // holds the restored/rebuilt state, so the republished events reflect
     // the state the relay is about to serve.
     relay.heal_rotated_role_state().await;
+    // Republish the NIP-43 roster on every start: it carries the relay's own
+    // owner identities (NIP-11 pubkey/self and the NIP-86 admin) and, on a
+    // closed relay, the allowlist. Without this an open relay has no 13534 at
+    // all, and a list edited while the daemon was down is stale.
+    if relay.relay_pubkey().is_some() && relay.config.read().await.nip_enabled(43) {
+        if !relay.publish_membership(None).await {
+            warn!("could not republish the NIP-43 membership list");
+        }
+        // Storing the 13534 event advances the role-state sequence. Persist
+        // the role snapshot afterwards so the next startup can restore it
+        // instead of rebuilding every time (the snapshot would otherwise
+        // always predate this publish).
+        relay.persist_roles().await;
+    }
     Ok(())
 }
 
@@ -922,6 +968,17 @@ pub async fn run_server(
     // migration only when nothing usable was ever persisted (see
     // [`restore_role_state`]).
     restore_role_state(&relay).await?;
+
+    // NIP-IA: NIP-IA-aware clients (Buzz) treat a missing archived-identities
+    // snapshot as an uncheckable archive state. nostrfy has no archive store
+    // yet, so publish the empty relay-signed snapshot: a truthful "nothing is
+    // archived here" that clients can verify against NIP-11 `self`.
+    if relay.config.read().await.relay.enabled_buzz
+        && relay.relay_pubkey().is_some()
+        && !relay.publish_archive_snapshot().await
+    {
+        warn!("could not publish the NIP-IA archived-identities snapshot");
+    }
 
     let blossom_state = blossom::build_state(&relay.config.read().await.clone(), &relay).await?;
     *relay.blossom.write().await = blossom_state.clone();
@@ -2829,6 +2886,17 @@ async fn handle_reload(
     // live in the database: re-read them on every reload (a failed load
     // keeps the previous lists — see `Relay::reload_db_state`).
     relay.reload_db_state().await;
+    // Republish 13534 after a CLI allow/deny or a config reload so
+    // Buzz-style clients see the new allowlist and owner identities without
+    // a restart.
+    if relay.relay_pubkey().is_some() && relay.config.read().await.nip_enabled(43) {
+        if !relay.publish_membership(None).await {
+            warn!("could not republish the NIP-43 membership list after reload");
+        }
+        // The publish advanced the role-state sequence; persist the snapshot
+        // so the next startup does not discard it as stale.
+        relay.persist_roles().await;
+    }
     relocated_pid
 }
 
@@ -6559,6 +6627,33 @@ mod tests {
             "media.test",
             "media.test",
             "/ws",
+            &axum::http::Method::GET
+        ));
+        // Buzz's bridge endpoints are relay paths, not Blossom blobs, and
+        // must stay reachable when a media host is configured.
+        for path in ["/info", "/query", "/events", "/count"] {
+            let method = if path == "/info" {
+                axum::http::Method::GET
+            } else {
+                axum::http::Method::POST
+            };
+            assert!(
+                host_route_allowed("", "media.test", "relay.example.com", path, &method),
+                "{path} must stay on the relay host"
+            );
+        }
+        assert!(host_route_allowed(
+            "",
+            "media.test",
+            "relay.example.com",
+            "/media/upload",
+            &axum::http::Method::PUT
+        ));
+        assert!(host_route_allowed(
+            "",
+            "media.test",
+            "relay.example.com",
+            &format!("/media/{sha}.png"),
             &axum::http::Method::GET
         ));
         // api + blossom: each host serves only its own paths.

@@ -22,6 +22,7 @@ pub mod nip77;
 pub mod nip78;
 pub mod nip86;
 pub mod nip98;
+pub mod nip_ia;
 
 /// Registry of Nostr Improvement Proposals.
 ///

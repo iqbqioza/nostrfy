@@ -1,0 +1,150 @@
+# Using the Buzz desktop app with nostrfy
+
+[Buzz](https://buzz.xyz) is a Nostr client built around NIP-29 relay groups.
+It uses the WebSocket relay for live traffic and a NIP-98-authenticated HTTP
+bridge for its read models and writes. nostrfy implements that bridge and the
+channel extensions Buzz relies on, so a stock Buzz desktop app can add a
+nostrfy relay as a community.
+
+## Requirements
+
+- Enable the compatibility layer: set `relay.enabled_buzz = true` (default
+  `false`). Without it the `/info`, `/query`, `/events` and `/count` bridge
+  routes are not served, so a stock Buzz client cannot use the relay.
+- A relay signing key: set `relay.private_key` (64 hex chars, generated with
+  `nostrfy genkey`). Buzz needs the relay's `kind:39000` metadata, system
+  messages and membership notices, all signed by this key.
+- A public URL that matches the URL clients use:
+  `relay.public_url = "wss://relay.example.com"`. NIP-98 and NIP-42 compare
+  the exact URL, so a mismatch fails auth.
+- Media uploads (avatars, attachments): a Blossom backend. Set
+  `[blossom]` `host`, `storage` and either `local_path` or the S3 keys. Buzz
+  uploads to the relay origin and nostrfy serves the same store at
+  `/media/...` as well as on the dedicated media host.
+
+## Adding the community in Buzz
+
+1. In Buzz, choose **Add community → Join an existing community**.
+2. Enter the relay's `wss://` URL (or its `https://` URL; Buzz normalizes it).
+3. Buzz probes `GET /info` and, when NIP-43 is advertised, checks that your
+   pubkey is on the relay's membership list.
+
+An **open** nostrfy relay does not advertise NIP-43, so Buzz treats it as an
+open community and lets any identity join. A **closed** relay
+(`access.restrict_relay = true`, i.e. the allowlist is enforced) advertises
+NIP-43 and includes the allowlisted pubkeys in its `kind:13534` membership
+list. Use `advertise_nip43 = true` only for a role-managed relay that wants
+Buzz to gate onboarding without an allowlist.
+
+The `kind:13534` membership list always gives the `owner` role to the
+relay's NIP-11 `pubkey` (`relay.pubkey`) and to `rpc.admin_pubkey`, so
+Buzz's community-members panel shows the operator as the owner instead of
+an absent or plain member. The relay's signing key (`relay.private_key`,
+NIP-11 `self`) is not added: it is the event signer, not an administrator
+identity.
+
+## HTTP bridge
+
+| Endpoint | Auth | Purpose |
+| --- | --- | --- |
+| `GET /info` | none | NIP-11 relay information document |
+| `POST /query` | NIP-98 | One-shot filters; returns a flat JSON array of events |
+| `POST /events` | NIP-98 | Publish one signed event |
+| `POST /count` | NIP-98 | NIP-45-style count for the supplied filters |
+
+`POST /query`, `/events` and `/count` require the NIP-98 `payload` tag with
+the SHA-256 of the exact request body, and every authorization is single-use
+(the shared replay guard).
+
+Bridge filters accept Buzz's extension fields in addition to NIP-01:
+
+- `until` + `before_id` — the composite `(created_at, event_id)` cursor used
+  by `get_channel_messages_before`; `before_id` without `until` is rejected.
+- `top_level`, `include_aux`, `include_summaries` — NIP-CW channel windows.
+  A served window returns the rows, the aux closure, relay-signed `kind:39005`
+  thread summaries, and exactly one relay-signed `kind:39006` bounds event.
+- `depth_limit` (+ optional `thread_cursor` / `thread_cursor_id`) — the legacy
+  thread-subtree path used by the thread panel.
+
+`/query` applies the same visibility rules as an authenticated WebSocket
+connection: NIP-70 protected events, NIP-59 gift-wrap recipients, NIP-78
+owner-only state, NIP-29 private/hidden groups, and per-pubkey state
+(`kind:44100`/`44101` membership notices and `kind:30622` DM visibility
+snapshots).
+
+## NIP-29 channel metadata
+
+Buzz and NIP-CL use tags that plain NIP-29 does not define. nostrfy accepts
+and publishes them:
+
+- `kind:9007` / `9002`: `visibility` (`open`/`private`), `channel_type`
+  (`stream`, `forum`, `dm`, `workflow`, `system`), `t` labels, `ttl`, `topic`,
+  `purpose`, `archived` and `join_role`.
+- `kind:39000` also carries `t` (type, then labels), `P` (creator) and
+  `created_at`; `39001`/`39002` carry the same identity tags.
+- `private` implies member-only writes (Buzz's channel model). A DM or system
+  channel is private unless the create event says `visibility=open`.
+- Metadata edits are **partial**: a `9002` without a tag leaves that setting
+  unchanged; `["visibility","open"]`, an empty string or `["ttl",""]` clears
+  the corresponding value. This follows NIP-CL/Buzz; plain NIP-29 clients that
+  send every field still work.
+
+## Relay-signed Buzz events
+
+- `kind:40099` — channel timeline system messages (`channel_created`,
+  `member_joined`, `member_left`, `member_removed`).
+- `kind:44100` / `44101` — membership notices with `p` (target), `h`
+  (channel) and `t` (channel type). Stored globally, read-gated by `p`.
+- `kind:30622` — NIP-DV per-viewer hidden-DM snapshot, published by
+  `kind:41012` (hide) and a re-open `kind:41010`.
+- `kind:41010` / `41012` — Buzz DM open/hide commands. The relay derives a
+  deterministic DM channel id from the sorted participant pubkeys, creates a
+  private/hidden NIP-29 group, and answers the open command with
+  `response:{"channel_id":"..."}` in the OK message.
+
+Client submissions of the relay-signed kinds above (`40099`, `44100`/
+`44101`, `30622`, and the query-time `39005`/`39006` overlays) are rejected.
+`41010`/`41012` are client commands: they are accepted, applied to the
+derived group state, and never stored as ordinary events.
+
+## Media
+
+Image attachments are accepted only when the relay has a Blossom server
+(`[blossom] host` and storage): a message carrying a NIP-92 `imeta` tag with
+an `image/…` MIME is rejected with `blocked: image attachments require a
+configured Blossom server` when Blossom is disabled. Profile pictures and
+other external image URLs are not `imeta` attachments and stay accepted.
+
+When Blossom is configured, the relay origin serves:
+
+- `PUT /media/upload` (and the standard `PUT /upload` on the media host)
+- `GET /media/{sha256}.{ext}` and `HEAD`
+
+The BUD-11 `server` tag may name either the Blossom host or the relay's public
+host, because Buzz signs the relay URL it uploads to.
+
+## Known gaps
+
+- NIP-IA archive/unarchive requests (`kind:9035`/`9036`) are not accepted
+  yet. The relay does publish the required empty `kind:13535` archived-
+  identities snapshot on startup, so Buzz's archive-state check completes
+  with "nothing archived" instead of failing.
+- Channel `ttl` is published but stored messages are not automatically
+  expired server-side; clients that set NIP-40 `expiration` get normal expiry.
+- NIP-CL's system-channel exclusion is applied to the HTTP bridge; a global
+  WebSocket subscription can still receive a system channel's relay-signed
+  state unless it names the channel.
+- Buzz's relay-member management commands (`kind:9030`-`9032`) are not wired
+  to nostrfy's access lists; manage an allowlist relay with `nostrfy relay
+  allow/deny` or NIP-86 instead. Channel member management (`kind:9000`/
+  `9001`) and the member UI do work.
+- Buzz's workspace-profile command (`kind:9033`) is stored as an ordinary
+  event but does not update the NIP-11 `icon`; set `relay.icon` in the
+  configuration instead.
+- A `kind:39005` summary's `reply_count` counts direct replies and
+  `descendant_count` currently carries the same value; fully nested reply
+  trees are not walked when synthesising the overlay.
+- Buzz's push leases, workflow commands, moderation commands and
+  hosted-community APIs are not part of this bridge.
+- NIP-34 git events (used by Buzz Projects) are rejected unless
+  `relay.enabled_git = true`.

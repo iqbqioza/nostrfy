@@ -7,38 +7,104 @@ use crate::event::Event;
 
 use super::{
     D, GROUP_ADMINS, GROUP_MEMBERS, GROUP_META, GROUP_PARTICIPANTS, GROUP_PINS, GROUP_ROLES, Group,
-    GroupSettings, H, P,
+    H, P,
 };
+/// Applies a kind:9007/9002 metadata event as a **partial update**.
+///
+/// NIP-29 clients that Buzz interoperates with (and Buzz itself) send only
+/// the fields they intend to change; replacing the whole settings object on
+/// every edit would silently clear an unrelated `private` flag when a client
+/// renames a channel. An absent tag therefore leaves the setting untouched;
+/// an explicit empty value clears a string/optional field.
 pub(crate) fn apply_settings(group: &mut Group, event: &Event) {
-    let mut settings = GroupSettings::default();
     for tag in &event.tags {
         if tag.is_empty() {
             continue;
         }
+        let value = tag.get(1).map(String::as_str);
         match tag[0].as_str() {
             "name" | "picture" | "banner" | "about" => {
-                if let Some(value) = tag.get(1) {
+                if let Some(value) = value {
                     match tag[0].as_str() {
-                        "name" => settings.name = value.clone(),
-                        "picture" => settings.picture = value.clone(),
-                        "banner" => settings.banner = value.clone(),
-                        _ => settings.about = value.clone(),
+                        "name" => group.settings.name = value.to_string(),
+                        "picture" => group.settings.picture = value.to_string(),
+                        "banner" => group.settings.banner = value.to_string(),
+                        _ => group.settings.about = value.to_string(),
                     }
                 }
             }
-            "private" => settings.private = true,
-            "restricted" => settings.restricted = true,
-            "closed" => settings.closed = true,
-            "hidden" => settings.hidden = true,
-            "livekit" => settings.livekit = true,
+            "topic" => group.settings.topic = value.filter(|v| !v.is_empty()).map(str::to_string),
+            "purpose" => {
+                group.settings.purpose = value.filter(|v| !v.is_empty()).map(str::to_string)
+            }
+            "ttl" => {
+                group.settings.ttl = value
+                    .filter(|v| !v.is_empty())
+                    .and_then(|v| v.parse::<u64>().ok())
+            }
+            "archived" => group.settings.archived = value != Some("false") && value != Some("0"),
+            "join_role" => {
+                group.settings.join_role = value.filter(|v| !v.is_empty()).map(str::to_string)
+            }
+            // NIP-CL: `visibility` is the Buzz spelling of the NIP-29
+            // private flag; `public` is its explicit inverse.
+            "visibility" => match value {
+                Some("private") => {
+                    group.settings.private = true;
+                    // Buzz's private channels are member-only for writes and
+                    // joins as well as reads; NIP-CL has no separate flags.
+                    group.settings.restricted = true;
+                    group.settings.closed = true;
+                }
+                Some("open" | "public") => {
+                    group.settings.private = false;
+                    group.settings.restricted = false;
+                    group.settings.closed = false;
+                }
+                _ => {}
+            },
+            "private" => group.settings.private = true,
+            "public" => group.settings.private = false,
+            "restricted" => {
+                group.settings.restricted = value != Some("false") && value != Some("0")
+            }
+            "closed" => group.settings.closed = value != Some("false") && value != Some("0"),
+            "hidden" => group.settings.hidden = value != Some("false") && value != Some("0"),
+            "livekit" => group.settings.livekit = value != Some("false") && value != Some("0"),
             "supported_kinds" => {
-                settings.supported_kinds =
+                group.settings.supported_kinds =
                     Some(tag[1..].iter().filter_map(|k| k.parse().ok()).collect())
             }
+            // NIP-CL labels: `t` tags replace the whole label set. `["t",""]`
+            // alone clears it; a 9002 without `t` leaves it unchanged.
+            "t" => {}
             _ => {}
         }
     }
-    group.settings = settings;
+    // NIP-CL announce channels: `join_role=guest` means only members (and
+    // guests are read-only) may post, which NIP-29 expresses as
+    // `restricted`. Changing it back to `member` clears the flag unless the
+    // channel is private for another reason.
+    if let Some(role) = &group.settings.join_role {
+        if role == "member" {
+            if !group.settings.private {
+                group.settings.restricted = false;
+            }
+        } else {
+            group.settings.restricted = true;
+        }
+    }
+    // Labels are group-level (the channel type never changes); handle them
+    // once after the field loop. Only a 9002/9007 that actually carries `t`
+    // tags replaces the set.
+    if event
+        .tags
+        .iter()
+        .any(|tag| tag.first().is_some_and(|t| t == "t"))
+    {
+        group.labels = super::label_values(event);
+        group.labels.retain(|label| !label.is_empty());
+    }
 }
 
 pub(crate) fn base_event(kind: u64, gid: &str, relay_pubkey: &str, now: u64) -> Event {
@@ -74,8 +140,26 @@ pub(crate) fn build_meta_event(
             event.tags.push(vec![name.to_string(), value.clone()]);
         }
     }
+    if let Some(topic) = &s.topic {
+        event.tags.push(vec!["topic".to_string(), topic.clone()]);
+    }
+    if let Some(purpose) = &s.purpose {
+        event
+            .tags
+            .push(vec!["purpose".to_string(), purpose.clone()]);
+    }
+    if let Some(ttl) = s.ttl {
+        event.tags.push(vec!["ttl".to_string(), ttl.to_string()]);
+    }
+    if s.archived {
+        event
+            .tags
+            .push(vec!["archived".to_string(), "true".to_string()]);
+    }
     if s.private {
         event.tags.push(vec!["private".to_string()]);
+    } else {
+        event.tags.push(vec!["public".to_string()]);
     }
     if s.restricted {
         event.tags.push(vec!["restricted".into()]);
@@ -89,10 +173,26 @@ pub(crate) fn build_meta_event(
     if s.livekit {
         event.tags.push(vec!["livekit".into()]);
     }
+    if let Some(join_role) = &s.join_role {
+        event
+            .tags
+            .push(vec!["join_role".to_string(), join_role.clone()]);
+    }
     if let Some(kinds) = &s.supported_kinds {
         let mut tag = vec!["supported_kinds".to_string()];
         tag.extend(kinds.iter().map(u64::to_string));
         event.tags.push(tag);
+    }
+    super::push_channel_identity_tags(&mut event, Some(group), true);
+    // Buzz reads a DM's participants from the lowercase `p` tags on its
+    // kind:39000 (the kind:39002 roster is a separate query). Only DMs pay
+    // this cost, and their participant set is bounded at 64 keys.
+    if group.channel_type == "dm" {
+        let mut members: Vec<&String> = group.members.keys().collect();
+        members.sort();
+        for member in members {
+            event.tags.push(vec![P.to_string(), member.clone()]);
+        }
     }
     if let Some(parent) = &group.parent {
         event.tags.push(vec!["parent".to_string(), parent.clone()]);
@@ -110,6 +210,7 @@ pub(crate) fn build_admins_event(
     now: u64,
 ) -> Event {
     let mut event = base_event(GROUP_ADMINS, gid, relay_pubkey, now);
+    super::push_channel_identity_tags(&mut event, group, false);
     if let Some(group) = group {
         let mut admins: Vec<(String, Vec<String>)> = group
             .members
@@ -141,11 +242,47 @@ pub(crate) fn build_members_event(
     now: u64,
 ) -> Event {
     let mut event = base_event(GROUP_MEMBERS, gid, relay_pubkey, now);
+    super::push_channel_identity_tags(&mut event, group, false);
     if let Some(group) = group {
         let mut members: Vec<String> = group.members.keys().cloned().collect();
         members.sort();
         for pk in members {
-            event.tags.push(vec![P.to_string(), pk]);
+            // Buzz reads a member's role from the fourth element of the
+            // `p` tag (`["p", pubkey, relay_url, role]`, NIP-29's
+            // convention). Without it every member, including an admin,
+            // defaults to `member`, and Buzz reports that the member list
+            // and role list disagree. Keep the relay URL empty because the
+            // event is signed by this relay.
+            let role = if group.guests.contains(&pk) {
+                "guest".to_string()
+            } else {
+                group
+                    .members
+                    .get(&pk)
+                    .map(|roles| {
+                        // Prefer the role names Buzz understands; an
+                        // arbitrary NIP-29 role is still published verbatim
+                        // (and is listed by kind:39003, so the two stay
+                        // consistent).
+                        if roles.contains("owner") {
+                            "owner".to_string()
+                        } else if roles.contains("admin") {
+                            "admin".to_string()
+                        } else if roles.contains("bot") {
+                            "bot".to_string()
+                        } else {
+                            roles
+                                .iter()
+                                .min()
+                                .cloned()
+                                .unwrap_or_else(|| "member".to_string())
+                        }
+                    })
+                    .unwrap_or_else(|| "member".to_string())
+            };
+            event
+                .tags
+                .push(vec![P.to_string(), pk, String::new(), role]);
         }
     }
     event
@@ -207,6 +344,69 @@ pub(crate) fn build_participants_event(
             .push(vec!["participant".to_string(), pubkey.clone()]);
     }
     event
+}
+
+/// Buzz `kind:40099` system message. Stored channel-scoped (it carries `h`),
+/// so it appears in the channel timeline as a relay-signed row.
+pub(crate) fn build_system_message(
+    gid: &str,
+    actor: &str,
+    target: Option<&str>,
+    message_type: &str,
+    relay_pubkey: &str,
+    now: u64,
+) -> Event {
+    let mut content = serde_json::Map::new();
+    content.insert("type".into(), serde_json::json!(message_type));
+    content.insert("actor".into(), serde_json::json!(actor));
+    if let Some(target) = target {
+        content.insert("target".into(), serde_json::json!(target));
+    }
+    Event {
+        id: String::new(),
+        pubkey: relay_pubkey.to_string(),
+        created_at: now,
+        kind: super::SYSTEM_MESSAGE,
+        tags: vec![vec![H.to_string(), gid.to_string()]],
+        content: serde_json::Value::Object(content).to_string(),
+        sig: String::new(),
+    }
+}
+
+/// Buzz `kind:44100`/`44101` membership notification. It carries the channel
+/// `h` tag for context but is stored community-globally by the relay.
+pub(crate) fn build_membership_notice(
+    kind: u64,
+    gid: &str,
+    channel_type: &str,
+    target: &str,
+    actor: &str,
+    relay_pubkey: &str,
+    now: u64,
+) -> Event {
+    let message_type = if kind == super::MEMBER_ADDED {
+        "member_added"
+    } else {
+        "member_removed"
+    };
+    let content = serde_json::json!({
+        "type": message_type,
+        "channel_id": gid,
+        "actor": actor,
+    });
+    Event {
+        id: String::new(),
+        pubkey: relay_pubkey.to_string(),
+        created_at: now,
+        kind,
+        tags: vec![
+            vec![P.to_string(), target.to_string()],
+            vec![H.to_string(), gid.to_string()],
+            vec!["t".to_string(), channel_type.to_string()],
+        ],
+        content: content.to_string(),
+        sig: String::new(),
+    }
 }
 
 pub(crate) fn build_put_user(
@@ -323,16 +523,21 @@ mod tests {
         assert_eq!(admin_tags[1][1], "mod1");
         assert_eq!(admin_tags[1][2], "mod");
 
-        // Members: everyone, plain p tags, sorted.
+        // Members: everyone, with Buzz's `["p", pubkey, "", role]` shape.
         let members = build_members_event("g1", Some(&group), "relay", now);
         assert_eq!(members.kind, GROUP_MEMBERS);
-        let member_tags: Vec<&String> = members
-            .tags
-            .iter()
-            .filter(|t| t[0] == P)
-            .map(|t| &t[1])
-            .collect();
-        assert_eq!(member_tags, vec!["admin1", "member1", "mod1"]);
+        let member_tags: Vec<&Vec<String>> = members.tags.iter().filter(|t| t[0] == P).collect();
+        assert_eq!(member_tags.len(), 3);
+        assert_eq!(member_tags[0][1], "admin1");
+        assert_eq!(member_tags[0][3], "admin");
+        assert_eq!(member_tags[1][1], "member1");
+        assert_eq!(member_tags[1][3], "member");
+        assert_eq!(member_tags[2][1], "mod1");
+        assert_eq!(member_tags[2][3], "mod");
+        assert!(
+            member_tags.iter().all(|t| t[2].is_empty()),
+            "the relay URL is implicit and must stay empty"
+        );
 
         // Pins.
         let pins = build_pins_event("g1", Some(&group), "relay", now);
@@ -374,14 +579,34 @@ mod tests {
     }
 
     #[test]
-    fn apply_settings_replaces_entire_settings() {
+    fn members_event_carries_the_guest_role() {
+        let mut group = group_with_members();
+        group.members.insert("guest1".into(), Default::default());
+        group.guests.insert("guest1".into());
+        let members = build_members_event("g1", Some(&group), "relay", 1);
+        assert!(
+            members.tags.iter().any(|t| t
+                == &vec![
+                    P.to_string(),
+                    "guest1".to_string(),
+                    String::new(),
+                    "guest".to_string()
+                ]),
+            "a read-only guest must not be reported as a plain member"
+        );
+    }
+
+    #[test]
+    fn apply_settings_updates_only_present_fields() {
         let mut group = Group::default();
         group.settings.name = "old".into();
+        group.settings.closed = true;
         let mut edit = base_event(9002, "g1", "relay", 1);
         edit.tags[0] = vec![H.to_string(), "g1".into()];
         edit.tags
             .push(vec!["name".to_string(), "new name".to_string()]);
-        edit.tags.push(vec!["private".to_string()]);
+        edit.tags
+            .push(vec!["visibility".to_string(), "private".to_string()]);
         edit.tags
             .push(vec!["supported_kinds".to_string(), "30023".to_string()]);
         edit.tags.push(vec![
@@ -392,8 +617,16 @@ mod tests {
         apply_settings(&mut group, &edit);
         assert_eq!(group.settings.name, "new name");
         assert!(group.settings.private);
-        // The old settings are gone (replacement semantics).
-        assert!(!group.settings.closed);
+        // Absent fields are left alone (Buzz/NIP-CL partial updates).
+        assert!(group.settings.closed);
         assert_eq!(group.settings.supported_kinds, Some(vec![30023]));
+
+        // An explicit visibility=open clears the private flag.
+        let mut open = base_event(9002, "g1", "relay", 2);
+        open.tags[0] = vec![H.to_string(), "g1".into()];
+        open.tags
+            .push(vec!["visibility".to_string(), "open".to_string()]);
+        apply_settings(&mut group, &open);
+        assert!(!group.settings.private);
     }
 }
