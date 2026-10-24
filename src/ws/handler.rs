@@ -688,10 +688,20 @@ impl super::Conn {
         // same-second page would answer with nothing while matching events
         // exist. The tie block is delivered whole instead, and the `more`
         // hint still reports the discarded excess.
-        let page_capacity = limits.iter().copied().min().unwrap_or(0);
+        // `limit: 0` is a quota of zero, not a signal to disable the
+        // guard: including it made `page_capacity` zero, so the tie-drop
+        // condition was always true and a page with a visible event plus a
+        // zero-limit filter could be emptied entirely.
+        let page_capacity = limits
+            .iter()
+            .copied()
+            .filter(|limit| *limit > 0)
+            .min()
+            .unwrap_or(0);
         let mut tie_truncated = false;
         if !search_ordered
             && (more || truncated)
+            && page_capacity > 0
             && kept.len() >= page_capacity
             && !kept.is_empty()
             && kept
@@ -1266,6 +1276,18 @@ impl super::Conn {
         let verdict = self.read_verdict(&access, &cfg.relay.pubkey);
         self.access_allowed_cache = verdict;
         verdict
+    }
+
+    /// Re-applies the read-authorization gates to already-open live
+    /// subscriptions. Called when access-control state or `require_auth`
+    /// changes, so a subscriber that becomes unauthorized receives CLOSED
+    /// immediately instead of waiting for the next matching event.
+    pub(crate) async fn enforce_read_authorization(&mut self) {
+        if !self.access_allows_read().await {
+            self.close_all_subs("restricted: you are not allowed to subscribe");
+        } else if self.require_auth && !self.is_authed() {
+            self.close_all_subs("auth-required: please authenticate before subscribing");
+        }
     }
 
     /// The access-list verdict for this connection: the deny list gates
