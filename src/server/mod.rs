@@ -709,7 +709,9 @@ async fn rebuild_group_state(relay: &Relay, groups_enabled: bool) -> Result<()> 
         // `unrestored`, and group writes are rejected; the operator can
         // repair the history and restart.
         let mut groups = relay.groups.write().await;
+        let buzz_enabled = groups.buzz_enabled;
         *groups = crate::nips::nip29::GroupStore::default();
+        groups.buzz_enabled = buzz_enabled;
         groups.mark_unrestored();
         drop(groups);
         log::error!(
@@ -2969,6 +2971,10 @@ async fn apply_reloaded_config(
                 != new_config.relay.livekit_participants_interval_secs,
         ),
         (
+            "relay.enabled_buzz",
+            old.relay.enabled_buzz != new_config.relay.enabled_buzz,
+        ),
+        (
             "relay.enabled_nips",
             old.relay.enabled_nips != new_config.relay.enabled_nips,
         ),
@@ -3179,6 +3185,10 @@ async fn apply_reloaded_config(
     new_config.server.metrics_enabled = old.server.metrics_enabled;
     new_config.rpc.max_admin_body_bytes = old.rpc.max_admin_body_bytes;
     new_config.relay.private_key = old.relay.private_key.clone();
+    // `enabled_buzz` shapes the router (bridge routes) and the NIP-11
+    // extension list, so it is startup-only; a reload must not half-apply it
+    // while the old routes stay mounted.
+    new_config.relay.enabled_buzz = old.relay.enabled_buzz;
     new_config.relay.livekit_url = old.relay.livekit_url.clone();
     new_config.relay.livekit_api_key = old.relay.livekit_api_key.clone();
     new_config.relay.livekit_api_secret = old.relay.livekit_api_secret.clone();

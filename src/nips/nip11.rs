@@ -507,3 +507,28 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod buzz_extension_tests {
+    use super::*;
+
+    #[test]
+    fn buzz_extensions_require_enabled_buzz() {
+        let mut cfg = Config::default();
+        cfg.relay.private_key = "11".repeat(32);
+        let stats = Stats::new();
+        let access = AccessControl::default();
+        let info = relay_info(&cfg, &access, &stats, None);
+        assert!(
+            info.get("supported_extensions").is_none(),
+            "NIP-CL/NIP-CW must not be advertised while Buzz is disabled"
+        );
+        cfg.relay.enabled_buzz = true;
+        let info = relay_info(&cfg, &access, &stats, None);
+        assert_eq!(
+            info["supported_extensions"],
+            json!(["nip-cl", "nip-cw"]),
+            "enabled Buzz must advertise its channel extensions"
+        );
+    }
+}

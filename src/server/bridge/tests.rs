@@ -380,6 +380,58 @@ async fn top_level_window_excludes_replies_and_emits_bounds() {
 }
 
 #[tokio::test]
+async fn forged_dm_open_is_rejected_before_creating_a_dm() {
+    let relay = test_relay().await;
+    let app = super::super::build_router(&relay, None).await;
+    let keypair = Keypair::from_secret_bytes([11u8; 32]).unwrap();
+    let other =
+        secp256k1::XOnlyPublicKey::from_keypair(&Keypair::from_secret_bytes([12u8; 32]).unwrap())
+            .0
+            .to_string();
+    let origin = origin(&relay).await;
+
+    let mut open = signed(
+        &keypair,
+        41010,
+        vec![vec!["p".into(), other]],
+        "",
+        crate::util::unix_now(),
+    );
+    // The NIP-98 header authenticates the signer, not the event signature.
+    // A forged event must still go through precheck before the relay runs
+    // the DM command (which mutates group state).
+    open.sig = "ff".repeat(64);
+    let body = serde_json::to_vec(&open).unwrap();
+    let auth = nip98(&keypair, &origin, "/events", "POST", &body, 1);
+    let response = app
+        .clone()
+        .oneshot(request(Method::POST, "/events", Some(&auth), body))
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_REQUEST,
+        "a forged DM command must be rejected"
+    );
+
+    // No DM group was created as a side effect.
+    let filter = json!([{ "kinds": [39000], "#t": ["dm"], "limit": 10 }]);
+    let body = serde_json::to_vec(&filter).unwrap();
+    let auth = nip98(&keypair, &origin, "/query", "POST", &body, 2);
+    let response = app
+        .clone()
+        .oneshot(request(Method::POST, "/query", Some(&auth), body))
+        .await
+        .unwrap();
+    let events = body_json(response).await;
+    assert!(
+        events.as_array().unwrap().is_empty(),
+        "a rejected DM command must not leave a DM group behind: {events}"
+    );
+    relay.db.shutdown();
+}
+
+#[tokio::test]
 async fn buzz_dm_open_and_hide_publish_group_and_visibility() {
     let relay = test_relay().await;
     let app = super::super::build_router(&relay, None).await;

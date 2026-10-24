@@ -1589,6 +1589,7 @@ async fn groups_rebuild_worker(
                 )
             };
             let mut fresh = GroupStore::with_cap(cap);
+            fresh.buzz_enabled = groups.read().await.buzz_enabled;
             // The scan must not outlive a shutdown: abort it at its next
             // await (a page query) and keep the state pending. The fresh
             // store is local and was never swapped in, so the live store
@@ -2173,6 +2174,12 @@ impl Relay {
                 std::process::exit(1);
             }
         };
+        let groups = {
+            let cfg = config.read().await;
+            let mut groups = GroupStore::with_cap(cfg.relay.max_groups);
+            groups.buzz_enabled = cfg.relay.enabled_buzz;
+            groups
+        };
         Relay {
             config: Arc::clone(&config),
             access: Arc::new(RwLock::new(access)),
@@ -2187,9 +2194,7 @@ impl Relay {
             live_rx: Some(live_rx),
             live_batch_interval_ms,
             live_batch_size,
-            groups: Arc::new(RwLock::new(GroupStore::with_cap(
-                config.read().await.relay.max_groups,
-            ))),
+            groups: Arc::new(RwLock::new(groups)),
             groups_rebuild: std::sync::Arc::new(GroupsRebuild::default()),
             startup_group_recovery: std::sync::atomic::AtomicBool::new(false),
             roles: Arc::new(RwLock::new(RoleStore::default())),
@@ -2831,23 +2836,53 @@ impl Relay {
         known_prefixes: Option<&crate::relay::validate::KnownPrevious<'_>>,
         verified: Option<bool>,
     ) -> PutOutcome {
-        // Buzz DM commands are relay-handled: they mutate derived group
-        // state and answer with a command response, but must not be stored
-        // as ordinary events.
-        if event.kind == crate::nips::nip29::DM_OPEN {
-            return self.handle_dm_open(&event, authed).await;
-        }
-        if event.kind == crate::nips::nip29::DM_HIDE {
-            return self.handle_dm_hide(&event, authed).await;
-        }
         let now = unix_now();
         let cfg = self.config.read().await;
         let access = self.access.read().await;
-
-        match self
+        let dm_command = matches!(
+            event.kind,
+            crate::nips::nip29::DM_OPEN | crate::nips::nip29::DM_HIDE
+        );
+        let verdict = self
             .precheck(&cfg, &access, &event, now, authed, known_prefixes, verified)
-            .await
-        {
+            .await;
+        if dm_command {
+            // Buzz DM commands are relay-handled: they mutate derived group
+            // state and answer with a command response, but must not be
+            // stored as ordinary events. They go through the normal precheck
+            // first: an invalid signature, a blocked kind, PoW, tag limits
+            // or a future timestamp must never create or hide a DM.
+            match verdict {
+                crate::relay::validate::Precheck::Accept => {}
+                crate::relay::validate::Precheck::Reject(reason) => {
+                    self.stats.bump(&self.stats.events_rejected, 1);
+                    return PutOutcome::Invalid(reason);
+                }
+                crate::relay::validate::Precheck::Duplicate(msg) => {
+                    self.stats.bump(&self.stats.events_duplicate, 1);
+                    return PutOutcome::Invalid(msg);
+                }
+                crate::relay::validate::Precheck::Admit(msg) => {
+                    return PutOutcome::Invalid(msg);
+                }
+                crate::relay::validate::Precheck::Vanish => {
+                    return PutOutcome::Invalid(
+                        "blocked: a DM command cannot be a vanish request".into(),
+                    );
+                }
+            }
+            // Drop the config/access guards before the handler takes them
+            // again.
+            drop(cfg);
+            drop(access);
+            return if event.kind == crate::nips::nip29::DM_OPEN {
+                self.handle_dm_open(&event, authed).await
+            } else {
+                self.handle_dm_hide(&event, authed).await
+            };
+        }
+
+        match verdict {
             crate::relay::validate::Precheck::Reject(reason) => {
                 self.stats.bump(&self.stats.events_rejected, 1);
                 return PutOutcome::Invalid(reason);

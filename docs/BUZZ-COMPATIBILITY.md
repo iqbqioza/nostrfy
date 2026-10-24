@@ -11,6 +11,13 @@ nostrfy relay as a community.
 - Enable the compatibility layer: set `relay.enabled_buzz = true` (default
   `false`). Without it the `/info`, `/query`, `/events` and `/count` bridge
   routes are not served, so a stock Buzz client cannot use the relay.
+  `enabled_buzz` is read at startup; changing it requires a restart.
+
+With `enabled_buzz = false` the relay keeps the pre-Buzz NIP-29 behavior:
+`9002` replaces the whole group metadata (Buzz mode makes it a partial
+update), `39002` carries bare `p` tags, the creator is the `admin` role,
+and NIP-CL channel tags/guests/bots are ignored. This keeps ordinary
+NIP-29 clients unaffected by the compatibility layer.
 - A relay signing key: set `relay.private_key` (64 hex chars, generated with
   `nostrfy genkey`). Buzz needs the relay's `kind:39000` metadata, system
   messages and membership notices, all signed by this key.
@@ -144,6 +151,22 @@ host, because Buzz signs the relay URL it uploads to.
 - A `kind:39005` summary's `reply_count` counts direct replies and
   `descendant_count` currently carries the same value; fully nested reply
   trees are not walked when synthesising the overlay.
+- DM groups are derived state backed by the group snapshot: the synthetic
+  `9007`/`9000` are not stored, so a full group-state rebuild from events
+  (after a dropped snapshot, not an ordinary restart) does not recreate a
+  DM channel. Hidden-DM sets are snapshot-backed for the same reason.
+- Enabling `enabled_buzz` on an existing relay upgrades the creator role in
+  the restored snapshot, but the stored `39001`/`39002` are republished only
+  on the next metadata or membership change; a restart alone does not
+  rewrite them.
+- The bridge inherits the relay's filter bounds: a single filter with more
+  than 512 ids/authors/kinds/tag values is rejected, and the over-fetch
+  window is capped at 2,000 events. A community with more than 512 channels
+  may need to split its channel-list query.
+- NIP-77 negentropy sync returns ids/timestamps without applying the
+  per-pubkey gate to `44100`/`44101`/`30622`; an anonymous syncer can learn
+  that those events exist, while REQ/COUNT still withhold their content.
+  This is the pre-existing NEG visibility limitation, not a content leak.
 - Buzz's push leases, workflow commands, moderation commands and
   hosted-community APIs are not part of this bridge.
 - NIP-34 git events (used by Buzz Projects) are rejected unless

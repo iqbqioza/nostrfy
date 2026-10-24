@@ -320,6 +320,11 @@ pub struct Group {
     /// change topic/purpose.
     #[serde(default)]
     pub guests: HashSet<String>,
+    /// Buzz agents admitted with `role=bot`. Buzz reads the `bot` role from
+    /// kind:39002 to decide whether a member is an agent; the NIP-29 role
+    /// set alone cannot carry it because a bot has no privileged role.
+    #[serde(default)]
+    pub bots: HashSet<String>,
 }
 
 /// NIP-CL channel types. A type outside this set is rejected; a type added
@@ -481,6 +486,12 @@ pub struct GroupStore {
     /// in-memory state even when an attacker churns group ids. 0 =
     /// unlimited.
     max_groups: usize,
+    /// Whether the Buzz compatibility extensions are active (config
+    /// `relay.enabled_buzz`). When false, group state is read and written
+    /// with plain NIP-29 semantics: no NIP-CL tags, no Buzz role columns in
+    /// `39002`, and `9002` replaces the metadata as NIP-29 specifies.
+    /// Not persisted; set from the config at startup and on reload.
+    pub(crate) buzz_enabled: bool,
     /// Total members across every group: the global budget (see
     /// [`MAX_TOTAL_MEMBERS`]) is enforced against this counter instead of
     /// rescanning every group per JOIN/9000. Every member-map mutation in
@@ -612,19 +623,22 @@ impl GroupStore {
         self.deleted = snap.deleted;
         self.ghost = snap.ghost;
         // Snapshots written before the creator role became `owner` still
-        // carry the old default `admin`. Upgrade only that exact default: a
-        // creator who was demoted (no roles) or explicitly given another
-        // role is left alone. The next roster publish reflects the change.
-        for group in self.groups.values_mut() {
-            let Some(creator) = group.creator.clone() else {
-                continue;
-            };
-            if let Some(roles) = group.members.get_mut(&creator)
-                && roles.len() == 1
-                && roles.contains("admin")
-            {
-                roles.clear();
-                roles.insert("owner".to_string());
+        // carry the old default `admin`. In Buzz mode, upgrade only that
+        // exact default: a creator who was demoted (no roles) or explicitly
+        // given another role is left alone. Plain NIP-29 keeps `admin`, so
+        // disabling Buzz restores the pre-Buzz role label.
+        if self.buzz_enabled {
+            for group in self.groups.values_mut() {
+                let Some(creator) = group.creator.clone() else {
+                    continue;
+                };
+                if let Some(roles) = group.members.get_mut(&creator)
+                    && roles.len() == 1
+                    && roles.contains("admin")
+                {
+                    roles.clear();
+                    roles.insert("owner".to_string());
+                }
             }
         }
         self.members_dirty.clear();
@@ -978,22 +992,28 @@ impl GroupStore {
         }
 
         // NIP-CL announce channels: guests can read and leave, but not post
-        // or change topic/purpose.
-        let guest = group.is_guest(pubkey);
-        if !is_group_action(event) && guest {
-            bail!("restricted: only members can post in this channel");
-        }
-        // NIP-CL: any member (not a guest) may update the topic/purpose with
-        // a kind:9002 that carries only those fields. Every other metadata
-        // edit stays owner/admin-only.
-        if event.kind == 9002 && !relay_signed && !group.is_admin(pubkey) {
-            let only_topic = event.tags.iter().all(|tag| {
-                tag.is_empty() || matches!(tag[0].as_str(), H | "topic" | "purpose" | "previous")
-            });
-            if guest || !group.is_member(pubkey) || !only_topic {
-                bail!("restricted: you are not an admin of this group");
+        // or change topic/purpose. This is a Buzz extension; with Buzz
+        // disabled, a stored `guest` role is an ordinary NIP-29 label (and
+        // any non-empty role is privileged here), so the special read-only
+        // restriction must not leak into plain NIP-29 operation.
+        if self.buzz_enabled {
+            let guest = group.is_guest(pubkey);
+            if !is_group_action(event) && guest {
+                bail!("restricted: only members can post in this channel");
             }
-            return Ok(());
+            // NIP-CL: any member (not a guest) may update the
+            // topic/purpose with a kind:9002 that carries only those fields.
+            // Every other metadata edit stays owner/admin-only.
+            if event.kind == 9002 && !relay_signed && !group.is_admin(pubkey) {
+                let only_topic = event.tags.iter().all(|tag| {
+                    tag.is_empty()
+                        || matches!(tag[0].as_str(), H | "topic" | "purpose" | "previous")
+                });
+                if guest || !group.is_member(pubkey) || !only_topic {
+                    bail!("restricted: you are not an admin of this group");
+                }
+                return Ok(());
+            }
         }
 
         if (MOD_MIN..=MOD_MAX).contains(&event.kind) {
@@ -1253,6 +1273,7 @@ impl GroupStore {
                 let member = event.pubkey.clone();
                 let removed = if let Some(group) = self.groups.get_mut(gid) {
                     group.guests.remove(&member);
+                    group.bots.remove(&member);
                     group.members.remove(&member).is_some()
                 } else {
                     false
@@ -1286,13 +1307,23 @@ impl GroupStore {
             9000 => {
                 let mut added = 0usize;
                 let mut added_members: Vec<String> = Vec::new();
-                let buzz_role = tag_value(event, "role").map(str::to_string);
+                // The separate `role` tag and the guest/bot tiers are Buzz
+                // extensions. In plain NIP-29 mode they stay ordinary role
+                // labels (any non-empty role is an admin role in this
+                // relay), so disabling Buzz must not silently demote or
+                // restrict an existing NIP-29 client.
+                let buzz_role = if self.buzz_enabled {
+                    tag_value(event, "role").map(str::to_string)
+                } else {
+                    None
+                };
                 if let Some(group) = self.groups.get_mut(gid) {
-                    let join_role_guest = group
-                        .settings
-                        .join_role
-                        .as_deref()
-                        .is_some_and(|role| role != "member");
+                    let join_role_guest = self.buzz_enabled
+                        && group
+                            .settings
+                            .join_role
+                            .as_deref()
+                            .is_some_and(|role| role != "member");
                     // Re-check the last-admin invariant under the write
                     // lock, like the 9001 arm below: two concurrent 9000
                     // demotions can both pass the read-side validation and
@@ -1304,7 +1335,14 @@ impl GroupStore {
                     // race dropped, leaving the group admin-less (B-1).
                     let mut overrides: HashMap<&str, bool> = HashMap::new();
                     for tag in event.tags.iter().filter(|t| t.len() >= 2 && t[0] == P) {
-                        let has_roles = tag[2..].iter().any(|r| !r.is_empty());
+                        let mut has_roles = tag[2..].iter().any(|r| !r.is_empty());
+                        // A Buzz `role=admin|owner|other` tag grants a
+                        // privileged role even though the p tag itself has
+                        // no role elements. Without this the guard sees a
+                        // re-assertion of the last admin as a demotion.
+                        if let Some(role) = buzz_role.as_deref() {
+                            has_roles |= !matches!(role, "guest" | "member" | "bot");
+                        }
                         overrides.insert(tag[1].as_str(), has_roles);
                     }
                     // The retention check must only count grants the
@@ -1381,36 +1419,54 @@ impl GroupStore {
                             tag[2..].iter().filter(|r| !r.is_empty()).cloned().collect();
                         // Buzz carries the role in a separate `["role", ...]`
                         // tag on kind:9000. Map its tiers onto the NIP-29
-                        // role model: admin/owner are privileged, member/bot
-                        // are plain members, guest is read-only.
+                        // role model: admin/owner are privileged, member and
+                        // bot are plain members (bot is remembered
+                        // separately for Buzz's 39002), guest is read-only.
                         let mut guest = false;
+                        let mut bot = false;
                         let explicit = !roles.is_empty() || buzz_role.is_some();
                         if roles.is_empty()
                             && let Some(role) = buzz_role.as_deref()
                         {
                             match role {
                                 "guest" => guest = true,
-                                "member" | "bot" => {}
+                                "member" => {}
+                                "bot" => bot = true,
                                 other => {
                                     roles.insert(other.to_string());
                                 }
                             }
                         }
-                        if roles.remove("guest") {
-                            guest = true;
+                        if self.buzz_enabled {
+                            if roles.remove("guest") {
+                                guest = true;
+                            }
+                            if roles.remove("bot") {
+                                bot = true;
+                            }
                         }
-                        let new_member = !group.members.contains_key(&pk);
-                        if !explicit && new_member && join_role_guest {
-                            guest = true;
-                        }
-                        if guest {
-                            group.guests.insert(pk.clone());
-                        } else if explicit || new_member {
-                            group.guests.remove(&pk);
-                        }
-                        // An empty role list leaves the user a plain member
-                        // (replacing any previous roles).
-                        if new_member {
+                        if self.buzz_enabled {
+                            let new_member = !group.members.contains_key(&pk);
+                            if !explicit && new_member && join_role_guest {
+                                guest = true;
+                            }
+                            if guest {
+                                group.guests.insert(pk.clone());
+                            } else if explicit || new_member {
+                                group.guests.remove(&pk);
+                            }
+                            if bot {
+                                group.bots.insert(pk.clone());
+                            } else if explicit || new_member {
+                                group.bots.remove(&pk);
+                            }
+                            // An empty role list leaves the user a plain
+                            // member (replacing any previous roles).
+                            if new_member {
+                                added += 1;
+                                added_members.push(pk.clone());
+                            }
+                        } else if !group.members.contains_key(&pk) {
                             added += 1;
                             added_members.push(pk.clone());
                         }
@@ -1471,6 +1527,7 @@ impl GroupStore {
                     }
                     for pk in removing {
                         group.guests.remove(pk);
+                        group.bots.remove(pk);
                         if group.members.remove(pk).is_some() {
                             removed += 1;
                             removed_members.push(pk.to_string());
@@ -1551,7 +1608,7 @@ impl GroupStore {
                             // make the group public. The live path rejects
                             // such an edit outright.
                             if let Some(group) = self.groups.get_mut(gid) {
-                                apply_settings(group, event);
+                                apply_settings(group, event, self.buzz_enabled);
                             }
                             return Vec::new();
                         }
@@ -1563,7 +1620,7 @@ impl GroupStore {
                     match self.groups.get_mut(gid) {
                         Some(group) => {
                             let livekit_before = group.settings.livekit;
-                            apply_settings(group, event);
+                            apply_settings(group, event, self.buzz_enabled);
                             let children_before = group.children.clone();
                             // Deduplicate while preserving order: a repeated
                             // `child` tag must not list the same child twice.
@@ -1727,6 +1784,7 @@ impl GroupStore {
                                 self.groups.get(old),
                                 relay_pubkey,
                                 now,
+                                self.buzz_enabled,
                             ));
                         }
                         if self.groups.contains_key(child) {
@@ -1735,6 +1793,7 @@ impl GroupStore {
                                 self.groups.get(child),
                                 relay_pubkey,
                                 now,
+                                self.buzz_enabled,
                             ));
                         }
                     }
@@ -1750,6 +1809,7 @@ impl GroupStore {
                                 self.groups.get(child),
                                 relay_pubkey,
                                 now,
+                                self.buzz_enabled,
                             ));
                         }
                     }
@@ -1760,6 +1820,7 @@ impl GroupStore {
                         self.groups.get(gid),
                         relay_pubkey,
                         now,
+                        self.buzz_enabled,
                     ));
                     // Leaving LiveKit: the stored 39004 would keep listing
                     // participants of a room that no longer exists. Publish
@@ -1775,6 +1836,7 @@ impl GroupStore {
                             self.groups.get(&parent),
                             relay_pubkey,
                             now,
+                            self.buzz_enabled,
                         ));
                     }
                     // The old parent's children list changed too: its
@@ -1788,6 +1850,7 @@ impl GroupStore {
                             self.groups.get(&old),
                             relay_pubkey,
                             now,
+                            self.buzz_enabled,
                         ));
                     }
                     for child in self
@@ -1808,6 +1871,7 @@ impl GroupStore {
                             self.groups.get(&child),
                             relay_pubkey,
                             now,
+                            self.buzz_enabled,
                         ));
                     }
                 }
@@ -1848,16 +1912,23 @@ impl GroupStore {
                     let mut group = Group {
                         creator: Some(event.pubkey.clone()),
                         created_at: Some(event.created_at),
-                        channel_type: channel_type(event),
+                        channel_type: if self.buzz_enabled {
+                            channel_type(event)
+                        } else {
+                            String::new()
+                        },
                         ..Group::default()
                     };
                     // NIP-29: the create event carries the initial metadata
                     // (name/about/private/...); Buzz's kind:9007 also carries
                     // the NIP-CL visibility, channel_type and label tags.
-                    apply_settings(&mut group, event);
+                    apply_settings(&mut group, event, self.buzz_enabled);
                     // NIP-CL: a DM or system channel is private unless the
-                    // create explicitly says otherwise.
-                    if matches!(group.channel_type.as_str(), "dm" | "system")
+                    // create explicitly says otherwise. This is Buzz-only;
+                    // in plain NIP-29 the create's NIP-29 `private` tag is
+                    // the only privacy switch.
+                    if self.buzz_enabled
+                        && matches!(group.channel_type.as_str(), "dm" | "system")
                         && tag_value(event, "visibility").is_none()
                     {
                         group.settings.private = true;
@@ -1873,7 +1944,7 @@ impl GroupStore {
                         .members
                         .entry(event.pubkey.clone())
                         .or_default()
-                        .insert("owner".into());
+                        .insert(if self.buzz_enabled { "owner" } else { "admin" }.into());
                     // A group that already declared this id as a child
                     // (a placeholder: the child did not exist yet) adopts
                     // it now, keeping both sides of the parent link
@@ -1932,6 +2003,7 @@ impl GroupStore {
                                     Some(other),
                                     relay_pubkey,
                                     now,
+                                    self.buzz_enabled,
                                 ));
                             }
                         }
@@ -1945,6 +2017,7 @@ impl GroupStore {
                             self.groups.get(parent),
                             relay_pubkey,
                             now,
+                            self.buzz_enabled,
                         ));
                     }
                 }
@@ -1970,6 +2043,7 @@ impl GroupStore {
                             self.groups.get(gid),
                             relay_pubkey,
                             now,
+                            self.buzz_enabled,
                         ));
                     }
                     if created {
@@ -2023,6 +2097,7 @@ impl GroupStore {
                                     Some(child_group),
                                     relay_pubkey,
                                     now,
+                                    self.buzz_enabled,
                                 ));
                             }
                         }
@@ -2038,6 +2113,7 @@ impl GroupStore {
                                 Some(parent_group),
                                 relay_pubkey,
                                 now,
+                                self.buzz_enabled,
                             ));
                         }
                     }
@@ -2302,10 +2378,17 @@ impl GroupStore {
                 self.groups.get(gid),
                 relay_pubkey,
                 now,
+                self.buzz_enabled,
             ));
         }
         out.extend([
-            build_admins_event(gid, self.groups.get(gid), relay_pubkey, now),
+            build_admins_event(
+                gid,
+                self.groups.get(gid),
+                relay_pubkey,
+                now,
+                self.buzz_enabled,
+            ),
             // NIP-29's `39003` (the roles in use): small and cheap, so it
             // rides every membership change like the admin list.
             build_roles_event(gid, self.groups.get(gid), relay_pubkey, now),
@@ -2324,6 +2407,7 @@ impl GroupStore {
                 self.groups.get(gid),
                 relay_pubkey,
                 now,
+                self.buzz_enabled,
             ));
         } else {
             // Remember that this update was throttled: the stats tick retries
@@ -2358,6 +2442,7 @@ impl GroupStore {
                     self.groups.get(&gid),
                     relay_pubkey,
                     now,
+                    self.buzz_enabled,
                 ));
             }
         }
@@ -2378,6 +2463,7 @@ impl GroupStore {
                 self.groups.get(&gid),
                 relay_pubkey,
                 now,
+                self.buzz_enabled,
             ));
             out.push(build_pins_event(
                 &gid,

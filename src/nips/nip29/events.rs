@@ -7,16 +7,26 @@ use crate::event::Event;
 
 use super::{
     D, GROUP_ADMINS, GROUP_MEMBERS, GROUP_META, GROUP_PARTICIPANTS, GROUP_PINS, GROUP_ROLES, Group,
-    H, P,
+    GroupSettings, H, P,
 };
-/// Applies a kind:9007/9002 metadata event as a **partial update**.
+/// Applies a kind:9007/9002 metadata event.
 ///
-/// NIP-29 clients that Buzz interoperates with (and Buzz itself) send only
-/// the fields they intend to change; replacing the whole settings object on
-/// every edit would silently clear an unrelated `private` flag when a client
-/// renames a channel. An absent tag therefore leaves the setting untouched;
-/// an explicit empty value clears a string/optional field.
-pub(crate) fn apply_settings(group: &mut Group, event: &Event) {
+/// In Buzz mode (`buzz = true`) this is a **partial update**: Buzz clients
+/// send only the fields they intend to change, and replacing the whole
+/// settings object would silently clear an unrelated `private` flag when a
+/// client renames a channel. An absent tag leaves the setting untouched; an
+/// explicit empty value clears a string/optional field.
+///
+/// In plain NIP-29 mode (`buzz = false`) the pre-Buzz behavior is kept:
+/// the event replaces the NIP-29 metadata, because NIP-29's `9002` table
+/// describes it as carrying "all the fields of group-metadata". Buzz-only
+/// settings (topic/purpose/ttl/archived/join_role) are preserved so a
+/// normal client's edit cannot wipe them.
+pub(crate) fn apply_settings(group: &mut Group, event: &Event, buzz: bool) {
+    if !buzz {
+        apply_nip29_settings(group, event);
+        return;
+    }
     for tag in &event.tags {
         if tag.is_empty() {
             continue;
@@ -107,6 +117,50 @@ pub(crate) fn apply_settings(group: &mut Group, event: &Event) {
     }
 }
 
+/// NIP-29's original whole-metadata semantics for `9002`/`9007`: fields
+/// absent from the event are cleared. Buzz-only settings are kept so a plain
+/// NIP-29 edit does not erase state that only another Buzz client can see or
+/// change.
+fn apply_nip29_settings(group: &mut Group, event: &Event) {
+    let old = group.settings.clone();
+    let mut settings = GroupSettings {
+        topic: old.topic,
+        purpose: old.purpose,
+        ttl: old.ttl,
+        archived: old.archived,
+        join_role: old.join_role,
+        ..GroupSettings::default()
+    };
+    for tag in &event.tags {
+        if tag.is_empty() {
+            continue;
+        }
+        match tag[0].as_str() {
+            "name" | "picture" | "banner" | "about" => {
+                if let Some(value) = tag.get(1) {
+                    match tag[0].as_str() {
+                        "name" => settings.name = value.clone(),
+                        "picture" => settings.picture = value.clone(),
+                        "banner" => settings.banner = value.clone(),
+                        _ => settings.about = value.clone(),
+                    }
+                }
+            }
+            "private" => settings.private = true,
+            "restricted" => settings.restricted = true,
+            "closed" => settings.closed = true,
+            "hidden" => settings.hidden = true,
+            "livekit" => settings.livekit = true,
+            "supported_kinds" => {
+                settings.supported_kinds =
+                    Some(tag[1..].iter().filter_map(|k| k.parse().ok()).collect())
+            }
+            _ => {}
+        }
+    }
+    group.settings = settings;
+}
+
 pub(crate) fn base_event(kind: u64, gid: &str, relay_pubkey: &str, now: u64) -> Event {
     Event {
         id: String::new(),
@@ -124,6 +178,7 @@ pub(crate) fn build_meta_event(
     group: Option<&Group>,
     relay_pubkey: &str,
     now: u64,
+    buzz: bool,
 ) -> Event {
     let Some(group) = group else {
         return base_event(GROUP_META, gid, relay_pubkey, now);
@@ -140,25 +195,29 @@ pub(crate) fn build_meta_event(
             event.tags.push(vec![name.to_string(), value.clone()]);
         }
     }
-    if let Some(topic) = &s.topic {
-        event.tags.push(vec!["topic".to_string(), topic.clone()]);
-    }
-    if let Some(purpose) = &s.purpose {
-        event
-            .tags
-            .push(vec!["purpose".to_string(), purpose.clone()]);
-    }
-    if let Some(ttl) = s.ttl {
-        event.tags.push(vec!["ttl".to_string(), ttl.to_string()]);
-    }
-    if s.archived {
-        event
-            .tags
-            .push(vec!["archived".to_string(), "true".to_string()]);
+    if buzz {
+        if let Some(topic) = &s.topic {
+            event.tags.push(vec!["topic".to_string(), topic.clone()]);
+        }
+        if let Some(purpose) = &s.purpose {
+            event
+                .tags
+                .push(vec!["purpose".to_string(), purpose.clone()]);
+        }
+        if let Some(ttl) = s.ttl {
+            event.tags.push(vec!["ttl".to_string(), ttl.to_string()]);
+        }
+        if s.archived {
+            event
+                .tags
+                .push(vec!["archived".to_string(), "true".to_string()]);
+        }
     }
     if s.private {
         event.tags.push(vec!["private".to_string()]);
-    } else {
+    } else if buzz {
+        // NIP-29 expresses a public group by omitting `private`; the
+        // explicit tag is a Buzz/NIP-CL aid.
         event.tags.push(vec!["public".to_string()]);
     }
     if s.restricted {
@@ -173,7 +232,9 @@ pub(crate) fn build_meta_event(
     if s.livekit {
         event.tags.push(vec!["livekit".into()]);
     }
-    if let Some(join_role) = &s.join_role {
+    if let Some(join_role) = &s.join_role
+        && buzz
+    {
         event
             .tags
             .push(vec!["join_role".to_string(), join_role.clone()]);
@@ -183,15 +244,17 @@ pub(crate) fn build_meta_event(
         tag.extend(kinds.iter().map(u64::to_string));
         event.tags.push(tag);
     }
-    super::push_channel_identity_tags(&mut event, Some(group), true);
-    // Buzz reads a DM's participants from the lowercase `p` tags on its
-    // kind:39000 (the kind:39002 roster is a separate query). Only DMs pay
-    // this cost, and their participant set is bounded at 64 keys.
-    if group.channel_type == "dm" {
-        let mut members: Vec<&String> = group.members.keys().collect();
-        members.sort();
-        for member in members {
-            event.tags.push(vec![P.to_string(), member.clone()]);
+    if buzz {
+        super::push_channel_identity_tags(&mut event, Some(group), true);
+        // Buzz reads a DM's participants from the lowercase `p` tags on its
+        // kind:39000 (the kind:39002 roster is a separate query). Only DMs
+        // pay this cost, and their participant set is bounded at 64 keys.
+        if group.channel_type == "dm" {
+            let mut members: Vec<&String> = group.members.keys().collect();
+            members.sort();
+            for member in members {
+                event.tags.push(vec![P.to_string(), member.clone()]);
+            }
         }
     }
     if let Some(parent) = &group.parent {
@@ -208,9 +271,12 @@ pub(crate) fn build_admins_event(
     group: Option<&Group>,
     relay_pubkey: &str,
     now: u64,
+    buzz: bool,
 ) -> Event {
     let mut event = base_event(GROUP_ADMINS, gid, relay_pubkey, now);
-    super::push_channel_identity_tags(&mut event, group, false);
+    if buzz {
+        super::push_channel_identity_tags(&mut event, group, false);
+    }
     if let Some(group) = group {
         let mut admins: Vec<(String, Vec<String>)> = group
             .members
@@ -240,13 +306,21 @@ pub(crate) fn build_members_event(
     group: Option<&Group>,
     relay_pubkey: &str,
     now: u64,
+    buzz: bool,
 ) -> Event {
     let mut event = base_event(GROUP_MEMBERS, gid, relay_pubkey, now);
-    super::push_channel_identity_tags(&mut event, group, false);
+    if buzz {
+        super::push_channel_identity_tags(&mut event, group, false);
+    }
     if let Some(group) = group {
         let mut members: Vec<String> = group.members.keys().cloned().collect();
         members.sort();
         for pk in members {
+            if !buzz {
+                // NIP-29 defines the member list as bare `p` tags.
+                event.tags.push(vec![P.to_string(), pk]);
+                continue;
+            }
             // Buzz reads a member's role from the fourth element of the
             // `p` tag (`["p", pubkey, relay_url, role]`, NIP-29's
             // convention). Without it every member, including an admin,
@@ -255,6 +329,8 @@ pub(crate) fn build_members_event(
             // event is signed by this relay.
             let role = if group.guests.contains(&pk) {
                 "guest".to_string()
+            } else if group.bots.contains(&pk) {
+                "bot".to_string()
             } else {
                 group
                     .members
@@ -481,7 +557,7 @@ mod tests {
         let group = group_with_members();
         let now = 1_700_000_000;
 
-        let meta = build_meta_event("g1", Some(&group), "relay", now);
+        let meta = build_meta_event("g1", Some(&group), "relay", now, true);
         assert_eq!(meta.kind, GROUP_META);
         assert_eq!(meta.pubkey, "relay");
         assert_eq!(meta.created_at, now);
@@ -515,7 +591,7 @@ mod tests {
         );
 
         // Admins: only members with roles, sorted deterministically.
-        let admins = build_admins_event("g1", Some(&group), "relay", now);
+        let admins = build_admins_event("g1", Some(&group), "relay", now, true);
         assert_eq!(admins.kind, GROUP_ADMINS);
         let admin_tags: Vec<&Vec<String>> = admins.tags.iter().filter(|t| t[0] == P).collect();
         assert_eq!(admin_tags.len(), 2, "admins and mods");
@@ -524,7 +600,7 @@ mod tests {
         assert_eq!(admin_tags[1][2], "mod");
 
         // Members: everyone, with Buzz's `["p", pubkey, "", role]` shape.
-        let members = build_members_event("g1", Some(&group), "relay", now);
+        let members = build_members_event("g1", Some(&group), "relay", now, true);
         assert_eq!(members.kind, GROUP_MEMBERS);
         let member_tags: Vec<&Vec<String>> = members.tags.iter().filter(|t| t[0] == P).collect();
         assert_eq!(member_tags.len(), 3);
@@ -571,10 +647,10 @@ mod tests {
         );
 
         // A missing group produces the bare metadata event.
-        let bare = build_meta_event("g2", None, "relay", now);
+        let bare = build_meta_event("g2", None, "relay", now, true);
         assert_eq!(bare.kind, GROUP_META);
         assert_eq!(bare.tags.len(), 1);
-        let bare_admins = build_admins_event("g2", None, "relay", now);
+        let bare_admins = build_admins_event("g2", None, "relay", now, true);
         assert_eq!(bare_admins.tags.len(), 1);
     }
 
@@ -583,7 +659,7 @@ mod tests {
         let mut group = group_with_members();
         group.members.insert("guest1".into(), Default::default());
         group.guests.insert("guest1".into());
-        let members = build_members_event("g1", Some(&group), "relay", 1);
+        let members = build_members_event("g1", Some(&group), "relay", 1, true);
         assert!(
             members.tags.iter().any(|t| t
                 == &vec![
@@ -614,7 +690,7 @@ mod tests {
             "x".to_string(),
             "y".to_string(),
         ]);
-        apply_settings(&mut group, &edit);
+        apply_settings(&mut group, &edit, true);
         assert_eq!(group.settings.name, "new name");
         assert!(group.settings.private);
         // Absent fields are left alone (Buzz/NIP-CL partial updates).
@@ -626,7 +702,76 @@ mod tests {
         open.tags[0] = vec![H.to_string(), "g1".into()];
         open.tags
             .push(vec!["visibility".to_string(), "open".to_string()]);
-        apply_settings(&mut group, &open);
+        apply_settings(&mut group, &open, true);
         assert!(!group.settings.private);
+    }
+
+    #[test]
+    fn plain_nip29_builders_omit_buzz_extensions() {
+        let mut group = group_with_members();
+        group.settings.private = false;
+        let meta = build_meta_event("g1", Some(&group), "relay", 1, false);
+        assert!(
+            !meta.tags.iter().any(|t| t[0] == "public"),
+            "plain NIP-29 expresses a public group by omitting private"
+        );
+        for extension in [
+            "topic",
+            "purpose",
+            "ttl",
+            "archived",
+            "join_role",
+            "P",
+            "created_at",
+        ] {
+            assert!(
+                !meta.tags.iter().any(|t| t[0] == extension),
+                "plain NIP-29 metadata must not carry the Buzz tag {extension}: {:?}",
+                meta.tags
+            );
+        }
+        assert!(
+            !meta.tags.iter().any(|t| t[0] == "t"),
+            "NIP-CL channel identity tags are Buzz-only: {:?}",
+            meta.tags
+        );
+
+        let members = build_members_event("g1", Some(&group), "relay", 1, false);
+        assert!(
+            members
+                .tags
+                .iter()
+                .filter(|t| t[0] == P)
+                .all(|t| t.len() == 2),
+            "plain NIP-29 39002 uses bare p tags: {:?}",
+            members.tags
+        );
+        let admins = build_admins_event("g1", Some(&group), "relay", 1, false);
+        assert!(
+            !admins.tags.iter().any(|t| t[0] == "t" || t[0] == "P"),
+            "Buzz identity tags must not leak into a plain 39001: {:?}",
+            admins.tags
+        );
+    }
+
+    #[test]
+    fn plain_nip29_edit_replaces_metadata() {
+        let mut group = Group::default();
+        group.settings.name = "old".into();
+        group.settings.closed = true;
+        group.settings.topic = Some("keep me".into());
+        let mut edit = base_event(9002, "g1", "relay", 1);
+        edit.tags[0] = vec![H.to_string(), "g1".into()];
+        edit.tags.push(vec!["name".into(), "new".into()]);
+        // Plain NIP-29: a 9002 carries the whole metadata. The absent
+        // `closed` tag clears it.
+        apply_settings(&mut group, &edit, false);
+        assert_eq!(group.settings.name, "new");
+        assert!(!group.settings.closed);
+        assert_eq!(
+            group.settings.topic.as_deref(),
+            Some("keep me"),
+            "a plain edit must not wipe Buzz-only state"
+        );
     }
 }

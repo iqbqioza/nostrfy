@@ -145,6 +145,8 @@ impl super::Relay {
                     Some(&group),
                     self.relay_pubkey_ref().unwrap_or_default(),
                     now,
+                    // DM commands only run with the Buzz layer enabled.
+                    true,
                 );
                 groups.groups.insert(channel.clone(), group);
                 vec![meta]
@@ -208,6 +210,10 @@ impl super::Relay {
                 return PutOutcome::Invalid("error: could not create the DM channel".into());
             }
         }
+        // The synthetic 9007/9000 are not stored, so the DM group state has
+        // no event history to rebuild from: persist the snapshot like the
+        // normal group path does, or a restart would lose the DM channel.
+        self.schedule_groups_persist();
         for mut relay_event in metadata {
             if self.store_relay_event(&mut relay_event).await.is_err() {
                 self.publish_rate_rollback(&event.pubkey, now);
@@ -268,6 +274,9 @@ impl super::Relay {
             }
             group.hidden_for.insert(event.pubkey.clone());
         }
+        // `hidden_for` is snapshot-only state; schedule the same debounced
+        // save the normal group path uses.
+        self.schedule_groups_persist();
         if let Err(()) = self.publish_dm_visibility(&event.pubkey).await {
             log::warn!("could not publish the DM visibility snapshot");
         }

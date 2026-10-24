@@ -1207,6 +1207,7 @@ impl super::Conn {
                     (self.is_authed() || !self.nip70_hidden(e))
                         && self.gift_wrap_visible(e)
                         && self.nip78_visible(e)
+                        && !self.p_gated_hidden(e)
                         && groups.as_deref().is_none_or(|g| {
                             if self.authed_pubkeys.is_empty() {
                                 g.visible_to(e, None)

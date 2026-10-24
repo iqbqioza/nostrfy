@@ -3703,8 +3703,8 @@ fn roles_event_lists_the_roles_in_use() {
             .filter(|t| t[0] == "role")
             .map(|t| t[1].as_str())
             .collect::<Vec<_>>(),
-        vec!["mod", "owner"],
-        "the creator's owner role and the assigned role must be listed"
+        vec!["admin", "mod"],
+        "the creator's admin role and the assigned role must be listed"
     );
     // Two members sharing a role list it once.
     let out = store.apply(
@@ -3750,8 +3750,8 @@ fn roles_event_lists_the_roles_in_use() {
             .filter(|t| t[0] == "role")
             .map(|t| t[1].as_str())
             .collect::<Vec<_>>(),
-        vec!["owner"],
-        "only the creator's owner role is left: {:?}",
+        vec!["admin"],
+        "only the creator's admin role is left: {:?}",
         roles.tags
     );
 }
@@ -3787,10 +3787,7 @@ fn leaving_livekit_clears_the_participants_event() {
             9002,
             ADMIN,
             Some("g1"),
-            vec![
-                vec!["livekit".into(), "false".into()],
-                vec!["name".into(), "g1".into()],
-            ],
+            vec![vec!["name".into(), "g1".into()]],
         ),
         "relay",
         now,
@@ -4342,7 +4339,10 @@ fn invite_code_validation_dedupes_duplicates() {
 
 #[test]
 fn buzz_join_role_guest_blocks_posting_and_member_topic_edits() {
-    let mut store = GroupStore::default();
+    let mut store = GroupStore {
+        buzz_enabled: true,
+        ..Default::default()
+    };
     let now = 1_600_000_000;
     store.apply(
         &event(
@@ -4428,7 +4428,10 @@ fn buzz_join_role_guest_blocks_posting_and_member_topic_edits() {
 
 #[test]
 fn channel_creator_owns_the_channel() {
-    let mut store = GroupStore::default();
+    let mut store = GroupStore {
+        buzz_enabled: true,
+        ..Default::default()
+    };
     store.apply(
         &event(CREATE_GROUP, ADMIN, Some("g1"), vec![]),
         "relay",
@@ -4447,4 +4450,154 @@ fn channel_creator_owns_the_channel() {
         !roles.contains("admin"),
         "the old admin default must not survive: {roles:?}"
     );
+}
+
+#[test]
+fn buzz_role_bot_is_preserved_in_the_roster() {
+    let mut store = GroupStore {
+        buzz_enabled: true,
+        ..Default::default()
+    };
+    let now = 1_600_000_000;
+    store.apply(
+        &event(CREATE_GROUP, ADMIN, Some("g1"), vec![]),
+        "relay",
+        now,
+        true,
+        false,
+    );
+    store.apply(
+        &event(
+            9000,
+            ADMIN,
+            Some("g1"),
+            vec![
+                vec!["p".into(), USER.into()],
+                vec!["role".into(), "bot".into()],
+            ],
+        ),
+        "relay",
+        now + 1,
+        true,
+        false,
+    );
+    let group = store.group("g1").unwrap();
+    assert!(group.bots.contains(USER), "the bot marker must be stored");
+    let members = super::events::build_members_event("g1", Some(group), "relay", now, true);
+    assert!(
+        members.tags.iter().any(|t| t
+            == &vec![
+                P.to_string(),
+                USER.to_string(),
+                String::new(),
+                "bot".to_string()
+            ]),
+        "Buzz must see role=bot in 39002: {:?}",
+        members.tags
+    );
+}
+
+#[test]
+fn plain_nip29_guest_role_keeps_admin_semantics() {
+    let mut store = GroupStore::default();
+    assert!(!store.buzz_enabled);
+    let now = 1_600_000_000;
+    store.apply(
+        &event(CREATE_GROUP, ADMIN, Some("g1"), vec![]),
+        "relay",
+        now,
+        true,
+        false,
+    );
+    store.apply(
+        &event(
+            9000,
+            ADMIN,
+            Some("g1"),
+            vec![vec![P.into(), USER.into(), "guest".into()]],
+        ),
+        "relay",
+        now + 1,
+        true,
+        false,
+    );
+    let group = store.group("g1").unwrap();
+    assert!(
+        group.is_admin(USER),
+        "in plain NIP-29 any non-empty role is an admin role"
+    );
+    assert!(!group.is_guest(USER), "Buzz guest state must stay off");
+    let post = event(9, USER, Some("g1"), vec![]);
+    assert!(
+        store.validate_write(&post).is_ok(),
+        "a role label named guest must not become read-only"
+    );
+}
+
+#[test]
+fn plain_nip29_member_cannot_edit_topic() {
+    let mut store = GroupStore::default();
+    assert!(!store.buzz_enabled);
+    let now = 1_600_000_000;
+    store.apply(
+        &event(CREATE_GROUP, ADMIN, Some("g1"), vec![]),
+        "relay",
+        now,
+        true,
+        false,
+    );
+    store.apply(
+        &event(JOIN, USER, Some("g1"), vec![]),
+        "relay",
+        now + 1,
+        true,
+        false,
+    );
+    let edit = event(
+        9002,
+        USER,
+        Some("g1"),
+        vec![vec!["topic".into(), "hi".into()]],
+    );
+    assert!(
+        store.validate_write(&edit).is_err(),
+        "the NIP-CL member topic edit is Buzz-only"
+    );
+}
+
+#[test]
+fn plain_nip29_ignores_buzz_channel_tags() {
+    let mut store = GroupStore::default();
+    assert!(!store.buzz_enabled);
+    let now = 1_600_000_000;
+    store.apply(
+        &event(
+            CREATE_GROUP,
+            ADMIN,
+            Some("g1"),
+            vec![
+                vec!["name".into(), "plain".into()],
+                vec!["channel_type".into(), "dm".into()],
+                vec!["visibility".into(), "private".into()],
+                vec!["join_role".into(), "guest".into()],
+                vec!["topic".into(), "buzz topic".into()],
+            ],
+        ),
+        "relay",
+        now,
+        true,
+        false,
+    );
+    let group = store.group("g1").unwrap();
+    assert!(
+        group.channel_type.is_empty(),
+        "NIP-CL channel_type is a Buzz extension"
+    );
+    assert!(
+        !group.settings.private,
+        "visibility=private is a Buzz extension in plain NIP-29 mode"
+    );
+    assert_eq!(group.settings.name, "plain");
+    assert!(group.settings.topic.is_none());
+    assert!(group.is_admin(ADMIN), "the creator remains an admin");
 }
