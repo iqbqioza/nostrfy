@@ -720,6 +720,18 @@ impl Conn {
         }
     }
 
+    /// Whether a live batch should be flushed before the next event is
+    /// delivered. A batch can queue many frames at once; waiting for the
+    /// outer loop to drain it lets the cumulative bytes of the batch exceed
+    /// the outgoing cap and closes a subscriber that was reading normally.
+    /// Half the cap leaves room for one more event-sized frame (including
+    /// its subscription id) without waiting for a full queue.
+    fn live_queue_pressure(&self) -> bool {
+        self.out_bytes > 0
+            && (self.out_bytes >= self.out_queue_cap() / 2
+                || self.outgoing.len() >= OUT_QUEUE_LIMIT / 2)
+    }
+
     /// RFC 6455 Close(1009) "message too big": queued (ahead of teardown)
     /// when the protocol layer rejects an oversized inbound frame, so the
     /// client can tell it from a network failure.
@@ -729,6 +741,22 @@ impl Conn {
         // delivered before Close(1009). Pushing it here sent the Close
         // first and abandoned every OK after the socket entered Closing.
         self.close_too_big = true;
+    }
+
+    /// Queues a Close when a SIGHUP raised a limit that was fixed at
+    /// upgrade time (message size or tungstenite write buffer). The client
+    /// must reconnect for the new protocol bound to apply; without an
+    /// explicit Close an idle peer cannot distinguish this from a network
+    /// failure.
+    fn queue_reconnect_close(&mut self) {
+        self.outgoing.push_back(OutFrame {
+            message: Message::Close(Some(axum::extract::ws::CloseFrame {
+                code: axum::extract::ws::close_code::AWAY,
+                reason: "reconnect required: limits increased".into(),
+            })),
+            event_sub: None,
+        });
+        self.out_msgs = self.out_msgs.saturating_add(1);
     }
 
     /// Queues the deferred Close(1009) after the pending-event flush.
@@ -1349,6 +1377,79 @@ where
     outcome
 }
 
+/// Delivers one live batch, draining the outgoing queue when it approaches
+/// the per-connection cap. Returns `false` when the connection must close
+/// (socket/idle/shutdown, live overflow, or an IP that became blocked).
+///
+/// Group events take the group-store read lock one event at a time instead
+/// of holding it across the whole batch, so the mid-batch drain cannot block
+/// a group write (and vice versa) while the socket is backpressured.
+#[allow(clippy::too_many_arguments)]
+async fn deliver_live_batch<F>(
+    conn: &mut Conn,
+    batch: &[(Arc<Event>, Arc<String>)],
+    group_store: Option<Arc<tokio::sync::RwLock<nip29::GroupStore>>>,
+    now: u64,
+    peer_ip: std::net::IpAddr,
+    sender: &mut F,
+    idle_sleep: &mut Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+    ip_blocks_rx: &mut tokio::sync::watch::Receiver<u64>,
+    overflow_rx: &mut tokio::sync::watch::Receiver<()>,
+    drain_rx: &mut tokio::sync::watch::Receiver<bool>,
+) -> bool
+where
+    F: futures_util::Sink<Message, Error = axum::Error> + Unpin,
+{
+    for (event, json) in batch {
+        if nip29::is_group_event(event) {
+            if let Some(store) = group_store.as_ref() {
+                let guard = store.read().await;
+                conn.deliver_live_at(event, json, Some(&guard), now);
+            } else {
+                // The caller only omits the store when the batch has no
+                // group events; a mismatch fails closed (the event is not
+                // visible without the group state).
+                conn.deliver_live_at(event, json, None, now);
+            }
+        } else {
+            conn.deliver_live_at(event, json, None, now);
+        }
+        if conn.live_overflowed {
+            conn.close_for_live_overflow();
+            return false;
+        }
+        if conn.live_queue_pressure() {
+            // A pending stored response may still be holding live events;
+            // let the pump move what fits before draining the socket.
+            conn.pump_pending_reqs();
+            match drain_outgoing(
+                conn,
+                sender,
+                idle_sleep,
+                ip_blocks_rx,
+                overflow_rx,
+                drain_rx,
+            )
+            .await
+            {
+                DrainOutcome::Drained => {}
+                DrainOutcome::Stop => return false,
+                DrainOutcome::IpChanged => {
+                    if conn.source_ip_blocked(peer_ip).await {
+                        return false;
+                    }
+                }
+                DrainOutcome::Overflow => {
+                    conn.live_overflowed = true;
+                    conn.close_for_live_overflow();
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
 /// Whether a receive error is the protocol layer's size-limit rejection.
 fn is_capacity_error(e: &axum::Error) -> bool {
     let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(e);
@@ -1531,6 +1632,13 @@ pub async fn handle_connection(
     // is dropped when its source IP becomes blocked, even if it only
     // receives live events and never sends a frame.
     let mut ip_blocks_rx = relay.ip_blocks_tx.subscribe();
+    let mut access_rx = relay.subscribe_access();
+    // Close the upgrade -> watch-subscription race: a blockip that landed
+    // after the accept-layer check but before this watcher existed is not
+    // delivered as a change (the watch initial value is already seen).
+    if relay.access.read().await.is_ip_blocked(peer_ip) {
+        return;
+    }
     // Graceful shutdown: the relay signals a drain so the loop flushes its
     // pending event batch and closes before the process exits (the upgraded
     // WebSocket task is detached from the HTTP connection, so the server's
@@ -1636,6 +1744,14 @@ pub async fn handle_connection(
         // hit its last-resort cap: the peer could be waiting on that OK or
         // EOSE forever, so close the socket (a reconnect resynchronizes).
         if conn.control_overflowed {
+            break;
+        }
+        // A SIGHUP may have raised a limit that was negotiated at upgrade
+        // time. Check even on a fully idle connection: the refresh can
+        // happen on a PING tick, and waiting for the next inbound frame
+        // would leave the socket on the old protocol bound forever.
+        if conn.reconnect_required {
+            conn.queue_reconnect_close();
             break;
         }
         // Drain pending outgoing messages. A slow reader stalls only its
@@ -1791,6 +1907,7 @@ pub async fn handle_connection(
                             conn.refresh_config_cache().await;
                         }
                         if conn.reconnect_required {
+                            conn.queue_reconnect_close();
                             break 'connection;
                         }
                         if conn.handle_frame(frame, conn.max_msg_size).await {
@@ -1848,6 +1965,7 @@ pub async fn handle_connection(
                         conn.refresh_config_cache().await;
                     }
                     if conn.reconnect_required {
+                        conn.queue_reconnect_close();
                         break 'connection;
                     }
                     if conn.handle_frame(frame, conn.max_msg_size).await {
@@ -1919,7 +2037,9 @@ pub async fn handle_connection(
                 // flag). Rebuild the local sleep/PING schedule at the top of
                 // the loop so a fully idle connection is affected too.
                 conn.refresh_config_if_stale().await;
+                conn.enforce_read_authorization().await;
                 if conn.reconnect_required {
+                    conn.queue_reconnect_close();
                     break 'connection;
                 }
                 continue 'connection;
@@ -1967,11 +2087,24 @@ pub async fn handle_connection(
                 }
             }
             changed = overflow_rx.changed() => {
-                if changed.is_ok() {
-                    conn.live_overflowed = true;
-                    conn.close_for_live_overflow();
+                // A dropped sender means the relay is gone; closing the
+                // connection is the only useful action. Falling through on
+                // `Err` would spin on a permanently-ready error.
+                if changed.is_err() {
                     break;
                 }
+                conn.live_overflowed = true;
+                conn.close_for_live_overflow();
+                break;
+            }
+            changed = access_rx.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+                // A ban/allowlist/require-auth change must reach a fully
+                // idle subscriber too: close its subscriptions now instead
+                // of waiting for the next matching event.
+                conn.enforce_read_authorization().await;
             }
             changed = drain_rx.changed() => {
                 // Graceful shutdown: break so the teardown flushes the
@@ -1996,32 +2129,34 @@ pub async fn handle_connection(
                             conn.refresh_config_cache().await;
                         }
                         if conn.reconnect_required {
+                            conn.queue_reconnect_close();
                             break 'connection;
                         }
-                        // The group store lock and its Arc clone are only
-                        // taken when the batch actually contains group
-                        // events (rare); ordinary traffic skips the shared
-                        // state entirely.
+                        // The group store lock is only taken for batches
+                        // that actually contain group events (rare); the
+                        // delivery helper acquires it per event, so a
+                        // mid-batch drain never holds the read lock while
+                        // waiting for the socket.
                         let has_group_events =
                             batch.iter().any(|(e, _)| nip29::is_group_event(e));
-                        let store = if has_group_events {
-                            Some(Arc::clone(&conn.relay.groups))
-                        } else {
-                            None
-                        };
-                        let guard = if let Some(store) = &store {
-                            Some(store.read().await)
-                        } else {
-                            None
-                        };
-                        let groups = guard.as_deref();
+                        let group_store =
+                            has_group_events.then(|| Arc::clone(&conn.relay.groups));
                         let now = crate::util::unix_now();
-                        for (event, json) in batch.iter() {
-                            conn.deliver_live_at(event, json, groups, now);
-                            if conn.live_overflowed {
-                                conn.close_for_live_overflow();
-                                break 'connection;
-                            }
+                        if !deliver_live_batch(
+                            &mut conn,
+                            batch.as_slice(),
+                            group_store,
+                            now,
+                            peer_ip,
+                            &mut sender,
+                            &mut idle_sleep,
+                            &mut ip_blocks_rx,
+                            &mut overflow_rx,
+                            &mut drain_rx,
+                        )
+                        .await
+                        {
+                            break 'connection;
                         }
                     }
                     None => break,
@@ -6318,6 +6453,320 @@ mod tests {
     }
 
     #[test]
+    fn zero_limit_filter_does_not_empty_a_visible_same_second_page() {
+        // A `limit: 0` filter contributes no events by definition, but it
+        // used to set `page_capacity` to zero. When the scan reported
+        // `more` and a hidden-event slack left only a few visible events at
+        // one second, the tie guard dropped that whole visible page and the
+        // client saw EVENT 0 + `["more"]`.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let now = unix_now();
+            for i in 0..28 {
+                let protected =
+                    signed_note(&format!("hidden-{i}"), now - 1, vec![vec!["-".into()]]);
+                conn.relay.db.put(protected, now).await;
+            }
+            for i in 0..2 {
+                let visible = signed_note(&format!("visible-{i}"), now, vec![]);
+                conn.relay.db.put(visible, now).await;
+            }
+            conn.handle_req(&[
+                json!("sub"),
+                json!({"kinds": [7], "limit": 0}),
+                json!({"kinds": [1], "limit": 5, "until": now}),
+            ])
+            .await;
+            conn.pump_pending_reqs();
+            let msgs = outgoing_json(&conn);
+            let contents: Vec<&str> = msgs
+                .iter()
+                .filter(|m| m[0] == "EVENT")
+                .map(|m| m[2]["content"].as_str().unwrap())
+                .collect();
+            assert_eq!(
+                contents.len(),
+                2,
+                "the visible events must not be dropped by a zero-limit filter: {msgs:?}"
+            );
+            assert!(
+                contents.iter().all(|c| c.starts_with("visible-")),
+                "protected events stay hidden: {contents:?}"
+            );
+            assert!(
+                msgs.iter().any(|m| {
+                    m[0] == "EOSE"
+                        && m[1] == "sub"
+                        && m[2]
+                            .as_array()
+                            .is_some_and(|hints| hints.iter().any(|h| h == "more"))
+                }),
+                "the scan incompleteness hint must remain: {msgs:?}"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn live_batch_drains_before_the_outgoing_byte_cap() {
+        // M02/WS-01: a whole live batch (up to 32 events) used to be queued
+        // before the outer loop drained it. Thirty-two ~10 KiB events exceed
+        // a 64 KiB per-connection cap, so a subscriber that was reading
+        // normally received CLOSED at the 4th-5th event. The delivery helper
+        // must drain when the queue approaches the cap.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_relay_with_limits("", |cfg| {
+                cfg.relay.send_auth_challenge = false;
+                cfg.limits.ws_idle_timeout_secs = 0;
+                cfg.limits.max_out_queue_bytes = 64 * 1024;
+            })
+            .await;
+            let mut conn = build_conn_on(Arc::clone(&relay)).await;
+            conn.subs
+                .insert("s".into(), (vec![Filter::default()], 0, "\"s\"".into()));
+            let now = unix_now();
+            let batch: Vec<(Arc<Event>, Arc<String>)> = (0..32)
+                .map(|i| {
+                    let event = signed_note(&format!("{i}:{}", "x".repeat(10 * 1024)), now, vec![]);
+                    let json = Arc::new(serde_json::to_string(&event).unwrap());
+                    (Arc::new(event), json)
+                })
+                .collect();
+            let mut sink = CollectSink::default();
+            let mut idle_sleep = None;
+            let (_ip_tx, mut ip_rx) = tokio::sync::watch::channel(0u64);
+            let (_overflow_tx, mut overflow_rx) = tokio::sync::watch::channel(());
+            let (_drain_tx, mut drain_rx) = tokio::sync::watch::channel(false);
+            let ok = deliver_live_batch(
+                &mut conn,
+                &batch,
+                None,
+                now,
+                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                &mut sink,
+                &mut idle_sleep,
+                &mut ip_rx,
+                &mut overflow_rx,
+                &mut drain_rx,
+            )
+            .await;
+            assert!(ok, "the healthy subscriber must not be disconnected");
+            assert!(!conn.live_overflowed);
+            let delivered = sink.frames.len() + conn.outgoing.len();
+            assert_eq!(
+                delivered, 32,
+                "every live event must be delivered exactly once"
+            );
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn access_changes_notify_idle_watchers() {
+        // The connection loop selects on the access watch; a mutation that
+        // forgets to bump it would leave a banned subscriber silent until
+        // the next matching event (WS-03).
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_relay_with("").await;
+            let changes = relay.subscribe_access();
+            relay.push_access_ops(vec![crate::config::AccessOp::DenyKind { kind: 1 }]);
+            assert!(
+                changes.has_changed().unwrap(),
+                "an access mutation must wake every connection"
+            );
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn sighup_raised_protocol_limit_closes_with_a_reason() {
+        // WS-04: a SIGHUP can raise a limit that tungstenite fixed at
+        // upgrade time. The connection must close promptly with a reason so
+        // an idle client reconnects instead of waiting forever on the old
+        // protocol bound.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_relay_with_limits("", |cfg| {
+                cfg.relay.send_auth_challenge = false;
+                cfg.limits.ws_idle_timeout_secs = 0;
+            })
+            .await;
+            let initial = relay.config.read().await.limits.max_ws_message_bytes;
+            let (addr, server) = spawn_ws_server(Arc::clone(&relay)).await;
+            let mut ws = connect_ws(addr, None).await;
+            relay.config.write().await.limits.max_ws_message_bytes = initial + 1;
+            relay.bump_config_version();
+            let (code, reason) = ws_next_close(&mut ws).await;
+            assert_eq!(code, axum::extract::ws::close_code::AWAY);
+            assert!(
+                reason.contains("reconnect required"),
+                "the close reason must explain the reconnect: {reason:?}"
+            );
+            server.abort();
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn banning_an_authenticated_subscriber_sends_closed() {
+        // WS-03 end to end: the connection is idle after EOSE, so no live
+        // event will trigger the read gate. The access watch must close the
+        // subscription as soon as the ban is applied.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_relay_with_limits("", |cfg| {
+                cfg.limits.ws_idle_timeout_secs = 0;
+            })
+            .await;
+            let (addr, server) = spawn_ws_server(Arc::clone(&relay)).await;
+            let mut ws = connect_ws(addr, None).await;
+            let challenge = ws_next_json(&mut ws).await;
+            assert_eq!(challenge[0], "AUTH", "the server sends a challenge");
+            let challenge = challenge[1].as_str().expect("challenge text");
+            let now = unix_now();
+            let auth = signed_auth_seeded(5, challenge, now);
+            futures_util::SinkExt::send(
+                &mut ws,
+                tokio_tungstenite::tungstenite::Message::Text(
+                    json!(["AUTH", auth]).to_string().into(),
+                ),
+            )
+            .await
+            .unwrap();
+            let ok = ws_next_json(&mut ws).await;
+            assert_eq!(ok[0], "OK");
+            assert_eq!(ok[2], true, "AUTH must succeed: {ok:?}");
+
+            futures_util::SinkExt::send(
+                &mut ws,
+                tokio_tungstenite::tungstenite::Message::Text(
+                    json!(["REQ", "s", {"kinds": [1]}]).to_string().into(),
+                ),
+            )
+            .await
+            .unwrap();
+            let eose = ws_next_json(&mut ws).await;
+            assert_eq!(eose[0], "EOSE", "the subscription is established");
+
+            let keypair = Keypair::from_secret_bytes([5; 32]).unwrap();
+            let pubkey = XOnlyPublicKey::from_keypair(&keypair).0.to_string();
+            let op = crate::config::AccessOp::BanPubkey {
+                pubkey,
+                reason: "test".into(),
+                insensitive: true,
+            };
+            {
+                let mut access = relay.access.write().await;
+                crate::config::apply_access_op(&mut access, &op);
+            }
+            relay.push_access_ops(vec![op]);
+
+            let closed = ws_next_json(&mut ws).await;
+            assert_eq!(closed[0], "CLOSED");
+            assert_eq!(closed[1], "s");
+            assert!(
+                closed[2]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("not allowed to subscribe"),
+                "the ban reason must be visible: {closed:?}"
+            );
+            server.abort();
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn blocked_ip_is_closed_before_the_upgrade_watch_race() {
+        // WS-05: a blockip between the accept-layer check and the watch
+        // subscription is not delivered as a change (the watch's initial
+        // value is already seen). handle_connection re-checks once after
+        // subscribing.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_relay_with("").await;
+            {
+                let mut access = relay.access.write().await;
+                crate::config::apply_access_op(
+                    &mut access,
+                    &crate::config::AccessOp::BlockIp {
+                        ip: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                        reason: "test".into(),
+                    },
+                );
+            }
+            let (addr, server) = spawn_ws_server(Arc::clone(&relay)).await;
+            let mut ws = connect_ws(addr, None).await;
+            assert!(
+                ws_next_text(&mut ws).await.is_none(),
+                "the connection must close before any AUTH/live frame"
+            );
+            server.abort();
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn reconnect_requirement_queues_a_close_reason() {
+        // WS-04: a raised protocol limit must close an idle socket with a
+        // visible reason, not only be observed on the next inbound frame.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            conn.reconnect_required = true;
+            conn.queue_reconnect_close();
+            let frame = conn.outgoing.back().expect("the close frame is queued");
+            match &frame.message {
+                Message::Close(Some(close)) => {
+                    assert_eq!(close.code, axum::extract::ws::close_code::AWAY);
+                    assert!(close.reason.contains("reconnect required"));
+                }
+                other => panic!("expected a Close frame, got {other:?}"),
+            }
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn access_loss_closes_live_subscriptions_without_an_event() {
+        // WS-03: an EOSE'd subscription had no pending response, so a ban
+        // left it silently open until an event happened to match. Reapply
+        // the read gate when access changes.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let sub = "s".to_string();
+            conn.subs
+                .insert(sub.clone(), (vec![Filter::default()], 0, "\"s\"".into()));
+            let banned = "aa".repeat(32);
+            conn.authed_pubkeys.push(banned.clone());
+            conn.relay
+                .access
+                .write()
+                .await
+                .blocked_pubkeys
+                .push((banned, String::new()));
+            conn.enforce_read_authorization().await;
+            assert!(!conn.subs.contains_key(&sub));
+            assert!(
+                outgoing_json(&conn).iter().any(|m| {
+                    m[0] == "CLOSED"
+                        && m[1] == "s"
+                        && m[2]
+                            .as_str()
+                            .unwrap_or("")
+                            .contains("not allowed to subscribe")
+                }),
+                "the subscriber must be told why it was closed"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
     fn tie_drop_delivers_the_over_fetched_older_events() {
         // The tie-drop guard must not throw away the older events the scan
         // already fetched: after dropping the boundary second they are
@@ -6944,6 +7393,38 @@ mod tests {
             assert!(live_pos > eose, "the live event must follow the EOSE");
             conn.relay.db.shutdown();
         });
+    }
+
+    /// A sink that accepts every frame into memory (for live-delivery tests).
+    #[derive(Default)]
+    struct CollectSink {
+        frames: Vec<Message>,
+    }
+
+    impl futures_util::Sink<Message> for CollectSink {
+        type Error = axum::Error;
+        fn poll_ready(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn start_send(self: std::pin::Pin<&mut Self>, item: Message) -> Result<(), Self::Error> {
+            self.get_mut().frames.push(item);
+            Ok(())
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_close(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
     }
 
     /// A sink that never becomes ready: models a peer that stopped reading.
@@ -9796,6 +10277,36 @@ mod tests {
                     Some(Ok(_)) => {}
                 },
                 _ = &mut deadline => panic!("timed out waiting for a websocket reply"),
+            }
+        }
+    }
+
+    /// Waits for the server's Close frame and returns it.
+    async fn ws_next_close<S>(ws: &mut S) -> (u16, String)
+    where
+        S: futures_util::Stream<
+                Item = Result<
+                    tokio_tungstenite::tungstenite::Message,
+                    tokio_tungstenite::tungstenite::Error,
+                >,
+            > + Unpin,
+    {
+        let deadline = tokio::time::sleep(Duration::from_secs(5));
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                msg = futures_util::StreamExt::next(ws) => match msg {
+                    Some(Ok(tokio_tungstenite::tungstenite::Message::Close(Some(close)))) => {
+                        return (u16::from(close.code), close.reason.to_string());
+                    }
+                    Some(Ok(tokio_tungstenite::tungstenite::Message::Close(None))) => {
+                        panic!("the server closed without a reason")
+                    }
+                    Some(Ok(_)) => {}
+                    Some(Err(error)) => panic!("the websocket failed before Close: {error}"),
+                    None => panic!("the websocket ended before Close"),
+                },
+                _ = &mut deadline => panic!("timed out waiting for a Close frame"),
             }
         }
     }

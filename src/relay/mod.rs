@@ -45,7 +45,12 @@ use crate::util::unix_now;
 /// Per-connection live-delivery queue capacity (in batches): a
 /// connection that stops reading is closed when its queue fills so it can
 /// reconnect and resynchronize instead of missing events silently.
-pub(crate) const LIVE_QUEUE_CAPACITY: usize = 64;
+// A REQ/COUNT/NEG database await can keep the connection task from reading
+// its live channel. 512 batches cover ~10 s of maximum-rate traffic at the
+// default 20 ms / 32-event batch, which is far beyond a normal query while
+// keeping the per-connection queue pointers bounded. A longer stall still
+// resynchronizes instead of pinning an unbounded backlog.
+pub(crate) const LIVE_QUEUE_CAPACITY: usize = 512;
 
 /// The bounded per-pubkey publish-rate tracker
 /// (`relay.max_events_per_min_per_pubkey`): a sliding 60-second window of
@@ -383,6 +388,11 @@ pub struct Relay {
     /// never send a frame) are disconnected too — a version counter could
     /// only be observed on an inbound frame.
     pub ip_blocks_tx: tokio::sync::watch::Sender<u64>,
+    /// NIP-86/CLI changes to the pubkey access lists, require-auth policy,
+    /// or other access state: established subscribers re-check whether they
+    /// may still read, so a ban closes their live subscriptions immediately
+    /// instead of waiting for the next matching event.
+    access_tx: tokio::sync::watch::Sender<u64>,
     /// Bumped on every SIGHUP config reload: connections cache the NIP-40/
     /// NIP-42 flags against this version and refresh them only when it
     /// changes, so the hot live path never takes the shared config lock.
@@ -2242,6 +2252,7 @@ impl Relay {
             persist_blossom_allow_lock: tokio::sync::Mutex::new(()),
             persist_relay_field_lock: tokio::sync::Mutex::new(()),
             ip_blocks_tx: tokio::sync::watch::channel(0).0,
+            access_tx: tokio::sync::watch::channel(0).0,
             config_version: AtomicU64::new(0),
             ghost_reclaim_cursor: std::sync::atomic::AtomicUsize::new(0),
             config_tx: tokio::sync::watch::channel(0).0,
@@ -2544,10 +2555,14 @@ impl Relay {
         // No cap: dropping queued intent would lose bans (fail-open). The
         // queue drains on every successful persist and only grows while
         // the database is failing, when the relay is broken anyway.
-        if queued.ops.len() > 1024 {
+        let unpersisted = queued.ops.len();
+        drop(queued);
+        // The caller already applied the mutation to the live access state;
+        // wake idle subscribers so a ban takes effect without an event.
+        self.note_access_changed();
+        if unpersisted > 1024 {
             log::warn!(
-                "access op log holds {} unpersisted mutations; the database is not accepting writes",
-                queued.ops.len()
+                "access op log holds {unpersisted} unpersisted mutations; the database is not accepting writes"
             );
         }
     }
@@ -2669,6 +2684,7 @@ impl Relay {
             }
             merged.restrict_relay = restrict_relay;
             *access = merged;
+            self.note_access_changed();
         } else {
             log::warn!(
                 "access mutations are durable but reloading the merged state failed; \
@@ -2748,6 +2764,9 @@ impl Relay {
                 }
             }
         }
+        // A CLI/daemon change replayed into the live lists must close
+        // subscriptions that are now unauthorized, even with no traffic.
+        self.note_access_changed();
     }
 
     pub fn has_relay_key(&self) -> bool {
@@ -2771,6 +2790,19 @@ impl Relay {
         self.ip_blocks_tx.send_modify(|version| {
             *version = version.wrapping_add(1);
         });
+    }
+
+    /// Notifies every connection that access-control state changed. Live
+    /// subscribers re-check the read verdict and close their subscriptions
+    /// (with CLOSED) when they can no longer read.
+    pub(crate) fn note_access_changed(&self) {
+        self.access_tx.send_modify(|version| {
+            *version = version.wrapping_add(1);
+        });
+    }
+
+    pub(crate) fn subscribe_access(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.access_tx.subscribe()
     }
 
     /// Persists a runtime change of one `[relay]` config field (e.g. the

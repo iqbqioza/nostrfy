@@ -69,6 +69,27 @@ Deploying to Fly.io, AWS, GCP, Azure, Digital Ocean, or any VPS? See the [deploy
 | [Deployment guides](docs/deploy/README.md) | Fly.io, Digital Ocean, AWS, GCP, Azure, any VPS |
 | [Migrating from strfry](docs/MIGRATING-FROM-STRFRY.md) | Step-by-step database migration |
 
+## Sponsored by
+
+<table>
+  <tr>
+    <td align="center">
+      <a href="https://github.com/hasky00">
+        <img src="https://avatars.githubusercontent.com/u/239224029?v=4" width="86px" alt="hasky"/><br />
+        <sub><b>hasky</b></sub>
+      </a>
+    </td>
+  </tr>
+</table>
+
+[Become a sponsor](https://github.com/sponsors/iqbqioza)
+
 ## License
 
 Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option. Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## Contributors
+
+<a align="center" href="https://github.com/iqbqioza/nostrfy/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=iqbqioza/nostrfy" />
+</a>

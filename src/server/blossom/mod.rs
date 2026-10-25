@@ -79,15 +79,24 @@ const MAX_UPLOADS_PER_PUBKEY: usize = 2;
 /// returns it.
 struct UploadSlot {
     state: Arc<BlossomState>,
+    /// Bytes actually reserved so far (not the declared/ceiling size): a
+    /// client that sends no body holds no byte permit.
     reserved: u64,
     pubkey: String,
+    /// Global byte permits acquired chunk by chunk. Dropping the slot
+    /// returns all of them; a stalled upload therefore cannot occupy the
+    /// shared budget before it has sent the bytes.
+    permits: Vec<tokio::sync::OwnedSemaphorePermit>,
 }
 
 impl BlossomState {
     /// Claims an in-flight upload slot for `pubkey`; `None` when this
     /// identity already holds [`MAX_UPLOADS_PER_PUBKEY`] uploads. The
-    /// caller answers 429 before taking a global permit or spooling a body.
-    fn try_register_upload(self: &Arc<Self>, pubkey: &str, reserved: u64) -> Option<UploadSlot> {
+    /// caller answers 429 before spooling a body. Byte permits are NOT
+    /// taken here: the declared Content-Length is untrusted and a chunked
+    /// body has none, so reserving a ceiling up front let a few identities
+    /// hold the whole global budget without sending a byte (M09).
+    fn try_register_upload(self: &Arc<Self>, pubkey: &str) -> Option<UploadSlot> {
         let mut inflight = self
             .uploads_inflight
             .lock()
@@ -96,23 +105,70 @@ impl BlossomState {
         if *count >= MAX_UPLOADS_PER_PUBKEY {
             return None;
         }
-        {
-            let mut reserved_by_identity = self
-                .uploads_reserved
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let held = reserved_by_identity.entry(pubkey.to_string()).or_insert(0);
-            if held.saturating_add(reserved) > self.max_upload_bytes as u64 {
-                return None;
-            }
-            *held = held.saturating_add(reserved);
-        }
         *count += 1;
         Some(UploadSlot {
             state: Arc::clone(self),
-            reserved,
+            reserved: 0,
             pubkey: pubkey.to_string(),
+            permits: Vec::new(),
         })
+    }
+}
+
+impl UploadSlot {
+    /// Reserves `bytes` against both this identity's ceiling and the
+    /// global upload budget, acquiring the global permits incrementally.
+    /// Returns `false` (and leaves the slot unchanged) when either limit
+    /// would be exceeded; the caller aborts the upload with 429.
+    fn try_reserve(&mut self, bytes: u64) -> bool {
+        if bytes == 0 {
+            return true;
+        }
+        let limit = self.state.max_upload_bytes as u64;
+        // Check under the lock, release it while acquiring the global
+        // semaphore, then re-check before committing: two uploads of the
+        // same identity must not race past the per-identity ceiling.
+        {
+            let reserved = self
+                .state
+                .uploads_reserved
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let held = reserved.get(&self.pubkey).copied().unwrap_or(0);
+            if held.saturating_add(bytes) > limit {
+                return false;
+            }
+        }
+        let mut acquired = Vec::new();
+        let mut remaining = bytes;
+        while remaining > 0 {
+            let chunk = remaining.min(u32::MAX as u64) as u32;
+            match self
+                .state
+                .upload_budget
+                .clone()
+                .try_acquire_many_owned(chunk)
+            {
+                Ok(permit) => acquired.push(permit),
+                Err(_) => return false,
+            }
+            remaining -= chunk as u64;
+        }
+        let mut reserved = self
+            .state
+            .uploads_reserved
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let held = reserved.entry(self.pubkey.clone()).or_insert(0);
+        if held.saturating_add(bytes) > limit {
+            // Another upload of this identity won the race; `acquired`
+            // drops here and returns its global permits.
+            return false;
+        }
+        *held = held.saturating_add(bytes);
+        self.reserved = self.reserved.saturating_add(bytes);
+        self.permits.append(&mut acquired);
+        true
     }
 }
 
@@ -140,6 +196,8 @@ impl Drop for UploadSlot {
                 inflight.remove(&self.pubkey);
             }
         }
+        // `self.permits` drops after this body and returns the global
+        // semaphore permits exactly once.
     }
 }
 
@@ -340,6 +398,13 @@ fn auth_server_host(server: &str) -> Option<String> {
     {
         return None;
     }
+    // A trailing dot is the DNS absolute-name spelling of the same host;
+    // normalize it on both sides so `blossom.host = "media.example.com."`
+    // and a token scoped to `media.example.com` agree (BLM-03).
+    let host = host.trim_end_matches('.');
+    if host.is_empty() {
+        return None;
+    }
     Some(host.to_ascii_lowercase())
 }
 
@@ -441,6 +506,11 @@ fn validate_auth_event(
             .trim()
             .trim_start_matches('[')
             .trim_end_matches(']')
+            // A fully-qualified spelling (`relay.example.com.`) names the
+            // same host as the canonical form. Keep the dot stripping for
+            // both the public and relay hosts while retaining the Buzz
+            // wildcard/loopback aliases below.
+            .trim_end_matches('.')
             .to_ascii_lowercase()
     };
     let mut hosts = vec![normalize(host), normalize(relay_host)];
@@ -756,13 +826,15 @@ impl futures_util::Stream for FileChunks {
 /// (a 200-with-the-full-object response must not overrun the range).
 struct S3Chunks {
     stream: std::pin::Pin<
-        Box<dyn futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send>,
+        Box<dyn futures_util::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send>,
     >,
     remaining: u64,
     /// Fires when no chunk arrived within the deadline: the streaming S3
     /// client has no total timeout (to avoid truncating large blobs), so a
     /// stalled connection would otherwise pin the download permit forever.
     stall: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+    /// Test override for the per-chunk stall deadline.
+    stall_timeout: std::time::Duration,
 }
 
 /// How long a single S3 stream chunk may take before the download is
@@ -771,10 +843,29 @@ const S3_STREAM_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 
 impl S3Chunks {
     fn new(resp: reqwest::Response, remaining: u64) -> S3Chunks {
+        use futures_util::StreamExt as _;
+        Self::from_stream(
+            Box::pin(
+                resp.bytes_stream()
+                    .map(|chunk| chunk.map_err(std::io::Error::other)),
+            ),
+            remaining,
+            S3_STREAM_READ_TIMEOUT,
+        )
+    }
+
+    fn from_stream(
+        stream: std::pin::Pin<
+            Box<dyn futures_util::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send>,
+        >,
+        remaining: u64,
+        stall_timeout: std::time::Duration,
+    ) -> S3Chunks {
         S3Chunks {
-            stream: Box::pin(resp.bytes_stream()),
+            stream,
             remaining,
             stall: None,
+            stall_timeout,
         }
     }
 }
@@ -791,38 +882,46 @@ impl futures_util::Stream for S3Chunks {
             return std::task::Poll::Ready(None);
         }
         let this = &mut *self;
-        // The stall timer is (re)armed on every poll where the inner stream
-        // is pending and cleared whenever a chunk arrives.
-        match this.stall.as_mut() {
-            Some(sleep) => {
-                if sleep.as_mut().poll(cx).is_ready() {
-                    return std::task::Poll::Ready(Some(Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "s3 stream stalled",
-                    ))));
-                }
-            }
-            None => {
-                this.stall = Some(Box::pin(tokio::time::sleep(S3_STREAM_READ_TIMEOUT)));
-            }
-        }
-        let chunk = std::task::ready!(this.stream.as_mut().poll_next(cx));
-        match chunk {
-            Some(Ok(bytes)) => {
+        // Poll the upstream stream first. The timer measures an S3 stall,
+        // not the time the downstream client spends not polling us: arming
+        // (and checking) it before the inner poll made a client that paused
+        // for 60 seconds see a spurious "s3 stream stalled" on resume.
+        match this.stream.as_mut().poll_next(cx) {
+            std::task::Poll::Ready(Some(Ok(bytes))) => {
                 this.stall = None;
                 let take = (bytes.len() as u64).min(this.remaining) as usize;
                 this.remaining -= take as u64;
                 if take == 0 {
                     return std::task::Poll::Ready(None);
                 }
-                std::task::Poll::Ready(Some(Ok(bytes.slice(..take))))
+                return std::task::Poll::Ready(Some(Ok(bytes.slice(..take))));
             }
-            Some(Err(e)) => {
+            std::task::Poll::Ready(Some(Err(e))) => {
                 this.stall = None;
-                std::task::Poll::Ready(Some(Err(std::io::Error::other(e))))
+                return std::task::Poll::Ready(Some(Err(e)));
             }
-            None => std::task::Poll::Ready(None),
+            std::task::Poll::Ready(None) => {
+                this.stall = None;
+                return std::task::Poll::Ready(None);
+            }
+            std::task::Poll::Pending => {}
         }
+        // The upstream is pending: start (or continue) the stall timer. It
+        // is cleared on the next ready chunk above.
+        if this.stall.is_none() {
+            this.stall = Some(Box::pin(tokio::time::sleep(this.stall_timeout)));
+        }
+        if this
+            .stall
+            .as_mut()
+            .is_some_and(|sleep| sleep.as_mut().poll(cx).is_ready())
+        {
+            return std::task::Poll::Ready(Some(Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "s3 stream stalled",
+            ))));
+        }
+        std::task::Poll::Pending
     }
 }
 
@@ -1127,51 +1226,30 @@ async fn put_blob(relay: Arc<Relay>, headers: HeaderMap, body: Body, verb: &str)
             "the upload exceeds the configured size limit",
         );
     }
-    // Reserve the size the spool will actually write BEFORE spooling. The
-    // upload permit is acquired for the same amount (not the ceiling): a
-    // pair of small uploads must not consume four maximum-sized permits.
-    let reserved = declared_len.map_or(max_upload as u64, |len| len.min(max_upload as u64));
-    // Per-identity caps: at most two uploads, and at most one ceiling's
-    // worth of reserved bytes. The count cap alone let two free identities
-    // take all four maximum-sized permits; the byte cap leaves at least
-    // half the global budget for other uploaders while still allowing one
-    // full-size upload per identity.
-    let Some(_upload_slot) = state.try_register_upload(&pubkey, reserved) else {
+    // The per-identity count cap is registered before spooling, but byte
+    // permits are acquired chunk by chunk inside the spool: the declared
+    // Content-Length (or a chunked body with no length) is untrusted, and
+    // reserving it up front let a few identities hold the whole global
+    // budget without sending a byte (M09).
+    let Some(mut upload_slot) = state.try_register_upload(&pubkey) else {
         return error(
             StatusCode::TOO_MANY_REQUESTS,
             "too many uploads in progress",
         );
-    };
-    let permits = match state
-        .upload_budget
-        .clone()
-        .try_acquire_many_owned(reserved.min(u32::MAX as u64) as u32)
-    {
-        Ok(permit) => permit,
-        Err(_) => {
-            return error(
-                StatusCode::TOO_MANY_REQUESTS,
-                "too many uploads in progress",
-            );
-        }
     };
     // Spool on the blob filesystem when possible: the final store is then a
     // rename (no second full write). A missing/uncreatable directory falls
     // back to the system temp dir, and that fallback is reserved against
     // `/tmp` (not the blob filesystem whose floor does not cover it).
     let drain = relay.subscribe_drain();
-    let spool_dir = state.store.spool_dir();
-    let spool_dir = match spool_dir.as_deref() {
-        Some(dir) => match tokio::fs::create_dir_all(dir).await {
-            Ok(()) => Some(dir),
-            Err(_) => None,
-        },
-        None => None,
-    };
-    let _spool_space = match if spool_dir.is_some() {
-        state.store.reserve_space(reserved)
+    // A symlinked `.spool` is refused and falls back to the system temp
+    // directory; `create_dir_all` would otherwise follow the link.
+    let spool_dir = state.store.prepare_spool_dir().await;
+    let spool_dir = spool_dir.as_deref();
+    let mut spool_space = match if spool_dir.is_some() {
+        state.store.reserve_space(0)
     } else {
-        state.store.reserve_temp_space(reserved)
+        state.store.reserve_temp_space(0)
     } {
         Ok(guard) => guard,
         Err(_) => return error(StatusCode::INSUFFICIENT_STORAGE, "storage is full"),
@@ -1179,10 +1257,12 @@ async fn put_blob(relay: Arc<Relay>, headers: HeaderMap, body: Body, verb: &str)
     let (path, size, sha) = match spool_upload(
         body,
         max_upload as u64,
-        reserved,
+        declared_len,
         idle_timeout,
         spool_dir,
         Some(drain.clone()),
+        Some(&mut upload_slot),
+        Some(&mut spool_space),
     )
     .await
     {
@@ -1223,7 +1303,6 @@ async fn put_blob(relay: Arc<Relay>, headers: HeaderMap, body: Body, verb: &str)
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => cleanup.disarm(),
         Err(_) => {}
     }
-    drop(permits);
     match result {
         Ok((desc, existed)) => {
             // Buzz uploads to the relay origin (its HTTP base URL), so the
@@ -1289,19 +1368,23 @@ const MAX_UPLOAD_TOTAL_SECS: u64 = 900;
 /// Spools an upload to disk while hashing it. The request body is never
 /// materialized in one `Bytes` allocation, and the size limit is enforced
 /// while reading rather than after the extractor has buffered the body.
-/// `reserved` is the disk space the caller reserved for this upload (the
-/// declared Content-Length, or the ceiling for a chunked body): the spool
-/// refuses to write past it, so the reservation always covers the spool.
+/// `declared_len` is the optional Content-Length: a body that overruns it
+/// is rejected. The byte/disk reservations are grown per received chunk
+/// through `slot`/`space` (the test-only calls pass `None`), so a client
+/// that declares a ceiling but sends nothing holds no permit.
 /// `idle_timeout` bounds the wait for the next chunk and the rate-derived
 /// total deadline bounds the whole body, so a stalled or trickled upload
 /// (slow-loris) cannot pin an upload permit or a temp file forever.
+#[allow(clippy::too_many_arguments)]
 async fn spool_upload(
     body: Body,
     max_upload: u64,
-    reserved: u64,
+    declared_len: Option<u64>,
     idle_timeout: std::time::Duration,
     spool_dir: Option<&std::path::Path>,
     drain: Option<tokio::sync::watch::Receiver<bool>>,
+    mut slot: Option<&mut UploadSlot>,
+    mut space: Option<&mut storage::SpaceReservation<'_>>,
 ) -> Result<(std::path::PathBuf, u64, String), Box<Response>> {
     use futures_util::StreamExt;
     use sha2::{Digest, Sha256};
@@ -1352,7 +1435,8 @@ async fn spool_upload(
     // `http_read_timeout_secs` must not override it, or one body could pin
     // an upload permit for hours.
     let rate_budget = std::time::Duration::from_secs(
-        (reserved / MIN_UPLOAD_RATE_BYTES_PER_SEC).clamp(1, MAX_UPLOAD_TOTAL_SECS),
+        (declared_len.unwrap_or(max_upload) / MIN_UPLOAD_RATE_BYTES_PER_SEC)
+            .clamp(1, MAX_UPLOAD_TOTAL_SECS),
     );
     let started = tokio::time::Instant::now();
     let total_deadline = started
@@ -1407,13 +1491,31 @@ async fn spool_upload(
                 "upload exceeds the configured size limit",
             )));
         }
-        if size > reserved {
-            // The body overran the space the caller reserved for it (a
-            // body larger than its declared Content-Length): abort instead
-            // of writing past what the disk reservation covers.
+        if declared_len.is_some_and(|declared| size > declared) {
+            // The body overran its declared Content-Length.
             return Err(Box::new(error(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "upload exceeds the declared size",
+            )));
+        }
+        // Reserve the bytes actually received, before writing them. The
+        // global/per-identity permit and the disk guard both grow with the
+        // body, so a stalled or tiny body cannot hold a ceiling-sized
+        // reservation (M09).
+        if let Some(slot) = slot.as_deref_mut()
+            && !slot.try_reserve(chunk.len() as u64)
+        {
+            return Err(Box::new(error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "too many uploads in progress",
+            )));
+        }
+        if let Some(space) = space.as_deref_mut()
+            && space.grow(chunk.len() as u64).is_err()
+        {
+            return Err(Box::new(error(
+                StatusCode::INSUFFICIENT_STORAGE,
+                "storage is full",
             )));
         }
         hash.update(&chunk);
@@ -1937,6 +2039,7 @@ pub(crate) fn host_is_blossom(blossom_host: &str, host_header: Option<&str>) -> 
 mod tests {
     use super::*;
     use crate::event::Event;
+    use futures_util::StreamExt as _;
     use secp256k1::{Keypair, XOnlyPublicKey};
 
     #[tokio::test]
@@ -2119,22 +2222,52 @@ mod tests {
     #[tokio::test]
     async fn s3_chunks_caps_at_remaining_bytes() {
         use futures_util::StreamExt as _;
-        let chunks: Vec<Result<bytes::Bytes, reqwest::Error>> = vec![
+        let chunks: Vec<Result<bytes::Bytes, std::io::Error>> = vec![
             Ok(bytes::Bytes::from_static(&[1, 2, 3])),
             Ok(bytes::Bytes::from_static(&[4, 5, 6, 7, 8])),
             Ok(bytes::Bytes::from_static(&[9])),
         ];
-        let stream = S3Chunks {
-            stream: Box::pin(futures_util::stream::iter(chunks)),
-            remaining: 7,
-            stall: None,
-        };
+        let stream = S3Chunks::from_stream(
+            Box::pin(futures_util::stream::iter(chunks)),
+            7,
+            S3_STREAM_READ_TIMEOUT,
+        );
         let mut out = Vec::new();
         futures_util::pin_mut!(stream);
         while let Some(chunk) = stream.next().await {
             out.extend_from_slice(&chunk.unwrap());
         }
         assert_eq!(out, vec![1, 2, 3, 4, 5, 6, 7], "the cap is byte-exact");
+    }
+
+    #[tokio::test]
+    async fn s3_chunks_resume_after_a_slow_downstream_pause() {
+        // BLM-02: the stall timer must measure an S3 stall, not the time the
+        // HTTP client spends not polling the response. A client that pauses
+        // longer than the deadline and then resumes must receive the ready
+        // upstream chunk, not a spurious timeout.
+        use futures_util::StreamExt as _;
+        let stream = futures_util::stream::once(async {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"ok"))
+        });
+        let mut chunks =
+            S3Chunks::from_stream(Box::pin(stream), 2, std::time::Duration::from_millis(10));
+        // Poll once, then let both the upstream chunk and the stall timer
+        // become ready while the downstream is paused.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(1), chunks.next())
+                .await
+                .is_err(),
+            "the first poll must be pending"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let chunk = chunks
+            .next()
+            .await
+            .expect("the ready upstream chunk must be served")
+            .expect("the chunk must be valid");
+        assert_eq!(&chunk[..], b"ok");
     }
 
     #[tokio::test]
@@ -2490,8 +2623,10 @@ mod tests {
             "the small upload fits the free space and must not 507"
         );
 
-        // Both paths agree on a declared size that needs the full ceiling:
-        // the headroom cannot cover it, so preflight and PUT both 507.
+        // The preflight still compares the declared ceiling with the
+        // headroom (it cannot know the eventual body size), but the PUT
+        // reserves only the bytes it receives: a small body behind a huge
+        // declaration must succeed because it fits the actual space.
         let ceiling = state_of(&relay)
             .await
             .expect("blossom state")
@@ -2501,7 +2636,10 @@ mod tests {
         headers.insert("x-content-length", ceiling.to_string().parse().unwrap());
         let resp = head_preflight(relay.clone(), headers, "upload").await;
         assert_eq!(resp.status(), StatusCode::INSUFFICIENT_STORAGE);
-        let (mut headers, _) = auth_headers_scoped("upload", Some(&sha));
+
+        let data2 = b"a small body with a large declared ceiling";
+        let sha2 = sha256_hex(data2);
+        let (mut headers, _) = auth_headers_scoped("upload", Some(&sha2));
         headers.insert(
             axum::http::header::CONTENT_LENGTH,
             ceiling.to_string().parse().unwrap(),
@@ -2513,24 +2651,37 @@ mod tests {
         let resp = upload(
             State(relay.clone()),
             headers,
-            Body::from(bytes::Bytes::copy_from_slice(data)),
+            Body::from(bytes::Bytes::copy_from_slice(data2)),
         )
         .await;
-        assert_eq!(resp.status(), StatusCode::INSUFFICIENT_STORAGE);
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "the actual body fits even though the declared ceiling does not"
+        );
 
-        // A chunked body (no Content-Length) reserves the full ceiling:
-        // near the floor it is refused rather than allowed to overshoot the
-        // reservation (BUD-06 has no no-length preflight; its declared size
-        // can never promise more than this case).
-        let (headers, _) = auth_headers_scoped("upload", Some(&sha));
+        // A chunked body has no declared size: its chunks reserve only the
+        // bytes actually received, so a small body also fits.
+        let data3 = b"a small chunked body";
+        let sha3 = sha256_hex(data3);
+        let (headers, _) = auth_headers_scoped("upload", Some(&sha3));
         let resp = upload(
             State(relay.clone()),
             headers,
-            Body::from(bytes::Bytes::copy_from_slice(data)),
+            Body::from(bytes::Bytes::copy_from_slice(data3)),
         )
         .await;
-        assert_eq!(resp.status(), StatusCode::INSUFFICIENT_STORAGE);
-
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "a chunked body must reserve its actual bytes, not the ceiling"
+        );
+        drop(_held);
+        assert_eq!(
+            state.store.reserved_bytes(),
+            0,
+            "all actual-byte reservations must be released"
+        );
         relay.db.shutdown();
     }
 
@@ -2834,62 +2985,67 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn one_pubkey_cannot_hold_every_upload_permit() {
+    async fn stalled_chunked_uploads_do_not_consume_the_global_budget() {
+        // M09: four free identities each open one chunked PUT and send no
+        // bytes. Before the fix each reserved the full ceiling and the
+        // global byte semaphore was exhausted; now the byte/disk permits
+        // grow only with received chunks, so the budget stays available.
         let relay = build_blossom_relay(0).await;
-        // Long enough that the stalled uploads stay pending while the
-        // second identity uploads.
         relay.config.write().await.limits.http_read_timeout_secs = 30;
         let state = state_of(&relay).await.expect("blossom state");
         let data = b"another uploader's blob";
         let sha = sha256_hex(data);
-        let (headers_a, pk_a) = auth_headers_scoped("upload", Some(&sha));
         let pending = || {
             Body::from_stream(futures_util::stream::pending::<
                 Result<bytes::Bytes, std::io::Error>,
             >())
         };
-        // Pubkey A's first stalled upload has no Content-Length, so it
-        // reserves the full ceiling and consumes the identity's whole byte
-        // budget. A second stalled upload must be refused, leaving the
-        // global budget for another identity.
-        let stalled = vec![tokio::spawn(upload(
-            State(relay.clone()),
-            headers_a.clone(),
-            pending(),
-        ))];
-        let mut a_slots = 0;
+        let mut stalled = Vec::new();
+        for seed in [3u8, 4, 5, 6] {
+            let (headers, _) = auth_headers_scoped_with_key(&[seed; 32], "upload", Some(&sha));
+            stalled.push(tokio::spawn(upload(
+                State(relay.clone()),
+                headers,
+                pending(),
+            )));
+        }
         for _ in 0..200 {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            a_slots = state
+            if state
                 .uploads_inflight
                 .lock()
                 .unwrap()
-                .get(&pk_a)
+                .values()
                 .copied()
-                .unwrap_or(0);
-            if a_slots >= 1 {
+                .sum::<usize>()
+                >= 4
+            {
                 break;
             }
         }
         assert_eq!(
-            a_slots, 1,
-            "the stalled upload must register its identity slot and byte budget"
+            state
+                .uploads_inflight
+                .lock()
+                .unwrap()
+                .values()
+                .copied()
+                .sum::<usize>(),
+            4,
+            "all four sybil identities must be registered"
         );
-        assert_eq!(
-            state.uploads_reserved.lock().unwrap().get(&pk_a).copied(),
-            Some(state.max_upload_bytes as u64),
-            "the identity must hold exactly one ceiling of reserved bytes"
+        assert!(
+            state.uploads_reserved.lock().unwrap().is_empty(),
+            "a body-less upload must hold no per-identity bytes"
         );
-        // A third upload by A is refused before it can take a permit.
-        let before = state.upload_budget.available_permits();
-        let resp = upload(State(relay.clone()), headers_a, pending()).await;
-        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(
             state.upload_budget.available_permits(),
-            before,
-            "a refused upload must not take a global permit"
+            state.max_upload_bytes.saturating_mul(4).max(1),
+            "a body-less upload must hold no global byte permit"
         );
-        // Another identity still uploads: A cannot hold the whole budget.
+
+        // A normal upload from another identity still succeeds while all
+        // four stalled requests are alive.
         let (headers_b, _) = auth_headers_scoped_with_key(&[7u8; 32], "upload", Some(&sha));
         let resp = upload(
             State(relay.clone()),
@@ -2900,9 +3056,9 @@ mod tests {
         assert_eq!(
             resp.status(),
             StatusCode::CREATED,
-            "another uploader must succeed while one identity is saturated"
+            "the global budget must remain available to another uploader"
         );
-        // Cancelling the stalled uploads returns every slot and permit.
+
         for handle in &stalled {
             handle.abort();
         }
@@ -2936,15 +3092,18 @@ mod tests {
         let relay = build_blossom_relay(1).await;
         relay.config.write().await.limits.http_read_timeout_secs = 30;
         let state = state_of(&relay).await.expect("blossom state");
-        let data = b"cancelled blob";
+        let data = b"x";
         let sha = sha256_hex(data);
         let (headers, pk) = auth_headers_scoped("upload", Some(&sha));
         let handle = tokio::spawn(upload(
             State(relay.clone()),
             headers,
-            Body::from_stream(futures_util::stream::pending::<
-                Result<bytes::Bytes, std::io::Error>,
-            >()),
+            Body::from_stream(
+                futures_util::stream::once(async {
+                    Ok::<_, std::io::Error>(bytes::Bytes::from_static(data))
+                })
+                .chain(futures_util::stream::pending()),
+            ),
         ));
         // Wait until the handler holds its slot, permit and reservation.
         let permits_full = state.max_upload_bytes.saturating_mul(4).max(1);
@@ -3019,8 +3178,10 @@ mod tests {
         let result = spool_upload(
             Body::from_stream(stream),
             64 * 1024,
-            64 * 1024,
+            Some(64 * 1024),
             std::time::Duration::from_secs(1),
+            None,
+            None,
             None,
             None,
         )
@@ -3043,6 +3204,30 @@ mod tests {
         assert_eq!(
             validate_auth_event(&ev, host, host, "upload", Some(&sha), now),
             Some(ev.pubkey.clone())
+        );
+        // A configured FQDN with the absolute-name trailing dot and a
+        // token scoped to the bare host are the same server (BLM-03).
+        assert_eq!(
+            validate_auth_event(
+                &ev,
+                "media.example.com.",
+                "media.example.com.",
+                "upload",
+                Some(&sha),
+                now,
+            ),
+            Some(ev.pubkey.clone())
+        );
+        let dotted = auth_event(
+            now,
+            "upload",
+            Some(now + 300),
+            Some(&sha),
+            Some("media.example.com."),
+        );
+        assert_eq!(
+            validate_auth_event(&dotted, host, host, "upload", Some(&sha), now),
+            Some(dotted.pubkey.clone())
         );
         // BUD-11: the `expiration` tag is mandatory.
         let ev = auth_event(now, "upload", None, Some(&sha), Some(host));

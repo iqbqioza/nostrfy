@@ -586,16 +586,17 @@ fn host_route_allowed(
     path: &str,
     method: &axum::http::Method,
 ) -> bool {
-    // Liveness is host-agnostic: platform probes (Docker, Fly, Kubernetes)
-    // may send any Host header, and `api_host` must not turn them unhealthy.
-    if path == "/live" {
+    // Health and liveness are host-agnostic: platform probes (Docker,
+    // Fly, Kubernetes) may send any Host header, and `api_host` must not
+    // turn a healthy relay unhealthy. `/api/v1` and `/metrics` remain
+    // isolated to the API host.
+    if path == "/live" || path == "/health" {
         return true;
     }
     let is_api = !api_host.is_empty() && host == api_host;
     let is_blossom = !blossom_host.is_empty() && host == blossom_host;
     let is_relay = !is_api && !is_blossom;
-    let api_path = !api_host.is_empty()
-        && (path.starts_with("/api/v1") || path == "/health" || path == "/metrics");
+    let api_path = !api_host.is_empty() && (path.starts_with("/api/v1") || path == "/metrics");
     // The root `/` is dispatched by the WS handler (relay info or Blossom
     // server info) for reads, so it must pass through on the Blossom host.
     // The relay host's root also carries the NIP-86 management RPC (POST),
@@ -5558,6 +5559,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn health_reports_map_full_as_unavailable() {
+        // A `MapFull` commit is a permanent write refusal until restart
+        // with a larger map, even though the writer thread is alive. It
+        // must surface as 503 (the same storage-full reason as a full
+        // disk), not as a healthy 200.
+        let relay = blossom_relay().await;
+        relay.db.force_map_full();
+        let response = health_handler(State(relay.clone())).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
     async fn the_stats_endpoint_withholds_the_storage_oracle() {
         // `/relay/stats` needs no token and the router adds a wildcard
         // `Access-Control-Allow-Origin`, so any web page can read it
@@ -6551,6 +6565,18 @@ mod tests {
                 &axum::http::Method::GET
             ));
         }
+        // `/health` is host-agnostic even with api_host set: the relay
+        // host (Docker/Fly probes default) and the API/Blossom hosts all
+        // answer it, while `/api/v1` and `/metrics` stay isolated.
+        for host in ["relay.example.com", "api.test", "media.test"] {
+            assert!(host_route_allowed(
+                "api.test",
+                "media.test",
+                host,
+                "/health",
+                &axum::http::Method::GET
+            ));
+        }
         // blossom only (api_host unset): relay paths stay reachable.
         assert!(host_route_allowed(
             "",
@@ -6624,8 +6650,9 @@ mod tests {
             "/not-a-sha256.png",
             &axum::http::Method::HEAD
         ));
-        // Single-segment relay endpoints stay off the media host.
-        assert!(!host_route_allowed(
+        // `/health` is host-agnostic (platform probes); other
+        // single-segment relay endpoints stay off the media host.
+        assert!(host_route_allowed(
             "",
             "media.test",
             "media.test",
@@ -6688,7 +6715,7 @@ mod tests {
             "/ws",
             &axum::http::Method::GET
         ));
-        assert!(!host_route_allowed(
+        assert!(host_route_allowed(
             "api.example.com",
             "media.test",
             "relay.example.com",
