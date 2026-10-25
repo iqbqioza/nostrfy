@@ -1240,8 +1240,14 @@ impl DbClient {
     ) -> Result<DbClient> {
         // One-time migration: databases written before the pubkey lists
         // moved into their own key still carry them inside the `access`
-        // blob — copy them over so existing bans/allowlists survive.
+        // blob — copy them over so existing bans/allowlists survive. Hold
+        // the same cross-process access lock as the CLI and NIP-86 write
+        // paths: without it a concurrent CLI ban can be overwritten by this
+        // migration's stale snapshot (DB-L01).
+        let _access_migration_lock = lock_access_state(&cfg.path)
+            .map_err(|e| anyhow::anyhow!("cannot lock the access state for migration: {e}"))?;
         store.migrate_access_pubkeys()?;
+        drop(_access_migration_lock);
         log::info!("access control migration check complete");
         // The store is built before the thread plumbing exists, so the
         // shutdown cancellation flag is attached here, before any reader

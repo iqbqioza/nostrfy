@@ -792,10 +792,14 @@ pub(crate) fn spawn(
         match store.gift_wrap_index_needs_rebuild() {
             Ok(true) => match store.rebuild_gift_wrap_index() {
                 Ok(n) => log::info!("gift-wrap recipient index rebuilt ({n} recipients)"),
-                Err(e) => log::warn!("gift-wrap recipient index rebuild failed: {e}"),
+                Err(_) if store.cancelled() => {
+                    log::debug!("gift-wrap recipient index rebuild interrupted by shutdown")
+                }
+                Err(e) => db_error(&thread_errors, &e),
             },
             Ok(false) => {}
-            Err(e) => log::warn!("gift-wrap recipient index check failed: {e}"),
+            Err(_) if store.cancelled() => {}
+            Err(e) => db_error(&thread_errors, &e),
         }
         // Resume interrupted NIP-62 vanishes before serving any message: a
         // crash or store error mid-walk left the pending record, and the
@@ -833,9 +837,13 @@ pub(crate) fn spawn(
         match store.meta_needs_rebuild() {
             Ok(true) => match store.rebuild_event_meta() {
                 Ok(n) => log::info!("event metadata index rebuilt ({n} events)"),
+                Err(_) if store.cancelled() => {
+                    log::debug!("event metadata index rebuild interrupted by shutdown")
+                }
                 Err(e) => db_error(&thread_errors, &e),
             },
             Ok(false) => {}
+            Err(_) if store.cancelled() => {}
             Err(e) => {
                 // A failed check must not silently skip the rebuild (that
                 // would keep serving a database with a missing meta index):
@@ -843,9 +851,27 @@ pub(crate) fn spawn(
                 db_error(&thread_errors, &e);
                 match store.rebuild_event_meta() {
                     Ok(n) => log::info!("event metadata index rebuilt ({n} events)"),
+                    Err(_) if store.cancelled() => {
+                        log::debug!("event metadata index rebuild interrupted by shutdown")
+                    }
                     Err(e) => db_error(&thread_errors, &e),
                 }
             }
+        }
+        // Revalidate NIP-26 delegation tags stored by older binaries before
+        // the intake verifier ran: forged tags must not remain in a victim's
+        // `authors` feed (N-04).
+        match store.delegation_check_needs_rebuild() {
+            Ok(true) => match store.recheck_delegation_indexes() {
+                Ok(n) => log::info!("NIP-26 delegation index rechecked ({n} tagged events)"),
+                Err(_) if store.cancelled() => {
+                    log::debug!("NIP-26 delegation index recheck interrupted by shutdown")
+                }
+                Err(e) => db_error(&thread_errors, &e),
+            },
+            Ok(false) => {}
+            Err(_) if store.cancelled() => {}
+            Err(e) => db_error(&thread_errors, &e),
         }
         // One-time backfill of the Blossom uploaded-order index (BUD-12
         // paging): databases written before the index existed page from
@@ -854,9 +880,13 @@ pub(crate) fn spawn(
         match store.blossom_order_needs_rebuild() {
             Ok(true) => match store.rebuild_blossom_order() {
                 Ok(n) => log::info!("blossom uploaded-order index rebuilt ({n} owners)"),
+                Err(_) if store.cancelled() => {
+                    log::debug!("blossom uploaded-order index rebuild interrupted by shutdown")
+                }
                 Err(e) => db_error(&thread_errors, &e),
             },
             Ok(false) => {}
+            Err(_) if store.cancelled() => {}
             Err(e) => db_error(&thread_errors, &e),
         }
         // One-time backfill of the NIP-50 word index: a database that ran
