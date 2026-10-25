@@ -861,7 +861,7 @@ async fn restore_role_state(relay: &Relay) -> Result<()> {
     // the state the relay is about to serve.
     relay.heal_rotated_role_state().await;
     // Republish the NIP-43 roster on every start: it carries the relay's own
-    // owner identities (NIP-11 pubkey/self and the NIP-86 admin) and, on a
+    // owner identities (NIP-11 pubkey and the NIP-86 admin) and, on a
     // closed relay, the allowlist. Without this an open relay has no 13534 at
     // all, and a list edited while the daemon was down is stale.
     if relay.relay_pubkey().is_some() && relay.config.read().await.nip_enabled(43) {

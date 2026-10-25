@@ -126,12 +126,25 @@ impl super::Relay {
             return PutOutcome::Invalid("rate-limited: too many events".into());
         }
 
+        let mut created_new = false;
         let metadata = {
             let mut groups = self.groups.write().await;
             let existing = groups.groups.get(&channel).cloned();
             if let Some(mut group) = existing {
                 if group.channel_type != "dm" {
+                    self.publish_rate_rollback(&event.pubkey, now);
                     return PutOutcome::Invalid("invalid: that channel is not a DM".into());
+                }
+                // Never acknowledge an existing DM that some requested
+                // participant cannot read (an admin may have removed one).
+                // Do not drop the group here: unlike the create path below,
+                // it predates this command and its metadata/history may be
+                // stored. Rejecting leaves it untouched for its members.
+                if !participants.iter().all(|pk| group.is_member(pk)) {
+                    self.publish_rate_rollback(&event.pubkey, now);
+                    return PutOutcome::Invalid(
+                        "restricted: not a member of this DM channel".into(),
+                    );
                 }
                 // Opening an existing DM re-surfaces it from the viewer's
                 // hidden set. A DM's metadata and writes stay member-only.
@@ -167,6 +180,7 @@ impl super::Relay {
                 );
                 let relay_pubkey = self.relay_pubkey_ref().unwrap_or_default();
                 let mut emitted = groups.apply(&create, relay_pubkey, now, true, false);
+                created_new = groups.groups.contains_key(&channel);
                 // Add every other participant as a plain member. The
                 // creator stays the admin; participants must not be able to
                 // remove each other through the DM.
@@ -202,10 +216,14 @@ impl super::Relay {
                 .is_some_and(|group| participants.iter().all(|pk| group.is_member(pk)));
             if !complete {
                 drop(groups);
-                // Roll back the in-memory create: no metadata was stored, so
-                // leaving the partial group would expose a half-initialized
-                // channel to later reads.
-                self.groups.write().await.groups.remove(&channel);
+                // Roll back only a group this command just created: no
+                // metadata was stored, so leaving the partial group would
+                // expose a half-initialized channel to later reads. An
+                // existing group is left untouched (its history may be
+                // stored; a concurrent removal must not delete it).
+                if created_new {
+                    self.groups.write().await.rollback_unstored_group(&channel);
+                }
                 self.publish_rate_rollback(&event.pubkey, now);
                 return PutOutcome::Invalid("error: could not create the DM channel".into());
             }

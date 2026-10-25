@@ -8,7 +8,7 @@ use anyhow::{anyhow, bail};
 
 use crate::config::{AccessControl, Config};
 use crate::event::Event;
-use crate::nips::{nip01, nip09, nip13, nip26, nip29, nip40, nip43, nip62, nip70};
+use crate::nips::{nip_ia, nip01, nip09, nip13, nip26, nip29, nip40, nip43, nip62, nip70};
 
 /// Wraps a batch for [`verify_signatures_parallel`] and recovers it
 /// afterwards. The blocking verification tasks need shared ownership
@@ -367,12 +367,14 @@ impl super::Relay {
                     | nip29::MEMBER_REMOVED
                     | nip29::WINDOW_BOUNDS
                     | nip29::THREAD_WINDOW_BOUNDS
+                    | nip_ia::ARCHIVED_IDENTITIES
                     | 30622
             ))
             && Some(event.pubkey.as_str()) != self.relay_pubkey_ref()
         {
             return Precheck::Reject(
-                "blocked: relay-signed group metadata/notices must be published by the relay"
+                "blocked: relay-signed group metadata/notices and NIP-IA snapshots must be \
+                 published by the relay"
                     .into(),
             );
         }
@@ -2096,6 +2098,18 @@ mod tests {
         assert!(
             matches!(out, super::Precheck::Reject(message) if message.contains("metadata")),
             "client-signed 39000 must be rejected even while NIP-29 is disabled"
+        );
+
+        // NIP-IA's archived-identities snapshot is relay state too: a
+        // client-signed 13535 must not be stored as an authoritative answer
+        // to Buzz's archive-state check.
+        let fake_archive = signed_with_seed(7, crate::nips::nip_ia::ARCHIVED_IDENTITIES, vec![]);
+        let out = relay
+            .precheck(&cfg, &access, &fake_archive, now, &[], None, None)
+            .await;
+        assert!(
+            matches!(out, super::Precheck::Reject(ref message) if message.contains("relay-signed")),
+            "client-signed 13535 must be rejected: {out:?}"
         );
         drop(cfg);
         relay.db.shutdown();

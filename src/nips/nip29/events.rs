@@ -21,10 +21,13 @@ use super::{
 /// the event replaces the NIP-29 metadata, because NIP-29's `9002` table
 /// describes it as carrying "all the fields of group-metadata". Buzz-only
 /// settings (topic/purpose/ttl/archived/join_role) are preserved so a
-/// normal client's edit cannot wipe them.
-pub(crate) fn apply_settings(group: &mut Group, event: &Event, buzz: bool) {
+/// normal client's edit cannot wipe them. `history` marks a rebuild replay:
+/// a stored `visibility=private` is then honored as a privacy floor even
+/// with Buzz disabled, so turning the compatibility layer off cannot expose
+/// a Buzz-created private channel whose only privacy marker is NIP-CL's tag.
+pub(crate) fn apply_settings(group: &mut Group, event: &Event, buzz: bool, history: bool) {
     if !buzz {
-        apply_nip29_settings(group, event);
+        apply_nip29_settings(group, event, history);
         return;
     }
     for tag in &event.tags {
@@ -117,12 +120,42 @@ pub(crate) fn apply_settings(group: &mut Group, event: &Event, buzz: bool) {
     }
 }
 
+/// The privacy floor for a stored Buzz/NIP-CL create replayed while Buzz is
+/// off. Plain NIP-29 `9007` carries no metadata (live creates keep their
+/// pre-Buzz default settings), but a Buzz-created private channel may carry
+/// only `visibility=private` on its create; dropping that on a rebuild would
+/// expose its stored messages.
+pub(crate) fn apply_plain_create_privacy(group: &mut Group, event: &Event) {
+    for tag in &event.tags {
+        let value = tag.get(1).map(String::as_str);
+        match tag.first().map(String::as_str) {
+            Some("visibility") if value == Some("private") => {
+                group.settings.private = true;
+                group.settings.restricted = true;
+                group.settings.closed = true;
+            }
+            Some("private") => group.settings.private = true,
+            Some("restricted") => group.settings.restricted = true,
+            Some("closed") => group.settings.closed = true,
+            Some("hidden") => group.settings.hidden = true,
+            _ => {}
+        }
+    }
+}
+
 /// NIP-29's original whole-metadata semantics for `9002`/`9007`: fields
 /// absent from the event are cleared. Buzz-only settings are kept so a plain
 /// NIP-29 edit does not erase state that only another Buzz client can see or
-/// change.
-fn apply_nip29_settings(group: &mut Group, event: &Event) {
+/// change. A Buzz-created channel replayed in plain mode (`buzz_origin`)
+/// instead treats a stored edit as the partial edit it was, so a mode-off
+/// rebuild does not lose its privacy or metadata.
+fn apply_nip29_settings(group: &mut Group, event: &Event, history: bool) {
     let old = group.settings.clone();
+    // A Buzz-created channel always carries a channel_type. On a plain-mode
+    // history replay, a stored partial 9002 (which omits the privacy tags)
+    // must not clear the privacy inherited from the create; a plain group
+    // has no channel_type and keeps the original whole-metadata semantics.
+    let buzz_origin = history && !group.channel_type.is_empty();
     let mut settings = GroupSettings {
         topic: old.topic,
         purpose: old.purpose,
@@ -131,10 +164,28 @@ fn apply_nip29_settings(group: &mut Group, event: &Event) {
         join_role: old.join_role,
         ..GroupSettings::default()
     };
+    if buzz_origin {
+        // Buzz's 9002 is partial. A stored Buzz edit therefore represents
+        // only the fields it carried; preserve the rest while rebuilding a
+        // Buzz-created channel instead of applying plain NIP-29's
+        // whole-metadata replacement. Plain groups (no channel_type) keep
+        // the original full-replacement semantics.
+        settings.name = old.name;
+        settings.picture = old.picture;
+        settings.banner = old.banner;
+        settings.about = old.about;
+        settings.private = old.private;
+        settings.restricted = old.restricted;
+        settings.closed = old.closed;
+        settings.hidden = old.hidden;
+        settings.livekit = old.livekit;
+        settings.supported_kinds = old.supported_kinds;
+    }
     for tag in &event.tags {
         if tag.is_empty() {
             continue;
         }
+        let value = tag.get(1).map(String::as_str);
         match tag[0].as_str() {
             "name" | "picture" | "banner" | "about" => {
                 if let Some(value) = tag.get(1) {
@@ -147,15 +198,83 @@ fn apply_nip29_settings(group: &mut Group, event: &Event) {
                 }
             }
             "private" => settings.private = true,
+            "public" if buzz_origin => settings.private = false,
+            "restricted" if buzz_origin => {
+                settings.restricted = value != Some("false") && value != Some("0")
+            }
+            "closed" if buzz_origin => {
+                settings.closed = value != Some("false") && value != Some("0")
+            }
+            "hidden" if buzz_origin => {
+                settings.hidden = value != Some("false") && value != Some("0")
+            }
+            "livekit" if buzz_origin => {
+                settings.livekit = value != Some("false") && value != Some("0")
+            }
             "restricted" => settings.restricted = true,
             "closed" => settings.closed = true,
             "hidden" => settings.hidden = true,
             "livekit" => settings.livekit = true,
+            "topic" if buzz_origin => {
+                settings.topic = value.filter(|v| !v.is_empty()).map(str::to_string)
+            }
+            "purpose" if buzz_origin => {
+                settings.purpose = value.filter(|v| !v.is_empty()).map(str::to_string)
+            }
+            "ttl" if buzz_origin => {
+                settings.ttl = value
+                    .filter(|v| !v.is_empty())
+                    .and_then(|v| v.parse::<u64>().ok())
+            }
+            "archived" if buzz_origin => {
+                settings.archived = value != Some("false") && value != Some("0")
+            }
+            "join_role" if buzz_origin => {
+                settings.join_role = value.filter(|v| !v.is_empty()).map(str::to_string)
+            }
+            // NIP-CL privacy is only changed during history replay. A
+            // Buzz-created private channel has no NIP-29 `private` tag;
+            // turning Buzz off and then rebuilding from events must not
+            // make its stored messages world-readable. On a plain group,
+            // only `visibility=private` is honored as a privacy floor; on a
+            // Buzz-origin group, `visibility=open` is a stored transition
+            // and clears the Buzz privacy.
+            "visibility" if history => match value {
+                Some("private") => {
+                    settings.private = true;
+                    settings.restricted = true;
+                    settings.closed = true;
+                }
+                Some("open" | "public") if buzz_origin => {
+                    settings.private = false;
+                    settings.restricted = false;
+                    settings.closed = false;
+                }
+                _ => {}
+            },
             "supported_kinds" => {
                 settings.supported_kinds =
                     Some(tag[1..].iter().filter_map(|k| k.parse().ok()).collect())
             }
             _ => {}
+        }
+    }
+    if buzz_origin {
+        if let Some(role) = &settings.join_role {
+            if role == "member" {
+                // Clearing join_role=guest must not open a private channel.
+                settings.restricted &= settings.private;
+            } else {
+                settings.restricted = true;
+            }
+        }
+        if event
+            .tags
+            .iter()
+            .any(|tag| tag.first().is_some_and(|name| name == "t"))
+        {
+            group.labels = super::label_values(event);
+            group.labels.retain(|label| !label.is_empty());
         }
     }
     group.settings = settings;
@@ -384,6 +503,7 @@ pub(crate) fn build_roles_event(
     group: Option<&Group>,
     relay_pubkey: &str,
     now: u64,
+    buzz: bool,
 ) -> Event {
     let mut event = base_event(GROUP_ROLES, gid, relay_pubkey, now);
     if let Some(group) = group {
@@ -398,6 +518,14 @@ pub(crate) fn build_roles_event(
             .values()
             .flat_map(|roles| roles.iter().map(String::as_str))
             .collect();
+        // Buzz's guest/bot tiers are published in 39002 but are not NIP-29
+        // role labels on the member map. List them here as well so the two
+        // relay-generated rosters agree; plain mode never writes these sets
+        // (and must not expose a stale snapshot's Buzz-only state).
+        if buzz {
+            roles.extend(group.guests.iter().map(|_| "guest"));
+            roles.extend(group.bots.iter().map(|_| "bot"));
+        }
         roles.sort_unstable();
         roles.dedup();
         for role in roles {
@@ -690,7 +818,7 @@ mod tests {
             "x".to_string(),
             "y".to_string(),
         ]);
-        apply_settings(&mut group, &edit, true);
+        apply_settings(&mut group, &edit, true, false);
         assert_eq!(group.settings.name, "new name");
         assert!(group.settings.private);
         // Absent fields are left alone (Buzz/NIP-CL partial updates).
@@ -702,7 +830,7 @@ mod tests {
         open.tags[0] = vec![H.to_string(), "g1".into()];
         open.tags
             .push(vec!["visibility".to_string(), "open".to_string()]);
-        apply_settings(&mut group, &open, true);
+        apply_settings(&mut group, &open, true, false);
         assert!(!group.settings.private);
     }
 
@@ -755,6 +883,57 @@ mod tests {
     }
 
     #[test]
+    fn plain_history_replay_preserves_buzz_private_visibility() {
+        // A Buzz private channel is marked with NIP-CL's `visibility`
+        // instead of NIP-29's `private`. If Buzz is turned off and the
+        // group state is rebuilt from stored events, the privacy flag must
+        // survive; otherwise the stored messages become world-readable.
+        let mut group = Group::default();
+        let mut private = base_event(9002, "g1", "relay", 1);
+        private.tags[0] = vec![H.to_string(), "g1".into()];
+        private
+            .tags
+            .push(vec!["visibility".into(), "private".into()]);
+        group.channel_type = "stream".into();
+        apply_settings(&mut group, &private, false, true);
+        assert!(group.settings.private);
+        assert!(group.settings.restricted);
+        assert!(group.settings.closed);
+
+        // A later stored Buzz 9002 is partial: its missing privacy tags must
+        // not clear the private setting during the rebuild.
+        let mut rename = base_event(9002, "g1", "relay", 2);
+        rename.tags[0] = vec![H.to_string(), "g1".into()];
+        rename.tags.push(vec!["name".into(), "renamed".into()]);
+        apply_settings(&mut group, &rename, false, true);
+        assert!(group.settings.private);
+        assert!(group.settings.restricted);
+        assert!(group.settings.closed);
+        assert_eq!(group.settings.name, "renamed");
+
+        // On a Buzz-origin group, visibility=open is a stored Buzz
+        // transition and is honored on replay.
+        let mut buzz_origin = Group {
+            channel_type: "stream".into(),
+            settings: GroupSettings {
+                private: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut open = base_event(9002, "g1", "relay", 3);
+        open.tags[0] = vec![H.to_string(), "g1".into()];
+        open.tags.push(vec!["visibility".into(), "open".into()]);
+        apply_settings(&mut buzz_origin, &open, false, true);
+        assert!(!buzz_origin.settings.private);
+
+        // Live plain NIP-29 still ignores the Buzz-only visibility tag.
+        let mut live = Group::default();
+        apply_settings(&mut live, &private, false, false);
+        assert!(!live.settings.private);
+    }
+
+    #[test]
     fn plain_nip29_edit_replaces_metadata() {
         let mut group = Group::default();
         group.settings.name = "old".into();
@@ -765,7 +944,7 @@ mod tests {
         edit.tags.push(vec!["name".into(), "new".into()]);
         // Plain NIP-29: a 9002 carries the whole metadata. The absent
         // `closed` tag clears it.
-        apply_settings(&mut group, &edit, false);
+        apply_settings(&mut group, &edit, false, false);
         assert_eq!(group.settings.name, "new");
         assert!(!group.settings.closed);
         assert_eq!(

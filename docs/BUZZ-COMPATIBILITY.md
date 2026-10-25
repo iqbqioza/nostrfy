@@ -16,8 +16,9 @@ nostrfy relay as a community.
 With `enabled_buzz = false` the relay keeps the pre-Buzz NIP-29 behavior:
 `9002` replaces the whole group metadata (Buzz mode makes it a partial
 update), `39002` carries bare `p` tags, the creator is the `admin` role,
-and NIP-CL channel tags/guests/bots are ignored. This keeps ordinary
-NIP-29 clients unaffected by the compatibility layer.
+plain `9007` tags are not treated as initial metadata (use `9002`), and
+NIP-CL channel tags/guests/bots are ignored. This keeps ordinary NIP-29
+clients unaffected by the compatibility layer.
 - A relay signing key: set `relay.private_key` (64 hex chars, generated with
   `nostrfy genkey`). Buzz needs the relay's `kind:39000` metadata, system
   messages and membership notices, all signed by this key.
@@ -88,9 +89,12 @@ and publishes them:
   (`stream`, `forum`, `dm`, `workflow`, `system`), `t` labels, `ttl`, `topic`,
   `purpose`, `archived` and `join_role`.
 - `kind:39000` also carries `t` (type, then labels), `P` (creator) and
-  `created_at`; `39001`/`39002` carry the same identity tags.
-- `private` implies member-only writes (Buzz's channel model). A DM or system
-  channel is private unless the create event says `visibility=open`.
+  `created_at`; `39001`/`39002` carry the same identity tags. `39003` lists
+  the `guest` and `bot` tiers alongside the ordinary roles, matching the
+  role column in `39002`.
+- `visibility=private` implies member-only writes (Buzz's channel model). A
+  DM or system channel is private unless the create event says
+  `visibility=open`.
 - Metadata edits are **partial**: a `9002` without a tag leaves that setting
   unchanged; `["visibility","open"]`, an empty string or `["ttl",""]` clears
   the corresponding value. This follows NIP-CL/Buzz; plain NIP-29 clients that
@@ -110,9 +114,10 @@ and publishes them:
   `response:{"channel_id":"..."}` in the OK message.
 
 Client submissions of the relay-signed kinds above (`40099`, `44100`/
-`44101`, `30622`, and the query-time `39005`/`39006` overlays) are rejected.
-`41010`/`41012` are client commands: they are accepted, applied to the
-derived group state, and never stored as ordinary events.
+`44101`, `30622`, the query-time `39005`/`39006` overlays, and the NIP-IA
+`13535` snapshot) are rejected. `41010`/`41012` are client commands: they
+are accepted, applied to the derived group state, and never stored as
+ordinary events.
 
 ## Media
 
@@ -151,14 +156,27 @@ host, because Buzz signs the relay URL it uploads to.
 - A `kind:39005` summary's `reply_count` counts direct replies and
   `descendant_count` currently carries the same value; fully nested reply
   trees are not walked when synthesising the overlay.
+- The legacy `depth_limit` thread path returns the subtree without a
+  `kind:39007` thread-bounds overlay; only the channel-window path emits its
+  `kind:39006` bounds event.
 - DM groups are derived state backed by the group snapshot: the synthetic
   `9007`/`9000` are not stored, so a full group-state rebuild from events
   (after a dropped snapshot, not an ordinary restart) does not recreate a
   DM channel. Hidden-DM sets are snapshot-backed for the same reason.
 - Enabling `enabled_buzz` on an existing relay upgrades the creator role in
-  the restored snapshot, but the stored `39001`/`39002` are republished only
-  on the next metadata or membership change; a restart alone does not
-  rewrite them.
+  the restored snapshot (and disabling it maps a Buzz-created channel's
+  restored `owner` default back to `admin`), but the stored
+  `39001`/`39002` are republished only on the next metadata or membership
+  change; a restart alone does not rewrite them.
+- Re-opening an existing DM whose participant set is incomplete (for example
+  after an admin removed a member) is rejected rather than acknowledged as a
+  partial channel. The existing channel is left intact; an admin can
+  re-admit the member with `kind:9000`.
+- If Buzz is disabled and the group state has to be rebuilt from events,
+  the create's privacy floor is kept and a Buzz-created channel that carries
+  a `channel_type`/`visibility` marker keeps its channel type and metadata.
+  Guest/bot tiers and separate `role` tag grants are replayed with plain
+  NIP-29 semantics and may be lost; the normal snapshot restore keeps them.
 - The bridge inherits the relay's filter bounds: a single filter with more
   than 512 ids/authors/kinds/tag values is rejected, and the over-fetch
   window is capped at 2,000 events. A community with more than 512 channels

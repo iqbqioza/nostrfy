@@ -9,9 +9,9 @@ pub(crate) mod events;
 pub(crate) mod tests;
 
 use events::{
-    apply_settings, build_admins_event, build_members_event, build_membership_notice,
-    build_meta_event, build_participants_event, build_pins_event, build_put_user,
-    build_remove_user, build_remove_users, build_roles_event, build_system_message,
+    apply_plain_create_privacy, apply_settings, build_admins_event, build_members_event,
+    build_membership_notice, build_meta_event, build_participants_event, build_pins_event,
+    build_put_user, build_remove_user, build_remove_users, build_roles_event, build_system_message,
 };
 
 /// Moderation policy implemented here: any user with at least one role (from
@@ -340,6 +340,29 @@ pub fn channel_type(event: &Event) -> String {
         .to_string()
 }
 
+/// Whether a kind:9000 `p` tag leaves the subject with a privileged role.
+///
+/// In Buzz mode the separate `role` tag is authoritative only when the `p`
+/// tag carries no role elements, and the `guest`/`bot` tiers are not
+/// privileged. Validation and apply must agree on this: otherwise the live
+/// last-admin guard can reject a valid role re-assertion, or accept a
+/// `["p", admin, "guest"]` that apply turns into a guest and leaves the
+/// group without an admin.
+fn tag_grants_privileged_role(tag: &[String], buzz: bool, buzz_role: Option<&str>) -> bool {
+    if !buzz {
+        return tag.iter().skip(2).any(|role| !role.is_empty());
+    }
+    let mut any = false;
+    for role in tag.iter().skip(2).filter(|role| !role.is_empty()) {
+        any = true;
+        if role != "guest" && role != "bot" {
+            return true;
+        }
+    }
+    !any && buzz_role
+        .is_some_and(|role| !role.is_empty() && !matches!(role, "guest" | "member" | "bot"))
+}
+
 /// Validates the NIP-CL tags on a create/edit event. The whole event is
 /// rejected on any violation, as NIP-CL requires.
 pub fn validate_channel_tags(event: &Event) -> Result<(), String> {
@@ -357,7 +380,7 @@ pub fn validate_channel_tags(event: &Event) -> Result<(), String> {
     {
         return Err(format!("invalid: unknown channel_type {kind:?}"));
     }
-    if event.kind == 9002
+    if matches!(event.kind, CREATE_GROUP | 9002)
         && let Some(ttl) = tag_value(event, "ttl")
         && !ttl.is_empty()
         && ttl.parse::<u64>().is_err()
@@ -627,18 +650,31 @@ impl GroupStore {
         // exact default: a creator who was demoted (no roles) or explicitly
         // given another role is left alone. Plain NIP-29 keeps `admin`, so
         // disabling Buzz restores the pre-Buzz role label.
-        if self.buzz_enabled {
-            for group in self.groups.values_mut() {
-                let Some(creator) = group.creator.clone() else {
-                    continue;
-                };
-                if let Some(roles) = group.members.get_mut(&creator)
-                    && roles.len() == 1
-                    && roles.contains("admin")
-                {
-                    roles.clear();
-                    roles.insert("owner".to_string());
-                }
+        for group in self.groups.values_mut() {
+            let Some(creator) = group.creator.clone() else {
+                continue;
+            };
+            let Some(roles) = group.members.get_mut(&creator) else {
+                continue;
+            };
+            let upgrade = self.buzz_enabled && roles.len() == 1 && roles.contains("admin");
+            // A Buzz-created channel (it always carries a channel_type) is
+            // restored by a relay that turned Buzz off: keep the documented
+            // plain-NIP-29 creator label instead of exposing the Buzz-only
+            // `owner` role. A plain group has no channel_type, so an
+            // explicitly assigned `owner` role in a normal NIP-29 group is
+            // left untouched.
+            let downgrade = !self.buzz_enabled
+                && !group.channel_type.is_empty()
+                && roles.len() == 1
+                && roles.contains("owner");
+            if upgrade {
+                // Buzz snapshots predating the owner default carry `admin`.
+                roles.clear();
+                roles.insert("owner".to_string());
+            } else if downgrade {
+                roles.clear();
+                roles.insert("admin".to_string());
             }
         }
         self.members_dirty.clear();
@@ -1109,10 +1145,15 @@ impl GroupStore {
                 // Simulate only the p-tag targets: cloning the whole member
                 // map (up to MAX_MEMBERS = 10k entries) for every 9000
                 // event was O(members) memory/CPU per moderation event.
+                let buzz_role = if self.buzz_enabled {
+                    tag_value(event, "role")
+                } else {
+                    None
+                };
                 let mut overrides: HashMap<&str, bool> = HashMap::new();
                 for tag in event.tags.iter().filter(|t| t.len() >= 2 && t[0] == P) {
                     let pk = tag[1].as_str();
-                    let has_roles = tag[2..].iter().any(|r| !r.is_empty());
+                    let has_roles = tag_grants_privileged_role(tag, self.buzz_enabled, buzz_role);
                     overrides.insert(pk, has_roles);
                 }
                 let retains_admin = group.members.iter().any(|(pk, roles)| {
@@ -1228,12 +1269,15 @@ impl GroupStore {
                             group.members.insert(member.clone(), Default::default());
                             // NIP-CL: an unknown stored join_role is treated
                             // as guest (only the explicit "member" grants a
-                            // write-capable role).
-                            if group
-                                .settings
-                                .join_role
-                                .as_deref()
-                                .is_some_and(|role| role != "member")
+                            // write-capable role). This is Buzz-only state:
+                            // a relay that switched Buzz off must not create
+                            // guest markers from a restored Buzz setting.
+                            if self.buzz_enabled
+                                && group
+                                    .settings
+                                    .join_role
+                                    .as_deref()
+                                    .is_some_and(|role| role != "member")
                             {
                                 group.guests.insert(member.clone());
                             }
@@ -1243,29 +1287,27 @@ impl GroupStore {
                     if added {
                         self.total_members = self.total_members.saturating_add(1);
                     }
-                    if emit {
+                    if emit && added {
                         out.push(build_put_user(gid, &member, &[], relay_pubkey, now));
                         out.extend(self.membership_events(gid, relay_pubkey, now));
-                        if added {
-                            let channel_type = self.notice_channel_type(gid);
-                            out.push(build_system_message(
-                                gid,
-                                &member,
-                                Some(&member),
-                                "member_joined",
-                                relay_pubkey,
-                                now,
-                            ));
-                            out.push(build_membership_notice(
-                                MEMBER_ADDED,
-                                gid,
-                                &channel_type,
-                                &member,
-                                &member,
-                                relay_pubkey,
-                                now,
-                            ));
-                        }
+                        let channel_type = self.notice_channel_type(gid);
+                        out.push(build_system_message(
+                            gid,
+                            &member,
+                            Some(&member),
+                            "member_joined",
+                            relay_pubkey,
+                            now,
+                        ));
+                        out.push(build_membership_notice(
+                            MEMBER_ADDED,
+                            gid,
+                            &channel_type,
+                            &member,
+                            &member,
+                            relay_pubkey,
+                            now,
+                        ));
                     }
                 }
             }
@@ -1335,14 +1377,16 @@ impl GroupStore {
                     // race dropped, leaving the group admin-less (B-1).
                     let mut overrides: HashMap<&str, bool> = HashMap::new();
                     for tag in event.tags.iter().filter(|t| t.len() >= 2 && t[0] == P) {
-                        let mut has_roles = tag[2..].iter().any(|r| !r.is_empty());
                         // A Buzz `role=admin|owner|other` tag grants a
                         // privileged role even though the p tag itself has
-                        // no role elements. Without this the guard sees a
-                        // re-assertion of the last admin as a demotion.
-                        if let Some(role) = buzz_role.as_deref() {
-                            has_roles |= !matches!(role, "guest" | "member" | "bot");
-                        }
+                        // no role elements; the guest/bot tiers do not.
+                        // This helper is shared with the live validation so
+                        // the two cannot disagree about the final state.
+                        let has_roles = tag_grants_privileged_role(
+                            tag,
+                            self.buzz_enabled,
+                            buzz_role.as_deref(),
+                        );
                         overrides.insert(tag[1].as_str(), has_roles);
                     }
                     // The retention check must only count grants the
@@ -1424,11 +1468,16 @@ impl GroupStore {
                         // separately for Buzz's 39002), guest is read-only.
                         let mut guest = false;
                         let mut bot = false;
-                        let explicit = !roles.is_empty() || buzz_role.is_some();
+                        // An empty `role` tag carries no role. It must not
+                        // count as an explicit grant (or as a privileged
+                        // role in the last-admin guard).
+                        let explicit = !roles.is_empty()
+                            || buzz_role.as_deref().is_some_and(|role| !role.is_empty());
                         if roles.is_empty()
                             && let Some(role) = buzz_role.as_deref()
                         {
                             match role {
+                                "" => {}
                                 "guest" => guest = true,
                                 "member" => {}
                                 "bot" => bot = true,
@@ -1608,7 +1657,7 @@ impl GroupStore {
                             // make the group public. The live path rejects
                             // such an edit outright.
                             if let Some(group) = self.groups.get_mut(gid) {
-                                apply_settings(group, event, self.buzz_enabled);
+                                apply_settings(group, event, self.buzz_enabled, history_replay);
                             }
                             return Vec::new();
                         }
@@ -1620,7 +1669,7 @@ impl GroupStore {
                     match self.groups.get_mut(gid) {
                         Some(group) => {
                             let livekit_before = group.settings.livekit;
-                            apply_settings(group, event, self.buzz_enabled);
+                            apply_settings(group, event, self.buzz_enabled, history_replay);
                             let children_before = group.children.clone();
                             // Deduplicate while preserving order: a repeated
                             // `child` tag must not list the same child twice.
@@ -1909,25 +1958,66 @@ impl GroupStore {
                     // never reach this arm (guarded above), so there is no
                     // tombstone of theirs to clear here.
                     self.deleted.remove(gid);
+                    // A Buzz-created channel always carries a channel_type.
+                    // Preserve it on a plain-mode history replay so a later
+                    // stored partial 9002 can keep the Buzz privacy floor
+                    // (see `apply_plain_create_privacy`). Live plain creates
+                    // keep the pre-Buzz empty value.
+                    let group_channel_type = if self.buzz_enabled {
+                        channel_type(event)
+                    } else if history_replay {
+                        tag_value(event, "channel_type")
+                            .filter(|kind| CHANNEL_TYPES.contains(kind))
+                            .map(str::to_string)
+                            .unwrap_or_default()
+                    } else {
+                        String::new()
+                    };
                     let mut group = Group {
                         creator: Some(event.pubkey.clone()),
                         created_at: Some(event.created_at),
-                        channel_type: if self.buzz_enabled {
-                            channel_type(event)
-                        } else {
-                            String::new()
-                        },
+                        channel_type: group_channel_type,
                         ..Group::default()
                     };
-                    // NIP-29: the create event carries the initial metadata
-                    // (name/about/private/...); Buzz's kind:9007 also carries
-                    // the NIP-CL visibility, channel_type and label tags.
-                    apply_settings(&mut group, event, self.buzz_enabled);
+                    // Buzz's kind:9007 carries the NIP-CL visibility,
+                    // channel_type, labels and initial metadata; apply them
+                    // fully in Buzz mode. Plain NIP-29 `9007` carries no
+                    // metadata, so live creates keep the pre-Buzz default.
+                    // A plain-mode history replay still honors the privacy
+                    // floor of a stored Buzz create (see
+                    // `apply_plain_create_privacy`).
+                    if self.buzz_enabled {
+                        apply_settings(&mut group, event, true, history_replay);
+                    } else if history_replay {
+                        apply_plain_create_privacy(&mut group, event);
+                        let buzz_marker = group.settings.private
+                            || event
+                                .tags
+                                .iter()
+                                .any(|tag| tag.first().is_some_and(|name| name == "visibility"));
+                        if group.channel_type.is_empty() && buzz_marker {
+                            // A Buzz/NIP-CL marker without an explicit
+                            // channel type still identifies a Buzz create;
+                            // mark it so later partial 9002 replays keep the
+                            // privacy floor and metadata. Plain output
+                            // ignores the field.
+                            group.channel_type = "stream".to_string();
+                        }
+                        if !group.channel_type.is_empty() {
+                            // Preserve the rest of a Buzz create (name,
+                            // topic, labels, DM defaults, ...) on a mode-off
+                            // rebuild. A plain create has no channel_type,
+                            // so its tags stay ignored as before.
+                            apply_settings(&mut group, event, true, history_replay);
+                        }
+                    }
                     // NIP-CL: a DM or system channel is private unless the
                     // create explicitly says otherwise. This is Buzz-only;
                     // in plain NIP-29 the create's NIP-29 `private` tag is
-                    // the only privacy switch.
-                    if self.buzz_enabled
+                    // the only privacy switch. A mode-off history replay
+                    // still applies the Buzz default so a stored DM/system
+                    // create cannot turn its metadata public on a rebuild.
+                    if (self.buzz_enabled || history_replay)
                         && matches!(group.channel_type.as_str(), "dm" | "system")
                         && tag_value(event, "visibility").is_none()
                     {
@@ -2087,6 +2177,7 @@ impl GroupStore {
                     // would skip the fresh 39002, and dead entries would
                     // accumulate alongside the delete tombstones.
                     self.members_published_at.remove(gid);
+                    self.members_dirty.remove(gid);
                     // Children become roots.
                     for child in group.children {
                         if let Some(child_group) = self.groups.get_mut(&child) {
@@ -2239,6 +2330,21 @@ impl GroupStore {
         self.ghost.contains(gid)
     }
 
+    /// Drops a group that was created only for a relay-side synthetic
+    /// command (a Buzz DM open) and whose events were never stored. This is
+    /// an in-memory rollback of state with no history, not a NIP-29 delete:
+    /// no tombstone is needed, but the global member budget and the
+    /// per-group publish throttle must be released with the group.
+    pub(crate) fn rollback_unstored_group(&mut self, gid: &str) -> bool {
+        let Some(group) = self.groups.remove(gid) else {
+            return false;
+        };
+        self.total_members = self.total_members.saturating_sub(group.members.len());
+        self.members_published_at.remove(gid);
+        self.members_dirty.remove(gid);
+        true
+    }
+
     /// Removes `pubkey` from every group's member map (a vanish) and keeps
     /// the global member counter in sync. Returns the affected group ids so
     /// the caller can republish their rosters and relay-signed 9000 mirrors;
@@ -2247,6 +2353,12 @@ impl GroupStore {
         let mut affected = Vec::new();
         for (gid, group) in self.groups.iter_mut() {
             if group.members.remove(pubkey).is_some() {
+                // A vanish must also drop the per-user Buzz tiers and DM
+                // visibility preference; otherwise 39003 keeps advertising
+                // a guest/bot role for a pubkey that is no longer a member.
+                group.guests.remove(pubkey);
+                group.bots.remove(pubkey);
+                group.hidden_for.remove(pubkey);
                 affected.push(gid.clone());
             }
         }
@@ -2391,7 +2503,13 @@ impl GroupStore {
             ),
             // NIP-29's `39003` (the roles in use): small and cheap, so it
             // rides every membership change like the admin list.
-            build_roles_event(gid, self.groups.get(gid), relay_pubkey, now),
+            build_roles_event(
+                gid,
+                self.groups.get(gid),
+                relay_pubkey,
+                now,
+                self.buzz_enabled,
+            ),
         ]);
         let members = self.groups.get(gid).map(|g| g.members.len()).unwrap_or(0);
         let due = members <= MEMBERS_EAGER_MAX

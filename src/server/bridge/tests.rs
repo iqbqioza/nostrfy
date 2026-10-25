@@ -541,6 +541,73 @@ async fn buzz_dm_open_and_hide_publish_group_and_visibility() {
 }
 
 #[tokio::test]
+async fn count_excludes_system_channel_events_unless_the_filter_names_the_channel() {
+    let relay = test_relay().await;
+    let keypair = Keypair::from_secret_bytes([13u8; 32]).unwrap();
+    let channel = "55555555-5555-4555-8555-555555555555";
+    let now = crate::util::unix_now();
+    let create = signed(
+        &keypair,
+        9007,
+        vec![
+            vec!["h".into(), channel.into()],
+            vec!["name".into(), "system".into()],
+            vec!["visibility".into(), "open".into()],
+            vec!["channel_type".into(), "system".into()],
+        ],
+        "",
+        now,
+    );
+    assert!(matches!(
+        relay.accept_event(create, &[], None).await,
+        crate::db::PutOutcome::Stored
+    ));
+    let message = signed(
+        &keypair,
+        9,
+        vec![vec!["h".into(), channel.into()]],
+        "system state",
+        now + 1,
+    );
+    assert!(matches!(
+        relay.accept_event(message, &[], None).await,
+        crate::db::PutOutcome::Stored
+    ));
+
+    let app = super::super::build_router(&relay, None).await;
+    let origin = origin(&relay).await;
+    for (index, (filter, expected)) in [
+        (json!([{ "kinds": [9] }]), 0u64),
+        (json!([{ "kinds": [9], "#h": [channel] }]), 1u64),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let body = serde_json::to_vec(&filter).unwrap();
+        let auth = nip98(
+            &keypair,
+            &origin,
+            "/count",
+            "POST",
+            &body,
+            60 + index as u64,
+        );
+        let response = app
+            .clone()
+            .oneshot(request(Method::POST, "/count", Some(&auth), body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let count = body_json(response).await;
+        assert_eq!(
+            count["count"], expected,
+            "system-channel state must only count when named: {filter}"
+        );
+    }
+    relay.db.shutdown();
+}
+
+#[tokio::test]
 async fn before_id_cursor_splits_a_dense_second_without_duplicates() {
     let relay = test_relay().await;
     let app = super::super::build_router(&relay, None).await;

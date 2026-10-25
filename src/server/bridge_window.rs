@@ -21,7 +21,7 @@ use crate::nips::nip29;
 use crate::relay::Relay;
 use crate::util::unix_now;
 
-use super::bridge::{bad_request, bridge_visible};
+use super::bridge::{bad_request, bridge_visible, nip_cl_visible};
 
 const WINDOW_DEFAULT_LIMIT: usize = 50;
 const WINDOW_MAX_LIMIT: usize = 200;
@@ -302,7 +302,7 @@ async fn channel_window(
     let mut out = rows.clone();
     if include_aux && !rows.is_empty() {
         let row_ids: Vec<String> = rows.iter().map(|event| event.id.clone()).collect();
-        let aux = fetch_aux(relay, cfg, authed, &row_ids).await?;
+        let aux = fetch_aux(relay, cfg, authed, &base_filter, &row_ids).await?;
         out.extend(aux);
     }
     if include_summaries && !rows.is_empty() {
@@ -321,6 +321,7 @@ async fn fetch_aux(
     relay: &Arc<Relay>,
     cfg: &crate::config::Config,
     authed: &str,
+    visible_filter: &Filter,
     row_ids: &[String],
 ) -> Result<Vec<Event>, Response> {
     let nip78_restricted = cfg.nip_enabled(78) && cfg.relay.enabled_nip78_auth;
@@ -361,7 +362,8 @@ async fn fetch_aux(
                     Some(&groups),
                     nip78_restricted,
                     relay.relay_pubkey_ref(),
-                ) {
+                ) || !nip_cl_visible(visible_filter, &event, &groups)
+                {
                     continue;
                 }
                 next.push(event.id.clone());
@@ -416,12 +418,10 @@ async fn thread_summaries(
         ) {
             continue;
         }
-        let parent = event
-            .tags
-            .iter()
-            .filter(|t| t.len() >= 2 && t[0] == "e")
-            .map(|t| t[1].as_str())
-            .find(|id| row_set.contains(id));
+        // Count only the marked reply parent. A nested reply also carries
+        // the root in an `e` tag, so taking the first `e` that names a row
+        // would count the whole subtree as direct replies.
+        let parent = reply_parent(&event).filter(|id| row_set.contains(id));
         let Some(parent) = parent else {
             continue;
         };
@@ -545,6 +545,13 @@ async fn thread_window(
         }
     }
 
+    // The raw filter's own channel constraints decide whether a system
+    // channel's state is visible on this path too. Without this a thread
+    // query that names only an `#e` root could materialize replies from a
+    // system channel it never named, bypassing the NIP-CL exclusion applied
+    // to the ordinary and channel-window paths.
+    let visible_filter: Filter = serde_json::from_value(raw.clone())
+        .map_err(|e| bad_request(&format!("invalid thread filter: {e}")))?;
     let depth_limit = raw
         .get("depth_limit")
         .and_then(Value::as_u64)
@@ -599,7 +606,8 @@ async fn thread_window(
                     Some(&groups),
                     nip78_restricted,
                     relay.relay_pubkey_ref(),
-                ) {
+                ) || !nip_cl_visible(&visible_filter, &event, &groups)
+                {
                     continue;
                 }
                 next.push(event.id.clone());
@@ -627,7 +635,7 @@ async fn thread_window(
     let mut out = replies.clone();
     if include_aux && !replies.is_empty() {
         let ids: Vec<String> = replies.iter().map(|event| event.id.clone()).collect();
-        out.extend(fetch_aux(relay, cfg, authed, &ids).await?);
+        out.extend(fetch_aux(relay, cfg, authed, &visible_filter, &ids).await?);
     }
     Ok(out)
 }

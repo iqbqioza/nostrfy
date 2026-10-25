@@ -332,8 +332,8 @@ impl RoleStore {
     /// `extra_members` lets a relay that enforces an allowlist include those
     /// pubkeys as plain `member` entries, so NIP-43-aware clients (Buzz)
     /// see the same closed community the write gate enforces. `owners` are
-    /// the relay's own identities (NIP-11 `pubkey`/`self` and the NIP-86
-    /// admin); they always carry the `owner` role, which is what Buzz's
+    /// the relay's own administrator identities (NIP-11 `pubkey` and the
+    /// NIP-86 admin); they always carry the `owner` role, which is what Buzz's
     /// community-members panel reads. Owner entries win over an assigned
     /// role so a stale assignment cannot demote the relay operator.
     pub fn membership_event(

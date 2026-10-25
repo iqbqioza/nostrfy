@@ -5803,6 +5803,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dm_open_does_not_delete_an_existing_channel_when_a_participant_was_removed() {
+        let relay = build_relay_with_key(false, &"11".repeat(32)).await;
+        relay.groups.write().await.buzz_enabled = true;
+        relay.config.write().await.relay.enabled_buzz = true;
+
+        let a = secp256k1::Keypair::from_secret_bytes([1u8; 32]).unwrap();
+        let b = secp256k1::Keypair::from_secret_bytes([2u8; 32]).unwrap();
+        let a_pk = secp256k1::XOnlyPublicKey::from_keypair(&a).0.to_string();
+        let b_pk = secp256k1::XOnlyPublicKey::from_keypair(&b).0.to_string();
+        let now = crate::util::unix_now();
+        let open = |from: &str, to: &str| crate::event::Event {
+            id: String::new(),
+            pubkey: from.to_string(),
+            created_at: now,
+            kind: crate::nips::nip29::DM_OPEN,
+            tags: vec![vec!["p".into(), to.to_string()]],
+            content: String::new(),
+            sig: String::new(),
+        };
+
+        let outcome = relay.handle_dm_open(&open(&a_pk, &b_pk), &[]).await;
+        let channel = match &outcome {
+            crate::db::PutOutcome::Duplicate(message) => {
+                let json = message.strip_prefix("response:").expect("DM response");
+                serde_json::from_str::<serde_json::Value>(json).unwrap()["channel_id"]
+                    .as_str()
+                    .expect("channel id")
+                    .to_string()
+            }
+            other => panic!("DM open failed: {other:?}"),
+        };
+
+        // Simulate an admin removing one participant after the DM existed.
+        let relay_pubkey = relay.relay_pubkey().expect("relay key");
+        let remove = crate::event::Event {
+            id: String::new(),
+            pubkey: a_pk.clone(),
+            created_at: now.saturating_add(1),
+            kind: crate::nips::nip29::REMOVE_USER,
+            tags: vec![
+                vec!["h".into(), channel.clone()],
+                vec!["p".into(), b_pk.clone()],
+            ],
+            content: String::new(),
+            sig: String::new(),
+        };
+        relay.groups.write().await.apply(
+            &remove,
+            &relay_pubkey,
+            now.saturating_add(1),
+            false,
+            false,
+        );
+        assert!(
+            !relay
+                .groups
+                .read()
+                .await
+                .group(&channel)
+                .unwrap()
+                .is_member(&b_pk)
+        );
+
+        // Re-opening from the removed participant (or from the remaining
+        // one) cannot make the channel complete again. It must be rejected
+        // without destroying the existing DM for its remaining members.
+        for (from, to) in [(&b_pk, &a_pk), (&a_pk, &b_pk)] {
+            let outcome = relay.handle_dm_open(&open(from, to), &[]).await;
+            assert!(
+                matches!(outcome, crate::db::PutOutcome::Invalid(_)),
+                "an incomplete existing DM must be rejected: {outcome:?}"
+            );
+            assert!(
+                relay.groups.read().await.group(&channel).is_some(),
+                "the existing DM must survive a rejected re-open"
+            );
+        }
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
     async fn full_live_queue_signals_connection_overflow() {
         let (sender, receiver) = tokio::sync::mpsc::channel(crate::relay::LIVE_QUEUE_CAPACITY);
         let (overflow, overflow_rx) = tokio::sync::watch::channel(());

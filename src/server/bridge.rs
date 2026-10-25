@@ -167,7 +167,7 @@ async fn authenticate(
 /// state only when it names the channel (`#h`, or `#d` on the channel-state
 /// kinds), asks for `#t:["system"]`, or has a `#P` creator constraint.
 /// Membership notices carry the channel type too.
-fn nip_cl_visible(filter: &Filter, event: &Event, groups: &nip29::GroupStore) -> bool {
+pub(super) fn nip_cl_visible(filter: &Filter, event: &Event, groups: &nip29::GroupStore) -> bool {
     let gid = nip29::group_id_any(event).or_else(|| {
         if nip29::is_membership_notice_kind(event.kind) {
             event
@@ -595,7 +595,7 @@ pub async fn count(State(relay): State<Arc<Relay>>, headers: HeaderMap, body: By
     }
     let Some((events, approximate)) = relay
         .db
-        .api_count(filters, cfg.limits.max_count, unix_now())
+        .api_count(filters.clone(), cfg.limits.max_count, unix_now())
         .await
     else {
         return (
@@ -615,7 +615,9 @@ pub async fn count(State(relay): State<Arc<Relay>>, headers: HeaderMap, body: By
                 Some(&groups),
                 nip78_restricted,
                 relay.relay_pubkey_ref(),
-            )
+            ) && filters
+                .iter()
+                .any(|filter| filter.matches(*event) && nip_cl_visible(filter, event, &groups))
         })
         .count();
     drop(groups);

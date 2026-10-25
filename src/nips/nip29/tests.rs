@@ -3469,9 +3469,15 @@ fn global_member_budget_is_enforced_and_freed_on_leave() {
     store.apply(&replay, "", 5, true, true);
     assert_eq!(store.total_members, 3);
     assert!(!store.group("g1").unwrap().is_member(&"ff".repeat(32)));
-    // The JOIN path honors the budget on the replay too (B-1).
+    // The JOIN path honors the budget on the replay too (B-1), and a
+    // dropped join must not emit a relay 9000 mirror that could resurrect
+    // the member on a later rebuild.
     let join4 = event(JOIN, &"ab".repeat(32), Some("g1"), vec![]);
-    store.apply(&join4, "", 6, true, true);
+    let joined = store.apply(&join4, "", 6, true, true);
+    assert!(
+        joined.is_empty(),
+        "a capacity-dropped join must emit nothing"
+    );
     assert_eq!(store.total_members, 3);
     assert!(!store.group("g1").unwrap().is_member(&"ab".repeat(32)));
 }
@@ -4427,6 +4433,256 @@ fn buzz_join_role_guest_blocks_posting_and_member_topic_edits() {
 }
 
 #[test]
+fn buzz_channel_create_validates_ttl_and_channel_type() {
+    let mut create = event(
+        CREATE_GROUP,
+        ADMIN,
+        Some("g1"),
+        vec![vec!["ttl".into(), "not-a-number".into()]],
+    );
+    assert!(
+        validate_channel_tags(&create).is_err(),
+        "a malformed create ttl must be rejected like a 9002 edit"
+    );
+    create.tags.retain(|tag| tag[0] != "ttl");
+    create.tags.push(vec!["ttl".into(), "3600".into()]);
+    assert!(validate_channel_tags(&create).is_ok());
+
+    create
+        .tags
+        .push(vec!["channel_type".into(), "unknown".into()]);
+    assert!(
+        validate_channel_tags(&create).is_err(),
+        "an unknown channel type must be rejected on create"
+    );
+}
+
+#[test]
+fn buzz_last_admin_guard_understands_the_separate_role_tag() {
+    let mut store = GroupStore {
+        buzz_enabled: true,
+        ..Default::default()
+    };
+    let now = 1_600_000_000;
+    store.apply(
+        &event(CREATE_GROUP, ADMIN, Some("g1"), vec![]),
+        "relay",
+        now,
+        true,
+        false,
+    );
+
+    // Re-assert the last owner as an admin. The separate role tag is the
+    // only role information in the event; validation must not mistake this
+    // for a demotion (apply already mapped it to a privileged role).
+    let reassert = event(
+        9000,
+        ADMIN,
+        Some("g1"),
+        vec![
+            vec![P.into(), ADMIN.into()],
+            vec!["role".into(), "admin".into()],
+        ],
+    );
+    assert!(
+        store.validate_write(&reassert).is_ok(),
+        "role=admin must keep the last admin"
+    );
+    store.apply(&reassert, "relay", now + 1, true, false);
+    assert!(store.group("g1").unwrap().is_admin(ADMIN));
+
+    // The guest/bot tiers are not privileged roles: a p-tag role named
+    // guest demotes the subject, so the last-admin guard must reject it.
+    // Apply's own re-check must agree (history replay can bypass validation).
+    let demote_guest = event(
+        9000,
+        ADMIN,
+        Some("g1"),
+        vec![vec![P.into(), ADMIN.into(), "guest".into()]],
+    );
+    assert!(store.validate_write(&demote_guest).is_err());
+    assert!(
+        store
+            .apply(&demote_guest, "relay", now + 2, true, false)
+            .is_empty()
+    );
+    assert!(store.group("g1").unwrap().is_admin(ADMIN));
+
+    // Transfer: the only admin is demoted by the bare p tag while the new
+    // member is promoted by the shared role=admin tag. Validation must see
+    // the grant even though neither p tag carries role elements.
+    let transfer = event(
+        9000,
+        ADMIN,
+        Some("g1"),
+        vec![
+            vec![P.into(), ADMIN.into()],
+            vec![P.into(), USER.into()],
+            vec!["role".into(), "admin".into()],
+        ],
+    );
+    assert!(
+        store.validate_write(&transfer).is_ok(),
+        "the shared role=admin tag must retain an admin"
+    );
+    store.apply(&transfer, "relay", now + 3, true, false);
+    assert!(store.group("g1").unwrap().is_admin(ADMIN));
+    assert!(store.group("g1").unwrap().is_admin(USER));
+
+    // Demoting both admins through the separate bot role leaves no admin:
+    // rejected by validation and dropped by apply.
+    let demote_both = event(
+        9000,
+        ADMIN,
+        Some("g1"),
+        vec![
+            vec![P.into(), ADMIN.into()],
+            vec![P.into(), USER.into()],
+            vec!["role".into(), "bot".into()],
+        ],
+    );
+    assert!(store.validate_write(&demote_both).is_err());
+    assert!(
+        store
+            .apply(&demote_both, "relay", now + 4, true, false)
+            .is_empty()
+    );
+    assert!(store.group("g1").unwrap().is_admin(ADMIN));
+    assert!(store.group("g1").unwrap().is_admin(USER));
+}
+
+#[test]
+fn vanish_removes_buzz_tiers_and_hidden_state() {
+    let mut store = GroupStore {
+        buzz_enabled: true,
+        ..Default::default()
+    };
+    let now = 1_600_000_000;
+    store.apply(
+        &event(CREATE_GROUP, ADMIN, Some("g1"), vec![]),
+        "relay",
+        now,
+        true,
+        false,
+    );
+    store.apply(
+        &event(
+            9000,
+            ADMIN,
+            Some("g1"),
+            vec![
+                vec![P.into(), USER.into()],
+                vec!["role".into(), "bot".into()],
+            ],
+        ),
+        "relay",
+        now + 1,
+        true,
+        false,
+    );
+    store
+        .groups
+        .get_mut("g1")
+        .unwrap()
+        .hidden_for
+        .insert(USER.to_string());
+    assert!(store.group("g1").unwrap().bots.contains(USER));
+
+    let affected = store.remove_member_everywhere(USER);
+    assert_eq!(affected, vec!["g1".to_string()]);
+    let group = store.group("g1").unwrap();
+    assert!(!group.is_member(USER));
+    assert!(!group.bots.contains(USER));
+    assert!(!group.guests.contains(USER));
+    assert!(!group.hidden_for.contains(USER));
+}
+
+#[test]
+fn rollback_unstored_group_releases_the_member_budget() {
+    let mut store = GroupStore {
+        buzz_enabled: true,
+        ..Default::default()
+    };
+    let now = 1_600_000_000;
+    store.apply(
+        &event(CREATE_GROUP, ADMIN, Some("dm-1"), vec![]),
+        "relay",
+        now,
+        true,
+        false,
+    );
+    store.apply(
+        &event(9000, ADMIN, Some("dm-1"), vec![vec![P.into(), USER.into()]]),
+        "relay",
+        now + 1,
+        true,
+        false,
+    );
+    assert_eq!(store.total_members, 2);
+    assert!(store.rollback_unstored_group("dm-1"));
+    assert!(store.group("dm-1").is_none());
+    assert_eq!(
+        store.total_members, 0,
+        "the in-memory rollback must release the global member budget"
+    );
+    assert!(!store.rollback_unstored_group("dm-1"));
+}
+
+#[test]
+fn buzz_empty_role_tag_is_not_an_admin_grant() {
+    let mut store = GroupStore {
+        buzz_enabled: true,
+        ..Default::default()
+    };
+    let now = 1_600_000_000;
+    store.apply(
+        &event(CREATE_GROUP, ADMIN, Some("g1"), vec![]),
+        "relay",
+        now,
+        true,
+        false,
+    );
+    let empty_role = event(
+        9000,
+        ADMIN,
+        Some("g1"),
+        vec![
+            vec![P.into(), USER.into()],
+            vec!["role".into(), String::new()],
+        ],
+    );
+    assert!(store.validate_write(&empty_role).is_ok());
+    store.apply(&empty_role, "relay", now + 1, true, false);
+    let group = store.group("g1").unwrap();
+    assert!(group.is_member(USER));
+    assert!(
+        !group.is_admin(USER),
+        "an empty role tag must leave a plain member: {:?}",
+        group.members.get(USER)
+    );
+    assert!(
+        group
+            .members
+            .get(USER)
+            .is_some_and(|roles| roles.is_empty()),
+        "the empty role must not be stored as a role label"
+    );
+
+    // Target the last admin: the empty role is still a demotion, so the
+    // invariant guard must reject it.
+    let demote_last = event(
+        9000,
+        ADMIN,
+        Some("g1"),
+        vec![
+            vec![P.into(), ADMIN.into()],
+            vec!["role".into(), String::new()],
+        ],
+    );
+    assert!(store.validate_write(&demote_last).is_err());
+}
+
+#[test]
 fn channel_creator_owns_the_channel() {
     let mut store = GroupStore {
         buzz_enabled: true,
@@ -4449,6 +4705,83 @@ fn channel_creator_owns_the_channel() {
     assert!(
         !roles.contains("admin"),
         "the old admin default must not survive: {roles:?}"
+    );
+}
+
+#[test]
+fn disabling_buzz_restores_the_plain_creator_role() {
+    let mut buzz = GroupStore {
+        buzz_enabled: true,
+        ..Default::default()
+    };
+    let now = 1_600_000_000;
+    buzz.apply(
+        &event(
+            CREATE_GROUP,
+            ADMIN,
+            Some("g1"),
+            vec![vec!["channel_type".into(), "stream".into()]],
+        ),
+        "relay",
+        now,
+        true,
+        false,
+    );
+    assert!(
+        buzz.group("g1")
+            .unwrap()
+            .members
+            .get(ADMIN)
+            .is_some_and(|roles| roles.contains("owner"))
+    );
+    let snapshot = buzz.snapshot();
+
+    let mut plain = GroupStore::default();
+    plain.restore(snapshot);
+    let roles = plain.group("g1").unwrap().members.get(ADMIN).unwrap();
+    assert_eq!(
+        roles.len(),
+        1,
+        "the Buzz owner default becomes exactly one plain role"
+    );
+    assert!(
+        roles.contains("admin") && !roles.contains("owner"),
+        "the Buzz owner default must become the plain NIP-29 admin label: {roles:?}"
+    );
+
+    // An explicitly assigned `owner` role in a plain group has no
+    // channel_type and must survive the restore unchanged.
+    let mut explicit = GroupStore::default();
+    explicit.apply(
+        &event(CREATE_GROUP, ADMIN, Some("g2"), vec![]),
+        "relay",
+        now,
+        true,
+        false,
+    );
+    explicit.apply(
+        &event(
+            9000,
+            ADMIN,
+            Some("g2"),
+            vec![vec![P.into(), ADMIN.into(), "owner".into()]],
+        ),
+        "relay",
+        now + 1,
+        true,
+        false,
+    );
+    let snapshot = explicit.snapshot();
+    let mut restored = GroupStore::default();
+    restored.restore(snapshot);
+    assert!(
+        restored
+            .group("g2")
+            .unwrap()
+            .members
+            .get(ADMIN)
+            .is_some_and(|roles| roles.contains("owner")),
+        "a plain NIP-29 group's explicit owner role is not a Buzz default"
     );
 }
 
@@ -4495,6 +4828,15 @@ fn buzz_role_bot_is_preserved_in_the_roster() {
         "Buzz must see role=bot in 39002: {:?}",
         members.tags
     );
+    let roles = super::events::build_roles_event("g1", Some(group), "relay", now, true);
+    assert!(
+        roles
+            .tags
+            .iter()
+            .any(|t| t == &vec!["role".to_string(), "bot".to_string()]),
+        "39003 must agree with 39002 about the in-use bot tier: {:?}",
+        roles.tags
+    );
 }
 
 #[test]
@@ -4532,6 +4874,122 @@ fn plain_nip29_guest_role_keeps_admin_semantics() {
         store.validate_write(&post).is_ok(),
         "a role label named guest must not become read-only"
     );
+}
+
+#[test]
+fn plain_nip29_join_ignores_a_restored_join_role() {
+    let mut store = GroupStore {
+        buzz_enabled: true,
+        ..Default::default()
+    };
+    let now = 1_600_000_000;
+    store.apply(
+        &event(
+            CREATE_GROUP,
+            ADMIN,
+            Some("g1"),
+            vec![vec!["join_role".into(), "guest".into()]],
+        ),
+        "relay",
+        now,
+        true,
+        false,
+    );
+    // Simulate restoring a snapshot from a Buzz-enabled run while the
+    // current config has Buzz disabled.
+    store.buzz_enabled = false;
+    assert_eq!(
+        store.group("g1").unwrap().settings.join_role.as_deref(),
+        Some("guest")
+    );
+    store.apply(
+        &event(JOIN, USER, Some("g1"), vec![]),
+        "relay",
+        now + 1,
+        true,
+        false,
+    );
+    let group = store.group("g1").unwrap();
+    assert!(group.is_member(USER));
+    assert!(
+        !group.is_guest(USER),
+        "join_role is a Buzz extension and must not create guest state when Buzz is off"
+    );
+}
+
+#[test]
+fn plain_history_create_preserves_buzz_privacy_floor() {
+    let tags = vec![
+        vec!["visibility".into(), "private".into()],
+        vec!["channel_type".into(), "stream".into()],
+        vec!["name".into(), "buzz channel".into()],
+    ];
+    let mut live = GroupStore::default();
+    live.apply(
+        &event(CREATE_GROUP, ADMIN, Some("g1"), tags.clone()),
+        "relay",
+        1_600_000_000,
+        true,
+        false,
+    );
+    let group = live.group("g1").unwrap();
+    assert!(
+        !group.settings.private,
+        "live plain NIP-29 ignores the Buzz visibility tag"
+    );
+    assert!(
+        group.settings.name.is_empty(),
+        "live plain NIP-29 ignores create metadata"
+    );
+
+    let mut history = GroupStore::default();
+    history.apply(
+        &event(CREATE_GROUP, ADMIN, Some("g2"), tags),
+        "relay",
+        1_600_000_000,
+        true,
+        true,
+    );
+    let group = history.group("g2").unwrap();
+    assert!(group.settings.private);
+    assert!(group.settings.restricted);
+    assert!(group.settings.closed);
+    assert_eq!(
+        group.settings.name, "buzz channel",
+        "a Buzz-created channel keeps its initial metadata on a mode-off rebuild"
+    );
+}
+
+#[test]
+fn plain_history_dm_create_stays_private() {
+    let tags = vec![
+        vec!["channel_type".into(), "dm".into()],
+        vec!["name".into(), "saved dm".into()],
+    ];
+    let mut live = GroupStore::default();
+    live.apply(
+        &event(CREATE_GROUP, ADMIN, Some("dm-live"), tags.clone()),
+        "relay",
+        1_600_000_000,
+        true,
+        false,
+    );
+    assert!(!live.group("dm-live").unwrap().settings.private);
+
+    let mut history = GroupStore::default();
+    history.apply(
+        &event(CREATE_GROUP, ADMIN, Some("dm-history"), tags),
+        "relay",
+        1_600_000_000,
+        true,
+        true,
+    );
+    let group = history.group("dm-history").unwrap();
+    assert!(group.settings.private);
+    assert!(group.settings.restricted);
+    assert!(group.settings.closed);
+    assert!(group.settings.hidden);
+    assert_eq!(group.settings.name, "saved dm");
 }
 
 #[test]
@@ -4597,7 +5055,10 @@ fn plain_nip29_ignores_buzz_channel_tags() {
         !group.settings.private,
         "visibility=private is a Buzz extension in plain NIP-29 mode"
     );
-    assert_eq!(group.settings.name, "plain");
+    assert!(
+        group.settings.name.is_empty(),
+        "plain NIP-29 9007 carries no metadata; a Buzz-style name tag is ignored"
+    );
     assert!(group.settings.topic.is_none());
     assert!(group.is_admin(ADMIN), "the creator remains an admin");
 }
