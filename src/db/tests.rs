@@ -11242,3 +11242,248 @@ fn nip91_history_count_and_negentropy_agree() {
     });
     db.shutdown();
 }
+
+#[test]
+fn event_meta_rebuild_resumes_after_its_durable_cursor() {
+    // DB-L04: the metadata backfill used to restart at the first event on
+    // every interrupted start. A persisted cursor must skip the committed
+    // prefix while still removing the cursor on completion.
+    let expiry = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let store = crate::db::store::Store::open(&config(), expiry, 128).unwrap();
+    let now = unix_now();
+    let a = event(1, "meta-a", now, vec![]);
+    let b = event(1, "meta-b", now + 1, vec![]);
+    let mut ids = [a.id_bytes().unwrap(), b.id_bytes().unwrap()];
+    ids.sort();
+    {
+        let mut wtxn = store.env.write_txn().unwrap();
+        store
+            .events
+            .put(&mut wtxn, &ids[0], &serde_json::to_vec(&a).unwrap())
+            .unwrap();
+        store
+            .events
+            .put(&mut wtxn, &ids[1], &serde_json::to_vec(&b).unwrap())
+            .unwrap();
+        store
+            .index_meta
+            .put(&mut wtxn, b"meta_rebuild", &ids[0])
+            .unwrap();
+        wtxn.commit().unwrap();
+    }
+    assert_eq!(
+        store.rebuild_event_meta().unwrap(),
+        1,
+        "only the event after the committed cursor must be re-indexed"
+    );
+    let rtxn = store.env.read_txn().unwrap();
+    assert!(
+        store
+            .index_meta
+            .get(&rtxn, b"meta_rebuild")
+            .unwrap()
+            .is_none(),
+        "completion must clear the resume cursor"
+    );
+}
+
+#[test]
+fn corrupt_pending_purge_does_not_hide_other_groups() {
+    // DB-L05: one undecodable pending row must not abort the whole resume
+    // walk (which left every group in the table as a permanent ghost).
+    let expiry = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let store = crate::db::store::Store::open(&config(), expiry, 128).unwrap();
+    {
+        let mut wtxn = store.env.write_txn().unwrap();
+        store
+            .purge_pending
+            .put(&mut wtxn, &[0xAA; 32], b"corrupt")
+            .unwrap();
+        let valid_key = crate::db::store::purged_group_key("healthy-group");
+        let valid = crate::db::store::encode_pending_purge("healthy-group", 10, 20, u64::MAX, None);
+        store
+            .purge_pending
+            .put(&mut wtxn, &valid_key, &valid)
+            .unwrap();
+        wtxn.commit().unwrap();
+    }
+    assert_eq!(
+        store.pending_purges().unwrap(),
+        vec![("healthy-group".to_string(), 10, u64::MAX)],
+        "the healthy record must still be reported"
+    );
+}
+
+#[test]
+fn removing_an_old_replaceable_keeps_the_newest_slot() {
+    // N-03: pre-slot-index databases can contain an old version whose
+    // removal used to delete the newest version's replaceable slot, making
+    // the old event acceptable again.
+    let expiry = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let store = crate::db::store::Store::open(&config(), expiry, 128).unwrap();
+    let now = unix_now();
+    let old = event(0, "old", now - 1, vec![]);
+    let new = event(0, "new", now, vec![]);
+    let old_id = old.id_bytes().unwrap();
+    let new_id = new.id_bytes().unwrap();
+    {
+        let mut wtxn = store.env.write_txn().unwrap();
+        assert!(matches!(
+            store.put_event_in(&mut wtxn, &old, now).unwrap(),
+            PutOutcome::Stored
+        ));
+        assert!(matches!(
+            store.put_event_in(&mut wtxn, &new, now).unwrap(),
+            PutOutcome::Replaced
+        ));
+        // Simulate a pre-fix database: the old version is still present while
+        // the slot already points at the new version.
+        store
+            .events
+            .put(&mut wtxn, &old_id, &serde_json::to_vec(&old).unwrap())
+            .unwrap();
+        store.remove_event(&mut wtxn, &old_id).unwrap();
+        let slot = store
+            .replaceable
+            .get(
+                &wtxn,
+                &crate::db::store::replaceable_key(
+                    0,
+                    &[0u8; 32],
+                    &crate::db::store::dtag_key_safe(""),
+                ),
+            )
+            .unwrap()
+            .expect("the newest slot must survive");
+        assert_eq!(&slot[slot.len() - 32..], &new_id);
+        wtxn.commit().unwrap();
+    }
+}
+
+#[test]
+fn forged_delegation_entries_are_removed_by_the_startup_recheck() {
+    // N-04: a forged delegation indexed by an older binary must not leave
+    // the event in the victim's author feed.
+    let expiry = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let store = crate::db::store::Store::open(&config(), expiry, 128).unwrap();
+    let now = unix_now();
+    let victim = "aa".repeat(32);
+    let forged = event(
+        1,
+        "forged delegation",
+        now,
+        vec![vec![
+            "delegation".into(),
+            victim.clone(),
+            "kind=1".into(),
+            "00".repeat(64),
+        ]],
+    );
+    let id = forged.id_bytes().unwrap();
+    let index_key = crate::db::store::pubkey_key(&hex::decode(&victim).unwrap(), now, &id);
+    {
+        let mut wtxn = store.env.write_txn().unwrap();
+        store
+            .events
+            .put(&mut wtxn, &id, &serde_json::to_vec(&forged).unwrap())
+            .unwrap();
+        store.by_pubkey.put(&mut wtxn, &index_key, b"").unwrap();
+        wtxn.commit().unwrap();
+    }
+    assert!(store.delegation_check_needs_rebuild().unwrap());
+    assert_eq!(store.recheck_delegation_indexes().unwrap(), 1);
+    assert!(!store.delegation_check_needs_rebuild().unwrap());
+    let rtxn = store.env.read_txn().unwrap();
+    assert!(
+        store.by_pubkey.get(&rtxn, &index_key).unwrap().is_none(),
+        "the forged delegator-side index entry must be removed"
+    );
+    assert!(
+        store
+            .index_meta
+            .get(&rtxn, b"delegation_rebuild")
+            .unwrap()
+            .is_none(),
+        "the completion must clear the resume cursor"
+    );
+}
+
+#[test]
+fn search_does_not_trust_the_word_index_atomic_without_the_marker() {
+    // DB-M01: the atomic is set just after the marker commit. A scan that
+    // opened its read transaction before the commit must use the marker in
+    // that transaction (and fall back to the time walk), never treat a
+    // partial index as complete because the atomic flipped meanwhile.
+    let expiry = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let store = crate::db::store::Store::open(&config(), expiry, 128).unwrap();
+    let now = unix_now();
+    let ev = event(1, "hello world", now, vec![]);
+    let id = ev.id_bytes().unwrap();
+    {
+        let mut wtxn = store.env.write_txn().unwrap();
+        store
+            .events
+            .put(&mut wtxn, &id, &serde_json::to_vec(&ev).unwrap())
+            .unwrap();
+        store
+            .by_created
+            .put(&mut wtxn, &crate::db::store::created_key(now, &id), b"")
+            .unwrap();
+        wtxn.commit().unwrap();
+    }
+    // Simulate the narrow window: the completion atomic is already true,
+    // while the marker is still absent (the index itself is empty).
+    store
+        .word_index_ready
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let filter: Filter = serde_json::from_value(serde_json::json!({
+        "search": "hello"
+    }))
+    .unwrap();
+    let (found, _) = store
+        .scan(
+            &[filter],
+            now,
+            10,
+            false,
+            false,
+            crate::db::scan::SCAN_BUDGET,
+            0,
+        )
+        .unwrap();
+    assert_eq!(found.len(), 1, "the fallback must find the stored event");
+    assert_eq!(found[0].id, ev.id);
+}
+
+#[test]
+fn startup_access_migration_waits_for_the_cli_lock() {
+    // DB-L01: the startup migration must share the CLI/NIP-86 access lock,
+    // not read-modify-write the legacy blob while a CLI ban is in flight.
+    let cfg = config();
+    let held = lock_access_state(&cfg.path).expect("test lock");
+    let (tx, rx) = std::sync::mpsc::channel();
+    let open_cfg = cfg.clone();
+    let handle = std::thread::spawn(move || {
+        let db = DbClient::open(
+            &open_cfg,
+            true,
+            Arc::new(Default::default()),
+            0,
+            128,
+            4096,
+            262144,
+        )
+        .expect("db open");
+        let _ = tx.send(());
+        db.shutdown();
+    });
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert!(
+        rx.try_recv().is_err(),
+        "startup must wait while the CLI holds the access lock"
+    );
+    drop(held);
+    handle.join().expect("startup thread");
+    rx.recv_timeout(std::time::Duration::from_secs(5))
+        .expect("startup completes after the lock is released");
+}

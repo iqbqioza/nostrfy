@@ -1229,10 +1229,15 @@ impl Store {
             // index can be partial: fall through to the time-range scan
             // below, which matches the terms per event, so a partial index
             // never yields silently short search results.
+            // Read the completion marker from the *same* read transaction
+            // as the index walk. The atomic flag is updated just after the
+            // marker commit; checking it before opening this transaction
+            // let a rebuild finish in between, so the scan could treat a
+            // partial (or pre-rebuild) index as complete and return a short
+            // result with `more=false`.
+            let index_ready = self.index_meta.get(rtxn, b"word_index")?.is_some();
             if let Some(by_word) = self.by_word
-                && self
-                    .word_index_ready
-                    .load(std::sync::atomic::Ordering::Relaxed)
+                && index_ready
             {
                 // A common term (df reaching the sampling cap) is dropped
                 // from the index walk: its range is the flood source that

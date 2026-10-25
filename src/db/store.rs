@@ -1939,12 +1939,20 @@ impl Store {
     /// backfill for databases written before the index existed).
     pub(crate) fn rebuild_blossom_order(&self) -> Result<usize> {
         const CHUNK: usize = 4096;
+        const STATE_KEY: &[u8] = b"blossom_order_rebuild";
         self.disk_full_error()?;
         let mut count = 0usize;
         // Resume from the last mapping key processed: resuming from the
         // owner entries could split one mapping's owner list across chunks
-        // and lose the owners after the cut.
-        let mut last: Option<Vec<u8>> = None;
+        // and lose the owners after the cut. The cursor commits with each
+        // chunk so a restart does not rescan the whole mapping table
+        // (DB-L04).
+        let mut last: Option<Vec<u8>> = {
+            let rtxn = self.env.read_txn()?;
+            self.index_meta
+                .get(&rtxn, STATE_KEY)?
+                .map(|raw| raw.to_vec())
+        };
         loop {
             if self.cancelled() {
                 anyhow::bail!("Blossom order rebuild cancelled during shutdown");
@@ -1998,6 +2006,9 @@ impl Store {
                 )?;
                 count += 1;
             }
+            if let Some((key, _, _, _)) = chunk.last() {
+                self.index_meta.put(&mut wtxn, STATE_KEY, key)?;
+            }
             wtxn.commit()?;
             if chunk.len() < CHUNK {
                 break;
@@ -2008,6 +2019,7 @@ impl Store {
         }
         let mut wtxn = self.env.write_txn()?;
         self.index_meta.put(&mut wtxn, b"blossom_order", b"1")?;
+        self.index_meta.delete(&mut wtxn, STATE_KEY)?;
         wtxn.commit()?;
         Ok(count)
     }
@@ -3264,8 +3276,14 @@ impl Store {
         let Some(meta) = self.event_meta else {
             return Ok(0);
         };
+        const STATE_KEY: &[u8] = b"meta_rebuild";
         let mut count = 0usize;
-        let mut last: Option<Vec<u8>> = None;
+        let mut last: Option<Vec<u8>> = {
+            let rtxn = self.env.read_txn()?;
+            self.index_meta
+                .get(&rtxn, STATE_KEY)?
+                .map(|raw| raw.to_vec())
+        };
         loop {
             if self.cancelled() {
                 anyhow::bail!("event metadata rebuild cancelled during shutdown");
@@ -3332,6 +3350,12 @@ impl Store {
             for (id, header) in &chunk {
                 meta.put(&mut wtxn, id, header)?;
             }
+            if let Some((id, _)) = chunk.last() {
+                // Commit the cursor with the chunk it describes: a crash
+                // after this commit resumes at the next row instead of
+                // re-indexing the whole database (DB-L04).
+                self.index_meta.put(&mut wtxn, STATE_KEY, id)?;
+            }
             wtxn.commit()?;
             count += chunk.len();
             last = chunk.last().map(|(id, _)| id.clone());
@@ -3339,6 +3363,11 @@ impl Store {
                 break;
             }
         }
+        // The completion is derived from the table counts, but remove the
+        // now-useless cursor so a later rebuild cannot resume mid-way.
+        let mut wtxn = self.env.write_txn()?;
+        self.index_meta.delete(&mut wtxn, STATE_KEY)?;
+        wtxn.commit()?;
         Ok(count)
     }
 
@@ -3386,11 +3415,17 @@ impl Store {
     /// were stored before the index existed.
     pub(crate) fn rebuild_gift_wrap_index(&self) -> Result<usize> {
         const CHUNK: usize = 4096;
+        const STATE_KEY: &[u8] = b"gift_wrap_rebuild";
         self.disk_full_error()?;
         let kind = crate::nips::nip62::GIFT_WRAP_KIND;
         let start = kind_key(kind, 0, &[0u8; ID_LEN]);
         let end = range_end(kind_key(kind, u64::MAX, &[0xffu8; ID_LEN]), u64::MAX);
-        let mut last_key: Option<Vec<u8>> = None;
+        let mut last_key: Option<Vec<u8>> = {
+            let rtxn = self.env.read_txn()?;
+            self.index_meta
+                .get(&rtxn, STATE_KEY)?
+                .map(|raw| raw.to_vec())
+        };
         let mut indexed = 0usize;
         loop {
             if self.cancelled() {
@@ -3437,24 +3472,25 @@ impl Store {
                 break;
             }
             last_key = chunk.last().map(|(key, _, _)| key.clone());
-            if chunk
-                .iter()
-                .any(|(_, _, recipients)| !recipients.is_empty())
-            {
-                let mut wtxn = self.env.write_txn()?;
-                for (key, created, recipients) in &chunk {
-                    let id = &key[key.len() - ID_LEN..];
-                    for recipient in recipients {
-                        self.by_tag.put(
-                            &mut wtxn,
-                            &tag_key(GIFT_WRAP_INDEX, recipient, *created, id),
-                            b"",
-                        )?;
-                        indexed += 1;
-                    }
+            let mut wtxn = self.env.write_txn()?;
+            for (key, created, recipients) in &chunk {
+                let id = &key[key.len() - ID_LEN..];
+                for recipient in recipients {
+                    self.by_tag.put(
+                        &mut wtxn,
+                        &tag_key(GIFT_WRAP_INDEX, recipient, *created, id),
+                        b"",
+                    )?;
+                    indexed += 1;
                 }
-                wtxn.commit()?;
             }
+            if let Some((key, _, _)) = chunk.last() {
+                // Persist the resume point even when this chunk had no
+                // recipients: otherwise a wrap-free prefix is rescanned on
+                // every interrupted start (DB-L04).
+                self.index_meta.put(&mut wtxn, STATE_KEY, key)?;
+            }
+            wtxn.commit()?;
             if chunk.len() < CHUNK {
                 break;
             }
@@ -3464,8 +3500,109 @@ impl Store {
         }
         let mut wtxn = self.env.write_txn()?;
         self.index_meta.put(&mut wtxn, b"gift_wrap_index", b"1")?;
+        self.index_meta.delete(&mut wtxn, STATE_KEY)?;
         wtxn.commit()?;
         Ok(indexed)
+    }
+
+    /// Whether the one-time NIP-26 index revalidation ran. Older binaries
+    /// could have stored events whose delegation tags were not verified
+    /// before the delegator-side `by_pubkey` entry was written; the startup
+    /// pass removes those forged entries (N-04).
+    pub(crate) fn delegation_check_needs_rebuild(&self) -> Result<bool> {
+        let rtxn = self.env.read_txn()?;
+        Ok(self.index_meta.get(&rtxn, b"delegation_check")?.is_none())
+    }
+
+    /// Revalidates every stored delegation tag and makes the delegator-side
+    /// index match the result. Chunked with a durable cursor, so a shutdown
+    /// or disk-full failure resumes instead of restarting the whole table.
+    pub(crate) fn recheck_delegation_indexes(&self) -> Result<usize> {
+        const CHUNK: usize = 4096;
+        const STATE_KEY: &[u8] = b"delegation_rebuild";
+        self.disk_full_error()?;
+        let mut last: Option<Vec<u8>> = {
+            let rtxn = self.env.read_txn()?;
+            self.index_meta
+                .get(&rtxn, STATE_KEY)?
+                .map(|raw| raw.to_vec())
+        };
+        let mut checked = 0usize;
+        loop {
+            if self.cancelled() {
+                anyhow::bail!("delegation index recheck cancelled during shutdown");
+            }
+            // Scan every event row (not only delegation matches) so the
+            // durable cursor advances over a fixed-size slice of the table
+            // even when long runs have no delegation tag.
+            let chunk: Vec<(Vec<u8>, Option<Event>)> = {
+                let rtxn = self.env.read_txn()?;
+                let range = (
+                    last.as_deref()
+                        .map(std::ops::Bound::Excluded)
+                        .unwrap_or(std::ops::Bound::Unbounded),
+                    std::ops::Bound::Unbounded,
+                );
+                let mut out = Vec::with_capacity(CHUNK);
+                for item in self.events.range(&rtxn, &range)? {
+                    let (id, raw) = item?;
+                    out.push((id.to_vec(), serde_json::from_slice::<Event>(raw).ok()));
+                    if out.len() >= CHUNK {
+                        break;
+                    }
+                }
+                out
+            };
+            if chunk.is_empty() {
+                break;
+            }
+            let cursor = chunk.last().expect("non-empty chunk").0.clone();
+            let mut wtxn = self.env.write_txn()?;
+            for (id, event) in &chunk {
+                let Some(event) = event else {
+                    continue;
+                };
+                let Some(delegator) = crate::nips::nip26::delegation(event) else {
+                    continue;
+                };
+                let Ok(pk) = hex::decode(delegator[0]) else {
+                    continue;
+                };
+                if pk.len() != ID_LEN {
+                    continue;
+                }
+                // A self-delegation has no separate index entry: deleting
+                // it for an invalid tag would remove the event from its own
+                // author's feed.
+                if event
+                    .pubkey_bytes()
+                    .is_some_and(|author| author == pk.as_slice())
+                {
+                    continue;
+                }
+                let key = pubkey_key(&pk, event.created_at, id);
+                if crate::nips::nip26::verify(event) && !self.vanished_or_pending(&wtxn, &pk)? {
+                    self.by_pubkey.put(&mut wtxn, &key, b"")?;
+                } else {
+                    // A forged/unverified delegation (or a vanished
+                    // delegator) must not put the event in the victim's
+                    // author feed.
+                    self.by_pubkey.delete(&mut wtxn, &key)?;
+                }
+                checked += 1;
+            }
+            self.index_meta.put(&mut wtxn, STATE_KEY, &cursor)?;
+            wtxn.commit()?;
+            last = Some(cursor);
+            if chunk.len() < CHUNK {
+                break;
+            }
+        }
+        let mut wtxn = self.env.write_txn()?;
+        self.index_meta.put(&mut wtxn, b"delegation_check", b"1")?;
+        self.index_meta.delete(&mut wtxn, STATE_KEY)?;
+        wtxn.commit()?;
+        Ok(checked)
     }
 
     /// Whether the NIP-50 word index needs its one-time backfill (marker
@@ -3829,10 +3966,18 @@ impl Store {
             } else {
                 ""
             };
-            self.replaceable.delete(
-                wtxn,
-                &replaceable_key(event.kind, &pubkey, &dtag_key_safe(dtag)),
-            )?;
+            let key = replaceable_key(event.kind, &pubkey, &dtag_key_safe(dtag));
+            // Only clear the slot when this event is its current owner.
+            // Pre-slot-index databases can contain an older event whose
+            // removal used to delete the newest event's slot blindly,
+            // making the old version acceptable again (N-03). The value is
+            // `created_at || id`.
+            if let Some(value) = self.replaceable.get(wtxn, &key)?
+                && value.len() >= ID_LEN
+                && &value[value.len() - ID_LEN..] == id
+            {
+                self.replaceable.delete(wtxn, &key)?;
+            }
         }
         self.by_pubkey
             .delete(wtxn, &pubkey_key(&pubkey, event.created_at, id))?;

@@ -1179,10 +1179,20 @@ impl Store {
         let rtxn = self.env.read_txn()?;
         let mut out = Vec::new();
         for item in self.purge_pending.iter(&rtxn)? {
-            let (_, raw) = item?;
-            let (gid, purge_now, _, until, _) = decode_pending_purge(raw).ok_or_else(|| {
-                anyhow::anyhow!("corrupt pending purge record ({} bytes)", raw.len())
-            })?;
+            let (key, raw) = item?;
+            let Some((gid, purge_now, _, until, _)) = decode_pending_purge(raw) else {
+                // One corrupt row must not stop every other group's
+                // recovery (and turn all of them into permanent ghosts).
+                // The row cannot be decoded, but its key is hash(gid):
+                // leaving it is harmless for other groups and lets the
+                // operator inspect it; the next restart skips it again.
+                log::warn!(
+                    "skipping corrupt pending group purge record ({} bytes, key {})",
+                    raw.len(),
+                    hex::encode(key)
+                );
+                continue;
+            };
             out.push((gid, purge_now, until));
         }
         Ok(out)
