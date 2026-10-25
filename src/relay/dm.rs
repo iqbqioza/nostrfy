@@ -157,7 +157,11 @@ impl super::Relay {
                     &channel,
                     Some(&group),
                     self.relay_pubkey_ref().unwrap_or_default(),
-                    now,
+                    // A re-open can happen in the same second as creation;
+                    // raw wall time would produce an older replaceable
+                    // 39000 and make the store reject the surface as a
+                    // duplicate.
+                    self.stamp_floor(now),
                     // DM commands only run with the Buzz layer enabled.
                     true,
                 );
@@ -179,7 +183,8 @@ impl super::Relay {
                     now,
                 );
                 let relay_pubkey = self.relay_pubkey_ref().unwrap_or_default();
-                let mut emitted = groups.apply(&create, relay_pubkey, now, true, false);
+                let create_at = self.stamp_floor(now);
+                let mut emitted = groups.apply(&create, relay_pubkey, create_at, true, false);
                 created_new = groups.groups.contains_key(&channel);
                 // Add every other participant as a plain member. The
                 // creator stays the admin; participants must not be able to
@@ -196,13 +201,8 @@ impl super::Relay {
                         put.tags.push(vec!["p".into(), participant.clone()]);
                     }
                 }
-                emitted.extend(groups.apply(
-                    &put,
-                    relay_pubkey,
-                    now.saturating_add(1),
-                    true,
-                    false,
-                ));
+                let put_at = self.stamp_floor(now.saturating_add(1));
+                emitted.extend(groups.apply(&put, relay_pubkey, put_at, true, false));
                 emitted
             }
         };
@@ -280,14 +280,17 @@ impl super::Relay {
             .find(|t| t.len() >= 2 && t[0] == "h")
             .map(|t| t[1].clone())
         else {
+            self.publish_rate_rollback(&event.pubkey, now);
             return PutOutcome::Invalid("invalid: dm hide requires an h tag".into());
         };
         {
             let mut groups = self.groups.write().await;
             let Some(group) = groups.groups.get_mut(&channel) else {
+                self.publish_rate_rollback(&event.pubkey, now);
                 return PutOutcome::Invalid("invalid: unknown DM channel".into());
             };
             if group.channel_type != "dm" || !group.is_member(&event.pubkey) {
+                self.publish_rate_rollback(&event.pubkey, now);
                 return PutOutcome::Invalid("restricted: not a member of this DM".into());
             }
             group.hidden_for.insert(event.pubkey.clone());

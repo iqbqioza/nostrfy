@@ -1728,6 +1728,20 @@ async fn groups_rebuild_worker(
                             true,
                         );
                     }
+                    // DM channels are snapshot-backed: their synthetic
+                    // create/member events are never stored, so the event
+                    // replay cannot reconstruct them. Copy the live store's
+                    // current DM state after any buffered 9000/9001 edits;
+                    // the handler's direct mutations are then preserved
+                    // across the swap instead of being ghosted as missing
+                    // history.
+                    let live_dms: Vec<(String, crate::nips::nip29::Group)> = store
+                        .groups
+                        .iter()
+                        .filter(|(_, group)| group.channel_type == "dm")
+                        .map(|(gid, group)| (gid.clone(), group.clone()))
+                        .collect();
+                    fresh.adopt_live_dm_groups(live_dms);
                     *store = fresh;
                     if relay_pubkey.is_some() {
                         state
@@ -5513,29 +5527,7 @@ impl Relay {
             }
         }
 
-        // One moderation event can generate several versions of the same
-        // replaceable metadata slot (e.g. a parent loses two adopted
-        // children in one 9002, rebuilding its 39000 after each removal).
-        // They all share the single per-apply stamp, so the NIP-01 id
-        // tie-break would keep one arbitrarily — retaining the stale
-        // version when its id happens to be lower and dropping the
-        // corrected one as a duplicate. Keep only the last build per `d`
-        // slot: the emit order lists the group's final state last.
-        let mut seen = std::collections::HashSet::new();
-        let mut generated: Vec<Event> = generated
-            .into_iter()
-            .rev()
-            .filter(|ev| {
-                let d = ev
-                    .tags
-                    .iter()
-                    .find(|t| t.len() >= 2 && t[0] == "d")
-                    .map(|t| t[1].clone())
-                    .unwrap_or_default();
-                seen.insert((ev.kind, d))
-            })
-            .collect();
-        generated.reverse();
+        let generated = dedup_generated_events(generated);
 
         for mut ev in generated {
             let participants_gid = if ev.kind == crate::nips::nip29::GROUP_PARTICIPANTS {
@@ -5729,6 +5721,36 @@ impl PendingBatch {
     }
 }
 
+/// One moderation event can generate several versions of the same
+/// replaceable metadata slot (e.g. a parent loses two adopted children in one
+/// 9002, rebuilding its 39000 after each removal). They all share the single
+/// per-apply stamp, so the NIP-01 id tie-break would keep one arbitrarily —
+/// retaining the stale version when its id happens to be lower and dropping
+/// the corrected one as a duplicate. Keep only the last build per `d` slot:
+/// the emit order lists the group's final state last. Events without a `d`
+/// tag (per-member 40099/44100/44101 notices and relay-signed 9000/9001
+/// mirrors) are not replaceable slots and must all be kept.
+fn dedup_generated_events(generated: Vec<Event>) -> Vec<Event> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out: Vec<Event> = generated
+        .into_iter()
+        .rev()
+        .filter(|event| {
+            let Some(d) = event
+                .tags
+                .iter()
+                .find(|tag| tag.len() >= 2 && tag[0] == "d")
+                .map(|tag| tag[1].clone())
+            else {
+                return true;
+            };
+            seen.insert((event.kind, d))
+        })
+        .collect();
+    out.reverse();
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::BufferedGroupEvent;
@@ -5802,6 +5824,53 @@ mod tests {
         std::sync::Arc::new(relay)
     }
 
+    #[test]
+    fn generated_event_dedup_keeps_per_member_notices_and_last_metadata() {
+        let notice = |target: &str| crate::event::Event {
+            id: String::new(),
+            pubkey: "relay".into(),
+            created_at: 1,
+            kind: 44100,
+            tags: vec![
+                vec!["p".into(), target.into()],
+                vec!["h".into(), "g1".into()],
+            ],
+            content: String::new(),
+            sig: String::new(),
+        };
+        let meta = |name: &str| crate::event::Event {
+            id: String::new(),
+            pubkey: "relay".into(),
+            created_at: 1,
+            kind: 39000,
+            tags: vec![
+                vec!["d".into(), "g1".into()],
+                vec!["name".into(), name.into()],
+            ],
+            content: String::new(),
+            sig: String::new(),
+        };
+        let events = super::dedup_generated_events(vec![
+            notice("aa"),
+            notice("bb"),
+            meta("old"),
+            meta("new"),
+        ]);
+        assert_eq!(
+            events.iter().filter(|event| event.kind == 44100).count(),
+            2,
+            "every per-member notice must survive deduplication"
+        );
+        let metadata: Vec<&crate::event::Event> =
+            events.iter().filter(|event| event.kind == 39000).collect();
+        assert_eq!(metadata.len(), 1);
+        assert!(
+            metadata[0]
+                .tags
+                .contains(&vec!["name".into(), "new".into()])
+        );
+    }
+
     #[tokio::test]
     async fn dm_open_does_not_delete_an_existing_channel_when_a_participant_was_removed() {
         let relay = build_relay_with_key(false, &"11".repeat(32)).await;
@@ -5834,6 +5903,14 @@ mod tests {
             }
             other => panic!("DM open failed: {other:?}"),
         };
+
+        // Re-opening immediately must refresh the 39000 without colliding
+        // with the create-time replaceable event.
+        let reopened = relay.handle_dm_open(&open(&a_pk, &b_pk), &[]).await;
+        assert!(
+            matches!(reopened, crate::db::PutOutcome::Duplicate(_)),
+            "an existing DM re-open must succeed: {reopened:?}"
+        );
 
         // Simulate an admin removing one participant after the DM existed.
         let relay_pubkey = relay.relay_pubkey().expect("relay key");

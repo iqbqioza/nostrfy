@@ -449,6 +449,10 @@ fn api_visible(
 ) -> bool {
     !nip70::hidden_from_anonymous(event, relay_pubkey)
         && event.kind != nip62::GIFT_WRAP_KIND
+        // These are per-pubkey state (Buzz membership notices and the
+        // NIP-DV DM visibility snapshot). The public REST API has no
+        // authenticated viewer, so it must not expose them anonymously.
+        && !matches!(event.kind, 44100 | 44101 | 30622)
         && !(nip78 && nip78::is_app_specific(event))
         && groups.is_none_or(|g| g.visible_to(event, None))
         && !excluded
@@ -1688,6 +1692,12 @@ fn aggregate_visible(
     if nip78 && item.app_specific {
         return false;
     }
+    // Buzz membership notices and NIP-DV visibility snapshots are
+    // per-pubkey state; anonymous aggregate endpoints must not reveal their
+    // kind, author, or existence.
+    if matches!(item.kind, 44100 | 44101 | 30622) {
+        return false;
+    }
     // NIP-29: private/hidden group content is withheld from non-members.
     // The store is absent when the sample holds no group item.
     if let Some(gid) = &item.gid
@@ -2513,6 +2523,29 @@ mod tests {
             "no_p excludes"
         );
         assert!(api_visible(&no_p, None, &["e"], false, None));
+        for kind in [44100u64, 44101, 30622] {
+            let mut per_pubkey = plain.clone();
+            per_pubkey.kind = kind;
+            per_pubkey.tags = vec![vec!["p".into(), "dd".repeat(32)]];
+            assert!(
+                !api_visible(&per_pubkey, None, &[], false, None),
+                "the anonymous REST API must not expose per-pubkey kind {kind}"
+            );
+            let item = crate::db::NegItem {
+                created: 0,
+                id: [0u8; 32],
+                kind,
+                pubkey: "dd".repeat(32),
+                protected: false,
+                app_specific: false,
+                gid: None,
+                wrap_recipients: None,
+            };
+            assert!(
+                !aggregate_visible(&item, None, false, None),
+                "the anonymous aggregate API must not count per-pubkey kind {kind}"
+            );
+        }
     }
 
     #[test]

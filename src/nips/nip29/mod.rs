@@ -343,9 +343,9 @@ pub fn channel_type(event: &Event) -> String {
 /// Whether a kind:9000 `p` tag leaves the subject with a privileged role.
 ///
 /// In Buzz mode the separate `role` tag is authoritative only when the `p`
-/// tag carries no role elements, and the `guest`/`bot` tiers are not
-/// privileged. Validation and apply must agree on this: otherwise the live
-/// last-admin guard can reject a valid role re-assertion, or accept a
+/// tag carries no role elements, and the `member`/`guest`/`bot` tiers are
+/// not privileged. Validation and apply must agree on this: otherwise the
+/// live last-admin guard can reject a valid role re-assertion, or accept a
 /// `["p", admin, "guest"]` that apply turns into a guest and leaves the
 /// group without an admin.
 fn tag_grants_privileged_role(tag: &[String], buzz: bool, buzz_role: Option<&str>) -> bool {
@@ -355,7 +355,7 @@ fn tag_grants_privileged_role(tag: &[String], buzz: bool, buzz_role: Option<&str
     let mut any = false;
     for role in tag.iter().skip(2).filter(|role| !role.is_empty()) {
         any = true;
-        if role != "guest" && role != "bot" {
+        if role != "member" && role != "guest" && role != "bot" {
             return true;
         }
     }
@@ -1493,6 +1493,13 @@ impl GroupStore {
                             if roles.remove("bot") {
                                 bot = true;
                             }
+                            // Buzz's 39002 spells a plain member as the
+                            // fourth p-tag element `member`; NIP-29's
+                            // p-tag role list uses the same position. A
+                            // Buzz client round-tripping its roster must
+                            // not silently turn every member into an admin
+                            // role named `member`.
+                            roles.remove("member");
                         }
                         if self.buzz_enabled {
                             let new_member = !group.members.contains_key(&pk);
@@ -2019,7 +2026,7 @@ impl GroupStore {
                     // create cannot turn its metadata public on a rebuild.
                     if (self.buzz_enabled || history_replay)
                         && matches!(group.channel_type.as_str(), "dm" | "system")
-                        && tag_value(event, "visibility").is_none()
+                        && tag_value(event, "visibility") != Some("open")
                     {
                         group.settings.private = true;
                         group.settings.restricted = true;
@@ -2345,6 +2352,40 @@ impl GroupStore {
         true
     }
 
+    /// Carries snapshot-backed DM groups across an event-history rebuild.
+    ///
+    /// DM channels are created by synthetic `9007`/`9000` events that are
+    /// deliberately never stored, so a rebuild from surviving events cannot
+    /// recreate them. The live store is authoritative for this derived
+    /// state; without this hand-off a state-removal rebuild would ghost every
+    /// DM id (and `41010` could never recreate it).
+    pub(crate) fn adopt_live_dm_groups(
+        &mut self,
+        groups: impl IntoIterator<Item = (String, Group)>,
+    ) {
+        for (gid, group) in groups {
+            if group.channel_type != "dm" {
+                continue;
+            }
+            // A non-DM group rebuilt from stored events owns the id; do not
+            // overwrite it with a stale in-memory DM.
+            if self
+                .groups
+                .get(&gid)
+                .is_some_and(|existing| existing.channel_type != "dm")
+            {
+                continue;
+            }
+            self.groups.insert(gid.clone(), group);
+            self.clear_ghost(&gid);
+            self.deleted.remove(&gid);
+            // A snapshot-backed DM is current even if the removal walk
+            // scoped a stored metadata deletion to its id.
+            self.stale_groups.remove(&gid);
+        }
+        self.recompute_derived();
+    }
+
     /// Removes `pubkey` from every group's member map (a vanish) and keeps
     /// the global member counter in sync. Returns the affected group ids so
     /// the caller can republish their rosters and relay-signed 9000 mirrors;
@@ -2576,13 +2617,24 @@ impl GroupStore {
         let gids: Vec<String> = self.groups.keys().cloned().collect();
         let mut out = Vec::with_capacity(gids.len().saturating_mul(4));
         for gid in gids {
-            out.push(build_meta_event(
-                &gid,
-                self.groups.get(&gid),
-                relay_pubkey,
-                now,
-                self.buzz_enabled,
-            ));
+            // `membership_events` already emits the DM 39000 so its
+            // participant `p` tags are refreshed. Emitting the generic one
+            // here as well would produce two byte-identical replaceable
+            // events; the second is a duplicate, making
+            // `publish_group_metadata` report failure forever.
+            if !self
+                .groups
+                .get(&gid)
+                .is_some_and(|group| group.channel_type == "dm")
+            {
+                out.push(build_meta_event(
+                    &gid,
+                    self.groups.get(&gid),
+                    relay_pubkey,
+                    now,
+                    self.buzz_enabled,
+                ));
+            }
             out.push(build_pins_event(
                 &gid,
                 self.groups.get(&gid),

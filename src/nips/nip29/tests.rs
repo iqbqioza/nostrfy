@@ -4433,6 +4433,60 @@ fn buzz_join_role_guest_blocks_posting_and_member_topic_edits() {
 }
 
 #[test]
+fn buzz_private_dm_hides_its_metadata() {
+    let mut store = GroupStore {
+        buzz_enabled: true,
+        ..Default::default()
+    };
+    let now = 1_600_000_000;
+    store.apply(
+        &event(
+            CREATE_GROUP,
+            ADMIN,
+            Some("dm-1"),
+            vec![
+                vec!["channel_type".into(), "dm".into()],
+                vec!["visibility".into(), "private".into()],
+            ],
+        ),
+        "relay",
+        now,
+        true,
+        false,
+    );
+    let group = store.group("dm-1").unwrap();
+    assert!(group.settings.private);
+    assert!(group.settings.restricted);
+    assert!(group.settings.closed);
+    assert!(
+        group.settings.hidden,
+        "a private DM must hide its participant metadata"
+    );
+
+    let open = event(
+        9002,
+        ADMIN,
+        Some("dm-1"),
+        vec![vec!["visibility".into(), "open".into()]],
+    );
+    store.apply(&open, "relay", now + 1, true, false);
+    let group = store.group("dm-1").unwrap();
+    assert!(!group.settings.private);
+    assert!(!group.settings.hidden);
+
+    let private_again = event(
+        9002,
+        ADMIN,
+        Some("dm-1"),
+        vec![vec!["visibility".into(), "private".into()]],
+    );
+    store.apply(&private_again, "relay", now + 2, true, false);
+    let group = store.group("dm-1").unwrap();
+    assert!(group.settings.private);
+    assert!(group.settings.hidden);
+}
+
+#[test]
 fn buzz_channel_create_validates_ttl_and_channel_type() {
     let mut create = event(
         CREATE_GROUP,
@@ -4552,6 +4606,53 @@ fn buzz_last_admin_guard_understands_the_separate_role_tag() {
 }
 
 #[test]
+fn all_metadata_does_not_duplicate_the_dm_meta_event() {
+    let mut store = GroupStore {
+        buzz_enabled: true,
+        ..Default::default()
+    };
+    let mut dm = Group {
+        channel_type: "dm".into(),
+        ..Default::default()
+    };
+    dm.members.insert(USER.into(), Default::default());
+    store.groups.insert("dm-1".to_string(), dm);
+    let events = store.all_metadata_events("relay", 1_600_000_000);
+    assert_eq!(
+        events.iter().filter(|e| e.kind == GROUP_META).count(),
+        1,
+        "a DM's 39000 must be emitted exactly once: {:?}",
+        events.iter().map(|e| e.kind).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn live_dm_groups_survive_the_rebuild_handoff() {
+    let mut dm = Group {
+        channel_type: "dm".into(),
+        settings: GroupSettings {
+            private: true,
+            hidden: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    dm.members.insert(USER.into(), Default::default());
+
+    let mut fresh = GroupStore::default();
+    fresh.mark_ghost("dm-1");
+    fresh.stale_groups.insert("dm-1".into());
+    fresh.adopt_live_dm_groups([("dm-1".to_string(), dm)]);
+    let group = fresh.group("dm-1").expect("the live DM is retained");
+    assert_eq!(group.channel_type, "dm");
+    assert!(group.is_member(USER));
+    assert!(!fresh.is_ghosted("dm-1"), "the live group is not missing");
+    assert!(!fresh.deleted.contains("dm-1"));
+    assert!(!fresh.group_is_stale("dm-1"));
+    assert_eq!(fresh.total_members, 1);
+}
+
+#[test]
 fn vanish_removes_buzz_tiers_and_hidden_state() {
     let mut store = GroupStore {
         buzz_enabled: true,
@@ -4626,6 +4727,55 @@ fn rollback_unstored_group_releases_the_member_budget() {
         "the in-memory rollback must release the global member budget"
     );
     assert!(!store.rollback_unstored_group("dm-1"));
+}
+
+#[test]
+fn buzz_member_role_tag_is_not_an_admin_grant() {
+    let mut store = GroupStore {
+        buzz_enabled: true,
+        ..Default::default()
+    };
+    let now = 1_600_000_000;
+    store.apply(
+        &event(CREATE_GROUP, ADMIN, Some("g1"), vec![]),
+        "relay",
+        now,
+        true,
+        false,
+    );
+    let member = event(
+        9000,
+        ADMIN,
+        Some("g1"),
+        vec![vec![P.into(), USER.into(), "member".into()]],
+    );
+    assert!(store.validate_write(&member).is_ok());
+    store.apply(&member, "relay", now + 1, true, false);
+    let group = store.group("g1").unwrap();
+    assert!(group.is_member(USER));
+    assert!(
+        !group.is_admin(USER),
+        "Buzz's member tier must stay a plain member: {:?}",
+        group.members.get(USER)
+    );
+    assert!(
+        group
+            .members
+            .get(USER)
+            .is_some_and(|roles| roles.is_empty()),
+        "39002's member label must not become a stored admin role"
+    );
+
+    let demote_last = event(
+        9000,
+        ADMIN,
+        Some("g1"),
+        vec![vec![P.into(), ADMIN.into(), "member".into()]],
+    );
+    assert!(
+        store.validate_write(&demote_last).is_err(),
+        "member is a demotion of the last admin"
+    );
 }
 
 #[test]

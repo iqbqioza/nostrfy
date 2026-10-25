@@ -68,11 +68,21 @@ pub(crate) fn apply_settings(group: &mut Group, event: &Event, buzz: bool, histo
                     // joins as well as reads; NIP-CL has no separate flags.
                     group.settings.restricted = true;
                     group.settings.closed = true;
+                    // A DM/system channel also hides its metadata from
+                    // non-members; `private` alone only gates messages.
+                    if matches!(group.channel_type.as_str(), "dm" | "system") {
+                        group.settings.hidden = true;
+                    }
                 }
                 Some("open" | "public") => {
                     group.settings.private = false;
                     group.settings.restricted = false;
                     group.settings.closed = false;
+                    // An explicit open DM/system channel is meant to make
+                    // its metadata reachable again.
+                    if matches!(group.channel_type.as_str(), "dm" | "system") {
+                        group.settings.hidden = false;
+                    }
                 }
                 _ => {}
             },
@@ -244,11 +254,17 @@ fn apply_nip29_settings(group: &mut Group, event: &Event, history: bool) {
                     settings.private = true;
                     settings.restricted = true;
                     settings.closed = true;
+                    if matches!(group.channel_type.as_str(), "dm" | "system") {
+                        settings.hidden = true;
+                    }
                 }
                 Some("open" | "public") if buzz_origin => {
                     settings.private = false;
                     settings.restricted = false;
                     settings.closed = false;
+                    if matches!(group.channel_type.as_str(), "dm" | "system") {
+                        settings.hidden = false;
+                    }
                 }
                 _ => {}
             },
@@ -365,15 +381,17 @@ pub(crate) fn build_meta_event(
     }
     if buzz {
         super::push_channel_identity_tags(&mut event, Some(group), true);
-        // Buzz reads a DM's participants from the lowercase `p` tags on its
-        // kind:39000 (the kind:39002 roster is a separate query). Only DMs
-        // pay this cost, and their participant set is bounded at 64 keys.
-        if group.channel_type == "dm" {
-            let mut members: Vec<&String> = group.members.keys().collect();
-            members.sort();
-            for member in members {
-                event.tags.push(vec![P.to_string(), member.clone()]);
-            }
+    }
+    // Buzz reads a DM's participants from the lowercase `p` tags on its
+    // kind:39000 (the kind:39002 roster is a separate query). Keep them even
+    // while the Buzz layer is disabled: a DM is a Buzz-only group, and a
+    // plain-mode membership edit must not overwrite its metadata without the
+    // participant list.
+    if group.channel_type == "dm" {
+        let mut members: Vec<&String> = group.members.keys().collect();
+        members.sort();
+        for member in members {
+            event.tags.push(vec![P.to_string(), member.clone()]);
         }
     }
     if let Some(parent) = &group.parent {
@@ -832,6 +850,33 @@ mod tests {
             .push(vec!["visibility".to_string(), "open".to_string()]);
         apply_settings(&mut group, &open, true, false);
         assert!(!group.settings.private);
+    }
+
+    #[test]
+    fn a_plain_mode_dm_meta_still_lists_its_participants() {
+        let mut group = Group {
+            channel_type: "dm".into(),
+            settings: GroupSettings {
+                private: true,
+                hidden: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let a = "a".repeat(64);
+        let b = "b".repeat(64);
+        group.members.insert(a.clone(), Default::default());
+        group.members.insert(b.clone(), Default::default());
+        let meta = build_meta_event("dm-1", Some(&group), "relay", 1, false);
+        let participants: Vec<&str> = meta
+            .tags
+            .iter()
+            .filter(|tag| tag.first().is_some_and(|name| name == P))
+            .filter_map(|tag| tag.get(1).map(String::as_str))
+            .collect();
+        assert_eq!(participants.len(), 2);
+        assert!(participants.contains(&a.as_str()));
+        assert!(participants.contains(&b.as_str()));
     }
 
     #[test]

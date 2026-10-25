@@ -39,6 +39,10 @@ const THREAD_SUMMARY: u64 = 39005;
 const AUX_KINDS: &[u64] = &[5, 7, 9005, 40003];
 const AUX_DELETE_KINDS: &[u64] = &[5, 9005];
 const THREAD_CONTENT_KINDS: &[u64] = &[9, 40002, 45001, 45003];
+/// Aggregate output bound for one mixed window request. Individual windows
+/// are already bounded; this keeps 256 repeated filters from materializing
+/// hundreds of thousands of events before the response-size check runs.
+const MAX_WINDOW_EVENTS: usize = 20_000;
 
 /// Executes a mixed `/query` request: window filters, legacy thread filters
 /// and ordinary NIP-01 filters, concatenated in request order.
@@ -59,11 +63,25 @@ pub(crate) async fn query_all(
         } else {
             ordinary.push(raw.clone());
         }
+        if out.len() > MAX_WINDOW_EVENTS {
+            return Err(window_too_large());
+        }
     }
     if !ordinary.is_empty() {
         out.extend(super::bridge::execute_filters(relay, cfg, authed, &ordinary).await?);
+        if out.len() > MAX_WINDOW_EVENTS {
+            return Err(window_too_large());
+        }
     }
     Ok(out)
+}
+
+fn window_too_large() -> Response {
+    (
+        StatusCode::PAYLOAD_TOO_LARGE,
+        Json(json!({ "error": "window response too large; narrow the filters" })),
+    )
+        .into_response()
 }
 
 fn is_hex_64(value: &str) -> bool {
@@ -195,6 +213,9 @@ async fn channel_window(
 
     let base_filter: Filter = serde_json::from_value(raw.clone())
         .map_err(|e| bad_request(&format!("invalid window filter: {e}")))?;
+    if base_filter.too_many_members() || base_filter.invalid_tag_values() {
+        return Err(bad_request("invalid window filter bounds"));
+    }
     let fetch = limit
         .saturating_mul(8)
         .saturating_add(64)
@@ -552,6 +573,9 @@ async fn thread_window(
     // to the ordinary and channel-window paths.
     let visible_filter: Filter = serde_json::from_value(raw.clone())
         .map_err(|e| bad_request(&format!("invalid thread filter: {e}")))?;
+    if visible_filter.too_many_members() || visible_filter.invalid_tag_values() {
+        return Err(bad_request("invalid thread filter bounds"));
+    }
     let depth_limit = raw
         .get("depth_limit")
         .and_then(Value::as_u64)

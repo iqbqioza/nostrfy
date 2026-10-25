@@ -540,7 +540,7 @@ pub(crate) async fn execute_filters(
         ) {
             continue;
         }
-        if !seen.insert(event.id.clone()) {
+        if seen.contains(&event.id) {
             continue;
         }
         for (index, parsed) in parsed.iter().enumerate() {
@@ -556,6 +556,7 @@ pub(crate) async fn execute_filters(
                 continue;
             }
             counts[index] += 1;
+            seen.insert(event.id.clone());
             out.push(event);
             break;
         }

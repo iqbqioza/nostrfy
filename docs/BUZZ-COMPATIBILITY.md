@@ -93,12 +93,13 @@ and publishes them:
   the `guest` and `bot` tiers alongside the ordinary roles, matching the
   role column in `39002`.
 - `visibility=private` implies member-only writes (Buzz's channel model). A
-  DM or system channel is private unless the create event says
-  `visibility=open`.
+  DM or system channel is private and its metadata is hidden unless the
+  create event says `visibility=open`.
 - Metadata edits are **partial**: a `9002` without a tag leaves that setting
-  unchanged; `["visibility","open"]`, an empty string or `["ttl",""]` clears
-  the corresponding value. This follows NIP-CL/Buzz; plain NIP-29 clients that
-  send every field still work.
+  unchanged; `["visibility","open"]`/`["visibility","private"]` set the
+  visibility, an empty optional text/`join_role` value clears that field,
+  and `["ttl",""]` clears the TTL. This follows NIP-CL/Buzz; plain NIP-29
+  clients that send every field still work.
 
 ## Relay-signed Buzz events
 
@@ -160,14 +161,29 @@ host, because Buzz signs the relay URL it uploads to.
   `kind:39007` thread-bounds overlay; only the channel-window path emits its
   `kind:39006` bounds event.
 - DM groups are derived state backed by the group snapshot: the synthetic
-  `9007`/`9000` are not stored, so a full group-state rebuild from events
-  (after a dropped snapshot, not an ordinary restart) does not recreate a
-  DM channel. Hidden-DM sets are snapshot-backed for the same reason.
+  `9007`/`9000` are not stored, so a snapshot-less full rebuild (new
+  database, migration, or dropped snapshot) cannot recreate a DM channel.
+  Runtime state-removal rebuilds carry live DM groups across the swap.
+  Hidden-DM sets are snapshot-backed for the same reason.
 - Enabling `enabled_buzz` on an existing relay upgrades the creator role in
   the restored snapshot (and disabling it maps a Buzz-created channel's
   restored `owner` default back to `admin`), but the stored
   `39001`/`39002` are republished only on the next metadata or membership
   change; a restart alone does not rewrite them.
+- The `owner` entries in `13534` are roster metadata, not an access-list
+  bypass. `relay.pubkey` has the operator publishing exemption;
+  `rpc.admin_pubkey` does not, so on a `restrict_relay` relay add it to the
+  allowlist if it should publish too. NIP-86 `banpubkey` removes an
+  allowlist entry but does not automatically remove NIP-43 role
+  assignments.
+- DM channel ids are derived from `relay.private_key`. Rotating the relay
+  key changes every derived id: old DM groups remain in the snapshot, while
+  a new open creates a new channel. There is no automatic DM migration.
+- In Buzz mode, a restored creator whose only role is exactly `admin` is
+  upgraded to `owner`. An explicit later demotion from owner to `admin`
+  uses the same exact shape and is therefore indistinguishable from the old
+  default on the next snapshot restore; use a non-default role label when a
+  deliberate demotion must survive a restart.
 - Re-opening an existing DM whose participant set is incomplete (for example
   after an admin removed a member) is rejected rather than acknowledged as a
   partial channel. The existing channel is left intact; an admin can
@@ -179,7 +195,8 @@ host, because Buzz signs the relay URL it uploads to.
   NIP-29 semantics and may be lost; the normal snapshot restore keeps them.
 - The bridge inherits the relay's filter bounds: a single filter with more
   than 512 ids/authors/kinds/tag values is rejected, and the over-fetch
-  window is capped at 2,000 events. A community with more than 512 channels
+  window is capped at 2,000 events. Window/thread requests also cap their
+  combined output at 20,000 events. A community with more than 512 channels
   may need to split its channel-list query.
 - NIP-77 negentropy sync returns ids/timestamps without applying the
   per-pubkey gate to `44100`/`44101`/`30622`; an anonymous syncer can learn
