@@ -1384,15 +1384,104 @@ impl LocalStore {
         Ok(())
     }
 
-    fn path_in_npub_dir(&self, npub: &str, dir: &std::fs::File, name: &str) -> PathBuf {
+    /// Opens a name below an already-open directory with `openat`, so the
+    /// operation cannot be redirected by renaming/symlinking the directory
+    /// between the check and the use (BLM-05). `openat` works on FreeBSD
+    /// too, unlike `/proc/self/fd/N/<child>` path tricks.
+    fn openat_at(
+        &self,
+        dir: &std::fs::File,
+        name: &str,
+        flags: i32,
+        mode: u32,
+    ) -> std::io::Result<std::fs::File> {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        let name = std::ffi::CString::new(name)
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+        let fd = unsafe {
+            libc::openat(
+                dir.as_raw_fd(),
+                name.as_ptr(),
+                flags | libc::O_CLOEXEC,
+                mode,
+            )
+        };
+        if fd < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+        }
+    }
+
+    fn open_read_at(&self, dir: &std::fs::File, name: &str) -> std::io::Result<std::fs::File> {
+        self.openat_at(
+            dir,
+            name,
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+            0,
+        )
+    }
+
+    fn open_write_at(&self, dir: &std::fs::File, name: &str) -> std::io::Result<std::fs::File> {
+        self.openat_at(
+            dir,
+            name,
+            libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_NOFOLLOW,
+            0o666,
+        )
+    }
+
+    fn rename_at(&self, dir: &std::fs::File, old: &str, new: &str) -> std::io::Result<()> {
         use std::os::fd::AsRawFd;
-        let fd = dir.as_raw_fd();
-        ["/proc/self/fd", "/dev/fd"]
-            .into_iter()
-            .map(|base| PathBuf::from(base).join(fd.to_string()))
-            .find(|path| path.join(".").exists())
-            .map(|path| path.join(name))
-            .unwrap_or_else(|| self.canonical_root.join(npub).join(name))
+        let old = std::ffi::CString::new(old)
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+        let new = std::ffi::CString::new(new)
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+        let rc =
+            unsafe { libc::renameat(dir.as_raw_fd(), old.as_ptr(), dir.as_raw_fd(), new.as_ptr()) };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+
+    fn rename_from_path_at(
+        &self,
+        source: &Path,
+        dir: &std::fs::File,
+        new: &str,
+    ) -> std::io::Result<()> {
+        use std::os::fd::AsRawFd;
+        let source = std::ffi::CString::new(source.as_os_str().as_encoded_bytes())
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+        let new = std::ffi::CString::new(new)
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+        let rc = unsafe {
+            libc::renameat(
+                libc::AT_FDCWD,
+                source.as_ptr(),
+                dir.as_raw_fd(),
+                new.as_ptr(),
+            )
+        };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+
+    fn unlink_at(&self, dir: &std::fs::File, name: &str) -> std::io::Result<()> {
+        use std::os::fd::AsRawFd;
+        let name = std::ffi::CString::new(name)
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+        let rc = unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), 0) };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
     }
 
     /// Whether the blob's parent directory is a real directory inside the
@@ -1480,13 +1569,8 @@ impl LocalStore {
             let Some(dir) = self.open_npub_dir(npub)? else {
                 return Err(anyhow!("blossom storage directory is missing"));
             };
-            let path = self.path_in_npub_dir(npub, &dir, "");
-            let result = match tokio::fs::File::open(&path).await {
-                Ok(file) => file.sync_all().await,
-                Err(e) => Err(e),
-            };
-            if let Err(e) = result {
-                log::warn!("blossom: cannot fsync directory {}: {e}", path.display());
+            if let Err(e) = dir.sync_all() {
+                log::warn!("blossom: cannot fsync directory for {npub}: {e}");
                 return Err(e.into());
             }
         }
@@ -1519,16 +1603,11 @@ impl LocalStore {
         // race can surface as a spurious failure — and O_NOFOLLOW keeps a
         // planted symlink from redirecting the write (or truncating an
         // external file through the link).
-        let tmp_path = self.path_in_npub_dir(npub, &dirfd, &format!(".{sha256}.tmp"));
+        let tmp_name = format!(".{sha256}.tmp");
         let write = {
             use tokio::io::AsyncWriteExt;
-            let mut tmp = tokio::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .custom_flags(libc::O_NOFOLLOW)
-                .open(&tmp_path)
-                .await?;
+            let std_tmp = self.open_write_at(&dirfd, &tmp_name)?;
+            let mut tmp = tokio::fs::File::from_std(std_tmp);
             let result = async {
                 tmp.write_all(bytes).await?;
                 tmp.flush().await
@@ -1538,13 +1617,11 @@ impl LocalStore {
             result
         };
         if let Err(e) = write {
-            let _ = tokio::fs::remove_file(&tmp_path).await;
+            let _ = self.unlink_at(&dirfd, &tmp_name);
             return Err(e.into());
         }
-        if let Err(e) =
-            tokio::fs::rename(&tmp_path, self.path_in_npub_dir(npub, &dirfd, sha256)).await
-        {
-            let _ = tokio::fs::remove_file(&tmp_path).await;
+        if let Err(e) = self.rename_at(&dirfd, &tmp_name, sha256) {
+            let _ = self.unlink_at(&dirfd, &tmp_name);
             return Err(e.into());
         }
         self.sync_dir(npub).await?;
@@ -1569,31 +1646,23 @@ impl LocalStore {
         let file = tokio::fs::File::open(source).await?;
         file.sync_all().await?;
         drop(file);
-        if tokio::fs::rename(source, self.path_in_npub_dir(npub, &dirfd, sha256))
-            .await
-            .is_ok()
-        {
+        if self.rename_from_path_at(source, &dirfd, sha256).is_ok() {
             // Publish the directory entry durably before the caller
             // reports success (the mapping commit already landed).
             self.sync_dir(npub).await?;
             return Ok(());
         }
-        let tmp_path = self.path_in_npub_dir(npub, &dirfd, &format!(".{sha256}.tmp"));
+        let tmp_name = format!(".{sha256}.tmp");
         let mut input = tokio::fs::File::open(source).await?;
-        let mut output = tokio::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&tmp_path)
-            .await?;
+        let std_tmp = self.open_write_at(&dirfd, &tmp_name)?;
+        let mut output = tokio::fs::File::from_std(std_tmp);
         if let Err(e) = tokio::io::copy(&mut input, &mut output).await {
-            let _ = tokio::fs::remove_file(&tmp_path).await;
+            let _ = self.unlink_at(&dirfd, &tmp_name);
             return Err(e.into());
         }
         if let Err(e) = output.flush().await {
             drop(output);
-            let _ = tokio::fs::remove_file(&tmp_path).await;
+            let _ = self.unlink_at(&dirfd, &tmp_name);
             return Err(e.into());
         }
         // Flush the file contents to disk before the rename publishes the
@@ -1602,14 +1671,12 @@ impl LocalStore {
         // already references the sha, so a truncated blob would surface).
         if let Err(e) = output.sync_all().await {
             drop(output);
-            let _ = tokio::fs::remove_file(&tmp_path).await;
+            let _ = self.unlink_at(&dirfd, &tmp_name);
             return Err(e.into());
         }
         drop(output);
-        if let Err(e) =
-            tokio::fs::rename(&tmp_path, self.path_in_npub_dir(npub, &dirfd, sha256)).await
-        {
-            let _ = tokio::fs::remove_file(&tmp_path).await;
+        if let Err(e) = self.rename_at(&dirfd, &tmp_name, sha256) {
+            let _ = self.unlink_at(&dirfd, &tmp_name);
             return Err(e.into());
         }
         self.sync_dir(npub).await?;
@@ -1634,13 +1701,8 @@ impl LocalStore {
             Err(e) if is_symlink_directory(&e) => return Ok(None),
             Err(e) => return Err(e),
         };
-        match tokio::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(self.path_in_npub_dir(npub, &dirfd, sha256))
-            .await
-        {
-            Ok(file) => match file.metadata().await {
+        match self.open_read_at(&dirfd, sha256) {
+            Ok(file) => match file.metadata() {
                 Ok(meta) if meta.is_file() => Ok(Some(true)),
                 // A symlink or directory at the blob path is not a
                 // readable blob: unknown, matching `open`'s `Refused`.
@@ -1674,13 +1736,8 @@ impl LocalStore {
             Err(e) if is_symlink_directory(&e) => return Ok(OpenOutcome::Refused),
             Err(e) => return Err(e),
         };
-        let mut file = match tokio::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(self.path_in_npub_dir(npub, &dirfd, sha256))
-            .await
-        {
-            Ok(f) => f,
+        let mut file = match self.open_read_at(&dirfd, sha256) {
+            Ok(f) => tokio::fs::File::from_std(f),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(OpenOutcome::Missing);
             }
@@ -1718,8 +1775,7 @@ impl LocalStore {
             Ok(None) => return Ok(false),
             Err(e) => return Err(e),
         };
-        let path = self.path_in_npub_dir(npub, &dirfd, sha256);
-        match tokio::fs::remove_file(&path).await {
+        match self.unlink_at(&dirfd, sha256) {
             Ok(()) => Ok(true),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
             Err(e) => Err(e.into()),
@@ -2727,7 +2783,7 @@ mod tests {
         let root = local(&s).root.clone();
         s.put(&a, &sha, b"real", "text/plain").await.unwrap();
         let dirfd = local(&s).open_npub_dir(&npub).unwrap().expect("dirfd");
-        let pinned = local(&s).path_in_npub_dir(&npub, &dirfd, &sha);
+        let mut pinned = local(&s).open_read_at(&dirfd, &sha).unwrap();
         let external = std::env::temp_dir().join(format!(
             "nostrfy-blossom-dirfd-external-{}",
             std::process::id()
@@ -2738,10 +2794,11 @@ mod tests {
         let old = root.join(format!("{npub}.old"));
         std::fs::rename(root.join(&npub), &old).unwrap();
         std::os::unix::fs::symlink(&external, root.join(&npub)).unwrap();
+        let mut pinned_bytes = Vec::new();
+        std::io::Read::read_to_end(&mut pinned, &mut pinned_bytes).unwrap();
         assert_eq!(
-            std::fs::read(&pinned).unwrap(),
-            b"real",
-            "the pinned fd path must still resolve the original directory"
+            pinned_bytes, b"real",
+            "the pinned dirfd must still resolve the original directory"
         );
         assert_eq!(
             std::fs::read(external.join(&sha)).unwrap(),
