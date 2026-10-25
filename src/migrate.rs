@@ -67,6 +67,11 @@ pub struct Options {
     /// Whether NIP-40 is enabled in the nostrfy config: a dry run uses it
     /// to classify already-expired events like the put path would.
     pub nip40_enabled: bool,
+    /// Whether the Buzz compatibility layer is enabled. The authorization
+    /// replay must use the same NIP-CL settings semantics as the relay's
+    /// startup rebuild, or a Buzz reopen (`visibility=open`) can make the
+    /// migration drop a JOIN the relay would admit.
+    pub enabled_buzz: bool,
     /// Record the first-seen timestamp of each imported author (only
     /// meaningful, and only set, when the new-pubkey gate is configured).
     pub first_seen: bool,
@@ -568,6 +573,31 @@ fn replay_moderation(
     if crate::nips::nip29::is_group_action(event) && crate::nips::nip29::group_id(event).is_none() {
         return false;
     }
+    // The startup rebuild of this relay's own keyless history trusts stored
+    // JOINs, because they were admitted live. An imported export has no such
+    // guarantee: refuse a code-less JOIN to a group that is closed at this
+    // point in the chronological replay, so it is dropped instead of
+    // becoming trusted on the first restart. A code-bearing JOIN is kept
+    // because its 9009 invite may have been removed later (see below).
+    if event.kind == crate::nips::nip29::JOIN {
+        let admitted = crate::nips::nip29::group_id(event)
+            .and_then(|gid| groups.group(gid))
+            .is_some_and(|group| {
+                !group.settings.closed
+                    // The code may have been added by a 9009 that a later
+                    // 9005 removed. The export keeps the JOIN but not the
+                    // deleted invite, so a code-bearing JOIN is treated as
+                    // pre-authorized; a code-less JOIN to a group that is
+                    // already closed is refused. Rejecting every code-bearing
+                    // JOIN after an invite revocation would delete legitimate
+                    // members from the migrated relay.
+                    || crate::nips::nip29::event_code(event)
+                        .is_some_and(|code| !code.is_empty())
+            });
+        if !admitted {
+            return false;
+        }
+    }
     if (crate::nips::nip29::MOD_MIN..=crate::nips::nip29::MOD_MAX).contains(&event.kind)
         && !relay_pubkey.is_some_and(|pk| pk.eq_ignore_ascii_case(&event.pubkey))
     {
@@ -687,6 +717,7 @@ async fn apply_group_side_effects(db: &DbClient, opts: &Options, stats: &mut Sta
     // scan, and only a state-changing action restarts it. Neither the
     // action list nor the refused list is materialized as a whole.
     let mut applied: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut admitted_joins: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut dropped: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut deleted_creates: std::collections::HashSet<String> = std::collections::HashSet::new();
     loop {
@@ -698,6 +729,14 @@ async fn apply_group_side_effects(db: &DbClient, opts: &Options, stats: &mut Sta
         // materialized: memory stays bounded by the page and `applied` ids.
         loop {
             let mut groups = crate::nips::nip29::GroupStore::with_cap(opts.max_groups);
+            groups.buzz_enabled = opts.enabled_buzz;
+            // The JOIN gate in `replay_moderation` has already refused
+            // invalid closed-group joins; for the accepted ones, reproduce
+            // the keyless startup rebuild's trust so the migration's
+            // authorization state matches the first restart. A keyed
+            // destination still re-adjudicates (its relay_pubkey is
+            // non-empty).
+            groups.trust_stored_joins = true;
             let mut sink = ModerationActionSink {
                 db,
                 deleted_creates: &mut deleted_creates,
@@ -709,6 +748,7 @@ async fn apply_group_side_effects(db: &DbClient, opts: &Options, stats: &mut Sta
                 &mut groups,
                 opts.relay_pubkey.as_deref(),
                 ReplayAction::Apply(&mut sink),
+                Some(&mut admitted_joins),
                 None,
             )
             .await?;
@@ -805,10 +845,13 @@ async fn apply_group_side_effects(db: &DbClient, opts: &Options, stats: &mut Sta
     // state once and drop the refused events page by page, so the refused
     // list is never held in memory as a whole.
     let mut groups = crate::nips::nip29::GroupStore::with_cap(opts.max_groups);
+    groups.buzz_enabled = opts.enabled_buzz;
+    groups.trust_stored_joins = true;
     {
         let mut dropper = RefusedDropper {
             db,
             applied: &applied,
+            admitted_joins: &admitted_joins,
             dropped: &mut dropped,
             stats,
         };
@@ -817,6 +860,7 @@ async fn apply_group_side_effects(db: &DbClient, opts: &Options, stats: &mut Sta
             &mut groups,
             opts.relay_pubkey.as_deref(),
             ReplayAction::Final(&applied),
+            None,
             Some(&mut dropper),
         )
         .await?;
@@ -924,6 +968,11 @@ async fn drop_fake_group_metadata(
 struct RefusedDropper<'a> {
     db: &'a DbClient,
     applied: &'a std::collections::HashSet<String>,
+    /// JOINs admitted by any fixpoint pass. A later pass may see the group's
+    /// create deleted and refuse the same JOIN; deleting it would break the
+    /// migration's contract because the event was accepted when it was
+    /// first replayed.
+    admitted_joins: &'a std::collections::HashSet<String>,
     dropped: &'a mut std::collections::HashSet<String>,
     stats: &'a mut Stats,
 }
@@ -938,6 +987,7 @@ impl RefusedDropper<'_> {
             // run had accepted.
             if event.kind == 9005
                 || self.applied.contains(&event.id)
+                || self.admitted_joins.contains(&event.id)
                 || !self.dropped.insert(event.id.clone())
             {
                 continue;
@@ -1024,6 +1074,7 @@ async fn replay_stored_moderation(
     groups: &mut crate::nips::nip29::GroupStore,
     relay_pubkey: Option<&str>,
     mut action: ReplayAction<'_>,
+    mut admitted_joins: Option<&mut std::collections::HashSet<String>>,
     mut refused: Option<&mut RefusedDropper<'_>>,
 ) -> Result<ReplayOutcome> {
     let kinds: Vec<u64> = (crate::nips::nip29::MOD_MIN..=crate::nips::nip29::MOD_MAX)
@@ -1086,9 +1137,10 @@ async fn replay_stored_moderation(
             .filter(|event| Some(event.created_at) == max_created)
             .count();
         // Consistency with the startup rebuild, not an authorization change:
-        // this replay's only gate is `is_admin` (`replay_moderation`), and a
-        // join grants no roles, so skipping a join that shares its second
-        // with the removal of the same member cannot flip a 9005/9008 verdict.
+        // this replay's moderation gate is `is_admin` (`replay_moderation`)
+        // plus the JOIN admission check, and a join grants no roles, so
+        // skipping a join that shares its second with the removal of the
+        // same member cannot flip a 9005/9008 verdict.
         // It is kept so the two replays derive the same group state from the
         // same stored events — they share `group_rank` for exactly that
         // reason — and so the `total_members` budget is not inflated by a
@@ -1111,7 +1163,14 @@ async fn replay_stored_moderation(
                     continue;
                 }
             }
-            if replay_moderation(groups, &event, relay_pubkey) {
+            let authorized = replay_moderation(groups, &event, relay_pubkey);
+            if authorized
+                && event.kind == crate::nips::nip29::JOIN
+                && let Some(admitted) = admitted_joins.as_deref_mut()
+            {
+                admitted.insert(event.id.clone());
+            }
+            if authorized {
                 if matches!(event.kind, 9005 | 9008) {
                     match &mut action {
                         ReplayAction::Apply(sink) => {
@@ -1131,7 +1190,18 @@ async fn replay_stored_moderation(
                     }
                 }
             } else if refused.is_some() {
-                page_refused.push(event);
+                // A JOIN whose group is missing may be a legitimate join
+                // whose create a 9005 removed in an earlier fixpoint pass.
+                // It has no effect on the replayed state (the group no
+                // longer exists) and dropping it would violate the
+                // migration contract; keep it. A JOIN to an existing
+                // closed group without a code is still dropped.
+                let keep_orphan_join = event.kind == crate::nips::nip29::JOIN
+                    && crate::nips::nip29::group_id(&event)
+                        .is_some_and(|gid| groups.group(gid).is_none());
+                if !keep_orphan_join {
+                    page_refused.push(event);
+                }
             }
         }
         if !more {
@@ -1397,6 +1467,7 @@ mod tests {
             apply_vanish: false,
             nip62_enabled: true,
             nip40_enabled: true,
+            enabled_buzz: false,
             first_seen: false,
             batch: 3,
             max_line_bytes: 1024 * 1024,
@@ -2964,5 +3035,60 @@ mod tests {
         });
         assert_eq!(stats.valid, 1);
         assert_eq!(stats.imported(), 0);
+    }
+
+    #[test]
+    fn migration_refuses_an_uninvited_closed_group_join() {
+        let admin = "aa".repeat(32);
+        let user = "bb".repeat(32);
+        let mut groups = nip29::GroupStore::default();
+        let create = Event {
+            id: String::new(),
+            pubkey: admin.clone(),
+            created_at: 1,
+            kind: nip29::CREATE_GROUP,
+            tags: vec![vec!["h".into(), "g1".into()]],
+            content: String::new(),
+            sig: String::new(),
+        };
+        let close = Event {
+            id: String::new(),
+            pubkey: admin,
+            created_at: 2,
+            kind: 9002,
+            tags: vec![vec!["h".into(), "g1".into()], vec!["closed".into()]],
+            content: String::new(),
+            sig: String::new(),
+        };
+        let join = Event {
+            id: String::new(),
+            pubkey: user.clone(),
+            created_at: 3,
+            kind: nip29::JOIN,
+            tags: vec![vec!["h".into(), "g1".into()]],
+            content: String::new(),
+            sig: String::new(),
+        };
+        // Match the migration's trusted mode: its explicit JOIN gate above
+        // is what refuses the invalid event.
+        groups.trust_stored_joins = true;
+        assert!(replay_moderation(&mut groups, &create, None));
+        assert!(replay_moderation(&mut groups, &close, None));
+        assert!(
+            !replay_moderation(&mut groups, &join, None),
+            "an imported closed-group JOIN without an invite must be refused"
+        );
+        assert!(!groups.group("g1").unwrap().is_member(&user));
+
+        // A code-bearing JOIN may reference a 9009 that a later 9005
+        // removed; the code is no longer in the replayed state, but the
+        // source relay accepted the membership and deleting it would lose
+        // the member.
+        let mut invited = join.clone();
+        invited
+            .tags
+            .push(vec!["code".into(), "removed-invite".into()]);
+        assert!(replay_moderation(&mut groups, &invited, None));
+        assert!(groups.group("g1").unwrap().is_member(&user));
     }
 }

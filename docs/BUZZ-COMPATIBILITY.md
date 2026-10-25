@@ -98,8 +98,10 @@ and publishes them:
 - Metadata edits are **partial**: a `9002` without a tag leaves that setting
   unchanged; `["visibility","open"]`/`["visibility","private"]` set the
   visibility, an empty optional text/`join_role` value clears that field,
-  and `["ttl",""]` clears the TTL. This follows NIP-CL/Buzz; plain NIP-29
-  clients that send every field still work.
+  and `["ttl",""]` clears the TTL. A subgroup is detached with an explicit
+  empty `["parent",""]`; omitting `parent` keeps the existing link. This
+  follows NIP-CL/Buzz; plain NIP-29 clients that send every field still
+  work.
 
 ## Relay-signed Buzz events
 
@@ -167,9 +169,11 @@ host, because Buzz signs the relay URL it uploads to.
   Hidden-DM sets are snapshot-backed for the same reason.
 - Enabling `enabled_buzz` on an existing relay upgrades the creator role in
   the restored snapshot (and disabling it maps a Buzz-created channel's
-  restored `owner` default back to `admin`), but the stored
-  `39001`/`39002` are republished only on the next metadata or membership
-  change; a restart alone does not rewrite them.
+  restored `owner` default back to `admin`), but the mode switch itself does
+  not rewrite the stored `39001`/`39002`; the next metadata or membership
+  change does. A snapshot restart schedules one roster refresh for groups
+  above the 1,000-member throttle threshold, but not for `39001` or smaller
+  groups.
 - The `owner` entries in `13534` are roster metadata, not an access-list
   bypass. `relay.pubkey` has the operator publishing exemption;
   `rpc.admin_pubkey` does not, so on a `restrict_relay` relay add it to the
@@ -193,6 +197,32 @@ host, because Buzz signs the relay URL it uploads to.
   a `channel_type`/`visibility` marker keeps its channel type and metadata.
   Guest/bot tiers and separate `role` tag grants are replayed with plain
   NIP-29 semantics and may be lost; the normal snapshot restore keeps them.
+  A plain-mode full `9002` that detaches a subgroup by omitting `parent` is
+  replayed as a Buzz partial edit; use an explicit empty `["parent",""]` on
+  a Buzz-origin channel if the detach must survive a mode-off rebuild.
+- A stored `9002` that turns LiveKit off is replayed with `emit=false`, so
+  its empty `kind:39004` is not republished by a snapshot-less rebuild. The
+  old participant list can remain until the room is reconfigured; the
+  LiveKit poll skips the now-inactive group.
+- The rebuild's same-second tie-break cannot recover arrival order between
+  a `9001` remove and a `9000` re-add, or a `9022` leave and a `9021`
+  rejoin. The remove/leave wins on replay until the next edit; store an
+  explicit later role/join event if that state must survive a restart.
+- Enabling Buzz on a restored plain-NIP-29 group does not reinterpret
+  literal `guest`/`bot` role labels. Such a role was an ordinary privileged
+  role in plain mode, while Buzz reports it as a read-only/bot tier. Use a
+  non-reserved label if the group will switch modes, or promote/reassign
+  the member after enabling Buzz.
+- A vanish that removes no group-state event only drops memberships from
+  the live store and snapshot. If NIP-29 is disabled at that moment, the
+  in-memory removal is skipped; a later re-enable can restore the member
+  from the pre-vanish snapshot until a state rebuild applies the vanish
+  filter.
+- The migration cannot distinguish a JOIN admitted with a `9009` invite
+  that was later deleted from a forged code-bearing JOIN to a closed group.
+  It keeps a code-bearing JOIN (and drops a code-less JOIN to a group that
+  is closed at that point in the chronological replay) so a legitimate
+  member is not lost when the invite was revoked after the join.
 - The bridge inherits the relay's filter bounds: a single filter with more
   than 512 ids/authors/kinds/tag values is rejected, and the over-fetch
   window is capped at 2,000 events. Window/thread requests also cap their

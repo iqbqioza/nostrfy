@@ -523,6 +523,12 @@ pub struct GroupStore {
     total_members: usize,
     /// The global member budget; 0 = unlimited (tests).
     max_total_members: usize,
+    /// Set while this relay replays its own stored history (or the
+    /// migration after its explicit JOIN admission gate). A keyless relay
+    /// has no relay-signed 9000 JOIN mirror, so its own accepted JOIN must
+    /// be trusted even after the group later closed. Other history replays
+    /// leave this false so `apply` re-adjudicates closed-group admission.
+    pub(crate) trust_stored_joins: bool,
     /// Child ids that some group's `children` list declared (a hint, never
     /// the authority): a CREATE_GROUP scans the groups for an adopting
     /// parent only when the id was ever declared, so an uncapped store does
@@ -678,6 +684,16 @@ impl GroupStore {
             }
         }
         self.members_dirty.clear();
+        // The snapshot stores the roster but not the throttling/dirty
+        // marker. A large group whose last 39002 was deferred before the
+        // restart would otherwise keep the stale stored event until its
+        // next membership change. Mark it for one stats-tick refresh.
+        self.members_dirty.extend(
+            self.groups
+                .iter()
+                .filter(|(_, group)| group.members.len() > MEMBERS_EAGER_MAX)
+                .map(|(gid, _)| gid.clone()),
+        );
         // The snapshot is authoritative: unknown ids are genuinely unknown
         // again (see the `unrestored` field).
         self.unrestored = false;
@@ -955,6 +971,9 @@ impl GroupStore {
                 if self.at_capacity() {
                     bail!("restricted: group limit reached");
                 }
+                if self.at_member_capacity(1) {
+                    bail!("restricted: the relay member limit is reached");
+                }
                 return Ok(());
             }
             bail!("blocked: the group has been deleted");
@@ -968,6 +987,9 @@ impl GroupStore {
             if event.kind == CREATE_GROUP {
                 if self.at_capacity() {
                     bail!("restricted: group limit reached");
+                }
+                if self.at_member_capacity(1) {
+                    bail!("restricted: the relay member limit is reached");
                 }
                 return Ok(());
             }
@@ -1041,11 +1063,10 @@ impl GroupStore {
             // topic/purpose with a kind:9002 that carries only those fields.
             // Every other metadata edit stays owner/admin-only.
             if event.kind == 9002 && !relay_signed && !group.is_admin(pubkey) {
-                let only_topic = event.tags.iter().all(|tag| {
-                    tag.is_empty()
-                        || matches!(tag[0].as_str(), H | "topic" | "purpose" | "previous")
-                });
-                if guest || !group.is_member(pubkey) || !only_topic {
+                // Keep the exact same predicate in the apply path so a
+                // member's topic/purpose edit cannot fall through to the
+                // full parent/child replacement and detach a subgroup.
+                if !is_member_topic_edit(group, event, relay_signed) {
                     bail!("restricted: you are not an admin of this group");
                 }
                 return Ok(());
@@ -1240,15 +1261,32 @@ impl GroupStore {
                 // honored; this relay keeps no pending-join queue — the
                 // live validation rejects such requests as final, so this
                 // arm is a no-op for them on every path).
+                // A keyless relay has no relay-signed 9000 mirror to carry
+                // an accepted JOIN across a rebuild. Re-adjudicating the
+                // stored JOIN against the *end-state* settings loses a join
+                // accepted while the group was open if a later 9002 closed
+                // it, or if the invite event behind a closed join was
+                // deleted. Live validation remains the admission gate; a
+                // keyless history replay trusts the stored JOIN.
+                let replay_keyless_join =
+                    history_replay && self.trust_stored_joins && relay_pubkey.is_empty();
                 let admitted = self.groups.get(gid).is_some_and(|g| {
-                    if g.settings.closed {
-                        event_code(event).is_some_and(|code| g.has_invite(code))
-                    } else {
-                        true
-                    }
+                    replay_keyless_join
+                        || if g.settings.closed {
+                            event_code(event).is_some_and(|code| g.has_invite(code))
+                        } else {
+                            true
+                        }
                 });
                 if admitted {
                     let member = event.pubkey.clone();
+                    let join_role_guest = self.buzz_enabled
+                        && self.groups.get(gid).is_some_and(|g| {
+                            g.settings
+                                .join_role
+                                .as_deref()
+                                .is_some_and(|role| role != "member")
+                        });
                     let mut added = false;
                     if let Some(group) = self.groups.get_mut(gid) {
                         // Membership is the entry in the member map; roles
@@ -1288,7 +1326,20 @@ impl GroupStore {
                         self.total_members = self.total_members.saturating_add(1);
                     }
                     if emit && added {
-                        out.push(build_put_user(gid, &member, &[], relay_pubkey, now));
+                        // Carry the guest tier on the relay-signed mirror as
+                        // a Buzz-level `role` tag. A p-tag role would turn
+                        // into an ordinary admin label if Buzz is later
+                        // disabled; the separate role tag is ignored by
+                        // plain-NIP-29 replay. Stamp the mirror at the JOIN
+                        // time, not the apply time: a promotion created
+                        // after the JOIN but before the delayed apply must
+                        // sort after the mirror on replay.
+                        let mut put =
+                            build_put_user(gid, &member, &[], relay_pubkey, event.created_at);
+                        if join_role_guest {
+                            put.tags.push(vec!["role".into(), "guest".into()]);
+                        }
+                        out.push(put);
                         out.extend(self.membership_events(gid, relay_pubkey, now));
                         let channel_type = self.notice_channel_type(gid);
                         out.push(build_system_message(
@@ -1316,6 +1367,10 @@ impl GroupStore {
                 let removed = if let Some(group) = self.groups.get_mut(gid) {
                     group.guests.remove(&member);
                     group.bots.remove(&member);
+                    // The hidden-DM preference belongs to a member; a later
+                    // re-add must surface the channel rather than inherit
+                    // the stale preference.
+                    group.hidden_for.remove(&member);
                     group.members.remove(&member).is_some()
                 } else {
                     false
@@ -1359,6 +1414,8 @@ impl GroupStore {
                 } else {
                     None
                 };
+                let relay_signed =
+                    !relay_pubkey.is_empty() && event.pubkey.eq_ignore_ascii_case(relay_pubkey);
                 if let Some(group) = self.groups.get_mut(gid) {
                     let join_role_guest = self.buzz_enabled
                         && group
@@ -1506,19 +1563,31 @@ impl GroupStore {
                             if !explicit && new_member && join_role_guest {
                                 guest = true;
                             }
+                            // The p tag is a full role/tier replacement:
+                            // an existing guest/bot promoted by a client
+                            // with a bare `["p", pk]` (or an empty role
+                            // element) must lose its tier. Old relay-signed
+                            // JOIN mirrors also carry a bare p tag; they
+                            // predate the `role=guest` tag, so a bare
+                            // relay-signed 9000 keeps the existing tier
+                            // instead of silently promoting every guest on
+                            // a rebuild.
                             if guest {
                                 group.guests.insert(pk.clone());
-                            } else if explicit || new_member {
+                            } else if explicit || new_member || !relay_signed {
                                 group.guests.remove(&pk);
                             }
                             if bot {
                                 group.bots.insert(pk.clone());
-                            } else if explicit || new_member {
+                            } else if explicit || new_member || !relay_signed {
                                 group.bots.remove(&pk);
                             }
                             // An empty role list leaves the user a plain
-                            // member (replacing any previous roles).
+                            // member (replacing any previous roles). A new
+                            // membership also clears a stale hidden-DM
+                            // preference left by an earlier incarnation.
                             if new_member {
+                                group.hidden_for.remove(&pk);
                                 added += 1;
                                 added_members.push(pk.clone());
                             }
@@ -1584,6 +1653,7 @@ impl GroupStore {
                     for pk in removing {
                         group.guests.remove(pk);
                         group.bots.remove(pk);
+                        group.hidden_for.remove(pk);
                         if group.members.remove(pk).is_some() {
                             removed += 1;
                             removed_members.push(pk.to_string());
@@ -1647,6 +1717,25 @@ impl GroupStore {
                 if let Some(group) = &group_snapshot {
                     let relay_signed =
                         !relay_pubkey.is_empty() && event.pubkey.eq_ignore_ascii_case(relay_pubkey);
+                    // A NIP-CL member topic/purpose edit is not a
+                    // whole-metadata replacement and must not run the
+                    // parent/child machinery (which would detach a subgroup
+                    // because the event carries no `parent` tag).
+                    if self.buzz_enabled && is_member_topic_edit(group, event, relay_signed) {
+                        if let Some(group) = self.groups.get_mut(gid) {
+                            apply_settings(group, event, true, history_replay);
+                        }
+                        if emit {
+                            out.push(build_meta_event(
+                                gid,
+                                self.groups.get(gid),
+                                relay_pubkey,
+                                now,
+                                self.buzz_enabled,
+                            ));
+                        }
+                        return out;
+                    }
                     match validate_edit_metadata(
                         self,
                         gid,
@@ -1671,6 +1760,28 @@ impl GroupStore {
                         Err(_) => return Vec::new(),
                     }
                 }
+                // Buzz's 9002 is a partial edit, so an absent `parent` or
+                // `child` tag leaves that link unchanged. Plain NIP-29's
+                // whole-metadata edit keeps the pre-Buzz behavior: an absent
+                // `parent` detaches and an absent child list clears it. A
+                // Buzz-origin channel replayed while Buzz is off follows the
+                // stored partial semantics too.
+                let partial_links = self.buzz_enabled
+                    || (history_replay
+                        && group_snapshot
+                            .as_ref()
+                            .is_some_and(|group| !group.channel_type.is_empty()));
+                // A valueless tag is malformed, not evidence that the field
+                // was supplied. An explicit empty value (`["parent", ""]`)
+                // is the Buzz-partial way to request a detach.
+                let has_parent_tag = event
+                    .tags
+                    .iter()
+                    .any(|tag| tag.len() >= 2 && tag[0] == "parent");
+                let has_child_tags = event
+                    .tags
+                    .iter()
+                    .any(|tag| tag.len() >= 2 && tag[0] == "child");
                 let child_cap = self.declared_children_cap();
                 let (parent_before, parent_after, children_before, children_after, livekit_before) = {
                     match self.groups.get_mut(gid) {
@@ -1716,16 +1827,24 @@ impl GroupStore {
                                     }
                                 }
                                 merged
+                            } else if partial_links && !has_child_tags {
+                                // A Buzz partial edit with no child tags
+                                // does not mean "remove every child".
+                                children_before.clone()
                             } else {
                                 declared
                             };
                             let before = group.parent.clone();
                             // A denied link must not detach an existing
-                            // parent: keep the group where it was.
-                            let after = if denials.parent {
+                            // parent. The same holds for a Buzz partial edit
+                            // that omits the parent tag; an explicit empty
+                            // value is the request to detach.
+                            let after = if denials.parent || (partial_links && !has_parent_tag) {
                                 before.clone()
                             } else {
-                                tag_value(event, "parent").map(str::to_string)
+                                tag_value(event, "parent")
+                                    .filter(|parent| !parent.is_empty())
+                                    .map(str::to_string)
                             };
                             (
                                 before,
@@ -1949,7 +2068,7 @@ impl GroupStore {
                 if !gid.is_empty()
                     && !self.groups.contains_key(gid)
                     && !self.ghost.contains(gid)
-                    && (history_replay || !self.at_capacity())
+                    && (history_replay || (!self.at_capacity() && !self.at_member_capacity(1)))
                 {
                     // The budget counts the tombstones too (they bound the
                     // store's memory): reclaim room for this group first, so
@@ -1997,11 +2116,20 @@ impl GroupStore {
                         apply_settings(&mut group, event, true, history_replay);
                     } else if history_replay {
                         apply_plain_create_privacy(&mut group, event);
-                        let buzz_marker = group.settings.private
-                            || event
-                                .tags
-                                .iter()
-                                .any(|tag| tag.first().is_some_and(|name| name == "visibility"));
+                        // Only NIP-CL/Buzz provenance marks a plain-mode
+                        // history create as Buzz-origin. A normal NIP-29
+                        // `["private"]` tag also sets `settings.private`, but
+                        // it is not evidence of a Buzz create; treating it as
+                        // one would replay later whole-metadata 9002 edits as
+                        // partial and change ordinary NIP-29 behavior after
+                        // a restart.
+                        let buzz_marker = event.tags.iter().any(|tag| {
+                            tag.first().is_some_and(|name| name == "visibility")
+                                && matches!(
+                                    tag.get(1).map(String::as_str),
+                                    Some("private" | "open" | "public")
+                                )
+                        });
                         if group.channel_type.is_empty() && buzz_marker {
                             // A Buzz/NIP-CL marker without an explicit
                             // channel type still identifies a Buzz create;
@@ -2670,9 +2798,11 @@ impl GroupStore {
     /// materialized and sorted every stored group event before applying
     /// anything).
     pub async fn rebuild(&mut self, db: &DbClient, relay_pubkey: Option<&str>) -> bool {
+        self.trust_stored_joins = true;
         let rebuilt = self
             .rebuild_inner(db, relay_pubkey, None, Vec::new(), Vec::new())
             .await;
+        self.trust_stored_joins = false;
         if rebuilt {
             // A completed full replay walked every stored group event:
             // unknown ids are genuinely unknown again (see the `unrestored`
@@ -2705,14 +2835,18 @@ impl GroupStore {
         previous_deleted: Vec<String>,
         previous_ghost: Vec<String>,
     ) -> bool {
-        self.rebuild_inner(
-            db,
-            relay_pubkey,
-            Some(previous),
-            previous_deleted,
-            previous_ghost,
-        )
-        .await
+        self.trust_stored_joins = true;
+        let rebuilt = self
+            .rebuild_inner(
+                db,
+                relay_pubkey,
+                Some(previous),
+                previous_deleted,
+                previous_ghost,
+            )
+            .await;
+        self.trust_stored_joins = false;
+        rebuilt
     }
 
     async fn rebuild_inner(
@@ -3105,6 +3239,23 @@ struct EditLinkDenials {
     children: HashSet<String>,
 }
 
+/// Whether this is the NIP-CL member form of a topic/purpose edit. Such an
+/// event is accepted without admin rights, but it is a partial settings
+/// update only: the apply path must not interpret the absent `parent`/
+/// `child` tags as a request to detach or clear the group's links.
+fn is_member_topic_edit(group: &Group, event: &Event, relay_signed: bool) -> bool {
+    if event.kind != 9002 || relay_signed {
+        return false;
+    }
+    let pubkey = event.pubkey.as_str();
+    if !group.is_member(pubkey) || group.is_guest(pubkey) || group.is_admin(pubkey) {
+        return false;
+    }
+    event.tags.iter().all(|tag| {
+        tag.is_empty() || matches!(tag[0].as_str(), H | "topic" | "purpose" | "previous")
+    })
+}
+
 /// Validates the subgroup rules of a `kind:9002` edit-metadata event against
 /// the graph as the edit will leave it. The structural and safety invariants
 /// (a single `parent` tag, no self/two-way links, no cycles, the
@@ -3146,7 +3297,11 @@ fn validate_edit_metadata(
     // group both the parent and the child of this one (that would create
     // a two-way cycle the walks below cannot see: both directions would
     // be applied and every later parent edit would loop forever).
-    let parent_value = tag_value(event, "parent").map(str::to_string);
+    // An empty parent value is the explicit detach form; it is not a group
+    // id that must exist.
+    let parent_value = tag_value(event, "parent")
+        .filter(|parent| !parent.is_empty())
+        .map(str::to_string);
     if tag_values(event, "child").any(|c| c == gid) {
         bail!("restricted: a group cannot be its own child");
     }
@@ -3282,9 +3437,22 @@ fn validate_edit_metadata(
     // `apply` arm), so a stored edit that raced a same-second child addition
     // cannot detach that child, and the check has nothing left to protect.
     if !replay {
-        let children: HashSet<&str> = tag_values(event, "child").collect();
-        if !group.children.iter().all(|c| children.contains(c.as_str())) {
-            bail!("restricted: missing child tags in metadata edit");
+        // Buzz's 9002 is partial: no `child` tags means "leave the child
+        // list unchanged", and the apply path preserves it. Plain NIP-29
+        // keeps the whole-metadata rule: every existing child must be
+        // listed, or the edit is rejected instead of silently dropping
+        // them. If a Buzz edit does carry child tags, treat the list as the
+        // replacement and enforce the same completeness check.
+        let has_child_tags = event
+            .tags
+            .iter()
+            .any(|tag| tag.len() >= 2 && tag[0] == "child");
+        let partial_children = store.buzz_enabled && !has_child_tags;
+        if !partial_children {
+            let children: HashSet<&str> = tag_values(event, "child").collect();
+            if !group.children.iter().all(|c| children.contains(c.as_str())) {
+                bail!("restricted: missing child tags in metadata edit");
+            }
         }
     }
     // Adopting a new child through the parent's list requires authority

@@ -79,6 +79,72 @@ fn synthetic(pubkey: &str, kind: u64, tags: Vec<Vec<String>>, content: &str, now
 }
 
 impl super::Relay {
+    /// The admission gates that ordinary stored events get from the
+    /// database writer. DM commands are answered without storing an event,
+    /// so the put-time vanish gate and the first-seen/account-age check
+    /// never run on this path; apply their read side explicitly.
+    async fn dm_preflight(
+        &self,
+        cfg: &crate::config::Config,
+        event: &Event,
+        now: u64,
+    ) -> Result<(), PutOutcome> {
+        // A vanished key must not be able to keep creating or mutating DM
+        // channels through the non-stored command path. A failed lookup
+        // fails closed like the store's put-time gate.
+        match self.db.is_vanished(&event.pubkey).await {
+            Some(false) => {}
+            Some(true) => {
+                return Err(PutOutcome::Invalid(
+                    "blocked: this pubkey has requested to vanish".into(),
+                ));
+            }
+            None => {
+                return Err(PutOutcome::Invalid(
+                    "error: cannot verify the vanish status; retry".into(),
+                ));
+            }
+        }
+        if cfg.relay.new_pubkey_min_age_secs > 0 {
+            let Some(pubkey) = event.pubkey_bytes() else {
+                return Err(PutOutcome::Invalid("invalid: bad pubkey".into()));
+            };
+            let first_seens = self.db.first_seen_batch(vec![pubkey]).await;
+            let Some(&(created, first_seen)) = first_seens.first() else {
+                return Err(PutOutcome::Invalid("error: database unavailable".into()));
+            };
+            if !created && now.saturating_sub(first_seen) < cfg.relay.new_pubkey_min_age_secs {
+                return Err(PutOutcome::Invalid(
+                    "restricted: your account is too new".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Records an accepted DM command as account activity. Ordinary events
+    /// persist this in the same write transaction as the event; the DM
+    /// command has no stored event, so record it after the command
+    /// succeeds. A failed write only logs: the command already mutated the
+    /// group state, and the age gate will fail closed on the next lookup if
+    /// the database is still unavailable.
+    async fn dm_record_activity(&self, cfg: &crate::config::Config, event: &Event, now: u64) {
+        if cfg.relay.new_pubkey_min_age_secs == 0 {
+            return;
+        }
+        let Some(pubkey) = event.pubkey_bytes() else {
+            return;
+        };
+        if self
+            .db
+            .touch_first_seen_batch(vec![(pubkey, now)])
+            .await
+            .is_empty()
+        {
+            log::warn!("could not record first-seen activity for a DM command");
+        }
+    }
+
     /// Handles kind:41010 (open or surface a DM).
     pub(crate) async fn handle_dm_open(&self, event: &Event, authed: &[String]) -> PutOutcome {
         let cfg = self.config.read().await.clone();
@@ -122,6 +188,9 @@ impl super::Relay {
         let channel =
             derive_channel_id(&participants, secret.as_ref().map(|bytes| bytes.as_slice()));
         let now = unix_now();
+        if let Err(outcome) = self.dm_preflight(&cfg, event, now).await {
+            return outcome;
+        }
         if !self.publish_rate_allowed(&cfg, &event.pubkey, now) {
             return PutOutcome::Invalid("rate-limited: too many events".into());
         }
@@ -129,6 +198,15 @@ impl super::Relay {
         let mut created_new = false;
         let metadata = {
             let mut groups = self.groups.write().await;
+            // 41010 has no `h` tag, so the normal group-action precheck
+            // cannot see the derived DM id. Apply the same fail-closed
+            // gates here, under the write lock that the synthetic 9007/9000
+            // are about to mutate.
+            if groups.is_unrestored() || groups.group_is_stale(&channel) {
+                drop(groups);
+                self.publish_rate_rollback(&event.pubkey, now);
+                return PutOutcome::Invalid("restricted: group state is rebuilding".into());
+            }
             let existing = groups.groups.get(&channel).cloned();
             if let Some(mut group) = existing {
                 if group.channel_type != "dm" {
@@ -246,6 +324,7 @@ impl super::Relay {
         if let Err(()) = self.publish_dm_visibility(&event.pubkey).await {
             log::warn!("could not publish the DM visibility snapshot");
         }
+        self.dm_record_activity(&cfg, event, now).await;
         PutOutcome::Duplicate(format!(
             "response:{}",
             serde_json::json!({ "channel_id": channel })
@@ -271,6 +350,9 @@ impl super::Relay {
             return PutOutcome::Invalid("restricted: this pubkey may not publish".into());
         }
         let now = unix_now();
+        if let Err(outcome) = self.dm_preflight(&cfg, event, now).await {
+            return outcome;
+        }
         if !self.publish_rate_allowed(&cfg, &event.pubkey, now) {
             return PutOutcome::Invalid("rate-limited: too many events".into());
         }
@@ -285,6 +367,11 @@ impl super::Relay {
         };
         {
             let mut groups = self.groups.write().await;
+            if groups.is_unrestored() || groups.group_is_stale(&channel) {
+                drop(groups);
+                self.publish_rate_rollback(&event.pubkey, now);
+                return PutOutcome::Invalid("restricted: group state is rebuilding".into());
+            }
             let Some(group) = groups.groups.get_mut(&channel) else {
                 self.publish_rate_rollback(&event.pubkey, now);
                 return PutOutcome::Invalid("invalid: unknown DM channel".into());
@@ -301,11 +388,76 @@ impl super::Relay {
         if let Err(()) = self.publish_dm_visibility(&event.pubkey).await {
             log::warn!("could not publish the DM visibility snapshot");
         }
+        self.dm_record_activity(&cfg, event, now).await;
         PutOutcome::Duplicate(String::new())
+    }
+
+    /// Viewers whose kind:30622 snapshot carries an `h` tag for `gid`.
+    /// A group purge removes every `h`-tagged event, including those
+    /// snapshots; the caller republishes them so deleting one DM does not
+    /// make the viewer's other hidden DMs reappear.
+    pub(crate) async fn dm_visibility_viewers(&self, gid: &str) -> Option<Vec<String>> {
+        let filter: crate::filter::Filter = serde_json::from_value(serde_json::json!({
+            "kinds": [30622],
+            "#h": [gid],
+        }))
+        .expect("static filter");
+        let (events, more) = self
+            .db
+            .query_req_result(vec![filter], 1_000, unix_now())
+            .await?;
+        if more {
+            // A DM is bounded to 64 participants, so 1,000 snapshots is
+            // already far beyond the expected set; a truncated scan means
+            // the caller must fail closed rather than purge snapshots for
+            // viewers it did not capture.
+            log::warn!("DM visibility snapshot scan was truncated");
+            return None;
+        }
+        let mut viewers = BTreeSet::new();
+        for event in events {
+            if let Some(viewer) = event
+                .tags
+                .iter()
+                .find(|tag| tag.len() >= 2 && (tag[0] == "p" || tag[0] == "d"))
+                .map(|tag| tag[1].clone())
+                .filter(|viewer| is_pubkey(viewer))
+            {
+                viewers.insert(viewer);
+            }
+        }
+        Some(viewers.into_iter().collect())
+    }
+
+    /// The live group's own hidden-DM viewer set. Captured before a 9008
+    /// removes the group so a failed or interrupted purge can still rebuild
+    /// the viewers' remaining snapshots even if the database query above
+    /// fails or some snapshots were already deleted by an earlier attempt.
+    pub(crate) async fn dm_hidden_viewers(&self, gid: &str) -> Vec<String> {
+        let groups = self.groups.read().await;
+        let mut viewers: Vec<String> = groups
+            .group(gid)
+            .map(|group| group.hidden_for.iter().cloned().collect())
+            .unwrap_or_default();
+        viewers.sort();
+        viewers.dedup();
+        viewers
     }
 
     /// Publishes the NIP-DV kind:30622 snapshot for one viewer.
     pub(crate) async fn publish_dm_visibility(&self, viewer: &str) -> Result<(), ()> {
+        self.publish_dm_visibility_excluding(viewer, None).await
+    }
+
+    /// Like [`Self::publish_dm_visibility`], optionally omitting one channel.
+    /// Used before a group purge: the rebuilt snapshot must not carry the
+    /// deleted group's `h` tag, or the purge would delete the fresh event
+    /// too.
+    pub(crate) async fn publish_dm_visibility_excluding(
+        &self,
+        viewer: &str,
+        exclude: Option<&str>,
+    ) -> Result<(), ()> {
         let Some(relay_pubkey) = self.relay_pubkey() else {
             return Err(());
         };
@@ -314,8 +466,9 @@ impl super::Relay {
             let mut hidden: Vec<String> = groups
                 .groups
                 .iter()
-                .filter(|(_, group)| {
-                    group.channel_type == "dm"
+                .filter(|(id, group)| {
+                    exclude != Some(id.as_str())
+                        && group.channel_type == "dm"
                         && group.hidden_for.contains(viewer)
                         && group.is_member(viewer)
                 })

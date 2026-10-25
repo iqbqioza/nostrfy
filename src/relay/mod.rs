@@ -1716,6 +1716,10 @@ async fn groups_rebuild_worker(
                     // mark on the same path cannot interleave between the
                     // scope read and the swap.
                     let mut store = groups.write().await;
+                    // These events passed live validation on this relay, so
+                    // a keyless store must trust a JOIN accepted while the
+                    // scan ran even if a later buffered close outranks it.
+                    fresh.trust_stored_joins = true;
                     for buffered in buffered {
                         // Pass the relay key so relay-signed 9002 edits in
                         // the buffer keep their master-key authority on
@@ -1728,6 +1732,7 @@ async fn groups_rebuild_worker(
                             true,
                         );
                     }
+                    fresh.trust_stored_joins = false;
                     // DM channels are snapshot-backed: their synthetic
                     // create/member events are never stored, so the event
                     // replay cannot reconstruct them. Copy the live store's
@@ -1896,7 +1901,14 @@ async fn snapshot_persist_worker(
             }
         }
         if state.groups_dirty.swap(false, Ordering::SeqCst) {
-            groups_rebuild.persist(&db, &groups).await;
+            let outcome = groups_rebuild.persist(&db, &groups).await;
+            if outcome == PersistOutcome::Deferred {
+                // A derived mutation was in flight when the capture tried
+                // to certify its generation; keep the store dirty so the
+                // worker's next pass saves it instead of dropping the
+                // post-mutation roster.
+                state.groups_dirty.store(true, Ordering::SeqCst);
+            }
         }
         if state.roles_dirty.swap(false, Ordering::SeqCst) {
             let outcome = persist_roles_now(&db, &roles, &roles_rebuild, &persist_roles_lock).await;
@@ -3956,6 +3968,9 @@ impl Relay {
     /// a large group once their interval has elapsed. The stats tick calls
     /// this, so a dropped update is delayed, never lost.
     pub(crate) async fn republish_due_group_members(&self) {
+        if !self.config.read().await.nip_enabled(29) {
+            return;
+        }
         let Some(relay_pubkey) = self.relay_pubkey() else {
             return;
         };
@@ -5093,6 +5108,52 @@ impl Relay {
                  stays fail-closed"
             );
         }
+        // The purge also removes every 30622 snapshot carrying this DM in
+        // an `h` tag. Capture the affected viewers before the walk so the
+        // resumed purge can rebuild their remaining hidden-DM list, exactly
+        // like the live 9008 path.
+        let dm_visibility_viewers = if until == u64::MAX {
+            // A failed presentation read must not block the security purge
+            // forever: continue with no captured viewers (the task may leave
+            // an old sidebar snapshot stale, but the deleted group's history
+            // is still purged).
+            self.dm_visibility_viewers(gid).await.unwrap_or_else(|| {
+                log::warn!(
+                    "could not read DM visibility snapshots for the resumed purge of {gid}; \
+                     continuing without rebuilding them"
+                );
+                Vec::new()
+            })
+        } else {
+            Vec::new()
+        };
+        if until == u64::MAX && self.relay_pubkey_ref().is_some() {
+            // Rebuild before the purge for the same crash-safety reason as
+            // the live 9008 path. If a rebuild fails, keep the purge pending
+            // rather than deleting a snapshot that could not be replaced.
+            // A relay without a signing key cannot have produced a 30622;
+            // do not let that block the purge.
+            let mut rebuilt = true;
+            for viewer in &dm_visibility_viewers {
+                if let Err(()) = self
+                    .publish_dm_visibility_excluding(viewer, Some(gid))
+                    .await
+                {
+                    rebuilt = false;
+                    log::warn!(
+                        "could not rebuild the DM visibility snapshot while resuming the \
+                         purge of {gid}"
+                    );
+                }
+            }
+            if !rebuilt {
+                log::error!(
+                    "keeping the resumed group purge of {gid} pending: a DM visibility \
+                     snapshot could not be rebuilt"
+                );
+                return;
+            }
+        }
         let removed = self
             .db
             .group_purge_until(gid.to_string(), purge_now, until)
@@ -5173,14 +5234,15 @@ impl Relay {
                 }
             };
         self.stats.bump(&self.stats.events_deleted, removed as u64);
-        if nip29_enabled && !state_removed.group {
-            // A replayed vanish, one that removed nothing, or one that only
-            // deleted ordinary posts: the live state only needs the vanished
-            // pubkey dropped from its memberships, and only a real change is
-            // worth a snapshot write. The removal is not reconstructible
-            // from the database (an admin's surviving 9000 may re-add the
-            // pubkey after the scan's vanished-set snapshot), so an
-            // in-flight rebuild discards its scan.
+        if nip29_enabled {
+            // Drop the vanished pubkey from every live group, including when
+            // a group-state event was removed and the normal rebuild will
+            // reconstruct the stored groups. The DM state is snapshot-backed:
+            // its synthetic 9007/9000 never exist in the event history, so a
+            // rebuild cannot derive the removal. An in-flight rebuild also
+            // discards its scan when this removal changes live state (the
+            // DMs it would adopt are taken from the live store after the
+            // scan).
             {
                 let mut buffer = self.groups_rebuild.buffer.lock().await;
                 if buffer.scanning {
@@ -5239,15 +5301,35 @@ impl Relay {
                 .await;
         }
         drop(groups_in_flight);
-        if nip29_enabled
-            && !state_removed.group
-            && !affected_gids.is_empty()
-            && !self.persist_groups().await
-        {
-            log::error!(
-                "could not persist the group state after a vanish; it will be \
-                 rebuilt on the next restart"
-            );
+        if nip29_enabled && !state_removed.group && !affected_gids.is_empty() {
+            match self.persist_groups_outcome().await {
+                PersistOutcome::Committed => {}
+                // A derived mutation held the in-flight claim, so nothing
+                // was written. The vanish removal is not a stored group
+                // event; on a keyless relay no 9001 mirror advances the
+                // sequence either. Drop the snapshot and rebuild fail-closed
+                // instead of leaving the pre-vanish roster restorable if the
+                // process exits before the debounced worker runs.
+                PersistOutcome::Deferred => {
+                    log::warn!(
+                        "group snapshot deferred after a vanish; forcing a fail-closed rebuild"
+                    );
+                    self.mark_group_state_stale_for(&affected_gids).await;
+                }
+                PersistOutcome::Failed => {
+                    log::error!(
+                        "could not persist the group state after a vanish; forcing a \
+                         fail-closed rebuild so a stale snapshot cannot resurrect the member"
+                    );
+                    // The removal is reconstructible from the surviving
+                    // history only after filtering the vanished pubkey: a
+                    // keyless relay has no relay-signed 9001 mirror to
+                    // advance the state sequence. Drop the snapshot and let
+                    // the rebuild reapply the vanish filter instead of
+                    // restoring the pre-vanish roster.
+                    self.mark_group_state_stale_for(&affected_gids).await;
+                }
+            }
         }
         drop(roles_in_flight);
         if nip43_enabled && role_changed {
@@ -5400,6 +5482,18 @@ impl Relay {
         };
         let mut removal_failed = false;
         let mut unapplied = None;
+        // A DM's 30622 snapshots carry this group in an `h` tag and are
+        // removed by the purge. Capture the live `hidden_for` set before the
+        // delete removes the group, so a failed/interrupted purge can still
+        // rebuild the viewers' snapshots from the other hidden DMs.
+        let dm_hidden_viewers = if event.kind == nip29::DELETE_GROUP {
+            match nip29::group_id(event) {
+                Some(gid) => self.dm_hidden_viewers(gid).await,
+                None => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
         // A `kind:9008` purge may fail (or the process may crash before it
         // commits). The delete tombstone alone would let a later create
         // clear it and expose the un-purged history, so the id is ghosted
@@ -5510,6 +5604,38 @@ impl Relay {
             // stats), so success is confirmed by the state below: only then
             // does the id return to the ordinary delete tombstone (which a
             // create may clear).
+            //
+            // A NIP-DV 30622 snapshot lists every hidden DM in one event
+            // with one `h` tag per channel. The purge removes it with the
+            // deleted DM, so combine the live hidden set captured before the
+            // state deletion with the stored snapshots and rebuild the
+            // viewers' remaining snapshots. The rebuilt snapshot no longer
+            // carries an `h` tag for this id, so a later purge retry cannot
+            // remove it again.
+            let mut dm_visibility_viewers = dm_hidden_viewers;
+            match self.dm_visibility_viewers(gid).await {
+                Some(viewers) => dm_visibility_viewers.extend(viewers),
+                None => log::warn!(
+                    "could not read stored DM visibility snapshots before purging {gid}; \
+                     using the live hidden set"
+                ),
+            }
+            dm_visibility_viewers.sort();
+            dm_visibility_viewers.dedup();
+            // Rebuild before the irreversible purge. The fresh snapshot
+            // omits this id, so the purge cannot delete it; a crash after
+            // the purge therefore cannot lose the viewer's other hidden
+            // DMs.
+            for viewer in &dm_visibility_viewers {
+                if let Err(()) = self
+                    .publish_dm_visibility_excluding(viewer, Some(gid))
+                    .await
+                {
+                    log::warn!(
+                        "could not rebuild the DM visibility snapshot before deleting {gid}"
+                    );
+                }
+            }
             let removed = self.db.group_purge(gid.to_string(), unix_now()).await;
             self.stats
                 .bump(&self.stats.events_deleted, removed.unwrap_or(0) as u64);

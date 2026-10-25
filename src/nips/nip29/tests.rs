@@ -5212,3 +5212,581 @@ fn plain_nip29_ignores_buzz_channel_tags() {
     assert!(group.settings.topic.is_none());
     assert!(group.is_admin(ADMIN), "the creator remains an admin");
 }
+
+#[test]
+fn plain_private_create_is_not_replayed_as_buzz_origin() {
+    let mut live = GroupStore::default();
+    let mut history = GroupStore::default();
+    let now = 1_600_000_000;
+    let create = event(
+        CREATE_GROUP,
+        ADMIN,
+        Some("g1"),
+        vec![vec!["private".into()]],
+    );
+    let edit = event(
+        9002,
+        ADMIN,
+        Some("g1"),
+        vec![vec!["name".into(), "renamed".into()]],
+    );
+
+    live.apply(&create, "relay", now, false, false);
+    live.apply(&edit, "relay", now, false, false);
+    let live_group = live.group("g1").unwrap();
+    assert!(!live_group.settings.private);
+    assert_eq!(live_group.settings.name, "renamed");
+
+    history.apply(&create, "relay", now, false, true);
+    assert!(
+        history.group("g1").unwrap().settings.private,
+        "the stored plain private tag is a privacy floor"
+    );
+    assert!(
+        history.group("g1").unwrap().channel_type.is_empty(),
+        "a plain NIP-29 private tag must not be mistaken for a Buzz marker"
+    );
+    history.apply(&edit, "relay", now, false, true);
+    let history_group = history.group("g1").unwrap();
+    assert_eq!(
+        history_group.settings.name, "renamed",
+        "a plain 9002 still replaces the metadata on replay"
+    );
+    assert!(
+        !history_group.settings.private,
+        "an absent private tag in a plain 9002 clears the setting, matching live"
+    );
+}
+
+#[test]
+fn buzz_member_topic_edit_preserves_parent_and_children() {
+    let mut store = GroupStore {
+        buzz_enabled: true,
+        ..GroupStore::default()
+    };
+    let now = 1_600_000_000;
+    store.apply(
+        &event(CREATE_GROUP, ADMIN, Some("p"), vec![]),
+        "relay",
+        now,
+        false,
+        false,
+    );
+    store.apply(
+        &event(CREATE_GROUP, ADMIN, Some("c"), vec![]),
+        "relay",
+        now,
+        false,
+        false,
+    );
+    store.apply(
+        &event(
+            9002,
+            ADMIN,
+            Some("c"),
+            vec![vec!["parent".into(), "p".into()]],
+        ),
+        "relay",
+        now,
+        false,
+        false,
+    );
+    store.apply(
+        &event(
+            PUT_USER,
+            ADMIN,
+            Some("c"),
+            vec![vec!["p".into(), USER.to_string()]],
+        ),
+        "relay",
+        now,
+        false,
+        false,
+    );
+
+    let topic = event(
+        9002,
+        USER,
+        Some("c"),
+        vec![vec!["topic".into(), "member topic".into()]],
+    );
+    let out = store.apply(&topic, "relay", now, true, false);
+    let child = store.group("c").unwrap();
+    assert_eq!(child.parent.as_deref(), Some("p"));
+    assert_eq!(child.settings.topic.as_deref(), Some("member topic"));
+    assert!(
+        store
+            .group("p")
+            .unwrap()
+            .children
+            .contains(&"c".to_string()),
+        "a member topic edit must not detach the child from its parent"
+    );
+    assert!(
+        out.iter().any(|event| event.kind == 39000),
+        "the topic edit still republishes the group metadata"
+    );
+
+    // The same partial rule applies to an admin's Buzz name-only edit.
+    let rename = event(
+        9002,
+        ADMIN,
+        Some("c"),
+        vec![vec!["name".into(), "renamed".into()]],
+    );
+    store.apply(&rename, "relay", now, true, false);
+    let child = store.group("c").unwrap();
+    assert_eq!(child.parent.as_deref(), Some("p"));
+    assert_eq!(child.settings.name, "renamed");
+    assert!(
+        store
+            .group("p")
+            .unwrap()
+            .children
+            .contains(&"c".to_string())
+    );
+
+    // A name-only partial edit of a parent must also keep its child list;
+    // the live validation must not apply plain NIP-29's "list every child"
+    // rule to a Buzz partial.
+    let rename_parent = event(
+        9002,
+        ADMIN,
+        Some("p"),
+        vec![vec!["name".into(), "parent renamed".into()]],
+    );
+    store.apply(&rename_parent, "relay", now, true, false);
+    let parent = store.group("p").unwrap();
+    assert_eq!(parent.settings.name, "parent renamed");
+    assert!(parent.children.contains(&"c".to_string()));
+}
+
+#[test]
+fn plain_metadata_edit_still_detaches_a_child() {
+    let mut store = GroupStore::default();
+    let now = 1_600_000_000;
+    store.apply(
+        &event(CREATE_GROUP, ADMIN, Some("p"), vec![]),
+        "relay",
+        now,
+        false,
+        false,
+    );
+    store.apply(
+        &event(CREATE_GROUP, ADMIN, Some("c"), vec![]),
+        "relay",
+        now,
+        false,
+        false,
+    );
+    store.apply(
+        &event(
+            9002,
+            ADMIN,
+            Some("c"),
+            vec![vec!["parent".into(), "p".into()]],
+        ),
+        "relay",
+        now,
+        false,
+        false,
+    );
+    store.apply(
+        &event(
+            9002,
+            ADMIN,
+            Some("c"),
+            vec![vec!["name".into(), "renamed".into()]],
+        ),
+        "relay",
+        now,
+        false,
+        false,
+    );
+    assert!(store.group("c").unwrap().parent.is_none());
+    assert!(store.group("p").unwrap().children.is_empty());
+}
+
+#[test]
+fn keyless_history_replay_trusts_a_stored_join_after_close() {
+    let now = 1_600_000_000;
+    let join = event(JOIN, USER, Some("g1"), vec![]);
+    let mut replayed = GroupStore::default();
+    replayed.apply(
+        &event(CREATE_GROUP, ADMIN, Some("g1"), vec![]),
+        "",
+        now,
+        false,
+        false,
+    );
+    replayed.apply(
+        &event(9002, ADMIN, Some("g1"), vec![vec!["closed".into()]]),
+        "",
+        now,
+        false,
+        false,
+    );
+    replayed.trust_stored_joins = true;
+    replayed.apply(&join, "", now, false, true);
+    assert!(
+        replayed.group("g1").unwrap().is_member(USER),
+        "a keyless relay must retain a JOIN accepted while the group was open"
+    );
+
+    let mut live_closed = GroupStore::default();
+    live_closed.apply(
+        &event(CREATE_GROUP, ADMIN, Some("g1"), vec![]),
+        "",
+        now,
+        false,
+        false,
+    );
+    live_closed.apply(
+        &event(9002, ADMIN, Some("g1"), vec![vec!["closed".into()]]),
+        "",
+        now,
+        false,
+        false,
+    );
+    live_closed.apply(&join, "", now, false, false);
+    assert!(
+        !live_closed.group("g1").unwrap().is_member(USER),
+        "live JOIN admission still requires an invite code on a closed group"
+    );
+
+    // A keyless migration replay does not have this relay's live-admission
+    // guarantee: keep re-adjudicating the imported JOIN against the closed
+    // group and its invite set.
+    let mut migrated = GroupStore::default();
+    migrated.apply(
+        &event(CREATE_GROUP, ADMIN, Some("g1"), vec![]),
+        "",
+        now,
+        false,
+        false,
+    );
+    migrated.apply(
+        &event(9002, ADMIN, Some("g1"), vec![vec!["closed".into()]]),
+        "",
+        now,
+        false,
+        false,
+    );
+    migrated.apply(&join, "", now, false, true);
+    assert!(
+        !migrated.group("g1").unwrap().is_member(USER),
+        "migration history must not gain closed-group membership without an invite"
+    );
+}
+
+#[test]
+fn join_role_guest_survives_keyed_replay_in_front_of_join() {
+    let mut store = GroupStore {
+        buzz_enabled: true,
+        ..GroupStore::default()
+    };
+    let now = 1_600_000_000;
+    store.apply(
+        &event(CREATE_GROUP, ADMIN, Some("g1"), vec![]),
+        "relay",
+        now,
+        false,
+        false,
+    );
+    store.apply(
+        &event(
+            9002,
+            ADMIN,
+            Some("g1"),
+            vec![vec!["join_role".into(), "guest".into()]],
+        ),
+        "relay",
+        now,
+        false,
+        false,
+    );
+    // The relay-signed JOIN mirror sorts before the JOIN on replay.
+    store.apply(
+        &event(
+            PUT_USER,
+            "relay",
+            Some("g1"),
+            vec![
+                vec!["p".into(), USER.to_string()],
+                vec!["role".into(), "guest".into()],
+            ],
+        ),
+        "relay",
+        now,
+        false,
+        true,
+    );
+    store.apply(
+        &event(JOIN, USER, Some("g1"), vec![]),
+        "relay",
+        now,
+        false,
+        true,
+    );
+    let group = store.group("g1").unwrap();
+    assert!(group.is_member(USER));
+    assert!(
+        group.is_guest(USER),
+        "the JOIN must restore the guest tier even when its mirror already inserted the member"
+    );
+}
+
+#[test]
+fn bare_put_user_clears_buzz_guest_and_bot_tiers() {
+    let mut store = GroupStore {
+        buzz_enabled: true,
+        ..GroupStore::default()
+    };
+    let now = 1_600_000_000;
+    store.apply(
+        &event(CREATE_GROUP, ADMIN, Some("g1"), vec![]),
+        "relay",
+        now,
+        false,
+        false,
+    );
+    store.apply(
+        &event(
+            PUT_USER,
+            ADMIN,
+            Some("g1"),
+            vec![
+                vec!["p".into(), USER.to_string()],
+                vec!["role".into(), "guest".into()],
+            ],
+        ),
+        "relay",
+        now,
+        false,
+        false,
+    );
+    assert!(store.group("g1").unwrap().is_guest(USER));
+    store.apply(
+        &event(
+            PUT_USER,
+            ADMIN,
+            Some("g1"),
+            vec![vec!["p".into(), USER.to_string()]],
+        ),
+        "relay",
+        now,
+        false,
+        false,
+    );
+    assert!(
+        !store.group("g1").unwrap().is_guest(USER),
+        "a bare NIP-29 p-tag is a full role replacement"
+    );
+
+    store.apply(
+        &event(
+            PUT_USER,
+            ADMIN,
+            Some("g1"),
+            vec![
+                vec!["p".into(), USER.to_string()],
+                vec!["role".into(), "bot".into()],
+            ],
+        ),
+        "relay",
+        now,
+        false,
+        false,
+    );
+    assert!(store.group("g1").unwrap().bots.contains(USER));
+    store.apply(
+        &event(
+            PUT_USER,
+            ADMIN,
+            Some("g1"),
+            vec![vec!["p".into(), USER.to_string()]],
+        ),
+        "relay",
+        now,
+        false,
+        false,
+    );
+    assert!(!store.group("g1").unwrap().bots.contains(USER));
+}
+
+#[test]
+fn create_group_respects_the_global_member_budget() {
+    let mut store = GroupStore::default();
+    let now = 1_600_000_000;
+    store.apply(
+        &event(CREATE_GROUP, ADMIN, Some("g1"), vec![]),
+        "relay",
+        now,
+        false,
+        false,
+    );
+    assert_eq!(store.total_members, 1);
+    store.max_total_members = 1;
+    let create = event(CREATE_GROUP, USER, Some("g2"), vec![]);
+    assert_eq!(
+        store.validate_write(&create).unwrap_err().to_string(),
+        "restricted: the relay member limit is reached"
+    );
+    assert!(!store.groups.contains_key("g2"));
+    assert_eq!(store.total_members, 1);
+}
+
+#[test]
+fn restore_queues_large_group_rosters_for_a_fresh_publish() {
+    let mut group = Group::default();
+    for index in 0..=MEMBERS_EAGER_MAX {
+        group
+            .members
+            .insert(format!("{index:064x}"), Default::default());
+    }
+    let mut snapshot = GroupsSnapshot::default();
+    snapshot.groups.insert("large".into(), group);
+    let mut store = GroupStore::default();
+    store.restore(snapshot);
+    assert!(store.members_dirty.contains("large"));
+    let out = store.due_membership_events("relay", 1_600_000_000);
+    assert!(
+        out.iter()
+            .any(|event| event.kind == GROUP_MEMBERS && event.tags.iter().any(|t| t[1] == "large"))
+    );
+}
+
+#[test]
+fn buzz_partial_empty_parent_detaches_the_subgroup() {
+    let mut store = GroupStore {
+        buzz_enabled: true,
+        ..GroupStore::default()
+    };
+    let now = 1_600_000_000;
+    store.apply(
+        &event(CREATE_GROUP, ADMIN, Some("p"), vec![]),
+        "relay",
+        now,
+        false,
+        false,
+    );
+    store.apply(
+        &event(CREATE_GROUP, ADMIN, Some("c"), vec![]),
+        "relay",
+        now,
+        false,
+        false,
+    );
+    let link = event(
+        9002,
+        ADMIN,
+        Some("c"),
+        vec![vec!["parent".into(), "p".into()]],
+    );
+    store.apply(&link, "relay", now, false, false);
+    assert_eq!(store.group("c").unwrap().parent.as_deref(), Some("p"));
+
+    let detach = event(
+        9002,
+        ADMIN,
+        Some("c"),
+        vec![vec!["parent".into(), String::new()]],
+    );
+    assert!(
+        store.validate_write(&detach).is_ok(),
+        "an explicit empty parent must be accepted as a detach"
+    );
+    store.apply(&detach, "relay", now, true, false);
+    assert!(store.group("c").unwrap().parent.is_none());
+    assert!(store.group("p").unwrap().children.is_empty());
+}
+
+#[test]
+fn old_relay_signed_join_mirror_does_not_clear_a_guest_tier() {
+    let mut store = GroupStore {
+        buzz_enabled: true,
+        ..GroupStore::default()
+    };
+    let now = 1_600_000_000;
+    store.apply(
+        &event(CREATE_GROUP, ADMIN, Some("g1"), vec![]),
+        "relay",
+        now,
+        false,
+        false,
+    );
+    store.apply(
+        &event(
+            PUT_USER,
+            "relay",
+            Some("g1"),
+            vec![
+                vec!["p".into(), USER.to_string()],
+                vec!["role".into(), "guest".into()],
+            ],
+        ),
+        "relay",
+        now,
+        false,
+        false,
+    );
+    assert!(store.group("g1").unwrap().is_guest(USER));
+    // Pre-fix JOIN mirrors are relay-signed 9000s with a bare p tag.
+    store.apply(
+        &event(
+            PUT_USER,
+            "relay",
+            Some("g1"),
+            vec![vec!["p".into(), USER.to_string()]],
+        ),
+        "relay",
+        now + 1,
+        false,
+        true,
+    );
+    assert!(
+        store.group("g1").unwrap().is_guest(USER),
+        "a legacy relay mirror must not promote a guest to a full member"
+    );
+}
+
+#[test]
+fn join_mirror_is_stamped_at_the_join_time() {
+    let mut store = GroupStore {
+        buzz_enabled: true,
+        ..GroupStore::default()
+    };
+    let now = 1_600_000_000;
+    store.apply(
+        &event(
+            CREATE_GROUP,
+            ADMIN,
+            Some("g1"),
+            vec![
+                vec!["join_role".into(), "guest".into()],
+                vec!["visibility".into(), "open".into()],
+            ],
+        ),
+        "relay",
+        now,
+        false,
+        false,
+    );
+    let mut join = event(JOIN, USER, Some("g1"), vec![]);
+    join.created_at = now + 1;
+    let out = store.apply(&join, "relay", now + 100, true, false);
+    let mirror = out
+        .iter()
+        .find(|event| event.kind == PUT_USER)
+        .expect("the JOIN emits a relay mirror");
+    assert_eq!(
+        mirror.created_at, join.created_at,
+        "a later promotion must sort after the mirror, not before it"
+    );
+    assert!(
+        mirror
+            .tags
+            .iter()
+            .any(|tag| tag == &vec!["role".to_string(), "guest".to_string()])
+    );
+}
