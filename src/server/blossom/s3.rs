@@ -137,12 +137,19 @@ impl S3Client {
             bucket: bucket.to_string(),
             access_key: access_key.to_string(),
             secret_key: secret_key.to_string(),
+            // S3 endpoints do not use redirects for signed requests. A
+            // followed redirect could replay the Authorization header
+            // (SigV4) to a different URL, including an https -> http
+            // downgrade on the same host (BLM-09). Surface the 3xx as an
+            // error instead.
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(60))
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .expect("reqwest client"),
             http_stream: reqwest::Client::builder()
                 .connect_timeout(std::time::Duration::from_secs(30))
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .expect("reqwest client"),
         }
@@ -1100,6 +1107,54 @@ pub(crate) mod mock_server {
         assert!(err.to_string().contains("delete failed"), "{err}");
         let err = failing.list_keys("").await.unwrap_err();
         assert!(err.to_string().contains("list failed"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn s3_redirects_are_not_followed_with_credentials() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // A same-host https -> http redirect used to be followed by the
+        // default reqwest policy, replaying the SigV4 Authorization header
+        // over plaintext. S3 endpoints do not use redirects: surface the
+        // 3xx instead (BLM-09).
+        let redirected = Arc::new(AtomicUsize::new(0));
+        let app = axum::Router::new()
+            .route(
+                "/bucket/{*key}",
+                axum::routing::get(|| async {
+                    (
+                        StatusCode::FOUND,
+                        [(axum::http::header::LOCATION, "/plaintext-target")],
+                        "",
+                    )
+                        .into_response()
+                }),
+            )
+            .route(
+                "/plaintext-target",
+                axum::routing::get({
+                    let redirected = Arc::clone(&redirected);
+                    move || {
+                        redirected.fetch_add(1, Ordering::SeqCst);
+                        async { "should not be reached" }
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = S3Client::new(&format!("http://{addr}"), "us-east-1", "bucket", "ak", "sk");
+        let err = client.get_object("k").await.unwrap_err();
+        assert!(
+            err.to_string().contains("302") || err.to_string().contains("redirect"),
+            "the 3xx must be surfaced: {err}"
+        );
+        assert_eq!(
+            redirected.load(Ordering::SeqCst),
+            0,
+            "the redirect target must never be requested"
+        );
     }
 
     #[tokio::test]

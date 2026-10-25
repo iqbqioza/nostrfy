@@ -54,6 +54,33 @@ pub(crate) enum BlobStream {
 /// One legacy-migration row: (sha256, mime, size, uploaded, hex pubkey).
 type LegacyEntry = (String, String, u64, i64, String);
 
+/// Marker for a symlinked npub directory (as opposed to a non-directory or
+/// an I/O error). The GET/HEAD paths report a symlink as an unsafe refusal,
+/// while a regular file at the directory path remains a storage error.
+#[derive(Debug)]
+struct SymlinkDirectory;
+
+impl std::fmt::Display for SymlinkDirectory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("blossom storage directory is a symlink")
+    }
+}
+
+impl std::error::Error for SymlinkDirectory {}
+
+fn is_symlink_directory(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<SymlinkDirectory>().is_some()
+}
+
+/// Clamps an untrusted legacy `uploaded` timestamp (a hand-edited meta or a
+/// file mtime) to the descriptor's valid range: unix seconds, never
+/// negative and never in the future. A negative or future value would leak
+/// into BUD-12 ordering and the JSON descriptor (BLM-07).
+fn clamp_uploaded(uploaded: i64) -> i64 {
+    let now = crate::util::unix_now().min(i64::MAX as u64) as i64;
+    uploaded.clamp(0, now)
+}
+
 /// A failure caused by the database being unavailable, not by the blob
 /// backend. The handlers map it to a retryable 503 instead of a 404 (which
 /// would hide an existing blob) or a 500 (which reads as a storage fault).
@@ -353,6 +380,44 @@ impl BlobStore {
         }
     }
 
+    /// Prepares the local spool directory, refusing a symlinked `.spool`
+    /// (BLM-04). `create_dir_all` would follow such a link and let a local
+    /// writer place upload spools outside the blob store. A missing
+    /// directory is created; a symlink or non-directory makes the caller
+    /// fall back to the system temp spool, which is reserved separately.
+    pub(crate) async fn prepare_spool_dir(&self) -> Option<PathBuf> {
+        let dir = self.spool_dir()?;
+        let ensure_real = |meta: &std::fs::Metadata| {
+            if meta.file_type().is_symlink() || !meta.is_dir() {
+                log::warn!(
+                    "blossom spool directory {} is a symlink or not a directory; using the system temp dir",
+                    dir.display()
+                );
+                false
+            } else {
+                true
+            }
+        };
+        match tokio::fs::symlink_metadata(&dir).await {
+            Ok(meta) if ensure_real(&meta) => Some(dir),
+            Ok(_) => None,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if tokio::fs::create_dir_all(&dir).await.is_err() {
+                    return None;
+                }
+                // Re-check after creation: a local writer may have raced a
+                // symlink into place. (The final spool open is not
+                // dirfd-relative; the local-write threat is already
+                // privileged, but the obvious link is refused.)
+                match tokio::fs::symlink_metadata(&dir).await {
+                    Ok(meta) if ensure_real(&meta) => Some(dir),
+                    _ => None,
+                }
+            }
+            Err(_) => None,
+        }
+    }
+
     /// Reserves `size` bytes against the local free-space floor for the
     /// duration of an upload (a plain floor check on the system temp dir
     /// for S3, whose uploads spool there). The guard releases on drop.
@@ -373,6 +438,18 @@ impl BlobStore {
     /// be created. That fallback must be accounted against `/tmp`, not the
     /// blob filesystem whose floor was already checked by `reserve_space`.
     pub(crate) fn reserve_temp_space(&self, size: u64) -> Result<SpaceReservation<'_>> {
+        self.reserve_temp_bytes(size)?;
+        Ok(SpaceReservation {
+            store: self,
+            size,
+            temp: true,
+        })
+    }
+
+    /// The accounting half of [`Self::reserve_temp_space`], without the
+    /// guard: [`SpaceReservation::grow`] extends an existing guard as body
+    /// chunks arrive.
+    fn reserve_temp_bytes(&self, size: u64) -> Result<()> {
         let previous = self
             .s3_spool_reserved
             .fetch_add(size, std::sync::atomic::Ordering::SeqCst);
@@ -385,11 +462,7 @@ impl BlobStore {
                 .fetch_sub(size, std::sync::atomic::Ordering::SeqCst);
             return Err(crate::error::storage_full());
         }
-        Ok(SpaceReservation {
-            store: self,
-            size,
-            temp: true,
-        })
+        Ok(())
     }
 
     /// Commits the LMDB owner mapping. Called only after the object has
@@ -1138,8 +1211,30 @@ pub(crate) struct SpaceReservation<'a> {
     temp: bool,
 }
 
+impl SpaceReservation<'_> {
+    /// Reserves additional bytes against the same backing filesystem and
+    /// extends this guard's release amount. Used by the upload spool to
+    /// account for each chunk as it actually arrives, instead of trusting
+    /// the client's declared Content-Length (M09).
+    pub(crate) fn grow(&mut self, size: u64) -> Result<()> {
+        if size == 0 {
+            return Ok(());
+        }
+        if self.temp {
+            self.store.reserve_temp_bytes(size)?;
+        } else if let Storage::Local(s) = &self.store.storage {
+            s.reserve(size)?;
+        }
+        self.size = self.size.saturating_add(size);
+        Ok(())
+    }
+}
+
 impl Drop for SpaceReservation<'_> {
     fn drop(&mut self) {
+        if self.size == 0 {
+            return;
+        }
         if self.temp {
             self.store
                 .s3_spool_reserved
@@ -1172,9 +1267,6 @@ fn free_space_of(path: &std::path::Path) -> Option<u64> {
 
 struct LocalStore {
     root: PathBuf,
-    // Kept open for the lifetime of the store so fd_root remains valid.
-    _root_dir: std::fs::File,
-    fd_root: Option<PathBuf>,
     /// The resolved root: every operation's parent directory is
     /// canonicalized and must resolve under this path, so a symlinked
     /// npub directory can never redirect reads, writes or deletes
@@ -1193,28 +1285,8 @@ impl LocalStore {
     async fn new(root: &Path, min_free_bytes: u64) -> Result<LocalStore> {
         tokio::fs::create_dir_all(root).await?;
         let canonical_root = tokio::fs::canonicalize(root).await?;
-        let root_dir = {
-            use std::os::unix::fs::OpenOptionsExt;
-            std::fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
-                .open(&canonical_root)?
-        };
-        let fd = std::os::fd::AsRawFd::as_raw_fd(&root_dir);
-        // The descriptor path must work as a directory *prefix*, not just
-        // exist: macOS (and FreeBSD with the default devfs) exposes
-        // `/dev/fd/N` itself, but a path below it (`/dev/fd/N/<npub>/...`)
-        // does not resolve (ENOENT), which would break every blob path.
-        // Probe `<fd path>/.` and fall back to the canonical root when it
-        // does not resolve.
-        let fd_root = ["/proc/self/fd", "/dev/fd"]
-            .into_iter()
-            .map(|base| PathBuf::from(base).join(fd.to_string()))
-            .find(|path| path.join(".").exists());
         Ok(LocalStore {
             root: root.to_path_buf(),
-            _root_dir: root_dir,
-            fd_root,
             canonical_root,
             min_free_bytes,
             reserved: std::sync::atomic::AtomicU64::new(0),
@@ -1226,18 +1298,101 @@ impl LocalStore {
         self.root.join(npub).join(sha256)
     }
 
-    fn rooted_path(&self, npub: &str, name: &str) -> PathBuf {
-        // FreeBSD installations without fdescfs do not expose open
-        // descriptors as pathname components. The canonical-root fallback
-        // retains the symlink checks and keeps those systems functional.
-        self.fd_root
-            .as_ref()
-            .map(|root| root.join(npub).join(name))
-            .unwrap_or_else(|| self.canonical_root.join(npub).join(name))
+    /// Opens the npub directory itself with `O_NOFOLLOW|O_DIRECTORY`.
+    /// Keeping this descriptor for the whole operation pins the directory
+    /// even if a local writer swaps the `root/npub` name for a symlink
+    /// after the check: every subsequent path is built below this fd, not
+    /// by resolving the name again (BLM-05).
+    fn open_npub_dir(&self, npub: &str) -> Result<Option<std::fs::File>> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let path = self.root.join(npub);
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(&path)
+        {
+            Ok(file) => {
+                if !file.metadata()?.is_dir() {
+                    return Err(anyhow!("blossom storage directory is not a directory"));
+                }
+                Ok(Some(file))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e)
+                if e.raw_os_error() == Some(libc::ELOOP)
+                    || e.raw_os_error() == Some(libc::EMLINK)
+                    || e.raw_os_error() == Some(libc::ENOTDIR) =>
+            {
+                // A symlink to a directory is reported as ENOTDIR by some
+                // kernels when O_DIRECTORY is combined with O_NOFOLLOW;
+                // inspect the name without following it to keep the
+                // symlink-vs-regular-file distinction.
+                match std::fs::symlink_metadata(&path) {
+                    Ok(meta) if meta.file_type().is_symlink() => {
+                        Err(anyhow::Error::new(SymlinkDirectory))
+                    }
+                    Ok(meta) if !meta.is_dir() => {
+                        Err(anyhow!("blossom storage directory is not a directory"))
+                    }
+                    _ => Err(e.into()),
+                }
+            }
+            Err(e) => Err(e.into()),
+        }
     }
 
-    fn npub_dir_path(&self, npub: &str) -> PathBuf {
-        self.rooted_path(npub, "")
+    /// A path below an already-open npub directory fd (or the canonical
+    /// root fallback on systems without `/proc/self/fd`).
+    /// Ensures `root/npub` is a real directory, never following a symlink
+    /// at that name. Returns the typed symlink error before `create_dir_all`
+    /// could touch the link target.
+    async fn ensure_npub_dir(&self, npub: &str) -> Result<()> {
+        let dir = self.root.join(npub);
+        match tokio::fs::symlink_metadata(&dir).await {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(anyhow::Error::new(SymlinkDirectory));
+            }
+            Ok(meta) if !meta.is_dir() => {
+                return Err(anyhow!("blossom storage directory is not a directory"));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // One component only: `create_dir` does not follow a
+                // symlink planted at the final name (it returns EEXIST,
+                // handled by the fresh metadata check below).
+                match tokio::fs::create_dir(&dir).await {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            Err(e) => return Err(e.into()),
+        }
+        match tokio::fs::symlink_metadata(&dir).await {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(anyhow::Error::new(SymlinkDirectory));
+            }
+            Ok(meta) if !meta.is_dir() => {
+                return Err(anyhow!("blossom storage directory is not a directory"));
+            }
+            Ok(_) => {}
+            Err(e) => return Err(e.into()),
+        }
+        if !self.parent_within_root(npub).await {
+            return Err(anyhow::Error::new(SymlinkDirectory));
+        }
+        Ok(())
+    }
+
+    fn path_in_npub_dir(&self, npub: &str, dir: &std::fs::File, name: &str) -> PathBuf {
+        use std::os::fd::AsRawFd;
+        let fd = dir.as_raw_fd();
+        ["/proc/self/fd", "/dev/fd"]
+            .into_iter()
+            .map(|base| PathBuf::from(base).join(fd.to_string()))
+            .find(|path| path.join(".").exists())
+            .map(|path| path.join(name))
+            .unwrap_or_else(|| self.canonical_root.join(npub).join(name))
     }
 
     /// Whether the blob's parent directory is a real directory inside the
@@ -1320,13 +1475,18 @@ impl LocalStore {
     async fn sync_dir(&self, npub: &str) -> Result<()> {
         #[cfg(unix)]
         {
-            let dir = self.npub_dir_path(npub);
-            let result = match tokio::fs::File::open(&dir).await {
+            // Sync the pinned directory fd, not the name: a concurrent
+            // symlink swap must not redirect the fsync.
+            let Some(dir) = self.open_npub_dir(npub)? else {
+                return Err(anyhow!("blossom storage directory is missing"));
+            };
+            let path = self.path_in_npub_dir(npub, &dir, "");
+            let result = match tokio::fs::File::open(&path).await {
                 Ok(file) => file.sync_all().await,
                 Err(e) => Err(e),
             };
             if let Err(e) = result {
-                log::warn!("blossom: cannot fsync directory {}: {e}", dir.display());
+                log::warn!("blossom: cannot fsync directory {}: {e}", path.display());
                 return Err(e.into());
             }
         }
@@ -1344,14 +1504,10 @@ impl LocalStore {
         _mime: &str,
         _uploaded: i64,
     ) -> Result<()> {
-        let dir = self.root.join(npub);
-        tokio::fs::create_dir_all(&dir).await?;
-        // Symlink-escape guard: the (possibly pre-existing) npub
-        // directory must resolve inside the blob root, or the write
-        // would land in the symlink target's directory.
-        if !self.parent_within_root(npub).await {
-            return Err(anyhow!("blossom storage directory is a symlink"));
-        }
+        self.ensure_npub_dir(npub).await?;
+        let Some(dirfd) = self.open_npub_dir(npub)? else {
+            return Err(anyhow!("blossom storage directory is missing"));
+        };
 
         // Atomic write: the bytes land in a temp file first and are moved
         // into place with a rename. A crash mid-write can then never leave
@@ -1363,7 +1519,7 @@ impl LocalStore {
         // race can surface as a spurious failure — and O_NOFOLLOW keeps a
         // planted symlink from redirecting the write (or truncating an
         // external file through the link).
-        let tmp_path = self.rooted_path(npub, &format!(".{sha256}.tmp"));
+        let tmp_path = self.path_in_npub_dir(npub, &dirfd, &format!(".{sha256}.tmp"));
         let write = {
             use tokio::io::AsyncWriteExt;
             let mut tmp = tokio::fs::OpenOptions::new()
@@ -1385,7 +1541,9 @@ impl LocalStore {
             let _ = tokio::fs::remove_file(&tmp_path).await;
             return Err(e.into());
         }
-        if let Err(e) = tokio::fs::rename(&tmp_path, self.rooted_path(npub, sha256)).await {
+        if let Err(e) =
+            tokio::fs::rename(&tmp_path, self.path_in_npub_dir(npub, &dirfd, sha256)).await
+        {
             let _ = tokio::fs::remove_file(&tmp_path).await;
             return Err(e.into());
         }
@@ -1395,11 +1553,10 @@ impl LocalStore {
 
     async fn put_file(&self, npub: &str, sha256: &str, source: &Path) -> Result<()> {
         use tokio::io::AsyncWriteExt;
-        let dir = self.npub_dir_path(npub);
-        tokio::fs::create_dir_all(&dir).await?;
-        if !self.parent_within_root(npub).await {
-            return Err(anyhow!("blossom storage directory is a symlink"));
-        }
+        self.ensure_npub_dir(npub).await?;
+        let Some(dirfd) = self.open_npub_dir(npub)? else {
+            return Err(anyhow!("blossom storage directory is missing"));
+        };
         // Fast path: a spool on the same filesystem is moved into place
         // instead of copied (the upload already wrote it once). Any rename
         // failure (EXDEV, permissions, a planted directory at the target)
@@ -1412,7 +1569,7 @@ impl LocalStore {
         let file = tokio::fs::File::open(source).await?;
         file.sync_all().await?;
         drop(file);
-        if tokio::fs::rename(source, self.rooted_path(npub, sha256))
+        if tokio::fs::rename(source, self.path_in_npub_dir(npub, &dirfd, sha256))
             .await
             .is_ok()
         {
@@ -1421,7 +1578,7 @@ impl LocalStore {
             self.sync_dir(npub).await?;
             return Ok(());
         }
-        let tmp_path = self.rooted_path(npub, &format!(".{sha256}.tmp"));
+        let tmp_path = self.path_in_npub_dir(npub, &dirfd, &format!(".{sha256}.tmp"));
         let mut input = tokio::fs::File::open(source).await?;
         let mut output = tokio::fs::OpenOptions::new()
             .write(true)
@@ -1449,7 +1606,9 @@ impl LocalStore {
             return Err(e.into());
         }
         drop(output);
-        if let Err(e) = tokio::fs::rename(&tmp_path, self.rooted_path(npub, sha256)).await {
+        if let Err(e) =
+            tokio::fs::rename(&tmp_path, self.path_in_npub_dir(npub, &dirfd, sha256)).await
+        {
             let _ = tokio::fs::remove_file(&tmp_path).await;
             return Err(e.into());
         }
@@ -1466,22 +1625,19 @@ impl LocalStore {
     /// for a directory/FIFO at the blob path; a writer-less FIFO cannot
     /// block because of O_NONBLOCK.
     async fn exists(&self, npub: &str, sha256: &str) -> Result<Option<bool>> {
-        if !self.parent_within_root(npub).await {
-            let dir = self.root.join(npub);
-            return match tokio::fs::symlink_metadata(&dir).await {
-                Ok(meta) if meta.file_type().is_symlink() => Ok(None),
-                Ok(meta) if !meta.is_dir() => {
-                    Err(anyhow!("blossom storage directory is not a directory"))
-                }
-                Ok(_) => Ok(None),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Some(false)),
-                Err(_) => Ok(None),
-            };
-        }
+        let dirfd = match self.open_npub_dir(npub) {
+            Ok(Some(dir)) => dir,
+            Ok(None) => return Ok(Some(false)),
+            // A symlinked npub path is an unsafe lookup, not a definitive
+            // absence; a regular file at the directory path is a storage
+            // error (surfaced by the open below).
+            Err(e) if is_symlink_directory(&e) => return Ok(None),
+            Err(e) => return Err(e),
+        };
         match tokio::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(self.rooted_path(npub, sha256))
+            .open(self.path_in_npub_dir(npub, &dirfd, sha256))
             .await
         {
             Ok(file) => match file.metadata().await {
@@ -1507,28 +1663,21 @@ impl LocalStore {
     }
 
     async fn open(&self, npub: &str, sha256: &str, start: u64, _len: u64) -> Result<OpenOutcome> {
-        // Symlink-escape guard: a symlinked npub directory would resolve
-        // outside the root; a symlinked blob file would be followed by a
-        // plain open. Both are refused — and reported as `Refused`, so the
-        // mapped-but-missing counter only sees definitive NotFound lookups.
-        if !self.parent_within_root(npub).await {
-            let dir = self.root.join(npub);
-            return match tokio::fs::symlink_metadata(&dir).await {
-                Ok(meta) if meta.file_type().is_symlink() => Ok(OpenOutcome::Refused),
-                Ok(meta) if !meta.is_dir() => {
-                    Err(anyhow!("blossom storage directory is not a directory"))
-                }
-                // A directory whose canonicalization failed: the state is
-                // unknown, not definitively missing.
-                Ok(_) => Ok(OpenOutcome::Refused),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(OpenOutcome::Missing),
-                Err(_) => Ok(OpenOutcome::Refused),
-            };
-        }
+        // Pin the npub directory with O_NOFOLLOW and build the blob path
+        // below its fd: a symlinked npub directory is refused (the open
+        // fails) and a concurrent name swap cannot redirect the blob open
+        // to another directory (BLM-05). A symlinked blob file is then
+        // refused by O_NOFOLLOW on the final component.
+        let dirfd = match self.open_npub_dir(npub) {
+            Ok(Some(dir)) => dir,
+            Ok(None) => return Ok(OpenOutcome::Missing),
+            Err(e) if is_symlink_directory(&e) => return Ok(OpenOutcome::Refused),
+            Err(e) => return Err(e),
+        };
         let mut file = match tokio::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(self.rooted_path(npub, sha256))
+            .open(self.path_in_npub_dir(npub, &dirfd, sha256))
             .await
         {
             Ok(f) => f,
@@ -1560,19 +1709,16 @@ impl LocalStore {
     }
 
     async fn delete(&self, npub: &str, sha256: &str) -> Result<bool> {
-        // Symlink-escape guard: with a symlinked npub directory, removing
-        // the blob would remove a file in the symlink target's directory.
-        // (A symlinked blob file itself is safe to remove — only the link
-        // is deleted.)
-        if !self.parent_within_root(npub).await {
-            let dir = self.npub_dir_path(npub);
-            return match tokio::fs::symlink_metadata(&dir).await {
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-                Ok(_) => Err(anyhow!("blossom storage directory is unsafe")),
-                Err(e) => Err(e.into()),
-            };
-        }
-        let path = self.rooted_path(npub, sha256);
+        // Remove below the pinned npub fd, so a symlinked directory or a
+        // concurrent name swap cannot redirect the unlink outside the
+        // store. (A symlinked blob file itself is safe to remove — only
+        // the link is deleted.)
+        let dirfd = match self.open_npub_dir(npub) {
+            Ok(Some(dir)) => dir,
+            Ok(None) => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        let path = self.path_in_npub_dir(npub, &dirfd, sha256);
         match tokio::fs::remove_file(&path).await {
             Ok(()) => Ok(true),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -1651,7 +1797,7 @@ impl LocalStore {
                         sha.clone(),
                         crate::server::blossom::sanitize_mime(meta["mime"].as_str().unwrap_or("")),
                         size,
-                        meta["uploaded"].as_i64().unwrap_or(0),
+                        clamp_uploaded(meta["uploaded"].as_i64().unwrap_or(0)),
                         pubkey.clone(),
                     ));
                     via_meta.insert(sha);
@@ -1688,7 +1834,7 @@ impl LocalStore {
                         meta.modified()
                             .ok()
                             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                            .map(|d| d.as_secs() as i64)
+                            .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
                             .unwrap_or(0),
                     ),
                     Err(_) => continue,
@@ -1697,7 +1843,7 @@ impl LocalStore {
                     name,
                     "application/octet-stream".to_string(),
                     size,
-                    uploaded,
+                    clamp_uploaded(uploaded),
                     pubkey.clone(),
                 ));
                 if buf.len() >= 5000 {
@@ -1909,7 +2055,7 @@ impl S3Store {
                         sha,
                         crate::server::blossom::sanitize_mime(meta["mime"].as_str().unwrap_or("")),
                         size,
-                        meta["uploaded"].as_i64().unwrap_or(0),
+                        clamp_uploaded(meta["uploaded"].as_i64().unwrap_or(0)),
                         pubkey,
                     ));
                 }
@@ -2521,6 +2667,116 @@ mod tests {
             std::fs::remove_file(&external).unwrap();
             s.db.shutdown();
         });
+    }
+
+    #[tokio::test]
+    async fn migration_clamps_untrusted_uploaded_timestamps() {
+        // BLM-07: legacy meta values are untrusted. A negative or future
+        // `uploaded` must not leak into the descriptor/BUD-12 ordering.
+        let (s, _db_path) = store("clamp-uploaded").await;
+        let a = pk(1);
+        let npub = npub_of(&a);
+        let dir = local(&s).root.join(&npub);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sha_neg = "ab".repeat(32);
+        let sha_future = "cd".repeat(32);
+        for (sha, uploaded) in [(&sha_neg, -5i64), (&sha_future, i64::MAX / 2)] {
+            std::fs::write(dir.join(sha), b"x").unwrap();
+            std::fs::write(
+                dir.join(format!("{sha}.meta.json")),
+                format!(r#"{{"mime":"text/plain","size":1,"uploaded":{uploaded}}}"#),
+            )
+            .unwrap();
+        }
+        let now_before = i64::try_from(crate::util::unix_now()).unwrap_or(i64::MAX);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+        local(&s).scan_legacy(tx).await.unwrap();
+        let mut seen = std::collections::HashMap::new();
+        while let Some(chunk) = rx.recv().await {
+            for (sha, _, _, uploaded, _) in chunk {
+                seen.insert(sha, uploaded);
+            }
+        }
+        let now = i64::try_from(crate::util::unix_now()).unwrap_or(i64::MAX);
+        assert_eq!(
+            seen.get(&sha_neg),
+            Some(&0),
+            "negative timestamps clamp to 0"
+        );
+        assert!(
+            seen.get(&sha_future)
+                .is_some_and(|uploaded| *uploaded >= now_before && *uploaded <= now),
+            "future timestamps clamp to the migration time"
+        );
+        assert!(
+            seen.values().all(|uploaded| (0..=now).contains(uploaded)),
+            "every migrated timestamp must be non-negative and not in the future"
+        );
+        let _ = std::fs::remove_dir_all(local(&s).root.clone());
+        s.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn blob_path_is_pinned_to_the_opened_npub_directory() {
+        // BLM-05: after opening the npub directory, swapping its name for
+        // a symlink must not redirect the path built for the operation.
+        let (s, _db_path) = store("dirfd-pin").await;
+        let a = pk(1);
+        let sha = "ef".repeat(32);
+        let npub = npub_of(&a);
+        let root = local(&s).root.clone();
+        s.put(&a, &sha, b"real", "text/plain").await.unwrap();
+        let dirfd = local(&s).open_npub_dir(&npub).unwrap().expect("dirfd");
+        let pinned = local(&s).path_in_npub_dir(&npub, &dirfd, &sha);
+        let external = std::env::temp_dir().join(format!(
+            "nostrfy-blossom-dirfd-external-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&external);
+        std::fs::create_dir_all(&external).unwrap();
+        std::fs::write(external.join(&sha), b"external").unwrap();
+        let old = root.join(format!("{npub}.old"));
+        std::fs::rename(root.join(&npub), &old).unwrap();
+        std::os::unix::fs::symlink(&external, root.join(&npub)).unwrap();
+        assert_eq!(
+            std::fs::read(&pinned).unwrap(),
+            b"real",
+            "the pinned fd path must still resolve the original directory"
+        );
+        assert_eq!(
+            std::fs::read(external.join(&sha)).unwrap(),
+            b"external",
+            "the external target must remain untouched"
+        );
+        let _ = std::fs::remove_dir_all(&old);
+        let _ = std::fs::remove_dir_all(&external);
+        s.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn spool_dir_symlink_is_refused() {
+        // BLM-04: create_dir_all on a symlinked `.spool` would follow the
+        // link; the preparation step must reject it and let the caller use
+        // the system temp directory instead.
+        let (s, _db_path) = store("symlink-spool").await;
+        let root = local(&s).root.clone();
+        let external = std::env::temp_dir().join(format!(
+            "nostrfy-blossom-symlink-spool-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&external);
+        std::fs::create_dir_all(&external).unwrap();
+        std::os::unix::fs::symlink(&external, root.join(".spool")).unwrap();
+        assert!(
+            s.prepare_spool_dir().await.is_none(),
+            "a symlinked spool directory must be refused"
+        );
+        assert!(
+            std::fs::read_dir(&external).unwrap().next().is_none(),
+            "nothing may be created through the spool symlink"
+        );
+        let _ = std::fs::remove_dir_all(&external);
+        s.db.shutdown();
     }
 
     #[test]
