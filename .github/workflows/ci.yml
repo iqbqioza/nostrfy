@@ -78,6 +78,12 @@ jobs:
       - uses: vmactions/freebsd-vm@v1
         with:
           usesh: true
+          # The merged test graph (including the Buzz/NIP-29 regression
+          # suite) needs more than the action's 6 GiB default to compile the
+          # test binary inside the emulated VM; 6 GiB ended in SIGKILL from
+          # the Rust compiler. Keep enough headroom for the guest and QEMU
+          # on a standard 16 GiB GitHub runner.
+          mem: "10240"
           # Pin a stable release: the action's default tracks FreeBSD
           # -CURRENT, which breaks CI with unrelated upstream churn. The
           # 14.x builder image predates the current pkg repository index
