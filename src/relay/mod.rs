@@ -3194,6 +3194,54 @@ impl Relay {
         self.access_tx.subscribe()
     }
 
+    /// Whether `pubkey` may issue Buzz relay-admin commands: a configured
+    /// owner/NIP-86 admin, or a NIP-43 assignment with the `owner`/`admin`
+    /// role.
+    pub(crate) async fn is_relay_owner_or_admin(&self, pubkey: &str) -> bool {
+        if self
+            .relay_owner_members()
+            .await
+            .iter()
+            .any(|owner| owner.eq_ignore_ascii_case(pubkey))
+        {
+            return true;
+        }
+        self.roles
+            .read()
+            .await
+            .assignments
+            .get(pubkey)
+            .is_some_and(|roles| {
+                roles.iter().any(|role| {
+                    role.eq_ignore_ascii_case("owner") || role.eq_ignore_ascii_case("admin")
+                })
+            })
+    }
+
+    /// Applies a Buzz `kind:9033` workspace icon. The value is already
+    /// validated by the accept path; persistence follows the NIP-86
+    /// changerelayicon contract (rollback on a failed file write).
+    pub(crate) async fn apply_workspace_icon(&self, icon: &str) -> bool {
+        let previous = {
+            let mut cfg = self.config.write().await;
+            let previous = cfg.relay.icon.clone();
+            cfg.relay.icon = icon.to_string();
+            previous
+        };
+        self.config_version
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if self.persist_relay_field("icon", icon).await {
+            return true;
+        }
+        let mut cfg = self.config.write().await;
+        if cfg.relay.icon == icon {
+            cfg.relay.icon = previous;
+        }
+        self.config_version
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        false
+    }
+
     /// Persists a runtime change of one `[relay]` config field (e.g. the
     /// NIP-86 `changerelayname`/`changerelaydescription`/`changerelayicon`
     /// methods) to the config file, preserving comments and unrelated
@@ -3537,6 +3585,45 @@ impl Relay {
             } else {
                 None
             };
+        // Buzz kind:9033 is an admin command that changes the NIP-11 icon.
+        // Authorize and validate it before the event write; the config write
+        // happens after the read guards are dropped below.
+        let workspace_icon = if event.kind == 9033 {
+            if !self.is_relay_owner_or_admin(&event.pubkey).await {
+                self.stats.bump(&self.stats.events_rejected, 1);
+                return PutOutcome::Invalid(
+                    "restricted: only the relay owner or an admin may set the workspace icon"
+                        .into(),
+                );
+            }
+            let mut icons = event
+                .tags
+                .iter()
+                .filter(|tag| tag.len() >= 2 && tag[0] == "icon")
+                .map(|tag| tag[1].as_str());
+            let Some(icon) = icons.next() else {
+                self.stats.bump(&self.stats.events_rejected, 1);
+                return PutOutcome::Invalid("invalid: workspace icon tag is missing".into());
+            };
+            if icons.next().is_some() {
+                self.stats.bump(&self.stats.events_rejected, 1);
+                return PutOutcome::Invalid("invalid: duplicate workspace icon tag".into());
+            }
+            if icon.len() > 4_000
+                || icon.chars().any(char::is_control)
+                || (!icon.is_empty()
+                    && !icon.starts_with("https://")
+                    && !icon.starts_with("data:image/"))
+            {
+                self.stats.bump(&self.stats.events_rejected, 1);
+                return PutOutcome::Invalid(
+                    "invalid: workspace icon must be an https or data:image URL".into(),
+                );
+            }
+            Some(icon.to_string())
+        } else {
+            None
+        };
         // The first-seen record rides along with the put: applied in the
         // same write transaction (one commit/fsync) only when the event
         // actually stores.
@@ -3562,6 +3649,15 @@ impl Relay {
             (cfg.nip_enabled(9), cfg.nip_enabled(43), cfg.nip_enabled(29));
         drop(cfg);
         drop(access);
+        if let Some(icon) = workspace_icon.as_deref()
+            && !self.apply_workspace_icon(icon).await
+        {
+            self.publish_rate_rollback(&event.pubkey, now);
+            self.stats.bump(&self.stats.events_rejected, 1);
+            return PutOutcome::Invalid(
+                "error: cannot persist the workspace icon; the command was not accepted".into(),
+            );
+        }
         let outcome = self
             .db
             .put_with_first_seen(Arc::clone(&event), now, first_seen)
@@ -3767,6 +3863,8 @@ impl Relay {
             || event.kind == nip43::JOIN
             || event.kind == crate::nips::nip29::DM_OPEN
             || event.kind == crate::nips::nip29::DM_HIDE
+            // Buzz workspace-profile command: it mutates the NIP-11 icon.
+            || event.kind == 9033
             || nip62::is_vanish(event)
             || (event.kind == 1 && self.relay_pubkey.as_deref() == Some(event.pubkey.as_str()))
     }
@@ -7412,6 +7510,50 @@ mod tests {
         );
         relay.clear_role_rebuild_journal().await;
         assert_eq!(relay.db.load_role_rebuild_pending().await, Some(None));
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn workspace_icon_requires_admin_and_persists() {
+        let relay = build_relay().await;
+        let owner = "aa".repeat(32);
+        let other = "bb".repeat(32);
+        relay.config.write().await.relay.pubkey = owner.clone();
+        assert!(relay.is_relay_owner_or_admin(&owner).await);
+        assert!(!relay.is_relay_owner_or_admin(&other).await);
+        relay
+            .roles
+            .write()
+            .await
+            .create("admin", "Admin", "", "", None);
+        relay.roles.write().await.assign(&other, "admin");
+        assert!(
+            relay.is_relay_owner_or_admin(&other).await,
+            "a NIP-43 admin assignment must authorize the command"
+        );
+
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join("nostrfy-workspace-icon-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{id}.toml"));
+        std::fs::write(&path, "[relay]\nname = \"test\"\nicon = \"\"\n").unwrap();
+        *relay.config_path.write().await = Some(path.clone());
+        assert!(
+            relay
+                .apply_workspace_icon("https://example.com/icon.png")
+                .await
+        );
+        assert_eq!(
+            relay.config.read().await.relay.icon,
+            "https://example.com/icon.png"
+        );
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("https://example.com/icon.png")
+        );
         relay.db.shutdown();
     }
 

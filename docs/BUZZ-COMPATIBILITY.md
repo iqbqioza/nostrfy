@@ -163,9 +163,12 @@ host, because Buzz signs the relay URL it uploads to.
   to nostrfy's access lists; manage an allowlist relay with `nostrfy relay
   allow/deny` or NIP-86 instead. Channel member management (`kind:9000`/
   `9001`) and the member UI do work.
-- Buzz's workspace-profile command (`kind:9033`) is stored as an ordinary
-  event but does not update the NIP-11 `icon`; set `relay.icon` in the
-  configuration instead.
+- Buzz's workspace-profile command (`kind:9033`) is accepted from a relay
+  owner/NIP-86 admin or a NIP-43 `owner`/`admin` assignment. It validates the
+  single `icon` tag (`https://` or `data:image/`, or empty), updates the
+  NIP-11 icon immediately, and persists `relay.icon` when a config path is
+  available; a failed file write rolls the in-memory change back. The
+  command event itself is still stored as an ordinary event.
 - A `kind:39005` summary counts visible direct replies and walks the visible
   descendant tree (up to 100 levels / 10,000 events) for `descendant_count`,
   `last_reply_at` and the 10 most recent participants. A larger tree, a
