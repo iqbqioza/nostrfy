@@ -306,6 +306,12 @@ pub struct Group {
     /// NIP-CL `created_at` tag: when the group was created (unix seconds).
     #[serde(default)]
     pub created_at: Option<u64>,
+    /// Event id of the group's `9007` create (or the synthetic DM marker).
+    /// State events validated against a previous incarnation carry the old
+    /// id and are dropped after a delete/recreate. Missing on old snapshots;
+    /// startup derives it from the stored create where possible.
+    #[serde(default)]
+    pub create_id: Option<String>,
     /// NIP-CL channel type (`stream`, `forum`, `dm`, `workflow`, `system`).
     /// Empty for snapshots written before the field existed; clients then
     /// fall back to their own default, as NIP-CL requires for older events.
@@ -2236,6 +2242,11 @@ impl GroupStore {
                     let mut group = Group {
                         creator: Some(event.pubkey.clone()),
                         created_at: Some(event.created_at),
+                        create_id: Some(if event.id.is_empty() {
+                            format!("synthetic:{gid}")
+                        } else {
+                            event.id.clone()
+                        }),
                         channel_type: group_channel_type,
                         buzz_metadata: self.buzz_enabled,
                         ..Group::default()

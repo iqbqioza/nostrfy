@@ -45,6 +45,9 @@ pub(crate) struct NegItem {
     /// other kind. Kept so the connection layer can serve wraps only to
     /// their recipients without loading the full events back.
     pub wrap_recipients: Option<Vec<String>>,
+    /// p-tag recipients of per-pubkey NIP-29/Buzz state (`44100`, `44101`,
+    /// `30622`). NEG has no event body to apply the p gate later.
+    pub state_recipients: Option<Vec<String>>,
 }
 
 pub(crate) type NegItems = Vec<NegItem>;
@@ -111,6 +114,10 @@ fn neg_item_size_estimate(item: &NegItem) -> usize {
         + item.gid.as_deref().map_or(0, str::len)
         + item
             .wrap_recipients
+            .as_ref()
+            .map_or(0, |recipients| recipients.iter().map(String::len).sum())
+        + item
+            .state_recipients
             .as_ref()
             .map_or(0, |recipients| recipients.iter().map(String::len).sum())
 }
@@ -532,6 +539,18 @@ impl ScanCollector for ItemCollector {
         } else {
             None
         };
+        let state_recipients = if matches!(event.kind, 44100 | 44101 | 30622) {
+            Some(
+                event
+                    .tags
+                    .iter()
+                    .filter(|t| t.len() >= 2 && t[0] == "p")
+                    .map(|t| t[1].clone())
+                    .collect(),
+            )
+        } else {
+            None
+        };
         let item = NegItem {
             created: event.created_at,
             id,
@@ -541,6 +560,7 @@ impl ScanCollector for ItemCollector {
             app_specific: crate::nips::nip78::is_app_specific(&event),
             gid,
             wrap_recipients,
+            state_recipients,
         };
         self.bytes = self.bytes.saturating_add(neg_item_size_estimate(&item));
         self.items.push(item);
@@ -569,6 +589,18 @@ impl ScanCollector for ItemCollector {
         } else {
             None
         };
+        let state_recipients = if matches!(event.kind(), 44100 | 44101 | 30622) {
+            Some(
+                event
+                    .tags()
+                    .iter()
+                    .filter(|t| t.len() >= 2 && t[0] == "p")
+                    .map(|t| t[1].clone())
+                    .collect(),
+            )
+        } else {
+            None
+        };
         let item = NegItem {
             created: event.created_at(),
             id,
@@ -578,6 +610,7 @@ impl ScanCollector for ItemCollector {
             app_specific: crate::nips::nip78::is_app_specific_kind(event.kind()),
             gid,
             wrap_recipients,
+            state_recipients,
         };
         self.bytes = self.bytes.saturating_add(neg_item_size_estimate(&item));
         self.items.push(item);

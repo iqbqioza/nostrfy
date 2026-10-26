@@ -413,6 +413,11 @@ pub async fn run(
         // order-independent), then the NIP-29 actions.
         apply_gift_wrap_purges(db, &mut stats).await?;
         apply_group_side_effects(db, opts, &mut stats).await?;
+        // Apply NIP-09/NIP-62 only after the 9005/9008 fixpoint has
+        // consumed every action. A later deletion may still remove an
+        // action event, but its already-applied effect is fail-closed
+        // (revoking membership/purging history) rather than being skipped.
+        apply_stored_removals(db, &mut stats).await?;
         invalidate_group_snapshot_after_import(db, &stats).await?;
     }
     Ok(stats)
@@ -575,21 +580,67 @@ async fn flush(
         {
             first_seen.push((pubkey, event.created_at));
         }
-        match event.kind {
-            nip09::DELETION_KIND => apply_nip09(db, event, stats).await?,
-            nip62::VANISH_KIND
-                if opts.apply_vanish
-                    && opts.nip62_enabled
-                    && nip62::is_vanish(event)
-                    && nip62::targets_us(event, identity) =>
-            {
-                apply_vanish(db, event, stats).await?
-            }
-            _ => {}
+        // NIP-62's marker must be written before later events of the same
+        // author are imported (the permanent-upload ban is order-sensitive).
+        if event.kind == nip62::VANISH_KIND
+            && opts.apply_vanish
+            && opts.nip62_enabled
+            && nip62::is_vanish(event)
+            && nip62::targets_us(event, identity)
+        {
+            apply_vanish(db, event, stats).await?;
         }
+        // NIP-09 deletions are deferred: applying them while streaming
+        // could erase a deferred 9005/9008 before its side effect runs.
     }
     if opts.first_seen && !first_seen.is_empty() {
         db.touch_first_seen_batch(std::mem::take(first_seen)).await;
+    }
+    Ok(())
+}
+
+/// Applies stored NIP-09/NIP-62 requests after group actions. Both are
+/// author-scoped removal effects; running them after the 9005/9008 fixpoint
+/// prevents a later deletion from erasing an action before its effect is
+/// applied (the effect may over-remove, never under-remove).
+async fn apply_stored_removals(db: &DbClient, stats: &mut Stats) -> Result<()> {
+    const PAGE: usize = 50_000;
+    let mut since: Option<u64> = None;
+    let mut last_key: Option<(u64, String)> = None;
+    loop {
+        let mut filter: Filter = serde_json::from_value(serde_json::json!({
+            "kinds": [nip09::DELETION_KIND],
+        }))
+        .expect("static filter");
+        filter.since = since;
+        let Some((mut page, more)) = db
+            .query_full_startup(vec![filter], PAGE, unix_now(), true)
+            .await
+        else {
+            bail!(
+                "could not read stored deletion requests; the migration did not complete \
+                 (re-run it)"
+            );
+        };
+        if page.is_empty() {
+            break;
+        }
+        page.sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
+        for event in page {
+            let key = (event.created_at, event.id.clone());
+            if last_key.as_ref().is_some_and(|last| &key <= last) {
+                continue;
+            }
+            last_key = Some(key);
+            apply_nip09(db, &event, stats).await?;
+        }
+        if !more {
+            break;
+        }
+        since = last_key.as_ref().map(|(created, _)| *created);
+        if since.is_none() {
+            break;
+        }
     }
     Ok(())
 }

@@ -3478,6 +3478,18 @@ impl Relay {
             self.stats.bump(&self.stats.events_rejected, 1);
             return PutOutcome::Invalid("rate-limited: too many events".into());
         }
+        // Bind a state event to the incarnation that validation saw. A
+        // delete/recreate between the read-side check and after_put must not
+        // let the old admin's event mutate the new group.
+        let expected_group_create =
+            if nip29::is_group_action(&event) && event.kind != nip29::CREATE_GROUP {
+                let groups = self.groups.read().await;
+                nip29::group_id(&event)
+                    .and_then(|gid| groups.group(gid))
+                    .and_then(|group| group.create_id.clone())
+            } else {
+                None
+            };
         // The first-seen record rides along with the put: applied in the
         // same write transaction (one commit/fsync) only when the event
         // actually stores.
@@ -3517,7 +3529,17 @@ impl Relay {
         }
         match outcome {
             PutOutcome::Stored | PutOutcome::Replaced | PutOutcome::Ephemeral => {
-                match self.after_put(event, now, nip9, nip43, nip29_enabled).await {
+                match self
+                    .after_put(
+                        event,
+                        now,
+                        nip9,
+                        nip43,
+                        nip29_enabled,
+                        expected_group_create.as_deref(),
+                    )
+                    .await
+                {
                     RemovalAck::Applied(delivered) => {
                         if !delivered {
                             log::error!("event persisted but live delivery failed");
@@ -4132,6 +4154,7 @@ impl Relay {
         nip9: bool,
         nip43: bool,
         nip29_enabled: bool,
+        expected_group_create: Option<&str>,
     ) -> RemovalAck {
         let mut removal_failed = false;
         // A removal that could not be applied, held for the pending-record
@@ -4240,7 +4263,9 @@ impl Relay {
             self.apply_leave_request(&event).await;
         }
         if nip29_enabled && nip29::is_group_action(&event) {
-            let (applied, group_unapplied) = self.apply_group_event(&event, now).await;
+            let (applied, group_unapplied) = self
+                .apply_group_event(&event, now, expected_group_create)
+                .await;
             if !applied {
                 removal_failed = true;
             }
@@ -5448,15 +5473,17 @@ impl Relay {
             // it, carry its claims, and rebuild from the surviving events.
             return;
         }
-        // Flag the rebuild first so the snapshot persistence stops saving the
-        // state as soon as the removal is known (the database generation has
-        // already advanced). `marking` is only for the persist paths: the
-        // mutation-visible `dirty` is stored *under the buffer lock* below so
-        // a mutation holding the lock sees a stable value (N43-M01).
+        // Publish the mutation-visible dirty flag immediately, before
+        // waiting for the mutation buffer. The DB removal has already
+        // committed, so a concurrent mutation that reaches the publish path
+        // must not store a pre-removal full 13534 and thereby resurrect the
+        // removed state on the next rebuild.
+        self.roles_rebuild.dirty.store(true, Ordering::SeqCst);
         self.roles_rebuild.marking.store(true, Ordering::SeqCst);
         let marking = RoleMarkingGuard(&self.roles_rebuild.marking);
         let buffer = self.roles_rebuild.buffer.lock().await;
-        self.roles_rebuild.dirty.store(true, Ordering::SeqCst);
+        // Keep the early store: it covers a mutation that observed the flag
+        // before this mark; the buffer lock now serializes revocation.
         // `dirty` now covers the persist paths; release the early flag.
         drop(marking);
         let claims = {
@@ -6071,7 +6098,12 @@ impl Relay {
     /// not buffered — its ghost/tombstone/purge outcome is not
     /// reconstructible from the database — so it forces the worker to
     /// discard the scan and rebuild instead.
-    async fn apply_group_state(&self, event: &Event, now: u64) -> Vec<Event> {
+    async fn apply_group_state(
+        &self,
+        event: &Event,
+        now: u64,
+        expected_group_create: Option<&str>,
+    ) -> Vec<Event> {
         let relay_pubkey = self.relay_pubkey().unwrap_or_default();
         // Relay-generated events are stamped with the strictly monotonic
         // clock (not plain `now`): two events applied in the same second
@@ -6083,6 +6115,19 @@ impl Relay {
         // wall time catches up after a restart).
         let stamp = self.stamp_floor(now);
         let mut buffer = self.groups_rebuild.buffer.lock().await;
+        // Take the store lock while still holding the buffer lock (the
+        // worker's established order), then re-check the incarnation. A
+        // delete/recreate between validation and this point must not let the
+        // old event mutate or be buffered into the new group's replay.
+        let mut groups = self.groups.write().await;
+        if let Some(expected) = expected_group_create {
+            let current = nip29::group_id(event)
+                .and_then(|gid| groups.group(gid))
+                .and_then(|group| group.create_id.as_deref());
+            if current != Some(expected) {
+                return Vec::new();
+            }
+        }
         if buffer.scanning {
             if event.kind == nip29::DELETE_GROUP {
                 buffer.retry = true;
@@ -6095,10 +6140,7 @@ impl Relay {
                 });
             }
         }
-        self.groups
-            .write()
-            .await
-            .apply(event, &relay_pubkey, stamp, self.has_relay_key(), false)
+        groups.apply(event, &relay_pubkey, stamp, self.has_relay_key(), false)
     }
 
     /// Marks a `9008` id as a ghost on the live store, before the delete is
@@ -6166,6 +6208,7 @@ impl Relay {
         &self,
         event: &Event,
         now: u64,
+        expected_group_create: Option<&str>,
     ) -> (bool, Option<crate::db::store::PendingDeletion>) {
         // Serialize the apply and its generated events with a LiveKit
         // refresh for the same group: a refresh that passed
@@ -6209,7 +6252,9 @@ impl Relay {
                 );
             }
         }
-        let generated = self.apply_group_state(event, now).await;
+        let generated = self
+            .apply_group_state(event, now, expected_group_create)
+            .await;
         // Debounced persistence: restarts restore from the snapshot instead
         // of replaying history, and a skipped save is detected at startup
         // through the group-state sequence (`DbClient::state_seq_group`).
@@ -6485,7 +6530,7 @@ impl PendingBatch {
             let mut ack_override = None;
             match outcome {
                 PutOutcome::Stored | PutOutcome::Replaced | PutOutcome::Ephemeral => {
-                    let ack = relay.after_put(event, now, nip9, nip43, nip29).await;
+                    let ack = relay.after_put(event, now, nip9, nip43, nip29, None).await;
                     match ack {
                         RemovalAck::Applied(delivered) => {
                             if !delivered {
@@ -12641,7 +12686,7 @@ mod tests {
         // the generated empty 39004 cannot be committed.
         let leave = signed_group_event(&admin, 9002, gid, vec![], now + 2);
         relay.db.shutdown();
-        let _ = relay.apply_group_event(&leave, now + 2).await;
+        let _ = relay.apply_group_event(&leave, now + 2, None).await;
         assert_eq!(
             relay.livekit_participants.lock().await.get(gid),
             Some(&old),
@@ -13142,7 +13187,7 @@ mod tests {
         // confirmed-purged id (the 9008's purge removed the events, so the
         // scan cannot reconstruct the tombstone) — blocking re-creation
         // forever. The worker re-seeds the captured tombstones.
-        let relay = build_relay().await;
+        let relay = build_relay_with_key(false, &"01".repeat(32)).await;
         let now = crate::util::unix_now();
         let admin = secp256k1::Keypair::from_secret_bytes([4u8; 32]).unwrap();
         let create = signed_group_event(
@@ -13931,7 +13976,7 @@ mod tests {
                 vec![vec!["p".into(), member.clone(), "mod".into()]],
                 now,
             );
-            relay.apply_group_event(&grant, now).await;
+            relay.apply_group_event(&grant, now, None).await;
             let buffered = {
                 let mut buffer = relay.groups_rebuild.buffer.lock().await;
                 assert_eq!(
@@ -14009,7 +14054,7 @@ mod tests {
                 vec![vec!["p".into(), member.clone(), "mod".into()]],
                 now,
             );
-            relay.apply_group_event(&grant, now).await;
+            relay.apply_group_event(&grant, now, None).await;
             {
                 let buffer = relay.groups_rebuild.buffer.lock().await;
                 assert!(
@@ -14259,6 +14304,62 @@ mod tests {
 
         relay.release_role_snapshot_preserve();
         assert!(relay.persist_roles().await);
+        relay.db.shutdown();
+    }
+    #[tokio::test]
+    async fn a_stale_create_id_cannot_mutate_the_new_incarnation() {
+        let relay = build_relay().await;
+        let now = crate::util::unix_now();
+        let create = crate::event::Event {
+            id: String::new(),
+            pubkey: "aa".repeat(32),
+            created_at: now,
+            kind: crate::nips::nip29::CREATE_GROUP,
+            tags: vec![vec!["h".into(), "g1".into()]],
+            content: String::new(),
+            sig: String::new(),
+        };
+        relay
+            .groups
+            .write()
+            .await
+            .apply(&create, "", now, false, false);
+        let edit = crate::event::Event {
+            id: String::new(),
+            pubkey: "aa".repeat(32),
+            created_at: now + 1,
+            kind: 9002,
+            tags: vec![
+                vec!["h".into(), "g1".into()],
+                vec!["name".into(), "new".into()],
+            ],
+            content: String::new(),
+            sig: String::new(),
+        };
+        let stale = relay
+            .apply_group_state(&edit, now + 1, Some("old-create-id"))
+            .await;
+        assert!(stale.is_empty());
+        assert_eq!(
+            relay.groups.read().await.group("g1").unwrap().settings.name,
+            ""
+        );
+        let create_id = relay
+            .groups
+            .read()
+            .await
+            .group("g1")
+            .unwrap()
+            .create_id
+            .clone()
+            .expect("create id");
+        let _ = relay
+            .apply_group_state(&edit, now + 1, Some(create_id.as_str()))
+            .await;
+        assert_eq!(
+            relay.groups.read().await.group("g1").unwrap().settings.name,
+            "new"
+        );
         relay.db.shutdown();
     }
 }

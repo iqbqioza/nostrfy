@@ -629,6 +629,87 @@ fn host_route_allowed(
 /// a database whose private groups are missing from the empty store cannot
 /// leak their content. The next start with the NIP re-enabled rebuilds the
 /// store from the surviving events.
+/// Derives the incarnation id for snapshots written before `create_id`
+/// existed. A DM has no stored synthetic create and gets the deterministic
+/// synthetic marker; other groups use the stored 9007 whose timestamp/creator
+/// matches the snapshot. If the history is unavailable the startup fails
+/// closed rather than serving an unbound group.
+async fn populate_group_create_ids(
+    relay: &Relay,
+    snapshot: &mut crate::nips::nip29::GroupsSnapshot,
+) -> Result<()> {
+    if snapshot
+        .groups
+        .values()
+        .all(|group| group.create_id.is_some())
+    {
+        return Ok(());
+    }
+    let filter: crate::filter::Filter = serde_json::from_value(serde_json::json!({
+        "kinds": [crate::nips::nip29::CREATE_GROUP],
+    }))
+    .expect("static filter");
+    let Some((events, more)) = relay
+        .db
+        .query_full_startup(vec![filter], 100_000, unix_now(), true)
+        .await
+    else {
+        return Err(anyhow::anyhow!(
+            "cannot read stored group creates to bind the NIP-29 snapshot; refusing to serve"
+        ));
+    };
+    if more {
+        return Err(anyhow::anyhow!(
+            "stored group-create scan was truncated; refusing to serve an unbound snapshot"
+        ));
+    }
+    let mut creates: std::collections::HashMap<String, Vec<(u64, String, String)>> =
+        std::collections::HashMap::new();
+    for event in events {
+        if let Some(gid) = crate::nips::nip29::group_id(&event) {
+            creates.entry(gid.to_string()).or_default().push((
+                event.created_at,
+                event.pubkey.clone(),
+                event.id.clone(),
+            ));
+        }
+    }
+    for (gid, group) in snapshot.groups.iter_mut() {
+        if group.create_id.is_some() {
+            continue;
+        }
+        if group.channel_type == "dm" {
+            group.create_id = Some(format!("synthetic:{gid}"));
+            continue;
+        }
+        let Some(candidates) = creates.get(gid) else {
+            continue;
+        };
+        let matched = candidates
+            .iter()
+            .find(|(created_at, pubkey, _)| {
+                group
+                    .created_at
+                    .is_some_and(|created| *created_at == created)
+                    && group
+                        .creator
+                        .as_deref()
+                        .is_some_and(|creator| creator.eq_ignore_ascii_case(pubkey))
+            })
+            .or_else(|| {
+                if candidates.len() == 1 {
+                    candidates.first()
+                } else {
+                    None
+                }
+            });
+        if let Some((_, _, id)) = matched {
+            group.create_id = Some(id.clone());
+        }
+    }
+    Ok(())
+}
+
 /// Removes vanished pubkeys from a persisted group snapshot before it is
 /// restored. The snapshot may predate a NIP-62 vanish (including a vanish
 /// accepted while NIP-29 was disabled), and unlike the NIP-43 restore the
@@ -700,6 +781,7 @@ async fn restore_group_state(relay: &Relay, groups_enabled: bool) -> Result<()> 
             ));
         }
     };
+    populate_group_create_ids(relay, &mut snapshot).await?;
     filter_vanished_group_snapshot(relay, &mut snapshot).await?;
     let stamp = relay.db.state_stamp().await;
     let seq = relay.db.state_seq_group().await;
@@ -712,6 +794,16 @@ async fn restore_group_state(relay: &Relay, groups_enabled: bool) -> Result<()> 
                 .restore_checked(snapshot, stamp, seq)
             {
                 info!("NIP-29 group state restored from the database snapshot");
+                // Persist the restored (and possibly auto-migrated/filtered)
+                // snapshot: this writes derived create ids and removes
+                // vanished members from old snapshots without a destructive
+                // schema migration.
+                if !relay.persist_groups().await {
+                    log::warn!(
+                        "could not persist the restored/filtered NIP-29 snapshot; \
+                         the next restart will repeat the safe restore"
+                    );
+                }
                 return Ok(());
             }
             error!(

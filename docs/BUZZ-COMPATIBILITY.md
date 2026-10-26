@@ -245,19 +245,23 @@ host, because Buzz signs the relay URL it uploads to.
   future timestamp beyond 600 seconds, but events accepted before that
   limit (or from an imported legacy database) can still do this. The relay's
   signing mirror is stamped at apply time, so it no longer amplifies it.
-- Live group validation now rejects a state event timestamped before its
+- Live group validation rejects a state event timestamped before its
   group's create, and the rebuild buffers such legacy state until the create
-  is seen. The migration replay and a full create-id/epoch binding are not
-  yet complete: an imported event before its create can still be dropped,
-  and a future-dated old moderation event can cross a delete/recreate.
+  is seen. Live client moderation is also bound to the group create id
+  across delete/recreate; relay-generated mirrors and imported/replayed
+  legacy events are not yet epoch-tagged, so a future-dated old event can
+  still cross a recreate on replay. Migration replay before a create is not
+  fully buffered.
 - Migration now invalidates the destination group snapshot after importing
   events (forcing the first start to rebuild/ghost-check), except when the
   snapshot contains DM groups; keeping DM snapshots preserves their
   membership at the cost of not auto-verifying imported private history.
-- Migration still applies NIP-09/NIP-62 removals during import and defers
-  9005/9008 effects until afterward; a later removal can erase the deferred
-  9005/9008 action before it runs. Do not run an incremental migration over
-  a live role/group database without a subsequent full rebuild.
+- Migration applies NIP-09 deletions only after the 9005/9008 fixpoint, so
+  an ordinary deletion can no longer erase an action before its effect. A
+  NIP-62 vanish still has to run inline to block later events in the same
+  export; a vanish authored by an admin can therefore remove the admin's
+  own deferred 9005/9008 before it runs. Do not run an incremental migration
+  over a live role/group database without a subsequent full rebuild.
 - Enabling Buzz on a restored plain-NIP-29 group does not reinterpret
   literal `guest`/`bot` role labels. Such a role was an ordinary privileged
   role in plain mode, while Buzz reports it as a read-only/bot tier. Use a
@@ -303,10 +307,6 @@ host, because Buzz signs the relay URL it uploads to.
   A role rebuild that is aborted or overflows retains captured mutations for
   the next scan; shutdown may still discard them because the process is
   ending.
-- NIP-77 negentropy sync returns ids/timestamps without applying the
-  per-pubkey gate to `44100`/`44101`/`30622`; an anonymous syncer can learn
-  that those events exist, while REQ/COUNT still withhold their content.
-  This is the pre-existing NEG visibility limitation, not a content leak.
 - Buzz's push leases, workflow commands, moderation commands and
   hosted-community APIs are not part of this bridge.
 - NIP-34 git events (used by Buzz Projects) are rejected unless

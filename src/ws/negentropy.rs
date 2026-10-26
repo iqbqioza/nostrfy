@@ -440,6 +440,18 @@ impl super::Conn {
                     {
                         return false;
                     }
+                    // NIP-DV/NIP-CL per-pubkey state has no group id (and
+                    // 30622 can carry `h` tags), so NEG must apply the p-tag
+                    // recipient gate explicitly; REQ/COUNT already do.
+                    if item.state_recipients.as_ref().is_some_and(|recipients| {
+                        !self.authed_pubkeys.iter().any(|pk| {
+                            recipients
+                                .iter()
+                                .any(|recipient| recipient.eq_ignore_ascii_case(pk))
+                        })
+                    }) {
+                        return false;
+                    }
                     // NIP-78: application-specific events are only synced
                     // to the authenticated owner.
                     if self.nip78_restricted

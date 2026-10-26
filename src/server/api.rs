@@ -2825,6 +2825,7 @@ mod tests {
                 app_specific: false,
                 gid: None,
                 wrap_recipients: None,
+                state_recipients: None,
             };
             assert!(
                 !aggregate_visible(&item, None, false, None),
