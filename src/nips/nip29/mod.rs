@@ -3279,6 +3279,13 @@ impl GroupStore {
                         continue;
                     }
                 }
+                // Legacy events accepted before the 600-second group-state
+                // future bound must not outrank later removals on replay.
+                // The live path no longer admits them; skip them here rather
+                // than resurrecting a stale membership.
+                if event.created_at > unix_now().saturating_add(600) {
+                    continue;
+                }
                 let gid = group_id(&event).unwrap_or_default().to_string();
                 let event_epoch = event.id_bytes().map(hex::encode);
                 let expected_epoch = event_epoch

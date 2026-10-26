@@ -682,6 +682,12 @@ fn replay_moderation(
     event: &Event,
     relay_pubkey: Option<&str>,
 ) -> bool {
+    // The live write path rejects group state more than 600 seconds in the
+    // future. Keep the replay from letting a pre-limit legacy row outrank a
+    // later removal and resurrect it.
+    if event.created_at > unix_now().saturating_add(600) {
+        return false;
+    }
     // The authorization gate only: the relay's own key is the master key,
     // an existing group requires an admin, and an unknown group only
     // accepts a create (a group action without an `h` tag is refused, like

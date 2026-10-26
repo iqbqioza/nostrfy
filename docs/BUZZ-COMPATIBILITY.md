@@ -269,11 +269,13 @@ host, because Buzz signs the relay URL it uploads to.
   rejoin. The remove/leave wins on replay until the next edit; store an
   explicit later role/join event if that state must survive a restart.
 - A JOIN accepted with a `created_at` far in the future (up to
-  `max_created_at_future_secs`) can sort after a later removal on replay
-  and re-add an open-group member. Group/join/leave events now reject a
-  future timestamp beyond 600 seconds, but events accepted before that
-  limit (or from an imported legacy database) can still do this. The relay's
-  signing mirror is stamped at apply time, so it no longer amplifies it.
+  `max_created_at_future_secs`) could sort after a later removal on replay
+  and re-add an open-group member. Group/join/leave events reject a future
+  timestamp beyond 600 seconds, and both live-state replay and migration
+  replay now skip legacy group state more than 600 seconds ahead. Events
+  within that 600-second skew window still follow timestamp order. The
+  relay's signing mirror is stamped at apply time, so it does not amplify
+  the problem.
 - Live group validation rejects a state event timestamped before its
   group's create, and the rebuild buffers such legacy state until the create
   is seen. Live client moderation is bound to the group create id across
