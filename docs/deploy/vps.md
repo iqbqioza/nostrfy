@@ -219,6 +219,14 @@ relay.example.com {
 }
 ```
 
+Container IPs are assigned per network and change when a container is
+recreated (`docker compose up` after a config change is enough) — if the
+proxy IP in `trusted_proxies` and the ufw rule goes stale, client IPs stop
+resolving and everyone shares the proxy address again. Re-check the IP after
+recreations, or pin the compose network's subnet and trust the whole subnet
+(`172.19.0.0/24`) — only do that if nothing untrusted can attach to it.
+Validate before reloading: `docker exec caddy caddy validate --config /etc/caddy/Caddyfile`.
+
 **Serving the Blossom media host too**: when `blossom.host = "media.example.com"` is set, that hostname must also reach the same port — the relay splits the hosts internally (like `server.api_host`). Add a second server block / site for it:
 
 ```nginx
