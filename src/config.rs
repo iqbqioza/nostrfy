@@ -2523,18 +2523,22 @@ impl AccessControl {
         // command events) who may type uppercase hex, while events on the
         // wire carry lowercase — an exact compare would fail open on deny
         // and fail closed on allow.
-        if self
-            .blocked_pubkeys
+        !self.blocks_pubkey(pubkey)
+            && (!self.restrict_relay
+                || self
+                    .allowed_pubkeys
+                    .iter()
+                    .any(|(p, _)| p.eq_ignore_ascii_case(pubkey)))
+    }
+
+    /// Whether `pubkey` is denied outright. Separate from
+    /// [`Self::allows_pubkey`] because a NIP-43 invite join bypasses the
+    /// `restrict_relay` allow list (the invite code is the authorization)
+    /// but must still be refused for a denied pubkey.
+    pub fn blocks_pubkey(&self, pubkey: &str) -> bool {
+        self.blocked_pubkeys
             .iter()
             .any(|(p, _)| p.eq_ignore_ascii_case(pubkey))
-        {
-            return false;
-        }
-        !self.restrict_relay
-            || self
-                .allowed_pubkeys
-                .iter()
-                .any(|(p, _)| p.eq_ignore_ascii_case(pubkey))
     }
 
     pub fn allows_kind(&self, kind: u64) -> bool {

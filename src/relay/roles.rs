@@ -2,12 +2,9 @@
 //! managed through the NIP-86 RPC, plus the published membership list
 //! and add/remove-user events.
 
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use crate::db::PutOutcome;
 use crate::event::Event;
-use crate::nips::nip01;
 use crate::nips::nip43::RoleStore;
 use crate::util::unix_now;
 
@@ -60,28 +57,34 @@ pub(crate) enum Admission {
 impl super::Relay {
     /// Applies a role mutation to the live store, capturing it for replay
     /// when a rebuild is pending or in flight (see
-    /// [`super::RolesRebuildBuffer`]). The capture and the live apply share
-    /// the buffer lock, so a mutation is either replayed onto the freshly
-    /// rebuilt store or applied after the swap — never lost in between.
-    /// `mutate` returns `(result, changed)`; a refused mutation (e.g. an
-    /// unknown role) is not captured, so the replay cannot apply what the
-    /// live store rejected — except callers that force `changed` for
-    /// removals the revoked empty store cannot confirm (see
+    /// [`super::RolesRebuildBuffer`]). The caller holds the buffer lock from
+    /// the live apply through its publish, so a mutation is either replayed
+    /// onto the freshly rebuilt store or applied (and stored) after the swap —
+    /// never lost in between. `mutate` returns `(result, changed)`; a refused
+    /// mutation (e.g. an unknown role) is not captured, so the replay cannot
+    /// apply what the live store rejected — except callers that force
+    /// `changed` for removals the revoked empty store cannot confirm (see
     /// [`Self::apply_leave_request`]).
+    ///
+    /// The lock is passed in instead of taken here so the caller can keep it
+    /// across the event publish. `mark_roles_stale` takes the same lock, so
+    /// it cannot revoke the store between this apply and the publish: either
+    /// it runs first (the mutation sees `dirty` and is captured) or the
+    /// mutation finishes storing its event first (the rebuild sees the event).
     pub(super) async fn mutate_roles<R>(
         &self,
+        buffer: &mut super::RolesRebuildBuffer,
         mutation: super::BufferedRoleMutation,
         mutate: impl FnOnce(&mut RoleStore) -> (R, bool),
     ) -> R {
-        let mut buffer = self.roles_rebuild.buffer.lock().await;
         let (result, changed) = {
             let mut roles = self.roles.write().await;
             mutate(&mut roles)
         };
         // Capture while a rebuild is pending, not just while its scan runs:
         // the revoked window starts at marking (`dirty`, stored before the
-        // store is revoked) and ends at worker exit (`running`), but the
-        // scan flag only covers the walk itself. A mutation accepted in the
+        // store is revoked) and ends at worker exit (`running`), but the scan
+        // flag only covers the walk itself. A mutation accepted in the
         // pre-scan gap would otherwise never replay.
         let rebuild_pending = self.roles_rebuild.dirty.load(Ordering::SeqCst)
             || self.roles_rebuild.running.load(Ordering::SeqCst);
@@ -92,8 +95,40 @@ impl super::Relay {
                 buffer.mutations.push(mutation);
             }
         }
-        drop(buffer);
         result
+    }
+
+    /// Whether the relay-signed role definition for `id` survives in the
+    /// stored history the rebuild will scan. During a revoked window the live
+    /// store is empty, so an RPC must not accept a role id from a stale hint:
+    /// the definition may be the very event whose removal triggered the
+    /// rebuild. Checking the surviving event makes the reply honest (N43-L04).
+    async fn role_definition_exists(&self, id: &str) -> bool {
+        let Some(relay_pubkey) = self.relay_pubkey() else {
+            return false;
+        };
+        let filter: crate::filter::Filter = serde_json::from_value(serde_json::json!({
+            "kinds": [crate::nips::nip43::ROLE_DEFINITION],
+            "#d": [id],
+        }))
+        .expect("static filter");
+        match self
+            .db
+            .query_full_startup(vec![filter], 1, unix_now(), false)
+            .await
+        {
+            Some((events, _)) => events.iter().any(|event| {
+                event.pubkey == relay_pubkey
+                    // A tombstone is the deleted role, not a definition.
+                    && !event.tags.iter().any(|tag| {
+                        tag.first().map(String::as_str) == Some(crate::nips::nip43::DELETED_TAG)
+                    })
+            }),
+            // A database that cannot answer must not authorize the mutation:
+            // the role's survival is unverified, so report it as unknown and
+            // let the operator retry after the rebuild.
+            None => false,
+        }
     }
 
     /// Signs, stores and broadcasts a relay-generated event. The event must
@@ -102,22 +137,33 @@ impl super::Relay {
     /// newest state because the stamps reflect the order in which the state
     /// was applied, not the order in which the events are stored.
     pub(crate) async fn store_relay_event(&self, event: &mut Event) -> Result<bool, ()> {
-        let Some(keypair) = &self.key else {
-            return Err(());
-        };
-        if nip01::sign(event, keypair).is_err() {
-            return Err(());
-        }
-        let now = unix_now();
-        // One allocation shared by the database write and the broadcast:
-        // relay-generated events must not deep-copy their content twice.
-        let shared = Arc::new(event.clone());
-        let outcome = self.db.put(Arc::clone(&shared), now).await;
-        if matches!(outcome, PutOutcome::Stored | PutOutcome::Replaced) {
-            Ok(self.broadcast(shared).await.is_ok())
-        } else {
-            Err(())
-        }
+        super::store_relay_event_parts(
+            &self.db,
+            self.key,
+            &self.stamps,
+            &self.live_tx,
+            &self.stats,
+            event,
+            false,
+        )
+        .await
+    }
+
+    /// Role state events retry a same-timestamp replacement tie at the
+    /// stamp clock's ceiling: NIP-01 keeps the lower id, so without the retry
+    /// the newer membership list or role definition can be dropped as a
+    /// duplicate and the role sequence never advances (N43-L03).
+    pub(super) async fn store_role_event(&self, event: &mut Event) -> Result<bool, ()> {
+        super::store_relay_event_parts(
+            &self.db,
+            self.key,
+            &self.stamps,
+            &self.live_tx,
+            &self.stats,
+            event,
+            true,
+        )
+        .await
     }
 
     /// Signs, stores and broadcasts a relay-generated event. Returns
@@ -126,7 +172,7 @@ impl super::Relay {
     /// (a success would leave the operator with an in-memory-only change
     /// that silently disappears on the next restart).
     async fn publish_relay_event(&self, mut event: Event) -> bool {
-        self.store_relay_event(&mut event).await.is_ok()
+        self.store_role_event(&mut event).await.is_ok()
     }
 
     /// Publishes the current membership list and an add/remove user event.
@@ -185,8 +231,10 @@ impl super::Relay {
         let relay_pubkey = self.relay_pubkey().unwrap_or_default();
         // Stamped with the monotonic clock so concurrent role changes
         // cannot collide on a timestamp (see `StampClock`).
+        let mut buffer = self.roles_rebuild.buffer.lock().await;
         let event = self
             .mutate_roles(
+                &mut buffer,
                 super::BufferedRoleMutation::Create {
                     id: id.to_string(),
                     label: label.to_string(),
@@ -207,7 +255,9 @@ impl super::Relay {
         // so the snapshot must follow or a restart would lose it). A
         // skipped save is detected at startup through the state sequence.
         self.schedule_roles_persist();
-        self.publish_relay_event(event).await
+        let stored = self.publish_relay_event(event).await;
+        drop(buffer);
+        stored
     }
 
     /// NIP-86 `editrole`: updates an *existing* role. A typo'd or missing id
@@ -225,11 +275,24 @@ impl super::Relay {
             return false;
         }
         let relay_pubkey = self.relay_pubkey().unwrap_or_default();
+        let mut buffer = self.roles_rebuild.buffer.lock().await;
+        // A pending rebuild revoked the live store. The surviving stored
+        // history is authoritative, not the old live ids: an edit accepted
+        // for a role whose definition event was just removed would publish a
+        // new definition and resurrect it (N43-L04).
+        let pending = self.roles_rebuild.dirty.load(Ordering::SeqCst)
+            || self.roles_rebuild.marking.load(Ordering::SeqCst)
+            || self.roles_rebuild.running.load(Ordering::SeqCst);
+        if pending && !self.role_definition_exists(id).await {
+            drop(buffer);
+            return false;
+        }
         // The existence check and the update share one write guard: with a
         // separate read check a concurrent `delete_role` could land between
         // them and the edit would recreate the deleted role.
         let event = self
             .mutate_roles(
+                &mut buffer,
                 super::BufferedRoleMutation::Edit {
                     id: id.to_string(),
                     label: label.to_string(),
@@ -238,16 +301,9 @@ impl super::Relay {
                     order,
                 },
                 |roles| {
-                    let pending = self.roles_rebuild.dirty.load(Ordering::SeqCst)
-                        || self.roles_rebuild.running.load(Ordering::SeqCst);
-                    let known = roles.roles.contains_key(id)
-                        || (pending
-                            && self
-                                .roles_rebuild
-                                .revoked_roles
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                .contains(id));
+                    // `pending` cannot change while the buffer lock is held:
+                    // `mark_roles_stale` sets it under the same lock.
+                    let known = roles.roles.contains_key(id) || pending;
                     if !known {
                         return (None, false);
                     }
@@ -268,13 +324,16 @@ impl super::Relay {
             )
             .await;
         let Some(event) = event else {
+            drop(buffer);
             return false;
         };
         // Deferred persistence and publish (same contract as
         // `create_role`): the in-memory change is snapshotted even when the
         // publish fails, so a restart cannot lose it.
         self.schedule_roles_persist();
-        self.publish_relay_event(event).await
+        let stored = self.publish_relay_event(event).await;
+        drop(buffer);
+        stored
     }
 
     pub async fn delete_role(&self, id: &str) -> RoleChange {
@@ -286,22 +345,19 @@ impl super::Relay {
         // reporting `Noop` would lose it — the rebuild resurrects the role
         // from its surviving events (B-5). Force-buffer the deletion for
         // replay, and skip the full membership republish below (it cannot be
-        // built from the revoked store).
-        let mut rebuild_pending = self.roles_rebuild.dirty.load(Ordering::SeqCst)
-            || self.roles_rebuild.running.load(Ordering::SeqCst);
+        // built from the revoked store). The buffer lock is held through the
+        // tombstone publish so `mark_roles_stale` cannot revoke in between.
+        let mut buffer = self.roles_rebuild.buffer.lock().await;
         let outcome = self
             .mutate_roles(
+                &mut buffer,
                 super::BufferedRoleMutation::Delete { id: id.to_string() },
                 |roles| {
                     let removed = roles.delete(id);
-                    // Re-read inside the mutation (under the write lock), not
-                    // just from the pre-lock snapshot above: a rebuild marked
-                    // in between would otherwise be missed, and a deletion
-                    // landing on the already-revoked empty store would report
-                    // "no such role" and never be buffered. Marking stores
-                    // `dirty` before revoking under the same write lock, so
-                    // observing the revoked store here implies observing the
-                    // mark.
+                    // Read inside the mutation (under the write lock): the
+                    // mark sets `dirty` under the same buffer lock, so while
+                    // this call holds it a rebuild cannot start or revoke
+                    // without being observed here.
                     let pending = self.roles_rebuild.dirty.load(Ordering::SeqCst)
                         || self.roles_rebuild.running.load(Ordering::SeqCst);
                     // Deleting a missing role is a no-op success (like the
@@ -316,13 +372,12 @@ impl super::Relay {
                 },
             )
             .await;
-        // Re-read: the rebuild may have started between the snapshot above
-        // and the mutation, in which case the deletion was buffered and the
-        // full membership list still cannot be built from the revoked store.
-        rebuild_pending = rebuild_pending
-            || self.roles_rebuild.dirty.load(Ordering::SeqCst)
+        // Stable while the buffer lock is held (the mark sets it under the
+        // same lock), but re-read for the publish decision below.
+        let rebuild_pending = self.roles_rebuild.dirty.load(Ordering::SeqCst)
             || self.roles_rebuild.running.load(Ordering::SeqCst);
         if outcome != RoleChange::Applied {
+            drop(buffer);
             return outcome;
         }
         // Deferred persistence before publishing (see `create_role`):
@@ -363,6 +418,7 @@ impl super::Relay {
                 );
             }
         }
+        drop(buffer);
         if stored {
             RoleChange::Applied
         } else {
@@ -378,26 +434,34 @@ impl super::Relay {
         // store: publishing its membership list would store a partial 13534
         // (only the member this call just assigned) and the rebuild would
         // replay it as the newest. Capture the window like `unassign_role`.
-        let mut rebuild_pending = self.roles_rebuild.dirty.load(Ordering::SeqCst)
+        // The buffer lock is held through the publish for the same reason as
+        // `create_role` (N43-M01).
+        let mut buffer = self.roles_rebuild.buffer.lock().await;
+        // The live store is revoked while a rebuild is pending, so its ids are
+        // not evidence that the role survives. Verify against the stored
+        // history instead of a stale hint: assigning to a role whose defining
+        // event was removed would otherwise report Applied and silently
+        // disappear on replay (N43-L04). `check_pending` is stable under the
+        // buffer lock (`mark_roles_stale` flips both flags there); `marking`
+        // only means the mark is waiting for this lock, so the live store is
+        // still intact and a full membership publish is safe.
+        let rebuild_pending = self.roles_rebuild.dirty.load(Ordering::SeqCst)
             || self.roles_rebuild.running.load(Ordering::SeqCst);
+        let check_pending = rebuild_pending || self.roles_rebuild.marking.load(Ordering::SeqCst);
+        if check_pending && !self.role_definition_exists(role).await {
+            drop(buffer);
+            return RoleChange::Unknown;
+        }
         let (outcome, was_member) = self
             .mutate_roles(
+                &mut buffer,
                 super::BufferedRoleMutation::Assign {
                     pubkey: pubkey.to_string(),
                     role: role.to_string(),
                 },
                 |roles| {
                     let was_member = roles.assignments.contains_key(pubkey);
-                    let pending = self.roles_rebuild.dirty.load(Ordering::SeqCst)
-                        || self.roles_rebuild.running.load(Ordering::SeqCst);
-                    let known = roles.roles.contains_key(role)
-                        || (pending
-                            && self
-                                .roles_rebuild
-                                .revoked_roles
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                .contains(role));
+                    let known = roles.roles.contains_key(role) || check_pending;
                     if !known {
                         ((RoleChange::Unknown, was_member), false)
                     } else if roles
@@ -415,11 +479,6 @@ impl super::Relay {
                 },
             )
             .await;
-        // Re-read: a rebuild may have started between the pre-lock snapshot
-        // and the mutation (see `delete_role`).
-        rebuild_pending = rebuild_pending
-            || self.roles_rebuild.dirty.load(Ordering::SeqCst)
-            || self.roles_rebuild.running.load(Ordering::SeqCst);
         if outcome == RoleChange::Applied {
             // NIP-43's 8000 announces a *membership* change; granting a role
             // to an existing member only changes the 13534 list.
@@ -435,11 +494,13 @@ impl super::Relay {
                 // onto the rebuilt store; the next membership change
                 // republishes the full list.
                 if change.is_some() && !self.publish_add_user(pubkey).await {
+                    drop(buffer);
                     return RoleChange::Failed;
                 }
             } else {
                 self.schedule_roles_persist();
                 if !self.publish_membership(change).await {
+                    drop(buffer);
                     return RoleChange::Failed;
                 }
             }
@@ -449,12 +510,15 @@ impl super::Relay {
             // current state so the retry can complete the original call.
             if rebuild_pending {
                 if !self.publish_add_user(pubkey).await {
+                    drop(buffer);
                     return RoleChange::Failed;
                 }
             } else if !self.publish_membership(None).await {
+                drop(buffer);
                 return RoleChange::Failed;
             }
         }
+        drop(buffer);
         outcome
     }
 
@@ -466,11 +530,14 @@ impl super::Relay {
         // cannot be confirmed, but must still be buffered or the rebuild
         // resurrects the assignment from the surviving membership events
         // (B-5), and the full member list must not be published from the
-        // revoked store.
-        let mut rebuild_pending = self.roles_rebuild.dirty.load(Ordering::SeqCst)
+        // revoked store. The buffer lock is held through the publish
+        // (N43-M01); `pending` is stable under it.
+        let mut buffer = self.roles_rebuild.buffer.lock().await;
+        let rebuild_pending = self.roles_rebuild.dirty.load(Ordering::SeqCst)
             || self.roles_rebuild.running.load(Ordering::SeqCst);
         let (outcome, is_member) = self
             .mutate_roles(
+                &mut buffer,
                 super::BufferedRoleMutation::Unassign {
                     pubkey: pubkey.to_string(),
                     role: role.to_string(),
@@ -478,15 +545,10 @@ impl super::Relay {
                 |roles| {
                     let revoked = roles.unassign(pubkey, role);
                     let is_member = roles.assignments.contains_key(pubkey);
-                    // Re-read inside the mutation (under the write lock): see
-                    // `delete_role` for why the pre-lock snapshot is not
-                    // enough.
-                    let pending = self.roles_rebuild.dirty.load(Ordering::SeqCst)
-                        || self.roles_rebuild.running.load(Ordering::SeqCst);
                     // Revoking an absent grant (or an unknown role) is a
                     // no-op success, per NIP-86's always-`true`; with a
                     // rebuild pending the revocation is buffered instead.
-                    if revoked || pending {
+                    if revoked || rebuild_pending {
                         ((RoleChange::Applied, is_member), true)
                     } else {
                         ((RoleChange::Noop, is_member), false)
@@ -494,11 +556,6 @@ impl super::Relay {
                 },
             )
             .await;
-        // Re-read: the rebuild may have started between the snapshot above
-        // and the mutation (see `apply_leave_request`).
-        rebuild_pending = rebuild_pending
-            || self.roles_rebuild.dirty.load(Ordering::SeqCst)
-            || self.roles_rebuild.running.load(Ordering::SeqCst);
         if outcome == RoleChange::Applied {
             if rebuild_pending {
                 // The live store is revoked: the full member list cannot be
@@ -507,6 +564,7 @@ impl super::Relay {
                 // revocation with a remove-user event alone; the buffered
                 // replay keeps the grant out of the rebuilt list.
                 if !self.publish_remove_user(pubkey).await {
+                    drop(buffer);
                     return RoleChange::Failed;
                 }
             } else {
@@ -515,6 +573,7 @@ impl super::Relay {
                 // of several roles only changes the 13534 list.
                 let change = (!is_member).then(|| (false, pubkey.to_string()));
                 if !self.publish_membership(change).await {
+                    drop(buffer);
                     return RoleChange::Failed;
                 }
             }
@@ -523,12 +582,15 @@ impl super::Relay {
             // memory but failed to publish must republish the membership.
             if rebuild_pending {
                 if !self.publish_remove_user(pubkey).await {
+                    drop(buffer);
                     return RoleChange::Failed;
                 }
             } else if !self.publish_membership(None).await {
+                drop(buffer);
                 return RoleChange::Failed;
             }
         }
+        drop(buffer);
         outcome
     }
 
@@ -547,8 +609,10 @@ impl super::Relay {
         }
         // A duplicate code is a no-op success; the snapshot is still
         // written through below to confirm that it is durably present.
+        let mut buffer = self.roles_rebuild.buffer.lock().await;
         let _ = self
             .mutate_roles(
+                &mut buffer,
                 super::BufferedRoleMutation::CreateClaim {
                     claim: claim.to_string(),
                 },
@@ -558,6 +622,7 @@ impl super::Relay {
                 },
             )
             .await;
+        drop(buffer);
         match self.persist_roles_outcome().await {
             super::PersistOutcome::Failed => {
                 // Keep the debounced retry armed for a transient database
@@ -585,17 +650,19 @@ impl super::Relay {
         if !self.config.read().await.nip_enabled(43) || self.key.is_none() {
             return Err(ClaimRejection::Unavailable);
         }
+        let mut buffer = self.roles_rebuild.buffer.lock().await;
         let _ = self
             .mutate_roles(
+                &mut buffer,
                 super::BufferedRoleMutation::DeleteClaim {
                     claim: claim.to_string(),
                 },
                 |roles| {
                     let removed = roles.remove_claim(claim);
-                    // Re-read inside the mutation (see `delete_role`): a
-                    // deleteclaim during a rebuild must be buffered too, or a
-                    // createclaim buffered earlier for the same code would
-                    // re-add it when the replay runs (B-5).
+                    // A deleteclaim during a rebuild must be buffered too, or
+                    // a createclaim buffered earlier for the same code would
+                    // re-add it when the replay runs (B-5). `dirty` is stable
+                    // under the buffer lock.
                     let pending = self.roles_rebuild.dirty.load(Ordering::SeqCst)
                         || self.roles_rebuild.running.load(Ordering::SeqCst);
                     if removed || pending {
@@ -606,6 +673,7 @@ impl super::Relay {
                 },
             )
             .await;
+        drop(buffer);
         match self.persist_roles_outcome().await {
             super::PersistOutcome::Failed => {
                 self.schedule_roles_persist();
@@ -650,14 +718,18 @@ impl super::Relay {
         // A rebuild revokes the live store. Accepting a join then would
         // either replay against the cap and be dropped after a welcome
         // (L-4) or disappear with a failed rebuild; a retryable refusal is
-        // the honest answer.
+        // the honest answer. The flag is read under the buffer lock so a
+        // concurrent mark cannot revoke between the check and the apply.
+        let mut buffer = self.roles_rebuild.buffer.lock().await;
         if self.roles_rebuild.dirty.load(Ordering::SeqCst)
             || self.roles_rebuild.running.load(Ordering::SeqCst)
         {
+            drop(buffer);
             return Admission::Unavailable;
         }
         let (outcome, added) = self
             .mutate_roles(
+                &mut buffer,
                 super::BufferedRoleMutation::AdmitMember {
                     pubkey: pubkey.to_string(),
                 },
@@ -672,6 +744,7 @@ impl super::Relay {
                 },
             )
             .await;
+        drop(buffer);
         // NIP-43 join-vanish TOCTOU: a VANISH commits the marker before it
         // drops the vanished key's roles. Re-check after the live mutation;
         // if the marker landed first, roll the admission back. If it lands
@@ -707,26 +780,41 @@ impl super::Relay {
             }
             Some(false) => {}
         }
-        // The DB round-trip above is long enough for a rebuild to start
-        // after the pre-check. Re-check now: publishing the revoked
-        // store's list would store a partial 13534 (M-2).
-        if self.roles_rebuild.dirty.load(Ordering::SeqCst)
-            || self.roles_rebuild.running.load(Ordering::SeqCst)
-        {
-            if added {
-                self.rollback_admission(pubkey).await;
-            }
-            return Admission::Unavailable;
-        }
+        // The DB round-trip above is long enough for a rebuild to start after
+        // the pre-check. Re-check and publish under the buffer lock: a mark
+        // that runs in between would revoke the member and the admission
+        // would be lost after a welcome. If the rebuild indicator flips while
+        // the publish runs, roll the admission back and report a retryable
+        // refusal instead of a false success.
         if added {
-            self.schedule_roles_persist();
-            // A failed republish is logged, not fatal: the membership is
-            // recorded and the next change republishes the full list (same
-            // contract as the leave path).
-            if !self
-                .publish_membership(Some((true, pubkey.to_string())))
-                .await
+            let buffer = self.roles_rebuild.buffer.lock().await;
+            if self.roles_rebuild.dirty.load(Ordering::SeqCst)
+                || self.roles_rebuild.running.load(Ordering::SeqCst)
             {
+                drop(buffer);
+                self.rollback_admission(pubkey).await;
+                return Admission::Unavailable;
+            }
+            self.schedule_roles_persist();
+            let published = self
+                .publish_membership(Some((true, pubkey.to_string())))
+                .await;
+            let pending = self.roles_rebuild.dirty.load(Ordering::SeqCst)
+                || self.roles_rebuild.running.load(Ordering::SeqCst);
+            drop(buffer);
+            if pending {
+                // A rebuild started while the list was being published: the
+                // revoked store replaces the live membership, and without a
+                // capture the admitted key would disappear after the scan.
+                // Capture the removal and refuse the welcome so the client
+                // can retry against the rebuilt state.
+                self.rollback_admission(pubkey).await;
+                return Admission::Unavailable;
+            }
+            if !published {
+                // A clean transient publish failure: the membership is
+                // recorded and the next change republishes the full list
+                // (same contract as the leave path).
                 log::warn!(
                     "admit_member: the membership list could not be republished; {pubkey} may be missing from kind 13534 until the next change"
                 );
@@ -740,24 +828,25 @@ impl super::Relay {
     /// [`Self::apply_leave_request`] while a rebuild is pending, so the
     /// removal replays onto the rebuilt store instead of being resurrected.
     async fn rollback_admission(&self, pubkey: &str) -> bool {
-        let mut rebuild_pending = self.roles_rebuild.dirty.load(Ordering::SeqCst)
+        let mut buffer = self.roles_rebuild.buffer.lock().await;
+        let rebuild_pending = self.roles_rebuild.dirty.load(Ordering::SeqCst)
             || self.roles_rebuild.running.load(Ordering::SeqCst);
         let removed = self
             .mutate_roles(
+                &mut buffer,
                 super::BufferedRoleMutation::RemovePubkey {
                     pubkey: pubkey.to_string(),
                 },
                 |roles| {
                     let removed = roles.remove_pubkey(pubkey);
-                    let pending = self.roles_rebuild.dirty.load(Ordering::SeqCst)
-                        || self.roles_rebuild.running.load(Ordering::SeqCst);
-                    (removed, removed || pending)
+                    (removed, removed || rebuild_pending)
                 },
             )
             .await;
-        rebuild_pending = rebuild_pending
-            || self.roles_rebuild.dirty.load(Ordering::SeqCst)
-            || self.roles_rebuild.running.load(Ordering::SeqCst);
+        // The rollback must survive a rebuild that raced it even though the
+        // admission itself left no replayable record (see the vanish path).
+        super::buffer_pubkey_removal(&mut buffer, &self.roles_rebuild, pubkey);
+        drop(buffer);
         if removed && !rebuild_pending {
             self.schedule_roles_persist();
         }
@@ -776,39 +865,25 @@ impl super::Relay {
         // failure to report and retry: force-buffer the removal while a
         // rebuild is pending (`dirty` covers mark-to-scan-start, `running`
         // covers scan-start-to-worker-exit, with no gap: `dirty` is stored
-        // before the store is revoked). The replay applies it to the fresh
-        // store (a no-op when the member is absent).
+        // under the buffer lock before the store is revoked). The replay
+        // applies it to the fresh store (a no-op when the member is absent).
+        // The lock is held through the publish so the mark cannot revoke
+        // between the apply and the announcement (N43-M01).
+        let mut buffer = self.roles_rebuild.buffer.lock().await;
         let rebuild_pending = self.roles_rebuild.dirty.load(Ordering::SeqCst)
             || self.roles_rebuild.running.load(Ordering::SeqCst);
         let removed = self
             .mutate_roles(
+                &mut buffer,
                 super::BufferedRoleMutation::RemovePubkey {
                     pubkey: event.pubkey.clone(),
                 },
                 |roles| {
                     let removed = roles.remove_pubkey(&event.pubkey);
-                    // Re-read inside the mutation (under the write lock),
-                    // not just from the pre-lock snapshot above: a rebuild
-                    // marked in between would otherwise be missed, and a
-                    // removal landing on the already-revoked empty store
-                    // would report "not a member" and never be buffered —
-                    // losing the leave while the rebuild resurrects the
-                    // member. Marking stores `dirty` before revoking under
-                    // the same write lock, so observing the revoked store
-                    // here implies observing the mark.
-                    let pending = self.roles_rebuild.dirty.load(Ordering::SeqCst)
-                        || self.roles_rebuild.running.load(Ordering::SeqCst);
-                    (removed, removed || pending)
+                    (removed, removed || rebuild_pending)
                 },
             )
             .await;
-        // Re-read: the rebuild may have started between the pre-lock
-        // snapshot and the mutation, in which case the departure was
-        // buffered for replay and is announced below like the
-        // snapshot-pending case.
-        let rebuild_pending = rebuild_pending
-            || self.roles_rebuild.dirty.load(Ordering::SeqCst)
-            || self.roles_rebuild.running.load(Ordering::SeqCst);
         if removed {
             self.schedule_roles_persist();
             // A failed republish would let the rebuild resurrect the
@@ -837,6 +912,12 @@ impl super::Relay {
                 );
             }
         }
+        // A leave has no stored event that carries it across a rebuild. If a
+        // rebuild started while the leave applied or published, capture the
+        // removal for the replay (N43-L01); outside that window the live
+        // store and its membership list are authoritative.
+        super::buffer_pubkey_removal(&mut buffer, &self.roles_rebuild, &event.pubkey);
+        drop(buffer);
     }
 
     /// Publishes only the add-user event for an admission applied while the
