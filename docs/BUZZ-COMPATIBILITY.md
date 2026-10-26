@@ -175,8 +175,9 @@ host, because Buzz signs the relay URL it uploads to.
   requested depth, bounded at 8,192 events and 1,000 rows per frontier query.
   Its bounds binding names the request `Host` authority, so a reverse proxy
   must preserve the original `Host`. A root that has already been tombstoned
-  is served as an empty (unbounded) thread, and the batch-wide access refresh
-  required by NIP-CW is not implemented. The legacy `depth_limit` path
+  is served as an empty (unbounded) thread. The thread-mode batch rechecks
+  its channel access after building the page and returns a retryable `503`
+  if access changed. The legacy `depth_limit` path
   intentionally has no signed bounds event (clients use the legacy short-page
   heuristic); it queries up to 1,000 direct replies per frontier (a complete
   same-second group can exceed that cap) and returns `413` when the DB

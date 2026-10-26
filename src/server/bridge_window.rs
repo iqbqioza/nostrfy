@@ -448,6 +448,19 @@ async fn channel_window(
     if let Some(bounds) = window_bounds(relay, &channel, cursor.as_ref(), has_more, next_cursor) {
         out.push(bounds);
     }
+    // Refresh access for the whole served page. A channel that became
+    // inaccessible while the scan ran must not release rows or bounds.
+    let still_visible = {
+        let groups = relay.groups.read().await;
+        groups.group(&channel).is_some() && groups.visible_kind(&channel, 9, Some(authed))
+    };
+    if !still_visible {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "group access changed; retry the query" })),
+        )
+            .into_response());
+    }
     Ok(out)
 }
 
@@ -892,6 +905,7 @@ async fn thread_mode_window(
         }
         frontier = next;
     }
+    drop(groups);
 
     let mut candidates: Vec<Event> = replies
         .into_iter()
@@ -941,12 +955,26 @@ async fn thread_mode_window(
         nip29::THREAD_WINDOW_BOUNDS,
         vec![
             vec!["d".to_string(), format!("tw:1:{binding}")],
-            vec!["h".to_string(), channel],
+            vec!["h".to_string(), channel.clone()],
             vec!["e".to_string(), root],
         ],
         content.to_string(),
     ) {
         out.push(bounds);
+    }
+    // NIP-CW requires the whole thread-mode batch to be access-checked
+    // again before it is released. A visibility change during the BFS must
+    // not return rows or a signed bounds event.
+    let still_visible = {
+        let groups = relay.groups.read().await;
+        groups.group(&channel).is_some() && groups.visible_kind(&channel, 9, Some(authed))
+    };
+    if !still_visible {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "group access changed; retry the query" })),
+        )
+            .into_response());
     }
     Ok(out)
 }
