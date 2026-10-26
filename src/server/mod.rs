@@ -784,6 +784,31 @@ async fn restore_role_state(relay: &Relay) -> Result<()> {
     }
     let (needs_rebuild, carried_claims) = match relay.db.load_roles().await {
         crate::db::LoadRolesOutcome::Loaded(snap) => {
+            let mut snap = snap;
+            // Vanish is permanent and may have happened while NIP-43 was
+            // disabled (no live role store) or during a role rebuild (the
+            // revoked store could not record the assignment removal). The
+            // snapshot itself predates that vanish, so filter it before
+            // restore; the event rebuild already applies the same filter.
+            if !snap.assignments.is_empty() {
+                let mut vanished = std::collections::HashSet::new();
+                if relay
+                    .db
+                    .vanish_pubkeys_each(|key| {
+                        vanished.insert(hex::encode(key));
+                        vanished.insert(hex::encode_upper(key));
+                    })
+                    .await
+                    .is_none()
+                {
+                    return Err(anyhow::anyhow!(
+                        "cannot read the vanished-pubkey list; refusing to restore the \
+                         NIP-43 role snapshot"
+                    ));
+                }
+                snap.assignments
+                    .retain(|pubkey, _| !vanished.contains(pubkey));
+            }
             let claims = snap.claims.clone();
             match (
                 relay.db.state_stamp().await,
@@ -843,6 +868,38 @@ async fn restore_role_state(relay: &Relay) -> Result<()> {
                  incomplete role store"
             ));
         }
+        // A keyless relay, or a relay whose signing key changed, finds no
+        // role-state events it can verify. Do not persist an empty snapshot
+        // over the previous one: that would permanently erase the
+        // assignments/claims the old key authored. The current key may still
+        // publish its synthetic roster below; leaving the snapshot in place
+        // is safe because its older generation makes the next startup reject
+        // it and retry the rebuild once the key is restored.
+        let rebuilt_empty = {
+            let store = relay.roles.read().await;
+            store.roles.is_empty() && store.assignments.is_empty()
+        };
+        if rebuilt_empty {
+            error!(
+                "NIP-43 role state rebuild found no role events for the current relay key; \
+                 keeping the previous snapshot instead of persisting an empty roster"
+            );
+            // Still publish the current key's (possibly synthetic-owner)
+            // roster so NIP-11/NIP-43 clients have a `self`-signed list; do
+            // not persist it, so the last snapshot (and any foreign events)
+            // remains available if the former key is restored.
+            relay.finish_startup_role_recovery();
+            if relay.relay_pubkey().is_some()
+                && relay.config.read().await.nip_enabled(43)
+                && !relay.publish_membership(None).await
+            {
+                log::warn!("could not republish the empty NIP-43 roster under the current key");
+            }
+            return Ok(());
+        }
+        // The startup rebuild is authoritative; release the recovery-pending
+        // flag so the publish/persist below can certify the fresh store.
+        relay.finish_startup_role_recovery();
         // The rebuilt store has no (or stale) published membership list:
         // republish it so NIP-43 clients see the current members (a
         // migrated database never had it). Publish before the snapshot
@@ -927,16 +984,6 @@ pub async fn run_server(
     // Make the config file path known to the relay so NIP-86 runtime
     // changes (relay name/description/icon) can be persisted to disk.
     *relay.config_path.write().await = Some(config_path.clone());
-    // The SIGHUP handler is registered early too (see above); the task can
-    // run as soon as the relay exists, before the long state restore.
-    let reload_task = tokio::spawn(reload_handler(
-        config_path,
-        relay.clone(),
-        relay.db.clone(),
-        relay.api_limit.clone(),
-        shutdown_rx.clone(),
-        hangup,
-    ));
     // Startup barrier: the database's synchronous recovery may have removed
     // a NIP-29/NIP-43 state event while resuming interrupted deletions. The
     // relay marks its derived stores stale here, before any snapshot is
@@ -971,6 +1018,20 @@ pub async fn run_server(
     // migration only when nothing usable was ever persisted (see
     // [`restore_role_state`]).
     restore_role_state(&relay).await?;
+
+    // Start the SIGHUP task only after the restored role/group state is
+    // authoritative. If it ran during the restore window, a reload could
+    // republish an empty 13534 from the not-yet-restored store and persist
+    // an empty role snapshot, permanently discarding NIP-43 assignments.
+    // The tokio signal driver buffers a SIGHUP delivered before this point.
+    let reload_task = tokio::spawn(reload_handler(
+        config_path,
+        relay.clone(),
+        relay.db.clone(),
+        relay.api_limit.clone(),
+        shutdown_rx.clone(),
+        hangup,
+    ));
 
     // NIP-IA: NIP-IA-aware clients (Buzz) treat a missing archived-identities
     // snapshot as an uncheckable archive state. nostrfy has no archive store
@@ -1072,9 +1133,8 @@ pub async fn run_server(
         });
         supervised.push(SupervisedTask { outer, inner });
     }
-    // Spawned before the startup work (see the top of `run_server`) and
-    // kept out of the abortable set so its second-signal escalation
-    // stays armed.
+    // Spawned after the state restore (see above) and kept out of the
+    // abortable set so its second-signal escalation stays armed.
     let mut tasks = Vec::new();
     {
         let shutdown = shutdown_rx.clone();

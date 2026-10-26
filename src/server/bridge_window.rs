@@ -178,11 +178,13 @@ fn parse_cursor(raw: &Value) -> Result<Option<(u64, String)>, Response> {
 }
 
 fn raw_limit(raw: &Value, default: usize, max: usize) -> usize {
+    // NIP-01 defines zero as "no events"; only a missing limit gets the
+    // window/thread default. A positive value is still capped.
     raw.get("limit")
         .and_then(Value::as_u64)
         .map(|value| value as usize)
         .unwrap_or(default)
-        .clamp(1, max)
+        .min(max)
 }
 
 /// Channel-mode window (NIP-CW §Channel-mode).
@@ -196,6 +198,9 @@ async fn channel_window(
     let channel = channel_id(raw)?;
     let cursor = parse_cursor(raw)?;
     let limit = raw_limit(raw, WINDOW_DEFAULT_LIMIT, WINDOW_MAX_LIMIT);
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
     let include_aux = raw.get("include_aux").and_then(Value::as_bool) == Some(true);
     let include_summaries = raw.get("include_summaries").and_then(Value::as_bool) == Some(true);
 
@@ -211,10 +216,22 @@ async fn channel_window(
         }
     }
 
-    let base_filter: Filter = serde_json::from_value(raw.clone())
+    let mut base_filter: Filter = serde_json::from_value(raw.clone())
         .map_err(|e| bad_request(&format!("invalid window filter: {e}")))?;
     if base_filter.too_many_members() || base_filter.invalid_tag_values() {
         return Err(bad_request("invalid window filter bounds"));
+    }
+    if !cfg.nip_enabled(50) {
+        base_filter.search = None;
+    }
+    if cfg.limits.max_api_search_bytes > 0
+        && let Some(search) = &base_filter.search
+        && search.len() > cfg.limits.max_api_search_bytes
+    {
+        return Err(bad_request(&format!(
+            "search exceeds the maximum of {} bytes",
+            cfg.limits.max_api_search_bytes
+        )));
     }
     let fetch = limit
         .saturating_mul(8)
@@ -225,6 +242,9 @@ async fn channel_window(
     let mut rows: Vec<Event> = Vec::with_capacity(limit);
     let mut page_cursor = cursor.clone();
     let mut last_scanned: Option<(u64, String)> = None;
+    // The published 39006 cursor must name a row the caller may see; using
+    // the last scanned row would disclose a hidden event's id/timestamp.
+    let mut last_visible: Option<(u64, String)> = None;
     let mut has_more = false;
     let mut rounds = 0usize;
     loop {
@@ -267,6 +287,7 @@ async fn channel_window(
             ) {
                 continue;
             }
+            last_visible = Some((event.created_at, event.id.clone()));
             if is_top_level(&event) {
                 eligible_this_round += 1;
                 if rows.len() < limit {
@@ -297,9 +318,9 @@ async fn channel_window(
         if rounds >= 4 {
             // The bounded over-fetch stopped early. There may still be older
             // rows, so hand the client a cursor rather than claiming
-            // exhaustion; an empty page can progress via the last scanned
+            // exhaustion; an empty page can progress via the last visible
             // candidate.
-            has_more = last_scanned.is_some();
+            has_more = last_visible.is_some();
             break;
         }
         // Advance strictly past the last candidate of this round. The next
@@ -314,7 +335,7 @@ async fn channel_window(
     let next_cursor = if has_more {
         rows.last()
             .map(|event| (event.created_at, event.id.clone()))
-            .or(last_scanned)
+            .or(last_visible)
     } else {
         None
     };
@@ -583,6 +604,9 @@ async fn thread_window(
         .unwrap_or(THREAD_DEPTH_DEFAULT)
         .min(THREAD_DEPTH_MAX);
     let limit = raw_limit(raw, THREAD_DEFAULT_LIMIT, THREAD_MAX_LIMIT);
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
     let include_aux = raw.get("include_aux").and_then(Value::as_bool) == Some(true);
     let cursor = thread_cursor(raw);
 

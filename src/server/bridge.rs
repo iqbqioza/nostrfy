@@ -78,40 +78,15 @@ fn unauthorized(message: &str) -> Response {
 
 /// NIP-98 `u` matching for the bridge.
 ///
-/// Buzz signs the absolute URL it requested. Behind a reverse proxy the
-/// configured `relay.public_url` is authoritative; a direct connection uses
-/// the request `Host`. Both are accepted as long as the path is exactly the
-/// bridge path, so a proxy that terminates TLS does not break auth.
-fn bridge_url_matches(
-    cfg: &crate::config::Config,
-    host_header: Option<&str>,
-    url: &str,
-    path: &str,
-) -> bool {
-    if nip98::matches_request_url(url, &cfg.relay_identity(), path, None) {
-        return true;
-    }
-    let Some((scheme, rest)) = url.split_once("://") else {
-        return false;
-    };
-    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
-        return false;
-    }
-    let rest = rest.split('#').next().unwrap_or(rest);
-    let (authority, signed_path) = rest.split_once('/').unwrap_or((rest, ""));
-    if authority.contains('@') || signed_path.is_empty() {
-        return false;
-    }
-    let signed_path = format!("/{signed_path}");
-    if signed_path != path {
-        return false;
-    }
-    let Some(host_header) = host_header else {
-        return false;
-    };
-    let signed_host = super::host_header_host(authority);
-    let request_host = super::host_header_host(host_header);
-    super::normalize_host(signed_host) == super::normalize_host(request_host)
+/// Buzz signs the absolute URL it requested. Only the configured relay
+/// identity is authoritative: comparing the signed authority with the
+/// request `Host` header would bind the token to an attacker-controlled
+/// value and let a captured authorization be replayed against another
+/// origin. Deployments behind a proxy must set `relay.public_url` to the
+/// externally visible origin; the direct `http://host:port` form is also
+/// covered by [`crate::nips::nip62::RelayIdentity::http_origin`].
+fn bridge_url_matches(cfg: &crate::config::Config, url: &str, path: &str) -> bool {
+    nip98::matches_request_url(url, &cfg.relay_identity(), path, None)
 }
 
 /// Verifies the NIP-98 authorization of a bridge request.
@@ -132,12 +107,9 @@ async fn authenticate(
         .and_then(|value| value.to_str().ok())
         .and_then(nip98::strip_nostr_scheme)
         .ok_or_else(|| unauthorized("auth-required: missing Nostr authorization"))?;
-    let host_header = headers
-        .get(header::HOST)
-        .and_then(|value| value.to_str().ok());
     let payload_hash = nip98::payload_sha256_hex(body);
     let verified = nip98::verify(encoded, None, true, Some(&payload_hash), method, |url| {
-        bridge_url_matches(cfg, host_header, url, path)
+        bridge_url_matches(cfg, url, path)
     })
     .ok_or_else(|| unauthorized("auth-required: verification failed"))?;
     if !relay.nip98_replay.accept(
@@ -212,7 +184,10 @@ pub(super) fn nip_cl_visible(filter: &Filter, event: &Event, groups: &nip29::Gro
     }
     if filter.tags.get("#d").is_some_and(|_| {
         filter.kinds.as_ref().is_some_and(|kinds| {
-            !kinds.is_empty() && kinds.iter().all(|kind| (39000..=39003).contains(kind))
+            !kinds.is_empty()
+                && kinds
+                    .iter()
+                    .all(|kind| (nip29::GROUP_META..=nip29::GROUP_PINS).contains(kind))
         })
     }) && values("#d")
     {

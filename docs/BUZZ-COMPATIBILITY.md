@@ -17,8 +17,11 @@ With `enabled_buzz = false` the relay keeps the pre-Buzz NIP-29 behavior:
 `9002` replaces the whole group metadata (Buzz mode makes it a partial
 update), `39002` carries bare `p` tags, the creator is the `admin` role,
 plain `9007` tags are not treated as initial metadata (use `9002`), and
-NIP-CL channel tags/guests/bots are ignored. This keeps ordinary NIP-29
-clients unaffected by the compatibility layer.
+NIP-CL channel tags/guests/bots are ignored. The exception is a group with
+Buzz provenance (a non-empty `channel_type` or a stored Buzz partial edit):
+it keeps the partial-edit privacy floor in live plain mode and replay, so
+a mode switch cannot expose its private messages. This keeps ordinary
+NIP-29 clients unaffected by the compatibility layer.
 - A relay signing key: set `relay.private_key` (64 hex chars, generated with
   `nostrfy genkey`). Buzz needs the relay's `kind:39000` metadata, system
   messages and membership notices, all signed by this key.
@@ -200,6 +203,12 @@ host, because Buzz signs the relay URL it uploads to.
   A plain-mode full `9002` that detaches a subgroup by omitting `parent` is
   replayed as a Buzz partial edit; use an explicit empty `["parent",""]` on
   a Buzz-origin channel if the detach must survive a mode-off rebuild.
+- The `buzz_metadata` provenance of a plain-origin group edited while Buzz
+  was enabled is snapshot-backed. A snapshot-less rebuild can infer Buzz
+  origin from `channel_type`/`visibility`, but not from a Buzz edit that
+  carried only ordinary fields (for example a name-only rename); such a
+  group falls back to plain whole-metadata replay and may lose its privacy
+  floor. Keep the snapshot if this transition matters.
 - A stored `9002` that turns LiveKit off is replayed with `emit=false`, so
   its empty `kind:39004` is not republished by a snapshot-less rebuild. The
   old participant list can remain until the room is reconfigured; the
@@ -228,6 +237,19 @@ host, because Buzz signs the relay URL it uploads to.
   window is capped at 2,000 events. Window/thread requests also cap their
   combined output at 20,000 events. A community with more than 512 channels
   may need to split its channel-list query.
+- Channel-window pagination can stall if one `created_at` second contains
+  more candidates than the bounded fetch. The legacy `depth_limit` thread
+  path also scans only the newest 1,000 direct replies per frontier, so
+  older replies behind that prefix are not returned. Split the timestamp
+  window (or use the channel-window path) for unusually dense bursts.
+- Aggregate `approximate` flags come from the raw database scan, before
+  visibility filtering. A filter dominated by hidden rows can therefore
+  report `approximate=true` with a small visible count; the count itself
+  never includes hidden rows.
+- NIP-29 and NIP-43 snapshots share one removal stamp. A group-state
+  removal or purge can invalidate the role snapshot, forcing a role rebuild
+  and dropping snapshot-only invite codes; role removals likewise invalidate
+  the group snapshot. The events remain the source of truth.
 - NIP-77 negentropy sync returns ids/timestamps without applying the
   per-pubkey gate to `44100`/`44101`/`30622`; an anonymous syncer can learn
   that those events exist, while REQ/COUNT still withhold their content.

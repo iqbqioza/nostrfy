@@ -156,16 +156,17 @@ pub(crate) fn apply_plain_create_privacy(group: &mut Group, event: &Event) {
 /// NIP-29's original whole-metadata semantics for `9002`/`9007`: fields
 /// absent from the event are cleared. Buzz-only settings are kept so a plain
 /// NIP-29 edit does not erase state that only another Buzz client can see or
-/// change. A Buzz-created channel replayed in plain mode (`buzz_origin`)
-/// instead treats a stored edit as the partial edit it was, so a mode-off
-/// rebuild does not lose its privacy or metadata.
+/// change. A Buzz-origin group (`channel_type` or a persisted Buzz metadata
+/// edit) instead treats the edit as partial even when the compatibility
+/// layer is disabled, so a mode-off live edit or rebuild cannot clear its
+/// privacy or metadata.
 fn apply_nip29_settings(group: &mut Group, event: &Event, history: bool) {
     let old = group.settings.clone();
-    // A Buzz-created channel always carries a channel_type. On a plain-mode
-    // history replay, a stored partial 9002 (which omits the privacy tags)
-    // must not clear the privacy inherited from the create; a plain group
-    // has no channel_type and keeps the original whole-metadata semantics.
-    let buzz_origin = history && !group.channel_type.is_empty();
+    // A Buzz-created channel always carries a channel_type. A plain-origin
+    // group edited by Buzz carries `buzz_metadata`; both must keep the
+    // partial-edit privacy floor after Buzz is disabled. A genuinely plain
+    // group has neither and keeps the original whole-metadata semantics.
+    let buzz_origin = !group.channel_type.is_empty() || group.buzz_metadata;
     let mut settings = GroupSettings {
         topic: old.topic,
         purpose: old.purpose,
@@ -242,14 +243,14 @@ fn apply_nip29_settings(group: &mut Group, event: &Event, history: bool) {
             "join_role" if buzz_origin => {
                 settings.join_role = value.filter(|v| !v.is_empty()).map(str::to_string)
             }
-            // NIP-CL privacy is only changed during history replay. A
-            // Buzz-created private channel has no NIP-29 `private` tag;
-            // turning Buzz off and then rebuilding from events must not
-            // make its stored messages world-readable. On a plain group,
-            // only `visibility=private` is honored as a privacy floor; on a
-            // Buzz-origin group, `visibility=open` is a stored transition
-            // and clears the Buzz privacy.
-            "visibility" if history => match value {
+            // A Buzz-created private channel has no NIP-29 `private` tag;
+            // turning Buzz off must not make its stored messages
+            // world-readable, whether the edit is live or replayed. On a
+            // plain group, only `visibility=private` is honored as a
+            // history privacy floor; on a Buzz-origin group,
+            // `visibility=open` is the explicit transition that clears the
+            // Buzz privacy.
+            "visibility" if buzz_origin || history => match value {
                 Some("private") => {
                     settings.private = true;
                     settings.restricted = true;

@@ -4281,6 +4281,18 @@ impl Relay {
         if more {
             return false;
         }
+        let owners: std::collections::HashSet<String> = self
+            .relay_owner_members()
+            .await
+            .into_iter()
+            .map(|pubkey| pubkey.to_ascii_lowercase())
+            .collect();
+        let allowlisted: std::collections::HashSet<String> = self
+            .allowlisted_members()
+            .await
+            .into_iter()
+            .map(|pubkey| pubkey.to_ascii_lowercase())
+            .collect();
         let roles = self.roles.read().await;
         for event in events {
             if event.pubkey.eq_ignore_ascii_case(relay_pubkey) {
@@ -4315,11 +4327,36 @@ impl Relay {
                         if tag.len() < 2 || tag[0] != "member" {
                             continue;
                         }
-                        let Some(assigned) = roles.assignments.get(&tag[1]) else {
-                            return false;
-                        };
-                        if !tag[2..].iter().all(|role| assigned.contains(role)) {
-                            return false;
+                        let roles_in_tag: Vec<&str> = tag[2..]
+                            .iter()
+                            .map(String::as_str)
+                            .filter(|role| !role.is_empty())
+                            .collect();
+                        if let Some(assigned) = roles.assignments.get(&tag[1]) {
+                            if !roles_in_tag
+                                .iter()
+                                .all(|role| assigned.iter().any(|assigned| assigned == role))
+                            {
+                                return false;
+                            }
+                        } else {
+                            let pubkey = tag[1].to_ascii_lowercase();
+                            let synthetic_owner =
+                                roles_in_tag.as_slice() == ["owner"] && owners.contains(&pubkey);
+                            let synthetic_allowlist =
+                                roles_in_tag.is_empty() && allowlisted.contains(&pubkey);
+                            // `membership_event` injects these entries from
+                            // the current owner identities/allowlist. They
+                            // have no role assignment, so requiring one made
+                            // every production roster fail this coverage
+                            // check and kept the former key's events forever.
+                            // Only current synthetic entries count: an old
+                            // owner/member removed from config stays
+                            // uncovered, so the cleanup keeps the former
+                            // events rather than guessing.
+                            if !synthetic_owner && !synthetic_allowlist {
+                                return false;
+                            }
                         }
                     }
                 }
@@ -5044,10 +5081,17 @@ impl Relay {
         }
         if state_removed.role {
             log::warn!(
-                "startup recovery removed a NIP-43 role-state event; rebuilding the role \
-                 state from the surviving events"
+                "startup recovery removed a NIP-43 role-state event; deferring the role \
+                 rebuild until the startup snapshot restore has loaded the invite claims"
             );
-            self.mark_roles_stale().await;
+            // Do not call `mark_roles_stale` here: that revokes the live
+            // store and schedules a worker while the snapshot (and its
+            // snapshot-only invite claims) is still unloaded. The startup
+            // `restore_role_state` sees the advanced state generation,
+            // rejects the stale snapshot, carries the claims across, and
+            // owns the rebuild. The dirty flag keeps `persist_roles` from
+            // certifying the empty pre-restore store.
+            self.roles_rebuild.dirty.store(true, Ordering::SeqCst);
         }
     }
 
@@ -5061,6 +5105,14 @@ impl Relay {
     /// Role-side counterpart of [`Self::begin_group_derived`].
     pub(crate) fn begin_role_derived(&self) -> impl Drop + '_ {
         self.roles_rebuild.derived.begin()
+    }
+
+    /// Releases the NIP-43 recovery-pending flag after the startup
+    /// `restore_role_state` has rebuilt the authoritative store. The rebuild
+    /// is synchronous and happens before the server accepts traffic, so no
+    /// coalesced worker owns the state here.
+    pub(crate) fn finish_startup_role_recovery(&self) {
+        self.roles_rebuild.dirty.store(false, Ordering::SeqCst);
     }
 
     /// Releases the startup recovery gate after `startup_group_state` has
@@ -5285,7 +5337,9 @@ impl Relay {
             }
         }
         // NIP-43 role assignments hold pubkeys too: a vanished author must
-        // not keep its roles.
+        // not keep its roles. Force-buffer the removal while a rebuild owns
+        // the revoked empty store, exactly like a leave request; otherwise
+        // the rebuilt member list would resurrect the assignment.
         if nip43_enabled {
             role_changed = self
                 .mutate_roles(
@@ -5294,7 +5348,9 @@ impl Relay {
                     },
                     |roles| {
                         let changed = roles.assignments.remove(&pubkey_hex).is_some();
-                        (changed, changed)
+                        let pending = self.roles_rebuild.dirty.load(Ordering::SeqCst)
+                            || self.roles_rebuild.running.load(Ordering::SeqCst);
+                        (changed, changed || pending)
                     },
                 )
                 .await;
@@ -5365,6 +5421,19 @@ impl Relay {
         }
         drop(roles_in_flight);
         if nip43_enabled && role_changed {
+            let pending = self.roles_rebuild.dirty.load(Ordering::SeqCst)
+                || self.roles_rebuild.running.load(Ordering::SeqCst);
+            let published = if pending {
+                // The live store is revoked; publishing its empty full list
+                // would overwrite the last good 13534. A remove-user event
+                // announces the vanish now; the rebuild restores the rest.
+                self.publish_remove_user(&pubkey_hex).await
+            } else {
+                self.publish_membership(None).await
+            };
+            if !published {
+                log::warn!("could not republish the NIP-43 roster after a vanish");
+            }
             self.schedule_roles_persist();
         }
         true

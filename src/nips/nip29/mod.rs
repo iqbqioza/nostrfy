@@ -310,6 +310,14 @@ pub struct Group {
     /// NIP-CL labels (the `t` tags after the channel type).
     #[serde(default)]
     pub labels: Vec<String>,
+    /// A Buzz client applied a partial `9002` to this group. Once Buzz is
+    /// disabled, a stored partial edit must still be replayed (and a live
+    /// edit treated) as partial for privacy: its omitted tags were never
+    /// meant to clear `private`/`hidden`. Snapshots persist this; a
+    /// snapshot-less rebuild that has no marker can only infer Buzz origin
+    /// from `channel_type`/`visibility`.
+    #[serde(default)]
+    pub buzz_metadata: bool,
     /// NIP-DV: pubkeys that hid this DM from their own sidebar. This is
     /// per-viewer presentation state, distinct from `settings.hidden`
     /// (which withholds a DM/system channel's metadata from non-members).
@@ -1700,6 +1708,15 @@ impl GroupStore {
                 }
             }
             9002 => {
+                // A Buzz client sends partial metadata. Persist that
+                // provenance so turning Buzz off later cannot reinterpret
+                // the stored event as a whole-metadata replacement and
+                // clear the group's privacy flags.
+                if self.buzz_enabled
+                    && let Some(group) = self.groups.get_mut(gid)
+                {
+                    group.buzz_metadata = true;
+                }
                 // Re-check the graph invariants under the write lock: two
                 // concurrent 9002 edits can each pass the read-side
                 // validation against the same state and then interleave
@@ -1764,13 +1781,12 @@ impl GroupStore {
                 // `child` tag leaves that link unchanged. Plain NIP-29's
                 // whole-metadata edit keeps the pre-Buzz behavior: an absent
                 // `parent` detaches and an absent child list clears it. A
-                // Buzz-origin channel replayed while Buzz is off follows the
-                // stored partial semantics too.
+                // Buzz-origin channel follows the stored partial semantics
+                // even while Buzz is off, for both live edits and replay.
                 let partial_links = self.buzz_enabled
-                    || (history_replay
-                        && group_snapshot
-                            .as_ref()
-                            .is_some_and(|group| !group.channel_type.is_empty()));
+                    || group_snapshot
+                        .as_ref()
+                        .is_some_and(|group| !group.channel_type.is_empty() || group.buzz_metadata);
                 // A valueless tag is malformed, not evidence that the field
                 // was supplied. An explicit empty value (`["parent", ""]`)
                 // is the Buzz-partial way to request a detach.
@@ -2103,6 +2119,7 @@ impl GroupStore {
                         creator: Some(event.pubkey.clone()),
                         created_at: Some(event.created_at),
                         channel_type: group_channel_type,
+                        buzz_metadata: self.buzz_enabled,
                         ..Group::default()
                     };
                     // Buzz's kind:9007 carries the NIP-CL visibility,
@@ -2143,6 +2160,7 @@ impl GroupStore {
                             // topic, labels, DM defaults, ...) on a mode-off
                             // rebuild. A plain create has no channel_type,
                             // so its tags stay ignored as before.
+                            group.buzz_metadata = true;
                             apply_settings(&mut group, event, true, history_replay);
                         }
                     }
@@ -3447,7 +3465,9 @@ fn validate_edit_metadata(
             .tags
             .iter()
             .any(|tag| tag.len() >= 2 && tag[0] == "child");
-        let partial_children = store.buzz_enabled && !has_child_tags;
+        let partial_children =
+            (store.buzz_enabled || group.buzz_metadata || !group.channel_type.is_empty())
+                && !has_child_tags;
         if !partial_children {
             let children: HashSet<&str> = tag_values(event, "child").collect();
             if !group.children.iter().all(|c| children.contains(c.as_str())) {

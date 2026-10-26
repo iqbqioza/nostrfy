@@ -5790,3 +5790,119 @@ fn join_mirror_is_stamped_at_the_join_time() {
             .any(|tag| tag == &vec!["role".to_string(), "guest".to_string()])
     );
 }
+
+#[test]
+fn buzz_created_private_channel_keeps_privacy_after_mode_off() {
+    let mut store = GroupStore {
+        buzz_enabled: true,
+        ..GroupStore::default()
+    };
+    let now = 1_600_000_000;
+    store.apply(
+        &event(
+            CREATE_GROUP,
+            ADMIN,
+            Some("dm"),
+            vec![
+                vec!["channel_type".into(), "dm".into()],
+                vec!["visibility".into(), "private".into()],
+            ],
+        ),
+        "relay",
+        now,
+        false,
+        false,
+    );
+    assert!(store.group("dm").unwrap().settings.private);
+    assert!(store.group("dm").unwrap().settings.hidden);
+
+    store.buzz_enabled = false;
+    let rename = event(
+        9002,
+        ADMIN,
+        Some("dm"),
+        vec![vec!["name".into(), "renamed".into()]],
+    );
+    store.apply(&rename, "relay", now + 1, true, false);
+    let group = store.group("dm").unwrap();
+    assert!(
+        group.settings.private,
+        "a live plain edit must keep the Buzz channel's privacy floor"
+    );
+    assert!(
+        group.settings.hidden,
+        "a live plain edit must not expose DM metadata"
+    );
+    assert_eq!(group.settings.name, "renamed");
+}
+
+#[test]
+fn plain_group_edited_by_buzz_keeps_privacy_after_mode_off() {
+    let mut store = GroupStore::default();
+    let now = 1_600_000_000;
+    store.apply(
+        &event(CREATE_GROUP, ADMIN, Some("g1"), vec![]),
+        "relay",
+        now,
+        false,
+        false,
+    );
+    store.apply(
+        &event(9002, ADMIN, Some("g1"), vec![vec!["private".into()]]),
+        "relay",
+        now + 1,
+        false,
+        false,
+    );
+    assert!(store.group("g1").unwrap().settings.private);
+
+    // A Buzz client applies the partial rename; remember its provenance.
+    store.buzz_enabled = true;
+    store.apply(
+        &event(
+            9002,
+            ADMIN,
+            Some("g1"),
+            vec![vec!["name".into(), "buzz name".into()]],
+        ),
+        "relay",
+        now + 2,
+        false,
+        false,
+    );
+    assert!(store.group("g1").unwrap().buzz_metadata);
+    assert!(store.group("g1").unwrap().settings.private);
+
+    store.buzz_enabled = false;
+    store.apply(
+        &event(
+            9002,
+            ADMIN,
+            Some("g1"),
+            vec![vec!["name".into(), "plain name".into()]],
+        ),
+        "relay",
+        now + 3,
+        false,
+        false,
+    );
+    assert!(
+        store.group("g1").unwrap().settings.private,
+        "the stored Buzz partial edit must keep its privacy floor"
+    );
+
+    // An explicit NIP-CL open transition is still the way to unprivate it.
+    store.apply(
+        &event(
+            9002,
+            ADMIN,
+            Some("g1"),
+            vec![vec!["visibility".into(), "open".into()]],
+        ),
+        "relay",
+        now + 4,
+        false,
+        false,
+    );
+    assert!(!store.group("g1").unwrap().settings.private);
+}

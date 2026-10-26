@@ -789,3 +789,21 @@ async fn legacy_thread_path_returns_the_subtree_in_ascending_order() {
     assert_eq!(contents, vec!["reply", "nested"]);
     relay.db.shutdown();
 }
+
+#[test]
+fn bridge_url_matches_only_the_configured_relay_identity() {
+    let mut cfg = Config::default();
+    cfg.relay.public_url = "wss://relay.example.com".into();
+    assert!(
+        super::bridge_url_matches(&cfg, "https://relay.example.com/query", "/query"),
+        "the configured public origin must authorize the bridge"
+    );
+    assert!(
+        !super::bridge_url_matches(&cfg, "https://other.example/query", "/query"),
+        "a captured token for another origin must not become valid just by changing Host"
+    );
+    assert!(
+        !super::bridge_url_matches(&cfg, "https://relay.example.com.evil/query", "/query"),
+        "the authority must match exactly"
+    );
+}

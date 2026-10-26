@@ -939,7 +939,7 @@ impl super::Relay {
     /// Publishes only the remove-user event for a departure applied while
     /// the live store is revoked (see [`Self::apply_leave_request`]): the
     /// full member list cannot be published from the empty store.
-    async fn publish_remove_user(&self, pubkey: &str) -> bool {
+    pub(crate) async fn publish_remove_user(&self, pubkey: &str) -> bool {
         let Some(relay_pubkey) = self.relay_pubkey() else {
             return false;
         };
