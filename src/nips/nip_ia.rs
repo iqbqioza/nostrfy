@@ -72,9 +72,44 @@ pub fn delta(
 }
 
 /// Verifies the request-borne NIP-OA owner-of-agent path. Returns the owner
-/// pubkey that consented when the single `auth` tag is valid. The published
-/// profile-attestation path is intentionally not implemented.
+/// pubkey that consented when the single `auth` tag is valid.
 pub(crate) fn verify_owner_agent_request(event: &Event, target: &str) -> Option<String> {
+    let (owner, conditions, signature) = auth_tag(event)?;
+    if !owner.eq_ignore_ascii_case(&event.pubkey)
+        || target.eq_ignore_ascii_case(&owner)
+        || !owner_conditions_allow(conditions, event.created_at)
+    {
+        return None;
+    }
+    verify_owner_signature(&owner, target, conditions, signature).then_some(owner)
+}
+
+/// Verifies the published-profile NIP-OA attestation path: the target's
+/// latest kind:0 carries a standing owner authorization. Conditions are
+/// syntax-checked but deliberately not evaluated (they describe the profile,
+/// not the archive request).
+pub(crate) fn verify_owner_agent_profile(
+    profile: &Event,
+    target: &str,
+    expected_owner: &str,
+) -> Option<String> {
+    if profile.kind != 0
+        || !profile.pubkey.eq_ignore_ascii_case(target)
+        || crate::nips::nip01::verify(profile).is_err()
+    {
+        return None;
+    }
+    let (owner, conditions, signature) = auth_tag(profile)?;
+    if !owner.eq_ignore_ascii_case(expected_owner)
+        || target.eq_ignore_ascii_case(&owner)
+        || !owner_conditions_syntax(conditions)
+    {
+        return None;
+    }
+    verify_owner_signature(&owner, target, conditions, signature).then_some(owner)
+}
+
+fn auth_tag(event: &Event) -> Option<(String, &str, &str)> {
     let mut auth = event
         .tags
         .iter()
@@ -84,37 +119,63 @@ pub(crate) fn verify_owner_agent_request(event: &Event, target: &str) -> Option<
         return None;
     }
     let owner = tag[1].to_ascii_lowercase();
-    if owner.len() != 64
-        || !owner.bytes().all(|byte| byte.is_ascii_hexdigit())
-        || !owner.eq_ignore_ascii_case(&event.pubkey)
-        || target.eq_ignore_ascii_case(&owner)
-    {
+    if owner.len() != 64 || !owner.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return None;
     }
-    let conditions = tag[2].as_str();
-    if !owner_conditions_allow(conditions, event.created_at) {
-        return None;
-    }
-    let owner_bytes: [u8; 32] = hex::decode(&owner).ok()?.try_into().ok()?;
-    let sig_bytes: [u8; 64] = hex::decode(&tag[3]).ok()?.try_into().ok()?;
-    let pk = secp256k1::XOnlyPublicKey::from_byte_array(owner_bytes).ok()?;
+    Some((owner, tag[2].as_str(), tag[3].as_str()))
+}
+
+fn verify_owner_signature(owner: &str, target: &str, conditions: &str, signature: &str) -> bool {
+    let Ok(owner_bytes) = hex::decode(owner) else {
+        return false;
+    };
+    let Ok(owner_bytes): Result<[u8; 32], _> = owner_bytes.try_into() else {
+        return false;
+    };
+    let Ok(sig_bytes) = hex::decode(signature) else {
+        return false;
+    };
+    let Ok(sig_bytes): Result<[u8; 64], _> = sig_bytes.try_into() else {
+        return false;
+    };
+    let Ok(pk) = secp256k1::XOnlyPublicKey::from_byte_array(owner_bytes) else {
+        return false;
+    };
     let signature = Signature::from_byte_array(sig_bytes);
     let preimage = format!("nostr:agent-auth:{target}:{conditions}");
     let message: [u8; 32] = Sha256::digest(preimage.as_bytes()).into();
-    secp256k1::schnorr::verify(&signature, &message, &pk)
-        .is_ok()
-        .then_some(owner)
+    secp256k1::schnorr::verify(&signature, &message, &pk).is_ok()
 }
 
-/// NIP-OA time clauses for the request-borne path. `kind=` is syntax-checked
-/// but does not restrict an NIP-IA identity binding.
-fn owner_conditions_allow(conditions: &str, created_at: u64) -> bool {
+fn owner_conditions_syntax(conditions: &str) -> bool {
     for clause in conditions.split('&').filter(|clause| !clause.is_empty()) {
         if let Some(kind) = clause.strip_prefix("kind=") {
             if kind.is_empty() || !kind.bytes().all(|byte| byte.is_ascii_digit()) {
                 return false;
             }
         } else if let Some(value) = clause.strip_prefix("created_at<") {
+            if value.parse::<u64>().is_err() {
+                return false;
+            }
+        } else if let Some(value) = clause.strip_prefix("created_at>") {
+            if value.parse::<u64>().is_err() {
+                return false;
+            }
+        } else {
+            return false;
+        }
+    }
+    true
+}
+
+/// NIP-OA time clauses for the request-borne path. `kind=` is syntax-checked
+/// but does not restrict an NIP-IA identity binding.
+fn owner_conditions_allow(conditions: &str, created_at: u64) -> bool {
+    if !owner_conditions_syntax(conditions) {
+        return false;
+    }
+    for clause in conditions.split('&').filter(|clause| !clause.is_empty()) {
+        if let Some(value) = clause.strip_prefix("created_at<") {
             let Ok(value) = value.parse::<u64>() else {
                 return false;
             };
@@ -128,8 +189,6 @@ fn owner_conditions_allow(conditions: &str, created_at: u64) -> bool {
             if created_at <= value {
                 return false;
             }
-        } else {
-            return false;
         }
     }
     true

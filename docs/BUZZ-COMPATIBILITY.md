@@ -151,13 +151,14 @@ host, because Buzz signs the relay URL it uploads to.
 ## Known gaps
 
 - NIP-IA archive/unarchive requests (`kind:9035`/`9036`) are accepted from a
-  self-request, a relay owner/admin, or a request-borne NIP-OA
-  owner-of-agent proof, with NIP-70/freshness/tag validation. Accepted state
-  changes emit `kind:8002`/`8003` deltas and a fresh relay-signed
-  `kind:13535` snapshot, persisted in an additive `index_meta` key. The
-  published-profile NIP-OA attestation path is not implemented. Archive
-  state is visibility metadata only: history is not deleted and `13534`
-  membership is not rewritten.
+  self-request, a relay owner/admin, or either NIP-OA owner-of-agent path
+  (request-borne `auth` or the target's latest kind:0 profile attestation),
+  with NIP-70/freshness/tag validation. Accepted state changes emit
+  `kind:8002`/`8003` deltas and a fresh relay-signed `kind:13535` snapshot,
+  persisted in an additive `index_meta` key. Profile-attestation archives
+  include the marked `proof` e-tag on the delta. Archive state is visibility
+  metadata only: history is not deleted and `13534` membership is not
+  rewritten.
 - Channel `ttl` is enforced at read time for non-state channel content on
   WebSocket REQ/COUNT/live/NEG, the HTTP bridge and the REST API. Messages
   older than the group's TTL are hidden immediately, including after a TTL

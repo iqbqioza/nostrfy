@@ -7681,6 +7681,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn published_profile_attestation_can_archive_an_agent() {
+        let relay = build_relay_with_key(false, &"01".repeat(32)).await;
+        let owner = secp256k1::Keypair::from_secret_bytes([3u8; 32]).unwrap();
+        let agent = secp256k1::Keypair::from_secret_bytes([4u8; 32]).unwrap();
+        let owner_pk = secp256k1::XOnlyPublicKey::from_keypair(&owner)
+            .0
+            .to_string();
+        let agent_pk = secp256k1::XOnlyPublicKey::from_keypair(&agent)
+            .0
+            .to_string();
+        let conditions = "";
+        let preimage = format!("nostr:agent-auth:{agent_pk}:{conditions}");
+        use sha2::Digest as _;
+        let message: [u8; 32] = sha2::Sha256::digest(preimage.as_bytes()).into();
+        let auth_sig = secp256k1::schnorr::sign_no_aux_rand(&message, &owner).to_string();
+        let mut profile = crate::event::Event {
+            id: String::new(),
+            pubkey: agent_pk.clone(),
+            created_at: crate::util::unix_now(),
+            kind: 0,
+            tags: vec![vec![
+                "auth".into(),
+                owner_pk.clone(),
+                conditions.into(),
+                auth_sig,
+            ]],
+            content: "{}".into(),
+            sig: String::new(),
+        };
+        crate::nips::nip01::sign(&mut profile, &agent).unwrap();
+        relay.db.put(profile.clone(), crate::util::unix_now()).await;
+
+        let request = crate::event::Event {
+            id: "ef".repeat(32),
+            pubkey: owner_pk,
+            created_at: crate::util::unix_now(),
+            kind: 9035,
+            tags: vec![vec!["-".into()], vec!["p".into(), agent_pk.clone()]],
+            content: String::new(),
+            sig: String::new(),
+        };
+        relay
+            .apply_identity_archive(&request)
+            .await
+            .expect("profile attestation must authorize the archive");
+        assert!(relay.archive.read().await.contains(&agent_pk));
+        let filter: crate::filter::Filter =
+            serde_json::from_value(serde_json::json!({"kinds": [8002]})).unwrap();
+        let (deltas, _) = relay
+            .db
+            .query(vec![filter], 10, crate::util::unix_now())
+            .await;
+        assert_eq!(deltas.len(), 1);
+        assert!(deltas[0].tags.iter().any(|tag| {
+            tag.len() == 5 && tag[0] == "e" && tag[1] == profile.id && tag[3] == "proof"
+        }));
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
     async fn owner_can_archive_an_agent_with_nip_oa() {
         let relay = build_relay_with_key(false, &"01".repeat(32)).await;
         let owner = secp256k1::Keypair::from_secret_bytes([1u8; 32]).unwrap();

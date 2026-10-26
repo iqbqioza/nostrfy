@@ -321,11 +321,37 @@ impl super::Relay {
             .map(|tag| tag[1].as_str());
         let self_request = event.pubkey.eq_ignore_ascii_case(&target);
         let admin = self.is_relay_owner_or_admin(&event.pubkey).await;
-        let owner = if !self_request && !admin {
+        let mut owner = if !self_request && !admin {
             crate::nips::nip_ia::verify_owner_agent_request(event, &target)
         } else {
             None
         };
+        let mut proof_profile_id = None;
+        if !self_request && !admin && owner.is_none() {
+            // Published-profile attestation: use the target's latest kind:0.
+            let filter = crate::filter::Filter {
+                kinds: Some(vec![0]),
+                authors: Some(vec![target.clone()]),
+                limit: Some(1),
+                ..crate::filter::Filter::default()
+            };
+            let Some((profiles, _)) = self
+                .db
+                .query_full_startup(vec![filter], 1, unix_now(), false)
+                .await
+            else {
+                return Err("error: database unavailable".into());
+            };
+            if let Some(profile) = profiles
+                .iter()
+                .find(|profile| profile.pubkey.eq_ignore_ascii_case(&target))
+                && let Some(owner_pubkey) =
+                    crate::nips::nip_ia::verify_owner_agent_profile(profile, &target, &event.pubkey)
+            {
+                owner = Some(owner_pubkey);
+                proof_profile_id = profile.id_bytes().map(hex::encode);
+            }
+        }
         if !self_request && !admin && owner.is_none() {
             return Err(
                 "restricted: only the target, a relay admin or a proven agent owner may archive \
@@ -400,6 +426,15 @@ impl super::Relay {
             replaced_by.as_deref(),
             &event.content,
         );
+        if let Some(profile_id) = proof_profile_id {
+            delta.tags.push(vec![
+                "e".into(),
+                profile_id,
+                String::new(),
+                "proof".into(),
+                target.clone(),
+            ]);
+        }
         if self.store_relay_event(&mut delta).await.is_err()
             || !self.publish_archive_snapshot().await
         {
