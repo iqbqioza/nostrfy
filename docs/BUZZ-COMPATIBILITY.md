@@ -80,6 +80,9 @@ Bridge filters accept Buzz's extension fields in addition to NIP-01:
   thread summaries, and exactly one relay-signed `kind:39006` bounds event.
 - `depth_limit` (+ optional `thread_cursor` / `thread_cursor_id`) — the legacy
   thread-subtree path used by the thread panel.
+- `thread_window: true` + `#e` root + `kinds` — NIP-CW thread mode. Returns
+  the newest-first descendant page and exactly one request-bound
+  relay-signed `kind:39007` bounds event.
 
 `/query` applies the same visibility rules as an authenticated WebSocket
 connection: NIP-70 protected events, NIP-59 gift-wrap recipients, NIP-78
@@ -124,8 +127,8 @@ and publishes them:
   `response:{"channel_id":"..."}` in the OK message.
 
 Client submissions of the relay-signed kinds above (`40099`, `44100`/
-`44101`, `30622`, the query-time `39005`/`39006` overlays, and the NIP-IA
-`13535` snapshot) are rejected. `41010`/`41012` are client commands: they
+`44101`, `30622`, the query-time `39005`/`39006`/`39007` overlays, and the
+NIP-IA `13535` snapshot) are rejected. `41010`/`41012` are client commands: they
 are accepted, applied to the derived group state, and never stored as
 ordinary events.
 
@@ -168,12 +171,16 @@ host, because Buzz signs the relay URL it uploads to.
   `last_reply_at` and the 10 most recent participants. A larger tree, a
   hidden intermediate, or a frontier capped at the per-query 1,000-event
   bound can still undercount the summary.
-- The newer `thread_window:true` / `kind:39007` thread mode is not
-  implemented. The legacy `depth_limit` path intentionally has no signed
-  bounds event (clients use the legacy short-page heuristic). It queries up
-  to 1,000 direct replies per frontier (a complete same-second group can
-  exceed that cap); when the DB reports a truncated frontier it now returns
-  `413` instead of silently dropping older replies and descendants.
+- `thread_window:true` / `kind:39007` thread mode walks descendants to the
+  requested depth, bounded at 8,192 events and 1,000 rows per frontier query.
+  Its bounds binding names the request `Host` authority, so a reverse proxy
+  must preserve the original `Host`. A root that has already been tombstoned
+  is served as an empty (unbounded) thread, and the batch-wide access refresh
+  required by NIP-CW is not implemented. The legacy `depth_limit` path
+  intentionally has no signed bounds event (clients use the legacy short-page
+  heuristic); it queries up to 1,000 direct replies per frontier (a complete
+  same-second group can exceed that cap) and returns `413` when the DB
+  reports a truncated frontier instead of silently dropping older replies.
 - DM groups are derived state backed by the group snapshot: the synthetic
   `9007`/`9000` are not stored, so a snapshot-less full rebuild (new
   database, migration, or dropped snapshot) cannot recreate a DM channel.

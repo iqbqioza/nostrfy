@@ -14,6 +14,7 @@ use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::event::Event;
 use crate::filter::Filter;
@@ -54,11 +55,19 @@ pub(crate) async fn query_all(
     cfg: &crate::config::Config,
     authed: &str,
     raw_filters: &[Value],
+    host: &str,
 ) -> Result<Vec<Event>, Response> {
     let mut out = Vec::new();
     let mut ordinary = Vec::new();
     for raw in raw_filters {
-        if raw.get("top_level").and_then(Value::as_bool) == Some(true) {
+        if raw.get("thread_window").and_then(Value::as_bool) == Some(true) {
+            if raw.get("top_level").and_then(Value::as_bool) == Some(true) {
+                return Err(bad_request(
+                    "thread_window cannot be combined with top_level",
+                ));
+            }
+            out.extend(thread_mode_window(relay, cfg, authed, host, raw).await?);
+        } else if raw.get("top_level").and_then(Value::as_bool) == Some(true) {
             out.extend(channel_window(relay, cfg, authed, raw).await?);
         } else if raw.get("depth_limit").is_some() {
             out.extend(thread_window(relay, cfg, authed, raw).await?);
@@ -728,6 +737,249 @@ fn sign_overlay(
         sig: String::new(),
     };
     relay.sign_relay_event(&mut event).then_some(event)
+}
+
+/// NIP-CW thread mode: newest-first descendants of one root, with the
+/// request-bound `kind:39007` bounds overlay.
+#[allow(clippy::result_large_err)]
+async fn thread_mode_window(
+    relay: &Arc<Relay>,
+    cfg: &crate::config::Config,
+    authed: &str,
+    host: &str,
+    raw: &Value,
+) -> Result<Vec<Event>, Response> {
+    let channel = channel_id(raw)?;
+    let root = raw
+        .get("#e")
+        .and_then(Value::as_array)
+        .filter(|values| values.len() == 1)
+        .and_then(|values| values[0].as_str())
+        .filter(|id| is_hex_64(id))
+        .map(str::to_ascii_lowercase)
+        .ok_or_else(|| bad_request("thread_window requires exactly one #e root"))?;
+    let Some(raw_kinds) = raw.get("kinds").and_then(Value::as_array) else {
+        return Err(bad_request("thread_window requires kinds"));
+    };
+    let mut kinds = Vec::with_capacity(raw_kinds.len());
+    for value in raw_kinds {
+        let Some(kind) = value.as_u64() else {
+            return Err(bad_request("thread_window kinds must be integers"));
+        };
+        if !THREAD_CONTENT_KINDS.contains(&kind) {
+            return Err(bad_request("thread_window kind is not supported"));
+        }
+        kinds.push(kind);
+    }
+    if kinds.is_empty() || kinds.len() > 4 {
+        return Err(bad_request("thread_window requires 1 to 4 kinds"));
+    }
+    kinds.sort_unstable();
+    kinds.dedup();
+    let limit = raw_limit(raw, 50, 200);
+    if limit == 0 {
+        return Err(bad_request("thread_window limit must be positive"));
+    }
+    let depth = match raw.get("depth_limit").and_then(Value::as_u64) {
+        None => THREAD_DEPTH_MAX,
+        Some(value) if (1..=u64::from(THREAD_DEPTH_MAX)).contains(&value) => value as u32,
+        Some(_) => return Err(bad_request("thread_window depth_limit must be 1 to 100")),
+    };
+    let include_aux = raw.get("include_aux").and_then(Value::as_bool) == Some(true);
+    let cursor = parse_cursor(raw)?;
+    let visible_filter: Filter = serde_json::from_value(raw.clone())
+        .map_err(|e| bad_request(&format!("invalid thread filter: {e}")))?;
+    if visible_filter.too_many_members() || visible_filter.invalid_tag_values() {
+        return Err(bad_request("invalid thread filter bounds"));
+    }
+
+    let groups = relay.groups.read().await;
+    if groups.group(&channel).is_none() || !groups.visible_kind(&channel, 9, Some(authed)) {
+        return Ok(Vec::new());
+    }
+    let Some((mut roots, _)) = relay
+        .db
+        .api_query(
+            vec![Filter {
+                ids: Some(vec![root.clone()]),
+                limit: Some(1),
+                ..Filter::default()
+            }],
+            1,
+            unix_now(),
+            false,
+        )
+        .await
+    else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "database is overloaded, try again shortly" })),
+        )
+            .into_response());
+    };
+    let Some(root_event) = roots.pop() else {
+        return Ok(Vec::new());
+    };
+    if !THREAD_CONTENT_KINDS.contains(&root_event.kind)
+        || nip29::group_id(&root_event) != Some(channel.as_str())
+        || !bridge_visible(
+            &root_event,
+            authed,
+            Some(&groups),
+            cfg.nip_enabled(78) && cfg.relay.enabled_nip78_auth,
+            relay.relay_pubkey_ref(),
+        )
+    {
+        return Ok(Vec::new());
+    }
+
+    let mut replies = Vec::new();
+    let mut seen = HashSet::from([root.clone()]);
+    let mut frontier = vec![root.clone()];
+    for _ in 0..depth {
+        if frontier.is_empty() {
+            break;
+        }
+        let frontier_set: HashSet<&str> = frontier.iter().map(String::as_str).collect();
+        let mut next = Vec::new();
+        for chunk in frontier.chunks(crate::filter::MAX_FILTER_MEMBERS) {
+            let mut filter = Filter {
+                kinds: Some(kinds.clone()),
+                limit: Some(AUX_LIMIT),
+                ..Filter::default()
+            };
+            filter.tags.insert("#e".to_string(), json!(chunk));
+            filter.tags.insert("#h".to_string(), json!([channel]));
+            let Some((events, more)) = relay
+                .db
+                .api_query(vec![filter], AUX_LIMIT, unix_now(), false)
+                .await
+            else {
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({ "error": "database is overloaded, try again shortly" })),
+                )
+                    .into_response());
+            };
+            if more {
+                return Err(window_too_large());
+            }
+            for event in events {
+                if !seen.insert(event.id.clone()) {
+                    continue;
+                }
+                if !bridge_visible(
+                    &event,
+                    authed,
+                    Some(&groups),
+                    cfg.nip_enabled(78) && cfg.relay.enabled_nip78_auth,
+                    relay.relay_pubkey_ref(),
+                ) {
+                    continue;
+                }
+                let Some(parent) = reply_parent(&event) else {
+                    continue;
+                };
+                if !frontier_set.contains(parent) {
+                    continue;
+                }
+                next.push(event.id.clone());
+                replies.push(event);
+                if replies.len() > 8_192 {
+                    return Err(window_too_large());
+                }
+            }
+        }
+        frontier = next;
+    }
+
+    let mut candidates: Vec<Event> = replies
+        .into_iter()
+        .filter(|event| match &cursor {
+            Some((until, before)) => cursor_after(event, *until, before),
+            None => true,
+        })
+        .collect();
+    sort_desc_id_asc(&mut candidates);
+    let has_more = candidates.len() > limit;
+    candidates.truncate(limit);
+    let next_cursor = if has_more {
+        candidates
+            .last()
+            .map(|event| (event.created_at, event.id.clone()))
+    } else {
+        None
+    };
+    let mut out = candidates.clone();
+    if include_aux && !candidates.is_empty() {
+        let mut targets = vec![root_event.id.clone()];
+        targets.extend(candidates.iter().map(|event| event.id.clone()));
+        out.extend(fetch_aux(relay, cfg, authed, &visible_filter, &targets).await?);
+    }
+    let binding = thread_binding(
+        host,
+        authed,
+        &channel,
+        &root,
+        limit,
+        depth,
+        &kinds,
+        cursor.as_ref(),
+        include_aux,
+    );
+    let content = json!({
+        "version": 1,
+        "direction": "older",
+        "has_more": has_more,
+        "next_cursor": next_cursor.as_ref().map(|(created_at, id)| json!({
+            "created_at": created_at,
+            "id": id,
+        })),
+    });
+    if let Some(bounds) = sign_overlay(
+        relay,
+        nip29::THREAD_WINDOW_BOUNDS,
+        vec![
+            vec!["d".to_string(), format!("tw:1:{binding}")],
+            vec!["h".to_string(), channel],
+            vec!["e".to_string(), root],
+        ],
+        content.to_string(),
+    ) {
+        out.push(bounds);
+    }
+    Ok(out)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn thread_binding(
+    host: &str,
+    reader: &str,
+    channel: &str,
+    root: &str,
+    limit: usize,
+    depth: u32,
+    kinds: &[u64],
+    cursor: Option<&(u64, String)>,
+    include_aux: bool,
+) -> String {
+    let cursor = cursor.map(|(created_at, id)| json!([created_at, id]));
+    let value = json!([
+        "tw",
+        1,
+        "older",
+        host,
+        reader,
+        channel,
+        root,
+        limit,
+        depth,
+        kinds,
+        cursor,
+        include_aux,
+    ]);
+    let bytes = serde_json::to_vec(&value).expect("thread binding is serializable");
+    hex::encode(Sha256::digest(bytes))
 }
 
 /// Legacy thread subtree path: `#e` root plus `depth_limit`.

@@ -385,14 +385,34 @@ pub async fn query(State(relay): State<Arc<Relay>>, headers: HeaderMap, body: By
     if raw_filters.is_empty() || raw_filters.len() > MAX_BRIDGE_FILTERS {
         return bad_request("query requires between 1 and 256 filters");
     }
+    // The thread-mode bounds binding names the server-resolved authority.
+    // The Host header is the authority the client addressed (behind a proxy
+    // the deployment must preserve it; there is no trusted forwarded-host
+    // header here). Fall back to the configured bind host for direct use.
+    let host = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|host| !host.is_empty())
+        .map(|host| host.trim_end_matches('.').to_ascii_lowercase())
+        .unwrap_or_else(|| {
+            cfg.server
+                .host
+                .trim()
+                .trim_end_matches('.')
+                .to_ascii_lowercase()
+        });
     let events = if raw_filters
         .iter()
         .any(|raw| extension_flag(raw, "top_level"))
         || raw_filters
             .iter()
             .any(|raw| raw.get("depth_limit").is_some())
+        || raw_filters
+            .iter()
+            .any(|raw| raw.get("thread_window").is_some())
     {
-        match super::bridge_window::query_all(&relay, &cfg, &pubkey, &raw_filters).await {
+        match super::bridge_window::query_all(&relay, &cfg, &pubkey, &raw_filters, &host).await {
             Ok(events) => events,
             Err(response) => return response,
         }

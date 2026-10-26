@@ -645,6 +645,167 @@ async fn legacy_thread_frontier_over_1000_fails_explicitly() {
 }
 
 #[tokio::test]
+async fn thread_window_pages_descendants_with_signed_bounds() {
+    let relay = test_relay().await;
+    let app = super::super::build_router(&relay, None).await;
+    let keypair = Keypair::from_secret_bytes([17u8; 32]).unwrap();
+    let channel = "66666666-6666-4666-8666-666666666666";
+    let origin = origin(&relay).await;
+    let create = signed(
+        &keypair,
+        9007,
+        vec![
+            vec!["h".into(), channel.into()],
+            vec!["name".into(), "stream".into()],
+            vec!["visibility".into(), "open".into()],
+            vec!["channel_type".into(), "stream".into()],
+        ],
+        "",
+        crate::util::unix_now(),
+    );
+    let create_body = serde_json::to_vec(&create).unwrap();
+    let auth = nip98(&keypair, &origin, "/events", "POST", &create_body, 1);
+    app.clone()
+        .oneshot(request(Method::POST, "/events", Some(&auth), create_body))
+        .await
+        .unwrap();
+
+    let now = crate::util::unix_now();
+    let root = signed(
+        &keypair,
+        9,
+        vec![vec!["h".into(), channel.into()]],
+        "root",
+        now - 3,
+    );
+    let reply1 = signed(
+        &keypair,
+        9,
+        vec![
+            vec!["h".into(), channel.into()],
+            vec!["e".into(), root.id.clone(), "".into(), "reply".into()],
+        ],
+        "reply1",
+        now - 2,
+    );
+    let reply2 = signed(
+        &keypair,
+        9,
+        vec![
+            vec!["h".into(), channel.into()],
+            vec!["e".into(), root.id.clone(), "".into(), "reply".into()],
+        ],
+        "reply2",
+        now - 1,
+    );
+    let nested = signed(
+        &keypair,
+        9,
+        vec![
+            vec!["h".into(), channel.into()],
+            vec!["e".into(), reply1.id.clone(), "".into(), "reply".into()],
+        ],
+        "nested",
+        now,
+    );
+    let reply1_id = reply1.id.clone();
+    let reply2_id = reply2.id.clone();
+    for event in [root.clone(), reply1, reply2, nested] {
+        assert_eq!(
+            relay.db.put(event, now).await,
+            crate::db::PutOutcome::Stored
+        );
+    }
+
+    let filter = json!([{
+        "thread_window": true,
+        "kinds": [9],
+        "#h": [channel],
+        "#e": [root.id],
+        "depth_limit": 10,
+        "limit": 2,
+    }]);
+    let body = serde_json::to_vec(&filter).unwrap();
+    let auth = nip98(&keypair, &origin, "/query", "POST", &body, 20);
+    let mut req = request(Method::POST, "/query", Some(&auth), body);
+    req.headers_mut()
+        .insert("host", "relay.example.test".parse().unwrap());
+    let response = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let events = body_json(response).await;
+    let rows: Vec<&Value> = events
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["kind"] == 9)
+        .collect();
+    assert_eq!(rows.len(), 2, "{events}");
+    assert_eq!(rows[0]["content"], "nested");
+    assert_eq!(rows[1]["content"], "reply2");
+    let bounds: Vec<&Value> = events
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["kind"] == 39007)
+        .collect();
+    assert_eq!(bounds.len(), 1, "{events}");
+    let content: Value = serde_json::from_str(bounds[0]["content"].as_str().unwrap()).unwrap();
+    assert_eq!(content["version"], 1);
+    assert_eq!(content["direction"], "older");
+    assert_eq!(content["has_more"], true);
+    assert_eq!(content["next_cursor"]["id"], reply2_id);
+    let tags = bounds[0]["tags"].as_array().unwrap();
+    assert!(tags.iter().any(|tag| tag[0] == "h" && tag[1] == channel));
+    assert!(tags.iter().any(|tag| tag[0] == "e" && tag[1] == root.id));
+    assert!(tags.iter().any(|tag| {
+        tag[0] == "d"
+            && tag[1]
+                .as_str()
+                .is_some_and(|value| value.starts_with("tw:1:") && value.len() == 69)
+    }));
+
+    // The next page is driven by the signed cursor and reaches the older
+    // sibling without re-delivering the first page.
+    let filter = json!([{
+        "thread_window": true,
+        "kinds": [9],
+        "#h": [channel],
+        "#e": [root.id],
+        "depth_limit": 10,
+        "limit": 2,
+        "until": now - 1,
+        "before_id": reply2_id,
+    }]);
+    let body = serde_json::to_vec(&filter).unwrap();
+    let auth = nip98(&keypair, &origin, "/query", "POST", &body, 21);
+    let mut req = request(Method::POST, "/query", Some(&auth), body);
+    req.headers_mut()
+        .insert("host", "relay.example.test".parse().unwrap());
+    let response = app.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let events = body_json(response).await;
+    let rows: Vec<&Value> = events
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["kind"] == 9)
+        .collect();
+    assert_eq!(rows.len(), 1, "{events}");
+    assert_eq!(rows[0]["id"], reply1_id);
+    let bounds: Vec<&Value> = events
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["kind"] == 39007)
+        .collect();
+    assert_eq!(bounds.len(), 1);
+    let content: Value = serde_json::from_str(bounds[0]["content"].as_str().unwrap()).unwrap();
+    assert_eq!(content["has_more"], false);
+    assert!(content["next_cursor"].is_null());
+    relay.db.shutdown();
+}
+
+#[tokio::test]
 async fn forged_dm_open_is_rejected_before_creating_a_dm() {
     let relay = test_relay().await;
     let app = super::super::build_router(&relay, None).await;
