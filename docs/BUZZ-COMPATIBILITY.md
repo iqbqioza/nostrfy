@@ -156,9 +156,10 @@ host, because Buzz signs the relay URL it uploads to.
   with "nothing archived" instead of failing.
 - Channel `ttl` is published but stored messages are not automatically
   expired server-side; clients that set NIP-40 `expiration` get normal expiry.
-- NIP-CL's system-channel exclusion is applied to the HTTP bridge; a global
-  WebSocket subscription can still receive a system channel's relay-signed
-  state unless it names the channel.
+- NIP-CL's system-channel exclusion is applied to the HTTP bridge and to
+  WebSocket REQ, COUNT, live delivery and NEG: a global filter does not
+  receive a system channel's relay-signed state unless it names the channel
+  (`#h`, `#d`, `#t:system` or `#P`).
 - Buzz's relay-member management commands (`kind:9030`-`9032`) are not wired
   to nostrfy's access lists; manage an allowlist relay with `nostrfy relay
   allow/deny` or NIP-86 instead. Channel member management (`kind:9000`/

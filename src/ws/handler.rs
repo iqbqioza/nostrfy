@@ -638,7 +638,7 @@ impl super::Conn {
                 None
             };
             for event in events {
-                if !self.visible_to(groups.as_deref(), &event) {
+                if !self.visible_to_filters(groups.as_deref(), &event, &stored) {
                     if auth_enabled && self.auth_hidden_behind(groups.as_deref(), &event) {
                         auth_hidden = true;
                     }
@@ -1213,21 +1213,7 @@ impl super::Conn {
             };
             events
                 .into_iter()
-                .filter(|e| {
-                    (self.is_authed() || !self.nip70_hidden(e))
-                        && self.gift_wrap_visible(e)
-                        && self.nip78_visible(e)
-                        && !self.p_gated_hidden(e)
-                        && groups.as_deref().is_none_or(|g| {
-                            if self.authed_pubkeys.is_empty() {
-                                g.visible_to(e, None)
-                            } else {
-                                self.authed_pubkeys
-                                    .iter()
-                                    .any(|pk| g.visible_to(e, Some(pk)))
-                            }
-                        })
-                })
+                .filter(|e| self.visible_to_filters(groups.as_deref(), e, &filters))
                 .collect()
         };
         self.send_control(nip45::count_response(sub_id, &filters, &events, more));
@@ -1427,6 +1413,48 @@ impl super::Conn {
     /// access checks). `groups` is `None` when the batch contains no group
     /// event: the expensive group-store lock is skipped then, and the
     /// NIP-29 check (which can only fail for a group event) does not run.
+    /// NIP-CL system-channel gate for a specific filter set. A global
+    /// filter must not receive a system channel's relay-signed state unless
+    /// it names the channel (`#h`, `#d`, `#t:system` or `#P`). Non-group
+    /// events and ordinary channel types are unaffected.
+    pub(crate) fn visible_to_filters(
+        &self,
+        groups: Option<&nip29::GroupStore>,
+        event: &Event,
+        filters: &[crate::filter::Filter],
+    ) -> bool {
+        if !self.visible_to(groups, event) {
+            return false;
+        }
+        let gid = nip29::group_id_any(event).or_else(|| {
+            if nip29::is_membership_notice_kind(event.kind) {
+                event
+                    .tags
+                    .iter()
+                    .find(|tag| tag.len() >= 2 && tag[0] == "h")
+                    .map(|tag| tag[1].as_str())
+            } else {
+                None
+            }
+        });
+        let Some(gid) = gid else {
+            return true;
+        };
+        let Some(groups) = groups else {
+            return false;
+        };
+        if !groups
+            .groups
+            .get(gid)
+            .is_some_and(|group| group.channel_type == "system")
+        {
+            return true;
+        }
+        filters.iter().any(|filter| {
+            filter.matches(event) && crate::server::bridge::nip_cl_visible(filter, event, groups)
+        })
+    }
+
     pub(crate) fn visible_to(&self, groups: Option<&nip29::GroupStore>, event: &Event) -> bool {
         // NIP-70: protected events are only served to authenticated clients
         // (the relay's own relay-signed events stay readable anonymously,
@@ -1532,7 +1560,12 @@ impl super::Conn {
             // every subscription, and the plan keeps tag matching
             // O(event tags + filter values) instead of the old
             // values × tags product.
-            if !filters.iter().any(|f| f.matches_with(event, f.tag_plan())) {
+            if !filters.iter().any(|f| {
+                f.matches_with(event, f.tag_plan())
+                    && groups.is_none_or(|groups| {
+                        crate::server::bridge::nip_cl_visible(f, event, groups)
+                    })
+            }) {
                 continue;
             }
             let mut out = String::with_capacity(event_json.len() + sub_json.len() + 16);

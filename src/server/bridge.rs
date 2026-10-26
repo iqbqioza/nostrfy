@@ -173,7 +173,7 @@ async fn authenticate(
 /// state only when it names the channel (`#h`, or `#d` on the channel-state
 /// kinds), asks for `#t:["system"]`, or has a `#P` creator constraint.
 /// Membership notices carry the channel type too.
-pub(super) fn nip_cl_visible(filter: &Filter, event: &Event, groups: &nip29::GroupStore) -> bool {
+pub(crate) fn nip_cl_visible(filter: &Filter, event: &Event, groups: &nip29::GroupStore) -> bool {
     let gid = nip29::group_id_any(event).or_else(|| {
         if nip29::is_membership_notice_kind(event.kind) {
             event
@@ -188,6 +188,12 @@ pub(super) fn nip_cl_visible(filter: &Filter, event: &Event, groups: &nip29::Gro
     let Some(gid) = gid else {
         return true;
     };
+    nip_cl_group_visible(filter, groups, gid)
+}
+
+/// The group-id half of [`nip_cl_visible`], shared with NIP-77 where only
+/// the lightweight record's group id is available.
+pub(crate) fn nip_cl_group_visible(filter: &Filter, groups: &nip29::GroupStore, gid: &str) -> bool {
     let Some(group) = groups.groups.get(gid) else {
         return true;
     };

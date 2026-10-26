@@ -383,6 +383,7 @@ impl super::Conn {
         let now = unix_now();
         // The negentropy query only needs (created_at, id) records, so it
         // never materializes every matching full event in memory.
+        let system_filter = filter.clone();
         let Some((items, more)) = self.relay.db.neg_query_result(filter, max_items, now).await
         else {
             // A failed sync must never be answered with an empty item set:
@@ -483,13 +484,19 @@ impl super::Conn {
                             // shape violates it.
                             return false;
                         };
-                        if self.authed_pubkeys.is_empty() {
+                        let visible = if self.authed_pubkeys.is_empty() {
                             groups.visible_kind(gid, item.kind, None)
                         } else {
                             self.authed_pubkeys
                                 .iter()
                                 .any(|pk| groups.visible_kind(gid, item.kind, Some(pk)))
-                        }
+                        };
+                        visible
+                            && crate::server::bridge::nip_cl_group_visible(
+                                &system_filter,
+                                groups,
+                                gid,
+                            )
                     } else {
                         true
                     }

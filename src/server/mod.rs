@@ -4,7 +4,7 @@
 
 mod api;
 pub(crate) mod blossom;
-mod bridge;
+pub(crate) mod bridge;
 mod bridge_window;
 mod landing;
 pub(crate) mod livekit;

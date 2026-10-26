@@ -2829,6 +2829,86 @@ mod tests {
     }
 
     #[test]
+    fn req_hides_system_channel_events_from_global_filters() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn_with(&"03".repeat(32)).await;
+            let now = unix_now();
+            let channel = "sys-channel";
+            let relay_pk = conn.relay.relay_pubkey.clone().expect("keyed relay");
+            let create = crate::event::Event {
+                id: "31".repeat(32),
+                pubkey: relay_pk.clone(),
+                created_at: now,
+                kind: crate::nips::nip29::CREATE_GROUP,
+                tags: vec![
+                    vec!["h".into(), channel.into()],
+                    vec!["visibility".into(), "open".into()],
+                    vec!["channel_type".into(), "system".into()],
+                ],
+                content: String::new(),
+                sig: String::new(),
+            };
+            {
+                let mut groups = conn.relay.groups.write().await;
+                groups.apply(&create, &relay_pk, now, false, false);
+                // Plain NIP-29 replay ignores Buzz's `channel_type` tag;
+                // this test directly builds the system-channel state.
+                if let Some(group) = groups.groups.get_mut(channel) {
+                    group.channel_type = "system".into();
+                }
+            }
+            let mut event = signed_note(
+                "system state",
+                now + 1,
+                vec![vec!["h".into(), channel.into()]],
+            );
+            event.kind = 9;
+            event.id = crate::nips::nip01::compute_id(&event);
+            conn.relay.db.put(event.clone(), now).await;
+            assert!(
+                conn.relay.groups.read().await.group(channel).is_some(),
+                "system test group must exist"
+            );
+            let groups = conn.relay.groups.read().await;
+            let named_filter: crate::filter::Filter =
+                serde_json::from_value(json!({"kinds":[9], "#h":[channel]})).unwrap();
+            assert!(
+                conn.visible_to_filters(Some(&groups), &event, &[named_filter]),
+                "named filter must see the system event"
+            );
+            drop(groups);
+
+            conn.handle_req(&[json!("global"), json!({"kinds": [9]})])
+                .await;
+            conn.pump_pending_reqs();
+            let global_ids: Vec<String> = outgoing_json(&conn)
+                .iter()
+                .filter(|m| m[0] == "EVENT")
+                .map(|m| m[2]["id"].as_str().unwrap().to_string())
+                .collect();
+            assert!(
+                !global_ids.contains(&event.id),
+                "a system-channel event must not reach a global filter"
+            );
+
+            conn.handle_req(&[json!("named"), json!({"kinds": [9], "#h": [channel]})])
+                .await;
+            conn.pump_pending_reqs();
+            let named_ids: Vec<String> = outgoing_json(&conn)
+                .iter()
+                .filter(|m| m[0] == "EVENT")
+                .map(|m| m[2]["id"].as_str().unwrap().to_string())
+                .collect();
+            assert!(
+                named_ids.contains(&event.id),
+                "the same event must reach a filter that names its channel"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
     fn req_hides_protected_events_from_anonymous() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
