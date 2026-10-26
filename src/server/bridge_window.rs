@@ -715,7 +715,7 @@ async fn thread_window(
             if let Some(channel) = channel {
                 filter.tags.insert("#h".to_string(), json!([channel]));
             }
-            let Some((events, _)) = relay
+            let Some((events, more)) = relay
                 .db
                 .api_query(vec![filter], AUX_LIMIT, unix_now(), false)
                 .await
@@ -726,6 +726,13 @@ async fn thread_window(
                 )
                     .into_response());
             };
+            if more {
+                // The legacy thread path has no signed bounds/cursor for
+                // the DB frontier. Silently truncating at the newest
+                // AUX_LIMIT direct replies would lose older replies (and
+                // their descendants); fail explicitly instead.
+                return Err(window_too_large());
+            }
             let groups = relay.groups.read().await;
             for event in events {
                 if !seen.insert(event.id.clone()) {

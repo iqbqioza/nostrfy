@@ -552,6 +552,79 @@ async fn hidden_prefix_across_seconds_fails_explicitly() {
 }
 
 #[tokio::test]
+async fn legacy_thread_frontier_over_1000_fails_explicitly() {
+    // The legacy depth_limit path has no signed bounds and cannot represent
+    // a DB frontier cut. Returning a short page here would silently lose
+    // replies older than the newest 1,000 and their descendants.
+    let relay = test_relay().await;
+    let app = super::super::build_router(&relay, None).await;
+    let keypair = Keypair::from_secret_bytes([16u8; 32]).unwrap();
+    let channel = "55555555-5555-4555-8555-555555555555";
+    let origin = origin(&relay).await;
+    let create = signed(
+        &keypair,
+        9007,
+        vec![
+            vec!["h".into(), channel.into()],
+            vec!["name".into(), "stream".into()],
+            vec!["visibility".into(), "open".into()],
+            vec!["channel_type".into(), "stream".into()],
+        ],
+        "",
+        crate::util::unix_now(),
+    );
+    let create_body = serde_json::to_vec(&create).unwrap();
+    let auth = nip98(&keypair, &origin, "/events", "POST", &create_body, 1);
+    app.clone()
+        .oneshot(request(Method::POST, "/events", Some(&auth), create_body))
+        .await
+        .unwrap();
+
+    let now = crate::util::unix_now();
+    let root = signed(
+        &keypair,
+        9,
+        vec![vec!["h".into(), channel.into()]],
+        "root",
+        now - 2,
+    );
+    let root_id = root.id.clone();
+    assert_eq!(relay.db.put(root, now).await, crate::db::PutOutcome::Stored);
+    for i in 0..1_001 {
+        let reply = signed(
+            &keypair,
+            9,
+            vec![
+                vec!["h".into(), channel.into()],
+                vec!["e".into(), root_id.clone(), "".into(), "reply".into()],
+            ],
+            &format!("reply-{i}"),
+            now - 1 - i,
+        );
+        assert_eq!(
+            relay.db.put(reply, now).await,
+            crate::db::PutOutcome::Stored
+        );
+    }
+
+    let filter = json!([{
+        "kinds": [9],
+        "#h": [channel],
+        "#e": [root_id],
+        "depth_limit": 10,
+        "limit": 100,
+    }]);
+    let body = serde_json::to_vec(&filter).unwrap();
+    let auth = nip98(&keypair, &origin, "/query", "POST", &body, 20);
+    let response = app
+        .oneshot(request(Method::POST, "/query", Some(&auth), body))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    relay.db.shutdown();
+}
+
+#[tokio::test]
 async fn forged_dm_open_is_rejected_before_creating_a_dm() {
     let relay = test_relay().await;
     let app = super::super::build_router(&relay, None).await;

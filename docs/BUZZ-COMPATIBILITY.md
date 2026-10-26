@@ -166,9 +166,12 @@ host, because Buzz signs the relay URL it uploads to.
 - A `kind:39005` summary's `reply_count` counts direct replies and
   `descendant_count` currently carries the same value; fully nested reply
   trees are not walked when synthesising the overlay.
-- The legacy `depth_limit` thread path returns the subtree without a
-  `kind:39007` thread-bounds overlay; only the channel-window path emits its
-  `kind:39006` bounds event.
+- The newer `thread_window:true` / `kind:39007` thread mode is not
+  implemented. The legacy `depth_limit` path intentionally has no signed
+  bounds event (clients use the legacy short-page heuristic). It queries up
+  to 1,000 direct replies per frontier (a complete same-second group can
+  exceed that cap); when the DB reports a truncated frontier it now returns
+  `413` instead of silently dropping older replies and descendants.
 - DM groups are derived state backed by the group snapshot: the synthetic
   `9007`/`9000` are not stored, so a snapshot-less full rebuild (new
   database, migration, or dropped snapshot) cannot recreate a DM channel.
