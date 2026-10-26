@@ -1307,6 +1307,22 @@ impl GroupStore {
         emit: bool,
         history_replay: bool,
     ) -> Vec<Event> {
+        self.apply_with_epoch(event, relay_pubkey, now, emit, history_replay, None)
+    }
+
+    /// [`Self::apply`] with an optional durable epoch read from the
+    /// `group_epochs` index. A state event accepted for an older
+    /// incarnation is dropped after delete/recreate even when its client
+    /// timestamp is newer than the new create.
+    pub fn apply_with_epoch(
+        &mut self,
+        event: &Event,
+        relay_pubkey: &str,
+        now: u64,
+        emit: bool,
+        history_replay: bool,
+        expected_epoch: Option<&str>,
+    ) -> Vec<Event> {
         let Some(gid) = group_id(event) else {
             return Vec::new();
         };
@@ -1324,6 +1340,16 @@ impl GroupStore {
                 .iter()
                 .find(|tag| tag.len() >= 2 && tag[0] == CREATE_ID_TAG)
                 .map(|tag| tag[1].as_str())
+            && self
+                .groups
+                .get(gid)
+                .and_then(|group| group.create_id.as_deref())
+                != Some(expected)
+        {
+            return Vec::new();
+        }
+        if let Some(expected) = expected_epoch
+            && event.kind != CREATE_GROUP
             && self
                 .groups
                 .get(gid)
@@ -3137,6 +3163,7 @@ impl GroupStore {
         // cannot exhaust memory.
         const PENDING_STATE_MAX: usize = 50_000;
         let mut pending_state: HashMap<String, Vec<Event>> = HashMap::new();
+        let mut pending_epochs: HashMap<String, String> = HashMap::new();
         let mut pending_state_count = 0usize;
         let mut since: Option<u64> = None;
         loop {
@@ -3160,6 +3187,20 @@ impl GroupStore {
             if page.is_empty() {
                 break;
             }
+            let page_epochs = {
+                let ids: Vec<Vec<u8>> = page
+                    .iter()
+                    .filter_map(|event| event.id_bytes().map(|id| id.to_vec()))
+                    .collect();
+                let Some(epochs) = db.group_epochs_startup(ids).await else {
+                    log::error!(
+                        "group state rebuild aborted: the group-epoch index did not answer; \
+                         refusing to persist an incomplete group store"
+                    );
+                    return false;
+                };
+                epochs
+            };
             if more {
                 // The collector stopped early. It can stop on the count cap
                 // with a full page, but also on the byte cap (64 MiB) or the
@@ -3216,6 +3257,11 @@ impl GroupStore {
                     }
                 }
                 let gid = group_id(&event).unwrap_or_default().to_string();
+                let event_epoch = event.id_bytes().map(hex::encode);
+                let expected_epoch = event_epoch
+                    .as_ref()
+                    .and_then(|id| page_epochs.get(id))
+                    .map(String::as_str);
                 if event.kind != CREATE_GROUP
                     && !gid.is_empty()
                     && !self.groups.contains_key(&gid)
@@ -3228,6 +3274,9 @@ impl GroupStore {
                         continue;
                     }
                     if pending_state_count < PENDING_STATE_MAX {
+                        if let (Some(key), Some(expected)) = (&event_epoch, expected_epoch) {
+                            pending_epochs.insert(key.clone(), expected.to_string());
+                        }
                         pending_state.entry(gid).or_default().push(event);
                         pending_state_count += 1;
                         continue;
@@ -3247,7 +3296,14 @@ impl GroupStore {
                 // arrival: migrated databases are made faithful by the
                 // migration itself, which refuses to import moderation its
                 // own replay would reject.
-                self.apply(&event, relay_pubkey.unwrap_or(""), unix_now(), false, true);
+                self.apply_with_epoch(
+                    &event,
+                    relay_pubkey.unwrap_or(""),
+                    unix_now(),
+                    false,
+                    true,
+                    expected_epoch,
+                );
                 if event.kind == CREATE_GROUP
                     && let Some(mut buffered) = pending_state.remove(&gid)
                 {
@@ -3261,12 +3317,17 @@ impl GroupStore {
                     });
                     pending_state_count = pending_state_count.saturating_sub(buffered.len());
                     for buffered_event in buffered {
-                        self.apply(
+                        let expected = buffered_event
+                            .id_bytes()
+                            .map(hex::encode)
+                            .and_then(|id| pending_epochs.remove(&id));
+                        self.apply_with_epoch(
                             &buffered_event,
                             relay_pubkey.unwrap_or(""),
                             unix_now(),
                             false,
                             true,
+                            expected.as_deref(),
                         );
                     }
                 }

@@ -4156,6 +4156,21 @@ impl Relay {
         nip29_enabled: bool,
         expected_group_create: Option<&str>,
     ) -> RemovalAck {
+        // Persist the incarnation this state event was validated against.
+        // The additive sidecar lets a replay reject a future-dated event
+        // that crosses a later delete/recreate of the same group id. A
+        // missing entry (old database) falls back to the legacy checks.
+        if let Some(create_id) = expected_group_create
+            && event.kind != nip29::CREATE_GROUP
+            && let Some(event_id) = event.id_bytes()
+            && !self.db.record_group_epoch(event_id, create_id).await
+        {
+            log::warn!(
+                "could not persist the group epoch for event {}; replay will use the \
+                 legacy create-id/timestamp checks",
+                event.id
+            );
+        }
         let mut removal_failed = false;
         // A removal that could not be applied, held for the pending-record
         // flush. See `Self::hold_pending_removal` for why the request cannot

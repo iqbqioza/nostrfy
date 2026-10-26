@@ -474,6 +474,18 @@ enum Msg {
         now: u64,
         reply: oneshot::Sender<Option<(NegItems, bool)>>,
     },
+    /// Persist the group create-id epoch seen when a NIP-29 state event was
+    /// accepted. Additive hardening index; old databases have no entries.
+    RecordGroupEpoch {
+        event_id: Vec<u8>,
+        create_id: String,
+        reply: oneshot::Sender<bool>,
+    },
+    /// Batch lookup of accepted group-event epochs for a rebuild page.
+    GroupEpochs {
+        event_ids: Vec<Vec<u8>>,
+        reply: oneshot::Sender<Option<std::collections::HashMap<String, String>>>,
+    },
     Delete {
         targets: Vec<String>,
         addresses: Vec<nip09::Address>,
@@ -1034,6 +1046,12 @@ fn msg_bytes(msg: &Msg) -> usize {
             .map(|(pubkey, reason)| pubkey.len() + reason.len())
             .sum(),
         Msg::SaveBlossomAllow { entries, .. } => entries.iter().map(String::len).sum(),
+        Msg::RecordGroupEpoch {
+            event_id,
+            create_id,
+            ..
+        } => event_id.len() + create_id.len(),
+        Msg::GroupEpochs { event_ids, .. } => event_ids.iter().map(Vec::len).sum(),
         Msg::Vanish { pubkey, .. }
         | Msg::RecordPendingVanish { pubkey, .. }
         | Msg::GiftWrapPurge { pubkey, .. } => pubkey.len(),
@@ -2127,6 +2145,29 @@ impl DbClient {
     pub async fn api_neg_sample(&self, limit: usize, now: u64) -> Option<(NegItems, bool)> {
         self.api_request(|reply| Msg::AggregateSample { limit, now, reply })
             .await
+    }
+
+    /// Persist the create-id epoch for an accepted group state event.
+    pub async fn record_group_epoch(&self, event_id: [u8; 32], create_id: &str) -> bool {
+        self.request_write_checked(|reply| Msg::RecordGroupEpoch {
+            event_id: event_id.to_vec(),
+            create_id: create_id.to_string(),
+            reply,
+        })
+        .await
+        .unwrap_or(false)
+    }
+
+    /// Batch lookup for a startup/rebuild page. `None` means the reader
+    /// could not answer (the caller must fail closed rather than rebuild
+    /// without the epoch index).
+    pub async fn group_epochs_startup(
+        &self,
+        event_ids: Vec<Vec<u8>>,
+    ) -> Option<std::collections::HashMap<String, String>> {
+        self.request_read_startup(|reply| Msg::GroupEpochs { event_ids, reply })
+            .await
+            .flatten()
     }
 
     /// Generic REST-API reader request with the API queue cap and timeout.

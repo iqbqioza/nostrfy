@@ -3846,6 +3846,34 @@ fn access_load_distinguishes_missing_loaded_and_failed() {
 }
 
 #[test]
+fn group_epoch_index_round_trips_additively() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let cfg = config();
+        let db = DbClient::open(
+            &cfg,
+            true,
+            Arc::new(Default::default()),
+            0,
+            128,
+            4096,
+            262144,
+        )
+        .expect("database must open");
+        let id = [7u8; 32];
+        let create_id = "ab".repeat(32);
+        assert!(db.record_group_epoch(id, &create_id).await);
+        let map = db
+            .group_epochs_startup(vec![id.to_vec(), [8u8; 32].to_vec()])
+            .await
+            .expect("epoch lookup must answer");
+        assert_eq!(map.get(&hex::encode(id)), Some(&create_id));
+        assert_eq!(map.len(), 1);
+        db.shutdown();
+    });
+}
+
+#[test]
 fn schema_upgrade_creates_missing_tables_instantly() {
     // Simulates an ancient database that only has the `events` table (all
     // other tables were added by later versions). Opening it must create

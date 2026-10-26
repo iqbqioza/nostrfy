@@ -25,6 +25,53 @@ const OTHER: &str = "ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
 const ADMIN2: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
 
 #[test]
+fn a_durable_epoch_rejects_stale_state_after_recreate() {
+    let mut store = GroupStore::default();
+    let now = 1_600_000_000;
+    let mut create = event(CREATE_GROUP, ADMIN, Some("g1"), vec![]);
+    create.id = "11".repeat(32);
+    store.apply(&create, "relay", now, true, false);
+    let edit = event(
+        9002,
+        ADMIN,
+        Some("g1"),
+        vec![vec!["name".into(), "old".into()]],
+    );
+    store.apply_with_epoch(&edit, "relay", now + 1, true, false, Some(&create.id));
+    assert_eq!(store.group("g1").unwrap().settings.name, "old");
+
+    store.apply(
+        &event(DELETE_GROUP, ADMIN, Some("g1"), vec![]),
+        "relay",
+        now + 2,
+        true,
+        false,
+    );
+    let mut recreate = event(CREATE_GROUP, ADMIN, Some("g1"), vec![]);
+    recreate.id = "22".repeat(32);
+    recreate.created_at = now + 3;
+    store.apply(&recreate, "relay", now + 3, true, false);
+    let stale = event(
+        9002,
+        ADMIN,
+        Some("g1"),
+        vec![vec!["name".into(), "stale".into()]],
+    );
+    assert!(
+        store
+            .apply_with_epoch(&stale, "relay", now + 4, true, true, Some(&create.id))
+            .is_empty()
+    );
+    assert_eq!(store.group("g1").unwrap().settings.name, "");
+    assert!(
+        !store
+            .apply_with_epoch(&stale, "relay", now + 5, true, true, Some(&recreate.id))
+            .is_empty()
+    );
+    assert_eq!(store.group("g1").unwrap().settings.name, "stale");
+}
+
+#[test]
 fn a_relay_mirror_from_an_old_incarnation_is_ignored_after_recreate() {
     let mut store = GroupStore::default();
     let now = 1_600_000_000;

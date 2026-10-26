@@ -2893,6 +2893,47 @@ impl Store {
         Ok((self.vanish.len(&rtxn)?, self.vanish_pending.len(&rtxn)?))
     }
 
+    /// Records the create-id epoch that an accepted NIP-29 state event was
+    /// validated against. This is a read-time hardening index; failures are
+    /// reported to the caller so the relay can log the reduced protection.
+    pub(crate) fn record_group_epoch(&self, event_id: &[u8], create_id: &str) -> Result<()> {
+        if event_id.len() != ID_LEN {
+            return Err(anyhow::anyhow!("invalid group-epoch event id"));
+        }
+        self.disk_full_error()?;
+        let mut key = Vec::with_capacity(12 + event_id.len());
+        key.extend_from_slice(b"group_epoch:");
+        key.extend_from_slice(event_id);
+        let mut wtxn = self.env.write_txn()?;
+        self.index_meta.put(&mut wtxn, &key, create_id.as_bytes())?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    /// Reads the epoch mappings for a batch of event ids. Missing entries
+    /// are normal (old databases and events accepted before the index).
+    pub(crate) fn group_epochs_for(
+        &self,
+        event_ids: &[Vec<u8>],
+    ) -> Result<std::collections::HashMap<String, String>> {
+        let rtxn = self.env.read_txn()?;
+        let mut out = std::collections::HashMap::with_capacity(event_ids.len());
+        for id in event_ids {
+            if id.len() != ID_LEN {
+                continue;
+            }
+            let mut key = Vec::with_capacity(12 + id.len());
+            key.extend_from_slice(b"group_epoch:");
+            key.extend_from_slice(id);
+            if let Some(value) = self.index_meta.get(&rtxn, &key)?
+                && let Ok(create_id) = std::str::from_utf8(value)
+            {
+                out.insert(hex::encode(id), create_id.to_string());
+            }
+        }
+        Ok(out)
+    }
+
     /// The persistent derived-group-state stamp: 0 when it was never
     /// bumped (fresh/pre-stamp database). See [`STATE_STAMP_KEY`].
     pub(crate) fn state_stamp(&self) -> Result<u64> {
@@ -3952,6 +3993,10 @@ impl Store {
             return Ok(());
         };
 
+        let mut epoch_key = Vec::with_capacity(12 + id.len());
+        epoch_key.extend_from_slice(b"group_epoch:");
+        epoch_key.extend_from_slice(id);
+        self.index_meta.delete(wtxn, &epoch_key)?;
         self.events.delete(wtxn, id)?;
         self.by_created
             .delete(wtxn, &created_key(event.created_at, id))?;
@@ -4071,6 +4116,10 @@ impl Store {
         {
             capped.push("by_word");
         }
+        let mut epoch_key = Vec::with_capacity(12 + id.len());
+        epoch_key.extend_from_slice(b"group_epoch:");
+        epoch_key.extend_from_slice(id);
+        self.index_meta.delete(wtxn, &epoch_key)?;
         self.events.delete(wtxn, id)?;
         if !capped.is_empty() {
             log::warn!(

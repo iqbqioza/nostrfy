@@ -220,6 +220,22 @@ fn handle_read_msg(store: &Store, errors: &Arc<std::sync::atomic::AtomicU64>, ms
             }
             false
         }
+        Msg::GroupEpochs { event_ids, reply } => {
+            let out = match store.group_epochs_for(&event_ids) {
+                Ok(map) => Some(map),
+                Err(e) => {
+                    db_error(errors, &e);
+                    None
+                }
+            };
+            let _ = reply.send(out);
+            false
+        }
+        Msg::RecordGroupEpoch { reply, .. } => {
+            // RecordGroupEpoch is a writer-channel message only.
+            let _ = reply.send(false);
+            false
+        }
         Msg::Query {
             filters,
             limit,
@@ -1356,6 +1372,32 @@ pub(crate) fn spawn(
                                         }
                                         Err(e) => db_error(&thread_errors, &e),
                                     }
+                                }
+                                Msg::RecordGroupEpoch {
+                                    event_id,
+                                    create_id,
+                                    reply,
+                                } => {
+                                    let recorded = match store
+                                        .record_group_epoch(&event_id, &create_id)
+                                    {
+                                        Ok(()) => true,
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            false
+                                        }
+                                    };
+                                    let _ = reply.send(recorded);
+                                }
+                                Msg::GroupEpochs { event_ids, reply } => {
+                                    let out = match store.group_epochs_for(&event_ids) {
+                                        Ok(map) => Some(map),
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            None
+                                        }
+                                    };
+                                    let _ = reply.send(out);
                                 }
                                 Msg::Delete {
                                     targets,

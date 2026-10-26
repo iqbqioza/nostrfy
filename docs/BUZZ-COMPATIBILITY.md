@@ -259,14 +259,18 @@ host, because Buzz signs the relay URL it uploads to.
   signing mirror is stamped at apply time, so it no longer amplifies it.
 - Live group validation rejects a state event timestamped before its
   group's create, and the rebuild buffers such legacy state until the create
-  is seen. Live client moderation is also bound to the group create id
-  across delete/recreate. Relay-generated `9000`/`9001` mirrors now carry
-  the create id and are ignored when replayed against a later incarnation;
-  imported/replayed legacy events (and mirrors written before this marker)
-  are not epoch-tagged, so a future-dated old event can still cross a
-  recreate on replay. Migration buffers pre-create state until the create,
-  re-adjudicates it against the real group, and then applies it; a
-  pre-create `9008` is kept but has no effect, matching the rebuild.
+  is seen. Live client moderation is bound to the group create id across
+  delete/recreate, and accepted state events record that epoch in an
+  additive `group_epoch:` key namespace in `index_meta`, checked during
+  rebuild; relay-generated `9000`/`9001` mirrors carry the create id and are
+  ignored against a later incarnation. Events accepted before this mapping
+  existed, and imported legacy events, have no entry, so a future-dated old
+  event can still cross a recreate on replay. The keys are additive: an old
+  database opens with no entries and keeps the timestamp/create-id fallback.
+  Migration
+  buffers pre-create state until the create, re-adjudicates it against the
+  real group, and then applies it; a pre-create `9008` is kept but has no
+  effect, matching the rebuild.
 - Migration now invalidates the destination group snapshot after importing
   events (forcing the first start to rebuild/ghost-check), except when the
   snapshot contains DM groups; keeping DM snapshots preserves their
