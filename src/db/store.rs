@@ -2934,6 +2934,32 @@ impl Store {
         Ok(out)
     }
 
+    /// Persist the role rebuild's bounded mutation journal. The key is
+    /// additive in `index_meta`; an old database simply has no record.
+    pub(crate) fn save_role_rebuild_pending(&self, data: &[u8]) -> Result<()> {
+        self.disk_full_error()?;
+        let mut wtxn = self.env.write_txn()?;
+        self.index_meta
+            .put(&mut wtxn, b"role_rebuild_pending", data)?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn load_role_rebuild_pending(&self) -> Result<Option<Vec<u8>>> {
+        let rtxn = self.env.read_txn()?;
+        Ok(self
+            .index_meta
+            .get(&rtxn, b"role_rebuild_pending")?
+            .map(<[u8]>::to_vec))
+    }
+
+    pub(crate) fn clear_role_rebuild_pending(&self) -> Result<()> {
+        let mut wtxn = self.env.write_txn()?;
+        self.index_meta.delete(&mut wtxn, b"role_rebuild_pending")?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
     /// The persistent derived-group-state stamp: 0 when it was never
     /// bumped (fresh/pre-stamp database). See [`STATE_STAMP_KEY`].
     pub(crate) fn state_stamp(&self) -> Result<u64> {

@@ -3846,6 +3846,34 @@ fn access_load_distinguishes_missing_loaded_and_failed() {
 }
 
 #[test]
+fn role_rebuild_journal_round_trips_additively() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let cfg = config();
+        let db = DbClient::open(
+            &cfg,
+            true,
+            Arc::new(Default::default()),
+            0,
+            128,
+            4096,
+            262144,
+        )
+        .expect("database must open");
+        let data = br#"[{"RemovePubkey":{"pubkey":"aa"}}]"#.to_vec();
+        assert!(db.save_role_rebuild_pending(data.clone()).await);
+        assert_eq!(
+            db.load_role_rebuild_pending().await,
+            Some(Some(data)),
+            "the journal must survive a writer round-trip"
+        );
+        assert!(db.clear_role_rebuild_pending().await);
+        assert_eq!(db.load_role_rebuild_pending().await, Some(None));
+        db.shutdown();
+    });
+}
+
+#[test]
 fn group_epoch_index_round_trips_additively() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {

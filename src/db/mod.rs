@@ -486,6 +486,17 @@ enum Msg {
         event_ids: Vec<Vec<u8>>,
         reply: oneshot::Sender<Option<std::collections::HashMap<String, String>>>,
     },
+    /// Persist the bounded role-rebuild mutation journal across shutdown.
+    SaveRoleRebuildPending {
+        data: Vec<u8>,
+        reply: oneshot::Sender<bool>,
+    },
+    LoadRoleRebuildPending {
+        reply: oneshot::Sender<Option<Option<Vec<u8>>>>,
+    },
+    ClearRoleRebuildPending {
+        reply: oneshot::Sender<bool>,
+    },
     Delete {
         targets: Vec<String>,
         addresses: Vec<nip09::Address>,
@@ -1052,6 +1063,7 @@ fn msg_bytes(msg: &Msg) -> usize {
             ..
         } => event_id.len() + create_id.len(),
         Msg::GroupEpochs { event_ids, .. } => event_ids.iter().map(Vec::len).sum(),
+        Msg::SaveRoleRebuildPending { data, .. } => data.len(),
         Msg::Vanish { pubkey, .. }
         | Msg::RecordPendingVanish { pubkey, .. }
         | Msg::GiftWrapPurge { pubkey, .. } => pubkey.len(),
@@ -2168,6 +2180,24 @@ impl DbClient {
         self.request_read_startup(|reply| Msg::GroupEpochs { event_ids, reply })
             .await
             .flatten()
+    }
+
+    pub async fn save_role_rebuild_pending(&self, data: Vec<u8>) -> bool {
+        self.request_write_checked(|reply| Msg::SaveRoleRebuildPending { data, reply })
+            .await
+            .unwrap_or(false)
+    }
+
+    pub async fn load_role_rebuild_pending(&self) -> Option<Option<Vec<u8>>> {
+        self.request_read_startup(|reply| Msg::LoadRoleRebuildPending { reply })
+            .await
+            .flatten()
+    }
+
+    pub async fn clear_role_rebuild_pending(&self) -> bool {
+        self.request_write_checked(|reply| Msg::ClearRoleRebuildPending { reply })
+            .await
+            .unwrap_or(false)
     }
 
     /// Generic REST-API reader request with the API queue cap and timeout.

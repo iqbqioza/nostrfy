@@ -236,6 +236,22 @@ fn handle_read_msg(store: &Store, errors: &Arc<std::sync::atomic::AtomicU64>, ms
             let _ = reply.send(false);
             false
         }
+        Msg::LoadRoleRebuildPending { reply } => {
+            let out = match store.load_role_rebuild_pending() {
+                Ok(data) => Some(data),
+                Err(e) => {
+                    db_error(errors, &e);
+                    None
+                }
+            };
+            let _ = reply.send(out);
+            false
+        }
+        Msg::SaveRoleRebuildPending { reply, .. } | Msg::ClearRoleRebuildPending { reply } => {
+            // Writer-channel messages only.
+            let _ = reply.send(false);
+            false
+        }
         Msg::Query {
             filters,
             limit,
@@ -1372,6 +1388,36 @@ pub(crate) fn spawn(
                                         }
                                         Err(e) => db_error(&thread_errors, &e),
                                     }
+                                }
+                                Msg::SaveRoleRebuildPending { data, reply } => {
+                                    let saved = match store.save_role_rebuild_pending(&data) {
+                                        Ok(()) => true,
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            false
+                                        }
+                                    };
+                                    let _ = reply.send(saved);
+                                }
+                                Msg::LoadRoleRebuildPending { reply } => {
+                                    let out = match store.load_role_rebuild_pending() {
+                                        Ok(data) => Some(data),
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            None
+                                        }
+                                    };
+                                    let _ = reply.send(out);
+                                }
+                                Msg::ClearRoleRebuildPending { reply } => {
+                                    let cleared = match store.clear_role_rebuild_pending() {
+                                        Ok(()) => true,
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            false
+                                        }
+                                    };
+                                    let _ = reply.send(cleared);
                                 }
                                 Msg::RecordGroupEpoch {
                                     event_id,

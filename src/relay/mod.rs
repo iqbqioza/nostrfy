@@ -960,7 +960,7 @@ const ROLES_REBUILD_BUFFER_MAX: usize = 4096;
 /// only when it actually changed the store — except removals the revoked
 /// empty store cannot confirm, which callers force-buffer (see
 /// [`Relay::apply_leave_request`]).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 enum BufferedRoleMutation {
     /// `create_role`: install the role definition (and create it).
     Create {
@@ -1234,14 +1234,32 @@ impl RolesRebuild {
         buffer.overflow = false;
     }
 
-    async fn leave_buffering(&self) {
+    async fn leave_buffering(&self, db: &DbClient) {
         let mut buffer = self.buffer.lock().await;
         buffer.scanning = false;
+        // A shutdown can discard mutations captured while the live store
+        // was revoked. Persist the bounded journal so the next startup can
+        // replay it after the event rebuild; an empty journal is left
+        // untouched (a previous crash may still own it).
+        if !buffer.mutations.is_empty() {
+            match serde_json::to_vec(&buffer.mutations) {
+                Ok(data) => {
+                    if !db.save_role_rebuild_pending(data).await {
+                        log::warn!(
+                            "could not persist the role rebuild mutation journal;                              captured mutations may be lost on shutdown"
+                        );
+                    }
+                }
+                Err(error) => {
+                    log::warn!("could not serialize the role rebuild mutation journal: {error}")
+                }
+            }
+        }
         // A dropped leave (buffered while the live store was revoked, never
         // applied to it) resurrects its member on the next rebuild: the
         // remove-user event published for it keeps clients correct, but the
         // rebuild only honors membership lists. Surface the count so the
-        // operator knows a re-leave may be needed.
+        // operator knows a re-leave may be needed if persistence failed.
         let dropped_leaves = buffer
             .mutations
             .iter()
@@ -1477,7 +1495,7 @@ async fn roles_rebuild_worker(
         // (e.g. a leave accepted while revoked) are reported and dropped:
         // the process is dying, so they can never replay.
         if *drain.borrow() {
-            state.leave_buffering().await;
+            state.leave_buffering(&db).await;
             break;
         }
         if !state.dirty.swap(false, Ordering::SeqCst) {
@@ -1496,7 +1514,7 @@ async fn roles_rebuild_worker(
                 )) => {}
                 _ = drain.changed() => {
                     state.dirty.store(true, Ordering::SeqCst);
-                    state.leave_buffering().await;
+                    state.leave_buffering(&db).await;
                     break;
                 }
             }
@@ -1525,7 +1543,7 @@ async fn roles_rebuild_worker(
             rebuilt = fresh.rebuild(&db, &relay_pubkey) => rebuilt,
             _ = drain.changed() => {
                 state.dirty.store(true, Ordering::SeqCst);
-                state.leave_buffering().await;
+                state.leave_buffering(&db).await;
                 log::warn!(
                     "role state rebuild aborted by shutdown; keeping the live role store \
                      empty (fail-closed) so the next startup rebuilds from the surviving \
@@ -4656,6 +4674,43 @@ impl Relay {
         all_stored
     }
 
+    /// Replays the bounded role-rebuild journal persisted at shutdown.
+    /// Returns whether a journal existed; the caller persists the store and
+    /// clears the journal only after that succeeds.
+    pub(crate) async fn apply_role_rebuild_journal(&self) -> anyhow::Result<bool> {
+        let Some(data) = self.db.load_role_rebuild_pending().await else {
+            return Err(anyhow::anyhow!(
+                "cannot read the role rebuild mutation journal; refusing to start \
+                 with potentially lost role mutations"
+            ));
+        };
+        let Some(data) = data else {
+            return Ok(false);
+        };
+        let mutations: Vec<BufferedRoleMutation> = serde_json::from_slice(&data)
+            .map_err(|error| anyhow::anyhow!("invalid role rebuild mutation journal: {error}"))?;
+        let mut roles = self.roles.write().await;
+        for mutation in &mutations {
+            if !replay_role_mutation(&mut roles, mutation) {
+                log::warn!(
+                    "role rebuild journal mutation could not be applied to the rebuilt \
+                     store: {mutation:?}"
+                );
+            }
+        }
+        Ok(true)
+    }
+
+    /// Clears the journal after the replayed state has been persisted.
+    pub(crate) async fn clear_role_rebuild_journal(&self) {
+        if !self.db.clear_role_rebuild_pending().await {
+            log::warn!(
+                "could not clear the role rebuild mutation journal; the next startup \
+                 will replay it again"
+            );
+        }
+    }
+
     /// Heals the NIP-43 role state left by a previous relay key.
     ///
     /// The role definitions, membership lists and add/remove-user events
@@ -7298,6 +7353,30 @@ mod tests {
                 .any(|t| t == &vec!["p".into(), member.clone()])),
             "the mid-flight leave must still announce its departure"
         );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn role_rebuild_journal_replays_captured_removal() {
+        let relay = build_relay().await;
+        let member = "aa".repeat(32);
+        assert!(relay.roles.write().await.admit(&member));
+        let journal = vec![BufferedRoleMutation::RemovePubkey {
+            pubkey: member.clone(),
+        }];
+        assert!(
+            relay
+                .db
+                .save_role_rebuild_pending(serde_json::to_vec(&journal).unwrap())
+                .await
+        );
+        assert!(relay.apply_role_rebuild_journal().await.unwrap());
+        assert!(
+            !relay.roles.read().await.is_member_of(&member),
+            "the persisted removal must be applied to the rebuilt store"
+        );
+        relay.clear_role_rebuild_journal().await;
+        assert_eq!(relay.db.load_role_rebuild_pending().await, Some(None));
         relay.db.shutdown();
     }
 

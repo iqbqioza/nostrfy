@@ -1082,6 +1082,11 @@ async fn restore_role_state(relay: &Relay) -> Result<()> {
             // overwriting it before a real role mutation.
             relay.preserve_role_snapshot();
             relay.finish_startup_role_recovery();
+            // Apply a shutdown journal before publishing the live roster,
+            // but keep it: this branch deliberately does not persist over
+            // the preserved old snapshot, so a later start must be able to
+            // replay the journal again after the relay key is restored.
+            relay.apply_role_rebuild_journal().await?;
             if relay.relay_pubkey().is_some()
                 && relay.config.read().await.nip_enabled(43)
                 && !relay.publish_membership(None).await
@@ -1105,6 +1110,20 @@ async fn restore_role_state(relay: &Relay) -> Result<()> {
             warn!("could not republish the NIP-43 membership list after the rebuild");
         }
         relay.persist_roles().await;
+    }
+    // Replay the bounded mutations captured while a rebuild was in flight
+    // at the previous shutdown. The event rebuild above is authoritative,
+    // but leaves/admissions made against the revoked store have no event
+    // to rebuild from; the journal is the only durable copy.
+    if relay.apply_role_rebuild_journal().await? {
+        if relay.persist_roles().await {
+            relay.clear_role_rebuild_journal().await;
+        } else {
+            warn!(
+                "could not persist the role store after replaying the shutdown journal; \
+                 keeping the journal for the next startup"
+            );
+        }
     }
     // A relay key rotation leaves the previous key's relay-signed role
     // state (33534/13534/8000/8001) stored: the current key can neither

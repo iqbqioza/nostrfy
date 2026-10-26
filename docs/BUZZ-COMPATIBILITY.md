@@ -329,10 +329,13 @@ host, because Buzz signs the relay URL it uploads to.
   entries are not treated as role-bearing assignments, and a vanished
   owner/allowlist entry is filtered from newly published `13534` rosters.
   A role rebuild that is aborted or overflows retains captured mutations for
-  the next scan; shutdown may still discard them because the process is
-  ending. A removal that is already waiting for the mutation buffer can
-  still interleave with a 13534 publish that passed its dirty/run check
-  immediately before the mark.
+  the next scan; on shutdown the bounded mutation journal is persisted under
+  an additive `index_meta` key and replayed after the next startup rebuild,
+  then cleared once the role snapshot is saved. If that journal save fails,
+  the captured leaves are still only in memory and can be lost. A removal
+  that is already waiting for the mutation buffer can still interleave with
+  a 13534 publish that passed its dirty/run check immediately before the
+  mark.
 - Buzz's push leases, workflow commands, moderation commands and
   hosted-community APIs are not part of this bridge.
 - NIP-34 git events (used by Buzz Projects) are rejected unless
