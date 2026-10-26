@@ -160,10 +160,13 @@ host, because Buzz signs the relay URL it uploads to.
   WebSocket REQ, COUNT, live delivery and NEG: a global filter does not
   receive a system channel's relay-signed state unless it names the channel
   (`#h`, `#d`, `#t:system` or `#P`).
-- Buzz's relay-member management commands (`kind:9030`-`9032`) are not wired
-  to nostrfy's access lists; manage an allowlist relay with `nostrfy relay
-  allow/deny` or NIP-86 instead. Channel member management (`kind:9000`/
-  `9001`) and the member UI do work.
+- Buzz's relay-member management commands (`kind:9030`-`9032`) are accepted
+  from a relay owner/NIP-86 admin or a NIP-43 `owner`/`admin` assignment and
+  update the NIP-43 role roster (member/admin; role changes use the same
+  roles). They update `kind:13534` and persist the role snapshot. They do not
+  edit the NIP-86 allowlist used by `restrict_relay`; manage that separately
+  with `nostrfy relay allow/deny` or NIP-86. Channel member management
+  (`kind:9000`/`9001`) and the member UI work as before.
 - Buzz's workspace-profile command (`kind:9033`) is accepted from a relay
   owner/NIP-86 admin or a NIP-43 `owner`/`admin` assignment. It validates the
   single `icon` tag (`https://` or `data:image/`, or empty), updates the

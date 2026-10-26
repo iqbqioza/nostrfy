@@ -3658,6 +3658,13 @@ impl Relay {
                 "error: cannot persist the workspace icon; the command was not accepted".into(),
             );
         }
+        if matches!(event.kind, 9030..=9032)
+            && let Err(reason) = self.apply_relay_member_command(&event).await
+        {
+            self.publish_rate_rollback(&event.pubkey, now);
+            self.stats.bump(&self.stats.events_rejected, 1);
+            return PutOutcome::Invalid(reason);
+        }
         let outcome = self
             .db
             .put_with_first_seen(Arc::clone(&event), now, first_seen)
@@ -3865,6 +3872,8 @@ impl Relay {
             || event.kind == crate::nips::nip29::DM_HIDE
             // Buzz workspace-profile command: it mutates the NIP-11 icon.
             || event.kind == 9033
+            // Buzz/NIP-43 relay member admin commands mutate the role store.
+            || matches!(event.kind, 9030..=9032)
             || nip62::is_vanish(event)
             || (event.kind == 1 && self.relay_pubkey.as_deref() == Some(event.pubkey.as_str()))
     }
@@ -7510,6 +7519,85 @@ mod tests {
         );
         relay.clear_role_rebuild_journal().await;
         assert_eq!(relay.db.load_role_rebuild_pending().await, Some(None));
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn relay_member_commands_update_the_roster() {
+        let key = "01".repeat(32);
+        let relay = build_role_relay(Some(&key)).await;
+        let owner = "aa".repeat(32);
+        let target = "bb".repeat(32);
+        relay.config.write().await.relay.pubkey = owner.clone();
+        let command = |kind: u64, tags: Vec<Vec<String>>| crate::event::Event {
+            id: String::new(),
+            pubkey: owner.clone(),
+            created_at: crate::util::unix_now(),
+            kind,
+            tags,
+            content: String::new(),
+            sig: String::new(),
+        };
+        let add = command(
+            9030,
+            vec![
+                vec!["p".into(), target.clone()],
+                vec!["role".into(), "admin".into()],
+            ],
+        );
+        relay
+            .apply_relay_member_command(&add)
+            .await
+            .expect("owner may add an admin member");
+        assert!(
+            relay
+                .roles
+                .read()
+                .await
+                .assignments
+                .get(&target)
+                .is_some_and(|roles| roles.iter().any(|role| role == "admin")),
+            "the member must hold the admin role"
+        );
+        let filter: crate::filter::Filter =
+            serde_json::from_value(serde_json::json!({"kinds": [13534]})).unwrap();
+        let (lists, _) = relay
+            .db
+            .query(vec![filter], 10, crate::util::unix_now())
+            .await;
+        assert_eq!(lists.len(), 1);
+        assert!(lists[0].tags.iter().any(|tag| {
+            tag.len() >= 3 && tag[0] == "member" && tag[1] == target && tag[2] == "admin"
+        }));
+
+        let change = command(
+            9032,
+            vec![
+                vec!["p".into(), target.clone()],
+                vec!["role".into(), "member".into()],
+            ],
+        );
+        relay
+            .apply_relay_member_command(&change)
+            .await
+            .expect("owner may change the member role");
+        assert!(
+            relay
+                .roles
+                .read()
+                .await
+                .assignments
+                .get(&target)
+                .is_some_and(Vec::is_empty),
+            "a member-role assignment has no privileged role"
+        );
+
+        let remove = command(9031, vec![vec!["p".into(), target.clone()]]);
+        relay
+            .apply_relay_member_command(&remove)
+            .await
+            .expect("owner may remove a member");
+        assert!(!relay.roles.read().await.is_member_of(&target));
         relay.db.shutdown();
     }
 

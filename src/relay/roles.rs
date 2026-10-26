@@ -558,6 +558,131 @@ impl super::Relay {
         }
     }
 
+    /// Applies a Buzz/NIP-43 relay member admin command (`9030` add,
+    /// `9031` remove, `9032` change role). The command event itself is
+    /// stored by the caller; this method only mutates the authoritative
+    /// role store and republishes the roster.
+    pub(crate) async fn apply_relay_member_command(
+        &self,
+        event: &crate::event::Event,
+    ) -> Result<(), String> {
+        if !self.config.read().await.nip_enabled(43) {
+            return Err("restricted: NIP-43 is disabled".into());
+        }
+        if !self.is_relay_owner_or_admin(&event.pubkey).await {
+            return Err("restricted: only the relay owner or an admin may manage members".into());
+        }
+        let kind = event.kind;
+        if !matches!(kind, 9030..=9032) {
+            return Err("invalid: not a relay member command".into());
+        }
+        let target = event
+            .tags
+            .iter()
+            .filter(|tag| tag.len() >= 2 && tag[0] == "p")
+            .map(|tag| tag[1].to_ascii_lowercase())
+            .find(|target| target.len() == 64 && target.bytes().all(|b| b.is_ascii_hexdigit()))
+            .ok_or_else(|| "invalid: member command needs one hex p tag".to_string())?;
+        let role = event
+            .tags
+            .iter()
+            .filter(|tag| tag.len() >= 2 && tag[0] == "role")
+            .map(|tag| tag[1].as_str())
+            .next();
+        if let Some(role) = role
+            && !matches!(role, "member" | "admin")
+        {
+            return Err("invalid: role must be member or admin".into());
+        }
+        if kind == 9032 && role.is_none() {
+            return Err("invalid: 9032 requires a role tag".into());
+        }
+        if kind == 9031
+            && self
+                .relay_owner_members()
+                .await
+                .iter()
+                .any(|owner| owner.eq_ignore_ascii_case(&target))
+        {
+            return Err("restricted: cannot remove a configured relay owner".into());
+        }
+        let buffer = self.roles_rebuild.buffer.lock().await;
+        if self.roles_rebuild.dirty.load(Ordering::SeqCst)
+            || self.roles_rebuild.running.load(Ordering::SeqCst)
+            || self.roles_rebuild.marking.load(Ordering::SeqCst)
+        {
+            return Err("error: role state is rebuilding; retry the command".into());
+        }
+        let mut definition_changed = false;
+        let changed = {
+            let mut roles = self.roles.write().await;
+            match kind {
+                9030 => {
+                    let desired = role.unwrap_or("member");
+                    if desired == "admin" && !roles.roles.contains_key("admin") {
+                        roles.create("admin", "admin", "", "", None);
+                        definition_changed = true;
+                    }
+                    let next = if desired == "admin" {
+                        vec!["admin".to_string()]
+                    } else {
+                        Vec::new()
+                    };
+                    let changed = roles.assignments.get(&target) != Some(&next);
+                    roles.assignments.insert(target.clone(), next);
+                    changed
+                }
+                9032 => {
+                    let desired = role.ok_or_else(|| "invalid: role is required".to_string())?;
+                    if desired == "admin" && !roles.roles.contains_key("admin") {
+                        roles.create("admin", "admin", "", "", None);
+                        definition_changed = true;
+                    }
+                    let next = if desired == "admin" {
+                        vec!["admin".to_string()]
+                    } else {
+                        Vec::new()
+                    };
+                    let changed = roles.assignments.get(&target) != Some(&next);
+                    roles.assignments.insert(target.clone(), next);
+                    changed
+                }
+                _ => {
+                    if let Some(required) = role {
+                        let current = roles.assignments.get(&target);
+                        let matches = match required {
+                            "member" => current.is_some_and(Vec::is_empty),
+                            "admin" => {
+                                current.is_some_and(|roles| roles.iter().any(|r| r == "admin"))
+                            }
+                            _ => false,
+                        };
+                        if !matches {
+                            return Err(
+                                "restricted: member does not have the requested role".into()
+                            );
+                        }
+                    }
+                    roles.remove_pubkey(&target)
+                }
+            }
+        };
+        let changed = changed || definition_changed;
+        if !changed {
+            return Ok(());
+        }
+        self.release_role_snapshot_preserve();
+        self.schedule_roles_persist();
+        if !self.publish_role_state().await {
+            return Err("error: could not publish the NIP-43 roster".into());
+        }
+        if !self.persist_roles().await {
+            return Err("error: could not persist the NIP-43 role state".into());
+        }
+        drop(buffer);
+        Ok(())
+    }
+
     pub async fn assign_role(&self, pubkey: &str, role: &str) -> RoleChange {
         if !self.config.read().await.nip_enabled(43) || self.key.is_none() {
             return RoleChange::Failed;
