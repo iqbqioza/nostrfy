@@ -54,6 +54,10 @@ pub const MOD_MIN: u64 = 9000;
 pub const MOD_MAX: u64 = 9020;
 pub const PUT_USER: u64 = 9000;
 pub const REMOVE_USER: u64 = 9001;
+/// Internal marker on the relay-signed `9000` mirror emitted for a JOIN.
+/// It lets replay treat that mirror as add-only without misclassifying an
+/// ordinary relay-master-key `9000` demotion.
+pub(crate) const JOIN_MIRROR_TAG: &str = "join_mirror";
 pub const CREATE_GROUP: u64 = 9007;
 pub const DELETE_GROUP: u64 = 9008;
 /// NIP-29 join request. The normative section says a relay MUST reject a
@@ -369,6 +373,17 @@ fn tag_grants_privileged_role(tag: &[String], buzz: bool, buzz_role: Option<&str
     }
     !any && buzz_role
         .is_some_and(|role| !role.is_empty() && !matches!(role, "guest" | "member" | "bot"))
+}
+
+/// NIP-CL/Buzz tags that the live plain path ignores but the history replay
+/// would honor. Plain mode must reject them on a group without Buzz
+/// provenance; otherwise a stored create/edit changes visibility after a
+/// restart even though it was a no-op when accepted.
+fn has_replay_sensitive_buzz_tags(event: &Event) -> bool {
+    event.tags.iter().any(|tag| {
+        tag.first()
+            .is_some_and(|name| name == "channel_type" || name == "visibility")
+    })
 }
 
 /// Validates the NIP-CL tags on a create/edit event. The whole event is
@@ -976,6 +991,9 @@ impl GroupStore {
             // with the same id must remain possible (the create clears the
             // marker in `apply`). Without this an id could never be reused.
             if event.kind == CREATE_GROUP {
+                if !self.buzz_enabled && has_replay_sensitive_buzz_tags(event) {
+                    bail!("restricted: NIP-CL channel tags require Buzz support");
+                }
                 if self.at_capacity() {
                     bail!("restricted: group limit reached");
                 }
@@ -993,6 +1011,9 @@ impl GroupStore {
             // group to admit the user into), so it is rejected here like
             // every other moderation event for an unknown group.
             if event.kind == CREATE_GROUP {
+                if !self.buzz_enabled && has_replay_sensitive_buzz_tags(event) {
+                    bail!("restricted: NIP-CL channel tags require Buzz support");
+                }
                 if self.at_capacity() {
                     bail!("restricted: group limit reached");
                 }
@@ -1008,6 +1029,19 @@ impl GroupStore {
         // (see `validate_write_for_relay`): it is accepted even when no
         // group admin remains.
         let relay_signed = relay_pubkey.is_some_and(|pk| pk.eq_ignore_ascii_case(pubkey));
+
+        // A plain-origin group ignores NIP-CL channel tags live but the
+        // history replay honors them as a privacy floor. Reject the tags on
+        // a plain group so the two paths cannot diverge after a restart.
+        // Buzz-created/edited groups keep the explicit transition.
+        if !self.buzz_enabled
+            && event.kind == 9002
+            && group.channel_type.is_empty()
+            && !group.buzz_metadata
+            && has_replay_sensitive_buzz_tags(event)
+        {
+            bail!("restricted: NIP-CL channel tags require Buzz support");
+        }
 
         if event.kind == JOIN {
             if group.is_member(pubkey) {
@@ -1338,12 +1372,11 @@ impl GroupStore {
                         // a Buzz-level `role` tag. A p-tag role would turn
                         // into an ordinary admin label if Buzz is later
                         // disabled; the separate role tag is ignored by
-                        // plain-NIP-29 replay. Stamp the mirror at the JOIN
-                        // time, not the apply time: a promotion created
-                        // after the JOIN but before the delayed apply must
-                        // sort after the mirror on replay.
-                        let mut put =
-                            build_put_user(gid, &member, &[], relay_pubkey, event.created_at);
+                        // plain-NIP-29 replay. Stamp it with the apply
+                        // stamp: inheriting the client's (possibly
+                        // future-dated) JOIN timestamp would let the mirror
+                        // outrank a later removal on replay.
+                        let mut put = build_put_user(gid, &member, &[], relay_pubkey, now);
                         if join_role_guest {
                             put.tags.push(vec!["role".into(), "guest".into()]);
                         }
@@ -1440,8 +1473,21 @@ impl GroupStore {
                     // order (same second, id order), and replaying the event
                     // without the re-check would re-apply a demotion the live
                     // race dropped, leaving the group admin-less (B-1).
+                    // A relay-signed JOIN mirror is add-only for an
+                    // existing member: replay order must not overwrite a
+                    // later explicit promotion or a tier restored by the
+                    // JOIN. The dedicated marker distinguishes the mirror
+                    // from an ordinary relay-master-key `9000` demotion.
+                    let relay_join_mirror = relay_signed
+                        && event
+                            .tags
+                            .iter()
+                            .any(|tag| tag.first().is_some_and(|name| name == JOIN_MIRROR_TAG));
                     let mut overrides: HashMap<&str, bool> = HashMap::new();
                     for tag in event.tags.iter().filter(|t| t.len() >= 2 && t[0] == P) {
+                        if relay_join_mirror && group.is_member(&tag[1]) {
+                            continue;
+                        }
                         // A Buzz `role=admin|owner|other` tag grants a
                         // privileged role even though the p tag itself has
                         // no role elements; the guest/bot tiers do not.
@@ -1518,6 +1564,9 @@ impl GroupStore {
                             && self.total_members.saturating_add(added) >= self.max_total_members
                             && !group.is_member(&tag[1]);
                         if over_global {
+                            continue;
+                        }
+                        if relay_join_mirror && group.is_member(&tag[1]) {
                             continue;
                         }
                         let pk = tag[1].clone();
@@ -1599,9 +1648,19 @@ impl GroupStore {
                                 added += 1;
                                 added_members.push(pk.clone());
                             }
-                        } else if !group.members.contains_key(&pk) {
-                            added += 1;
-                            added_members.push(pk.clone());
+                        } else {
+                            let new_member = !group.members.contains_key(&pk);
+                            if new_member {
+                                group.hidden_for.remove(&pk);
+                                added += 1;
+                                added_members.push(pk.clone());
+                            }
+                            // Plain NIP-29 has no guest/bot tiers: a plain
+                            // role edit replaces any Buzz-mode markers too,
+                            // so re-enabling Buzz cannot silently restore a
+                            // stale read-only/bot label.
+                            group.guests.remove(&pk);
+                            group.bots.remove(&pk);
                         }
                         group.members.insert(pk, roles);
                     }
@@ -1712,10 +1771,22 @@ impl GroupStore {
                 // provenance so turning Buzz off later cannot reinterpret
                 // the stored event as a whole-metadata replacement and
                 // clear the group's privacy flags.
-                if self.buzz_enabled
-                    && let Some(group) = self.groups.get_mut(gid)
-                {
-                    group.buzz_metadata = true;
+                if let Some(group) = self.groups.get_mut(gid) {
+                    if self.buzz_enabled {
+                        group.buzz_metadata = true;
+                    } else if history_replay
+                        && event.tags.iter().any(|tag| {
+                            tag.first().is_some_and(|name| name == "visibility")
+                                && tag.get(1).map(String::as_str) == Some("private")
+                        })
+                    {
+                        // A snapshot-less rebuild can still recognize the
+                        // privacy-bearing Buzz form even when the mode is
+                        // off; without this marker the next name-only stored
+                        // 9002 would be replayed as a whole-metadata edit
+                        // and clear `private`.
+                        group.buzz_metadata = true;
+                    }
                 }
                 // Re-check the graph invariants under the write lock: two
                 // concurrent 9002 edits can each pass the read-side
@@ -1782,11 +1853,13 @@ impl GroupStore {
                 // whole-metadata edit keeps the pre-Buzz behavior: an absent
                 // `parent` detaches and an absent child list clears it. A
                 // Buzz-origin channel follows the stored partial semantics
-                // even while Buzz is off, for both live edits and replay.
+                // on replay; a live plain edit is still NIP-29 whole
+                // metadata (with the settings privacy floor).
                 let partial_links = self.buzz_enabled
-                    || group_snapshot
-                        .as_ref()
-                        .is_some_and(|group| !group.channel_type.is_empty() || group.buzz_metadata);
+                    || (history_replay
+                        && group_snapshot.as_ref().is_some_and(|group| {
+                            !group.channel_type.is_empty() || group.buzz_metadata
+                        }));
                 // A valueless tag is malformed, not evidence that the field
                 // was supplied. An explicit empty value (`["parent", ""]`)
                 // is the Buzz-partial way to request a detach.
@@ -3465,9 +3538,9 @@ fn validate_edit_metadata(
             .tags
             .iter()
             .any(|tag| tag.len() >= 2 && tag[0] == "child");
-        let partial_children =
-            (store.buzz_enabled || group.buzz_metadata || !group.channel_type.is_empty())
-                && !has_child_tags;
+        let partial_children = (store.buzz_enabled
+            || (replay && (group.buzz_metadata || !group.channel_type.is_empty())))
+            && !has_child_tags;
         if !partial_children {
             let children: HashSet<&str> = tag_values(event, "child").collect();
             if !group.children.iter().all(|c| children.contains(c.as_str())) {

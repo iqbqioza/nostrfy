@@ -807,3 +807,30 @@ fn bridge_url_matches_only_the_configured_relay_identity() {
         "the authority must match exactly"
     );
 }
+
+#[test]
+fn bridge_url_allows_loopback_aliases_only_without_a_public_url() {
+    let mut cfg = Config::default();
+    cfg.relay.public_url.clear();
+    cfg.server.host = "127.0.0.1".into();
+    assert!(super::bridge_url_matches(
+        &cfg,
+        "http://localhost:8080/query",
+        "/query"
+    ));
+    assert!(!super::bridge_url_matches(
+        &cfg,
+        "https://relay.example.com/query",
+        "/query"
+    ));
+    assert!(!super::bridge_url_matches(
+        &cfg,
+        "http://localhost:9999/query",
+        "/query"
+    ));
+    assert!(!super::bridge_url_matches(
+        &cfg,
+        "https://localhost:8080/query",
+        "/query"
+    ));
+}

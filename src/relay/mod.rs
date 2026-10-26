@@ -1037,6 +1037,11 @@ struct RolesRebuild {
     /// A worker task owns (or is about to own) the rebuild loop: triggers
     /// only set the flags.
     running: std::sync::atomic::AtomicBool,
+    /// The startup rebuild found no role events for the current relay key,
+    /// while a previous snapshot/foreign-key events may still be the only
+    /// copy of the assignments. Refuse to persist an empty snapshot until a
+    /// real role mutation supersedes it.
+    preserve_snapshot: std::sync::atomic::AtomicBool,
     /// Unix seconds of the last completed attempt, the minimum-interval
     /// floor (see [`ROLES_REBUILD_MIN_INTERVAL_SECS`]).
     last: std::sync::atomic::AtomicU64,
@@ -1299,12 +1304,26 @@ async fn roles_rebuild_worker(
         if !state.finish_rebuild(&roles, fresh).await {
             continue;
         }
+        // A fresh non-empty store is authoritative and supersedes the
+        // preserved old snapshot; an empty one must not overwrite it.
+        let (empty, preserved) = {
+            let store = roles.read().await;
+            (
+                store.roles.is_empty() && store.assignments.is_empty(),
+                state.preserve_snapshot.load(Ordering::SeqCst),
+            )
+        };
+        if !empty {
+            state.preserve_snapshot.store(false, Ordering::SeqCst);
+        }
         // Persist the fresh store under the mutation-serializing lock. A
         // mutation that lands in the meantime is refused persistence (the
         // state is not established yet) and a removal clears the store
         // again; the loop then rebuilds with the surviving state.
         let _persist = persist_lock.lock().await;
-        if persist_fresh_roles(&db, &roles, &state).await == PersistOutcome::Failed {
+        if !(empty && preserved)
+            && persist_fresh_roles(&db, &roles, &state).await == PersistOutcome::Failed
+        {
             state
                 .failed_rebuilds
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1378,6 +1397,12 @@ async fn persist_fresh_roles(
     if state.dirty.load(Ordering::SeqCst) {
         return PersistOutcome::Failed;
     }
+    if state.preserve_snapshot.load(Ordering::SeqCst)
+        && snapshot.roles.is_empty()
+        && snapshot.assignments.is_empty()
+    {
+        return PersistOutcome::Failed;
+    }
     if state.derived.in_flight() {
         return PersistOutcome::Deferred;
     }
@@ -1423,7 +1448,11 @@ async fn persist_roles_now(
     // already-advanced generation would make the next startup accept it.
     // The stored snapshot keeps its older generation, so startup rejects it
     // and rebuilds from the surviving events.
-    let stale = || state.dirty.load(Ordering::SeqCst) || state.running.load(Ordering::SeqCst);
+    let stale = || {
+        state.dirty.load(Ordering::SeqCst)
+            || state.running.load(Ordering::SeqCst)
+            || state.preserve_snapshot.load(Ordering::SeqCst)
+    };
     if stale() {
         return PersistOutcome::Failed;
     }
@@ -4332,6 +4361,17 @@ impl Relay {
                             .map(String::as_str)
                             .filter(|role| !role.is_empty())
                             .collect();
+                        let pubkey = tag[1].to_ascii_lowercase();
+                        let synthetic_owner =
+                            roles_in_tag.as_slice() == ["owner"] && owners.contains(&pubkey);
+                        if synthetic_owner {
+                            // `membership_event` overwrites an owner entry
+                            // to exactly `owner`, even if the same pubkey
+                            // also has a role assignment. Check this before
+                            // the assignment branch so that configuration
+                            // does not keep the former key's events forever.
+                            continue;
+                        }
                         if let Some(assigned) = roles.assignments.get(&tag[1]) {
                             if !roles_in_tag
                                 .iter()
@@ -4340,9 +4380,6 @@ impl Relay {
                                 return false;
                             }
                         } else {
-                            let pubkey = tag[1].to_ascii_lowercase();
-                            let synthetic_owner =
-                                roles_in_tag.as_slice() == ["owner"] && owners.contains(&pubkey);
                             let synthetic_allowlist =
                                 roles_in_tag.is_empty() && allowlisted.contains(&pubkey);
                             // `membership_event` injects these entries from
@@ -4354,7 +4391,7 @@ impl Relay {
                             // owner/member removed from config stays
                             // uncovered, so the cleanup keeps the former
                             // events rather than guessing.
-                            if !synthetic_owner && !synthetic_allowlist {
+                            if !synthetic_allowlist {
                                 return false;
                             }
                         }
@@ -5113,6 +5150,23 @@ impl Relay {
     /// coalesced worker owns the state here.
     pub(crate) fn finish_startup_role_recovery(&self) {
         self.roles_rebuild.dirty.store(false, Ordering::SeqCst);
+    }
+
+    /// Protect the last persisted NIP-43 snapshot after an empty/keyless/
+    /// rotated-key rebuild. A later reload or mutation must not overwrite it
+    /// with an empty roster until a real role change supersedes it.
+    pub(crate) fn preserve_role_snapshot(&self) {
+        self.roles_rebuild
+            .preserve_snapshot
+            .store(true, Ordering::SeqCst);
+    }
+
+    /// A non-empty rebuild or a real role mutation made the current store
+    /// authoritative again; allow persistence.
+    pub(crate) fn release_role_snapshot_preserve(&self) {
+        self.roles_rebuild
+            .preserve_snapshot
+            .store(false, Ordering::SeqCst);
     }
 
     /// Releases the startup recovery gate after `startup_group_state` has
@@ -13167,6 +13221,36 @@ mod tests {
                 stored.len()
             );
         }
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_preserved_role_snapshot_survives_an_empty_persist() {
+        let relay = build_role_relay(Some(&"01".repeat(32))).await;
+        relay
+            .roles
+            .write()
+            .await
+            .create("king", "King", "", "", None);
+        relay.roles.write().await.add_claim("welcome");
+        assert!(
+            relay.persist_roles().await,
+            "the baseline snapshot must save"
+        );
+
+        *relay.roles.write().await = RoleStore::default();
+        relay.preserve_role_snapshot();
+        relay.finish_startup_role_recovery();
+        assert!(
+            !relay.persist_roles().await,
+            "an empty persist must not overwrite the preserved snapshot"
+        );
+        let saved = relay.db.load_roles().await.expect_loaded("snapshot");
+        assert!(saved.roles.contains_key("king"));
+        assert!(saved.claims.contains("welcome"));
+
+        relay.release_role_snapshot_preserve();
+        assert!(relay.persist_roles().await);
         relay.db.shutdown();
     }
 }

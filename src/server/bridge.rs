@@ -78,15 +78,49 @@ fn unauthorized(message: &str) -> Response {
 
 /// NIP-98 `u` matching for the bridge.
 ///
-/// Buzz signs the absolute URL it requested. Only the configured relay
-/// identity is authoritative: comparing the signed authority with the
-/// request `Host` header would bind the token to an attacker-controlled
-/// value and let a captured authorization be replayed against another
-/// origin. Deployments behind a proxy must set `relay.public_url` to the
-/// externally visible origin; the direct `http://host:port` form is also
-/// covered by [`crate::nips::nip62::RelayIdentity::http_origin`].
+/// Buzz signs the absolute URL it requested. The configured relay identity
+/// is authoritative. When `relay.public_url` is unset (a direct local
+/// deployment), accept the configured bind host and loopback aliases as a
+/// fixed allowlist; never compare against the request `Host` header, which
+/// an attacker controls and could use to replay a captured authorization
+/// from another origin. Deployments behind a proxy must set
+/// `relay.public_url` to the externally visible origin.
 fn bridge_url_matches(cfg: &crate::config::Config, url: &str, path: &str) -> bool {
-    nip98::matches_request_url(url, &cfg.relay_identity(), path, None)
+    if nip98::matches_request_url(url, &cfg.relay_identity(), path, None) {
+        return true;
+    }
+    if !cfg.relay.public_url.trim().is_empty() {
+        return false;
+    }
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return false;
+    };
+    // The direct fallback is plain HTTP only; a TLS-proxied deployment must
+    // configure `relay.public_url` so its scheme and authority are pinned.
+    if !scheme.eq_ignore_ascii_case("http") {
+        return false;
+    }
+    let rest = rest.split('#').next().unwrap_or(rest);
+    let (authority, signed_path) = rest.split_once('/').unwrap_or((rest, ""));
+    if authority.contains('@') || signed_path.is_empty() {
+        return false;
+    }
+    if format!("/{signed_path}") != path {
+        return false;
+    }
+    let (authority_host, signed_port) = crate::nips::nip62::split_host_port(authority);
+    let signed_port = signed_port.unwrap_or(80);
+    if signed_port != cfg.server.port {
+        return false;
+    }
+    let signed_host = super::normalize_host(authority_host);
+    let configured = super::normalize_host(&cfg.server.host);
+    let loopback = matches!(
+        configured.as_str(),
+        "" | "0.0.0.0" | "::" | "127.0.0.1" | "::1" | "localhost"
+    );
+    signed_host == configured
+        || (loopback && matches!(signed_host.as_str(), "127.0.0.1" | "::1" | "localhost"))
 }
 
 /// Verifies the NIP-98 authorization of a bridge request.

@@ -7,7 +7,7 @@ use crate::event::Event;
 
 use super::{
     D, GROUP_ADMINS, GROUP_MEMBERS, GROUP_META, GROUP_PARTICIPANTS, GROUP_PINS, GROUP_ROLES, Group,
-    GroupSettings, H, P,
+    GroupSettings, H, JOIN_MIRROR_TAG, P,
 };
 /// Applies a kind:9007/9002 metadata event.
 ///
@@ -107,8 +107,15 @@ pub(crate) fn apply_settings(group: &mut Group, event: &Event, buzz: bool, histo
     // NIP-CL announce channels: `join_role=guest` means only members (and
     // guests are read-only) may post, which NIP-29 expresses as
     // `restricted`. Changing it back to `member` clears the flag unless the
-    // channel is private for another reason.
-    if let Some(role) = &group.settings.join_role {
+    // channel is private for another reason. Re-derive only when this event
+    // actually carries join_role, so an explicit `restricted` tag is not
+    // overwritten by the old value in a partial edit.
+    if event
+        .tags
+        .iter()
+        .any(|tag| tag.first().is_some_and(|name| name == "join_role"))
+        && let Some(role) = &group.settings.join_role
+    {
         if role == "member" {
             if !group.settings.private {
                 group.settings.restricted = false;
@@ -156,10 +163,10 @@ pub(crate) fn apply_plain_create_privacy(group: &mut Group, event: &Event) {
 /// NIP-29's original whole-metadata semantics for `9002`/`9007`: fields
 /// absent from the event are cleared. Buzz-only settings are kept so a plain
 /// NIP-29 edit does not erase state that only another Buzz client can see or
-/// change. A Buzz-origin group (`channel_type` or a persisted Buzz metadata
-/// edit) instead treats the edit as partial even when the compatibility
-/// layer is disabled, so a mode-off live edit or rebuild cannot clear its
-/// privacy or metadata.
+/// change. A stored Buzz partial edit on a Buzz-origin group (non-empty
+/// `channel_type` or `buzz_metadata`) is replayed as partial even with the
+/// compatibility layer disabled; a **live** plain edit keeps only the
+/// privacy floor and otherwise follows NIP-29 whole-metadata replacement.
 fn apply_nip29_settings(group: &mut Group, event: &Event, history: bool) {
     let old = group.settings.clone();
     // A Buzz-created channel always carries a channel_type. A plain-origin
@@ -167,6 +174,7 @@ fn apply_nip29_settings(group: &mut Group, event: &Event, history: bool) {
     // partial-edit privacy floor after Buzz is disabled. A genuinely plain
     // group has neither and keeps the original whole-metadata semantics.
     let buzz_origin = !group.channel_type.is_empty() || group.buzz_metadata;
+    let partial = history && buzz_origin;
     let mut settings = GroupSettings {
         topic: old.topic,
         purpose: old.purpose,
@@ -175,12 +183,10 @@ fn apply_nip29_settings(group: &mut Group, event: &Event, history: bool) {
         join_role: old.join_role,
         ..GroupSettings::default()
     };
-    if buzz_origin {
-        // Buzz's 9002 is partial. A stored Buzz edit therefore represents
-        // only the fields it carried; preserve the rest while rebuilding a
-        // Buzz-created channel instead of applying plain NIP-29's
-        // whole-metadata replacement. Plain groups (no channel_type) keep
-        // the original full-replacement semantics.
+    if partial {
+        // A stored Buzz edit represents only the fields it carried; preserve
+        // the rest while rebuilding a Buzz-created channel instead of
+        // applying plain NIP-29's whole-metadata replacement.
         settings.name = old.name;
         settings.picture = old.picture;
         settings.banner = old.banner;
@@ -191,6 +197,15 @@ fn apply_nip29_settings(group: &mut Group, event: &Event, history: bool) {
         settings.hidden = old.hidden;
         settings.livekit = old.livekit;
         settings.supported_kinds = old.supported_kinds;
+    } else if buzz_origin {
+        // A live plain edit after Buzz was disabled is still NIP-29 whole
+        // metadata for ordinary clients, but a missing privacy tag must not
+        // expose stored private/hidden content. The explicit privacy tags
+        // below can still open the group.
+        settings.private = old.private;
+        settings.restricted = old.restricted;
+        settings.closed = old.closed;
+        settings.hidden = old.hidden;
     }
     for tag in &event.tags {
         if tag.is_empty() {
@@ -277,7 +292,15 @@ fn apply_nip29_settings(group: &mut Group, event: &Event, history: bool) {
         }
     }
     if buzz_origin {
-        if let Some(role) = &settings.join_role {
+        // Only an event that actually changes join_role may re-derive
+        // `restricted`; otherwise an explicit `restricted` tag in the same
+        // 9002 would be overwritten by the old join_role.
+        if event
+            .tags
+            .iter()
+            .any(|tag| tag.first().is_some_and(|name| name == "join_role"))
+            && let Some(role) = &settings.join_role
+        {
             if role == "member" {
                 // Clearing join_role=guest must not open a private channel.
                 settings.restricted &= settings.private;
@@ -644,6 +667,9 @@ pub(crate) fn build_put_user(
     let mut tag = vec![P.to_string(), member.to_string()];
     tag.extend(roles.iter().map(|r| r.to_string()));
     event.tags.push(tag);
+    event
+        .tags
+        .push(vec![JOIN_MIRROR_TAG.to_string(), "1".to_string()]);
     event
 }
 

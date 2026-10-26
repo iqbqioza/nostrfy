@@ -5751,7 +5751,7 @@ fn old_relay_signed_join_mirror_does_not_clear_a_guest_tier() {
 }
 
 #[test]
-fn join_mirror_is_stamped_at_the_join_time() {
+fn join_mirror_carries_guest_role_and_apply_stamp() {
     let mut store = GroupStore {
         buzz_enabled: true,
         ..GroupStore::default()
@@ -5780,8 +5780,9 @@ fn join_mirror_is_stamped_at_the_join_time() {
         .find(|event| event.kind == PUT_USER)
         .expect("the JOIN emits a relay mirror");
     assert_eq!(
-        mirror.created_at, join.created_at,
-        "a later promotion must sort after the mirror, not before it"
+        mirror.created_at,
+        now + 100,
+        "the mirror must use the apply stamp, not a future-dated JOIN timestamp"
     );
     assert!(
         mirror
@@ -5905,4 +5906,278 @@ fn plain_group_edited_by_buzz_keeps_privacy_after_mode_off() {
         false,
     );
     assert!(!store.group("g1").unwrap().settings.private);
+}
+
+#[test]
+fn plain_mode_rejects_tags_that_replay_would_reinterpret() {
+    let mut store = GroupStore::default();
+    let create = event(
+        CREATE_GROUP,
+        ADMIN,
+        Some("g1"),
+        vec![
+            vec!["channel_type".into(), "dm".into()],
+            vec!["visibility".into(), "private".into()],
+        ],
+    );
+    assert!(
+        store.validate_write(&create).is_err(),
+        "plain mode must reject a create whose NIP-CL tags are ignored live"
+    );
+
+    store.apply(
+        &event(CREATE_GROUP, ADMIN, Some("g1"), vec![]),
+        "relay",
+        1_600_000_000,
+        false,
+        false,
+    );
+    let edit = event(
+        9002,
+        ADMIN,
+        Some("g1"),
+        vec![vec!["visibility".into(), "private".into()]],
+    );
+    assert!(
+        store.validate_write(&edit).is_err(),
+        "plain mode must reject a visibility edit it would not apply live"
+    );
+
+    store.buzz_enabled = true;
+    assert!(
+        store.validate_write(&edit).is_ok(),
+        "Buzz mode applies the same tag and may accept it"
+    );
+}
+
+#[test]
+fn buzz_partial_join_role_does_not_override_explicit_restricted() {
+    let mut store = GroupStore {
+        buzz_enabled: true,
+        ..GroupStore::default()
+    };
+    let now = 1_600_000_000;
+    store.apply(
+        &event(
+            CREATE_GROUP,
+            ADMIN,
+            Some("g1"),
+            vec![vec!["join_role".into(), "member".into()]],
+        ),
+        "relay",
+        now,
+        false,
+        false,
+    );
+    store.apply(
+        &event(9002, ADMIN, Some("g1"), vec![vec!["restricted".into()]]),
+        "relay",
+        now + 1,
+        false,
+        false,
+    );
+    assert!(
+        store.group("g1").unwrap().settings.restricted,
+        "an explicit restricted tag must win over the unchanged join_role"
+    );
+}
+
+#[test]
+fn plain_live_metadata_edit_clears_non_privacy_fields_on_buzz_origin() {
+    let mut store = GroupStore::default();
+    let now = 1_600_000_000;
+    store.apply(
+        &event(CREATE_GROUP, ADMIN, Some("g1"), vec![]),
+        "relay",
+        now,
+        false,
+        false,
+    );
+    store.apply(
+        &event(
+            9002,
+            ADMIN,
+            Some("g1"),
+            vec![
+                vec!["name".into(), "buzz".into()],
+                vec!["supported_kinds".into(), "1".into()],
+            ],
+        ),
+        "relay",
+        now + 1,
+        false,
+        false,
+    );
+    store.buzz_enabled = true;
+    store.apply(
+        &event(
+            9002,
+            ADMIN,
+            Some("g1"),
+            vec![vec!["name".into(), "buzz renamed".into()]],
+        ),
+        "relay",
+        now + 2,
+        false,
+        false,
+    );
+    assert!(store.group("g1").unwrap().buzz_metadata);
+    store.buzz_enabled = false;
+    store.apply(
+        &event(
+            9002,
+            ADMIN,
+            Some("g1"),
+            vec![vec!["name".into(), "plain".into()]],
+        ),
+        "relay",
+        now + 3,
+        false,
+        false,
+    );
+    let group = store.group("g1").unwrap();
+    assert_eq!(group.settings.name, "plain");
+    assert!(
+        group.settings.supported_kinds.is_none(),
+        "a plain whole-metadata edit must clear omitted supported_kinds"
+    );
+}
+
+#[test]
+fn plain_put_user_clears_restored_buzz_tiers() {
+    let mut store = GroupStore {
+        buzz_enabled: true,
+        ..GroupStore::default()
+    };
+    let now = 1_600_000_000;
+    store.apply(
+        &event(CREATE_GROUP, ADMIN, Some("g1"), vec![]),
+        "relay",
+        now,
+        false,
+        false,
+    );
+    store.apply(
+        &event(
+            PUT_USER,
+            ADMIN,
+            Some("g1"),
+            vec![
+                vec!["p".into(), USER.to_string()],
+                vec!["role".into(), "guest".into()],
+            ],
+        ),
+        "relay",
+        now + 1,
+        false,
+        false,
+    );
+    assert!(store.group("g1").unwrap().is_guest(USER));
+    store.buzz_enabled = false;
+    store.apply(
+        &event(
+            PUT_USER,
+            ADMIN,
+            Some("g1"),
+            vec![vec!["p".into(), USER.to_string(), "mod".into()]],
+        ),
+        "relay",
+        now + 2,
+        false,
+        false,
+    );
+    let group = store.group("g1").unwrap();
+    assert!(
+        !group.is_guest(USER),
+        "a plain-mode role edit must clear the stale Buzz guest marker"
+    );
+    assert!(group.is_admin(USER));
+}
+
+#[test]
+fn history_replay_infers_buzz_provenance_from_a_visibility_edit() {
+    let mut store = GroupStore::default();
+    let now = 1_600_000_000;
+    store.apply(
+        &event(CREATE_GROUP, ADMIN, Some("g1"), vec![]),
+        "relay",
+        now,
+        false,
+        true,
+    );
+    store.apply(
+        &event(
+            9002,
+            ADMIN,
+            Some("g1"),
+            vec![vec!["visibility".into(), "private".into()]],
+        ),
+        "relay",
+        now + 1,
+        false,
+        true,
+    );
+    assert!(store.group("g1").unwrap().buzz_metadata);
+    assert!(store.group("g1").unwrap().settings.private);
+    store.apply(
+        &event(
+            9002,
+            ADMIN,
+            Some("g1"),
+            vec![vec!["name".into(), "renamed".into()]],
+        ),
+        "relay",
+        now + 2,
+        false,
+        true,
+    );
+    assert!(
+        store.group("g1").unwrap().settings.private,
+        "the inferred Buzz partial must keep the privacy floor on later replay"
+    );
+}
+
+#[test]
+fn relay_master_bare_put_user_still_demotes_roles() {
+    let mut store = GroupStore {
+        buzz_enabled: true,
+        ..GroupStore::default()
+    };
+    let now = 1_600_000_000;
+    store.apply(
+        &event(CREATE_GROUP, ADMIN, Some("g1"), vec![]),
+        "relay",
+        now,
+        false,
+        false,
+    );
+    store.apply(
+        &event(
+            PUT_USER,
+            ADMIN,
+            Some("g1"),
+            vec![vec!["p".into(), USER.to_string(), "mod".into()]],
+        ),
+        "relay",
+        now + 1,
+        false,
+        false,
+    );
+    assert!(store.group("g1").unwrap().is_admin(USER));
+    store.apply(
+        &event(
+            PUT_USER,
+            "relay",
+            Some("g1"),
+            vec![vec!["p".into(), USER.to_string()]],
+        ),
+        "relay",
+        now + 2,
+        false,
+        false,
+    );
+    assert!(
+        !store.group("g1").unwrap().is_admin(USER),
+        "a relay-master-key 9000 without the JOIN marker must remain a demotion"
+    );
 }

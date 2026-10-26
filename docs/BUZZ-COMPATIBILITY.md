@@ -17,11 +17,15 @@ With `enabled_buzz = false` the relay keeps the pre-Buzz NIP-29 behavior:
 `9002` replaces the whole group metadata (Buzz mode makes it a partial
 update), `39002` carries bare `p` tags, the creator is the `admin` role,
 plain `9007` tags are not treated as initial metadata (use `9002`), and
-NIP-CL channel tags/guests/bots are ignored. The exception is a group with
-Buzz provenance (a non-empty `channel_type` or a stored Buzz partial edit):
-it keeps the partial-edit privacy floor in live plain mode and replay, so
-a mode switch cannot expose its private messages. This keeps ordinary
-NIP-29 clients unaffected by the compatibility layer.
+NIP-CL channel tags/guests/bots are not applied. A plain group rejects
+`channel_type`/`visibility` tags on create/edit instead of ignoring them,
+because the rebuild would otherwise honor a stored tag the live path
+ignored. The exception is a group with Buzz provenance (a non-empty
+`channel_type` or a stored Buzz partial edit): it keeps the partial-edit
+privacy floor in live plain mode and replay, so a mode switch cannot expose
+its private messages. Apart from that floor, a live plain `9002` still
+replaces ordinary NIP-29 metadata. This keeps ordinary NIP-29 clients
+unaffected by the compatibility layer.
 - A relay signing key: set `relay.private_key` (64 hex chars, generated with
   `nostrfy genkey`). Buzz needs the relay's `kind:39000` metadata, system
   messages and membership notices, all signed by this key.
@@ -177,6 +181,15 @@ host, because Buzz signs the relay URL it uploads to.
   change does. A snapshot restart schedules one roster refresh for groups
   above the 1,000-member throttle threshold, but not for `39001` or smaller
   groups.
+- A vanish that lands while a NIP-43 rebuild is in flight publishes a
+  remove-user event, but the full `13534` roster is not republished until
+  the next role/membership change; a client that fetches only the stored
+  roster can see the vanished identity until then.
+- Vanish is exempt from the publish rate limit. While a role rebuild is
+  pending, each vanish force-captures a removal in the bounded replay
+  buffer; a burst from fresh keys can overflow it and force another rebuild.
+  The rebuild itself filters the vanished set, so this is an availability
+  bound rather than a membership resurrection.
 - The `owner` entries in `13534` are roster metadata, not an access-list
   bypass. `relay.pubkey` has the operator publishing exemption;
   `rpc.admin_pubkey` does not, so on a `restrict_relay` relay add it to the
@@ -200,15 +213,21 @@ host, because Buzz signs the relay URL it uploads to.
   a `channel_type`/`visibility` marker keeps its channel type and metadata.
   Guest/bot tiers and separate `role` tag grants are replayed with plain
   NIP-29 semantics and may be lost; the normal snapshot restore keeps them.
-  A plain-mode full `9002` that detaches a subgroup by omitting `parent` is
-  replayed as a Buzz partial edit; use an explicit empty `["parent",""]` on
-  a Buzz-origin channel if the detach must survive a mode-off rebuild.
+  A plain-mode full `9002` on a Buzz-origin channel is replayed as a Buzz
+  partial edit, so an omitted `parent`/`child`, `supported_kinds` or other
+  field is preserved rather than cleared; use explicit empty values where
+  the field supports one, or keep the snapshot. This is the replay
+  counterpart of the live privacy floor.
 - The `buzz_metadata` provenance of a plain-origin group edited while Buzz
   was enabled is snapshot-backed. A snapshot-less rebuild can infer Buzz
-  origin from `channel_type`/`visibility`, but not from a Buzz edit that
-  carried only ordinary fields (for example a name-only rename); such a
-  group falls back to plain whole-metadata replay and may lose its privacy
-  floor. Keep the snapshot if this transition matters.
+  origin from `channel_type` or a `visibility=private` edit, but not from a
+  Buzz edit that carried only ordinary fields (for example a name-only
+  rename); such a group falls back to plain whole-metadata replay and may
+  lose its privacy floor. Keep the snapshot if this transition matters.
+- Plain-mode events imported from an older database or migration may still
+  carry `channel_type`/`visibility` even though new plain-mode submissions
+  reject them. The history replay applies their privacy floor; the live
+  path cannot undo that legacy marker.
 - A stored `9002` that turns LiveKit off is replayed with `emit=false`, so
   its empty `kind:39004` is not republished by a snapshot-less rebuild. The
   old participant list can remain until the room is reconfigured; the
@@ -217,6 +236,12 @@ host, because Buzz signs the relay URL it uploads to.
   a `9001` remove and a `9000` re-add, or a `9022` leave and a `9021`
   rejoin. The remove/leave wins on replay until the next edit; store an
   explicit later role/join event if that state must survive a restart.
+- A JOIN accepted with a `created_at` far in the future (up to
+  `max_created_at_future_secs`) can sort after a later removal on replay
+  and re-add an open-group member. The relay's signing mirror is stamped at
+  apply time, so it no longer amplifies this, but the stored JOIN itself
+  still does; keep clock skew bounded or use explicit moderation after the
+  join timestamp passes.
 - Enabling Buzz on a restored plain-NIP-29 group does not reinterpret
   literal `guest`/`bot` role labels. Such a role was an ordinary privileged
   role in plain mode, while Buzz reports it as a read-only/bot tier. Use a
@@ -238,18 +263,23 @@ host, because Buzz signs the relay URL it uploads to.
   combined output at 20,000 events. A community with more than 512 channels
   may need to split its channel-list query.
 - Channel-window pagination can stall if one `created_at` second contains
-  more candidates than the bounded fetch. The legacy `depth_limit` thread
-  path also scans only the newest 1,000 direct replies per frontier, so
-  older replies behind that prefix are not returned. Split the timestamp
-  window (or use the channel-window path) for unusually dense bursts.
+  more candidates than the bounded fetch. A prefix made entirely of rows
+  hidden from the caller can also end a window with no page and no cursor.
+  The legacy `depth_limit` thread path scans only the newest 1,000 direct
+  replies per frontier, so older replies behind that prefix are not
+  returned. Split the timestamp window (or use the channel-window path) for
+  unusually dense bursts.
+- Without `relay.public_url`, the bridge NIP-98 check accepts the configured
+  bind host plus loopback aliases. A proxy or LAN hostname must set
+  `public_url`; an arbitrary request `Host` is deliberately not trusted.
 - Aggregate `approximate` flags come from the raw database scan, before
   visibility filtering. A filter dominated by hidden rows can therefore
   report `approximate=true` with a small visible count; the count itself
   never includes hidden rows.
 - NIP-29 and NIP-43 snapshots share one removal stamp. A group-state
   removal or purge can invalidate the role snapshot, forcing a role rebuild
-  and dropping snapshot-only invite codes; role removals likewise invalidate
-  the group snapshot. The events remain the source of truth.
+  (stale-snapshot invite codes are carried across); role removals likewise
+  invalidate the group snapshot. The events remain the source of truth.
 - NIP-77 negentropy sync returns ids/timestamps without applying the
   per-pubkey gate to `44100`/`44101`/`30622`; an anonymous syncer can learn
   that those events exist, while REQ/COUNT still withhold their content.

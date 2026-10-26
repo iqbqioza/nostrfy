@@ -780,23 +780,33 @@ async fn startup_group_state(relay: &Relay, groups_enabled: bool) -> Result<()> 
 /// which rebuilds from the surviving events. A failed rebuild is fatal.
 async fn restore_role_state(relay: &Relay) -> Result<()> {
     if !relay.config.read().await.nip_enabled(43) {
+        // No role operations can run while NIP-43 is disabled. Clear a
+        // recovery mark so it cannot leave a stale flag in this process.
+        relay.finish_startup_role_recovery();
         return Ok(());
     }
+    let mut preserve_existing = false;
     let (needs_rebuild, carried_claims) = match relay.db.load_roles().await {
         crate::db::LoadRolesOutcome::Loaded(snap) => {
             let mut snap = snap;
+            preserve_existing = !snap.roles.is_empty() || !snap.assignments.is_empty();
             // Vanish is permanent and may have happened while NIP-43 was
             // disabled (no live role store) or during a role rebuild (the
             // revoked store could not record the assignment removal). The
             // snapshot itself predates that vanish, so filter it before
             // restore; the event rebuild already applies the same filter.
             if !snap.assignments.is_empty() {
-                let mut vanished = std::collections::HashSet::new();
+                // Do not materialize the (unbounded) vanish table: stream
+                // its pages and remove only the bounded snapshot keys.
                 if relay
                     .db
                     .vanish_pubkeys_each(|key| {
-                        vanished.insert(hex::encode(key));
-                        vanished.insert(hex::encode_upper(key));
+                        let lower = hex::encode(key);
+                        snap.assignments.remove(&lower);
+                        let upper = hex::encode_upper(key);
+                        if upper != lower {
+                            snap.assignments.remove(&upper);
+                        }
                     })
                     .await
                     .is_none()
@@ -806,8 +816,6 @@ async fn restore_role_state(relay: &Relay) -> Result<()> {
                          NIP-43 role snapshot"
                     ));
                 }
-                snap.assignments
-                    .retain(|pubkey, _| !vanished.contains(pubkey));
             }
             let claims = snap.claims.clone();
             match (
@@ -817,6 +825,11 @@ async fn restore_role_state(relay: &Relay) -> Result<()> {
                 (Some(stamp), Some(seq)) => {
                     if relay.roles.write().await.restore_checked(snap, stamp, seq) {
                         info!("NIP-43 role state restored from the database snapshot");
+                        // The snapshot is authoritative and already reflects
+                        // any recovered removal; release a recovery mark that
+                        // would otherwise block role persistence forever.
+                        relay.release_role_snapshot_preserve();
+                        relay.finish_startup_role_recovery();
                         (false, None)
                     } else {
                         error!(
@@ -879,15 +892,41 @@ async fn restore_role_state(relay: &Relay) -> Result<()> {
             let store = relay.roles.read().await;
             store.roles.is_empty() && store.assignments.is_empty()
         };
-        if rebuilt_empty {
-            error!(
+        if rebuilt_empty && !preserve_existing {
+            // A missing/empty snapshot on a genuinely fresh relay has
+            // nothing to preserve. A keyless/rotated start may instead be
+            // hiding former-key events: only those require the preserve
+            // flag. A failed lookup fails closed.
+            let kinds = [
+                crate::nips::nip43::ROLE_DEFINITION,
+                crate::nips::nip43::MEMBERSHIP_LIST,
+                crate::nips::nip43::ADD_USER,
+                crate::nips::nip43::REMOVE_USER,
+                crate::nips::nip43::INVITE,
+            ];
+            match relay
+                .db
+                .foreign_relay_event_ids(&relay.relay_pubkey().unwrap_or_default(), &kinds)
+                .await
+            {
+                Some(ids) if !ids.is_empty() => preserve_existing = true,
+                None => preserve_existing = true,
+                Some(_) => {}
+            }
+        }
+        if rebuilt_empty && preserve_existing {
+            warn!(
                 "NIP-43 role state rebuild found no role events for the current relay key; \
-                 keeping the previous snapshot instead of persisting an empty roster"
+                 preserving the previous snapshot (if any) instead of persisting an empty \
+                 roster"
             );
             // Still publish the current key's (possibly synthetic-owner)
             // roster so NIP-11/NIP-43 clients have a `self`-signed list; do
             // not persist it, so the last snapshot (and any foreign events)
-            // remains available if the former key is restored.
+            // remains available if the former key is restored. The preserve
+            // flag also blocks a later SIGHUP/NIP-86 persist from
+            // overwriting it before a real role mutation.
+            relay.preserve_role_snapshot();
             relay.finish_startup_role_recovery();
             if relay.relay_pubkey().is_some()
                 && relay.config.read().await.nip_enabled(43)
@@ -898,7 +937,9 @@ async fn restore_role_state(relay: &Relay) -> Result<()> {
             return Ok(());
         }
         // The startup rebuild is authoritative; release the recovery-pending
-        // flag so the publish/persist below can certify the fresh store.
+        // and preserve flags so the publish/persist below can certify the
+        // fresh store.
+        relay.release_role_snapshot_preserve();
         relay.finish_startup_role_recovery();
         // The rebuilt store has no (or stale) published membership list:
         // republish it so NIP-43 clients see the current members (a
@@ -6892,5 +6933,20 @@ mod tests {
             .await
             .expect("the body fits");
         assert_eq!(bytes.len(), 128);
+    }
+
+    #[tokio::test]
+    async fn a_fresh_empty_role_store_does_not_block_claim_persistence() {
+        let relay = blossom_relay_with_key(&"01".repeat(32)).await;
+        restore_role_state(&relay)
+            .await
+            .expect("a fresh role start must succeed");
+        assert!(
+            relay.create_claim("fresh-code").await.is_ok(),
+            "a fresh empty role store has nothing to preserve; claims must persist"
+        );
+        let saved = relay.db.load_roles().await.expect_loaded("snapshot");
+        assert!(saved.claims.contains("fresh-code"));
+        relay.db.shutdown();
     }
 }

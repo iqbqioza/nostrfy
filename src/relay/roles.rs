@@ -73,11 +73,24 @@ impl super::Relay {
         mutation: super::BufferedRoleMutation,
         mutate: impl FnOnce(&mut RoleStore) -> (R, bool),
     ) -> R {
+        // Claims are snapshot-only and may accompany the old assignments we
+        // are protecting after a keyless/empty rebuild; only a role or
+        // membership change makes it safe to overwrite that snapshot.
+        let clears_preserve = !matches!(
+            &mutation,
+            super::BufferedRoleMutation::CreateClaim { .. }
+                | super::BufferedRoleMutation::DeleteClaim { .. }
+        );
         let mut buffer = self.roles_rebuild.buffer.lock().await;
         let (result, changed) = {
             let mut roles = self.roles.write().await;
             mutate(&mut roles)
         };
+        if changed && clears_preserve {
+            // A real role/membership change supersedes the snapshot we
+            // protected after an empty/keyless rebuild; persistence is safe.
+            self.release_role_snapshot_preserve();
+        }
         // Capture while a rebuild is pending, not just while its scan runs:
         // the revoked window starts at marking (`dirty`, stored before the
         // store is revoked) and ends at worker exit (`running`), but the
