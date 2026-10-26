@@ -305,11 +305,10 @@ host, because Buzz signs the relay URL it uploads to.
   role in plain mode, while Buzz reports it as a read-only/bot tier. Use a
   non-reserved label if the group will switch modes, or promote/reassign
   the member after enabling Buzz.
-- A vanish that removes no group-state event only drops memberships from
-  the live store and snapshot. If NIP-29 is disabled at that moment, the
-  in-memory removal is skipped; a later re-enable can restore the member
-  from the pre-vanish snapshot until a state rebuild applies the vanish
-  filter.
+- A vanish that removes no group-state event drops memberships from the
+  live store and persists the snapshot even while NIP-29 is disabled. If
+  that snapshot persist fails, the affected groups are marked stale rather
+  than leaving a pre-vanish snapshot restorable after re-enabling NIP-29.
 - The migration cannot distinguish a JOIN admitted with a `9009` invite
   that was later deleted from a forged code-bearing JOIN to a closed group.
   It keeps a code-bearing JOIN (and drops a code-less JOIN to a group that

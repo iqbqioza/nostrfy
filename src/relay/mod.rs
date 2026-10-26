@@ -6116,7 +6116,6 @@ impl Relay {
         let pubkey_hex = hex::encode(pubkey);
         let nip29_enabled = self.config.read().await.nip_enabled(29);
         let nip43_enabled = self.config.read().await.nip_enabled(43);
-        let mut affected_gids: Vec<String> = Vec::new();
         let mut role_changed = false;
         // The removal commits in the database before the in-memory derived
         // state is updated: hold the in-flight claims until the per-store
@@ -6141,24 +6140,23 @@ impl Relay {
                 }
             };
         self.stats.bump(&self.stats.events_deleted, removed as u64);
-        if nip29_enabled {
-            // Drop the vanished pubkey from every live group, including when
-            // a group-state event was removed and the normal rebuild will
-            // reconstruct the stored groups. The DM state is snapshot-backed:
-            // its synthetic 9007/9000 never exist in the event history, so a
-            // rebuild cannot derive the removal. An in-flight rebuild also
-            // discards its scan when this removal changes live state (the
-            // DMs it would adopt are taken from the live store after the
-            // scan).
-            {
-                let mut buffer = self.groups_rebuild.buffer.lock().await;
-                if buffer.scanning {
-                    buffer.retry = true;
-                }
-                let mut groups = self.groups.write().await;
-                affected_gids = groups.remove_member_everywhere(&pubkey_hex);
+        // Drop the vanished pubkey from every live group even while NIP-29
+        // is disabled: the group store still gates private content and is
+        // restored from its snapshot independently of the NIP toggle. A
+        // later re-enable must not restore the pre-vanish member from that
+        // snapshot. The DM state is snapshot-backed: its synthetic
+        // 9007/9000 never exist in the event history, so a rebuild cannot
+        // derive the removal. An in-flight rebuild also discards its scan
+        // when this removal changes live state (the DMs it would adopt are
+        // taken from the live store after the scan).
+        let affected_gids: Vec<String> = {
+            let mut buffer = self.groups_rebuild.buffer.lock().await;
+            if buffer.scanning {
+                buffer.retry = true;
             }
-        }
+            let mut groups = self.groups.write().await;
+            groups.remove_member_everywhere(&pubkey_hex)
+        };
         // NIP-43 role assignments hold pubkeys too: a vanished author must
         // not keep its roles. Force-buffer the removal while a rebuild owns
         // the revoked empty store, exactly like a leave request; otherwise
@@ -6226,7 +6224,7 @@ impl Relay {
                 .await;
         }
         drop(groups_in_flight);
-        if nip29_enabled && !state_removed.group && !affected_gids.is_empty() {
+        if !state_removed.group && !affected_gids.is_empty() {
             match self.persist_groups_outcome().await {
                 PersistOutcome::Committed => {}
                 // A derived mutation held the in-flight claim, so nothing
@@ -11944,6 +11942,70 @@ mod tests {
             );
             relay.db.shutdown();
         });
+    }
+
+    #[tokio::test]
+    async fn vanish_removes_group_members_while_nip29_is_disabled() {
+        let relay = build_relay().await;
+        let now = crate::util::unix_now();
+        let admin = "aa".repeat(32);
+        let member = "bb".repeat(32);
+        let create = crate::event::Event {
+            id: "31".repeat(32),
+            pubkey: admin.clone(),
+            created_at: now,
+            kind: crate::nips::nip29::CREATE_GROUP,
+            tags: vec![vec!["h".into(), "g1".into()]],
+            content: String::new(),
+            sig: String::new(),
+        };
+        relay
+            .groups
+            .write()
+            .await
+            .apply(&create, "", now, false, false);
+        let grant = crate::event::Event {
+            id: "32".repeat(32),
+            pubkey: admin,
+            created_at: now + 1,
+            kind: crate::nips::nip29::PUT_USER,
+            tags: vec![
+                vec!["h".into(), "g1".into()],
+                vec!["p".into(), member.clone()],
+            ],
+            content: String::new(),
+            sig: String::new(),
+        };
+        relay
+            .groups
+            .write()
+            .await
+            .apply(&grant, "", now + 1, false, false);
+        assert!(
+            relay
+                .groups
+                .read()
+                .await
+                .group("g1")
+                .unwrap()
+                .members
+                .contains_key(&member)
+        );
+        relay.config.write().await.relay.enabled_nips = vec![9];
+        let bytes: [u8; 32] = hex::decode(&member).unwrap().try_into().unwrap();
+        assert!(relay.vanish_pubkey(bytes, now + 2).await);
+        assert!(
+            !relay
+                .groups
+                .read()
+                .await
+                .group("g1")
+                .unwrap()
+                .members
+                .contains_key(&member),
+            "the snapshot-backed group member must be removed even while NIP-29 is disabled"
+        );
+        relay.db.shutdown();
     }
 
     #[tokio::test]
