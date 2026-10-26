@@ -771,6 +771,10 @@ async fn thread_mode_window(
         .filter(|id| is_hex_64(id))
         .map(str::to_ascii_lowercase)
         .ok_or_else(|| bad_request("thread_window requires exactly one #e root"))?;
+    let root_bytes: [u8; 32] = hex::decode(&root)
+        .ok()
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or_else(|| bad_request("thread_window root must be 32-byte hex"))?;
     let Some(raw_kinds) = raw.get("kinds").and_then(Value::as_array) else {
         return Err(bad_request("thread_window requires kinds"));
     };
@@ -830,20 +834,33 @@ async fn thread_mode_window(
         )
             .into_response());
     };
-    let Some(root_event) = roots.pop() else {
-        return Ok(Vec::new());
-    };
-    if !THREAD_CONTENT_KINDS.contains(&root_event.kind)
-        || nip29::group_id(&root_event) != Some(channel.as_str())
-        || !bridge_visible(
-            &root_event,
-            authed,
-            Some(&groups),
-            cfg.nip_enabled(78) && cfg.relay.enabled_nip78_auth,
-            relay.relay_pubkey_ref(),
-        )
-    {
-        return Ok(Vec::new());
+    let root_event = roots.pop();
+    if let Some(root_event) = &root_event {
+        if !THREAD_CONTENT_KINDS.contains(&root_event.kind)
+            || nip29::group_id(root_event) != Some(channel.as_str())
+            || !bridge_visible(
+                root_event,
+                authed,
+                Some(&groups),
+                cfg.nip_enabled(78) && cfg.relay.enabled_nip78_auth,
+                relay.relay_pubkey_ref(),
+            )
+        {
+            return Ok(Vec::new());
+        }
+    } else {
+        // A retained root tombstone still permits serving its replies.
+        match relay.db.thread_root_tombstone(root_bytes).await {
+            Some(Some((kind, gid))) if THREAD_CONTENT_KINDS.contains(&kind) && gid == channel => {}
+            Some(_) => return Ok(Vec::new()),
+            None => {
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({ "error": "database is overloaded, try again shortly" })),
+                )
+                    .into_response());
+            }
+        }
     }
 
     let mut replies = Vec::new();
@@ -926,7 +943,7 @@ async fn thread_mode_window(
     };
     let mut out = candidates.clone();
     if include_aux && !candidates.is_empty() {
-        let mut targets = vec![root_event.id.clone()];
+        let mut targets = vec![root.clone()];
         targets.extend(candidates.iter().map(|event| event.id.clone()));
         out.extend(fetch_aux(relay, cfg, authed, &visible_filter, &targets).await?);
     }

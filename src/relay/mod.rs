@@ -1185,6 +1185,14 @@ struct RolesRebuild {
     /// lock, so a mutation holding that lock sees a stable value (the mark
     /// cannot revoke underneath it).
     dirty: std::sync::atomic::AtomicBool,
+    /// A role-state removal has committed (or is in flight) and a rebuild
+    /// has not yet produced an authoritative roster. Full 13534 publishes
+    /// must not leave a pre-removal list as the newest event.
+    removal_committed: std::sync::atomic::AtomicBool,
+    /// Monotonic generation of committed role-state removals. The worker
+    /// clears `removal_committed` only when this did not advance during the
+    /// scan.
+    removal_epoch: std::sync::atomic::AtomicU64,
     /// A mark is waiting for the mutation buffer lock (or is about to set
     /// `dirty` under it). Persistence must already stop here: the database
     /// removal advanced the generation before the in-memory mark runs, and
@@ -1410,7 +1418,10 @@ impl RoleStatePublisher {
         }
         let mut event = {
             let roles = roles.read().await;
-            if state.dirty.load(Ordering::SeqCst) {
+            if state.dirty.load(Ordering::SeqCst)
+                || state.removal_committed.load(Ordering::SeqCst)
+                || state.derived.in_flight()
+            {
                 return false;
             }
             roles.membership_event(
@@ -1420,7 +1431,7 @@ impl RoleStatePublisher {
                 &owners,
             )
         };
-        store_relay_event_parts(
+        let stored = store_relay_event_parts(
             db,
             Some(key),
             &self.stamps,
@@ -1430,7 +1441,17 @@ impl RoleStatePublisher {
             true,
         )
         .await
-        .is_ok()
+        .is_ok();
+        if stored && (state.removal_committed.load(Ordering::SeqCst) || state.derived.in_flight()) {
+            // A removal began between the pre-check and the write. Remove
+            // the pre-removal roster so the rebuild cannot read it as the
+            // newest membership list.
+            if let Some(id) = event.id_bytes() {
+                let _ = db.remove_events_by_id(&[id]).await;
+            }
+            return false;
+        }
+        stored
     }
 }
 
@@ -1488,6 +1509,7 @@ async fn roles_rebuild_worker(
     // Set after a clean swap so the trailing code republishes the membership
     // list (N43-L02). A later dirty/failed scan skips the refresh.
     let mut membership_rebuilt = false;
+    let mut last_scan_epoch = None;
     loop {
         // Shutdown: stop before starting another scan. The removal that
         // dirtied the state already cleared the live store, so the next
@@ -1530,6 +1552,7 @@ async fn roles_rebuild_worker(
             buffer.scanning = true;
             buffer.overflow = false;
         }
+        last_scan_epoch = Some(state.removal_epoch.load(Ordering::SeqCst));
         // Claims are snapshot-only; carry the revoked store's codes into the
         // rebuilt store (removals cannot recreate them from events).
         let preserved_claims = roles.read().await.claims.clone();
@@ -1633,6 +1656,12 @@ async fn roles_rebuild_worker(
         buffer.mutations.clear();
         buffer.overflow = false;
         buffer.scanning = false;
+        // The rebuild is authoritative now only if no later removal began
+        // while the scan ran. The epoch compare closes the check-then-clear
+        // race with a mark that sets the flag before waiting for this lock.
+        if last_scan_epoch == Some(state.removal_epoch.load(Ordering::SeqCst)) {
+            state.removal_committed.store(false, Ordering::SeqCst);
+        }
         // The runtime rebuild could have dropped assignments to a role whose
         // definition was removed, while the stored kind:13534 still names
         // them. Republish the authoritative list so clients see the rebuilt
@@ -5548,6 +5577,12 @@ impl Relay {
         // committed, so a concurrent mutation that reaches the publish path
         // must not store a pre-removal full 13534 and thereby resurrect the
         // removed state on the next rebuild.
+        self.roles_rebuild
+            .removal_committed
+            .store(true, Ordering::SeqCst);
+        self.roles_rebuild
+            .removal_epoch
+            .fetch_add(1, Ordering::SeqCst);
         self.roles_rebuild.dirty.store(true, Ordering::SeqCst);
         self.roles_rebuild.marking.store(true, Ordering::SeqCst);
         let marking = RoleMarkingGuard(&self.roles_rebuild.marking);
@@ -7974,6 +8009,28 @@ mod tests {
             "the full membership list must carry the marking-window grant: {:?}",
             lists[0].tags
         );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_committed_removal_blocks_a_full_membership_publish() {
+        let key = "01".repeat(32);
+        let relay = build_role_relay(Some(&key)).await;
+        relay
+            .roles_rebuild
+            .removal_committed
+            .store(true, Ordering::SeqCst);
+        assert!(
+            !relay.publish_membership(None).await,
+            "a pre-removal full 13534 must not be published while the removal rebuild is pending"
+        );
+        let filter: crate::filter::Filter =
+            serde_json::from_value(serde_json::json!({"kinds": [13534]})).unwrap();
+        let (lists, _) = relay
+            .db
+            .query(vec![filter], 10, crate::util::unix_now())
+            .await;
+        assert!(lists.is_empty());
         relay.db.shutdown();
     }
 

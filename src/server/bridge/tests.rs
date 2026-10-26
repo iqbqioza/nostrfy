@@ -781,7 +781,7 @@ async fn thread_window_pages_descendants_with_signed_bounds() {
     let mut req = request(Method::POST, "/query", Some(&auth), body);
     req.headers_mut()
         .insert("host", "relay.example.test".parse().unwrap());
-    let response = app.oneshot(req).await.unwrap();
+    let response = app.clone().oneshot(req).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let events = body_json(response).await;
     let rows: Vec<&Value> = events
@@ -802,6 +802,50 @@ async fn thread_window_pages_descendants_with_signed_bounds() {
     let content: Value = serde_json::from_str(bounds[0]["content"].as_str().unwrap()).unwrap();
     assert_eq!(content["has_more"], false);
     assert!(content["next_cursor"].is_null());
+
+    // The root itself can be deleted while retained replies remain. NIP-CW
+    // keeps a root tombstone eligible for thread mode.
+    assert_eq!(
+        relay
+            .db
+            .remove_events_by_id(&[root.id_bytes().expect("root id")])
+            .await,
+        Some(1)
+    );
+    let filter = json!([{
+        "thread_window": true,
+        "kinds": [9],
+        "#h": [channel],
+        "#e": [root.id],
+        "depth_limit": 10,
+        "limit": 10,
+    }]);
+    let body = serde_json::to_vec(&filter).unwrap();
+    let auth = nip98(&keypair, &origin, "/query", "POST", &body, 22);
+    let mut req = request(Method::POST, "/query", Some(&auth), body);
+    req.headers_mut()
+        .insert("host", "relay.example.test".parse().unwrap());
+    let response = app.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let events = body_json(response).await;
+    let rows: Vec<&Value> = events
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["kind"] == 9)
+        .collect();
+    assert_eq!(
+        rows.len(),
+        3,
+        "retained replies must survive the root tombstone"
+    );
+    let bounds: Vec<&Value> = events
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["kind"] == 39007)
+        .collect();
+    assert_eq!(bounds.len(), 1);
     relay.db.shutdown();
 }
 

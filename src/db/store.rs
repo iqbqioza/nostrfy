@@ -2893,6 +2893,65 @@ impl Store {
         Ok((self.vanish.len(&rtxn)?, self.vanish_pending.len(&rtxn)?))
     }
 
+    fn thread_root_key(id: &[u8]) -> Vec<u8> {
+        let mut key = Vec::with_capacity(13 + id.len());
+        key.extend_from_slice(b"thread_root:");
+        key.extend_from_slice(id);
+        key
+    }
+
+    /// Retains the minimal wire metadata of a deleted NIP-CW thread root:
+    /// `kind || gid length || gid`. The event body is gone, but thread mode
+    /// can still serve retained replies for the tombstone.
+    fn remember_thread_root_tombstone(
+        &self,
+        wtxn: &mut heed::RwTxn,
+        event: &Event,
+        id: &[u8],
+    ) -> Result<()> {
+        if !matches!(event.kind, 9 | 40002 | 45001 | 45003) {
+            return Ok(());
+        }
+        let Some(gid) = event
+            .tags
+            .iter()
+            .find(|tag| tag.len() >= 2 && tag[0] == "h")
+            .map(|tag| tag[1].as_str())
+            .filter(|gid| !gid.is_empty())
+        else {
+            return Ok(());
+        };
+        let mut value = Vec::with_capacity(12 + gid.len());
+        value.extend_from_slice(&event.kind.to_be_bytes());
+        value.extend_from_slice(&(gid.len() as u32).to_be_bytes());
+        value.extend_from_slice(gid.as_bytes());
+        self.index_meta
+            .put(wtxn, &Self::thread_root_key(id), &value)?;
+        Ok(())
+    }
+
+    pub(crate) fn thread_root_tombstone(&self, id: &[u8]) -> Result<Option<(u64, String)>> {
+        if id.len() != ID_LEN {
+            return Ok(None);
+        }
+        let rtxn = self.env.read_txn()?;
+        let Some(raw) = self.index_meta.get(&rtxn, &Self::thread_root_key(id))? else {
+            return Ok(None);
+        };
+        if raw.len() < 12 {
+            return Ok(None);
+        }
+        let kind = u64::from_be_bytes(raw[..8].try_into().expect("checked length"));
+        let gid_len = u32::from_be_bytes(raw[8..12].try_into().expect("checked length")) as usize;
+        if raw.len() != 12 + gid_len {
+            return Ok(None);
+        }
+        let gid = std::str::from_utf8(&raw[12..])
+            .map_err(|_| anyhow::anyhow!("corrupt thread-root tombstone"))?
+            .to_string();
+        Ok(Some((kind, gid)))
+    }
+
     /// Records the create-id epoch that an accepted NIP-29 state event was
     /// validated against. This is a read-time hardening index; failures are
     /// reported to the caller so the relay can log the reduced protection.
@@ -3289,6 +3348,7 @@ impl Store {
 
         let raw = serde_json::to_vec(event)?;
         self.events.put(wtxn, &id, &raw)?;
+        self.index_meta.delete(wtxn, &Self::thread_root_key(&id))?;
         self.put_indexes(wtxn, event, &id, &pubkey)?;
         // The derived-state sequence advances in the same commit as the
         // state-relevant event it describes: a snapshot can claim a
@@ -4023,6 +4083,7 @@ impl Store {
         epoch_key.extend_from_slice(b"group_epoch:");
         epoch_key.extend_from_slice(id);
         self.index_meta.delete(wtxn, &epoch_key)?;
+        self.remember_thread_root_tombstone(wtxn, &event, id)?;
         self.events.delete(wtxn, id)?;
         self.by_created
             .delete(wtxn, &created_key(event.created_at, id))?;

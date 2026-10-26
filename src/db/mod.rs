@@ -486,6 +486,11 @@ enum Msg {
         event_ids: Vec<Vec<u8>>,
         reply: oneshot::Sender<Option<std::collections::HashMap<String, String>>>,
     },
+    /// Look up the retained metadata of a deleted NIP-CW thread root.
+    ThreadRootTombstone {
+        event_id: Vec<u8>,
+        reply: oneshot::Sender<Option<Option<(u64, String)>>>,
+    },
     /// Persist the bounded role-rebuild mutation journal across shutdown.
     SaveRoleRebuildPending {
         data: Vec<u8>,
@@ -1063,6 +1068,7 @@ fn msg_bytes(msg: &Msg) -> usize {
             ..
         } => event_id.len() + create_id.len(),
         Msg::GroupEpochs { event_ids, .. } => event_ids.iter().map(Vec::len).sum(),
+        Msg::ThreadRootTombstone { event_id, .. } => event_id.len(),
         Msg::SaveRoleRebuildPending { data, .. } => data.len(),
         Msg::Vanish { pubkey, .. }
         | Msg::RecordPendingVanish { pubkey, .. }
@@ -2180,6 +2186,15 @@ impl DbClient {
         self.request_read_startup(|reply| Msg::GroupEpochs { event_ids, reply })
             .await
             .flatten()
+    }
+
+    pub async fn thread_root_tombstone(&self, event_id: [u8; 32]) -> Option<Option<(u64, String)>> {
+        self.request_read_result(|reply| Msg::ThreadRootTombstone {
+            event_id: event_id.to_vec(),
+            reply,
+        })
+        .await
+        .flatten()
     }
 
     pub async fn save_role_rebuild_pending(&self, data: Vec<u8>) -> bool {

@@ -174,10 +174,11 @@ host, because Buzz signs the relay URL it uploads to.
 - `thread_window:true` / `kind:39007` thread mode walks descendants to the
   requested depth, bounded at 8,192 events and 1,000 rows per frontier query.
   Its bounds binding names the request `Host` authority, so a reverse proxy
-  must preserve the original `Host`. A root that has already been tombstoned
-  is served as an empty (unbounded) thread. The thread-mode batch rechecks
-  its channel access after building the page and returns a retryable `503`
-  if access changed. The legacy `depth_limit` path
+  must preserve the original `Host`. A deleted root keeps minimal tombstone
+  metadata (`kind` + channel) and still serves its retained replies; a root
+  with no event or tombstone returns an empty, unbounded thread. The
+  thread-mode batch rechecks its channel access after building the page and
+  returns a retryable `503` if access changed. The legacy `depth_limit` path
   intentionally has no signed bounds event (clients use the legacy short-page
   heuristic); it queries up to 1,000 direct replies per frontier (a complete
   same-second group can exceed that cap) and returns `413` when the DB
@@ -334,9 +335,10 @@ host, because Buzz signs the relay URL it uploads to.
   an additive `index_meta` key and replayed after the next startup rebuild,
   then cleared once the role snapshot is saved. If that journal save fails,
   the captured leaves are still only in memory and can be lost. A removal
-  that is already waiting for the mutation buffer can still interleave with
-  a 13534 publish that passed its dirty/run check immediately before the
-  mark.
+  generation now blocks a full `13534` publish before it is stored and
+  deletes one that raced the pre-check; a write that starts after that
+  post-store check can still be transiently visible until the rebuild
+  republishes the roster.
 - Buzz's push leases, workflow commands, moderation commands and
   hosted-community APIs are not part of this bridge.
 - NIP-34 git events (used by Buzz Projects) are rejected unless

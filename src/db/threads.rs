@@ -236,6 +236,17 @@ fn handle_read_msg(store: &Store, errors: &Arc<std::sync::atomic::AtomicU64>, ms
             let _ = reply.send(false);
             false
         }
+        Msg::ThreadRootTombstone { event_id, reply } => {
+            let out = match store.thread_root_tombstone(&event_id) {
+                Ok(meta) => Some(meta),
+                Err(e) => {
+                    db_error(errors, &e);
+                    None
+                }
+            };
+            let _ = reply.send(out);
+            false
+        }
         Msg::LoadRoleRebuildPending { reply } => {
             let out = match store.load_role_rebuild_pending() {
                 Ok(data) => Some(data),
@@ -1388,6 +1399,16 @@ pub(crate) fn spawn(
                                         }
                                         Err(e) => db_error(&thread_errors, &e),
                                     }
+                                }
+                                Msg::ThreadRootTombstone { event_id, reply } => {
+                                    let out = match store.thread_root_tombstone(&event_id) {
+                                        Ok(meta) => Some(meta),
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            None
+                                        }
+                                    };
+                                    let _ = reply.send(out);
                                 }
                                 Msg::SaveRoleRebuildPending { data, reply } => {
                                     let saved = match store.save_role_rebuild_pending(&data) {

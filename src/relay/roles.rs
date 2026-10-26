@@ -314,6 +314,8 @@ impl super::Relay {
             // is safe and the RPC reports failure.
             if self.roles_rebuild.dirty.load(Ordering::SeqCst)
                 || self.roles_rebuild.running.load(Ordering::SeqCst)
+                || self.roles_rebuild.removal_committed.load(Ordering::SeqCst)
+                || self.roles_rebuild.derived.in_flight()
             {
                 return false;
             }
@@ -328,9 +330,20 @@ impl super::Relay {
             }
             events
         };
+        let ids: Vec<[u8; 32]> = events.iter().filter_map(Event::id_bytes).collect();
         let mut all_stored = true;
         for event in events {
             all_stored &= self.publish_relay_event(event).await;
+        }
+        if all_stored
+            && (self.roles_rebuild.removal_committed.load(Ordering::SeqCst)
+                || self.roles_rebuild.derived.in_flight())
+        {
+            // A removal committed between the pre-check and the write. The
+            // new full list may predate the removal and would be the newest
+            // event the rebuild reads, resurrecting the removed grant.
+            let _ = self.db.remove_events_by_id(&ids).await;
+            return false;
         }
         all_stored
     }
