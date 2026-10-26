@@ -192,6 +192,33 @@ Caddy sets `X-Forwarded-For` and `X-Forwarded-Proto` itself (and does not
 need the long read timeout), so the same `server.trusted_proxies = ["127.0.0.1/32", "::1/128"]`
 configuration applies.
 
+**When the proxy runs in a container** (Caddy or nginx via `docker`/compose), three
+things change — the container's `127.0.0.1` is its own loopback, not the host's:
+
+1. **Upstream address**: point the proxy at the host via its gateway IP on the
+   proxy's Docker network (`docker inspect <proxy> --format '{{range .NetworkSettings.Networks}}{{.Gateway}} {{end}}'`,
+   typically `172.x.0.1`) instead of `127.0.0.1`. The relay must then listen on
+   more than loopback: set `server.host = "0.0.0.0"` — the host firewall keeps
+   the port closed to the internet as long as no container publishes it.
+2. **`trusted_proxies`**: the proxy now connects from its container IP on that
+   network, not from loopback. Add it (e.g.
+   `trusted_proxies = ["127.0.0.1/32", "::1/128", "172.19.0.3/32"]`), or every
+   client shares the container's address for the per-IP caps.
+3. **Firewall**: the same host firewall that blocks the relay port from the
+   internet also blocks the container→host path. Allow only the proxy's
+   container IP through: `ufw allow from 172.19.0.3 to any port 8090 proto tcp`.
+
+Also note that host-published containers commonly occupy loopback ports first
+(`docker-proxy` binds them), so pick the relay's host port after checking
+`ss -tlnp | grep 127.0.0.1`. Worked example with a containerized Caddy and the
+relay on 8090:
+
+```
+relay.example.com {
+    reverse_proxy 172.19.0.1:8090
+}
+```
+
 **Serving the Blossom media host too**: when `blossom.host = "media.example.com"` is set, that hostname must also reach the same port — the relay splits the hosts internally (like `server.api_host`). Add a second server block / site for it:
 
 ```nginx
