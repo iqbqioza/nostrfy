@@ -32,6 +32,8 @@ const THREAD_MAX_LIMIT: usize = 500;
 const THREAD_DEPTH_DEFAULT: u32 = 64;
 const THREAD_DEPTH_MAX: u32 = 100;
 const AUX_LIMIT: usize = 1_000;
+/// Cap on events walked for one set of thread-summary trees.
+const SUMMARY_TREE_MAX: usize = 10_000;
 
 /// NIP-CW's thread-summary kind. The same integer is NIP-29's group-pins
 /// event; Buzz never asks for pins in a window, so the two never mix.
@@ -502,6 +504,11 @@ async fn fetch_aux(
 }
 
 /// One relay-signed `kind:39005` per row that has at least one direct reply.
+///
+/// Counts, participants and `last_reply_at` cover the visible subtree, not
+/// just the direct replies. The walk is bounded by `THREAD_DEPTH_MAX` and
+/// `SUMMARY_TREE_MAX` so a hostile or very large thread cannot make one
+/// channel window materialize an unbounded tree.
 #[allow(clippy::result_large_err)]
 async fn thread_summaries(
     relay: &Arc<Relay>,
@@ -532,7 +539,11 @@ async fn thread_summaries(
     let nip78_restricted = cfg.nip_enabled(78) && cfg.relay.enabled_nip78_auth;
     let groups = relay.groups.read().await;
     let row_set: HashSet<&str> = rows.iter().map(|event| event.id.as_str()).collect();
-    let mut per_row: HashMap<String, (usize, u64, Vec<String>)> = HashMap::new();
+    // (direct replies, all descendants, last reply, recent participants)
+    type Summary = (usize, usize, u64, Vec<(u64, String)>);
+    let mut per_row: HashMap<String, Summary> = HashMap::new();
+    let mut root_for: HashMap<String, String> = HashMap::new();
+    let mut frontier: Vec<String> = Vec::new();
     for event in events {
         if !bridge_visible(
             &event,
@@ -550,27 +561,90 @@ async fn thread_summaries(
         let Some(parent) = parent else {
             continue;
         };
-        let entry = per_row
-            .entry(parent.to_string())
-            .or_insert((0, event.created_at, Vec::new()));
+        let entry =
+            per_row
+                .entry(parent.to_string())
+                .or_insert((0, 0, event.created_at, Vec::new()));
         entry.0 += 1;
-        entry.1 = entry.1.max(event.created_at);
-        if entry.2.len() < 10 && !entry.2.iter().any(|pk| pk == &event.pubkey) {
-            entry.2.push(event.pubkey.clone());
+        entry.2 = entry.2.max(event.created_at);
+        record_summary_participant(&mut entry.3, event.created_at, &event.pubkey);
+        root_for.insert(event.id.clone(), parent.to_string());
+        frontier.push(event.id.clone());
+    }
+
+    // Walk descendants breadth-first. A child is counted only when its
+    // marked parent survived visibility, so a hidden intermediate cannot
+    // contribute a visible-looking count to the root summary.
+    let mut seen: HashSet<String> = root_for.keys().cloned().collect();
+    let mut depth = 1u32;
+    while !frontier.is_empty() && depth < THREAD_DEPTH_MAX && seen.len() < SUMMARY_TREE_MAX {
+        let mut next = Vec::new();
+        for chunk in frontier.chunks(crate::filter::MAX_FILTER_MEMBERS) {
+            let mut filter = Filter {
+                kinds: Some(THREAD_CONTENT_KINDS.to_vec()),
+                limit: Some(AUX_LIMIT),
+                ..Filter::default()
+            };
+            filter.tags.insert("#e".to_string(), json!(chunk));
+            filter.tags.insert("#h".to_string(), json!([channel]));
+            let Some((events, _)) = relay
+                .db
+                .api_query(vec![filter], AUX_LIMIT, unix_now(), false)
+                .await
+            else {
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({ "error": "database is overloaded, try again shortly" })),
+                )
+                    .into_response());
+            };
+            for event in events {
+                if !seen.insert(event.id.clone()) {
+                    continue;
+                }
+                if seen.len() > SUMMARY_TREE_MAX {
+                    break;
+                }
+                if !bridge_visible(
+                    &event,
+                    authed,
+                    Some(&groups),
+                    nip78_restricted,
+                    relay.relay_pubkey_ref(),
+                ) {
+                    continue;
+                }
+                let Some(parent) = reply_parent(&event) else {
+                    continue;
+                };
+                let Some(root) = root_for.get(parent).cloned() else {
+                    continue;
+                };
+                root_for.insert(event.id.clone(), root.clone());
+                next.push(event.id.clone());
+                if let Some(entry) = per_row.get_mut(&root) {
+                    entry.1 += 1;
+                    entry.2 = entry.2.max(event.created_at);
+                    record_summary_participant(&mut entry.3, event.created_at, &event.pubkey);
+                }
+            }
         }
+        frontier = next;
+        depth += 1;
     }
     drop(groups);
 
     let mut out = Vec::new();
     for row in rows {
-        let Some((reply_count, last_reply_at, participants)) = per_row.get(&row.id) else {
+        let Some((reply_count, descendants, last_reply_at, participants)) = per_row.get(&row.id)
+        else {
             continue;
         };
         let content = json!({
             "reply_count": reply_count,
-            "descendant_count": reply_count,
+            "descendant_count": reply_count + descendants,
             "last_reply_at": last_reply_at,
-            "participants": participants,
+            "participants": participants.iter().map(|(_, pubkey)| pubkey).collect::<Vec<_>>(),
         });
         if let Some(event) = sign_overlay(
             relay,
@@ -588,7 +662,26 @@ async fn thread_summaries(
     Ok(out)
 }
 
-/// The single `kind:39006` bounds overlay for a served window.
+/// Keeps the ten most recent distinct participants for a summary. Sorting
+/// on every insert is cheap at ten entries and avoids retaining a huge
+/// thread's whole author list.
+fn record_summary_participant(
+    participants: &mut Vec<(u64, String)>,
+    created_at: u64,
+    pubkey: &str,
+) {
+    if let Some(existing) = participants
+        .iter_mut()
+        .find(|(_, existing)| existing.eq_ignore_ascii_case(pubkey))
+    {
+        existing.0 = existing.0.max(created_at);
+    } else {
+        participants.push((created_at, pubkey.to_string()));
+    }
+    participants.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    participants.truncate(10);
+}
+
 fn window_bounds(
     relay: &Arc<Relay>,
     channel: &str,

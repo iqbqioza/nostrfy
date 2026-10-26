@@ -324,7 +324,18 @@ async fn top_level_window_excludes_replies_and_emits_bounds() {
         "reply",
         now + 1,
     );
-    for (index, event) in [root, reply].into_iter().enumerate() {
+    let reply_id = reply.id.clone();
+    let nested = signed(
+        &keypair,
+        9,
+        vec![
+            vec!["h".into(), channel.into()],
+            vec!["e".into(), reply_id, "".into(), "reply".into()],
+        ],
+        "nested",
+        now + 2,
+    );
+    for (index, event) in [root, reply, nested].into_iter().enumerate() {
         let body = serde_json::to_vec(&event).unwrap();
         let auth = nip98(
             &keypair,
@@ -376,6 +387,15 @@ async fn top_level_window_excludes_replies_and_emits_bounds() {
                 .as_str()
         )
     );
+    let summaries: Vec<&Value> = events.iter().filter(|e| e["kind"] == 39005).collect();
+    assert_eq!(summaries.len(), 1);
+    let summary: Value = serde_json::from_str(summaries[0]["content"].as_str().unwrap()).unwrap();
+    assert_eq!(summary["reply_count"], 1);
+    assert_eq!(
+        summary["descendant_count"], 2,
+        "the nested reply must be counted in the summary"
+    );
+    assert_eq!(summary["last_reply_at"], now + 2);
     relay.db.shutdown();
 }
 

@@ -163,9 +163,11 @@ host, because Buzz signs the relay URL it uploads to.
 - Buzz's workspace-profile command (`kind:9033`) is stored as an ordinary
   event but does not update the NIP-11 `icon`; set `relay.icon` in the
   configuration instead.
-- A `kind:39005` summary's `reply_count` counts direct replies and
-  `descendant_count` currently carries the same value; fully nested reply
-  trees are not walked when synthesising the overlay.
+- A `kind:39005` summary counts visible direct replies and walks the visible
+  descendant tree (up to 100 levels / 10,000 events) for `descendant_count`,
+  `last_reply_at` and the 10 most recent participants. A larger tree, a
+  hidden intermediate, or a frontier capped at the per-query 1,000-event
+  bound can still undercount the summary.
 - The newer `thread_window:true` / `kind:39007` thread mode is not
   implemented. The legacy `depth_limit` path intentionally has no signed
   bounds event (clients use the legacy short-page heuristic). It queries up
