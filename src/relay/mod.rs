@@ -6077,8 +6077,15 @@ impl Relay {
         };
         let stamp = self.stamp_floor(unix_now());
         for gid in gids {
+            let create_id = self
+                .groups
+                .read()
+                .await
+                .group(gid)
+                .and_then(|group| group.create_id.clone());
             let mut event =
                 crate::nips::nip29::events::build_remove_user(gid, pubkey, &relay_pubkey, stamp);
+            crate::nips::nip29::events::attach_create_id(&mut event, create_id.as_deref());
             if self.store_relay_event(&mut event).await.is_err() {
                 log::error!("could not store the relay-signed 9001 for a vanished member in {gid}");
             }

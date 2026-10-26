@@ -9,9 +9,10 @@ pub(crate) mod events;
 pub(crate) mod tests;
 
 use events::{
-    apply_plain_create_privacy, apply_settings, build_admins_event, build_members_event,
-    build_membership_notice, build_meta_event, build_participants_event, build_pins_event,
-    build_put_user, build_remove_user, build_remove_users, build_roles_event, build_system_message,
+    CREATE_ID_TAG, apply_plain_create_privacy, apply_settings, attach_create_id,
+    build_admins_event, build_members_event, build_membership_notice, build_meta_event,
+    build_participants_event, build_pins_event, build_put_user, build_remove_user,
+    build_remove_users, build_roles_event, build_system_message,
 };
 
 /// Moderation policy implemented here: any user with at least one role (from
@@ -1309,6 +1310,28 @@ impl GroupStore {
         let Some(gid) = group_id(event) else {
             return Vec::new();
         };
+        // Relay-generated mirrors are stamped with the create id they were
+        // produced for. A replay after delete/recreate must not let the old
+        // mirror re-add a member to the new incarnation. Only relay-signed
+        // events are checked so a client's unrelated custom `create_id` tag
+        // cannot make its own state silently disappear.
+        let relay_signed =
+            !relay_pubkey.is_empty() && relay_pubkey.eq_ignore_ascii_case(&event.pubkey);
+        if relay_signed
+            && event.kind != CREATE_GROUP
+            && let Some(expected) = event
+                .tags
+                .iter()
+                .find(|tag| tag.len() >= 2 && tag[0] == CREATE_ID_TAG)
+                .map(|tag| tag[1].as_str())
+            && self
+                .groups
+                .get(gid)
+                .and_then(|group| group.create_id.as_deref())
+                != Some(expected)
+        {
+            return Vec::new();
+        }
         // A delayed after-put from a previous incarnation must not mutate a
         // group re-created under the same id. The live validation runs
         // before the store commit; re-check the incarnation here under the
@@ -1412,6 +1435,12 @@ impl GroupStore {
                         if join_role_guest {
                             put.tags.push(vec!["role".into(), "guest".into()]);
                         }
+                        attach_create_id(
+                            &mut put,
+                            self.groups
+                                .get(gid)
+                                .and_then(|group| group.create_id.as_deref()),
+                        );
                         out.push(put);
                         out.extend(self.membership_events(gid, relay_pubkey, now));
                         let channel_type = self.notice_channel_type(gid);
@@ -1452,7 +1481,14 @@ impl GroupStore {
                     self.total_members = self.total_members.saturating_sub(1);
                 }
                 if emit && removed {
-                    out.push(build_remove_user(gid, &member, relay_pubkey, now));
+                    let mut remove = build_remove_user(gid, &member, relay_pubkey, now);
+                    attach_create_id(
+                        &mut remove,
+                        self.groups
+                            .get(gid)
+                            .and_then(|group| group.create_id.as_deref()),
+                    );
+                    out.push(remove);
                     out.extend(self.membership_events(gid, relay_pubkey, now));
                     let channel_type = self.notice_channel_type(gid);
                     out.push(build_system_message(
@@ -1781,7 +1817,15 @@ impl GroupStore {
                     // join (plus its put-user mirror) re-adds them on the
                     // next restart.
                     if !removed_members.is_empty() {
-                        out.push(build_remove_users(gid, &removed_members, relay_pubkey, now));
+                        let mut remove =
+                            build_remove_users(gid, &removed_members, relay_pubkey, now);
+                        attach_create_id(
+                            &mut remove,
+                            self.groups
+                                .get(gid)
+                                .and_then(|group| group.create_id.as_deref()),
+                        );
+                        out.push(remove);
                     }
                     out.extend(self.membership_events(gid, relay_pubkey, now));
                     let channel_type = self.notice_channel_type(gid);
@@ -2628,6 +2672,13 @@ impl GroupStore {
     /// [`Self::mark_ghost`]).
     pub(crate) fn is_ghosted(&self, gid: &str) -> bool {
         self.ghost.contains(gid)
+    }
+
+    /// Whether `gid` is a confirmed delete tombstone. A rebuild must not
+    /// buffer pre-create state for such an id: the old incarnation is gone
+    /// and a later create starts a new one.
+    pub(crate) fn is_deleted(&self, gid: &str) -> bool {
+        self.deleted.contains(gid)
     }
 
     /// Drops a group that was created only for a relay-side synthetic

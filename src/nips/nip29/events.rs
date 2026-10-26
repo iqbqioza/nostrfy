@@ -9,6 +9,20 @@ use super::{
     D, GROUP_ADMINS, GROUP_MEMBERS, GROUP_META, GROUP_PARTICIPANTS, GROUP_PINS, GROUP_ROLES, Group,
     GroupSettings, H, JOIN_MIRROR_TAG, P,
 };
+
+/// Epoch marker carried by relay-generated `9000`/`9001` mirrors. The id is
+/// the `9007` event that created the incarnation. Replaying a mirror against
+/// a later incarnation with the same `h` id is a no-op; client-authored
+/// events do not carry this tag and are protected by live validation.
+pub(crate) const CREATE_ID_TAG: &str = "create_id";
+
+pub(crate) fn attach_create_id(event: &mut Event, create_id: Option<&str>) {
+    if let Some(create_id) = create_id {
+        event
+            .tags
+            .push(vec![CREATE_ID_TAG.to_string(), create_id.to_string()]);
+    }
+}
 fn has_tag(event: &Event, name: &str) -> bool {
     event
         .tags

@@ -1191,6 +1191,15 @@ async fn replay_stored_moderation(
         );
     }
     const PAGE: usize = 50_000;
+    // Mirror the startup rebuild: a stored state event whose create is
+    // later in the chronological/rank order is held until that create is
+    // replayed, then re-adjudicated against the real group. Without this,
+    // migration deletes a legitimate pre-create setting/admin grant that
+    // the first restart would have buffered and applied.
+    const PENDING_STATE_MAX: usize = 50_000;
+    let mut pending_state: std::collections::HashMap<String, Vec<Event>> =
+        std::collections::HashMap::new();
+    let mut pending_state_count = 0usize;
     let mut since: Option<u64> = None;
     let mut page_refused = Vec::new();
     loop {
@@ -1260,6 +1269,32 @@ async fn replay_stored_moderation(
                     continue;
                 }
             }
+            let event_gid = crate::nips::nip29::group_id(&event)
+                .filter(|gid| !gid.is_empty())
+                .map(str::to_string);
+            let is_create = event.kind == crate::nips::nip29::CREATE_GROUP;
+            if event.kind != crate::nips::nip29::CREATE_GROUP
+                && let Some(gid) = &event_gid
+                && groups.group(gid).is_none()
+                && !groups.is_ghosted(gid)
+                && !groups.is_deleted(gid)
+            {
+                // A delete for an id that has no group yet is not a
+                // state-bearing event to resurrect; the startup rebuild
+                // skips it, so keep it stored but do not create a pending
+                // group from it.
+                if event.kind == crate::nips::nip29::DELETE_GROUP {
+                    continue;
+                }
+                if pending_state_count < PENDING_STATE_MAX {
+                    pending_state.entry(gid.clone()).or_default().push(event);
+                    pending_state_count += 1;
+                    continue;
+                }
+                // Bounded history exceeded: fall back to the pre-buffer
+                // behavior (the event will be refused below) rather than
+                // aborting a healthy migration.
+            }
             let authorized = replay_moderation(groups, &event, relay_pubkey);
             if authorized
                 && event.kind == crate::nips::nip29::JOIN
@@ -1300,9 +1335,74 @@ async fn replay_stored_moderation(
                     page_refused.push(event);
                 }
             }
+            // The create has established the group: replay the state that
+            // preceded it, now with the real group state for authorization
+            // and apply. State-changing 9005/9008 actions run through the
+            // same sink as in-order actions.
+            if authorized
+                && is_create
+                && let Some(gid) = event_gid.as_deref()
+                && let Some(mut buffered) = pending_state.remove(gid)
+            {
+                pending_state_count = pending_state_count.saturating_sub(buffered.len());
+                buffered.sort_by(|a, b| {
+                    (
+                        a.created_at,
+                        crate::nips::nip29::group_rank(a.kind),
+                        a.kind,
+                        &a.id,
+                    )
+                        .cmp(&(
+                            b.created_at,
+                            crate::nips::nip29::group_rank(b.kind),
+                            b.kind,
+                            &b.id,
+                        ))
+                });
+                for buffered_event in buffered {
+                    let authorized = replay_moderation(groups, &buffered_event, relay_pubkey);
+                    if authorized
+                        && buffered_event.kind == crate::nips::nip29::JOIN
+                        && let Some(admitted) = admitted_joins.as_deref_mut()
+                    {
+                        admitted.insert(buffered_event.id.clone());
+                    }
+                    if authorized {
+                        if matches!(buffered_event.kind, 9005 | 9008) {
+                            match &mut action {
+                                ReplayAction::Apply(sink) => {
+                                    if !sink.applied.contains(&buffered_event.id)
+                                        && sink.apply(&buffered_event).await?
+                                    {
+                                        return Ok(ReplayOutcome::StateChanged);
+                                    }
+                                }
+                                ReplayAction::Final(applied) => {
+                                    if !applied.contains(&buffered_event.id) {
+                                        bail!(
+                                            "the NIP-29 moderation fixpoint was not stable: an \
+                                             authorized buffered action remained in the final \
+                                             replay; the migration did not complete (re-run it)"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    } else if refused.is_some() {
+                        page_refused.push(buffered_event);
+                    }
+                }
+            }
         }
         if !more {
             if let Some(dropper) = refused.as_deref_mut() {
+                // A buffered state event whose create never appeared is
+                // unauthorized in this replay. Drop it in the final pass,
+                // like the pre-buffer code did, so a future re-create
+                // cannot inherit it.
+                for events in pending_state.drain().map(|(_, events)| events) {
+                    page_refused.extend(events);
+                }
                 dropper.drop_page(std::mem::take(&mut page_refused)).await?;
             }
             break;
@@ -1313,6 +1413,9 @@ async fn replay_stored_moderation(
         // incomplete state); fail the migration instead.
         let Some(boundary) = max_created else {
             if let Some(dropper) = refused.as_deref_mut() {
+                for events in pending_state.drain().map(|(_, events)| events) {
+                    page_refused.extend(events);
+                }
                 dropper.drop_page(std::mem::take(&mut page_refused)).await?;
             }
             break;
@@ -2292,6 +2395,67 @@ mod tests {
         let stats = run_str(&db, &jsonl(&[delete]), &options());
         assert_eq!(stats.group_deletions, 1, "the seeded admin is authorized");
         assert!(visible(&db, serde_json::json!({"ids": [post.id]})).is_empty());
+        db.shutdown();
+    }
+
+    #[test]
+    fn state_before_its_create_is_buffered_and_replayed() {
+        // strfry can export a grant before the group create (for example a
+        // backdated event whose id sorts first). The migration must keep the
+        // state, apply it once the create establishes the group, and then
+        // authorize a later action by that grant just like the startup
+        // rebuild does.
+        let db = test_db("pre-create-state");
+        let now = unix_now();
+        let admin_pk = keypair(2).x_only_public_key().0.to_string();
+        let grant = signed(
+            1,
+            9000,
+            now - 50,
+            vec![
+                vec!["h".into(), "g".into()],
+                vec!["p".into(), admin_pk, "admin".into()],
+            ],
+            "",
+        );
+        let create = signed(1, 9007, now - 40, vec![vec!["h".into(), "g".into()]], "");
+        let post = signed(1, 9, now - 30, vec![vec!["h".into(), "g".into()]], "post");
+        let delete = signed(
+            2,
+            9005,
+            now - 20,
+            vec![
+                vec!["h".into(), "g".into()],
+                vec!["e".into(), post.id.clone()],
+            ],
+            "",
+        );
+        let stats = run_str(
+            &db,
+            &jsonl(&[grant.clone(), create.clone(), post.clone(), delete]),
+            &options(),
+        );
+        assert_eq!(
+            stats.unauthorized_moderation, 0,
+            "the buffered grant must not be counted as refused"
+        );
+        assert_eq!(
+            stats.group_deletions, 1,
+            "the buffered grant authorizes the 9005"
+        );
+        assert_eq!(
+            visible(&db, serde_json::json!({"ids": [grant.id]})).len(),
+            1,
+            "the pre-create grant must survive the refused-event cleanup"
+        );
+        assert_eq!(
+            visible(&db, serde_json::json!({"ids": [create.id]})).len(),
+            1
+        );
+        assert!(
+            visible(&db, serde_json::json!({"ids": [post.id]})).is_empty(),
+            "the granted admin's 9005 must be applied"
+        );
         db.shutdown();
     }
 

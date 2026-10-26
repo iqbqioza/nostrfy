@@ -25,6 +25,48 @@ const OTHER: &str = "ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
 const ADMIN2: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
 
 #[test]
+fn a_relay_mirror_from_an_old_incarnation_is_ignored_after_recreate() {
+    let mut store = GroupStore::default();
+    let now = 1_600_000_000;
+    let mut create = event(CREATE_GROUP, ADMIN, Some("g1"), vec![]);
+    create.id = "11".repeat(32);
+    store.apply(&create, "relay", now, true, false);
+    let join = event(JOIN, USER, Some("g1"), vec![]);
+    let out = store.apply(&join, "relay", now + 1, true, false);
+    let mirror = out
+        .into_iter()
+        .find(|event| event.kind == 9000 && event.pubkey == "relay")
+        .expect("JOIN emits a relay-signed put-user mirror");
+    assert!(
+        mirror
+            .tags
+            .iter()
+            .any(|tag| tag.len() == 2 && tag[0] == CREATE_ID_TAG && tag[1] == create.id),
+        "the mirror must carry the incarnation it was generated for"
+    );
+    assert!(store.group("g1").unwrap().members.contains_key(USER));
+
+    // Delete and re-create the same group id with a new create event.
+    store.apply(
+        &event(DELETE_GROUP, ADMIN, Some("g1"), vec![]),
+        "relay",
+        now + 2,
+        true,
+        false,
+    );
+    let mut recreate = event(CREATE_GROUP, ADMIN, Some("g1"), vec![]);
+    recreate.id = "22".repeat(32);
+    recreate.created_at = now + 3;
+    store.apply(&recreate, "relay", now + 3, true, false);
+    let applied = store.apply(&mirror, "relay", now + 4, true, true);
+    assert!(applied.is_empty(), "the stale mirror must be a no-op");
+    assert!(
+        !store.group("g1").unwrap().members.contains_key(USER),
+        "the old mirror must not re-add a member to the new incarnation"
+    );
+}
+
+#[test]
 fn replay_does_not_adopt_a_foreign_child() {
     // A 9002 stored while NIP-29 was disabled was never live-validated.
     // The rebuild replay must not let ADMIN (admin of `a` only) graft
