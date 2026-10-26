@@ -618,6 +618,12 @@ pub(crate) struct GroupsSnapshot {
     /// older snapshots deserialize as 0.
     #[serde(default)]
     pub seq: u64,
+    /// Buzz compatibility mode at snapshot capture. If it differs on the
+    /// next restore, startup republishes the 39000/39001/39002 rosters so a
+    /// mode switch is reflected without waiting for the next mutation.
+    /// Older snapshots have no field and are refreshed once.
+    #[serde(default)]
+    pub buzz_enabled: Option<bool>,
 }
 
 /// Verifies that a rebuild page delivered every event of its boundary
@@ -671,6 +677,7 @@ impl GroupStore {
             // `DbClient::state_seq`).
             stamp: 0,
             seq: 0,
+            buzz_enabled: Some(self.buzz_enabled),
         }
     }
 

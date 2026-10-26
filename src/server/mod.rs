@@ -787,6 +787,10 @@ async fn restore_group_state(relay: &Relay, groups_enabled: bool) -> Result<()> 
     let seq = relay.db.state_seq_group().await;
     match (stamp, seq) {
         (Some(stamp), Some(seq)) => {
+            let mode_changed = {
+                let groups = relay.groups.read().await;
+                snapshot.buzz_enabled != Some(groups.buzz_enabled)
+            };
             if relay
                 .groups
                 .write()
@@ -794,6 +798,17 @@ async fn restore_group_state(relay: &Relay, groups_enabled: bool) -> Result<()> 
                 .restore_checked(snapshot, stamp, seq)
             {
                 info!("NIP-29 group state restored from the database snapshot");
+                if mode_changed {
+                    // The stored 39000/39001/39002 were generated under the
+                    // previous Buzz mode. Refresh them now rather than
+                    // waiting for the next metadata/membership mutation.
+                    if !relay.publish_group_metadata().await {
+                        log::warn!(
+                            "could not refresh NIP-29 metadata after a Buzz-mode change; \
+                             the next membership/metadata change retries it"
+                        );
+                    }
+                }
                 // Persist the restored (and possibly auto-migrated/filtered)
                 // snapshot: this writes derived create ids and removes
                 // vanished members from old snapshots without a destructive

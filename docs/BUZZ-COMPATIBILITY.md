@@ -206,13 +206,12 @@ host, because Buzz signs the relay URL it uploads to.
   (a failed save is retryable), so a crash cannot leave a current pre-DM
   snapshot that makes the unknown channel public. Hidden-DM sets are
   snapshot-backed for the same reason.
-- Enabling `enabled_buzz` on an existing relay upgrades the creator role in
-  the restored snapshot (and disabling it maps a Buzz-created channel's
-  restored `owner` default back to `admin`), but the mode switch itself does
-  not rewrite the stored `39001`/`39002`; the next metadata or membership
-  change does. A snapshot restart schedules one roster refresh for groups
-  above the 1,000-member throttle threshold, but not for `39001` or smaller
-  groups.
+- Enabling or disabling `enabled_buzz` on an existing relay upgrades/maps
+  the creator role in the restored snapshot and records the mode in the
+  group snapshot. The next startup detects a mode change (including an old
+  snapshot with no recorded mode) and republishes `39000`/`39001`/`39002`
+  for every group, so the rosters do not wait for the next metadata or
+  membership mutation.
 - A vanish that lands while a NIP-43 rebuild is in flight publishes a
   remove-user event, but the full `13534` roster is not republished until
   the next role/membership change; a client that fetches only the stored
