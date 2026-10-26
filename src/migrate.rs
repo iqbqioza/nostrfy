@@ -10,12 +10,14 @@
 //! ([`DbClient::put_batch_checked`]), so NIP-01 replaceable/addressable
 //! semantics, the NIP-40 expiry index, the NIP-50 word index, the gift-wrap
 //! recipient index and every other index are maintained. The per-event side
-//! effects the relay applies *after* a store are reproduced in input order:
+//! effects the relay applies *after* a store are reproduced without changing
+//! the group-action fixpoint:
 //!
-//! - NIP-09 (`kind:5`): the deletion is applied and the deleter's gift wraps
-//!   are purged, writing the tombstones that keep the deleted events from
-//!   being re-published (strfry physically removes deleted events, so the
-//!   export has no trace of them except the deletion requests themselves).
+//! - NIP-09 (`kind:5`): the deletion is recorded during import and applied
+//!   after the NIP-29 fixpoint; its gift-wrap purges run in the same pass.
+//!   It writes the tombstones that keep the deleted events from being
+//!   re-published (strfry physically removes deleted events, so the export
+//!   has no trace of them except the deletion requests themselves).
 //! - NIP-29 (`kind:9005`): the referenced events are deleted with the group
 //!   scoping check.
 //! - NIP-29 (`kind:9008`): the group's stored events are purged and the
@@ -23,9 +25,11 @@
 //!   (fail-closed: leftover history would become world-readable if the id
 //!   were re-created).
 //! - NIP-62 (`kind:62`): only with [`Options::apply_vanish`], and only when
-//!   the request targets this relay. Opt-in because strfry does not
-//!   implement NIP-62: the events the request names were served by strfry
-//!   and are part of the data being migrated.
+//!   the request targets this relay. The pending marker is written during
+//!   import (so later rows of the same author are blocked), while the
+//!   removal walk waits for the group fixpoint. Opt-in because strfry does
+//!   not implement NIP-62: the events the request names were served by
+//!   strfry and are part of the data being migrated.
 //!
 //! Derived state (NIP-29 groups, NIP-43 roles) is not rebuilt here: the
 //! first relay start after the migration replays the stored events, exactly
@@ -417,7 +421,7 @@ pub async fn run(
         // consumed every action. A later deletion may still remove an
         // action event, but its already-applied effect is fail-closed
         // (revoking membership/purging history) rather than being skipped.
-        apply_stored_removals(db, &mut stats).await?;
+        apply_stored_removals(db, opts, &identity, &mut stats).await?;
         invalidate_group_snapshot_after_import(db, &stats).await?;
     }
     Ok(stats)
@@ -582,16 +586,27 @@ async fn flush(
         }
         // NIP-62's marker must be written before later events of the same
         // author are imported (the permanent-upload ban is order-sensitive).
+        // The removal walk is deferred with NIP-09, so an admin's earlier
+        // 9005/9008 retains its effect; the marker alone blocks later rows.
         if event.kind == nip62::VANISH_KIND
             && opts.apply_vanish
             && opts.nip62_enabled
             && nip62::is_vanish(event)
             && nip62::targets_us(event, identity)
         {
-            apply_vanish(db, event, stats).await?;
+            let Some(pubkey) = event.pubkey_bytes() else {
+                bail!(
+                    "the stored NIP-62 request has no valid pubkey; the migration did not \
+                     complete (re-run it)"
+                );
+            };
+            if !db.record_pending_vanish(pubkey, event.created_at).await {
+                bail!(
+                    "could not record the NIP-62 pending marker; the migration did not \
+                     complete (re-run it)"
+                );
+            }
         }
-        // NIP-09 deletions are deferred: applying them while streaming
-        // could erase a deferred 9005/9008 before its side effect runs.
     }
     if opts.first_seen && !first_seen.is_empty() {
         db.touch_first_seen_batch(std::mem::take(first_seen)).await;
@@ -603,13 +618,18 @@ async fn flush(
 /// author-scoped removal effects; running them after the 9005/9008 fixpoint
 /// prevents a later deletion from erasing an action before its effect is
 /// applied (the effect may over-remove, never under-remove).
-async fn apply_stored_removals(db: &DbClient, stats: &mut Stats) -> Result<()> {
+async fn apply_stored_removals(
+    db: &DbClient,
+    opts: &Options,
+    identity: &nip62::RelayIdentity<'_>,
+    stats: &mut Stats,
+) -> Result<()> {
     const PAGE: usize = 50_000;
     let mut since: Option<u64> = None;
-    let mut last_key: Option<(u64, String)> = None;
+    let mut last_key: Option<(u64, u64, String)> = None;
     loop {
         let mut filter: Filter = serde_json::from_value(serde_json::json!({
-            "kinds": [nip09::DELETION_KIND],
+            "kinds": [nip09::DELETION_KIND, nip62::VANISH_KIND],
         }))
         .expect("static filter");
         filter.since = since;
@@ -618,26 +638,34 @@ async fn apply_stored_removals(db: &DbClient, stats: &mut Stats) -> Result<()> {
             .await
         else {
             bail!(
-                "could not read stored deletion requests; the migration did not complete \
-                 (re-run it)"
+                "could not read stored deletion/vanish requests; the migration did not \
+                 complete (re-run it)"
             );
         };
         if page.is_empty() {
             break;
         }
-        page.sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
+        page.sort_by(|a, b| (a.created_at, a.kind, &a.id).cmp(&(b.created_at, b.kind, &b.id)));
         for event in page {
-            let key = (event.created_at, event.id.clone());
+            let key = (event.created_at, event.kind, event.id.clone());
             if last_key.as_ref().is_some_and(|last| &key <= last) {
                 continue;
             }
             last_key = Some(key);
-            apply_nip09(db, &event, stats).await?;
+            if event.kind == nip09::DELETION_KIND {
+                apply_nip09(db, &event, stats).await?;
+            } else if opts.apply_vanish
+                && opts.nip62_enabled
+                && nip62::is_vanish(&event)
+                && nip62::targets_us(&event, identity)
+            {
+                apply_vanish(db, &event, stats).await?;
+            }
         }
         if !more {
             break;
         }
-        since = last_key.as_ref().map(|(created, _)| *created);
+        since = last_key.as_ref().map(|(created, _, _)| *created);
         if since.is_none() {
             break;
         }
@@ -2199,6 +2227,45 @@ mod tests {
         assert!(
             visible(&db, serde_json::json!({})).is_empty(),
             "nothing of the vanished author stays visible"
+        );
+        db.shutdown();
+    }
+
+    #[test]
+    fn vanish_does_not_erase_the_admins_deferred_group_action() {
+        // The vanish marker now blocks later rows immediately, but the
+        // removal walk runs after the 9005/9008 fixpoint. An admin's own
+        // vanish must not erase the 9005 before its effect is applied.
+        let db = test_db("vanish-admin-action");
+        let now = unix_now();
+        let create = signed(1, 9007, now - 50, vec![vec!["h".into(), "g".into()]], "");
+        let post = signed(2, 9, now - 40, vec![vec!["h".into(), "g".into()]], "post");
+        let delete = signed(
+            1,
+            9005,
+            now - 30,
+            vec![
+                vec!["h".into(), "g".into()],
+                vec!["e".into(), post.id.clone()],
+            ],
+            "",
+        );
+        let vanish = signed(
+            1,
+            nip62::VANISH_KIND,
+            now - 20,
+            vec![vec!["relay".into(), "ALL_RELAYS".into()]],
+            "",
+        );
+        let mut opts = options();
+        opts.apply_vanish = true;
+        let stats = run_str(&db, &jsonl(&[create, post.clone(), delete, vanish]), &opts);
+        assert_eq!(stats.group_deletions, 1, "the 9005 must run before vanish");
+        assert_eq!(stats.vanishes, 1);
+        assert!(
+            visible(&db, serde_json::json!({"ids": [post.id]})).is_empty(),
+            "the deferred 9005 must delete the other author's post even though \
+             its admin author vanished"
         );
         db.shutdown();
     }

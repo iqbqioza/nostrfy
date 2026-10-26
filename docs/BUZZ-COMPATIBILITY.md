@@ -259,12 +259,12 @@ host, because Buzz signs the relay URL it uploads to.
   events (forcing the first start to rebuild/ghost-check), except when the
   snapshot contains DM groups; keeping DM snapshots preserves their
   membership at the cost of not auto-verifying imported private history.
-- Migration applies NIP-09 deletions only after the 9005/9008 fixpoint, so
-  an ordinary deletion can no longer erase an action before its effect. A
-  NIP-62 vanish still has to run inline to block later events in the same
-  export; a vanish authored by an admin can therefore remove the admin's
-  own deferred 9005/9008 before it runs. Do not run an incremental migration
-  over a live role/group database without a subsequent full rebuild.
+- Migration records NIP-09 deletions and NIP-62 vanish markers while
+  streaming, then runs their removal walks after the 9005/9008 fixpoint. The
+  NIP-62 marker still blocks later rows in the same export immediately, but
+  an admin's vanish no longer erases the admin's own deferred
+  `9005`/`9008` before its effect. Do not run an incremental migration over
+  a live role/group database without a subsequent full rebuild.
 - Enabling Buzz on a restored plain-NIP-29 group does not reinterpret
   literal `guest`/`bot` role labels. Such a role was an ordinary privileged
   role in plain mode, while Buzz reports it as a read-only/bot tier. Use a

@@ -529,6 +529,14 @@ enum Msg {
         /// and only for the families it actually belonged to.
         reply: oneshot::Sender<Option<(usize, store::StateRemoved)>>,
     },
+    /// NIP-62: record the pending marker without running the removal walk.
+    /// Migration uses this to make the request block later events in the
+    /// same export before the deferred removal pass.
+    RecordPendingVanish {
+        pubkey: Vec<u8>,
+        until_created: u64,
+        reply: oneshot::Sender<bool>,
+    },
     /// NIP-59: delete gift wraps addressed to a pubkey (on NIP-09 deletion).
     GiftWrapPurge {
         pubkey: Vec<u8>,
@@ -1026,7 +1034,9 @@ fn msg_bytes(msg: &Msg) -> usize {
             .map(|(pubkey, reason)| pubkey.len() + reason.len())
             .sum(),
         Msg::SaveBlossomAllow { entries, .. } => entries.iter().map(String::len).sum(),
-        Msg::Vanish { pubkey, .. } | Msg::GiftWrapPurge { pubkey, .. } => pubkey.len(),
+        Msg::Vanish { pubkey, .. }
+        | Msg::RecordPendingVanish { pubkey, .. }
+        | Msg::GiftWrapPurge { pubkey, .. } => pubkey.len(),
         _ => 0,
     }
 }
@@ -2362,6 +2372,19 @@ impl DbClient {
             reply,
         })
         .await
+    }
+
+    /// Records the NIP-62 in-progress marker without walking the stored
+    /// history. Used by migration so a request blocks later rows in the
+    /// export before the deferred removal pass completes the vanish.
+    pub async fn record_pending_vanish(&self, pubkey: [u8; 32], until_created: u64) -> bool {
+        self.request_write_checked(|reply| Msg::RecordPendingVanish {
+            pubkey: pubkey.to_vec(),
+            until_created,
+            reply,
+        })
+        .await
+        .unwrap_or(false)
     }
 
     /// NIP-59: deletes `kind:1059` gift wraps p-tagging `pubkey`.

@@ -1431,6 +1431,22 @@ pub(crate) fn spawn(
                                     };
                                     let _ = reply.send(outcome);
                                 }
+                                Msg::RecordPendingVanish {
+                                    pubkey,
+                                    until_created,
+                                    reply,
+                                } => {
+                                    let recorded = match store
+                                        .record_pending_vanish(&pubkey, until_created)
+                                    {
+                                        Ok(_) => true,
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            false
+                                        }
+                                    };
+                                    let _ = reply.send(recorded);
+                                }
                                 Msg::GiftWrapPurge {
                                     pubkey,
                                     until,
