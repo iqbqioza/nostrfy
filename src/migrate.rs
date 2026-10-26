@@ -413,8 +413,50 @@ pub async fn run(
         // order-independent), then the NIP-29 actions.
         apply_gift_wrap_purges(db, &mut stats).await?;
         apply_group_side_effects(db, opts, &mut stats).await?;
+        invalidate_group_snapshot_after_import(db, &stats).await?;
     }
     Ok(stats)
+}
+
+/// An imported database must not trust a pre-import group snapshot: the
+/// snapshot knows neither the imported group ids nor the imported `h`/`d`
+/// history, so unknown private groups could read as public and the ghost pass
+/// would never run. Drop the snapshot so the next start rebuilds from events.
+/// DM groups are snapshot-only, so keep the snapshot when one exists and
+/// leave that (documented) migration limitation rather than destroying its
+/// membership; the next start still serves the restored DM safely.
+async fn invalidate_group_snapshot_after_import(db: &DbClient, stats: &Stats) -> Result<()> {
+    if stats.stored == 0 && stats.replaced == 0 {
+        return Ok(());
+    }
+    match db.load_groups().await {
+        crate::db::LoadGroupsOutcome::Missing => Ok(()),
+        crate::db::LoadGroupsOutcome::Failed => bail!(
+            "cannot inspect the destination group snapshot after the migration; \
+             refusing to leave it as authoritative (re-run the migration)"
+        ),
+        crate::db::LoadGroupsOutcome::Loaded(snapshot) => {
+            if snapshot
+                .groups
+                .values()
+                .any(|group| group.channel_type == "dm")
+            {
+                log::warn!(
+                    "migration imported group events into a database with DM groups; \
+                     keeping the snapshot because DMs are snapshot-only. Imported private \
+                     group history may need an explicit rebuild before serving."
+                );
+                return Ok(());
+            }
+            if !db.clear_groups_snapshot().await {
+                bail!(
+                    "could not invalidate the destination group snapshot after the \
+                     migration; refusing to leave imported private history unverified"
+                );
+            }
+            Ok(())
+        }
+    }
 }
 
 /// Reads one line (up to and including `\n`) into `out`, keeping at most
@@ -1151,7 +1193,11 @@ async fn replay_stored_moderation(
                 continue;
             }
             if event.kind == crate::nips::nip29::JOIN
-                && same_second_removals.removes(&event.pubkey, event.created_at)
+                && same_second_removals.removes(
+                    &event.pubkey,
+                    event.created_at,
+                    crate::nips::nip29::group_id(&event).unwrap_or_default(),
+                )
             {
                 continue;
             }

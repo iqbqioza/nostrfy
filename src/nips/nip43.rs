@@ -101,6 +101,15 @@ pub(crate) struct RolesSnapshot {
 }
 
 impl RoleStore {
+    /// Whether the store holds event-derived role state: a role definition
+    /// or an assignment that names at least one role. Role-empty entries can
+    /// be claim-admitted members or synthetic owner/allowlist roster rows;
+    /// they must not make an otherwise empty rebuild look authoritative over
+    /// a former-key snapshot.
+    pub fn has_role_state(&self) -> bool {
+        !self.roles.is_empty() || self.assignments.values().any(|roles| !roles.is_empty())
+    }
+
     /// Whether `pubkey` holds at least one role assignment.
     pub fn is_member_of(&self, pubkey: &str) -> bool {
         // Membership is presence on the member list: a claim-admitted

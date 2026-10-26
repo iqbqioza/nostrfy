@@ -9,6 +9,13 @@ use super::{
     D, GROUP_ADMINS, GROUP_MEMBERS, GROUP_META, GROUP_PARTICIPANTS, GROUP_PINS, GROUP_ROLES, Group,
     GroupSettings, H, JOIN_MIRROR_TAG, P,
 };
+fn has_tag(event: &Event, name: &str) -> bool {
+    event
+        .tags
+        .iter()
+        .any(|tag| tag.first().is_some_and(|tag_name| tag_name == name))
+}
+
 /// Applies a kind:9007/9002 metadata event.
 ///
 /// In Buzz mode (`buzz = true`) this is a **partial update**: Buzz clients
@@ -110,10 +117,8 @@ pub(crate) fn apply_settings(group: &mut Group, event: &Event, buzz: bool, histo
     // channel is private for another reason. Re-derive only when this event
     // actually carries join_role, so an explicit `restricted` tag is not
     // overwritten by the old value in a partial edit.
-    if event
-        .tags
-        .iter()
-        .any(|tag| tag.first().is_some_and(|name| name == "join_role"))
+    if has_tag(event, "join_role")
+        && !has_tag(event, "restricted")
         && let Some(role) = &group.settings.join_role
     {
         if role == "member" {
@@ -295,10 +300,8 @@ fn apply_nip29_settings(group: &mut Group, event: &Event, history: bool) {
         // Only an event that actually changes join_role may re-derive
         // `restricted`; otherwise an explicit `restricted` tag in the same
         // 9002 would be overwritten by the old join_role.
-        if event
-            .tags
-            .iter()
-            .any(|tag| tag.first().is_some_and(|name| name == "join_role"))
+        if has_tag(event, "join_role")
+            && !has_tag(event, "restricted")
             && let Some(role) = &settings.join_role
         {
             if role == "member" {

@@ -190,8 +190,8 @@ fn apply_covers_parent_child_roles_pins_and_delete() {
     let _ = store.apply(&drop_child, "relay", now, true, true);
     assert_eq!(
         store.group("g1").unwrap().children,
-        vec!["g2".to_string(), "g3".to_string(), "g4".to_string()],
-        "the replay merges the declared children instead of replacing the list"
+        vec!["g2".to_string(), "g4".to_string(), "g3".to_string()],
+        "the replay keeps the declared order and appends the undetached old child"
     );
     assert_eq!(store.group("g3").unwrap().parent.as_deref(), Some("g1"));
     // The old parent's metadata is republished when the parent changes.
@@ -1593,7 +1593,9 @@ fn a_same_second_removal_beats_a_join() {
 
     let mut store = GroupStore::default();
     for e in &events {
-        if e.kind == JOIN && removals.removes(&e.pubkey, e.created_at) {
+        if e.kind == JOIN
+            && removals.removes(&e.pubkey, e.created_at, group_id(e).unwrap_or_default())
+        {
             continue;
         }
         store.apply(e, "relay", now, false, true);
@@ -1642,7 +1644,9 @@ fn a_later_join_after_a_removal_still_readmits() {
 
     let mut store = GroupStore::default();
     for e in &events {
-        if e.kind == JOIN && removals.removes(&e.pubkey, e.created_at) {
+        if e.kind == JOIN
+            && removals.removes(&e.pubkey, e.created_at, group_id(e).unwrap_or_default())
+        {
             continue;
         }
         store.apply(e, "relay", now, false, true);
@@ -1818,6 +1822,57 @@ fn rebuild_keeps_join_membership() {
             "creator is an admin (owner) after rebuild"
         );
         assert!(g.is_member(OTHER), "JOIN membership survives rebuild");
+    });
+}
+
+#[test]
+fn rebuild_buffers_state_that_precedes_its_create() {
+    // A legacy export can contain a settings event with a timestamp earlier
+    // than its create. It must not be discarded (which could make a private
+    // group public after a rebuild); buffer it until the create is seen.
+    use crate::db::DbClient;
+    use crate::nips::nip01;
+    use std::sync::Arc;
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = std::env::temp_dir()
+        .join("nostrfy-nip29-pending-state")
+        .join(format!("{:x}-{id}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&path);
+    let cfg = crate::config::DatabaseConfig {
+        path,
+        map_size: 16 * 1024 * 1024,
+        max_map_size: 32 * 1024 * 1024,
+        ..Default::default()
+    };
+    let db = DbClient::open(
+        &cfg,
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let now = 1_700_000_000;
+        let mut create = event(CREATE_GROUP, ADMIN, Some("g1"), vec![]);
+        create.created_at = now + 10;
+        create.id = nip01::compute_id(&create);
+        let mut private = event(9002, ADMIN, Some("g1"), vec![vec!["private".into()]]);
+        private.created_at = now;
+        private.id = nip01::compute_id(&private);
+        assert_eq!(db.put(private, now).await, crate::db::PutOutcome::Stored);
+        assert_eq!(db.put(create, now).await, crate::db::PutOutcome::Stored);
+
+        let mut store = GroupStore::default();
+        assert!(store.rebuild(&db, None).await);
+        assert!(
+            store.group("g1").unwrap().settings.private,
+            "the out-of-order private setting must survive replay"
+        );
     });
 }
 
@@ -5970,7 +6025,15 @@ fn buzz_partial_join_role_does_not_override_explicit_restricted() {
         false,
     );
     store.apply(
-        &event(9002, ADMIN, Some("g1"), vec![vec!["restricted".into()]]),
+        &event(
+            9002,
+            ADMIN,
+            Some("g1"),
+            vec![
+                vec!["restricted".into()],
+                vec!["join_role".into(), "member".into()],
+            ],
+        ),
         "relay",
         now + 1,
         false,
@@ -5978,7 +6041,7 @@ fn buzz_partial_join_role_does_not_override_explicit_restricted() {
     );
     assert!(
         store.group("g1").unwrap().settings.restricted,
-        "an explicit restricted tag must win over the unchanged join_role"
+        "an explicit restricted tag must win over join_role normalization"
     );
 }
 
@@ -6179,5 +6242,168 @@ fn relay_master_bare_put_user_still_demotes_roles() {
     assert!(
         !store.group("g1").unwrap().is_admin(USER),
         "a relay-master-key 9000 without the JOIN marker must remain a demotion"
+    );
+}
+
+#[test]
+fn a_join_invite_code_is_member_only() {
+    let mut store = GroupStore::default();
+    let now = 1_600_000_000;
+    store.apply(
+        &event(CREATE_GROUP, ADMIN, Some("g1"), vec![]),
+        "relay",
+        now,
+        false,
+        false,
+    );
+    store.apply(
+        &event(9002, ADMIN, Some("g1"), vec![vec!["closed".into()]]),
+        "relay",
+        now,
+        false,
+        false,
+    );
+    store.apply(
+        &event(
+            9009,
+            ADMIN,
+            Some("g1"),
+            vec![vec!["code".into(), "secret".into()]],
+        ),
+        "relay",
+        now,
+        false,
+        false,
+    );
+    let join = event(
+        JOIN,
+        USER,
+        Some("g1"),
+        vec![vec!["code".into(), "secret".into()]],
+    );
+    assert!(
+        !store.visible_to(&join, None),
+        "a non-member must not read the code from a JOIN"
+    );
+    assert!(
+        !store.visible_to(&join, Some(OTHER)),
+        "another authenticated non-member must not read it either"
+    );
+    assert!(
+        store.visible_to(&join, Some(ADMIN)),
+        "a member may read the join history"
+    );
+    assert!(
+        store.privacy_gated(&join),
+        "the JOIN with a code is member-gated"
+    );
+}
+
+#[test]
+fn same_second_removals_are_group_scoped() {
+    let now = 1_600_000_000;
+    let mut remove = event(
+        REMOVE_USER,
+        ADMIN,
+        Some("a"),
+        vec![vec!["p".into(), USER.into()]],
+    );
+    remove.created_at = now;
+    let mut join = event(JOIN, USER, Some("b"), vec![]);
+    join.created_at = now;
+    let removals = SameSecondRemovals::collect(&[remove, join]);
+    assert!(removals.removes(USER, now, "a"));
+    assert!(
+        !removals.removes(USER, now, "b"),
+        "a removal in group a must not cancel a JOIN to group b"
+    );
+}
+
+#[test]
+fn replay_preserves_declared_child_order() {
+    let mut store = GroupStore::default();
+    let now = 1_600_000_000;
+    for gid in ["p", "c1", "c2"] {
+        store.apply(
+            &event(CREATE_GROUP, ADMIN, Some(gid), vec![]),
+            "relay",
+            now,
+            false,
+            true,
+        );
+    }
+    store.apply(
+        &event(
+            9002,
+            ADMIN,
+            Some("p"),
+            vec![
+                vec!["child".into(), "c1".into()],
+                vec!["child".into(), "c2".into()],
+            ],
+        ),
+        "relay",
+        now,
+        false,
+        true,
+    );
+    store.apply(
+        &event(
+            9002,
+            ADMIN,
+            Some("p"),
+            vec![
+                vec!["child".into(), "c2".into()],
+                vec!["child".into(), "c1".into()],
+            ],
+        ),
+        "relay",
+        now + 1,
+        false,
+        true,
+    );
+    assert_eq!(
+        store.group("p").unwrap().children,
+        vec!["c2".to_string(), "c1".to_string()],
+        "the stored 9002 order must survive replay"
+    );
+}
+
+#[test]
+fn privileged_put_user_wins_over_a_guest_tier() {
+    let mut store = GroupStore {
+        buzz_enabled: true,
+        ..GroupStore::default()
+    };
+    let now = 1_600_000_000;
+    store.apply(
+        &event(CREATE_GROUP, ADMIN, Some("g1"), vec![]),
+        "relay",
+        now,
+        false,
+        false,
+    );
+    store.apply(
+        &event(
+            PUT_USER,
+            ADMIN,
+            Some("g1"),
+            vec![vec![
+                "p".into(),
+                USER.into(),
+                "admin".into(),
+                "guest".into(),
+            ]],
+        ),
+        "relay",
+        now,
+        false,
+        false,
+    );
+    let group = store.group("g1").unwrap();
+    assert!(group.is_admin(USER));
+    assert!(
+        !group.is_guest(USER),
+        "a privileged role must not leave a contradictory guest tier"
     );
 }

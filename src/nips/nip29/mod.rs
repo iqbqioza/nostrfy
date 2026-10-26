@@ -1030,6 +1030,17 @@ impl GroupStore {
         // group admin remains.
         let relay_signed = relay_pubkey.is_some_and(|pk| pk.eq_ignore_ascii_case(pubkey));
 
+        // A group-state event cannot predate the incarnation it mutates.
+        // This also blocks the common stale-after-recreate case and keeps
+        // replay from silently discarding a backdated private setting.
+        if event.kind != CREATE_GROUP
+            && group
+                .created_at
+                .is_some_and(|created| event.created_at < created)
+        {
+            bail!("invalid: group event predates the group");
+        }
+
         // A plain-origin group ignores NIP-CL channel tags live but the
         // history replay honors them as a privacy floor. Reject the tags on
         // a plain group so the two paths cannot diverge after a restart.
@@ -1292,6 +1303,21 @@ impl GroupStore {
         let Some(gid) = group_id(event) else {
             return Vec::new();
         };
+        // A delayed after-put from a previous incarnation must not mutate a
+        // group re-created under the same id. The live validation runs
+        // before the store commit; re-check the incarnation here under the
+        // write lock. (A full create-id/epoch binding is a later hardening
+        // step; created_at catches the ordinary delayed case safely.)
+        if !history_replay
+            && event.kind != CREATE_GROUP
+            && self
+                .groups
+                .get(gid)
+                .and_then(|group| group.created_at)
+                .is_some_and(|created| event.created_at < created)
+        {
+            return Vec::new();
+        }
         let mut out = Vec::new();
         match event.kind {
             JOIN => {
@@ -1614,6 +1640,14 @@ impl GroupStore {
                             // not silently turn every member into an admin
                             // role named `member`.
                             roles.remove("member");
+                            // A privileged role wins over a tier label in
+                            // the same p tag: otherwise a user can be both
+                            // an admin and a guest, which makes the roster
+                            // inconsistent and blocks their posts.
+                            if !roles.is_empty() {
+                                guest = false;
+                                bot = false;
+                            }
                         }
                         if self.buzz_enabled {
                             let new_member = !group.members.contains_key(&pk);
@@ -1904,10 +1938,21 @@ impl GroupStore {
                                 // is bounded like the declared-children hint
                                 // (a history full of unvalidated 9002s cannot
                                 // grow the list without limit).
-                                let mut present: HashSet<String> =
-                                    group.children.iter().cloned().collect();
-                                let mut merged = group.children.clone();
+                                let stored = group.children.clone();
+                                let mut present: HashSet<String> = HashSet::new();
+                                let mut merged = Vec::with_capacity(stored.len());
+                                // The event's declared order is the NIP-29
+                                // child order; append only stored children
+                                // the event omitted (a same-second race).
                                 for child in declared {
+                                    if merged.len() >= child_cap {
+                                        break;
+                                    }
+                                    if present.insert(child.clone()) {
+                                        merged.push(child);
+                                    }
+                                }
+                                for child in stored {
                                     if merged.len() >= child_cap {
                                         break;
                                     }
@@ -2488,7 +2533,21 @@ impl GroupStore {
         let Some(gid) = group_id_any(event) else {
             return true;
         };
-        self.visible_kind(gid, event.kind, authed)
+        if !self.visible_kind(gid, event.kind, authed) {
+            return false;
+        }
+        // A JOIN carries the bearer invite code that admitted it. Like the
+        // 9009 itself, the code must never be readable by a non-member: a
+        // closed public-read group would otherwise leak reusable credentials
+        // through its join history.
+        if event.kind == JOIN && event_code(event).is_some_and(|code| !code.is_empty()) {
+            return authed.is_some_and(|pk| {
+                self.groups
+                    .get(gid)
+                    .is_some_and(|group| group.is_member(pk))
+            });
+        }
+        true
     }
 
     /// Whether `event` belongs to a membership-gated group (`private`
@@ -2519,6 +2578,10 @@ impl GroupStore {
             (g.settings.private && !is_meta)
                 || (g.settings.hidden && (is_meta || is_group_action_kind(event.kind)))
                 || event.kind == CREATE_INVITE
+                // A JOIN with a code is member-only for the same reason as
+                // the 9009 bearer token.
+                || (event.kind == JOIN
+                    && event_code(event).is_some_and(|code| !code.is_empty()))
         })
     }
 
@@ -3004,6 +3067,15 @@ impl GroupStore {
         // arrive after the member operation, keep the stored 39002 list
         // correct.
         const PAGE: usize = 50_000;
+        // A legacy/hostile history may contain a group-state event whose
+        // client timestamp precedes its create. The live state machine
+        // rejects state before the incarnation; a rebuild buffers it until
+        // the create is seen instead of silently discarding a private
+        // setting or admin grant. Bound the buffer so malformed history
+        // cannot exhaust memory.
+        const PENDING_STATE_MAX: usize = 50_000;
+        let mut pending_state: HashMap<String, Vec<Event>> = HashMap::new();
+        let mut pending_state_count = 0usize;
         let mut since: Option<u64> = None;
         loop {
             let mut filter: Filter =
@@ -3065,7 +3137,11 @@ impl GroupStore {
                     continue;
                 }
                 if event.kind == JOIN
-                    && same_second_removals.removes(&event.pubkey, event.created_at)
+                    && same_second_removals.removes(
+                        &event.pubkey,
+                        event.created_at,
+                        group_id(&event).unwrap_or_default(),
+                    )
                 {
                     continue;
                 }
@@ -3077,6 +3153,31 @@ impl GroupStore {
                         continue;
                     }
                 }
+                let gid = group_id(&event).unwrap_or_default().to_string();
+                if event.kind != CREATE_GROUP
+                    && !gid.is_empty()
+                    && !self.groups.contains_key(&gid)
+                    && !self.ghost.contains(&gid)
+                    && !self.deleted.contains(&gid)
+                {
+                    // A delete for an unknown id is not a state-bearing
+                    // event to resurrect; live validation would refuse it.
+                    if event.kind == DELETE_GROUP {
+                        continue;
+                    }
+                    if pending_state_count < PENDING_STATE_MAX {
+                        pending_state.entry(gid).or_default().push(event);
+                        pending_state_count += 1;
+                        continue;
+                    }
+                    // Bounded history exceeded: fall back to the previous
+                    // no-op behavior for the overflow rather than aborting a
+                    // healthy store.
+                    log::warn!(
+                        "group rebuild pending-state cap ({PENDING_STATE_MAX}) exceeded; \
+                         applying an out-of-order state event without its create"
+                    );
+                }
                 // Every stored moderation event is replayed. The relay
                 // applied it in arrival order when it was accepted, and a
                 // second rebuild-time authorization would drop legitimate
@@ -3085,6 +3186,28 @@ impl GroupStore {
                 // migration itself, which refuses to import moderation its
                 // own replay would reject.
                 self.apply(&event, relay_pubkey.unwrap_or(""), unix_now(), false, true);
+                if event.kind == CREATE_GROUP
+                    && let Some(mut buffered) = pending_state.remove(&gid)
+                {
+                    buffered.sort_by(|a, b| {
+                        (a.created_at, group_rank(a.kind), a.kind, &a.id).cmp(&(
+                            b.created_at,
+                            group_rank(b.kind),
+                            b.kind,
+                            &b.id,
+                        ))
+                    });
+                    pending_state_count = pending_state_count.saturating_sub(buffered.len());
+                    for buffered_event in buffered {
+                        self.apply(
+                            &buffered_event,
+                            relay_pubkey.unwrap_or(""),
+                            unix_now(),
+                            false,
+                            true,
+                        );
+                    }
+                }
             }
             if !more {
                 // The collector reported no truncation: every remaining
@@ -3288,7 +3411,7 @@ pub(crate) fn group_rank(kind: u64) -> u8 {
 /// second is unaffected and is honoured.
 #[derive(Default)]
 pub(crate) struct SameSecondRemovals {
-    by_second: HashMap<u64, HashSet<String>>,
+    by_second: HashMap<(u64, String), HashSet<String>>,
 }
 
 impl SameSecondRemovals {
@@ -3298,20 +3421,24 @@ impl SameSecondRemovals {
     /// (`boundary_second_complete`), so no removal can be hiding in the next
     /// page while its join is applied in this one.
     pub(crate) fn collect(events: &[Event]) -> Self {
-        let mut by_second: HashMap<u64, HashSet<String>> = HashMap::new();
+        let mut by_second: HashMap<(u64, String), HashSet<String>> = HashMap::new();
         for event in events.iter().filter(|e| e.kind == REMOVE_USER) {
+            let Some(gid) = group_id(event) else {
+                continue;
+            };
             by_second
-                .entry(event.created_at)
+                .entry((event.created_at, gid.to_string()))
                 .or_default()
                 .extend(tag_values(event, P).map(str::to_string));
         }
         Self { by_second }
     }
 
-    /// Whether a `kind:9001` in the second `at` removed `pubkey`.
-    pub(crate) fn removes(&self, pubkey: &str, at: u64) -> bool {
+    /// Whether a `kind:9001` in the second `at` removed `pubkey` from `gid`.
+    /// A removal in an unrelated group must not cancel a JOIN there.
+    pub(crate) fn removes(&self, pubkey: &str, at: u64, gid: &str) -> bool {
         self.by_second
-            .get(&at)
+            .get(&(at, gid.to_string()))
             .is_some_and(|removed| removed.contains(pubkey))
     }
 }

@@ -1225,6 +1225,15 @@ impl RolesRebuild {
     /// discarded. Buffered leaves that never reached the live store (the
     /// revoked window) are lost here: they are counted and warned about
     /// so the operator knows a re-leave may be needed.
+    /// Leaves the buffering window after a failed scan but keeps the
+    /// captured mutations for the next attempt. Called when the live store
+    /// remains fail-closed and the worker will retry on a later mark.
+    async fn retain_buffering(&self) {
+        let mut buffer = self.buffer.lock().await;
+        buffer.scanning = false;
+        buffer.overflow = false;
+    }
+
     async fn leave_buffering(&self) {
         let mut buffer = self.buffer.lock().await;
         buffer.scanning = false;
@@ -1273,8 +1282,11 @@ impl RolesRebuild {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             log::warn!(
                 "role state rebuild discarded: the mutation buffer overflowed during the \
-                 scan; rebuilding again"
+                 scan; retaining the captured mutations for the next scan"
             );
+            // Do not lose ACKed mutations: the next scan must replay them.
+            buffer.mutations = buffered;
+            buffer.overflow = false;
             return false;
         }
         let mut store = roles.write().await;
@@ -1297,6 +1309,9 @@ impl RolesRebuild {
                  to the surviving history; retry the affected role change"
             );
         }
+        // Claims are snapshot-only: they cannot be reconstructed from
+        // events, so even the fail-closed reset below must carry them.
+        let preserved_claims = fresh.claims.clone();
         *store = fresh;
         if self.dirty.load(Ordering::SeqCst) {
             // A removal landed while the scan ran (or during the swap): the
@@ -1306,7 +1321,10 @@ impl RolesRebuild {
             // were accepted during this pending window and applied to the
             // live store, which is being discarded here; the next scan must
             // replay them or an ACKed claim/leave would vanish.
-            *store = RoleStore::default();
+            *store = RoleStore {
+                claims: preserved_claims,
+                ..RoleStore::default()
+            };
             buffer.mutations = buffered;
             buffer.overflow = false;
             self.failed_rebuilds
@@ -1356,6 +1374,22 @@ impl RoleStatePublisher {
         let Some(key) = self.key else {
             return false;
         };
+        let mut extra_members = Vec::with_capacity(self.extra_members.len());
+        for pubkey in self.extra_members.iter() {
+            match db.is_vanished(pubkey).await {
+                Some(false) => extra_members.push(pubkey.clone()),
+                Some(true) => {}
+                None => return false,
+            }
+        }
+        let mut owners = Vec::with_capacity(self.owners.len());
+        for pubkey in self.owners.iter() {
+            match db.is_vanished(pubkey).await {
+                Some(false) => owners.push(pubkey.clone()),
+                Some(true) => {}
+                None => return false,
+            }
+        }
         let mut event = {
             let roles = roles.read().await;
             if state.dirty.load(Ordering::SeqCst) {
@@ -1364,8 +1398,8 @@ impl RoleStatePublisher {
             roles.membership_event(
                 relay_pubkey,
                 self.stamps.stamp(unix_now()),
-                &self.extra_members,
-                &self.owners,
+                &extra_members,
+                &owners,
             )
         };
         store_relay_event_parts(
@@ -1511,24 +1545,12 @@ async fn roles_rebuild_worker(
             state
                 .failed_rebuilds
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            state.leave_buffering().await;
+            state.retain_buffering().await;
             log::error!(
                 "role state rebuild failed; keeping the live role store empty (fail-closed) \
-                 and retrying on the next role-state removal"
+                 and retaining captured mutations for the next role-state removal"
             );
             state.running.store(false, Ordering::SeqCst);
-            // The worker is done: drop the post-swap captures it may have
-            // accepted while still marked running. They were applied to the live
-            // store (and scheduled for persistence) like normal mutations, so
-            // replaying them in a later rebuild would wrongly re-apply stale
-            // intent. Clearing runs after `running` is already false, so a racing
-            // mutation either lands before the clear (applied live, safe to drop)
-            // or after it (sees a closed window and stays live-only, like normal).
-            {
-                let mut buffer = state.buffer.lock().await;
-                buffer.mutations.clear();
-                buffer.overflow = false;
-            }
             return;
         }
         if state.dirty.load(Ordering::SeqCst) {
@@ -1552,7 +1574,7 @@ async fn roles_rebuild_worker(
         let (empty, preserved) = {
             let store = roles.read().await;
             (
-                store.roles.is_empty() && store.assignments.is_empty(),
+                !store.has_role_state(),
                 state.preserve_snapshot.load(Ordering::SeqCst),
             )
         };
@@ -1670,7 +1692,7 @@ async fn persist_fresh_roles(
     }
     if state.preserve_snapshot.load(Ordering::SeqCst)
         && snapshot.roles.is_empty()
-        && snapshot.assignments.is_empty()
+        && snapshot.assignments.values().all(|roles| roles.is_empty())
     {
         return PersistOutcome::Failed;
     }
@@ -1746,7 +1768,7 @@ async fn persist_roles_now(
     }
     if state.preserve_snapshot.load(Ordering::SeqCst)
         && snapshot.roles.is_empty()
-        && snapshot.assignments.is_empty()
+        && snapshot.assignments.values().all(|roles| roles.is_empty())
     {
         return PersistOutcome::Failed;
     }
@@ -3277,6 +3299,39 @@ impl Relay {
             };
         }
 
+        // A live 9000 can re-add a vanished pubkey; the rebuild strips such
+        // p tags, but no rebuild is scheduled for a successful live insert.
+        // Apply the same permanent-vanish rule before storing the grant.
+        if matches!(&verdict, crate::relay::validate::Precheck::Accept)
+            && event.kind == crate::nips::nip29::PUT_USER
+        {
+            let mut targets = std::collections::HashSet::new();
+            for tag in event
+                .tags
+                .iter()
+                .filter(|tag| tag.len() >= 2 && tag[0] == "p")
+            {
+                if !targets.insert(tag[1].to_ascii_lowercase()) {
+                    continue;
+                }
+                match self.db.is_vanished(&tag[1].to_ascii_lowercase()).await {
+                    Some(false) => {}
+                    Some(true) => {
+                        self.stats.bump(&self.stats.events_rejected, 1);
+                        return PutOutcome::Invalid(
+                            "blocked: a group member has requested to vanish".into(),
+                        );
+                    }
+                    None => {
+                        self.stats.bump(&self.stats.events_rejected, 1);
+                        return PutOutcome::Invalid(
+                            "error: cannot verify the vanish status; retry".into(),
+                        );
+                    }
+                }
+            }
+        }
+
         match verdict {
             crate::relay::validate::Precheck::Reject(reason) => {
                 self.stats.bump(&self.stats.events_rejected, 1);
@@ -4351,6 +4406,24 @@ impl Relay {
         self.persist_groups_outcome().await == PersistOutcome::Committed
     }
 
+    /// Persists group state only when a successful return means the current
+    /// store is actually restorable. `persist_groups` reports a stale-state
+    /// snapshot *clear* as `Committed`; that is correct for the fail-closed
+    /// maintenance paths but not for a DM/command ACK, where it would claim
+    /// durability for a state the next rebuild cannot reconstruct.
+    pub(crate) async fn persist_groups_durable(&self) -> bool {
+        if self.groups_rebuild.pending.load(Ordering::SeqCst)
+            || self.groups.read().await.is_unrestored()
+        {
+            return false;
+        }
+        if !self.persist_groups().await {
+            return false;
+        }
+        !self.groups_rebuild.pending.load(Ordering::SeqCst)
+            && !self.groups.read().await.is_unrestored()
+    }
+
     /// Like [`Self::persist_groups`], reporting a deferred save (a derived
     /// mutation was in flight) separately from a failed one: callers must
     /// only treat `Failed` as fail-closed (the state may still be current).
@@ -4511,8 +4584,22 @@ impl Relay {
             return false;
         };
         let now = self.stamp_floor(unix_now());
-        let extra_members = self.allowlisted_members().await;
-        let owners = self.relay_owner_members().await;
+        let mut extra_members = Vec::new();
+        for pubkey in self.allowlisted_members().await {
+            match self.db.is_vanished(&pubkey).await {
+                Some(false) => extra_members.push(pubkey),
+                Some(true) => {}
+                None => return false,
+            }
+        }
+        let mut owners = Vec::new();
+        for pubkey in self.relay_owner_members().await {
+            match self.db.is_vanished(&pubkey).await {
+                Some(false) => owners.push(pubkey),
+                Some(true) => {}
+                None => return false,
+            }
+        }
         let events = {
             let roles = self.roles.read().await;
             let mut events =
@@ -5354,6 +5441,13 @@ impl Relay {
     /// rebuilds from the surviving events; `persist_roles` refuses to
     /// overwrite it until the rebuild completes.
     pub(crate) async fn mark_roles_stale(&self) {
+        if !self.config.read().await.nip_enabled(43) {
+            // The role store was never loaded and nothing serves NIP-43.
+            // Leave the persisted snapshot and its claims untouched; the
+            // advanced DB generation makes the next enabled startup reject
+            // it, carry its claims, and rebuild from the surviving events.
+            return;
+        }
         // Flag the rebuild first so the snapshot persistence stops saving the
         // state as soon as the removal is known (the database generation has
         // already advanced). `marking` is only for the persist paths: the
@@ -5593,6 +5687,62 @@ impl Relay {
         for (gid, purge_now, until) in pending {
             self.resume_pending_purge(&gid, purge_now, until).await;
         }
+    }
+
+    /// Recovers a stored `9008` whose purge was never recorded (the process
+    /// crashed between the event/ghost commit and `group_purge`). Such a
+    /// group is absent from the restored store but still has `h`-tagged
+    /// history, so it must be purged or kept ghosted before serving. This is
+    /// the startup counterpart to the live delete path; a re-created group
+    /// is present in the store and is skipped.
+    pub(crate) async fn recover_unrecorded_group_purges(&self) -> bool {
+        let filter: crate::filter::Filter =
+            serde_json::from_value(serde_json::json!({ "kinds": [nip29::DELETE_GROUP] }))
+                .expect("static filter");
+        let Some((events, more)) = self
+            .db
+            .query_full_startup(vec![filter], 10_000, unix_now(), true)
+            .await
+        else {
+            log::error!(
+                "cannot read stored 9008 events; refusing to serve without completing \
+                 crash-interrupted group purges"
+            );
+            return false;
+        };
+        if more {
+            log::error!(
+                "stored 9008 scan was truncated; refusing to serve without completing every \
+                 crash-interrupted group purge"
+            );
+            return false;
+        }
+        for event in events {
+            let Some(gid) = nip29::group_id(&event) else {
+                continue;
+            };
+            if self.groups.read().await.group(gid).is_some() {
+                // A re-created id is live; its later events must survive.
+                continue;
+            }
+            let removed = self.db.group_purge(gid.to_string(), unix_now()).await;
+            self.stats
+                .bump(&self.stats.events_deleted, removed.unwrap_or(0) as u64);
+            if self.group_purge_confirmed(gid, u64::MAX).await {
+                self.unghost_confirmed(gid).await;
+                if self.persist_groups_outcome().await == PersistOutcome::Failed {
+                    log::error!("could not persist the recovered purge for {gid}");
+                }
+            } else {
+                // The purge did not complete: keep the id ghosted so a
+                // later create cannot expose the surviving history.
+                self.ghost_deleted_group(gid).await;
+                if self.persist_groups_outcome().await == PersistOutcome::Failed {
+                    log::error!("could not persist the fail-closed ghost for {gid}");
+                }
+            }
+        }
+        true
     }
 
     /// Resumes one recorded purge (see [`Self::resume_pending_purges`]):
@@ -5854,9 +6004,21 @@ impl Relay {
             }
         }
         drop(roles_in_flight);
-        if nip43_enabled && role_changed {
+        let synthetic_member = nip43_enabled
+            && (self
+                .allowlisted_members()
+                .await
+                .iter()
+                .any(|pk| pk.eq_ignore_ascii_case(&pubkey_hex))
+                || self
+                    .relay_owner_members()
+                    .await
+                    .iter()
+                    .any(|pk| pk.eq_ignore_ascii_case(&pubkey_hex)));
+        if nip43_enabled && (role_changed || synthetic_member) {
             let pending = self.roles_rebuild.dirty.load(Ordering::SeqCst)
-                || self.roles_rebuild.running.load(Ordering::SeqCst);
+                || self.roles_rebuild.running.load(Ordering::SeqCst)
+                || self.roles_rebuild.marking.load(Ordering::SeqCst);
             let published = if pending {
                 // The live store is revoked; publishing its empty full list
                 // would overwrite the last good 13534. A remove-user event
@@ -6564,6 +6726,14 @@ mod tests {
             }
             other => panic!("DM open failed: {other:?}"),
         };
+        // The ACK is only safe after the DM group state is durable: a
+        // pre-DM snapshot would make the unknown channel id public on the
+        // next restart.
+        let snapshot = relay.db.load_groups().await.expect_loaded("snapshot");
+        assert!(
+            snapshot.groups.contains_key(&channel),
+            "the DM must be persisted before handle_dm_open acknowledges it"
+        );
 
         // Re-opening immediately must refresh the 39000 without colliding
         // with the create-time replaceable event.

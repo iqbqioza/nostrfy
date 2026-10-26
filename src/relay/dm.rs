@@ -181,6 +181,24 @@ impl super::Relay {
         if participants.len() > MAX_DM_PARTICIPANTS {
             return PutOutcome::Invalid("invalid: too many DM participants".into());
         }
+        // A vanish is permanent: never create/re-surface a DM that includes
+        // a vanished participant, or the live snapshot would override the
+        // rebuild's vanish filter for this snapshot-backed group.
+        for participant in &participants {
+            match self.db.is_vanished(participant).await {
+                Some(false) => {}
+                Some(true) => {
+                    return PutOutcome::Invalid(
+                        "blocked: a DM participant has requested to vanish".into(),
+                    );
+                }
+                None => {
+                    return PutOutcome::Invalid(
+                        "error: cannot verify the vanish status; retry".into(),
+                    );
+                }
+            }
+        }
         let secret = self
             .key
             .as_ref()
@@ -307,9 +325,17 @@ impl super::Relay {
             }
         }
         // The synthetic 9007/9000 are not stored, so the DM group state has
-        // no event history to rebuild from: persist the snapshot like the
-        // normal group path does, or a restart would lose the DM channel.
-        self.schedule_groups_persist();
+        // no event history to rebuild from. Persist synchronously before
+        // acknowledging (and before storing metadata): a crash or a failed
+        // debounced save would otherwise leave a current pre-DM snapshot
+        // that makes the unknown channel id public on the next start.
+        if !self.persist_groups_durable().await {
+            if created_new {
+                self.groups.write().await.rollback_unstored_group(&channel);
+            }
+            self.publish_rate_rollback(&event.pubkey, now);
+            return PutOutcome::Invalid("error: could not persist the DM channel; retry".into());
+        }
         for mut relay_event in metadata {
             if self.store_relay_event(&mut relay_event).await.is_err() {
                 self.publish_rate_rollback(&event.pubkey, now);
@@ -365,7 +391,7 @@ impl super::Relay {
             self.publish_rate_rollback(&event.pubkey, now);
             return PutOutcome::Invalid("invalid: dm hide requires an h tag".into());
         };
-        {
+        let was_hidden = {
             let mut groups = self.groups.write().await;
             if groups.is_unrestored() || groups.group_is_stale(&channel) {
                 drop(groups);
@@ -380,11 +406,18 @@ impl super::Relay {
                 self.publish_rate_rollback(&event.pubkey, now);
                 return PutOutcome::Invalid("restricted: not a member of this DM".into());
             }
+            let was_hidden = group.hidden_for.contains(&event.pubkey);
             group.hidden_for.insert(event.pubkey.clone());
+            was_hidden
+        };
+        // `hidden_for` is snapshot-only; make it durable before ACKing.
+        if !self.persist_groups_durable().await {
+            if !was_hidden && let Some(group) = self.groups.write().await.groups.get_mut(&channel) {
+                group.hidden_for.remove(&event.pubkey);
+            }
+            self.publish_rate_rollback(&event.pubkey, now);
+            return PutOutcome::Invalid("error: could not persist the DM hide; retry".into());
         }
-        // `hidden_for` is snapshot-only state; schedule the same debounced
-        // save the normal group path uses.
-        self.schedule_groups_persist();
         if let Err(()) = self.publish_dm_visibility(&event.pubkey).await {
             log::warn!("could not publish the DM visibility snapshot");
         }

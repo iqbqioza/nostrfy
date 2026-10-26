@@ -761,6 +761,16 @@ impl super::Relay {
         if event.created_at > now.saturating_add(max_future) {
             bail!("invalid: event creation date is in the future");
         }
+        // Group state feeds a replay ordered by client timestamps. A
+        // far-future group event can outrank a later removal/settings edit on
+        // every rebuild, so keep only a small clock-skew allowance even when
+        // the generic NIP-01 window is wider.
+        if cfg.nip_enabled(29)
+            && nip29::is_group_action(event)
+            && event.created_at > now.saturating_add(max_future.min(600))
+        {
+            bail!("invalid: group event creation date is in the future");
+        }
 
         // NIP-40: the expiration value is required to be a unix timestamp.
         // A malformed value must not silently mean "no expiration" — the

@@ -629,8 +629,63 @@ fn host_route_allowed(
 /// a database whose private groups are missing from the empty store cannot
 /// leak their content. The next start with the NIP re-enabled rebuilds the
 /// store from the surviving events.
+/// Removes vanished pubkeys from a persisted group snapshot before it is
+/// restored. The snapshot may predate a NIP-62 vanish (including a vanish
+/// accepted while NIP-29 was disabled), and unlike the NIP-43 restore the
+/// group store has no event-derived fallback for DM membership.
+async fn filter_vanished_group_snapshot(
+    relay: &Relay,
+    snapshot: &mut crate::nips::nip29::GroupsSnapshot,
+) -> Result<()> {
+    let mut present = std::collections::HashSet::new();
+    for group in snapshot.groups.values() {
+        present.extend(group.members.keys().map(|pk| pk.to_ascii_lowercase()));
+        present.extend(group.guests.iter().map(|pk| pk.to_ascii_lowercase()));
+        present.extend(group.bots.iter().map(|pk| pk.to_ascii_lowercase()));
+        present.extend(group.hidden_for.iter().map(|pk| pk.to_ascii_lowercase()));
+    }
+    if present.is_empty() {
+        return Ok(());
+    }
+    let mut vanished = std::collections::HashSet::new();
+    if relay
+        .db
+        .vanish_pubkeys_each(|key| {
+            let lower = hex::encode(key);
+            if present.contains(&lower) {
+                vanished.insert(lower);
+            }
+        })
+        .await
+        .is_none()
+    {
+        return Err(anyhow::anyhow!(
+            "cannot read the vanished-pubkey list; refusing to restore the NIP-29 \
+             group snapshot"
+        ));
+    }
+    if vanished.is_empty() {
+        return Ok(());
+    }
+    for group in snapshot.groups.values_mut() {
+        group
+            .members
+            .retain(|pk, _| !vanished.contains(&pk.to_ascii_lowercase()));
+        group
+            .guests
+            .retain(|pk| !vanished.contains(&pk.to_ascii_lowercase()));
+        group
+            .bots
+            .retain(|pk| !vanished.contains(&pk.to_ascii_lowercase()));
+        group
+            .hidden_for
+            .retain(|pk| !vanished.contains(&pk.to_ascii_lowercase()));
+    }
+    Ok(())
+}
+
 async fn restore_group_state(relay: &Relay, groups_enabled: bool) -> Result<()> {
-    let snapshot = match relay.db.load_groups().await {
+    let mut snapshot = match relay.db.load_groups().await {
         crate::db::LoadGroupsOutcome::Loaded(snapshot) => snapshot,
         crate::db::LoadGroupsOutcome::Missing => {
             return rebuild_group_state(relay, groups_enabled).await;
@@ -645,6 +700,7 @@ async fn restore_group_state(relay: &Relay, groups_enabled: bool) -> Result<()> 
             ));
         }
     };
+    filter_vanished_group_snapshot(relay, &mut snapshot).await?;
     let stamp = relay.db.state_stamp().await;
     let seq = relay.db.state_seq_group().await;
     match (stamp, seq) {
@@ -743,6 +799,11 @@ async fn startup_group_state(relay: &Relay, groups_enabled: bool) -> Result<()> 
     // finished (the process crashed mid-walk) is re-run here, before the
     // relay serves. Idempotent and a no-op when nothing is pending.
     relay.resume_pending_purges().await;
+    if !relay.recover_unrecorded_group_purges().await {
+        return Err(anyhow::anyhow!(
+            "could not recover crash-interrupted group purges; refusing to serve"
+        ));
+    }
     // A relay key rotation leaves the previous key's relay-signed metadata
     // (39000-39005) stored: addressable replacement is per author, so the
     // current key can never replace it, and clients that verify the relay
@@ -789,7 +850,8 @@ async fn restore_role_state(relay: &Relay) -> Result<()> {
     let (needs_rebuild, carried_claims) = match relay.db.load_roles().await {
         crate::db::LoadRolesOutcome::Loaded(snap) => {
             let mut snap = snap;
-            preserve_existing = !snap.roles.is_empty() || !snap.assignments.is_empty();
+            preserve_existing =
+                !snap.roles.is_empty() || snap.assignments.values().any(|roles| !roles.is_empty());
             // Vanish is permanent and may have happened while NIP-43 was
             // disabled (no live role store) or during a role rebuild (the
             // revoked store could not record the assignment removal). The
@@ -890,7 +952,7 @@ async fn restore_role_state(relay: &Relay) -> Result<()> {
         // it and retry the rebuild once the key is restored.
         let rebuilt_empty = {
             let store = relay.roles.read().await;
-            store.roles.is_empty() && store.assignments.is_empty()
+            !store.has_role_state()
         };
         if rebuilt_empty && !preserve_existing {
             // A missing/empty snapshot on a genuinely fresh relay has
@@ -6947,6 +7009,30 @@ mod tests {
         );
         let saved = relay.db.load_roles().await.expect_loaded("snapshot");
         assert!(saved.claims.contains("fresh-code"));
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn restore_filters_vanished_group_members() {
+        let relay = blossom_relay_with_key(&"01".repeat(32)).await;
+        let vanished = "aa".repeat(32);
+        let mut group = crate::nips::nip29::Group::default();
+        group.members.insert(vanished.clone(), Default::default());
+        group.guests.insert(vanished.clone());
+        group.bots.insert(vanished.clone());
+        group.hidden_for.insert(vanished.clone());
+        let mut snapshot = crate::nips::nip29::GroupsSnapshot::default();
+        snapshot.groups.insert("g1".into(), group);
+        let key: [u8; 32] = hex::decode(&vanished).unwrap().try_into().unwrap();
+        relay.db.apply_vanish(key, crate::util::unix_now()).await;
+        filter_vanished_group_snapshot(&relay, &mut snapshot)
+            .await
+            .expect("vanish list must be readable");
+        let group = snapshot.groups.get("g1").unwrap();
+        assert!(!group.members.contains_key(&vanished));
+        assert!(!group.guests.contains(&vanished));
+        assert!(!group.bots.contains(&vanished));
+        assert!(!group.hidden_for.contains(&vanished));
         relay.db.shutdown();
     }
 }

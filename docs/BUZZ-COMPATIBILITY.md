@@ -173,7 +173,10 @@ host, because Buzz signs the relay URL it uploads to.
   `9007`/`9000` are not stored, so a snapshot-less full rebuild (new
   database, migration, or dropped snapshot) cannot recreate a DM channel.
   Runtime state-removal rebuilds carry live DM groups across the swap.
-  Hidden-DM sets are snapshot-backed for the same reason.
+  Creation and hide now persist the snapshot synchronously before the ACK
+  (a failed save is retryable), so a crash cannot leave a current pre-DM
+  snapshot that makes the unknown channel public. Hidden-DM sets are
+  snapshot-backed for the same reason.
 - Enabling `enabled_buzz` on an existing relay upgrades the creator role in
   the restored snapshot (and disabling it maps a Buzz-created channel's
   restored `owner` default back to `admin`), but the mode switch itself does
@@ -238,10 +241,23 @@ host, because Buzz signs the relay URL it uploads to.
   explicit later role/join event if that state must survive a restart.
 - A JOIN accepted with a `created_at` far in the future (up to
   `max_created_at_future_secs`) can sort after a later removal on replay
-  and re-add an open-group member. The relay's signing mirror is stamped at
-  apply time, so it no longer amplifies this, but the stored JOIN itself
-  still does; keep clock skew bounded or use explicit moderation after the
-  join timestamp passes.
+  and re-add an open-group member. Group/join/leave events now reject a
+  future timestamp beyond 600 seconds, but events accepted before that
+  limit (or from an imported legacy database) can still do this. The relay's
+  signing mirror is stamped at apply time, so it no longer amplifies it.
+- Live group validation now rejects a state event timestamped before its
+  group's create, and the rebuild buffers such legacy state until the create
+  is seen. The migration replay and a full create-id/epoch binding are not
+  yet complete: an imported event before its create can still be dropped,
+  and a future-dated old moderation event can cross a delete/recreate.
+- Migration now invalidates the destination group snapshot after importing
+  events (forcing the first start to rebuild/ghost-check), except when the
+  snapshot contains DM groups; keeping DM snapshots preserves their
+  membership at the cost of not auto-verifying imported private history.
+- Migration still applies NIP-09/NIP-62 removals during import and defers
+  9005/9008 effects until afterward; a later removal can erase the deferred
+  9005/9008 action before it runs. Do not run an incremental migration over
+  a live role/group database without a subsequent full rebuild.
 - Enabling Buzz on a restored plain-NIP-29 group does not reinterpret
   literal `guest`/`bot` role labels. Such a role was an ordinary privileged
   role in plain mode, while Buzz reports it as a read-only/bot tier. Use a
@@ -280,6 +296,13 @@ host, because Buzz signs the relay URL it uploads to.
   removal or purge can invalidate the role snapshot, forcing a role rebuild
   (stale-snapshot invite codes are carried across); role removals likewise
   invalidate the group snapshot. The events remain the source of truth.
+- A role rebuild is deferred while NIP-43 is disabled; the snapshot's claims
+  are carried over when it is re-enabled. Synthetic owner/allowlist roster
+  entries are not treated as role-bearing assignments, and a vanished
+  owner/allowlist entry is filtered from newly published `13534` rosters.
+  A role rebuild that is aborted or overflows retains captured mutations for
+  the next scan; shutdown may still discard them because the process is
+  ending.
 - NIP-77 negentropy sync returns ids/timestamps without applying the
   per-pubkey gate to `44100`/`44101`/`30622`; an anonymous syncer can learn
   that those events exist, while REQ/COUNT still withhold their content.

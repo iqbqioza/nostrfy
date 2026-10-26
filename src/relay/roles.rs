@@ -267,6 +267,9 @@ impl super::Relay {
 
     /// Publishes the current membership list and an add/remove user event.
     pub(crate) async fn publish_membership(&self, change: Option<(bool, String)>) -> bool {
+        if !self.config.read().await.nip_enabled(43) {
+            return false;
+        }
         let Some(relay_pubkey) = self.relay_pubkey() else {
             return false;
         };
@@ -282,6 +285,26 @@ impl super::Relay {
         // the guards are never nested.
         let extra_members = self.allowlisted_members().await;
         let owners = self.relay_owner_members().await;
+        // Synthetic roster entries bypass `RoleStore::rebuild`'s vanish
+        // filter because they have no event behind them. Filter them here;
+        // an unavailable vanish lookup fails closed instead of republishing
+        // an erased identity.
+        let mut filtered_extra = Vec::with_capacity(extra_members.len());
+        for pubkey in extra_members {
+            match self.db.is_vanished(&pubkey).await {
+                Some(false) => filtered_extra.push(pubkey),
+                Some(true) => {}
+                None => return false,
+            }
+        }
+        let mut filtered_owners = Vec::with_capacity(owners.len());
+        for pubkey in owners {
+            match self.db.is_vanished(&pubkey).await {
+                Some(false) => filtered_owners.push(pubkey),
+                Some(true) => {}
+                None => return false,
+            }
+        }
         let events = {
             let roles = self.roles.read().await;
             // The caller re-read the rebuild flags before calling, but a
@@ -295,7 +318,7 @@ impl super::Relay {
                 return false;
             }
             let mut events =
-                vec![roles.membership_event(&relay_pubkey, now, &extra_members, &owners)];
+                vec![roles.membership_event(&relay_pubkey, now, &filtered_extra, &filtered_owners)];
             if let Some(pubkey) = pubkey {
                 events.push(if add {
                     roles.add_user_event(&pubkey, &relay_pubkey, now)
@@ -777,7 +800,7 @@ impl super::Relay {
             }
             super::PersistOutcome::Deferred => {
                 self.schedule_roles_persist();
-                Ok(())
+                Err(ClaimRejection::NotDurable)
             }
             super::PersistOutcome::Committed => Ok(()),
         }
