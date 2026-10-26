@@ -366,6 +366,13 @@ pub async fn api_auth_middleware(relay: Arc<Relay>, request: Request, next: Next
     next.run(request).await
 }
 
+/// `approximate` must reflect truncation of the *visible* result, not the
+/// raw database scan: hidden rows consuming the scan limit would otherwise
+/// become a volume oracle for private groups/per-pubkey state.
+fn visible_approximate(more: bool, visible: usize, limit: usize) -> bool {
+    more && limit > 0 && visible >= limit
+}
+
 /// Answers a rejected API query parameter.
 fn param_rejection(e: anyhow::Error) -> (StatusCode, Json<Value>) {
     error_response(StatusCode::BAD_REQUEST, &e.to_string())
@@ -926,7 +933,6 @@ pub async fn api_monthly_handler(
         // The per-iteration scan is done: release the permit before the
         // group lock.
         drop(_permit);
-        approximate |= more;
         // The same visibility rules as the unauthenticated API: protected
         // events, gift wraps and private/hidden group content are withheld.
         let has_group_events = events.iter().any(nip29::is_group_event);
@@ -949,10 +955,12 @@ pub async fn api_monthly_handler(
             .count();
         drop(groups);
         total += count as u64;
+        let bucket_approximate = visible_approximate(more, count, count_limit);
+        approximate |= bucket_approximate;
         month_counts.push(json!({
             "month": format!("{y:04}-{m:02}"),
             "count": count,
-            "approximate": more,
+            "approximate": bucket_approximate,
         }));
     }
 
@@ -1052,7 +1060,10 @@ pub async fn api_count_handler(
     drop(groups);
     (
         StatusCode::OK,
-        Json(json!({ "count": count, "approximate": more })),
+        Json(json!({
+            "count": count,
+            "approximate": visible_approximate(more, count, count_limit),
+        })),
     )
 }
 
@@ -1120,6 +1131,7 @@ pub async fn api_kinds_handler(
         *by_kind.entry(e.kind).or_default() += 1;
     }
     drop(groups);
+    let visible_total: usize = by_kind.values().sum();
     let mut kinds: Vec<Value> = by_kind
         .into_iter()
         .map(|(kind, count)| json!({ "kind": kind, "count": count }))
@@ -1132,7 +1144,10 @@ pub async fn api_kinds_handler(
     });
     (
         StatusCode::OK,
-        Json(json!({ "kinds": kinds, "approximate": more })),
+        Json(json!({
+            "kinds": kinds,
+            "approximate": visible_approximate(more, visible_total, count_limit),
+        })),
     )
 }
 
@@ -1220,7 +1235,6 @@ pub async fn api_daily_handler(
         };
         // Release the permit before the group lock (per-iteration permit).
         drop(_permit);
-        approximate |= more;
         let has_group_events = events.iter().any(nip29::is_group_event);
         let groups = if has_group_events {
             Some(relay.groups.read().await)
@@ -1241,10 +1255,12 @@ pub async fn api_daily_handler(
             .count();
         drop(groups);
         total += count as u64;
+        let bucket_approximate = visible_approximate(more, count, count_limit);
+        approximate |= bucket_approximate;
         day_counts.push(json!({
             "day": format!("{year:04}-{month:02}-{:02}", day + 1),
             "count": count,
-            "approximate": more,
+            "approximate": bucket_approximate,
         }));
     }
     (
@@ -1468,7 +1484,7 @@ pub async fn api_stats_handler(
         StatusCode::OK,
         Json(json!({
             "total": total,
-            "approximate": more,
+            "approximate": visible_approximate(more, total, count_limit),
             "first_seen": first_seen,
             "last_seen": last_seen,
             "first_month": first_month,
@@ -1580,7 +1596,6 @@ pub async fn api_hourly_handler(
         };
         // Release the permit before the group lock (per-iteration permit).
         drop(_permit);
-        approximate |= more;
         let has_group_events = events.iter().any(nip29::is_group_event);
         let groups = if has_group_events {
             Some(relay.groups.read().await)
@@ -1601,10 +1616,12 @@ pub async fn api_hourly_handler(
             .count();
         drop(groups);
         total += count as u64;
+        let bucket_approximate = visible_approximate(more, count, count_limit);
+        approximate |= bucket_approximate;
         hour_counts.push(json!({
             "hour": format!("{year:04}-{month:02}-{day:02}T{h:02}"),
             "count": count,
-            "approximate": more,
+            "approximate": bucket_approximate,
         }));
     }
     (
@@ -3073,6 +3090,40 @@ mod tests {
                 5,
                 "0 disables the byte budget"
             );
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn approximate_flags_do_not_count_hidden_scan_rows() {
+        // A raw scan can be capped entirely by events the caller cannot
+        // see. That must not turn `approximate` into a hidden-volume oracle:
+        // the visible result here is complete (1 of 1) even though the
+        // database scan hit its limit and has more rows.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_relay().await;
+            {
+                let mut cfg = relay.config.write().await;
+                cfg.limits.max_count = 2;
+            }
+            let now = unix_now();
+            let visible = signed_note("visible", now, vec![]);
+            assert_eq!(
+                relay.db.put(visible, now).await,
+                crate::db::PutOutcome::Stored
+            );
+            for i in 0..2 {
+                let mut hidden = signed_note(&format!("hidden{i}"), now - 1 - i, vec![]);
+                hidden.kind = 1059;
+                hidden.tags = vec![vec!["p".into(), "bb".repeat(32)]];
+                hidden.id = crate::nips::nip01::compute_id(&hidden);
+                let _ = relay.db.put(hidden, now).await;
+            }
+            let (_, Json(resp)) =
+                api_count_handler(State(relay.clone()), Query(ApiParams::default())).await;
+            assert_eq!(resp["count"], 1, "{resp}");
+            assert_eq!(resp["approximate"], false, "{resp}");
             relay.db.shutdown();
         });
     }

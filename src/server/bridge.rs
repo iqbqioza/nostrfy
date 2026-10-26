@@ -631,5 +631,6 @@ pub async fn count(State(relay): State<Arc<Relay>>, headers: HeaderMap, body: By
         })
         .count();
     drop(groups);
+    let approximate = approximate && cfg.limits.max_count > 0 && count >= cfg.limits.max_count;
     Json(json!({ "count": count, "approximate": approximate })).into_response()
 }

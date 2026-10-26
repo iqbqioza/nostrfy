@@ -292,10 +292,10 @@ host, because Buzz signs the relay URL it uploads to.
 - Without `relay.public_url`, the bridge NIP-98 check accepts the configured
   bind host plus loopback aliases. A proxy or LAN hostname must set
   `public_url`; an arbitrary request `Host` is deliberately not trusted.
-- Aggregate `approximate` flags come from the raw database scan, before
-  visibility filtering. A filter dominated by hidden rows can therefore
-  report `approximate=true` with a small visible count; the count itself
-  never includes hidden rows.
+- Count/stats/daily/monthly/hourly `approximate` flags now describe
+  truncation of the visible result, not hidden scan rows. The sampled
+  relay-wide kind/author aggregates may still be marked approximate when
+  hidden rows consume the sample; their counts never include hidden rows.
 - NIP-29 and NIP-43 snapshots share one removal stamp. A group-state
   removal or purge can invalidate the role snapshot, forcing a role rebuild
   (stale-snapshot invite codes are carried across); role removals likewise
@@ -306,7 +306,9 @@ host, because Buzz signs the relay URL it uploads to.
   owner/allowlist entry is filtered from newly published `13534` rosters.
   A role rebuild that is aborted or overflows retains captured mutations for
   the next scan; shutdown may still discard them because the process is
-  ending.
+  ending. A removal that is already waiting for the mutation buffer can
+  still interleave with a 13534 publish that passed its dirty/run check
+  immediately before the mark.
 - Buzz's push leases, workflow commands, moderation commands and
   hosted-community APIs are not part of this bridge.
 - NIP-34 git events (used by Buzz Projects) are rejected unless
