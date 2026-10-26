@@ -1748,6 +1748,15 @@ pub async fn api_follows_handler(
 /// walking the whole store.
 const AGGREGATE_SAMPLE: usize = 20_000;
 
+/// `approximate` for the relay-wide sampled aggregates must describe the
+/// visible sample, not the raw scan. If hidden rows consume the sample and
+/// fewer than `AGGREGATE_SAMPLE` visible events remain, their presence must
+/// not turn the flag into a volume oracle. The response also carries
+/// `sampled: true`, so clients know the counts are still sample-based.
+fn sampled_approximate(more: bool, visible: usize) -> bool {
+    more && visible >= AGGREGATE_SAMPLE
+}
+
 /// Anonymous visibility of a lightweight aggregate record: the same
 /// NIP-70/NIP-59/NIP-78/NIP-29 rules as [`api_visible`], evaluated without
 /// loading the event content.
@@ -1837,6 +1846,7 @@ pub async fn api_relay_kinds_handler(
             }
         }
     }
+    let visible_total: u64 = counts.values().sum();
     let limit = {
         let mut limit = params.limit.unwrap_or(20).min(100);
         // `max_api_limit` is the ceiling for the API `limit` parameter
@@ -1859,7 +1869,12 @@ pub async fn api_relay_kinds_handler(
     kinds.truncate(limit);
     (
         StatusCode::OK,
-        Json(json!({ "kinds": kinds, "approximate": more, "filtered": true })),
+        Json(json!({
+            "kinds": kinds,
+            "approximate": sampled_approximate(more, visible_total as usize),
+            "sampled": true,
+            "filtered": true,
+        })),
     )
 }
 
@@ -1909,6 +1924,7 @@ pub async fn api_top_authors_handler(
             }
         }
     }
+    let visible_total: u64 = counts.values().sum();
     let limit = {
         let mut limit = params.limit.unwrap_or(20).min(100);
         // See the kinds aggregation above: honor a restrictive
@@ -1929,7 +1945,12 @@ pub async fn api_top_authors_handler(
     authors.truncate(limit);
     (
         StatusCode::OK,
-        Json(json!({ "authors": authors, "approximate": more, "filtered": true })),
+        Json(json!({
+            "authors": authors,
+            "approximate": sampled_approximate(more, visible_total as usize),
+            "sampled": true,
+            "filtered": true,
+        })),
     )
 }
 
@@ -3092,6 +3113,14 @@ mod tests {
             );
             relay.db.shutdown();
         });
+    }
+
+    #[test]
+    fn sampled_approximate_ignores_hidden_scan_rows() {
+        assert!(!sampled_approximate(true, 0));
+        assert!(!sampled_approximate(true, AGGREGATE_SAMPLE - 1));
+        assert!(sampled_approximate(true, AGGREGATE_SAMPLE));
+        assert!(!sampled_approximate(false, AGGREGATE_SAMPLE));
     }
 
     #[test]

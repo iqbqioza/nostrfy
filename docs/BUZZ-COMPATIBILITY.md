@@ -305,8 +305,10 @@ host, because Buzz signs the relay URL it uploads to.
   `public_url`; an arbitrary request `Host` is deliberately not trusted.
 - Count/stats/daily/monthly/hourly `approximate` flags now describe
   truncation of the visible result, not hidden scan rows. The sampled
-  relay-wide kind/author aggregates may still be marked approximate when
-  hidden rows consume the sample; their counts never include hidden rows.
+  relay-wide kind/author aggregates also set `approximate` only when the
+  visible sample itself is saturated, so hidden rows cannot set it; their
+  counts still come from the newest 20,000 raw events, may undercount older
+  visible events, and are marked `sampled: true`.
 - NIP-29 and NIP-43 snapshots share one removal stamp. A group-state
   removal or purge can invalidate the role snapshot, forcing a role rebuild
   (stale-snapshot invite codes are carried across); role removals likewise
