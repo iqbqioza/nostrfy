@@ -274,7 +274,7 @@ To generate a secret key, use the `nostrfy genkey` command (see [5. Command Refe
 
 | Option | Description |
 | --- | --- |
-| `restrict_relay` | `true` = only allow-listed pubkeys may post (NIP-11 `restricted_writes`; reading stays open to everyone except denied pubkeys) |
+| `restrict_relay` | `true` = only allow-listed pubkeys may post (NIP-11 `restricted_writes`; reading stays open to everyone except denied pubkeys). A NIP-43 join with a valid invite code is still admitted (denied pubkeys are not) |
 | `blocked_kinds` | Event kinds to reject |
 | `allowed_kinds` | Kind allowlist. When non-empty, only these kinds are accepted |
 | `blocked_ips` | IP addresses to refuse connections from |
@@ -541,7 +541,7 @@ curl -X POST http://127.0.0.1:8080/ \
 | 34 | git stuff (kinds 1617-1619, 1621, 1622, 1630-1633, 30617/30618 — **opt-in** via `relay.enabled_git`, off by default) |
 | 40 | Expiration timestamp |
 | 42 | Client authentication |
-| 43 | Relay access metadata (roles) — kinds 33534/13534/8000/8001 plus ephemeral 28934/28935/28936; the relay-signed metadata events (33534/13534/8000/8001) carry the NIP-70 `-` tag as the spec requires, but the relay's own protected events stay **publicly readable** (the tag constrains publication and re-publication; the read gate exempts the relay's own advertisement — foreign protected events remain visible only to authenticated clients). Invite codes are issued with NIP-86 `createclaim`/`deleteclaim` (listed by `listclaims`); a `kind:28934` carrying a listed `claim` tag admits its author to the member list, which is capped at 10,000 members (`restricted: the relay member list is full`), and the admission itself counts against `max_events_per_min_per_pubkey` |
+| 43 | Relay access metadata (roles) — kinds 33534/13534/8000/8001 plus ephemeral 28934/28935/28936; the relay-signed metadata events (33534/13534/8000/8001) carry the NIP-70 `-` tag as the spec requires, but the relay's own protected events stay **publicly readable** (the tag constrains publication and re-publication; the read gate exempts the relay's own advertisement — foreign protected events remain visible only to authenticated clients). Invite codes are issued with NIP-86 `createclaim`/`deleteclaim` (listed by `listclaims`); a `kind:28934` carrying a listed `claim` tag admits its author to the member list, which is capped at 10,000 members (`restricted: the relay member list is full`). Every join attempt (admitted or rejected) counts against `max_events_per_min_per_pubkey`, and a fixed per-author limit (10 attempts/minute) also applies before the signature/database work even when that option is `0`. A valid invite is admitted even on a `restrict_relay` relay (the code authorizes the join); a denied pubkey is still refused |
 | 45 | Counting results (COUNT / HyperLogLog) |
 | 46 | Nostr Connect (ephemeral kind 24133, exempt from `reject_ephemeral`) |
 | 47 | Nostr Wallet Connect (ephemeral kinds 23194/23195, exempt from `reject_ephemeral`) |

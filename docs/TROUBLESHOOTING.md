@@ -244,7 +244,8 @@ When publishing fails, the 4th element of the `OK` message explains why. The com
 | `duplicate: event already stored` | The same event is already stored (normal) |
 | `blocked: pubkey not allowed` | The pubkey is banned (`banpubkey`) or outside the allowlist |
 | `blocked: kind not allowed` | This kind is disallowed |
-| `rate-limited: too many events` | The pubkey exceeded `max_events_per_min_per_pubkey` (sliding 60-second window). Wait a minute and retry, or raise/disable the limit |
+| `rate-limited: too many events` | The pubkey exceeded `max_events_per_min_per_pubkey` (sliding 60-second window), or a NIP-43 join exceeded the fixed 10-per-minute per-author limit. Wait a minute and retry, or raise/disable the configured limit |
+| `rate-limited: too many join attempts` | This author made more than 10 NIP-43 join attempts in the last minute (the fixed limit runs before signature verification). Wait a minute and retry with a valid code |
 | `blocked: event has been banned` | The event id is banned |
 | `blocked: event has been deleted` | Re-publishing a deleted event |
 | `invalid: event has expired` | The NIP-40 expiration has passed |

@@ -34,6 +34,7 @@ use tokio::sync::mpsc;
 use crate::config::{AccessControl, Config};
 use crate::db::{DbClient, PutOutcome};
 use crate::event::Event;
+use crate::nips::nip01;
 use crate::nips::nip09;
 use crate::nips::nip29::{self, GroupStore};
 use crate::nips::nip43::{self, RoleStore};
@@ -333,6 +334,14 @@ pub struct Relay {
     /// per second) and evicts the least recently active window, so it never
     /// rejects a fresh pubkey and never clears the map (`PublishRate`).
     publish_rate: std::sync::Mutex<PublishRate>,
+    /// NIP-43 join-attempt limiter, keyed by the event author and applied
+    /// before signature verification. The fixed window (independent of
+    /// `max_events_per_min_per_pubkey`, which may be 0) bounds a single key's
+    /// invite-code guesses; a valid code shared by many members is not
+    /// throttled because each author has its own window. The map is bounded
+    /// like [`PublishRate`]; a flood of one-shot keys evicts unsaturated
+    /// windows first, so a saturated window cannot be reset cheaply.
+    join_pubkeys: std::sync::Mutex<PublishRate>,
     /// Serializes `persist_access`: two concurrent NIP-86 mutations must
     /// not capture snapshots in one order and queue their writes in the
     /// other, or the older snapshot lands last and loses the newer entry
@@ -446,8 +455,9 @@ pub struct Relay {
     /// persistence a SIGHUP config reload would silently revert them.
     pub config_path: Arc<tokio::sync::RwLock<Option<std::path::PathBuf>>>,
     /// Strictly monotonic stamp for relay-generated events: see
-    /// [`StampClock`].
-    stamps: StampClock,
+    /// [`StampClock`]. Shared with the role rebuild worker so it can republish
+    /// the membership list with the same ordering guarantee.
+    stamps: Arc<StampClock>,
     /// The Blossom file server state (when configured), so its handlers can
     /// share the relay's state.
     pub blossom: Arc<tokio::sync::RwLock<Option<Arc<crate::server::blossom::BlossomState>>>>,
@@ -532,6 +542,83 @@ impl StampClock {
             }
         }
     }
+}
+
+/// Sends one accepted event to the live bus. Shared by the relay methods and
+/// the role rebuild worker (which republishes the membership list without a
+/// [`Relay`] handle).
+async fn broadcast_with(
+    live_tx: &mpsc::Sender<(Arc<Event>, Arc<String>)>,
+    stats: &Stats,
+    event: Arc<Event>,
+) -> Result<(), ()> {
+    let json = Arc::new(serde_json::to_string(&*event).unwrap_or_default());
+    if live_tx.send((event, json)).await.is_err() {
+        log::error!("live bus stopped before an accepted event could be broadcast");
+        stats.bump(&stats.db_errors, 1);
+        return Err(());
+    }
+    Ok(())
+}
+
+/// Signs, stores and broadcasts a relay-generated event on behalf of the
+/// relay or its role rebuild worker.
+///
+/// `retry_tie` is used for relay-generated *state* events (NIP-43 roles): at
+/// [`StampClock`]'s ceiling two events issued in the same wall-clock second
+/// share `created_at`, and NIP-01 keeps the lower id — so the newer state can
+/// lose the replacement and the role sequence never advances (N43-L03). A
+/// same-timestamp `Duplicate` is therefore retried after the wall clock
+/// advances (at most a few seconds), which raises the stamp past the tied
+/// value without lifting the drift cap. Events that are not replaceable never
+/// retry: a duplicate there is a genuine re-publication, not a tie.
+async fn store_relay_event_parts(
+    db: &DbClient,
+    key: Option<Keypair>,
+    stamps: &StampClock,
+    live_tx: &mpsc::Sender<(Arc<Event>, Arc<String>)>,
+    stats: &Stats,
+    event: &mut Event,
+    retry_tie: bool,
+) -> Result<bool, ()> {
+    let Some(keypair) = key else {
+        return Err(());
+    };
+    const MAX_TIE_RETRIES: u8 = 3;
+    for attempt in 0..=MAX_TIE_RETRIES {
+        if nip01::sign(event, &keypair).is_err() {
+            return Err(());
+        }
+        // One allocation shared by the database write and the broadcast:
+        // relay-generated events must not deep-copy their content twice.
+        let shared = Arc::new(event.clone());
+        let outcome = db.put(Arc::clone(&shared), unix_now()).await;
+        match outcome {
+            PutOutcome::Stored | PutOutcome::Replaced => {
+                return Ok(broadcast_with(live_tx, stats, shared).await.is_ok());
+            }
+            PutOutcome::Duplicate(_)
+                if retry_tie
+                    && attempt < MAX_TIE_RETRIES
+                    && crate::db::store::is_replaceable(event) =>
+            {
+                // Wait for the wall clock to move the cap (and with it the
+                // stamp) past the value that tied. Another issuer may advance
+                // the clock first; then the next stamp already wins.
+                let tied = event.created_at;
+                loop {
+                    let next = stamps.stamp(unix_now());
+                    if next > tied {
+                        event.created_at = next;
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+            }
+            _ => return Err(()),
+        }
+    }
+    Err(())
 }
 
 /// Minimum seconds between two completed post-vanish group rebuilds. A
@@ -950,6 +1037,17 @@ enum GroupStaleScope<'a> {
     Groups(&'a [String]),
 }
 
+/// Clears [`RolesRebuild::marking`] even when the marking task is cancelled
+/// while waiting for the mutation buffer, so a dropped future cannot leave
+/// snapshot persistence disabled forever.
+struct RoleMarkingGuard<'a>(&'a AtomicBool);
+
+impl Drop for RoleMarkingGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
 /// Role mutations accepted while a rebuild scan is in flight (see
 /// [`ROLES_REBUILD_BUFFER_MAX`]). The local `Mutex` serializes the capture
 /// with the worker's take-and-swap, so no mutation can slip between the
@@ -965,8 +1063,47 @@ struct RolesRebuildBuffer {
     overflow: bool,
 }
 
-/// Applies one captured mutation to a freshly rebuilt store.
-fn replay_role_mutation(store: &mut RoleStore, mutation: &BufferedRoleMutation) {
+/// Records a fire-and-forget pubkey removal (NIP-43 leave, vanish, failed
+/// admission rollback) for replay onto the next rebuilt store, but only
+/// while a rebuild is pending or in flight.
+///
+/// Unlike role definitions/assignments, these removals have no replaceable
+/// event that would carry them across a rebuild: a leave is ephemeral and a
+/// vanish removes the author's events. A rebuild that started before the
+/// removal committed would restore the member from an older membership list,
+/// so the removal is captured for the replay (N43-L01). The caller holds the
+/// buffer lock, so this post-apply snapshot catches a mark that set `dirty`
+/// while the mutation was publishing. Outside the window the live store is
+/// authoritative; buffering a stale leave would drop a later rejoin on the
+/// next rebuild. Duplicates are folded to keep the buffer small.
+fn buffer_pubkey_removal(buffer: &mut RolesRebuildBuffer, state: &RolesRebuild, pubkey: &str) {
+    if !(buffer.scanning
+        || state.dirty.load(Ordering::SeqCst)
+        || state.running.load(Ordering::SeqCst))
+    {
+        return;
+    }
+    if buffer.mutations.iter().any(|mutation| {
+        matches!(mutation, BufferedRoleMutation::RemovePubkey { pubkey: buffered } if buffered == pubkey)
+    }) {
+        return;
+    }
+    if buffer.mutations.len() >= ROLES_REBUILD_BUFFER_MAX {
+        buffer.overflow = true;
+    } else {
+        buffer.mutations.push(BufferedRoleMutation::RemovePubkey {
+            pubkey: pubkey.to_string(),
+        });
+    }
+}
+
+/// Applies one captured mutation to a freshly rebuilt store. Returns false
+/// when the mutation could not take effect on the authoritative state: an
+/// `Assign`/`Edit` whose role did not survive the scan (its definition was
+/// the removed event) or an admission over the cap. The caller logs the loss
+/// instead of silently swapping a store that contradicts an acknowledged RPC
+/// (N43-L04).
+fn replay_role_mutation(store: &mut RoleStore, mutation: &BufferedRoleMutation) -> bool {
     match mutation {
         BufferedRoleMutation::Create {
             id,
@@ -974,7 +1111,10 @@ fn replay_role_mutation(store: &mut RoleStore, mutation: &BufferedRoleMutation) 
             description,
             color,
             order,
-        } => store.create(id, label, description, color, *order),
+        } => {
+            store.create(id, label, description, color, *order);
+            true
+        }
         BufferedRoleMutation::Edit {
             id,
             label,
@@ -984,29 +1124,38 @@ fn replay_role_mutation(store: &mut RoleStore, mutation: &BufferedRoleMutation) 
         } => {
             if store.roles.contains_key(id) {
                 store.create(id, label, description, color, *order);
+                true
+            } else {
+                false
             }
         }
         BufferedRoleMutation::Delete { id } => {
             store.delete(id);
+            true
         }
-        BufferedRoleMutation::Assign { pubkey, role } => {
-            store.assign(pubkey, role);
-        }
+        BufferedRoleMutation::Assign { pubkey, role } => store.assign(pubkey, role),
         BufferedRoleMutation::Unassign { pubkey, role } => {
             store.unassign(pubkey, role);
+            true
         }
         BufferedRoleMutation::RemovePubkey { pubkey } => {
             store.remove_pubkey(pubkey);
+            true
         }
         BufferedRoleMutation::CreateClaim { claim } => {
             store.add_claim(claim);
+            true
         }
         BufferedRoleMutation::DeleteClaim { claim } => {
             store.remove_claim(claim);
+            true
         }
         BufferedRoleMutation::AdmitMember { pubkey } => {
             if !store.admit(pubkey) {
                 log::warn!("replayed NIP-43 admission dropped: the member list is at its cap");
+                false
+            } else {
+                true
             }
         }
     }
@@ -1031,8 +1180,18 @@ struct RolesRebuild {
     /// At least one role-state removal happened since the last completed
     /// rebuild: the live store is the fail-closed empty store and
     /// `persist_roles` must not save it. The worker drains it before a scan
-    /// and restores it when the scan fails.
+    /// and restores it when the scan fails. Stored under the mutation buffer
+    /// lock, so a mutation holding that lock sees a stable value (the mark
+    /// cannot revoke underneath it).
     dirty: std::sync::atomic::AtomicBool,
+    /// A mark is waiting for the mutation buffer lock (or is about to set
+    /// `dirty` under it). Persistence must already stop here: the database
+    /// removal advanced the generation before the in-memory mark runs, and
+    /// saving the still-live pre-removal store with that generation would let
+    /// the next startup accept stale state. Mutations do not treat this as a
+    /// rebuild window: they hold the buffer, and a mark that is still waiting
+    /// cannot revoke their store before they publish.
+    marking: std::sync::atomic::AtomicBool,
     /// A worker task owns (or is about to own) the rebuild loop: triggers
     /// only set the flags.
     running: std::sync::atomic::AtomicBool,
@@ -1048,11 +1207,6 @@ struct RolesRebuild {
     failed_rebuilds: std::sync::atomic::AtomicU64,
     /// Mutations accepted while the scan runs (see [`RolesRebuildBuffer`]).
     buffer: tokio::sync::Mutex<RolesRebuildBuffer>,
-    /// Role ids the live store held when it was last revoked. During the
-    /// rebuild the live store is empty, so `assign_role`/`edit_role` use
-    /// this hint to distinguish "exists in the history being replayed"
-    /// from a genuinely unknown id. Cleared once a rebuild succeeds.
-    revoked_roles: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Derived-state mutations committed but not yet applied in memory
     /// (see [`DerivedMutationEpoch`]).
     derived: DerivedMutationEpoch,
@@ -1118,8 +1272,24 @@ impl RolesRebuild {
             return false;
         }
         let mut store = roles.write().await;
+        let mut lost = 0usize;
         for mutation in &buffered {
-            replay_role_mutation(&mut fresh, mutation);
+            if !replay_role_mutation(&mut fresh, mutation) {
+                lost += 1;
+            }
+        }
+        if lost > 0 {
+            // The role did not survive the scan (its definition was the
+            // removed event) or the member list reached its cap. The
+            // authoritative state cannot honor the buffered intent; dropping
+            // it silently would hide that an RPC may have reported success
+            // during the revoked window (the pre-checks minimize that race).
+            // Keep the fresh store (the correct fail-closed outcome) and log
+            // so the operator can retry the change.
+            log::warn!(
+                "role state rebuild dropped {lost} buffered mutation(s) that no longer apply \
+                 to the surviving history; retry the affected role change"
+            );
         }
         *store = fresh;
         if self.dirty.load(Ordering::SeqCst) {
@@ -1141,14 +1311,71 @@ impl RolesRebuild {
     }
 }
 
+/// The handles a role rebuild worker needs to republish the membership list
+/// after a clean swap (N43-L02). The spawned worker has no [`Relay`] handle,
+/// so the signer, stamp clock and live bus are passed explicitly.
+#[derive(Clone)]
+struct RoleStatePublisher {
+    key: Option<Keypair>,
+    stamps: Arc<StampClock>,
+    live_tx: mpsc::Sender<(Arc<Event>, Arc<String>)>,
+    stats: Arc<Stats>,
+}
+
+impl RoleStatePublisher {
+    /// Republishes `kind:13534` from the freshly rebuilt store. The store may
+    /// have dropped assignments to a role whose definition was the removed
+    /// event, while the stored membership list still names them: without this
+    /// refresh clients see the stale list until the next membership change.
+    ///
+    /// A dirty state means another removal is pending: skip (that rebuild
+    /// republishes when it completes). The caller holds the rebuild buffer
+    /// lock, so no mutation can land between this capture and the publish
+    /// (and the `running` flag is still set while it runs, so a concurrent
+    /// mark cannot revoke underneath it). The stamp is taken while holding
+    /// the store read guard, so a mutation that lands afterwards cannot be
+    /// overwritten by an older snapshot with a newer stamp.
+    async fn publish_membership(
+        &self,
+        db: &DbClient,
+        roles: &RwLock<RoleStore>,
+        relay_pubkey: &str,
+        state: &RolesRebuild,
+    ) -> bool {
+        let Some(key) = self.key else {
+            return false;
+        };
+        let mut event = {
+            let roles = roles.read().await;
+            if state.dirty.load(Ordering::SeqCst) {
+                return false;
+            }
+            roles.membership_event(relay_pubkey, self.stamps.stamp(unix_now()))
+        };
+        store_relay_event_parts(
+            db,
+            Some(key),
+            &self.stamps,
+            &self.live_tx,
+            &self.stats,
+            &mut event,
+            true,
+        )
+        .await
+        .is_ok()
+    }
+}
+
 /// Marks the role state stale, revokes the live grants and schedules the
 /// coalesced background rebuild (single-flight via the `running` flag).
+#[allow(clippy::too_many_arguments)]
 fn schedule_roles_rebuild(
     db: DbClient,
     roles: std::sync::Arc<RwLock<RoleStore>>,
     relay_pubkey: String,
     persist_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
     state: std::sync::Arc<RolesRebuild>,
+    publisher: RoleStatePublisher,
     drain: tokio::sync::watch::Receiver<bool>,
 ) {
     if *drain.borrow() {
@@ -1165,6 +1392,7 @@ fn schedule_roles_rebuild(
         relay_pubkey,
         persist_lock,
         state,
+        publisher,
         drain,
     ));
 }
@@ -1179,14 +1407,19 @@ fn schedule_roles_rebuild(
 /// scan after shutdown and aborts an in-flight scan at its next await. Either
 /// way the live store stays fail-closed and the dirty flag stays set, so the
 /// next startup rebuilds from the surviving events.
+#[allow(clippy::too_many_arguments)]
 async fn roles_rebuild_worker(
     db: DbClient,
     roles: std::sync::Arc<RwLock<RoleStore>>,
     relay_pubkey: String,
     persist_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
     state: std::sync::Arc<RolesRebuild>,
+    publisher: RoleStatePublisher,
     mut drain: tokio::sync::watch::Receiver<bool>,
 ) {
+    // Set after a clean swap so the trailing code republishes the membership
+    // list (N43-L02). A later dirty/failed scan skips the refresh.
+    let mut membership_rebuilt = false;
     loop {
         // Shutdown: stop before starting another scan. The removal that
         // dirtied the state already cleared the live store, so the next
@@ -1298,6 +1531,7 @@ async fn roles_rebuild_worker(
         if !state.finish_rebuild(&roles, fresh).await {
             continue;
         }
+        membership_rebuilt = true;
         // Persist the fresh store under the mutation-serializing lock. A
         // mutation that lands in the meantime is refused persistence (the
         // state is not established yet) and a removal clears the store
@@ -1319,7 +1553,6 @@ async fn roles_rebuild_worker(
     // `dirty` under the lock; a removal marked in between must keep the
     // captures for the next scan.
     let mut buffer = state.buffer.lock().await;
-    state.running.store(false, Ordering::SeqCst);
     if !state.dirty.load(Ordering::SeqCst) {
         // A clean rebuild persisted the live store with every mutation
         // captured while `running` was set. Replaying those captures in a
@@ -1328,23 +1561,40 @@ async fn roles_rebuild_worker(
         buffer.mutations.clear();
         buffer.overflow = false;
         buffer.scanning = false;
+        // The runtime rebuild could have dropped assignments to a role whose
+        // definition was removed, while the stored kind:13534 still names
+        // them. Republish the authoritative list so clients see the rebuilt
+        // state without waiting for the next membership change (N43-L02).
+        // The buffer lock is held and `running` is still set: no mutation can
+        // race the capture and no mark can revoke the store underneath it.
+        if membership_rebuilt
+            && !*drain.borrow()
+            && !publisher
+                .publish_membership(&db, &roles, &relay_pubkey, &state)
+                .await
+        {
+            log::warn!(
+                "could not republish the NIP-43 membership list after the role rebuild; \
+                 kind:13534 may stay stale until the next membership change"
+            );
+        }
     }
+    state.running.store(false, Ordering::SeqCst);
     drop(buffer);
-    if !state.dirty.load(Ordering::SeqCst) {
-        // The successful swap restored the role ids; the revoked hint is
-        // no longer authoritative.
-        state
-            .revoked_roles
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clear();
-    }
     // A removal that arrived after the loop's last dirty check (while
     // `running` was still set) saw a running worker and did not spawn one:
     // re-check and reschedule. A signaled drain keeps the state dirty
     // (fail-closed) instead so the next startup rebuilds.
     if state.dirty.load(Ordering::SeqCst) && !*drain.borrow() {
-        schedule_roles_rebuild(db, roles, relay_pubkey, persist_lock, state, drain);
+        schedule_roles_rebuild(
+            db,
+            roles,
+            relay_pubkey,
+            persist_lock,
+            state,
+            publisher,
+            drain,
+        );
     }
 }
 
@@ -1363,6 +1613,12 @@ async fn persist_fresh_roles(
     if state.derived.in_flight() {
         return PersistOutcome::Deferred;
     }
+    if state.marking.load(Ordering::SeqCst) {
+        // A mark is waiting for the mutation buffer: the store it is about
+        // to revoke must not be persisted, but this is not a failure (the
+        // mark's own rebuild owns the next save).
+        return PersistOutcome::Deferred;
+    }
     let Some((stamp, seq)) = read_role_generation(db).await else {
         log::error!(
             "cannot read the state generation; keeping the persisted NIP-43 role \
@@ -1376,6 +1632,9 @@ async fn persist_fresh_roles(
     // would make the next startup accept state that predates the removal.
     if state.dirty.load(Ordering::SeqCst) {
         return PersistOutcome::Failed;
+    }
+    if state.marking.load(Ordering::SeqCst) {
+        return PersistOutcome::Deferred;
     }
     if state.derived.in_flight() {
         return PersistOutcome::Deferred;
@@ -1416,13 +1675,17 @@ async fn persist_roles_now(
 ) -> PersistOutcome {
     let _guard = lock.lock().await;
     // A stale store must never overwrite the stored snapshot: while a
-    // removal is pending a rebuild (`dirty`) or a worker owns the state
-    // (`running`), the live store is the fail-closed empty store or a
+    // removal is marking (`marking`/`dirty`) a rebuild or a worker owns the
+    // state (`running`), the live store is the fail-closed empty store or a
     // store that may predate the removal, and stamping it with the
     // already-advanced generation would make the next startup accept it.
     // The stored snapshot keeps its older generation, so startup rejects it
     // and rebuilds from the surviving events.
-    let stale = || state.dirty.load(Ordering::SeqCst) || state.running.load(Ordering::SeqCst);
+    let stale = || {
+        state.dirty.load(Ordering::SeqCst)
+            || state.marking.load(Ordering::SeqCst)
+            || state.running.load(Ordering::SeqCst)
+    };
     if stale() {
         return PersistOutcome::Failed;
     }
@@ -2205,6 +2468,7 @@ impl Relay {
             roles_rebuild: std::sync::Arc::new(RolesRebuild::default()),
             api_limit: ApiLimiter::new(api_max_concurrent),
             publish_rate: std::sync::Mutex::new(PublishRate::default()),
+            join_pubkeys: std::sync::Mutex::new(PublishRate::default()),
             persist_access_lock: tokio::sync::Mutex::new(()),
             access_ops: std::sync::Mutex::new(PendingAccessOps {
                 seq: seed_ops.len() as u64,
@@ -2229,7 +2493,7 @@ impl Relay {
             key,
             relay_pubkey,
             config_path: Arc::new(tokio::sync::RwLock::new(None)),
-            stamps: StampClock::new_with_last(stamp_last),
+            stamps: Arc::new(StampClock::new_with_last(stamp_last)),
             blossom: Arc::new(tokio::sync::RwLock::new(None)),
             blossom_allow: Arc::new(tokio::sync::RwLock::new(blossom_allow)),
             audit: crate::audit::AuditLog::default(),
@@ -2451,14 +2715,7 @@ impl Relay {
     /// Accepts an [`Arc<Event>`] (or an owned [`Event`]) so the accept path
     /// can share one allocation with the database write.
     pub async fn broadcast(&self, event: impl Into<Arc<Event>>) -> Result<(), ()> {
-        let event = event.into();
-        let json = Arc::new(serde_json::to_string(&*event).unwrap_or_default());
-        if self.live_tx.send((event, json)).await.is_err() {
-            log::error!("live bus stopped before an accepted event could be broadcast");
-            self.stats.bump(&self.stats.db_errors, 1);
-            return Err(());
-        }
-        Ok(())
+        broadcast_with(&self.live_tx, &self.stats, event.into()).await
     }
 
     /// Whether `pubkey` may publish another event under
@@ -2478,6 +2735,26 @@ impl Relay {
         }
         let mut rate = self.publish_rate.lock().unwrap_or_else(|p| p.into_inner());
         rate.allow(max as usize, pubkey, now, MAX_TRACKED_PUBKEYS)
+    }
+
+    /// Join attempts allowed per minute for one author. The limiter is keyed
+    /// by the (unverified) event author so it can run before the signature
+    /// and database work; a valid invite code shared by many members is not
+    /// throttled because each author has its own window. It is a fixed bound
+    /// independent of `max_events_per_min_per_pubkey`: a short invite code
+    /// must not be brute-forceable on a relay that leaves the generic publish
+    /// rate disabled (the default). Spoofing another author's pubkey can
+    /// exhaust that author's join attempts for a minute, but not its ordinary
+    /// publishing quota; the signature check still rejects the spoofed event.
+    const JOIN_ATTEMPTS_PER_MINUTE: usize = 10;
+
+    /// Whether one more join attempt for `pubkey` fits in its window.
+    pub(crate) fn allow_join_pubkey_attempt(&self, pubkey: &str, now: u64) -> bool {
+        let mut rate = self
+            .join_pubkeys
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        rate.allow(Self::JOIN_ATTEMPTS_PER_MINUTE, pubkey, now, 10_000)
     }
 
     /// Releases one publish-rate reservation when database admission rejects
@@ -2847,7 +3124,7 @@ impl Relay {
             // The single-event path never caps its per-reference lookups.
             capped: false,
         });
-        self.accept_event_verified(event, authed, known.as_ref(), None)
+        self.accept_event_verified(event, authed, known.as_ref(), None, None)
             .await
     }
 
@@ -2861,10 +3138,28 @@ impl Relay {
         authed: &[String],
         known_prefixes: Option<&crate::relay::validate::KnownPrevious<'_>>,
         verified: Option<bool>,
+        join_attempt: Option<bool>,
     ) -> PutOutcome {
         let now = unix_now();
         let cfg = self.config.read().await;
         let access = self.access.read().await;
+
+        // NIP-43 invite-code brute-force guard (N43-L05): reserve the attempt
+        // before the signature check (`precheck` verifies inline when
+        // `verified` is None) and before the vanish lookup / claim
+        // comparison. The mixed batch path passes a verdict it already
+        // reserved before its parallel signature pass, so this never charges
+        // the same attempt twice.
+        if cfg.nip_enabled(43) && event.kind == nip43::JOIN {
+            let allowed = match join_attempt {
+                Some(allowed) => allowed,
+                None => self.allow_join_pubkey_attempt(&event.pubkey, now),
+            };
+            if !allowed {
+                self.stats.bump(&self.stats.events_rejected, 1);
+                return PutOutcome::Invalid("rate-limited: too many join attempts".into());
+            }
+        }
 
         match self
             .precheck(&cfg, &access, &event, now, authed, known_prefixes, verified)
@@ -2890,17 +3185,9 @@ impl Relay {
                 // guards are dropped: `admit_member` must not re-acquire the
                 // config lock (see the comment on `admit_member`).
                 let nip43_enabled = cfg.nip_enabled(43);
-                // This branch returns before the shared publish-rate check
-                // below, so the limiter is applied here: a claim-holder
-                // cycling leave/rejoin would otherwise re-sign the whole
-                // member list on every admission without ever being
-                // rate-limited.
-                if !self.publish_rate_allowed(&cfg, &event.pubkey, now) {
-                    drop(cfg);
-                    drop(access);
-                    self.stats.bump(&self.stats.events_rejected, 1);
-                    return PutOutcome::Invalid("rate-limited: too many events".into());
-                }
+                // `precheck` already charged the publish rate for this join
+                // attempt (N43-L05), so the failures below roll that
+                // reservation back instead of checking it again.
                 drop(cfg);
                 drop(access);
                 match self.admit_member(&event.pubkey, nip43_enabled).await {
@@ -3255,13 +3542,56 @@ impl Relay {
         // accepted (or already stored): a later event may reference an
         // earlier sibling, but never a rejected one.
         let (mut known_set, previous_capped) = self.batch_known_prefixes(&events).await;
+        // N43-L05: reserve every join attempt before the parallel signature
+        // pass. The verdict is handed to the singleton below so the attempt
+        // is charged exactly once. The fixed window is per author; the
+        // configured publish rate is charged later, after the signature.
+        let now = unix_now();
+        let nip43_enabled = self.config.read().await.nip_enabled(43);
+        let join_attempts: Vec<Option<bool>> = events
+            .iter()
+            .map(|event| {
+                (nip43_enabled && event.kind == nip43::JOIN)
+                    .then(|| self.allow_join_pubkey_attempt(&event.pubkey, now))
+            })
+            .collect();
         // One parallel pass for the whole batch: the sequential singletons
         // below must not re-verify each signature inline. The batch is shared
         // so the verification can run off the runtime worker, then reclaimed
-        // unchanged for the loop below.
-        let batch: Arc<Box<[Event]>> = Arc::new(events.into_boxed_slice());
-        let verified = crate::relay::validate::verify_signatures_parallel(Arc::clone(&batch)).await;
-        let events = crate::relay::validate::reclaim_events(batch);
+        // unchanged for the loop below. A join already refused by the
+        // attempt limiter is excluded from the signature pass (N43-L05): the
+        // limiter runs before any signature work, so a flood of guesses
+        // cannot burn the verification CPU. The filtered branch clones the
+        // surviving events; it is only taken when a join was actually
+        // limited.
+        let (events, verified) = if join_attempts.contains(&Some(false)) {
+            let to_verify: std::sync::Arc<Box<[Event]>> = std::sync::Arc::new(
+                events
+                    .iter()
+                    .zip(&join_attempts)
+                    .filter(|(_, allowed)| **allowed != Some(false))
+                    .map(|(event, _)| event.clone())
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+            );
+            let mut verdicts = crate::relay::validate::verify_signatures_parallel(to_verify)
+                .await
+                .into_iter();
+            let mut aligned = vec![false; events.len()];
+            for (slot, allowed) in aligned.iter_mut().zip(&join_attempts) {
+                if *allowed != Some(false) {
+                    // A missing verdict fails closed (unreachable: the
+                    // filtered vector has one entry per allowed event).
+                    *slot = verdicts.next().unwrap_or(false);
+                }
+            }
+            (events, aligned)
+        } else {
+            let batch: Arc<Box<[Event]>> = Arc::new(events.into_boxed_slice());
+            let verdicts =
+                crate::relay::validate::verify_signatures_parallel(Arc::clone(&batch)).await;
+            (crate::relay::validate::reclaim_events(batch), verdicts)
+        };
         let mut out: Vec<(String, PutOutcome)> = Vec::with_capacity(events.len());
         let mut run: Vec<Event> = Vec::new();
         let mut run_verdicts: Vec<bool> = Vec::new();
@@ -3297,13 +3627,27 @@ impl Relay {
                     run_verdicts.clear();
                 }
                 let id = event.id.clone();
+                if join_attempts[index] == Some(false) {
+                    self.stats.bump(&self.stats.events_rejected, 1);
+                    out.push((
+                        id,
+                        PutOutcome::Invalid("rate-limited: too many join attempts".into()),
+                    ));
+                    continue;
+                }
                 let outcome = {
                     let known = crate::relay::validate::KnownPrevious {
                         known: &known_set,
                         capped: previous_capped,
                     };
-                    self.accept_event_verified(event, authed, Some(&known), Some(verified[index]))
-                        .await
+                    self.accept_event_verified(
+                        event,
+                        authed,
+                        Some(&known),
+                        Some(verified[index]),
+                        join_attempts[index],
+                    )
+                    .await
                 };
                 if matches!(
                     outcome,
@@ -3446,18 +3790,9 @@ impl Relay {
                     // Should it ever be reached, the cost is a stall, not a
                     // deadlock: the admission's two database commits would
                     // run under both read guards.
-                    // The same per-pubkey publish limiter the single-event
-                    // path applies to this branch (which returns before the
-                    // shared check): a claim-holder cycling leave/rejoin
-                    // must not re-sign the whole member list unthrottled.
-                    if !self.publish_rate_allowed(&cfg, &event.pubkey, now) {
-                        self.stats.bump(&self.stats.events_rejected, 1);
-                        results.push((
-                            id,
-                            PutOutcome::Invalid("rate-limited: too many events".into()),
-                        ));
-                        continue;
-                    }
+                    // `precheck` already charged the publish rate for this
+                    // join attempt (N43-L05); the failure arms below roll the
+                    // reservation back.
                     match self.admit_member(&event.pubkey, cfg.nip_enabled(43)).await {
                         crate::relay::roles::Admission::Recorded => {}
                         crate::relay::roles::Admission::Full => {
@@ -4853,16 +5188,19 @@ impl Relay {
     /// rebuilds from the surviving events; `persist_roles` refuses to
     /// overwrite it until the rebuild completes.
     pub(crate) async fn mark_roles_stale(&self) {
+        // Flag the rebuild first so the snapshot persistence stops saving the
+        // state as soon as the removal is known (the database generation has
+        // already advanced). `marking` is only for the persist paths: the
+        // mutation-visible `dirty` is stored *under the buffer lock* below so
+        // a mutation holding the lock sees a stable value (N43-M01).
+        self.roles_rebuild.marking.store(true, Ordering::SeqCst);
+        let marking = RoleMarkingGuard(&self.roles_rebuild.marking);
+        let buffer = self.roles_rebuild.buffer.lock().await;
         self.roles_rebuild.dirty.store(true, Ordering::SeqCst);
+        // `dirty` now covers the persist paths; release the early flag.
+        drop(marking);
         let claims = {
             let live = self.roles.read().await;
-            let mut revoked = self
-                .roles_rebuild
-                .revoked_roles
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            revoked.clear();
-            revoked.extend(live.roles.keys().cloned());
             // Invite codes have no backing events. Keep them in the revoked
             // store so the rebuild can carry them across; otherwise an
             // unrelated role-state event would discard every code.
@@ -4872,14 +5210,27 @@ impl Relay {
             claims,
             ..Default::default()
         };
+        drop(buffer);
         schedule_roles_rebuild(
             self.db.clone(),
             Arc::clone(&self.roles),
             self.relay_pubkey().unwrap_or_default(),
             Arc::clone(&self.persist_roles_lock),
             Arc::clone(&self.roles_rebuild),
+            self.role_state_publisher(),
             self.subscribe_drain(),
         );
+    }
+
+    /// The handles the role rebuild worker needs to republish the membership
+    /// list after a clean rebuild (see [`RoleStatePublisher`]).
+    fn role_state_publisher(&self) -> RoleStatePublisher {
+        RoleStatePublisher {
+            key: self.key,
+            stamps: Arc::clone(&self.stamps),
+            live_tx: self.live_tx.clone(),
+            stats: Arc::clone(&self.stats),
+        }
     }
 
     /// Whether a `kind:9008` group purge committed. The purge API reports a
@@ -5161,17 +5512,33 @@ impl Relay {
         // NIP-43 role assignments hold pubkeys too: a vanished author must
         // not keep its roles.
         if nip43_enabled {
+            let mut buffer = self.roles_rebuild.buffer.lock().await;
+            // `dirty`/`running` are stable under the buffer lock. A vanish
+            // that lands while a rebuild owns the store must be captured even
+            // though the revoked store reports no change: the scan may have
+            // read the vanish set before the marker committed, so the fresh
+            // store can resurrect the member from a surviving membership list
+            // (N43-L01).
+            let pending = self.roles_rebuild.dirty.load(Ordering::SeqCst)
+                || self.roles_rebuild.running.load(Ordering::SeqCst);
             role_changed = self
                 .mutate_roles(
+                    &mut buffer,
                     BufferedRoleMutation::RemovePubkey {
                         pubkey: pubkey_hex.clone(),
                     },
                     |roles| {
-                        let changed = roles.assignments.remove(&pubkey_hex).is_some();
-                        (changed, changed)
+                        let changed = roles.remove_pubkey(&pubkey_hex);
+                        (changed, changed || pending)
                     },
                 )
                 .await;
+            // No event carries a vanish's role removal across a rebuild: the
+            // scan may have read the vanish set before the marker committed.
+            // Capture it when a rebuild is pending or starts while this
+            // removal publishes (L01).
+            buffer_pubkey_removal(&mut buffer, &self.roles_rebuild, &pubkey_hex);
+            drop(buffer);
         }
         if state_removed.group {
             // A moderation/join/leave event was removed: the group state
@@ -6638,6 +7005,188 @@ mod tests {
         assert!(
             roles.is_member_of(&b),
             "the surviving role's grant must be restored"
+        );
+        drop(roles);
+        // N43-L02: the stored kind:13534 still named `a` (assigned to the
+        // deleted role) after the rebuild. The worker must republish the
+        // authoritative list instead of leaving clients on that stale one.
+        let filter: crate::filter::Filter =
+            serde_json::from_value(serde_json::json!({"kinds": [13534]})).unwrap();
+        let (lists, _) = relay
+            .db
+            .query(vec![filter], 10, crate::util::unix_now())
+            .await;
+        assert_eq!(lists.len(), 1, "exactly one replaceable membership list");
+        let members: Vec<&str> = lists[0]
+            .tags
+            .iter()
+            .filter(|tag| tag.first().map(String::as_str) == Some("member"))
+            .filter_map(|tag| tag.get(1).map(String::as_str))
+            .collect();
+        assert!(
+            !members.contains(&a.as_str()),
+            "the republished list must not name the deleted role's holder: {members:?}"
+        );
+        assert!(
+            members.contains(&b.as_str()),
+            "the republished list must keep the surviving grant: {members:?}"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn marking_roles_stale_waits_for_an_in_flight_role_mutation() {
+        // N43-M01: the mark used to clear the live store without the buffer
+        // lock. A mutation that had applied but not yet published could then
+        // vanish from both the live store and the replay buffer. The mark now
+        // takes the same lock the mutation holds through its publish, so it
+        // cannot revoke underneath an accepted change.
+        let key = "01".repeat(32);
+        let relay = build_role_relay(Some(&key)).await;
+        assert!(relay.create_role("mod", "Mod", "", "", None).await);
+        let gate = relay.roles_rebuild.buffer.lock().await;
+        // A drained relay does not spawn the worker, so the dirty flag stays
+        // observable after the mark returns.
+        relay.signal_drain();
+        let task_relay = relay.clone();
+        let mark = tokio::spawn(async move { task_relay.mark_roles_stale().await });
+        tokio::task::yield_now().await;
+        assert!(
+            relay.roles.read().await.roles.contains_key("mod"),
+            "the mark must not revoke while the mutation window is held"
+        );
+        drop(gate);
+        mark.await.unwrap();
+        assert!(
+            relay.roles.read().await.roles.is_empty(),
+            "the mark revokes once the window is released"
+        );
+        assert!(relay.roles_rebuild.dirty.load(Ordering::SeqCst));
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn vanish_during_a_role_rebuild_is_buffered() {
+        // N43-L01: on the revoked empty store a vanish's role removal reports
+        // "not a member", so it used to be neither applied nor captured. A
+        // scan that read the vanish set before the marker committed could
+        // then restore the member from the surviving membership list, and the
+        // persisted snapshot would carry it. The removal is force-buffered.
+        let key = "01".repeat(32);
+        let relay = build_role_relay(Some(&key)).await;
+        let member = "aa".repeat(32);
+        assert!(relay.create_role("mod", "Mod", "", "", None).await);
+        assert_eq!(relay.assign_role(&member, "mod").await, RoleChange::Applied);
+        relay.signal_drain();
+        relay.mark_roles_stale().await;
+        let vanished: [u8; 32] = hex::decode(&member).unwrap().try_into().unwrap();
+        assert!(relay.vanish_pubkey(vanished, crate::util::unix_now()).await);
+        {
+            let buffer = relay.roles_rebuild.buffer.lock().await;
+            assert!(
+                buffer.mutations.iter().any(|mutation| matches!(
+                    mutation,
+                    BufferedRoleMutation::RemovePubkey { pubkey } if pubkey == &member
+                )),
+                "the vanished member's removal must be captured for replay"
+            );
+        }
+        // Replaying onto a store the scan restored resurrects nothing.
+        let mut fresh = RoleStore::default();
+        fresh.create("mod", "Mod", "", "", None);
+        fresh.assign(&member, "mod");
+        assert!(fresh.is_member_of(&member));
+        {
+            let buffer = relay.roles_rebuild.buffer.lock().await;
+            for mutation in &buffer.mutations {
+                super::replay_role_mutation(&mut fresh, mutation);
+            }
+        }
+        assert!(
+            !fresh.is_member_of(&member),
+            "the buffered vanish removal must win the replay"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn assign_during_a_rebuild_rejects_a_removed_role_definition() {
+        // N43-L04: the revoked store's role ids are not evidence that the role
+        // survives. Assigning to a role whose definition event was removed
+        // used to report Applied from the stale live set, then the replay
+        // silently dropped the grant.
+        let key = "01".repeat(32);
+        let relay = build_role_relay(Some(&key)).await;
+        assert!(relay.create_role("mod", "Mod", "", "", None).await);
+        let filter: crate::filter::Filter = serde_json::from_value(serde_json::json!({
+            "kinds": [33534],
+            "#d": ["mod"],
+        }))
+        .unwrap();
+        let (stored, _) = relay
+            .db
+            .query(vec![filter], 1, crate::util::unix_now())
+            .await;
+        let id = stored
+            .first()
+            .expect("the role definition is stored")
+            .id_bytes()
+            .unwrap();
+        assert_eq!(
+            relay.db.remove_events_by_id(&[id]).await,
+            Some(1),
+            "the definition must be removed before the revoked-window assign"
+        );
+        relay.signal_drain();
+        relay.mark_roles_stale().await;
+        let member = "aa".repeat(32);
+        assert_eq!(
+            relay.assign_role(&member, "mod").await,
+            RoleChange::Unknown,
+            "a role whose definition no longer exists must not report Applied"
+        );
+        assert!(!relay.roles.read().await.is_member_of(&member));
+        let buffer = relay.roles_rebuild.buffer.lock().await;
+        assert!(
+            !buffer
+                .mutations
+                .iter()
+                .any(|mutation| matches!(mutation, BufferedRoleMutation::Assign { .. })),
+            "a rejected assign must not enter the replay buffer"
+        );
+        drop(buffer);
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn assign_during_a_marking_window_publishes_the_full_membership() {
+        // A mark waiting for the mutation buffer (`marking`, dirty not yet
+        // set) has not revoked the live store. An assign must still verify
+        // the role against the stored history, but it must publish the full
+        // kind:13534 (not just an add-user event): that list is what the
+        // upcoming rebuild reads, so skipping it would drop the grant while
+        // the RPC reported success.
+        let key = "01".repeat(32);
+        let relay = build_role_relay(Some(&key)).await;
+        assert!(relay.create_role("mod", "Mod", "", "", None).await);
+        relay.roles_rebuild.marking.store(true, Ordering::SeqCst);
+        let member = "aa".repeat(32);
+        assert_eq!(relay.assign_role(&member, "mod").await, RoleChange::Applied);
+        relay.roles_rebuild.marking.store(false, Ordering::SeqCst);
+        assert!(relay.roles.read().await.is_member_of(&member));
+        let filter: crate::filter::Filter =
+            serde_json::from_value(serde_json::json!({"kinds": [13534]})).unwrap();
+        let (lists, _) = relay
+            .db
+            .query(vec![filter], 10, crate::util::unix_now())
+            .await;
+        assert_eq!(lists.len(), 1);
+        assert!(
+            lists[0].tags.iter().any(|tag| {
+                tag.len() >= 3 && tag[0] == "member" && tag[1] == member && tag[2] == "mod"
+            }),
+            "the full membership list must carry the marking-window grant: {:?}",
+            lists[0].tags
         );
         relay.db.shutdown();
     }
@@ -9107,6 +9656,85 @@ mod tests {
         assert_eq!(drifted.stamp(base), base + StampClock::MAX_AHEAD_SECS);
     }
 
+    #[tokio::test]
+    async fn role_events_retry_a_clock_ceiling_tie() {
+        // N43-L03: at MAX_AHEAD the clock returns the same second for every
+        // issue, and NIP-01 keeps the lower id on a tie. A new role snapshot
+        // could therefore lose the replacement (about half the time) and the
+        // role sequence would never advance. The role publish retries after
+        // the wall clock raises the cap instead of reporting a duplicate.
+        let key = "01".repeat(32);
+        let relay = build_role_relay(Some(&key)).await;
+        let now = crate::util::unix_now();
+        for _ in 0..=StampClock::MAX_AHEAD_SECS {
+            relay.stamp_floor(now);
+        }
+        let ceiling = now + StampClock::MAX_AHEAD_SECS;
+        let relay_pubkey = relay.relay_pubkey().unwrap();
+
+        let role = |label: &str, created_at: u64| crate::event::Event {
+            id: String::new(),
+            pubkey: relay_pubkey.clone(),
+            created_at,
+            kind: crate::nips::nip43::ROLE_DEFINITION,
+            tags: vec![
+                vec!["-".into()],
+                vec!["d".into(), "tie".into()],
+                vec!["label".into(), label.into()],
+            ],
+            content: String::new(),
+            sig: String::new(),
+        };
+        // The incumbent at the ceiling.
+        let mut old = role("old", ceiling);
+        assert_eq!(relay.store_relay_event(&mut old).await, Ok(true));
+        let old_id = old.id.clone();
+
+        // A newer definition with the same timestamp loses the NIP-01 tie
+        // unless its id sorts lower; search for such an id so the first put
+        // is guaranteed to be a duplicate.
+        let (label, mut new) = {
+            let mut counter = 0u32;
+            loop {
+                let label = format!("new-{counter}");
+                let candidate = role(&label, ceiling);
+                if crate::nips::nip01::compute_id(&candidate) > old_id {
+                    break (label, candidate);
+                }
+                counter += 1;
+            }
+        };
+        assert_eq!(
+            relay.store_role_event(&mut new).await,
+            Ok(true),
+            "the tie-losing role event must retry and store"
+        );
+        assert!(
+            new.created_at > ceiling,
+            "the retry must advance the stamp past the ceiling: {}",
+            new.created_at
+        );
+        let filter: crate::filter::Filter = serde_json::from_value(serde_json::json!({
+            "kinds": [crate::nips::nip43::ROLE_DEFINITION],
+            "#d": ["tie"],
+        }))
+        .unwrap();
+        let (stored, _) = relay
+            .db
+            .query(vec![filter], 1, crate::util::unix_now())
+            .await;
+        assert_eq!(stored.len(), 1, "one addressable version is kept");
+        assert!(
+            stored[0]
+                .tags
+                .iter()
+                .any(|tag| tag.len() >= 2 && tag[0] == "label" && tag[1] == label),
+            "the retried event must replace the incumbent: {:?}",
+            stored[0].tags
+        );
+        relay.db.shutdown();
+    }
+
     #[test]
     fn stamp_clock_saturates_without_regressing() {
         // At the cap strict monotonicity is impossible (no larger value
@@ -10740,6 +11368,203 @@ mod tests {
                 !relay.roles.read().await.is_member_of(&pubkey),
                 "the rate-limited rejoin must not record the member"
             );
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn restricted_relay_admits_an_invite_join_but_still_blocks_publishing() {
+        // N43-M02: `restrict_relay` rejected a join before the invite code was
+        // considered, contradicting the admission path's contract ("the code
+        // is the authorization"). A valid claim now bypasses only the
+        // allow-list gate; a denied pubkey is still refused and ordinary
+        // publishing stays restricted.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            use crate::db::PutOutcome;
+
+            let relay = build_role_relay(Some(&"01".repeat(32))).await;
+            relay.access.write().await.restrict_relay = true;
+            relay.roles.write().await.add_claim("INVITE");
+
+            let keypair = secp256k1::Keypair::from_secret_bytes([41u8; 32]).unwrap();
+            let pubkey = secp256k1::XOnlyPublicKey::from_keypair(&keypair)
+                .0
+                .to_string();
+            let now = crate::util::unix_now();
+            let signed = |kind: u64, tags: Vec<Vec<String>>| {
+                let mut event = crate::event::Event {
+                    id: String::new(),
+                    pubkey: pubkey.clone(),
+                    created_at: now,
+                    kind,
+                    tags,
+                    content: String::new(),
+                    sig: String::new(),
+                };
+                event.id = crate::nips::nip01::compute_id(&event);
+                let id = event.id_bytes().unwrap();
+                event.sig = secp256k1::schnorr::sign_no_aux_rand(&id, &keypair).to_string();
+                event
+            };
+            let join = signed(
+                crate::nips::nip43::JOIN,
+                vec![vec!["claim".into(), "INVITE".into()]],
+            );
+            let outcome = relay.accept_event(join, &[], None).await;
+            assert!(
+                matches!(&outcome, PutOutcome::Duplicate(msg) if msg.contains("welcome")),
+                "a valid invite must admit on a restricted relay: {outcome:?}"
+            );
+            assert!(relay.roles.read().await.is_member_of(&pubkey));
+
+            // Membership does not bypass the allow list for publishing.
+            let note = signed(1, Vec::new());
+            assert!(
+                matches!(
+                    relay.accept_event(note, &[], None).await,
+                    PutOutcome::Invalid(msg) if msg.contains("pubkey not allowed")
+                ),
+                "a restricted relay must still refuse non-allowlisted publishing"
+            );
+
+            // A denied pubkey is refused even with a listed code.
+            relay.roles.write().await.add_claim("BLOCKED");
+            relay
+                .access
+                .write()
+                .await
+                .blocked_pubkeys
+                .push((pubkey.clone(), String::new()));
+            let blocked = signed(
+                crate::nips::nip43::JOIN,
+                vec![vec!["claim".into(), "BLOCKED".into()]],
+            );
+            assert!(
+                matches!(
+                    relay.accept_event(blocked, &[], None).await,
+                    PutOutcome::Invalid(msg) if msg.contains("pubkey not allowed")
+                ),
+                "a ban must outrank an invite code"
+            );
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn join_attempts_are_rate_limited_before_signature_verification() {
+        // N43-L05: the join Reject path returned before the publish-rate
+        // check, so a short code could be guessed with only connection
+        // limits. The per-claim attempt limiter now runs before the
+        // signature check: an unsigned (invalid) join still consumes an
+        // attempt, and the 11th attempt is refused with the rate-limit
+        // reason instead of the signature error.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            use crate::db::PutOutcome;
+
+            let relay = build_role_relay(Some(&"01".repeat(32))).await;
+            let now = crate::util::unix_now();
+            let mut join = crate::event::Event {
+                id: String::new(),
+                pubkey: "aa".repeat(32),
+                created_at: now,
+                kind: crate::nips::nip43::JOIN,
+                tags: vec![vec!["claim".into(), "GUESS".into()]],
+                content: String::new(),
+                sig: "00".repeat(64),
+            };
+            join.id = crate::nips::nip01::compute_id(&join);
+            for attempt in 1..=10 {
+                let outcome = relay.accept_event(join.clone(), &[], None).await;
+                assert!(
+                    matches!(&outcome, PutOutcome::Invalid(msg) if msg.contains("signature")),
+                    "attempt {attempt} must reach signature verification: {outcome:?}"
+                );
+            }
+            let outcome = relay.accept_event(join, &[], None).await;
+            assert!(
+                matches!(&outcome, PutOutcome::Invalid(msg) if msg.contains("rate-limited")),
+                "the 11th guess must be rate-limited before the signature check: {outcome:?}"
+            );
+
+            // Brute-forcing *different* codes with one valid key is also
+            // bounded even though the default publish rate is unlimited: the
+            // fixed per-author join window applies in the precheck before the
+            // claim comparison.
+            let keypair = secp256k1::Keypair::from_secret_bytes([42u8; 32]).unwrap();
+            let pubkey = secp256k1::XOnlyPublicKey::from_keypair(&keypair)
+                .0
+                .to_string();
+            let mut guesses = (1..=11).map(|i| {
+                let mut event = crate::event::Event {
+                    id: String::new(),
+                    pubkey: pubkey.clone(),
+                    created_at: now,
+                    kind: crate::nips::nip43::JOIN,
+                    tags: vec![vec!["claim".into(), format!("guess-{i}")]],
+                    content: String::new(),
+                    sig: String::new(),
+                };
+                event.id = crate::nips::nip01::compute_id(&event);
+                let id = event.id_bytes().unwrap();
+                event.sig = secp256k1::schnorr::sign_no_aux_rand(&id, &keypair).to_string();
+                event
+            });
+            for i in 1..=10 {
+                let outcome = relay.accept_event(guesses.next().unwrap(), &[], None).await;
+                assert!(
+                    matches!(&outcome, PutOutcome::Invalid(msg) if msg.contains("invite code")),
+                    "guess {i} must reach the claim check: {outcome:?}"
+                );
+            }
+            let outcome = relay.accept_event(guesses.next().unwrap(), &[], None).await;
+            assert!(
+                matches!(&outcome, PutOutcome::Invalid(msg) if msg.contains("rate-limited")),
+                "the 11th distinct guess from one key must be rate-limited: {outcome:?}"
+            );
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn a_shared_invite_code_is_not_throttled_per_code() {
+        // The fixed join limit is per author, not per code: a reusable invite
+        // used by a team must not stop admitting after 10 members. Every
+        // author has its own window (the configured publish rate is also 0
+        // here).
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            use crate::db::PutOutcome;
+
+            let relay = build_role_relay(Some(&"01".repeat(32))).await;
+            relay.roles.write().await.add_claim("SHARED");
+            let now = crate::util::unix_now();
+            for i in 0..11u8 {
+                let keypair =
+                    secp256k1::Keypair::from_secret_bytes([60u8.wrapping_add(i); 32]).unwrap();
+                let pubkey = secp256k1::XOnlyPublicKey::from_keypair(&keypair)
+                    .0
+                    .to_string();
+                let mut join = crate::event::Event {
+                    id: String::new(),
+                    pubkey: pubkey.clone(),
+                    created_at: now,
+                    kind: crate::nips::nip43::JOIN,
+                    tags: vec![vec!["claim".into(), "SHARED".into()]],
+                    content: String::new(),
+                    sig: String::new(),
+                };
+                join.id = crate::nips::nip01::compute_id(&join);
+                let id = join.id_bytes().unwrap();
+                join.sig = secp256k1::schnorr::sign_no_aux_rand(&id, &keypair).to_string();
+                let outcome = relay.accept_event(join, &[], None).await;
+                assert!(
+                    matches!(&outcome, PutOutcome::Duplicate(msg) if msg.contains("welcome")),
+                    "member {i} using the shared code must be admitted: {outcome:?}"
+                );
+                assert!(relay.roles.read().await.is_member_of(&pubkey));
+            }
             relay.db.shutdown();
         });
     }

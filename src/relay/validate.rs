@@ -177,6 +177,21 @@ impl super::Relay {
         if let Err(e) = self.validate_base(cfg, event, now, authed, verified) {
             return Precheck::Reject(e.to_string());
         }
+        // NIP-43: charge the configured publish rate for every verified join
+        // attempt *before* the vanish lookup and the invite-code comparison.
+        // The admit branch returns early (it never reaches the shared rate
+        // check at the end of `accept_event_verified`), and the reject branch
+        // used to bypass the limiter entirely, so a short code could be
+        // guessed without any throttle (N43-L05). The fixed per-author join
+        // window is charged earlier, before the signature check. Any
+        // publish-rate reservation is rolled back on an admission failure
+        // below.
+        if cfg.nip_enabled(43)
+            && event.kind == nip43::JOIN
+            && !self.publish_rate_allowed(cfg, &event.pubkey, now)
+        {
+            return Precheck::Reject("rate-limited: too many events".into());
+        }
         // NIP-62: request to vanish — delete everything by this pubkey.
         // The spec requires the relay to honor the request "regardless of
         // the user's status", so it is detected *before* the access-control
@@ -209,7 +224,15 @@ impl super::Relay {
             .as_ref()
             .is_some_and(|pk| pk == &event.pubkey)
             || cfg.relay.pubkey.eq_ignore_ascii_case(&event.pubkey);
-        if !is_operator && !access.allows_pubkey(&event.pubkey) {
+        // NIP-43: a join carrying a valid invite code is authorized by the
+        // code, so `restrict_relay`'s allow list must not reject it before
+        // the claim is considered (the admission below is the gate). A denied
+        // pubkey is still refused: a ban outranks an invite (N43-M02).
+        let invite_join = cfg.nip_enabled(43) && event.kind == nip43::JOIN;
+        if !is_operator
+            && (access.blocks_pubkey(&event.pubkey)
+                || (!invite_join && !access.allows_pubkey(&event.pubkey)))
+        {
             return Precheck::Reject("blocked: pubkey not allowed".into());
         }
         if !access.allows_kind(event.kind) {
