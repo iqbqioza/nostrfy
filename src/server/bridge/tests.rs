@@ -476,6 +476,82 @@ async fn dense_same_second_hidden_prefix_does_not_stall_the_window() {
 }
 
 #[tokio::test]
+async fn hidden_prefix_across_seconds_fails_explicitly() {
+    // Four over-fetch rounds can be filled entirely by rows the caller may
+    // not see. There is no visible row to use as the 39006 cursor, so the
+    // window must fail explicitly instead of returning an empty
+    // "exhausted" page and losing the older visible root.
+    let relay = test_relay().await;
+    let app = super::super::build_router(&relay, None).await;
+    let keypair = Keypair::from_secret_bytes([14u8; 32]).unwrap();
+    let other =
+        secp256k1::XOnlyPublicKey::from_keypair(&Keypair::from_secret_bytes([15u8; 32]).unwrap())
+            .0
+            .to_string();
+    let channel = "44444444-4444-4444-8444-444444444444";
+    let origin = origin(&relay).await;
+    let create = signed(
+        &keypair,
+        9007,
+        vec![
+            vec!["h".into(), channel.into()],
+            vec!["name".into(), "stream".into()],
+            vec!["visibility".into(), "open".into()],
+            vec!["channel_type".into(), "stream".into()],
+        ],
+        "",
+        crate::util::unix_now(),
+    );
+    let create_body = serde_json::to_vec(&create).unwrap();
+    let auth = nip98(&keypair, &origin, "/events", "POST", &create_body, 1);
+    app.clone()
+        .oneshot(request(Method::POST, "/events", Some(&auth), create_body))
+        .await
+        .unwrap();
+
+    let now = crate::util::unix_now();
+    let root = signed(
+        &keypair,
+        9,
+        vec![vec!["h".into(), channel.into()]],
+        "root",
+        now - 1_000,
+    );
+    assert_eq!(relay.db.put(root, now).await, crate::db::PutOutcome::Stored);
+    for i in 0..900 {
+        let hidden = signed(
+            &keypair,
+            crate::nips::nip62::GIFT_WRAP_KIND,
+            vec![
+                vec!["h".into(), channel.into()],
+                vec!["p".into(), other.clone()],
+            ],
+            "",
+            now - 1 - i,
+        );
+        assert_eq!(
+            relay.db.put(hidden, now).await,
+            crate::db::PutOutcome::Stored
+        );
+    }
+
+    let filter = json!([{
+        "kinds": [9, 1059],
+        "#h": [channel],
+        "limit": 10,
+        "top_level": true,
+    }]);
+    let body = serde_json::to_vec(&filter).unwrap();
+    let auth = nip98(&keypair, &origin, "/query", "POST", &body, 20);
+    let response = app
+        .oneshot(request(Method::POST, "/query", Some(&auth), body))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    relay.db.shutdown();
+}
+
+#[tokio::test]
 async fn forged_dm_open_is_rejected_before_creating_a_dm() {
     let relay = test_relay().await;
     let app = super::super::build_router(&relay, None).await;

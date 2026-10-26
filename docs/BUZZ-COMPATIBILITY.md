@@ -289,8 +289,9 @@ host, because Buzz signs the relay URL it uploads to.
   (up to 2,000 events) when the composite cursor cannot advance, so hidden
   replies in that second cannot strand an older visible row. A second above
   that cap, or a visible page that would have to split one second, returns
-  `413` instead of an empty/exhausted page. A prefix hidden across many
-  separate seconds can still end a window early. The legacy `depth_limit`
+  `413` instead of an empty/exhausted page. An entirely hidden prefix that
+  outlasts the four over-fetch rounds also returns `413` rather than an
+  empty/exhausted page with no visible cursor. The legacy `depth_limit`
   thread path scans only the newest 1,000 direct replies per frontier, so
   older replies behind that prefix are not returned. Split the timestamp
   window (or use the channel-window path) for unusually dense bursts.

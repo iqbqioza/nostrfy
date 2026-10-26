@@ -393,10 +393,16 @@ async fn channel_window(
             break;
         }
         if rounds >= 4 {
-            // The bounded over-fetch stopped early. There may still be older
-            // rows, so hand the client a cursor rather than claiming
-            // exhaustion; an empty page can progress via the last visible
-            // candidate.
+            // The bounded over-fetch stopped early. If every scanned row was
+            // hidden there is no visible cursor to hand back; returning an
+            // empty/exhausted page would silently truncate the channel.
+            // Fail explicitly instead.
+            if db_more && last_visible.is_none() {
+                return Err(window_too_large());
+            }
+            // There may still be older rows, so hand the client a cursor
+            // rather than claiming exhaustion; an empty page can progress via
+            // the last visible candidate.
             has_more = last_visible.is_some();
             break;
         }
