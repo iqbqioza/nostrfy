@@ -245,6 +245,7 @@ async fn channel_window(
     // The published 39006 cursor must name a row the caller may see; using
     // the last scanned row would disclose a hidden event's id/timestamp.
     let mut last_visible: Option<(u64, String)> = None;
+    let mut scanned_ids: HashSet<String> = HashSet::new();
     let mut has_more = false;
     let mut rounds = 0usize;
     loop {
@@ -274,6 +275,9 @@ async fn channel_window(
             if let Some((until, before)) = &page_cursor
                 && !cursor_after(&event, *until, before)
             {
+                continue;
+            }
+            if !scanned_ids.insert(event.id.clone()) {
                 continue;
             }
             examined_this_round += 1;
@@ -306,6 +310,79 @@ async fn channel_window(
             // exhaustion even though the page is full.
             has_more = false;
             break;
+        }
+        // A dense timestamp can fill the over-fetch window with rows all
+        // newer than the cursor. Re-reading `until` then makes no progress.
+        // Fetch that complete second explicitly, so hidden replies cannot
+        // strand an older visible top-level row.
+        if examined_this_round == 0
+            && db_more
+            && let Some((boundary, _)) = last_scanned
+        {
+            let mut second_filter = base_filter.clone();
+            second_filter.since = Some(boundary);
+            second_filter.until = Some(boundary);
+            second_filter.limit = Some(WINDOW_FETCH_MAX);
+            let Some((mut second, second_more)) = relay
+                .db
+                .api_query(vec![second_filter], WINDOW_FETCH_MAX, unix_now(), false)
+                .await
+            else {
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({ "error": "database is overloaded, try again shortly" })),
+                )
+                    .into_response());
+            };
+            if second_more {
+                // More events than one complete-second fetch can hold. A
+                // partial page would publish a cursor that cannot advance
+                // through the same second; fail explicitly instead of
+                // returning an empty/exhausted page.
+                return Err(window_too_large());
+            }
+            sort_desc_id_asc(&mut second);
+            let groups = relay.groups.read().await;
+            for event in second {
+                if !scanned_ids.insert(event.id.clone()) {
+                    continue;
+                }
+                last_scanned = Some((event.created_at, event.id.clone()));
+                if !bridge_visible(
+                    &event,
+                    authed,
+                    Some(&groups),
+                    nip78_restricted,
+                    relay.relay_pubkey_ref(),
+                ) {
+                    continue;
+                }
+                last_visible = Some((event.created_at, event.id.clone()));
+                if is_top_level(&event) {
+                    if rows.len() < limit {
+                        rows.push(event);
+                    } else {
+                        // The visible page would have to split this second;
+                        // a composite cursor cannot represent that safely.
+                        drop(groups);
+                        return Err(window_too_large());
+                    }
+                }
+            }
+            drop(groups);
+            if boundary == 0 {
+                // The completed second is the oldest possible one; an exact
+                // page is exhaustion, not a split-second cursor.
+                has_more = false;
+                break;
+            }
+            if rows.len() == limit {
+                return Err(window_too_large());
+            }
+            // `since`/`until` are inclusive; start strictly before the
+            // completed second.
+            page_cursor = Some((boundary - 1, String::new()));
+            continue;
         }
         if !db_more || examined_this_round == 0 {
             // The scan is exhausted (or cannot make progress without

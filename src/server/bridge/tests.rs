@@ -380,6 +380,102 @@ async fn top_level_window_excludes_replies_and_emits_bounds() {
 }
 
 #[tokio::test]
+async fn dense_same_second_hidden_prefix_does_not_stall_the_window() {
+    // More non-top-level replies at one timestamp than the over-fetch
+    // window used to make the next round re-read the same rows, return an
+    // empty page and claim exhaustion even though the older root was
+    // visible. Complete-second fallback must reach the root.
+    let relay = test_relay().await;
+    let app = super::super::build_router(&relay, None).await;
+    let keypair = Keypair::from_secret_bytes([13u8; 32]).unwrap();
+    let channel = "33333333-3333-4333-8333-333333333333";
+    let origin = origin(&relay).await;
+    let create = signed(
+        &keypair,
+        9007,
+        vec![
+            vec!["h".into(), channel.into()],
+            vec!["name".into(), "stream".into()],
+            vec!["visibility".into(), "open".into()],
+            vec!["channel_type".into(), "stream".into()],
+        ],
+        "",
+        crate::util::unix_now(),
+    );
+    let create_body = serde_json::to_vec(&create).unwrap();
+    let auth = nip98(&keypair, &origin, "/events", "POST", &create_body, 1);
+    app.clone()
+        .oneshot(request(Method::POST, "/events", Some(&auth), create_body))
+        .await
+        .unwrap();
+
+    let now = crate::util::unix_now();
+    let root = signed(
+        &keypair,
+        9,
+        vec![vec!["h".into(), channel.into()]],
+        "root",
+        now - 2,
+    );
+    let root_id = root.id.clone();
+    assert_eq!(relay.db.put(root, now).await, crate::db::PutOutcome::Stored);
+    for i in 0..500 {
+        let reply = signed(
+            &keypair,
+            9,
+            vec![
+                vec!["h".into(), channel.into()],
+                vec!["e".into(), root_id.clone(), "".into(), "reply".into()],
+            ],
+            &format!("reply-{i}"),
+            now - 1,
+        );
+        assert_eq!(
+            relay.db.put(reply, now).await,
+            crate::db::PutOutcome::Stored
+        );
+    }
+
+    let filter = json!([{
+        "kinds": [9],
+        "#h": [channel],
+        "limit": 10,
+        "top_level": true,
+    }]);
+    let body = serde_json::to_vec(&filter).unwrap();
+    let auth = nip98(&keypair, &origin, "/query", "POST", &body, 20);
+    let response = app
+        .oneshot(request(Method::POST, "/query", Some(&auth), body))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let events = body_json(response).await;
+    let rounds: Vec<&Value> = events
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["kind"] == 9)
+        .collect();
+    assert_eq!(
+        rounds.len(),
+        1,
+        "the older top-level root must be returned: {events}"
+    );
+    assert_eq!(rounds[0]["id"].as_str(), Some(root_id.as_str()));
+    let bounds: Vec<&Value> = events
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["kind"] == 39006)
+        .collect();
+    assert_eq!(bounds.len(), 1);
+    let bounds_content: Value =
+        serde_json::from_str(bounds[0]["content"].as_str().unwrap()).unwrap();
+    assert_eq!(bounds_content["has_more"], false);
+    relay.db.shutdown();
+}
+
+#[tokio::test]
 async fn forged_dm_open_is_rejected_before_creating_a_dm() {
     let relay = test_relay().await;
     let app = super::super::build_router(&relay, None).await;
