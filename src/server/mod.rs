@@ -931,6 +931,136 @@ async fn startup_group_state(relay: &Relay, groups_enabled: bool) -> Result<()> 
 /// snapshot (the per-family sequence), and an unreadable generation fails
 /// closed the same way. Both cases fall through to the replay migration,
 /// which rebuilds from the surviving events. A failed rebuild is fatal.
+/// One-time migration for databases written before durable group epochs:
+/// bind every currently stored group-state event to its group's current
+/// create id. It cannot reconstruct a past incarnation that was already
+/// deleted, but it prevents those pre-existing rows from crossing the next
+/// delete/recreate. The marker makes this a single full scan.
+async fn backfill_group_epochs(relay: &Relay) -> Result<()> {
+    match relay.db.group_epochs_backfilled().await {
+        Some(true) => return Ok(()),
+        Some(false) => {}
+        None => {
+            return Err(anyhow::anyhow!(
+                "cannot read the group-epoch backfill marker; refusing to serve with an \
+                 unverified epoch index"
+            ));
+        }
+    }
+    let create_ids: std::collections::HashMap<String, String> = relay
+        .groups
+        .read()
+        .await
+        .groups
+        .iter()
+        .filter_map(|(gid, group)| group.create_id.clone().map(|id| (gid.clone(), id)))
+        .collect();
+    if create_ids.is_empty() {
+        if !relay.db.mark_group_epochs_backfilled().await {
+            return Err(anyhow::anyhow!(
+                "cannot mark the group-epoch backfill complete"
+            ));
+        }
+        return Ok(());
+    }
+    const PAGE: usize = 50_000;
+    let kinds: Vec<u64> = (crate::nips::nip29::MOD_MIN..=crate::nips::nip29::MOD_MAX)
+        .chain([crate::nips::nip29::JOIN, crate::nips::nip29::LEAVE])
+        .collect();
+    let mut since = None;
+    loop {
+        let mut filter: crate::filter::Filter = serde_json::from_value(serde_json::json!({
+            "kinds": kinds,
+        }))
+        .expect("static filter");
+        filter.since = since;
+        let boundary_filter = filter.clone();
+        let Some((page, more)) = relay
+            .db
+            .query_full_startup(vec![filter], PAGE, unix_now(), true)
+            .await
+        else {
+            return Err(anyhow::anyhow!(
+                "cannot read stored group state for the epoch backfill; refusing to serve"
+            ));
+        };
+        if page.is_empty() {
+            break;
+        }
+        let max_created = page.last().map(|event| event.created_at);
+        let boundary_count = page
+            .iter()
+            .filter(|event| Some(event.created_at) == max_created)
+            .count();
+        let ids: Vec<Vec<u8>> = page
+            .iter()
+            .filter_map(|event| event.id_bytes().map(|id| id.to_vec()))
+            .collect();
+        let Some(existing) = relay.db.group_epochs_startup(ids).await else {
+            return Err(anyhow::anyhow!(
+                "cannot read the existing group epochs during backfill; refusing to serve"
+            ));
+        };
+        let mut entries = Vec::new();
+        for event in &page {
+            if matches!(
+                event.kind,
+                crate::nips::nip29::CREATE_GROUP | crate::nips::nip29::DELETE_GROUP
+            ) {
+                continue;
+            }
+            let Some(gid) = crate::nips::nip29::group_id(event) else {
+                continue;
+            };
+            let Some(create_id) = create_ids.get(gid) else {
+                continue;
+            };
+            let Some(id) = event.id_bytes() else {
+                continue;
+            };
+            if existing.contains_key(&hex::encode(id)) {
+                continue;
+            }
+            entries.push((id.to_vec(), create_id.clone()));
+        }
+        if !entries.is_empty() && !relay.db.record_group_epochs_batch(entries).await {
+            return Err(anyhow::anyhow!(
+                "cannot persist the group-epoch backfill; refusing to serve"
+            ));
+        }
+        if !more {
+            break;
+        }
+        let Some(boundary) = max_created else {
+            break;
+        };
+        if !crate::nips::nip29::boundary_second_complete(
+            &relay.db,
+            boundary_filter,
+            boundary,
+            boundary_count,
+        )
+        .await
+        {
+            return Err(anyhow::anyhow!(
+                "the group-epoch backfill boundary second {boundary} is incomplete; \
+                 refusing to serve"
+            ));
+        }
+        if boundary == u64::MAX {
+            break;
+        }
+        since = Some(boundary.saturating_add(1));
+    }
+    if !relay.db.mark_group_epochs_backfilled().await {
+        return Err(anyhow::anyhow!(
+            "cannot mark the group-epoch backfill complete; refusing to serve"
+        ));
+    }
+    info!("group-state epoch backfill completed");
+    Ok(())
+}
+
 async fn restore_archive_state(relay: &Relay) -> Result<()> {
     let Some(data) = relay.db.load_identity_archive().await else {
         return Err(anyhow::anyhow!(
@@ -1235,6 +1365,7 @@ pub async fn run_server(
     startup_group_state(&relay, groups_enabled).await?;
     if groups_enabled {
         relay.finish_startup_group_recovery().await;
+        backfill_group_epochs(&relay).await?;
     }
     if groups_enabled && relay.has_relay_key() {
         info!(
@@ -4119,6 +4250,59 @@ mod tests {
             err.to_string().contains("refusing to start"),
             "an unreadable snapshot must stop startup, got: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn group_epoch_backfill_binds_pre_existing_state() {
+        let relay = blossom_relay_with_key(&"01".repeat(32)).await;
+        let now = unix_now();
+        let relay_pk = relay.relay_pubkey().unwrap_or_default();
+        let channel = "g1";
+        let create = Event {
+            id: "11".repeat(32),
+            pubkey: relay_pk.clone(),
+            created_at: now - 2,
+            kind: crate::nips::nip29::CREATE_GROUP,
+            tags: vec![vec!["h".into(), channel.into()]],
+            content: String::new(),
+            sig: String::new(),
+        };
+        relay
+            .groups
+            .write()
+            .await
+            .apply(&create, &relay_pk, now - 2, false, false);
+        let state = Event {
+            id: "22".repeat(32),
+            pubkey: relay_pk.clone(),
+            created_at: now - 1,
+            kind: crate::nips::nip29::PUT_USER,
+            tags: vec![
+                vec!["h".into(), channel.into()],
+                vec!["p".into(), "aa".repeat(32)],
+            ],
+            content: String::new(),
+            sig: String::new(),
+        };
+        assert_eq!(
+            relay.db.put(state.clone(), now).await,
+            crate::db::PutOutcome::Stored
+        );
+        backfill_group_epochs(&relay)
+            .await
+            .expect("backfill must succeed");
+        let mappings = relay
+            .db
+            .group_epochs_startup(vec![state.id_bytes().unwrap().to_vec()])
+            .await
+            .expect("mapping read must answer");
+        assert_eq!(
+            mappings.get(&state.id),
+            Some(&create.id),
+            "the pre-existing state must be bound to the current group epoch"
+        );
+        assert_eq!(relay.db.group_epochs_backfilled().await, Some(true));
+        relay.db.shutdown();
     }
 
     #[tokio::test]

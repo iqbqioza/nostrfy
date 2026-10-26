@@ -491,6 +491,17 @@ enum Msg {
         event_id: Vec<u8>,
         reply: oneshot::Sender<Option<Option<(u64, String)>>>,
     },
+    /// Batch epoch mapping write for the one-time startup backfill.
+    RecordGroupEpochsBatch {
+        entries: Vec<(Vec<u8>, String)>,
+        reply: oneshot::Sender<bool>,
+    },
+    GroupEpochsBackfilled {
+        reply: oneshot::Sender<Option<bool>>,
+    },
+    MarkGroupEpochsBackfilled {
+        reply: oneshot::Sender<bool>,
+    },
     /// Persist the NIP-IA archived-identities set.
     SaveIdentityArchive {
         data: Vec<u8>,
@@ -1076,6 +1087,10 @@ fn msg_bytes(msg: &Msg) -> usize {
             ..
         } => event_id.len() + create_id.len(),
         Msg::GroupEpochs { event_ids, .. } => event_ids.iter().map(Vec::len).sum(),
+        Msg::RecordGroupEpochsBatch { entries, .. } => entries
+            .iter()
+            .map(|(id, value)| id.len() + value.len())
+            .sum(),
         Msg::ThreadRootTombstone { event_id, .. } => event_id.len(),
         Msg::SaveRoleRebuildPending { data, .. } | Msg::SaveIdentityArchive { data, .. } => {
             data.len()
@@ -2205,6 +2220,24 @@ impl DbClient {
         })
         .await
         .flatten()
+    }
+
+    pub async fn record_group_epochs_batch(&self, entries: Vec<(Vec<u8>, String)>) -> bool {
+        self.request_write_checked(|reply| Msg::RecordGroupEpochsBatch { entries, reply })
+            .await
+            .unwrap_or(false)
+    }
+
+    pub async fn group_epochs_backfilled(&self) -> Option<bool> {
+        self.request_read_startup(|reply| Msg::GroupEpochsBackfilled { reply })
+            .await
+            .flatten()
+    }
+
+    pub async fn mark_group_epochs_backfilled(&self) -> bool {
+        self.request_write_checked(|reply| Msg::MarkGroupEpochsBackfilled { reply })
+            .await
+            .unwrap_or(false)
     }
 
     pub async fn save_identity_archive(&self, data: Vec<u8>) -> bool {

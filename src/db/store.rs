@@ -3036,6 +3036,43 @@ impl Store {
         Ok(())
     }
 
+    /// Batch form used by the one-time startup backfill. One transaction
+    /// keeps a large legacy group history from paying one fsync per event.
+    pub(crate) fn record_group_epochs_batch(&self, entries: &[(Vec<u8>, String)]) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        self.disk_full_error()?;
+        let mut wtxn = self.env.write_txn()?;
+        for (event_id, create_id) in entries {
+            if event_id.len() != ID_LEN {
+                continue;
+            }
+            let mut key = Vec::with_capacity(12 + event_id.len());
+            key.extend_from_slice(b"group_epoch:");
+            key.extend_from_slice(event_id);
+            self.index_meta.put(&mut wtxn, &key, create_id.as_bytes())?;
+        }
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn group_epochs_backfilled(&self) -> Result<bool> {
+        let rtxn = self.env.read_txn()?;
+        Ok(self
+            .index_meta
+            .get(&rtxn, b"group_epochs_backfill")?
+            .is_some())
+    }
+
+    pub(crate) fn mark_group_epochs_backfilled(&self) -> Result<()> {
+        let mut wtxn = self.env.write_txn()?;
+        self.index_meta
+            .put(&mut wtxn, b"group_epochs_backfill", b"1")?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
     /// The persistent derived-group-state stamp: 0 when it was never
     /// bumped (fresh/pre-stamp database). See [`STATE_STAMP_KEY`].
     pub(crate) fn state_stamp(&self) -> Result<u64> {

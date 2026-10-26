@@ -236,6 +236,21 @@ fn handle_read_msg(store: &Store, errors: &Arc<std::sync::atomic::AtomicU64>, ms
             let _ = reply.send(false);
             false
         }
+        Msg::GroupEpochsBackfilled { reply } => {
+            let out = match store.group_epochs_backfilled() {
+                Ok(done) => Some(done),
+                Err(e) => {
+                    db_error(errors, &e);
+                    None
+                }
+            };
+            let _ = reply.send(out);
+            false
+        }
+        Msg::RecordGroupEpochsBatch { reply, .. } | Msg::MarkGroupEpochsBackfilled { reply } => {
+            let _ = reply.send(false);
+            false
+        }
         Msg::LoadIdentityArchive { reply } => {
             let out = match store.load_identity_archive() {
                 Ok(data) => Some(data),
@@ -1424,6 +1439,36 @@ pub(crate) fn spawn(
                                         }
                                     };
                                     let _ = reply.send(out);
+                                }
+                                Msg::RecordGroupEpochsBatch { entries, reply } => {
+                                    let stored = match store.record_group_epochs_batch(&entries) {
+                                        Ok(()) => true,
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            false
+                                        }
+                                    };
+                                    let _ = reply.send(stored);
+                                }
+                                Msg::GroupEpochsBackfilled { reply } => {
+                                    let out = match store.group_epochs_backfilled() {
+                                        Ok(done) => Some(done),
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            None
+                                        }
+                                    };
+                                    let _ = reply.send(out);
+                                }
+                                Msg::MarkGroupEpochsBackfilled { reply } => {
+                                    let marked = match store.mark_group_epochs_backfilled() {
+                                        Ok(()) => true,
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            false
+                                        }
+                                    };
+                                    let _ = reply.send(marked);
                                 }
                                 Msg::SaveIdentityArchive { data, reply } => {
                                     let saved = match store.save_identity_archive(&data) {

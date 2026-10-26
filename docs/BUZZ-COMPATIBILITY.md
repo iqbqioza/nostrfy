@@ -280,14 +280,16 @@ host, because Buzz signs the relay URL it uploads to.
   delete/recreate, and accepted state events record that epoch in an
   additive `group_epoch:` key namespace in `index_meta`, checked during
   rebuild; relay-generated `9000`/`9001` mirrors carry the create id and are
-  ignored against a later incarnation. Events accepted before this mapping
-  existed, and imported legacy events, have no entry, so a future-dated old
-  event can still cross a recreate on replay. The keys are additive: an old
+  ignored against a later incarnation. On the first startup after upgrading,
+  a one-time scan binds every currently stored group-state event to its
+  group's current create id, so pre-existing and imported rows are protected
+  from the *next* recreate. It cannot reconstruct a past incarnation that was
+  already deleted, and an old future-dated event that already crossed a
+  recreate before the upgrade remains applied. The keys are additive: an old
   database opens with no entries and keeps the timestamp/create-id fallback.
-  Migration
-  buffers pre-create state until the create, re-adjudicates it against the
-  real group, and then applies it; a pre-create `9008` is kept but has no
-  effect, matching the rebuild.
+  Migration buffers pre-create state until the create, re-adjudicates it
+  against the real group, and then applies it; a pre-create `9008` is kept
+  but has no effect, matching the rebuild.
 - Migration now invalidates the destination group snapshot after importing
   events (forcing the first start to rebuild/ghost-check), except when the
   snapshot contains DM groups; keeping DM snapshots preserves their
