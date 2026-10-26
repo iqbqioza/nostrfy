@@ -491,6 +491,14 @@ enum Msg {
         event_id: Vec<u8>,
         reply: oneshot::Sender<Option<Option<(u64, String)>>>,
     },
+    /// Persist the NIP-IA archived-identities set.
+    SaveIdentityArchive {
+        data: Vec<u8>,
+        reply: oneshot::Sender<bool>,
+    },
+    LoadIdentityArchive {
+        reply: oneshot::Sender<Option<Option<Vec<u8>>>>,
+    },
     /// Persist the bounded role-rebuild mutation journal across shutdown.
     SaveRoleRebuildPending {
         data: Vec<u8>,
@@ -1069,7 +1077,9 @@ fn msg_bytes(msg: &Msg) -> usize {
         } => event_id.len() + create_id.len(),
         Msg::GroupEpochs { event_ids, .. } => event_ids.iter().map(Vec::len).sum(),
         Msg::ThreadRootTombstone { event_id, .. } => event_id.len(),
-        Msg::SaveRoleRebuildPending { data, .. } => data.len(),
+        Msg::SaveRoleRebuildPending { data, .. } | Msg::SaveIdentityArchive { data, .. } => {
+            data.len()
+        }
         Msg::Vanish { pubkey, .. }
         | Msg::RecordPendingVanish { pubkey, .. }
         | Msg::GiftWrapPurge { pubkey, .. } => pubkey.len(),
@@ -2195,6 +2205,18 @@ impl DbClient {
         })
         .await
         .flatten()
+    }
+
+    pub async fn save_identity_archive(&self, data: Vec<u8>) -> bool {
+        self.request_write_checked(|reply| Msg::SaveIdentityArchive { data, reply })
+            .await
+            .unwrap_or(false)
+    }
+
+    pub async fn load_identity_archive(&self) -> Option<Option<Vec<u8>>> {
+        self.request_read_startup(|reply| Msg::LoadIdentityArchive { reply })
+            .await
+            .flatten()
     }
 
     pub async fn save_role_rebuild_pending(&self, data: Vec<u8>) -> bool {

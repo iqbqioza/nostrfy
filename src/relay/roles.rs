@@ -261,8 +261,148 @@ impl super::Relay {
             return false;
         };
         let now = self.stamp_floor(unix_now());
-        let mut event = crate::nips::nip_ia::empty_snapshot(&relay_pubkey, now);
+        let archived = self.archive.read().await.clone();
+        let mut event = crate::nips::nip_ia::snapshot(&relay_pubkey, now, &archived);
         self.store_relay_event(&mut event).await.is_ok()
+    }
+
+    /// Applies a NIP-IA archive/unarchive request. The request event is
+    /// stored by the caller after this succeeds. Supported policy paths are
+    /// self and relay-admin; the NIP-OA owner-of-agent path is not enabled.
+    pub(crate) async fn apply_identity_archive(
+        &self,
+        event: &crate::event::Event,
+    ) -> Result<(), String> {
+        if !matches!(event.kind, 9035 | 9036) {
+            return Err("invalid: not a NIP-IA request".into());
+        }
+        if event.created_at.abs_diff(unix_now()) > 120 {
+            return Err("restricted: archive request is outside the freshness window".into());
+        }
+        if event
+            .tags
+            .iter()
+            .filter(|tag| tag.len() == 1 && tag[0] == "-")
+            .count()
+            != 1
+        {
+            return Err("invalid: archive request requires exactly one NIP-70 - tag".into());
+        }
+        let mut targets = event
+            .tags
+            .iter()
+            .filter(|tag| tag.len() >= 2 && tag[0] == "p")
+            .map(|tag| tag[1].to_ascii_lowercase());
+        let Some(target) = targets.next() else {
+            return Err("invalid: archive request requires one p tag".into());
+        };
+        if targets.next().is_some()
+            || target.len() != 64
+            || !target.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err("invalid: archive request target must be one hex pubkey".into());
+        }
+        let replaced_by = event
+            .tags
+            .iter()
+            .find(|tag| tag.len() >= 2 && tag[0] == "replaced-by")
+            .map(|tag| tag[1].to_ascii_lowercase());
+        if let Some(replaced_by) = &replaced_by
+            && (replaced_by.len() != 64
+                || !replaced_by.bytes().all(|byte| byte.is_ascii_hexdigit())
+                || replaced_by == &target)
+        {
+            return Err("invalid: replaced-by must be a different hex pubkey".into());
+        }
+        let reason = event
+            .tags
+            .iter()
+            .find(|tag| tag.len() >= 2 && tag[0] == "reason")
+            .map(|tag| tag[1].as_str());
+        let self_request = event.pubkey.eq_ignore_ascii_case(&target);
+        let admin = self.is_relay_owner_or_admin(&event.pubkey).await;
+        if !self_request && !admin {
+            return Err(
+                "restricted: only the target or a relay admin may archive this identity".into(),
+            );
+        }
+        if event.kind == 9036
+            && self
+                .access
+                .read()
+                .await
+                .blocked_pubkeys
+                .iter()
+                .any(|(blocked, _)| blocked.eq_ignore_ascii_case(&target))
+        {
+            return Err("restricted: an access-control ban cannot be self-unarchived".into());
+        }
+        let archived = event.kind == 9035;
+        let consent = if self_request { "self" } else { "admin" };
+        let consent_pubkey = if self_request {
+            Some(target.as_str())
+        } else {
+            Some(event.pubkey.as_str())
+        };
+        let changed = {
+            let mut archive = self.archive.write().await;
+            if archived {
+                archive.insert(target.clone())
+            } else {
+                archive.remove(&target)
+            }
+        };
+        if !changed {
+            return Ok(());
+        }
+        let data = {
+            let archive = self.archive.read().await;
+            serde_json::to_vec(&*archive).map_err(|error| format!("error: {error}"))?
+        };
+        if !self.db.save_identity_archive(data).await {
+            // Roll back so an ACKed request cannot disappear on restart.
+            let mut archive = self.archive.write().await;
+            if archived {
+                archive.remove(&target);
+            } else {
+                archive.insert(target.clone());
+            }
+            return Err("error: could not persist the archive state".into());
+        }
+        let now = self.stamp_floor(unix_now());
+        let Some(relay_pubkey) = self.relay_pubkey() else {
+            return Err("error: relay has no signing key".into());
+        };
+        let mut delta = crate::nips::nip_ia::delta(
+            &relay_pubkey,
+            now,
+            &target,
+            archived,
+            consent,
+            consent_pubkey,
+            &event.id,
+            reason,
+            replaced_by.as_deref(),
+            &event.content,
+        );
+        if self.store_relay_event(&mut delta).await.is_err()
+            || !self.publish_archive_snapshot().await
+        {
+            // Keep the durable set and the published snapshot in step: the
+            // request is not ACKed, so a retry must be able to make progress
+            // instead of finding an already-applied but unpublished state.
+            let mut archive = self.archive.write().await;
+            if archived {
+                archive.remove(&target);
+            } else {
+                archive.insert(target.clone());
+            }
+            if let Ok(data) = serde_json::to_vec(&*archive) {
+                let _ = self.db.save_identity_archive(data).await;
+            }
+            return Err("error: could not publish the archive state".into());
+        }
+        Ok(())
     }
 
     /// Publishes the current membership list and an add/remove user event.

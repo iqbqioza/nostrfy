@@ -150,10 +150,14 @@ host, because Buzz signs the relay URL it uploads to.
 
 ## Known gaps
 
-- NIP-IA archive/unarchive requests (`kind:9035`/`9036`) are not accepted
-  yet. The relay does publish the required empty `kind:13535` archived-
-  identities snapshot on startup, so Buzz's archive-state check completes
-  with "nothing archived" instead of failing.
+- NIP-IA archive/unarchive requests (`kind:9035`/`9036`) are accepted from a
+  self-request or a relay owner/admin, with NIP-70/freshness/tag validation.
+  Accepted state changes emit `kind:8002`/`8003` deltas and a fresh
+  relay-signed `kind:13535` snapshot, persisted in an additive `index_meta`
+  key. The NIP-OA owner-of-agent authorization paths are not implemented, so
+  an owner cannot archive an agent without acting as a relay admin. Archive
+  state is visibility metadata only: history is not deleted and `13534`
+  membership is not rewritten.
 - Channel `ttl` is published but stored messages are not automatically
   expired server-side; clients that set NIP-40 `expiration` get normal expiry.
 - NIP-CL's system-channel exclusion is applied to the HTTP bridge and to

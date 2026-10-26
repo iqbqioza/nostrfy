@@ -2993,6 +2993,23 @@ impl Store {
         Ok(out)
     }
 
+    /// Persist the NIP-IA archived-identities set (JSON array).
+    pub(crate) fn save_identity_archive(&self, data: &[u8]) -> Result<()> {
+        self.disk_full_error()?;
+        let mut wtxn = self.env.write_txn()?;
+        self.index_meta.put(&mut wtxn, b"identity_archive", data)?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn load_identity_archive(&self) -> Result<Option<Vec<u8>>> {
+        let rtxn = self.env.read_txn()?;
+        Ok(self
+            .index_meta
+            .get(&rtxn, b"identity_archive")?
+            .map(<[u8]>::to_vec))
+    }
+
     /// Persist the role rebuild's bounded mutation journal. The key is
     /// additive in `index_meta`; an old database simply has no record.
     pub(crate) fn save_role_rebuild_pending(&self, data: &[u8]) -> Result<()> {

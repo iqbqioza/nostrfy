@@ -236,6 +236,21 @@ fn handle_read_msg(store: &Store, errors: &Arc<std::sync::atomic::AtomicU64>, ms
             let _ = reply.send(false);
             false
         }
+        Msg::LoadIdentityArchive { reply } => {
+            let out = match store.load_identity_archive() {
+                Ok(data) => Some(data),
+                Err(e) => {
+                    db_error(errors, &e);
+                    None
+                }
+            };
+            let _ = reply.send(out);
+            false
+        }
+        Msg::SaveIdentityArchive { reply, .. } => {
+            let _ = reply.send(false);
+            false
+        }
         Msg::ThreadRootTombstone { event_id, reply } => {
             let out = match store.thread_root_tombstone(&event_id) {
                 Ok(meta) => Some(meta),
@@ -1403,6 +1418,26 @@ pub(crate) fn spawn(
                                 Msg::ThreadRootTombstone { event_id, reply } => {
                                     let out = match store.thread_root_tombstone(&event_id) {
                                         Ok(meta) => Some(meta),
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            None
+                                        }
+                                    };
+                                    let _ = reply.send(out);
+                                }
+                                Msg::SaveIdentityArchive { data, reply } => {
+                                    let saved = match store.save_identity_archive(&data) {
+                                        Ok(()) => true,
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            false
+                                        }
+                                    };
+                                    let _ = reply.send(saved);
+                                }
+                                Msg::LoadIdentityArchive { reply } => {
+                                    let out = match store.load_identity_archive() {
+                                        Ok(data) => Some(data),
                                         Err(e) => {
                                             db_error(&thread_errors, &e);
                                             None

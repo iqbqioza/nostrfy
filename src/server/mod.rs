@@ -931,6 +931,21 @@ async fn startup_group_state(relay: &Relay, groups_enabled: bool) -> Result<()> 
 /// snapshot (the per-family sequence), and an unreadable generation fails
 /// closed the same way. Both cases fall through to the replay migration,
 /// which rebuilds from the surviving events. A failed rebuild is fatal.
+async fn restore_archive_state(relay: &Relay) -> Result<()> {
+    let Some(data) = relay.db.load_identity_archive().await else {
+        return Err(anyhow::anyhow!(
+            "cannot read the NIP-IA archive state; refusing to start with an unknown archive"
+        ));
+    };
+    let archived: std::collections::BTreeSet<String> = match data {
+        Some(bytes) => serde_json::from_slice(&bytes)
+            .map_err(|error| anyhow::anyhow!("invalid NIP-IA archive state: {error}"))?,
+        None => std::collections::BTreeSet::new(),
+    };
+    *relay.archive.write().await = archived;
+    Ok(())
+}
+
 async fn restore_role_state(relay: &Relay) -> Result<()> {
     if !relay.config.read().await.nip_enabled(43) {
         // No role operations can run while NIP-43 is disabled. Clear a
@@ -1247,10 +1262,12 @@ pub async fn run_server(
         hangup,
     ));
 
+    restore_archive_state(&relay).await?;
+
     // NIP-IA: NIP-IA-aware clients (Buzz) treat a missing archived-identities
-    // snapshot as an uncheckable archive state. nostrfy has no archive store
-    // yet, so publish the empty relay-signed snapshot: a truthful "nothing is
-    // archived here" that clients can verify against NIP-11 `self`.
+    // snapshot as an uncheckable archive state. Publish the current
+    // relay-signed snapshot so clients can verify the archive state against
+    // NIP-11 `self`.
     if relay.config.read().await.relay.enabled_buzz
         && relay.relay_pubkey().is_some()
         && !relay.publish_archive_snapshot().await

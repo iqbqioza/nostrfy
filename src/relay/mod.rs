@@ -320,6 +320,8 @@ pub struct Relay {
     startup_group_recovery: std::sync::atomic::AtomicBool,
     /// NIP-43 role definitions and member assignments.
     pub roles: Arc<RwLock<RoleStore>>,
+    /// NIP-IA archived identities (relay-scoped visibility metadata).
+    pub archive: Arc<RwLock<std::collections::BTreeSet<String>>>,
     /// The coalesced NIP-43 role rebuild that follows a NIP-09 deletion,
     /// NIP-62 vanish or NIP-40 expiry of a role-state event: while stale,
     /// the live store is the fail-closed empty store and `persist_roles`
@@ -2609,6 +2611,7 @@ impl Relay {
             groups_rebuild: std::sync::Arc::new(GroupsRebuild::default()),
             startup_group_recovery: std::sync::atomic::AtomicBool::new(false),
             roles: Arc::new(RwLock::new(RoleStore::default())),
+            archive: Arc::new(RwLock::new(std::collections::BTreeSet::new())),
             roles_rebuild: std::sync::Arc::new(RolesRebuild::default()),
             api_limit: ApiLimiter::new(api_max_concurrent),
             publish_rate: std::sync::Mutex::new(PublishRate::default()),
@@ -3665,6 +3668,13 @@ impl Relay {
             self.stats.bump(&self.stats.events_rejected, 1);
             return PutOutcome::Invalid(reason);
         }
+        if matches!(event.kind, 9035 | 9036)
+            && let Err(reason) = self.apply_identity_archive(&event).await
+        {
+            self.publish_rate_rollback(&event.pubkey, now);
+            self.stats.bump(&self.stats.events_rejected, 1);
+            return PutOutcome::Invalid(reason);
+        }
         let outcome = self
             .db
             .put_with_first_seen(Arc::clone(&event), now, first_seen)
@@ -3874,6 +3884,10 @@ impl Relay {
             || event.kind == 9033
             // Buzz/NIP-43 relay member admin commands mutate the role store.
             || matches!(event.kind, 9030..=9032)
+            // NIP-IA archive requests mutate the archive set and publish
+            // relay-signed state.
+            || event.kind == 9035
+            || event.kind == 9036
             || nip62::is_vanish(event)
             || (event.kind == 1 && self.relay_pubkey.as_deref() == Some(event.pubkey.as_str()))
     }
@@ -7598,6 +7612,71 @@ mod tests {
             .await
             .expect("owner may remove a member");
         assert!(!relay.roles.read().await.is_member_of(&target));
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn identity_archive_requests_update_the_snapshot() {
+        let relay = build_relay_with_key(false, &"01".repeat(32)).await;
+        let target = "aa".repeat(32);
+        let request = |kind: u64| crate::event::Event {
+            id: "ab".repeat(32),
+            pubkey: target.clone(),
+            created_at: crate::util::unix_now(),
+            kind,
+            tags: vec![
+                vec!["-".into()],
+                vec!["p".into(), target.clone()],
+                vec!["reason".into(), "rotated".into()],
+            ],
+            content: "archive test".into(),
+            sig: String::new(),
+        };
+        relay
+            .apply_identity_archive(&request(9035))
+            .await
+            .expect("self archive request must be accepted");
+        assert!(relay.archive.read().await.contains(&target));
+        let filter: crate::filter::Filter =
+            serde_json::from_value(serde_json::json!({"kinds": [13535]})).unwrap();
+        let (snapshots, _) = relay
+            .db
+            .query(vec![filter.clone()], 10, crate::util::unix_now())
+            .await;
+        assert_eq!(snapshots.len(), 1);
+        assert!(
+            snapshots[0]
+                .tags
+                .iter()
+                .any(|tag| tag.len() == 2 && tag[0] == "p" && tag[1] == target)
+        );
+        let deltas = relay
+            .db
+            .query(
+                vec![serde_json::from_value(serde_json::json!({"kinds": [8002]})).unwrap()],
+                10,
+                crate::util::unix_now(),
+            )
+            .await
+            .0;
+        assert_eq!(deltas.len(), 1);
+
+        relay
+            .apply_identity_archive(&request(9036))
+            .await
+            .expect("self unarchive request must be accepted");
+        assert!(!relay.archive.read().await.contains(&target));
+        let (snapshots, _) = relay
+            .db
+            .query(vec![filter], 10, crate::util::unix_now())
+            .await;
+        assert_eq!(snapshots.len(), 1, "13535 is replaceable");
+        assert!(
+            !snapshots[0]
+                .tags
+                .iter()
+                .any(|tag| { tag.len() == 2 && tag[0] == "p" && tag[1] == target })
+        );
         relay.db.shutdown();
     }
 
