@@ -321,9 +321,16 @@ impl super::Relay {
             .map(|tag| tag[1].as_str());
         let self_request = event.pubkey.eq_ignore_ascii_case(&target);
         let admin = self.is_relay_owner_or_admin(&event.pubkey).await;
-        if !self_request && !admin {
+        let owner = if !self_request && !admin {
+            crate::nips::nip_ia::verify_owner_agent_request(event, &target)
+        } else {
+            None
+        };
+        if !self_request && !admin && owner.is_none() {
             return Err(
-                "restricted: only the target or a relay admin may archive this identity".into(),
+                "restricted: only the target, a relay admin or a proven agent owner may archive \
+                 this identity"
+                    .into(),
             );
         }
         if event.kind == 9036
@@ -338,11 +345,19 @@ impl super::Relay {
             return Err("restricted: an access-control ban cannot be self-unarchived".into());
         }
         let archived = event.kind == 9035;
-        let consent = if self_request { "self" } else { "admin" };
+        let consent = if self_request {
+            "self"
+        } else if admin {
+            "admin"
+        } else {
+            "owner"
+        };
         let consent_pubkey = if self_request {
             Some(target.as_str())
-        } else {
+        } else if admin {
             Some(event.pubkey.as_str())
+        } else {
+            owner.as_deref()
         };
         let changed = {
             let mut archive = self.archive.write().await;

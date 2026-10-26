@@ -492,6 +492,12 @@ impl super::Conn {
                                 .any(|pk| groups.visible_kind(gid, item.kind, Some(pk)))
                         };
                         visible
+                            && !groups.channel_ttl_expired_gid(
+                                gid,
+                                item.kind,
+                                item.created,
+                                unix_now(),
+                            )
                             && crate::server::bridge::nip_cl_group_visible(
                                 &system_filter,
                                 groups,

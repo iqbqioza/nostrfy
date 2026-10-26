@@ -6,6 +6,9 @@
 
 use std::collections::BTreeSet;
 
+use secp256k1::schnorr::Signature;
+use sha2::{Digest, Sha256};
+
 use crate::event::Event;
 
 /// NIP-IA current archived-identities snapshot (replaceable).
@@ -68,6 +71,70 @@ pub fn delta(
     )
 }
 
+/// Verifies the request-borne NIP-OA owner-of-agent path. Returns the owner
+/// pubkey that consented when the single `auth` tag is valid. The published
+/// profile-attestation path is intentionally not implemented.
+pub(crate) fn verify_owner_agent_request(event: &Event, target: &str) -> Option<String> {
+    let mut auth = event
+        .tags
+        .iter()
+        .filter(|tag| tag.len() == 4 && tag[0] == "auth");
+    let tag = auth.next()?;
+    if auth.next().is_some() {
+        return None;
+    }
+    let owner = tag[1].to_ascii_lowercase();
+    if owner.len() != 64
+        || !owner.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || !owner.eq_ignore_ascii_case(&event.pubkey)
+        || target.eq_ignore_ascii_case(&owner)
+    {
+        return None;
+    }
+    let conditions = tag[2].as_str();
+    if !owner_conditions_allow(conditions, event.created_at) {
+        return None;
+    }
+    let owner_bytes: [u8; 32] = hex::decode(&owner).ok()?.try_into().ok()?;
+    let sig_bytes: [u8; 64] = hex::decode(&tag[3]).ok()?.try_into().ok()?;
+    let pk = secp256k1::XOnlyPublicKey::from_byte_array(owner_bytes).ok()?;
+    let signature = Signature::from_byte_array(sig_bytes);
+    let preimage = format!("nostr:agent-auth:{target}:{conditions}");
+    let message: [u8; 32] = Sha256::digest(preimage.as_bytes()).into();
+    secp256k1::schnorr::verify(&signature, &message, &pk)
+        .is_ok()
+        .then_some(owner)
+}
+
+/// NIP-OA time clauses for the request-borne path. `kind=` is syntax-checked
+/// but does not restrict an NIP-IA identity binding.
+fn owner_conditions_allow(conditions: &str, created_at: u64) -> bool {
+    for clause in conditions.split('&').filter(|clause| !clause.is_empty()) {
+        if let Some(kind) = clause.strip_prefix("kind=") {
+            if kind.is_empty() || !kind.bytes().all(|byte| byte.is_ascii_digit()) {
+                return false;
+            }
+        } else if let Some(value) = clause.strip_prefix("created_at<") {
+            let Ok(value) = value.parse::<u64>() else {
+                return false;
+            };
+            if created_at >= value {
+                return false;
+            }
+        } else if let Some(value) = clause.strip_prefix("created_at>") {
+            let Ok(value) = value.parse::<u64>() else {
+                return false;
+            };
+            if created_at <= value {
+                return false;
+            }
+        } else {
+            return false;
+        }
+    }
+    true
+}
+
 fn base(kind: u64, relay_pubkey: &str, now: u64, tags: Vec<Vec<String>>, content: &str) -> Event {
     Event {
         id: String::new(),
@@ -92,6 +159,41 @@ mod tests {
         assert_eq!(event.created_at, 1);
         assert_eq!(event.tags, vec![vec!["-".to_string()]]);
         assert!(event.content.is_empty());
+    }
+
+    #[test]
+    fn owner_agent_request_vector_verifies() {
+        // NIP-IA test vector 1's NIP-OA auth tag and request timestamp.
+        let event = Event {
+            id: String::new(),
+            pubkey: "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+                .into(),
+            created_at: 1_713_956_400,
+            kind: 9035,
+            tags: vec![
+                vec!["-".into()],
+                vec![
+                    "p".into(),
+                    "c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5"
+                        .into(),
+                ],
+                vec![
+                    "auth".into(),
+                    "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798".into(),
+                    "kind=1&created_at<1713957000".into(),
+                    "8b7df2575caf0a108374f8471722b233c53f9ff827a8b0f91861966c3b9dd5cb2e189eae9f49d72187674c2f5bd244145e10ff86c9f257ffe65a1ee5f108b369".into(),
+                ],
+            ],
+            content: String::new(),
+            sig: String::new(),
+        };
+        assert_eq!(
+            verify_owner_agent_request(
+                &event,
+                "c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5"
+            ),
+            Some("79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798".into())
+        );
     }
 
     #[test]

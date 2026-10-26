@@ -244,6 +244,12 @@ pub(crate) fn bridge_visible(
     nip78_restricted: bool,
     relay_pubkey: Option<&str>,
 ) -> bool {
+    if let Some(groups) = groups
+        && groups.channel_ttl_expired(event, unix_now())
+    {
+        return false;
+    }
+
     // NIP-70: the `-` tag constrains publication; authenticated readers may
     // read protected events exactly like an authenticated WebSocket client.
     if nip70::hidden_from_anonymous(event, relay_pubkey) && authed.is_empty() {

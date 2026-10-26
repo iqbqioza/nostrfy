@@ -25,6 +25,41 @@ const OTHER: &str = "ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
 const ADMIN2: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
 
 #[test]
+fn channel_ttl_expires_only_content_events() {
+    let mut store = GroupStore {
+        buzz_enabled: true,
+        ..GroupStore::default()
+    };
+    let now = 1_600_000_000;
+    let create = event(
+        CREATE_GROUP,
+        ADMIN,
+        Some("g1"),
+        vec![vec!["ttl".into(), "10".into()]],
+    );
+    store.apply(&create, "relay", now, true, false);
+    assert_eq!(store.group("g1").unwrap().settings.ttl, Some(10));
+    let message = event(9, USER, Some("g1"), vec![]);
+    assert!(!store.channel_ttl_expired(&message, now + 9));
+    assert!(store.channel_ttl_expired(&message, now + 10));
+    let action = event(
+        PUT_USER,
+        ADMIN,
+        Some("g1"),
+        vec![vec!["p".into(), USER.into()]],
+    );
+    assert!(
+        !store.channel_ttl_expired(&action, now + 100),
+        "group state must not expire with the message TTL"
+    );
+    let metadata = event(GROUP_META, ADMIN, Some("g1"), vec![]);
+    assert!(
+        !store.channel_ttl_expired(&metadata, now + 100),
+        "group metadata must not expire with the message TTL"
+    );
+}
+
+#[test]
 fn a_durable_epoch_rejects_stale_state_after_recreate() {
     let mut store = GroupStore::default();
     let now = 1_600_000_000;

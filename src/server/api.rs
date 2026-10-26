@@ -464,6 +464,12 @@ fn api_visible(
     nip78: bool,
     relay_pubkey: Option<&str>,
 ) -> bool {
+    if let Some(groups) = groups
+        && groups.channel_ttl_expired(event, unix_now())
+    {
+        return false;
+    }
+
     !nip70::hidden_from_anonymous(event, relay_pubkey)
         && event.kind != nip62::GIFT_WRAP_KIND
         // These are per-pubkey state (Buzz membership notices and the

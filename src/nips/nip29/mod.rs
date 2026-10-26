@@ -2610,6 +2610,29 @@ impl GroupStore {
     }
 
     /// Whether a stored event may be served to `authed` (NIP-29 read access).
+    /// NIP-CL channel TTL: whether a non-state channel event is older than
+    /// the group's configured TTL and must no longer be served. Physical
+    /// deletion remains the normal reaper's job; this is the read-time
+    /// authority so a TTL edit applies to existing messages immediately.
+    pub fn channel_ttl_expired(&self, event: &Event, now: u64) -> bool {
+        let Some(gid) = group_id_any(event) else {
+            return false;
+        };
+        self.channel_ttl_expired_gid(gid, event.kind, event.created_at, now)
+    }
+
+    /// The lightweight NIP-77 variant: only the group id, kind and timestamp
+    /// are available.
+    pub fn channel_ttl_expired_gid(&self, gid: &str, kind: u64, created_at: u64, now: u64) -> bool {
+        if is_group_action_kind(kind) || (GROUP_META..=GROUP_PINS).contains(&kind) {
+            return false;
+        }
+        let Some(ttl) = self.groups.get(gid).and_then(|group| group.settings.ttl) else {
+            return false;
+        };
+        ttl > 0 && created_at.saturating_add(ttl) <= now
+    }
+
     pub fn visible_to(&self, event: &Event, authed: Option<&str>) -> bool {
         let Some(gid) = group_id_any(event) else {
             return true;

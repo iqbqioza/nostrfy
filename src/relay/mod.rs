@@ -7681,6 +7681,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn owner_can_archive_an_agent_with_nip_oa() {
+        let relay = build_relay_with_key(false, &"01".repeat(32)).await;
+        let owner = secp256k1::Keypair::from_secret_bytes([1u8; 32]).unwrap();
+        let agent = secp256k1::Keypair::from_secret_bytes([2u8; 32]).unwrap();
+        let owner_pk = secp256k1::XOnlyPublicKey::from_keypair(&owner)
+            .0
+            .to_string();
+        let agent_pk = secp256k1::XOnlyPublicKey::from_keypair(&agent)
+            .0
+            .to_string();
+        use sha2::Digest as _;
+        let conditions = "";
+        let preimage = format!("nostr:agent-auth:{agent_pk}:{conditions}");
+        let message: [u8; 32] = sha2::Sha256::digest(preimage.as_bytes()).into();
+        let signature = secp256k1::schnorr::sign_no_aux_rand(&message, &owner).to_string();
+        let event = crate::event::Event {
+            id: "cd".repeat(32),
+            pubkey: owner_pk.clone(),
+            created_at: crate::util::unix_now(),
+            kind: 9035,
+            tags: vec![
+                vec!["-".into()],
+                vec!["p".into(), agent_pk.clone()],
+                vec!["auth".into(), owner_pk, conditions.into(), signature],
+            ],
+            content: String::new(),
+            sig: String::new(),
+        };
+        relay
+            .apply_identity_archive(&event)
+            .await
+            .expect("a valid owner-of-agent request must be accepted");
+        assert!(relay.archive.read().await.contains(&agent_pk));
+        let filter: crate::filter::Filter =
+            serde_json::from_value(serde_json::json!({"kinds": [8002]})).unwrap();
+        let (deltas, _) = relay
+            .db
+            .query(vec![filter], 10, crate::util::unix_now())
+            .await;
+        assert_eq!(deltas.len(), 1);
+        assert!(
+            deltas[0]
+                .tags
+                .iter()
+                .any(|tag| { tag.len() >= 3 && tag[0] == "consent" && tag[1] == "owner" })
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
     async fn workspace_icon_requires_admin_and_persists() {
         let relay = build_relay().await;
         let owner = "aa".repeat(32);

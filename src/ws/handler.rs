@@ -1477,6 +1477,9 @@ impl super::Conn {
             // a caller bug, so fail closed for it.
             return !nip29::is_group_event(event);
         };
+        if groups.channel_ttl_expired(event, crate::util::unix_now()) {
+            return false;
+        }
         if self.authed_pubkeys.is_empty() {
             groups.visible_to(event, None)
         } else {
